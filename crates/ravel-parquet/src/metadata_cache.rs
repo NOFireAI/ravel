@@ -92,21 +92,12 @@ impl MetadataCache {
 
     /// Admit `metadata` under `key`, replacing whatever was there. It is
     /// charged its [`ParquetMetaData::memory_size`] or `estimate`, the
-    /// estimate of what decoding it allocated, whichever is larger. A charge
-    /// above the whole bound is returned as the error: nothing is admitted,
-    /// and the entry under `key` is dropped.
-    pub fn insert(
-        &self,
-        key: MetadataKey,
-        metadata: Arc<ParquetMetaData>,
-        estimate: u64,
-    ) -> Result<(), u64> {
+    /// estimate of what decoding it allocated, whichever is larger. Returns
+    /// whether it was admitted: with a charge above the whole bound nothing
+    /// is, and the entry under `key` is dropped.
+    pub fn insert(&self, key: MetadataKey, metadata: Arc<ParquetMetaData>, estimate: u64) -> bool {
         let bytes = (metadata.memory_size() as u64).max(estimate);
-        if self.admit(key, CachedFooter::Decoded(metadata), bytes) {
-            Ok(())
-        } else {
-            Err(bytes)
-        }
+        self.admit(key, CachedFooter::Decoded(metadata), bytes)
     }
 
     /// Record that the footer under `key` was refused with `message`, charged

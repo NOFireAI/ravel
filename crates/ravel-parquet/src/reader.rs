@@ -131,6 +131,18 @@ pub struct PinnedParquetReader {
     services: ReadServices,
     accounting: PhaseAccounting,
     limits: ReadLimits,
+    /// The footer the metadata cache did not admit, set by the first
+    /// [`Self::metadata`] call that decoded it and shared by clones.
+    uncached: Arc<Mutex<Option<UncachedFooter>>>,
+}
+
+/// A decoded footer the metadata cache could not hold, kept with the
+/// reservation of its decode estimate so the metadata stays charged to the
+/// memory budget until the last clone of the reader is dropped.
+#[derive(Debug)]
+struct UncachedFooter {
+    metadata: Arc<ParquetMetaData>,
+    _reservation: Reservation,
 }
 
 impl PinnedParquetReader {
@@ -147,6 +159,7 @@ impl PinnedParquetReader {
             services,
             accounting,
             limits,
+            uncached: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -410,18 +423,21 @@ impl PinnedParquetReader {
     /// cached, whatever it failed on: a store error or a read that came back
     /// short.
     ///
-    /// Decoding reserves its estimate from the memory budget. The reservation
-    /// is released before this returns, on every path: after the cache has
-    /// admitted the metadata, or with the refusal. The cache charges the
-    /// metadata the larger of its `memory_size` and that estimate. A footer
-    /// whose charge exceeds the cache's whole bound (`metadata_cache_bytes`)
-    /// is refused as `Corrupt`, naming that bound, and is not cached, since
-    /// the refusal depends on configuration rather than on the bytes. So
-    /// metadata this returns was admitted at a charge within that bound, and
-    /// once the reservation is gone that charge is all that accounts for it:
-    /// a caller holding the `Arc` after the cache evicts the entry keeps
+    /// Decoding reserves its estimate from the memory budget. The cache
+    /// charges the metadata the larger of its `memory_size` and that
+    /// estimate; once it admits the metadata the reservation is released,
+    /// and a caller holding the `Arc` after the cache evicts the entry keeps
     /// memory neither the budget nor the cache counts, at most that charge.
+    /// A footer whose charge exceeds the cache's whole bound
+    /// (`metadata_cache_bytes`) is read uncached: this reader keeps the
+    /// metadata and its reservation until its last clone is dropped, so the
+    /// metadata the scan holds stays charged to the budget, and a later
+    /// call on the reader returns the same metadata without reading or
+    /// reserving again.
     pub async fn metadata(&self) -> Result<Arc<ParquetMetaData>, ParquetReadError> {
+        if let Some(held) = &*self.uncached.lock().unwrap_or_else(PoisonError::into_inner) {
+            return Ok(Arc::clone(&held.metadata));
+        }
         let cache_key = MetadataKey::of(&self.cache_key(0, 0), self.file.file.footer_len);
         if let Some((footer, bytes)) = self.services.metadata.get(&cache_key) {
             let probe = self.accounting.phase(QueryPhase::Probe);
@@ -439,15 +455,18 @@ impl PinnedParquetReader {
                     Arc::clone(&decoded.metadata),
                     decoded.estimate,
                 );
-                drop(decoded.reservation);
-                match admitted {
-                    Ok(()) => Ok(decoded.metadata),
-                    Err(charge) => Err(self.corrupt(format!(
-                        "the decoded footer is charged {charge} bytes, more than the {}-byte \
-                         bound of the Parquet metadata cache (metadata_cache_bytes)",
-                        self.services.metadata.max_bytes()
-                    ))),
+                if admitted {
+                    drop(decoded.reservation);
+                    return Ok(decoded.metadata);
                 }
+                // A concurrent call on a clone may have kept its own decode
+                // first; this one's reservation is then released here.
+                let mut held = self.uncached.lock().unwrap_or_else(PoisonError::into_inner);
+                let held = held.get_or_insert_with(|| UncachedFooter {
+                    metadata: decoded.metadata,
+                    _reservation: decoded.reservation,
+                });
+                Ok(Arc::clone(&held.metadata))
             }
             Err(FooterError::Refused(message)) => {
                 self.services.metadata.insert_refused(cache_key, &message);
@@ -542,11 +561,11 @@ pub(crate) struct DecodedFooter {
 /// estimate of what the decoder allocates that the check returns is taken
 /// from `reserve` before decoding and handed back with the metadata.
 ///
-/// The reader releases the reservation once it has offered the metadata to
-/// the metadata cache, which charges it at least this estimate. It hands out
-/// only metadata the cache admitted and refuses a footer charged more than
-/// the cache's whole bound, so that bound is what bounds the metadata after
-/// the release. The Arrow schema a scan converts from the metadata each time
+/// The reader releases the reservation once the metadata cache has admitted
+/// the metadata, charging it at least this estimate, so that bound is what
+/// bounds the metadata after the release. A footer the cache cannot hold is
+/// read uncached, and the reader holds its reservation for as long as the
+/// scan holds the reader. The Arrow schema a scan converts from the metadata each time
 /// it opens the file is within the estimate but is not reserved. The
 /// snapshot holds the reservation until it has built the file's schema and
 /// dropped the metadata.
@@ -1045,43 +1064,58 @@ mod tests {
         assert_eq!(memory.reserved(), 0);
     }
 
-    /// Guards: the refusal of an `Err` from `MetadataCache::insert` in
-    /// `metadata`. A footer charged more than the cache's whole bound is
-    /// refused, naming the bound, and not cached: the next call reads the
-    /// footer again. A bound equal to the charge admits it as before.
-    #[tokio::test]
-    async fn a_footer_the_metadata_cache_cannot_hold_is_refused_and_not_cached() {
+    /// The decode estimate of the footer [`recorded_file`] writes.
+    fn recorded_footer_estimate() -> u64 {
         let bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]);
         let end = bytes.len() - TRAILER_LEN as usize;
         let footer = &bytes[end - footer_len_of(&bytes) as usize..end];
-        let estimate = check_footer_shape(footer).expect("a writer footer");
+        check_footer_shape(footer).expect("a writer footer")
+    }
+
+    /// Guards: the uncached branch of `metadata`, where the reader keeps a
+    /// footer the cache did not admit with its reservation. A footer charged
+    /// one byte more than the cache's whole bound is handed out, not cached,
+    /// and its estimate stays reserved on the budget while the reader lives;
+    /// dropping the reader releases it.
+    #[tokio::test]
+    async fn a_footer_the_metadata_cache_cannot_hold_is_read_uncached_and_stays_reserved() {
+        let estimate = recorded_footer_estimate();
         let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
         let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
-
-        let (fixture, recording, file) = recorded_file(limits.clone()).await;
+        let (fixture, recording, file) = recorded_file(limits).await;
         let fixture = fixture.with_metadata_cache_only(estimate - 1);
-        for reads in 1..=2 {
-            match fixture.reader(file.clone()).metadata().await {
-                Err(ParquetReadError::Corrupt { message, .. }) => assert_eq!(
-                    message,
-                    format!(
-                        "the decoded footer is charged {estimate} bytes, more than the {}-byte \
-                         bound of the Parquet metadata cache (metadata_cache_bytes)",
-                        estimate - 1
-                    )
-                ),
-                other => panic!("expected the refusal, got {other:?}"),
-            }
-            assert_eq!(recording.ranges().len(), reads, "the footer read again");
-            assert!(fixture.services().metadata.is_empty());
-            assert_eq!(memory.reserved(), 0);
-        }
 
+        let reader = fixture.reader(file);
+        let metadata = reader.metadata().await.expect("read uncached");
+        assert_eq!(metadata.file_metadata().num_rows(), 3);
+        assert_eq!(recording.ranges().len(), 1);
+        assert!(fixture.services().metadata.is_empty());
+        assert_eq!(memory.reserved(), estimate, "held while the reader lives");
+
+        drop(metadata);
+        assert_eq!(memory.reserved(), estimate, "the reader still holds it");
+        drop(reader);
+        assert_eq!(memory.reserved(), 0);
+    }
+
+    /// Guards: the release of the reservation once `MetadataCache::insert`
+    /// admits the footer. A bound equal to the charge caches the footer, a
+    /// second reader's call is a cache hit, and nothing stays reserved while
+    /// either reader lives.
+    #[tokio::test]
+    async fn a_footer_the_metadata_cache_holds_is_cached_and_released() {
+        let estimate = recorded_footer_estimate();
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
         let (fixture, recording, file) = recorded_file(limits).await;
         let fixture = fixture.with_metadata_cache_only(estimate);
-        for _ in 0..2 {
-            let metadata = fixture.reader(file.clone()).metadata().await.expect("fits");
+
+        let first = fixture.reader(file.clone());
+        let second = fixture.reader(file);
+        for reader in [&first, &second] {
+            let metadata = reader.metadata().await.expect("fits");
             assert_eq!(metadata.file_metadata().num_rows(), 3);
+            assert_eq!(memory.reserved(), 0);
         }
         assert_eq!(
             recording.ranges().len(),
@@ -1089,6 +1123,32 @@ mod tests {
             "the second call is a cache hit"
         );
         assert_eq!(fixture.services().metadata.resident_bytes(), estimate);
+    }
+
+    /// Guards: the check of the reader's held footer at the top of
+    /// `metadata`. A second call on the reader, or on a clone of it, returns
+    /// the footer it holds: no second read and no second reservation.
+    #[tokio::test]
+    async fn an_uncached_footer_is_read_and_reserved_once_per_reader() {
+        let estimate = recorded_footer_estimate();
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
+        let (fixture, recording, file) = recorded_file(limits).await;
+        let fixture = fixture.with_metadata_cache_only(estimate - 1);
+
+        let reader = fixture.reader(file);
+        let first = reader.metadata().await.expect("read uncached");
+        let clone = reader.clone();
+        for again in [&reader, &clone] {
+            let metadata = again.metadata().await.expect("held");
+            assert!(Arc::ptr_eq(&metadata, &first));
+            assert_eq!(memory.reserved(), estimate, "reserved once");
+        }
+        assert_eq!(recording.ranges().len(), 1, "the footer read once");
+        drop(reader);
+        assert_eq!(memory.reserved(), estimate, "the clone still holds it");
+        drop(clone);
+        assert_eq!(memory.reserved(), 0);
     }
 
     /// Guards: the `check_footer_shape` call in `decode_footer`. Without it
