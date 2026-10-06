@@ -5086,9 +5086,11 @@ name = "ravel-parquet"
 version = "0.22.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "datafusion",
  "datafusion-datasource-parquet",
+ "flatbuffers",
  "futures",
  "object_store 0.13.2",
  "parquet 58.4.0",

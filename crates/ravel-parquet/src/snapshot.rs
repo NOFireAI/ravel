@@ -26,7 +26,7 @@ use ravel_query::{GetLimiter, PhaseAccounting, QueryPhase};
 use ravel_types::accounting::AccountedOp;
 
 use crate::provider::file_schema;
-use crate::reader::{TRAILER_LEN, decode_footer, trailer_footer_len};
+use crate::reader::{DecodeError, DecodedFooter, TRAILER_LEN, decode_footer, trailer_footer_len};
 
 /// The most files one table may hold.
 pub const MAX_TABLE_FILES: usize = 100_000;
@@ -164,7 +164,10 @@ pub enum SnapshotError {
 /// Each file's footer read reserves its bytes against `memory` before the
 /// GET is issued and releases the reservation once the footer is decoded; a
 /// refusal is a typed [`SnapshotError::MemoryExhausted`] naming the file,
-/// with no GET issued for that read. Each read carries `If-Match` on the
+/// with no GET issued for that read. Decoding the footer reserves the
+/// estimate of what the decoder allocates the same way, before it decodes,
+/// and holds it until the file's schema is built and the decoded footer
+/// dropped. Each read carries `If-Match` on the
 /// ETag the listing (or the HEAD) reported, takes a `limiter` permit, and is
 /// charged to [`QueryPhase::Probe`]; the LIST pages and the HEAD are charged
 /// to [`QueryPhase::Resolve`]. The recorded ETag, version and size come from
@@ -773,13 +776,36 @@ async fn read_file(
             vec![before_reservation, concat_reservation],
         )
     };
-    let metadata = decode_footer(&footer, size - footer_and_trailer).map_err(&corrupt)?;
+    let DecodedFooter {
+        metadata,
+        reservation: decoding,
+        ..
+    } = decode_footer(&footer, size - footer_and_trailer, |bytes| {
+        memory
+            .reserve(bytes)
+            .map_err(|exhausted| SnapshotError::MemoryExhausted {
+                key: key.clone(),
+                requested: exhausted.requested,
+                reserved: exhausted.reserved,
+                limit: exhausted.limit,
+            })
+    })
+    .map_err(|err| match err {
+        DecodeError::Refused(message) => corrupt(message),
+        DecodeError::Reserve(err) => err,
+    })?;
     let row_count = u64::try_from(metadata.file_metadata().num_rows())
         .map_err(|_| corrupt("the footer records a negative row count".to_string()))?;
     // `trailer_footer_len` widens the trailer's own 4-byte field (a u32) to
     // build `footer_len`, so this cannot truncate.
     let footer_len = footer_len as u32;
     let schema = file_schema(&metadata).map_err(|message| corrupt(format!("schema: {message}")))?;
+    #[cfg(test)]
+    tests::schema_built(memory);
+    // The decode estimate covers the metadata and the conversions that built
+    // the schema from it; it is released only once they are gone.
+    drop(metadata);
+    drop(decoding);
     let file = ParquetFile {
         profile: grant.profile.clone(),
         bucket: grant.bucket.clone(),
@@ -818,6 +844,63 @@ mod tests {
     };
 
     const DEADLINE: Duration = Duration::from_secs(60);
+
+    type SchemaHook = Box<dyn Fn(&Arc<MemoryBudget>)>;
+
+    thread_local! {
+        /// Run by `read_file` on this thread once a file's schema is built
+        /// and before the decoded footer is dropped, with the budget the
+        /// file's reads and decode were reserved from.
+        static SCHEMA_BUILT: std::cell::RefCell<Option<SchemaHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn schema_built(memory: &Arc<MemoryBudget>) {
+        SCHEMA_BUILT.with_borrow(|hook| {
+            if let Some(hook) = hook {
+                hook(memory);
+            }
+        });
+    }
+
+    /// Guards: the decode reservation `read_file` holds past `file_schema`.
+    /// With a budget of exactly the footer read and the decode estimate, the
+    /// budget is still full once the schema is built from the decoded
+    /// footer, and a further byte is refused there.
+    #[tokio::test]
+    async fn the_decode_reservation_is_held_while_the_schema_is_built() {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        let bytes = parquet_bytes(&[1], &["x"]);
+        let estimate = decode_estimate(&bytes);
+        put(store.inner(), "data/a.parquet", bytes).await;
+        let limiter = GetLimiter::new(1).expect("permits");
+        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH + estimate));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        SCHEMA_BUILT.set(Some(Box::new(move |memory| {
+            let one_more = memory.reserve(1).is_ok();
+            record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((memory.reserved(), one_more));
+        })));
+        let got = snapshot_location(
+            &store,
+            &location("s3://lake/data/"),
+            &limiter,
+            &memory,
+            DEADLINE,
+            &PhaseAccounting::new(),
+        )
+        .await;
+        SCHEMA_BUILT.set(None);
+        assert_eq!(got.expect("snapshot").files.len(), 1);
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            [(FOOTER_PREFETCH + estimate, false)]
+        );
+        assert_eq!(memory.reserved(), 0);
+    }
 
     fn grant(prefix: &str) -> Grant {
         Grant {
@@ -2073,6 +2156,69 @@ mod tests {
         }
     }
 
+    /// Guards: the `reserve` call in `decode_footer`, at the snapshot's
+    /// decode site. A budget one byte short of the footer read and the
+    /// decode estimate together refuses the file as memory exhausted, asking
+    /// for the estimate; a budget holding both snapshots it.
+    #[tokio::test]
+    async fn decoding_a_footer_reserves_its_estimate() {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        let bytes = parquet_bytes(&[1], &["x"]);
+        let estimate = decode_estimate(&bytes);
+        put(store.inner(), "data/a.parquet", bytes).await;
+        let limiter = GetLimiter::new(1).expect("permits");
+        let snapshot_within = |budget: u64| {
+            let memory = Arc::new(MemoryBudget::new(budget));
+            let (store, limiter) = (&store, &limiter);
+            async move {
+                snapshot_location(
+                    store,
+                    &location("s3://lake/data/"),
+                    limiter,
+                    &memory,
+                    DEADLINE,
+                    &PhaseAccounting::new(),
+                )
+                .await
+            }
+        };
+        match snapshot_within(FOOTER_PREFETCH + estimate - 1).await {
+            Err(SnapshotError::MemoryExhausted {
+                key,
+                requested,
+                reserved,
+                ..
+            }) => {
+                assert_eq!(key, "data/a.parquet");
+                assert_eq!(requested, estimate);
+                assert_eq!(reserved, FOOTER_PREFETCH);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+        let got = snapshot_within(FOOTER_PREFETCH + estimate)
+            .await
+            .expect("snapshot");
+        assert_eq!(got.files.len(), 1);
+    }
+
+    /// Guards: the length check in `trailer_footer_len`, which refuses the
+    /// footer from the trailer the first read returns, before the footer
+    /// is read.
+    #[tokio::test]
+    async fn a_trailer_recording_more_than_the_limit_is_corrupt() {
+        let store = MemoryStore::new();
+        let mut bytes = b"PAR1".to_vec();
+        let recorded = u32::try_from(crate::reader::MAX_FOOTER_BYTES + 1).expect("u32");
+        bytes.extend_from_slice(&recorded.to_le_bytes());
+        bytes.extend_from_slice(b"PAR1");
+        put(&store, "data/one.parquet", Bytes::from(bytes)).await;
+        assert_corrupt(
+            snapshot(&store, "s3://lake/data/").await,
+            "data/one.parquet",
+            "the footer is 67108865 bytes, longer than the 67108864-byte limit",
+        );
+    }
+
     /// The long footer's second GET has already read this object once, at
     /// the tail read above; a `NotFound` there means the object changed
     /// since, not that it was never there. Mutation that fails it: reporting
@@ -2400,11 +2546,18 @@ mod tests {
         );
     }
 
-    /// A budget sized for exactly one footer read at a time snapshots
-    /// several files when a one-permit limiter serializes the reads.
-    /// Mutation that fails it: never releasing the reservation (the second
-    /// file's reserve then finds the first file's bytes still held and
-    /// refuses).
+    /// What decoding the footer of the whole file `bytes` reserves.
+    fn decode_estimate(bytes: &[u8]) -> u64 {
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let footer = &bytes[end - footer_len_of(bytes) as usize..end];
+        crate::footer_shape::check_footer_shape(footer).expect("a writer footer")
+    }
+
+    /// A budget sized for exactly one footer read and decode at a time
+    /// snapshots several files when a one-permit limiter serializes the
+    /// reads. Mutation that fails it: never releasing the reservation (the
+    /// second file's reserve then finds the first file's bytes still held
+    /// and refuses).
     #[tokio::test]
     async fn a_budget_that_fits_one_footer_snapshots_several_files_when_reads_are_serialized() {
         let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
@@ -2413,7 +2566,7 @@ mod tests {
             put(store.inner(), key, bytes.clone()).await;
         }
         let limiter = GetLimiter::new(1).expect("permits");
-        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH));
+        let memory = Arc::new(MemoryBudget::new(FOOTER_PREFETCH + decode_estimate(&bytes)));
         let got = snapshot_location(
             &store,
             &location("s3://lake/data/"),

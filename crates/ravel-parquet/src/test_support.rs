@@ -258,6 +258,15 @@ impl Fixture {
         self
     }
 
+    /// This fixture's readers share a metadata cache bounded at `max_bytes`
+    /// and no byte cache, so every footer they do not find in the metadata
+    /// cache is read from the store.
+    pub(crate) fn with_metadata_cache_only(mut self, max_bytes: u64) -> Self {
+        self.services.cache = None;
+        self.services.metadata = Arc::new(MetadataCache::new(max_bytes));
+        self
+    }
+
     /// Write `bytes` at `key` and describe it as a manifest would. With
     /// `record_version` false the manifest pins the ETag alone.
     pub(crate) async fn put_file(
@@ -446,9 +455,10 @@ impl Fixture {
         total
     }
 
-    /// [`ParquetMetaData::memory_size`] of `file`'s footer, without its page
-    /// index, decoded from the stored bytes: the size its metadata cache entry
-    /// is charged.
+    /// The size `file`'s metadata cache entry is charged: the larger of the
+    /// [`ParquetMetaData::memory_size`] of its footer, without its page
+    /// index, decoded from the stored bytes, and the footer's decode
+    /// estimate.
     ///
     /// [`ParquetMetaData::memory_size`]: parquet::file::metadata::ParquetMetaData::memory_size
     pub(crate) async fn decoded_footer_bytes(&self, file: &ParquetFile) -> u64 {
@@ -460,9 +470,13 @@ impl Fixture {
             .expect("get")
             .data;
         let end = bytes.len() - 8;
-        ParquetMetaDataReader::decode_metadata(&bytes[end - file.footer_len as usize..end])
+        let footer = &bytes[end - file.footer_len as usize..end];
+        let decoded = ParquetMetaDataReader::decode_metadata(footer)
             .expect("footer")
-            .memory_size() as u64
+            .memory_size() as u64;
+        let estimate =
+            crate::footer_shape::check_footer_shape(footer).expect("a footer the walk passes");
+        decoded.max(estimate)
     }
 
     pub(crate) fn session(&self, tables: &[(&str, Arc<ParquetTableProvider>)]) -> SessionContext {

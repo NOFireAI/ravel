@@ -25,7 +25,8 @@ pub enum ParquetReadError {
         source: Arc<StoreError>,
     },
     /// The bytes or the requested range disagree with what the manifest
-    /// recorded about the file.
+    /// recorded about the file, or the file's decoded footer is charged more
+    /// than the whole bound of the metadata cache.
     #[error("Parquet file {key}: {message}")]
     Corrupt { key: String, message: String },
     #[error("reading Parquet file {key}: the concurrent read it waited on was lost")]

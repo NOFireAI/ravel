@@ -31,7 +31,9 @@
 //! them whose registry is a [`SingleStoreRegistry`].
 
 mod boundary;
+mod embedded_schema;
 mod error;
+mod footer_shape;
 mod limits;
 mod metadata_cache;
 mod provider;
