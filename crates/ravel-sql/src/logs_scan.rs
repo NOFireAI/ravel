@@ -298,6 +298,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion::common::ColumnStatistics;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -1466,8 +1467,12 @@ impl BlockMetrics {
     /// whole-segment fast path (#693 part 3) there is no plan phase, but each
     /// segment has exactly one owning partition, so its owner records these
     /// totals once at exhaustion straight from the scan's own stats -- still
-    /// exactly once per segment. Either way the per-partition decode counts come
-    /// from [`Self::record_scan`].
+    /// exactly once per segment. A pushed `fetch` that stops the owner
+    /// mid-segment records them at that stop instead; they are final from the
+    /// open, so the figure is the whole segment's. A fast-path segment the
+    /// owner never opened, because `fetch` was already met, records none.
+    /// Either way the per-partition decode counts come from
+    /// [`Self::record_scan`].
     fn record_segment_totals(&self, stats: &ScanStats) {
         self.total.add(stats.blocks_total as usize);
         self.pruned_by_postings.add(
@@ -1482,7 +1487,9 @@ impl BlockMetrics {
     /// [`Self::record_segment_totals`], because each partition decodes only its
     /// own striped subset of a segment's blocks. Summed across every partition
     /// this equals what a single whole-segment scan would have reported for
-    /// `blocks_scanned`/`pages_*`.
+    /// `blocks_scanned`/`pages_*`. A partition that a pushed `fetch` stops
+    /// mid-segment records what its scan decoded up to the stop, so the sum is
+    /// then the decode work actually done, not the whole segment's.
     fn record_scan(&self, stats: &ScanStats) {
         self.scanned.add(stats.blocks_scanned as usize);
         self.pages_decoded.add(stats.pages_decoded as usize);
@@ -1872,6 +1879,37 @@ impl LogsScanExec {
                 .segments
                 .iter()
                 .all(|seg| self.ts_min <= seg.min_event_ts_ns && seg.max_event_ts_ns <= self.ts_max)
+    }
+
+    /// Narrow whole-plan statistics computed under [`Self::stats_are_exact`]
+    /// to what a scan carrying a pushed `fetch` emits: each partition stops at
+    /// `min(fetch, rows it owns)`, so over `n` partitions and `total` committed
+    /// rows the scan emits between `min(fetch, total)` and
+    /// `min(fetch * n, total)`. `num_rows` becomes `min(fetch, total)`, `Exact`
+    /// when the two bounds meet (one partition, `fetch == 0`, or `total <=
+    /// fetch`) and `Inexact` otherwise.
+    ///
+    /// Unless every committed row is emitted (`total <= fetch`), the scan emits
+    /// a subset whose min/max/NULL count the catalog figures only bound, so
+    /// every column statistic drops to `Inexact` too. An unknown total proves
+    /// nothing either way and is treated the same.
+    fn apply_fetch_to_statistics(&self, stats: &mut Statistics, fetch: usize) {
+        if let Precision::Exact(total) = stats.num_rows {
+            if total <= fetch {
+                return;
+            }
+            let partitions = self.properties().partitioning.partition_count();
+            let upper = fetch.saturating_mul(partitions).min(total);
+            stats.num_rows = if upper == fetch {
+                Precision::Exact(fetch)
+            } else {
+                Precision::Inexact(fetch)
+            };
+        }
+        stats.column_statistics = std::mem::take(&mut stats.column_statistics)
+            .into_iter()
+            .map(ColumnStatistics::to_inexact)
+            .collect();
     }
 
     /// Exact MIN/MAX (plus the exact NULL count, where a carrier proves one)
@@ -2638,6 +2676,9 @@ impl ExecutionPlan for LogsScanExec {
     /// column that is neither `ts` nor a resolved declared column stays
     /// `Absent`, as does a declared column any touched segment leaves
     /// uncovered. `total_byte_size` stays `Absent`.
+    ///
+    /// A pushed `fetch` narrows all of this to what the scan emits under it,
+    /// as [`Self::apply_fetch_to_statistics`] describes.
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         // Validate the partition index exactly as the trait default does, so an
         // out-of-range request is an internal error, never a silent answer.
@@ -2719,6 +2760,10 @@ impl ExecutionPlan for LogsScanExec {
                         col.null_count = Precision::Exact(nulls);
                     }
                 }
+            }
+
+            if let Some(fetch) = self.fetch {
+                self.apply_fetch_to_statistics(&mut stats, fetch);
             }
         }
         Ok(Arc::new(stats))
@@ -4556,8 +4601,29 @@ impl LogScanStream {
 
     /// This partition has emitted its pushed `fetch` rows: stop, mid-segment
     /// if need be, and release everything the scan still holds.
+    ///
+    /// A scan still open is dropped here instead of running to its
+    /// end-of-segment record, so its counters are published first: the decode
+    /// counts as they stand (`record_scan` accumulates), and on the
+    /// whole-segment fast path the segment's prune totals, which are final from
+    /// the open and so are the whole segment's, not a partial count.
     fn finish_at_fetch(&mut self) {
-        self.state = LogScanState::Done;
+        match std::mem::replace(&mut self.state, LogScanState::Done) {
+            LogScanState::Columnar(scan)
+            | LogScanState::Rows(scan)
+            | LogScanState::RowFallbackBlock { scan, .. } => {
+                let stats = scan.stats();
+                self.blocks.record_scan(&stats);
+                if self.fast_whole_segment {
+                    self.blocks.record_segment_totals(&stats);
+                }
+            }
+            LogScanState::Planning(_)
+            | LogScanState::NextSegment
+            | LogScanState::Opening(_)
+            | LogScanState::ReopenRows { .. }
+            | LogScanState::Done => {}
+        }
         self.current_dirs = None;
         self.work.clear();
         self.prefetch_pool.clear(self.partition);
