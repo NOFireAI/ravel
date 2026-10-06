@@ -455,7 +455,7 @@ and #2350:
 | The Parquet table provider (`crates/ravel-sql/src/parquet.rs`, built from `services/ravel-server/src/query.rs`) resolves a table through `crates/ravel-pqtable/src/resolve.rs`: `newest` (through `versions`) lists `t/<tenant_hash>/pq/t/<table>/v/`, `read_version` GETs the manifest, and `grants::list` GETs `t/<tenant_hash>/pq/grants` | `query`, `all` | `s3:ListBucket`, `s3:GetObject` | `QueryList` `s3:prefix` `t/*/pq/t/*`; `QueryRead` `t/*/pq/t/*` and `t/*/pq/grants` |
 | HTTP Parquet DDL: `POST /api/v1/sql` runs `CREATE [OR REPLACE] EXTERNAL TABLE` and `DROP TABLE` through `execute_ddl` (`crates/ravel-sql/src/ddl.rs`). `resolve::newest` lists `t/<tenant_hash>/pq/t/<table>/v/` and GETs the newest manifest; `CREATE` also GETs `t/<tenant_hash>/pq/grants` and runs `probe_not_ravel_bucket`, which PUTs `sys/pq-probe/<random>` (`Overwrite`) and DELETEs it; `writer::apply` (`crates/ravel-pqtable/src/writer.rs`) PUTs `t/<tenant_hash>/pq/t/<table>/v/<version>.pqm` with `CreateIfAbsent`, its only put, for both `CREATE` and `DROP` | `query`, `all` | `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `QueryManifestCreate` `t/????????????????????????????????/pq/t/*/v/????????????????????.pqm`, conditioned on `StringEquals` `s3:if-none-match` `*`; `QueryWrite` and `QueryProbeDelete` `sys/pq-probe/*`; the list and reads are the Parquet table provider's row above |
 | `ravel-cli parquet sweep` (`crates/ravel-pqtable/src/sweep.rs`): `plan` lists `t/<tenant_hash>/pq/t/`, the CLI wrapper reads `sys/gc` for the deployment's grace floor, and `execute` deletes each superseded manifest | Maintain credential | `s3:ListBucket`, `s3:GetObject`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*`; `sys/gc` is already in `MaintainRead` |
-| `ravel-cli parquet repair` (`crates/ravel-pqtable/src/repair.rs`): lists one table's `t/<tenant_hash>/pq/t/<table>/v/` keys, and with `--delete` or `--delete-version` deletes the flagged or the named manifest key; it never reads a manifest, since Maintain cannot | Maintain credential | `s3:ListBucket`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*` |
+| `ravel-cli parquet repair` (`crates/ravel-pqtable/src/repair.rs`): lists one table's `t/<tenant_hash>/pq/t/<table>/v/` keys, or with `--stray` the tenant's `t/<tenant_hash>/pq/t/` keys under no valid table name, and with `--delete` or `--delete-version` deletes the flagged, stray or named manifest key, then with `--stray` lists again; it never reads a manifest, since Maintain cannot | Maintain credential | `s3:ListBucket`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*` |
 | The admission reconcile's `reap_keys` (`crates/ravel-ingest/src/reconcile.rs`) deletes the snapshots `t/<tenant_hash>/<signal>/admission/<process_id>.snapshot` of processes past the reap horizon | `gateway`, `all` | `s3:DeleteObject` | `GatewayAdmissionDelete` `t/????????????????????????????????/?/admission/*` |
 
 The last row lists only prefixes; nothing below `t/*/a/` but the memo is a
@@ -538,9 +538,10 @@ Maintain credential instead, because `maintain.json` grants everything they
 issue and `admin.json` does not:
 
 - `parquet sweep` deletes superseded Parquet table manifests.
-- `parquet repair` lists a table's manifest keys and, with `--delete` or
-  `--delete-version`, deletes forged ones (see "Parquet table DDL" above for
-  when).
+- `parquet repair` lists a table's manifest keys, or with `--stray` the
+  tenant's keys under no valid table name, and with `--delete` or
+  `--delete-version` deletes forged or stray ones (see "Parquet table DDL"
+  above for when).
 - `maintain compact-bucket` and `maintain compact-tenant` take claims under
   `sys/maintain/claims/compaction/` and write L1 segments and compaction
   records.
@@ -633,13 +634,23 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
   slot names no version (the wrong length, an extra path segment, too large
   for a `u64`, zero, or not all digits) is skipped, counted and warned about
   by every listing, as a version above the bound is, and
-  `ravel-cli parquet repair --delete` removes it. A key whose segment between
-  `pq/t/` and `/v/` is not a single valid table name, such as the `a/b` one,
-  is still refused as foreign: it makes the tenant's `parquet ls` and
-  manifest sweep fail with a foreign-key error, though no table's resolve,
-  until the Maintain credential deletes it; validating that segment is issue
-  #2510. That is the same class of harm as the maximal-version wedge below,
-  confined to the manifest keyspace.
+  `ravel-cli parquet repair --delete` removes it. A `.pqm` key whose segment
+  between `pq/t/` and `/v/` is not a single valid table name, such as the
+  `a/b` one, is skipped by the tenant-wide listings (`parquet ls`, the
+  manifest sweep), counted per tenant and warned about once, and
+  `ravel-cli parquet repair --tenant <tenant> --stray --delete` removes it.
+  On S3 a key of either kind holding a control character, an empty segment or
+  a `.` or `..` segment cannot be listed at all, and fails the listing that
+  reaches it. A key whose characters the S3 adapter encodes cannot be
+  deleted through Ravel: `--stray --delete` skips it and `--table --delete`
+  refuses to delete anything while one is flagged. It is listed only when no
+  such key sits at a list page boundary: the adapter encodes the page's
+  continuation too, so the next page either repeats keys, failing the
+  listing, or skips the keys after it, and the listing `--stray --delete`
+  runs after deleting then names every key still there only under the same
+  condition. The Maintain credential deletes either by its exact key through
+  an S3 tool. That is the same class of harm as the
+  maximal-version wedge below, confined to the manifest keyspace.
 
   Creating a new version is not harmless: the newest version is the table
   for every reader. A compromised Query credential can define, redefine or

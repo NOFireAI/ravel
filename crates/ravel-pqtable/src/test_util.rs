@@ -1,11 +1,14 @@
-//! Shared test fixtures: tenants, manifests, and a store wrapper that records
-//! which writes landed and which prefixes were listed.
+//! Shared test fixtures: tenants, manifests, a store wrapper that records
+//! which writes landed and which prefixes were listed, and wrappers that
+//! handle prefixes and keys the way the S3 adapter does.
 #![allow(clippy::expect_used)]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use ravel_object_store::instrument::InstrumentedStore;
+use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, Pin, PinnedRead, PutMode, PutOptions, PutOutcome, StoreError,
@@ -286,6 +289,160 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingStore<S> {
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Lists the way the S3 adapter does: `object_store` appends the path
+/// delimiter to every non-empty list prefix, so a prefix that ends mid
+/// segment, such as a whole key, matches nothing.
+pub struct SegmentAlignedStore {
+    pub inner: InstrumentedStore<MemoryStore>,
+    /// Every key passed to `delete`, in call order.
+    deletes: Mutex<Vec<String>>,
+}
+
+impl SegmentAlignedStore {
+    pub fn new(inner: MemoryStore) -> Self {
+        SegmentAlignedStore {
+            inner: InstrumentedStore::new(inner),
+            deletes: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn deletes(&self) -> Vec<String> {
+        self.deletes.lock().expect("lock").clone()
+    }
+}
+
+fn segment_aligned(prefix: &str) -> String {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for SegmentAlignedStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(&segment_aligned(prefix), page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(&segment_aligned(prefix)).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.deletes.lock().expect("lock").push(key.to_string());
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Handles keys the way the S3 adapter's `object_store` client does. A list
+/// page holding a key `Path::parse` refuses (a control character, an empty
+/// segment, a `.` or `..` segment) fails with the error the adapter maps that
+/// to, as `object_store` fails to parse the whole ListObjectsV2 response. A
+/// request for one key goes to `Path::from` of it, as the adapter's
+/// `path_of` sends it, which percent-encodes some characters and drops empty
+/// segments. Prefixes and page tokens pass through.
+pub struct S3KeyStore<S> {
+    pub inner: S,
+}
+
+/// What the S3 adapter's `map_error_common` makes of a listed key
+/// `object_store` cannot parse.
+fn parse_listed(key: &str) -> Result<(), StoreError> {
+    object_store::path::Path::parse(key)
+        .map(drop)
+        .map_err(|source| StoreError::Permanent(format!("invalid path: {source}")))
+}
+
+fn s3_path(key: &str) -> String {
+    object_store::path::Path::from(key).to_string()
+}
+
+#[async_trait::async_trait]
+impl<S: ObjectStoreBackend> ObjectStoreBackend for S3KeyStore<S> {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(&s3_path(key), data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(&s3_path(key), range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(&s3_path(key)).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(&s3_path(key)).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        let page = self.inner.list(prefix, page).await?;
+        for meta in &page.objects {
+            parse_listed(&meta.key)?;
+        }
+        Ok(page)
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        let listed = self.inner.list_delimited(prefix).await?;
+        for key in listed
+            .objects
+            .iter()
+            .map(|meta| meta.key.as_str())
+            .chain(listed.common_prefixes.iter().map(String::as_str))
+        {
+            parse_listed(key)?;
+        }
+        Ok(listed)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(&s3_path(key)).await
     }
 
     fn capabilities(&self) -> Capabilities {

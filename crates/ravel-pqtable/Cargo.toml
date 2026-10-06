@@ -10,6 +10,7 @@ description = "Parquet table manifests, key layout and object-storage operations
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
+object_store = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
@@ -21,7 +22,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 blake3 = { workspace = true }
-object_store = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
