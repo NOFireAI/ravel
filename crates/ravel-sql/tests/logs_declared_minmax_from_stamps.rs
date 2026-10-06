@@ -19,10 +19,13 @@
 //! can have run.
 //!
 //! Every negative test pins the #849 safety lemma extended to the new carrier:
-//! whenever exactness cannot be proven for a column (one segment unstamped, a
-//! stamp of an ineligible type, a duplicated stamp name, or the two carriers
-//! disagreeing) the column's statistics stay `Precision::Absent`, the rule
-//! does not fire, and the query scans to the correct answer.
+//! whenever exactness cannot be proven for a column (one segment unstamped,
+//! whether or not a `.cstat` entry covers it, a stamp of an ineligible type, or
+//! a duplicated stamp name) the column's statistics stay `Precision::Absent`,
+//! the rule does not fire, and the query scans to the correct answer. A
+//! `.cstat` entry tallies record-level cells only, while SQL returns the merged
+//! value (a row with no record-level value takes its resource or scope value),
+//! so the entry never answers on its own and never overrides a stamp.
 //!
 //! The objects here are real RLOG objects and every stamp is derived from the
 //! same rows the object was written from, so a rewrite that answers a
@@ -884,19 +887,19 @@ async fn duplicate_stamp_names_grant_no_coverage_on_any_read_route() {
 }
 
 // ---------------------------------------------------------------------------
-// The union of the two carriers (ADR-0873 decision 4).
+// The stamp and the `.cstat` entry side by side.
 // ---------------------------------------------------------------------------
 
 /// A snapshot split between carriers -- one segment stamped only, the other
-/// covered only by `.cstat` -- is still fully covered: that split is the
-/// normal state of every tenant after this ADR ships (a live tail with stamps
-/// above a pre-stamp sealed history), so a reader consulting one carrier alone
-/// would answer nothing.
+/// covered only by `.cstat` -- leaves the column `Absent` and the statement
+/// scans: the `.cstat` entry describes record-level cells, not the merged value
+/// SQL returns, so it does not stand in for the missing stamp.
 ///
-/// Prove-the-test: drop the `.cstat` half of the union (`(None, Some(only))`
-/// arm) and this plan regains its `LogsScanExec`.
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp and the plan loses its
+/// `LogsScanExec`, answering from the entry with zero GETs.
 #[tokio::test]
-async fn one_carrier_each_still_covers_the_whole_snapshot() {
+async fn a_cstat_only_segment_declines_the_column() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let a = write_segment(&store, "logs/a.rlog", 1, SEG_A_ROWS).await;
     let b = write_segment(&store, "logs/b.rlog", 2, SEG_B_ROWS).await;
@@ -909,32 +912,25 @@ async fn one_carrier_each_still_covers_the_whole_snapshot() {
         b.clone(),
     ]);
 
-    let out = min_max_over_store(&store, snapshot.clone(), Some(Arc::clone(&stats))).await;
+    let col_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
+    let col = declared_col_stats(&col_stats);
+    assert_eq!(col.min_value, Precision::Absent);
+    assert_eq!(col.null_count, Precision::Absent);
+
+    let out = min_max_over_store(&store, snapshot, Some(stats)).await;
     assert!(
-        !out.plan.contains("LogsScanExec"),
-        "stamp for A plus .cstat for B covers everything; plan was:\n{}",
+        out.plan.contains("LogsScanExec"),
+        "segment B has no stamp, so the statement scans; plan was:\n{}",
         out.plan
     );
     assert_eq!(out.answer, true_answer());
-    assert_eq!(out.gets, 0);
-
-    // The NULL count, by contrast, stays `Absent`: segment B's figure comes
-    // from a `.cstat` entry, which is reconciled against the joined
-    // `sample_count` before any grant but whose NULL count is deliberately
-    // not promoted to proven. The extrema are exact regardless.
-    let col_stats = scan_stats(snapshot, Some(stats));
-    let col = declared_col_stats(&col_stats);
-    assert_eq!(
-        col.min_value,
-        Precision::Exact(ScalarValue::Int64(Some(17_100)))
-    );
-    assert_eq!(col.null_count, Precision::Absent);
+    assert_eq!(out.objects_touched, 2, "both segments opened, once each");
 }
 
-/// Both carriers covering one segment and agreeing: the answer is that value,
-/// counted once. A union that summed the two `null_count`s would report 2 for
-/// segment A's single NULL row, which is what the NULL-count assertion here
-/// fails on.
+/// Both carriers covering one segment and agreeing: the answer is the stamp's
+/// value, its NULL count counted once. A reader that summed the two
+/// `null_count`s would report 2 for segment A's single NULL row, which is what
+/// the NULL-count assertion here fails on.
 #[tokio::test]
 async fn both_carriers_agreeing_answer_once() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -968,17 +964,15 @@ async fn both_carriers_agreeing_answer_once() {
     assert_eq!(out.gets, 0);
 }
 
-/// Both carriers covering one segment and disagreeing: the column is `Absent`
-/// for the whole query and the statement scans. One conflicted segment poisons
-/// the column exactly as one uncovered segment does -- the segment is
-/// immutable and both carriers claim exactness, so a disagreement means one of
-/// them is wrong and no answer is safe.
+/// Both carriers covering one segment and differing: the stamp answers and the
+/// `.cstat` entry is ignored. The entry tallies record-level cells only, so it
+/// differs from the stamp wherever a row takes its value from the resource or
+/// scope, and that difference says nothing about either carrier being wrong.
 ///
-/// Prove-the-test: replace the `agrees_with` check in `declared_min_max_all`
-/// with `true` and the plan loses its `LogsScanExec` while the answer becomes
-/// whichever carrier the union happens to keep.
+/// Prove-the-test: decline the column when the stamp and the entry differ in
+/// `segment_declared_coverage` and the plan regains its `LogsScanExec`.
 #[tokio::test]
-async fn carriers_disagreeing_about_one_segment_decline() {
+async fn a_differing_cstat_entry_leaves_the_stamp_answering() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let a = write_segment(&store, "logs/a.rlog", 1, SEG_A_ROWS).await;
     let a_stamped = stamped(&a, vec![encode_stamp(&stamp_for(SEG_A_ROWS))]);
@@ -990,19 +984,23 @@ async fn carriers_disagreeing_about_one_segment_decline() {
     let snapshot = snapshot_of(vec![a_stamped]);
 
     let col_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
-    assert_eq!(declared_col_stats(&col_stats).min_value, Precision::Absent);
+    assert_eq!(
+        declared_col_stats(&col_stats).min_value,
+        Precision::Exact(ScalarValue::Int64(Some(18_500)))
+    );
 
     let out = min_max_over_store(&store, snapshot, Some(stats)).await;
     assert!(
-        out.plan.contains("LogsScanExec"),
-        "conflicting carriers must fail closed to a scan; plan was:\n{}",
+        !out.plan.contains("LogsScanExec"),
+        "the stamp answers at plan time; plan was:\n{}",
         out.plan
     );
     assert_eq!(
         out.answer,
         (Some(18_500), Some(19_000)),
-        "the scan answers segment A's real extrema, not the fabricated -1"
+        "the stamp's extrema, not the entry's -1"
     );
+    assert_eq!(out.gets, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,16 +1014,14 @@ async fn carriers_disagreeing_about_one_segment_decline() {
 /// equal to `sample_count - null_count` with the NULL count taken ONCE.
 ///
 /// Both segments here are covered by BOTH carriers, in agreement, which is what
-/// makes the exact value the assertion: a union that summed the carriers'
+/// makes the exact value the assertion: a reader that summed the carriers'
 /// `null_count`s instead of taking one would answer 3, and one that dropped the
 /// NULL count entirely would leave the column `Absent` and scan. The corpus has
 /// 5 rows and exactly one NULL, so the only correct answer is 4.
 ///
 /// Prove-the-test: in `LogsScanExec::declared_min_max_all`
-/// (crates/ravel-sql/src/logs_scan.rs) replace the union's
-/// `null_count_proven: stamp.null_count_proven || cstat.null_count_proven,
-/// ..stamp` arm with an arm that sums (`null_count: stamp.null_count +
-/// cstat.null_count`) and this reads 3; delete the `col.null_count =
+/// (crates/ravel-sql/src/logs_scan.rs) add each segment's `coverage.null_count`
+/// twice and this reads 3; delete the `col.null_count =
 /// Precision::Exact(nulls)` assignment in `partition_statistics` and the plan
 /// keeps its `LogsScanExec` with 2 GETs while the count still answers 4.
 #[tokio::test]
@@ -1316,7 +1312,9 @@ async fn the_stamped_bool_answer_equals_the_scanned_answer() {
 // `non_null_count + null_count` does not reach the joined segment's row count.
 // The plan-time half of these cases, asserted as a drop-metric delta, is in
 // declared_stat_cstat_drops.rs; here the assertion is the number the statement
-// returns, so an entry wrongly accepted shows up as a wrong answer.
+// returns. A `.cstat` entry no longer answers MIN/MAX on its own, reconciled
+// or not, so these pin the answer rather than the reconciliation; the
+// reconciliation itself is pinned in logs_scan's `cstat_reconcile_tests`.
 // ---------------------------------------------------------------------------
 
 /// The stale-claim segment: it holds both the corpus minimum and the corpus
@@ -1357,11 +1355,13 @@ fn cstat_counts(
 /// row carries: the answer is the assertion that the scan, not the entry,
 /// produced it.
 ///
-/// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
-/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). The
-/// plan then loses its `LogsScanExec`, the statement answers
-/// `(Some(-1), Some(42))` from the entry with zero GETs, and the column
-/// statistics read `Precision::Exact(Int64(-1))`.
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp, and delete the
+/// `accounted != Some(seg.sample_count)` refusal block in
+/// `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). The plan then
+/// loses its `LogsScanExec`, the statement answers `(Some(-1), Some(42))` from
+/// the entry with zero GETs, and the column statistics read
+/// `Precision::Exact(Int64(-1))`.
 #[tokio::test]
 async fn an_unreconciled_cstat_entry_lends_no_exact_extremum() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -1397,16 +1397,15 @@ async fn an_unreconciled_cstat_entry_lends_no_exact_extremum() {
     assert_eq!(out.objects_touched, 1, "the one segment, opened once");
 }
 
-/// The reconciled half of the same segment, which is what keeps the refusal
-/// above from being satisfied by a reader that refuses every entry: `2 + 1 == 3
-/// == sample_count`, so the entry answers at plan time with no `LogsScanExec`
-/// and zero GETs.
+/// The reconciled half of the same segment: `2 + 1 == 3 == sample_count`, and
+/// the entry still lends nothing, because without a stamp nothing shows that
+/// its record-level cells are the values SQL returns.
 ///
-/// Prove-the-test: change the refusal in `reconciled_column_stat` to
-/// `accounted != Some(seg.sample_count + 1)` and this plan regains its
-/// `LogsScanExec` and its GETs while the test above still passes.
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp and the plan loses its
+/// `LogsScanExec`, answering from the entry with zero GETs.
 #[tokio::test]
-async fn a_reconciled_cstat_entry_still_answers_from_statistics() {
+async fn a_reconciled_cstat_entry_alone_lends_no_exact_extremum() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let a = write_segment(&store, "logs/reconciled.rlog", 1, SEG_A_ROWS).await;
     let stats = loaded_stats(vec![(
@@ -1417,25 +1416,17 @@ async fn a_reconciled_cstat_entry_still_answers_from_statistics() {
 
     let plan_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
     let col = declared_col_stats(&plan_stats);
-    assert_eq!(
-        col.min_value,
-        Precision::Exact(ScalarValue::Int64(Some(18_500))),
-        "a reconciled entry still lends an exact MIN"
-    );
-    assert_eq!(
-        col.max_value,
-        Precision::Exact(ScalarValue::Int64(Some(19_000)))
-    );
+    assert_eq!(col.min_value, Precision::Absent);
+    assert_eq!(col.max_value, Precision::Absent);
 
     let out = min_max_over_store(&store, snapshot, Some(stats)).await;
     assert!(
-        !out.plan.contains("LogsScanExec"),
-        "a reconciled entry answers at plan time; plan was:\n{}",
+        out.plan.contains("LogsScanExec"),
+        "an entry with no stamp beside it does not answer; plan was:\n{}",
         out.plan
     );
     assert_eq!(out.answer, (Some(18_500), Some(19_000)));
-    assert_eq!(out.gets, 0, "no data object may be read");
-    assert_eq!(out.objects_touched, 0);
+    assert_eq!(out.objects_touched, 1, "the one segment, opened once");
 }
 
 /// The stale all-NULL claim: an entry with zero non-null rows and both extrema
@@ -1446,8 +1437,8 @@ async fn a_reconciled_cstat_entry_still_answers_from_statistics() {
 /// maximum both live in that segment, so the answer would collapse to the
 /// companion segment's narrower range with no scan and no error.
 ///
-/// Prove-the-test: delete the same `accounted != Some(seg.sample_count)` block
-/// in `reconciled_column_stat`. The stale entry is then accepted as an exact
+/// Prove-the-test: make the same two changes as for the test above. The stale
+/// entry is then accepted as an exact
 /// all-NULL coverage statement, the plan loses its `LogsScanExec`, and the
 /// statement answers `(Some(9_100), Some(9_200))` instead of the true
 /// `(Some(9_000), Some(9_500))`.
