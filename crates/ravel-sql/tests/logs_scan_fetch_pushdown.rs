@@ -26,6 +26,12 @@
 //! - `fetch_stops_opening_segments_once_the_partition_limit_is_met` (GET-count
 //!   regression): a partition made to own two whole segments opens only the
 //!   first once the pushed per-partition fetch is satisfied by it.
+//! - `fetch_stopped_segment_publishes_its_scan_metrics` (issue #2616): a
+//!   segment the fetch stops partway through still publishes the blocks and
+//!   pages its scan decoded, and on the fast path its whole-segment totals.
+//! - `fetch_narrows_the_scan_statistics` (issue #2616): the scan's
+//!   `partition_statistics` count what it emits under a fetch, not every
+//!   committed row.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -36,6 +42,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{StringArray, TimestampNanosecondArray};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
+use datafusion::common::stats::Precision;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -551,5 +559,190 @@ async fn fetch_stops_opening_segments_once_the_partition_limit_is_met() {
          `partitions` segments opened, plus zero resolve GETs (the fast path \
          skips the plan phase entirely).",
         GC_SEGMENTS / GC_PARTS,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Metrics: a segment the fetch stops partway through still reports its scan
+// ---------------------------------------------------------------------------
+
+/// Sum a per-partition counter metric across every partition of the executed
+/// `LogsScanExec` in `plan`.
+fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+    let set = find_by_name(plan, "LogsScanExec")
+        .expect("a LogsScanExec leaf")
+        .metrics()
+        .expect("the scan publishes metrics");
+    set.iter()
+        .filter(|m| m.value().name() == name)
+        .map(|m| m.value().as_usize())
+        .sum()
+}
+
+const MB_BLOCKS: usize = 3;
+
+/// Run `sql` over one segment of `MB_BLOCKS` three-record blocks on one
+/// partition, and return the executed plan so its metrics can be read.
+async fn run_one_segment(sql: &str) -> (Arc<dyn ExecutionPlan>, usize) {
+    let store = MemoryStore::new();
+    let recs: Vec<LogRecord> = (0..MB_BLOCKS * 3)
+        .map(|i| record(i as i64, &format!("r{i}")))
+        .collect();
+    let seg = write_object(&store, "logs/mb-seg0.rlog", [9u8; 32], &recs).await;
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let table_provider = provider(snapshot, LogSegmentFetcher::new(backend));
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_table("logs", Arc::new(table_provider))
+        .expect("register table");
+    let plan = ctx
+        .sql(sql)
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let rows = total_rows(&collect_plan(Arc::clone(&plan)).await);
+    (plan, rows)
+}
+
+/// A LIMIT met inside the first block of a three-block segment ends the stream
+/// with that segment's scan still open. Its counters must still be published:
+/// one block scanned, and exactly a third of the pages the full scan decodes
+/// and skips (every block holds three records of the same shape). The
+/// predicate-free one-partition query takes the whole-segment fast path, which
+/// records `blocks_total` at the segment's end, so that total must be
+/// published at the stop too, and equal the full scan's.
+#[tokio::test]
+async fn fetch_stopped_segment_publishes_its_scan_metrics() {
+    let (full, full_rows) = run_one_segment("SELECT body FROM logs").await;
+    assert_eq!(full_rows, MB_BLOCKS * 3);
+    assert_eq!(
+        sum_metric(&full, "fast_path_whole_object_segments")
+            + sum_metric(&full, "fast_path_ranged_segments"),
+        1,
+        "the premise is the whole-segment fast path"
+    );
+    assert_eq!(sum_metric(&full, "blocks_total"), MB_BLOCKS);
+    assert_eq!(sum_metric(&full, "blocks_scanned"), MB_BLOCKS);
+    let full_decoded = sum_metric(&full, "pages_decoded");
+    let full_skipped = sum_metric(&full, "pages_skipped");
+    assert!(
+        full_decoded > 0 && full_decoded.is_multiple_of(MB_BLOCKS),
+        "every block decodes the same pages; got {full_decoded}"
+    );
+    assert!(
+        full_skipped > 0 && full_skipped.is_multiple_of(MB_BLOCKS),
+        "every block skips the same unprojected pages; got {full_skipped}"
+    );
+
+    let (limited, limited_rows) = run_one_segment("SELECT body FROM logs LIMIT 1").await;
+    assert_eq!(limited_rows, 1);
+    assert_eq!(
+        find_by_name(&limited, "LogsScanExec")
+            .expect("a LogsScanExec leaf")
+            .fetch(),
+        Some(1),
+        "the premise is a fetch pushed into the scan"
+    );
+    assert_eq!(
+        sum_metric(&limited, "blocks_scanned"),
+        1,
+        "the stop came inside the first block"
+    );
+    assert_eq!(
+        sum_metric(&limited, "pages_decoded"),
+        full_decoded / MB_BLOCKS
+    );
+    assert_eq!(
+        sum_metric(&limited, "pages_skipped"),
+        full_skipped / MB_BLOCKS
+    );
+    assert_eq!(
+        sum_metric(&limited, "blocks_total"),
+        MB_BLOCKS,
+        "the whole-segment total is known from the open"
+    );
+    assert_eq!(
+        sum_metric(&limited, "blocks_pruned_by_postings"),
+        sum_metric(&full, "blocks_pruned_by_postings")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Statistics under a fetch
+// ---------------------------------------------------------------------------
+
+/// The `(num_rows, ts min/max)` statistics of `plan` after `with_fetch(fetch)`.
+fn fetched_stats(
+    plan: &Arc<dyn ExecutionPlan>,
+    fetch: Option<usize>,
+) -> (
+    Precision<usize>,
+    Precision<ScalarValue>,
+    Precision<ScalarValue>,
+) {
+    let plan = match fetch {
+        Some(_) => plan.with_fetch(fetch).expect("the scan takes a fetch"),
+        None => Arc::clone(plan),
+    };
+    let ts = plan.schema().index_of("ts").expect("a ts column");
+    let stats = plan.partition_statistics(None).expect("statistics");
+    let col = &stats.column_statistics[ts];
+    (stats.num_rows, col.min_value.clone(), col.max_value.clone())
+}
+
+/// Over the 20-row fixture, one partition under `fetch = 1` emits exactly one
+/// row, so `num_rows` is `Exact(1)`; four partitions each stop at one row
+/// they own, so the count is only bounded and reads `Inexact(1)`. Either way
+/// the emitted row is a subset, so the `ts` extrema the catalog proves for the
+/// whole table drop to `Inexact`. A fetch at or above the total cuts nothing
+/// and leaves every figure `Exact`.
+#[tokio::test]
+async fn fetch_narrows_the_scan_statistics() {
+    let store = MemoryStore::new();
+    let (snapshot, _) = build_fixture(&store).await;
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let table_provider = provider(snapshot, LogSegmentFetcher::new(backend));
+    let ts_min = Precision::Exact(ScalarValue::TimestampNanosecond(Some(0), None));
+    let ts_max = Precision::Exact(ScalarValue::TimestampNanosecond(
+        Some(TOTAL as i64 - 1),
+        None,
+    ));
+
+    let one = table_provider.plan(1).expect("plan");
+    let four = table_provider.plan(SEGS).expect("plan");
+    assert_eq!(one.properties().partitioning.partition_count(), 1);
+    assert_eq!(four.properties().partitioning.partition_count(), SEGS);
+
+    for plan in [&one, &four] {
+        assert_eq!(
+            fetched_stats(plan, None),
+            (Precision::Exact(TOTAL), ts_min.clone(), ts_max.clone())
+        );
+        assert_eq!(
+            fetched_stats(plan, Some(TOTAL)),
+            (Precision::Exact(TOTAL), ts_min.clone(), ts_max.clone())
+        );
+    }
+    assert_eq!(
+        fetched_stats(&one, Some(1)),
+        (
+            Precision::Exact(1),
+            ts_min.clone().to_inexact(),
+            ts_max.clone().to_inexact()
+        )
+    );
+    assert_eq!(
+        fetched_stats(&four, Some(1)),
+        (
+            Precision::Inexact(1),
+            ts_min.to_inexact(),
+            ts_max.to_inexact()
+        )
     );
 }
