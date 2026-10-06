@@ -52,7 +52,7 @@ Two findings drive this decision:
 
 - **The `AttrValue`-per-cell batch costs about 4.5 KB per row**, against 419
   bytes of raw data: a tenfold blow-up before anything is copied. A 32-byte
-  `AttrValue` per cell across 105 columns is 3.3 KB per row, and every string
+  `AttrValue` per cell across the 104 mapped attributes is 3.3 KB per row, and every string
   cell adds an owned `String` copied out of the Arrow buffer (the findings
   document's "Where the memory is" and "Multiplicity" sections). Up to
   1 + Q + 2D copies of it can be alive (building, queued, the router's
@@ -116,9 +116,19 @@ reference and keeps the parent alive until the shard acks. What changes:
 - The parent is gone before any shard message is sent, so the router no
   longer holds it until the acks.
 
-The per-shard batches carry the parent's column dictionaries
-(`dyn_col_dicts`), which the clone path drops today. The encoder re-interns,
-so bytes are unchanged, but the drop discards work the loader already did.
+The clone path drops the parent's column dictionaries (`dyn_col_dicts`)
+today. A parent dictionary cannot be copied onto a child as it is: its `ids`
+hold one id per present cell of the parent's column, and the partition drops
+columns a child leaves all-absent, so the vector is the wrong length and
+misaligned for any child. What a child can keep is, for each column it
+retains, the parent's `distinct` table, with `ids` cut down to the child's
+present cells and the vector re-indexed onto the child's `dyn_columns`. The
+child must pass the same `validate()` checks a loader-built batch does. The
+encoder re-interns, so RLOG bytes are the same either way. The wave 1 task
+keeps the dictionaries only if it shows byte identity; otherwise it keeps
+dropping them and says so. Under decision 4 the dictionary becomes the
+dictionary form of the typed string column, and the same subset-and-reindex
+rule applies to it.
 
 ### 3. Dense columns from the start
 
@@ -152,13 +162,25 @@ cursor, and the encoder's working set for the concurrent flushes. Those are
 the terms Stage 0 measured outside the batch copies. The implementing task
 pins the floor's constants and states them. Where host memory cannot be read
 (no `/proc/meminfo`, as on macOS), the budget falls back to a named constant
-that the implementing task states, and the loader logs that it did so. Every
-built batch is charged its
-measured size while it is:
+that the implementing task states, and the loader logs that it did so.
+
+Every built batch is charged its measured size from the moment it is built
+until the flush that consumes it completes or fails. That covers the time it
+is:
 - being built;
 - queued;
 - in the write window;
-- held in a shard actor's buffer.
+- held in a shard actor's buffer;
+- held by a spawned flush task, including one queued behind the
+  `--max-inflight-flushes` permits (Stage 0 measured that term separately
+  from the encoder's working set).
+
+This is the lifetime of the ingest byte budget ADR-0069 already charges in
+`write_columnar`. The charge is cloned into every shard message and refunded
+when the flush holding the bytes completes or fails. The loader builds its
+router with that budget unlimited today. `--load-memory-bytes` is the same
+mechanism with a ceiling. The difference is that the loader waits for room
+before it builds the next batch, instead of the router refusing a write.
 
 The decoder waits when the budget is spent.
 - `--pipeline-depth`, `--decode-queue-batches` and `--max-inflight-flushes`
@@ -240,7 +262,6 @@ corpus twice, q33 exceeds the per-query limit), and on spill needing
   - Compaction, erasure rewrite and the audit writer use the row builder and
     are unaffected.
 - **The `--pipeline-depth` help text.** It said the working set scales by
-  roughly the depth. Stage 0 measured otherwise, and decision 1's task
-  corrects it.
+  roughly the depth. Stage 0 measured otherwise, and #2621 corrected it.
 - **Validation.** The ClickBench entry's sizing (#2592) waits for this epic,
   then is measured on all nine machine types before any upstream PR.
