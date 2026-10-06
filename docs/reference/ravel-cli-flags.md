@@ -640,7 +640,7 @@ Delete manifest versions superseded for longer than `--grace`
 
 ### parquet repair
 
-The repair for a forged manifest version: list one table's manifest version keys and flag those above the version bound and those naming no version; with `--delete`, delete exactly the flagged ones; with `--delete-version N`, delete exactly version N
+The repair for a forged manifest version: list one table's manifest version keys and flag those above the version bound and those naming no version; with `--delete`, delete the flagged ones, skipping and naming any Ravel cannot delete; with `--delete-version N`, delete exactly version N
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |

@@ -642,8 +642,9 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
   On S3 a key of either kind holding a control character, an empty segment or
   a `.` or `..` segment cannot be listed at all, and fails the listing that
   reaches it. A key whose characters the S3 adapter encodes cannot be
-  deleted through Ravel: `--stray --delete` skips it and `--table --delete`
-  refuses to delete anything while one is flagged. It is listed only when no
+  deleted through Ravel: `--stray --delete` skips it, and `--table --delete`
+  skips it, deletes every other flagged key and exits non-zero naming the
+  keys left in place. It is listed only when no
   such key sits at a list page boundary: the adapter encodes the page's
   continuation too, so the next page either repeats keys, failing the
   listing, or skips the keys after it, and the listing `--stray --delete`

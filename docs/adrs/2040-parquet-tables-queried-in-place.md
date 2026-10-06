@@ -1322,8 +1322,12 @@ deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
 flags: a flagged key under the table's own `v/` prefix that changes under
 `Path::from`, such as a slot of 20 tildes, or `hits/v//<20 digits>.pqm`,
 whose delete would reach version N of `hits`, is marked undeletable by Ravel
-in the listing, and `--delete` prints the listing and then refuses the whole
-call with `RepairError::Undeletable` naming that key, before any delete.
+in the listing. `--delete` sends that key no delete: it prints the listing,
+prints each such key as skipped, deletes every other flagged key, returns
+the skipped keys in `FlaggedDeletion::undeletable`, and exits non-zero
+naming the keys left in place. A delete that fails part way, in either mode,
+returns `RepairError::Delete` carrying the keys deleted before it; the
+command prints those keys, then the store error, and exits non-zero.
 The command runs
 under the Maintain credential: `MaintainList` grants the `t/*/pq/t/*`
 listing and `MaintainDelete` grants `s3:DeleteObject` on `t/*/pq/t/*`. It is

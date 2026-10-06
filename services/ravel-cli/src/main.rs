@@ -916,8 +916,9 @@ enum ParquetCommand {
     },
     /// The repair for a forged manifest version: list one table's manifest
     /// version keys and flag those above the version bound and those naming
-    /// no version; with `--delete`, delete exactly the flagged ones; with
-    /// `--delete-version N`, delete exactly version N.
+    /// no version; with `--delete`, delete the flagged ones, skipping and
+    /// naming any Ravel cannot delete; with `--delete-version N`, delete
+    /// exactly version N.
     ///
     /// No DDL statement writes a version above the bound (2^32) or a `.pqm`
     /// key under a table's `v/` prefix whose slot is not a version number, so
@@ -926,8 +927,11 @@ enum ParquetCommand {
     /// the sweep already skip it when the store lists it; `--delete` removes
     /// it. A flagged key the S3 adapter would send a delete of to a different
     /// key (one holding a character its path encoding escapes, such as `~`)
-    /// is marked undeletable, and `--delete` refuses, deleting nothing, while
-    /// one is flagged. On S3 a key holding a control character, an empty
+    /// is marked undeletable. `--delete` deletes every other flagged key,
+    /// sends no delete for an undeletable one, prints it as skipped, and then
+    /// fails naming the keys left in place. A delete that fails part way
+    /// prints the keys deleted before it, then the store error, and fails.
+    /// On S3 a key holding a control character, an empty
     /// segment or a `.` or `..` segment fails this listing and every read of
     /// the table; delete those with the Maintain credential through an S3
     /// tool. A forged version at
