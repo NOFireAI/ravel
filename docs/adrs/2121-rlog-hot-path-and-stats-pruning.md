@@ -95,7 +95,8 @@ the record-level cells. A row whose value lives only in the resource or
 scope attributes is outside its [min, max], so skipping on `.cstat` would
 drop that row. When a segment has both carriers and they disagree, the
 segment is not skipped, the same conflict rule `declared_min_max_all`
-applies.
+applies. (`declared_min_max_all` no longer applies it; see the
+stamp-versus-entry correction below.)
 
 - **Predicates.** The predicates are exactly the ones `extract_logs` (in
   `logs_pushdown.rs`, under ADR-0093) already turns into prune-only
@@ -117,8 +118,10 @@ applies.
   segment is skipped when any one arm's range is disjoint from the segment's
   [min, max].
 - **Conservative by construction.** A segment is skipped only when its
-  stamp covers that column, no `.cstat` entry conflicts with the stamp, and
-  the arm is false over the closed interval [min, max] for every value.
+  stamp covers that column, no `.cstat` entry conflicts with the stamp (a
+  rule that lives only in `arm_excludes`; see the stamp-versus-entry
+  correction below), and the arm is false over the closed interval
+  [min, max] for every value.
 - **Ordering.** The disjointness test runs in the declared type's own
   ordering: signed `i64`, and `false < true` for `Bool`. The arm's
   bit-pattern bounds are decoded to that type before any comparison, the
@@ -391,3 +394,16 @@ flowchart LR
 - Measurement depends on #2130: until whole-object reads attribute their
   bytes to the scan phase, per-phase cost reports stay incomplete on this
   path.
+
+## Correction 2026-10-07: `declared_min_max_all` applies no stamp-versus-entry rule
+
+<!-- amendment-applies: sections="D1. Skip segments by declared-column statistics when the logs scan is planned" pointer="stamp-versus-entry correction" -->
+<!-- amendment-supersedes: phrase="the same conflict rule `declared_min_max_all` applies" pointer="stamp-versus-entry correction" -->
+
+This is the stamp-versus-entry correction D1 points to (issue #2159).
+`declared_min_max_all` no longer applies any stamp-versus-entry conflict rule:
+it answers from the stamp alone and never compares a `.cstat` entry with it
+(ADR-0873's 2026-10-07 amendment). D1's precondition that no `.cstat` entry
+disagrees with the stamp now lives only in `arm_excludes`
+(`crates/ravel-sql/src/logs_stats_prune.rs`), and a disagreement only keeps
+the segment; it is not counted.

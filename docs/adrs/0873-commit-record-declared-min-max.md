@@ -541,11 +541,14 @@ under bytewise order and counts reconciling against the joined
 `sample_count` **passes** the predicate, appears in the valid set, grants
 coverage, and `partition_statistics` still reports `Precision::Exact`
 min/max for that column with zero increments on the defect metric (same
-case once more with `BYTES`). The assertion that fails if the vocabulary
-clause is ever applied carrier-independently again is that entry's
-presence and the `Exact` precision. The `STR` half of that positive case
+case once more with `BYTES`; see the merged-value read amendment below).
+The assertion that fails if the vocabulary clause is ever applied
+carrier-independently again is that entry's presence and the `Exact`
+precision. The `STR` half of that positive case
 is withdrawn with the claim it rests on (the .cstat carrier amendment
-below); the `BYTES` half stands.
+below); the `BYTES` half stands. The merged-value read amendment below
+withdraws the `BYTES` half too: a `BYTES` column has no stamp, and only the
+stamp answers.
 
 The `.cstat`
 lane adds the redundancy case of clause 4: an entry with `non_null_count +
@@ -854,6 +857,10 @@ governing rule for rewrite parts is force-empty, not recompute.
 
 ### 4. Read side: union of carriers, behind the existing gate
 
+The union of carriers below, its equality rule and its conflict metric are
+retired by the merged-value read amendment below (issue #2159): the stamp
+alone answers, and a `.cstat` entry never answers on its own.
+
 The fold copies `CommitRecord.declared_column_stats` onto the
 `SnapshotEntry` (field 15) exactly as it copies `sample_count` and the ts
 bounds today, and `CompactionPart.declared_column_stats` onto L1/rewrite
@@ -883,7 +890,8 @@ lets the same stock rule also answer `COUNT(col)`) with
    Passage is proven by type, not by provenance: the union consumes only
    decision 2's constructor-gated validated form, produced by the shared
    resolution helper, never a raw entry — whatever path delivered it. The
-   two carriers are a union, per segment, per column. Any segment covered by
+   two carriers are a union, per segment, per column (retired by the
+   merged-value read amendment below). Any segment covered by
    neither leaves the column `Precision::Absent`, the `AggregateStatistics`
    rule silently does not fire, and the query scans — the ADR-0850 safety
    lemma, extended verbatim to the new carrier. Absence is never an error
@@ -915,9 +923,11 @@ predicate participate at all: an invalid entry is absent from the union
   union degenerating to one carrier is not an error and not a conflict.
   That degenerate case is `BYTES` only now: for `STR` there is no union at
   all, by the .cstat carrier amendment below.
-- **Both:** the triples must be equal — min, max, and null_count each
-  compared for exact equality (for the allowlisted types value equality
-  and bit-identity coincide; a future F64 amendment must say which, and
+- **Both** (retired by the merged-value read amendment below, where the
+  stamp answers and is not compared): the triples must be equal — min,
+  max, and null_count each compared for exact equality (for the
+  allowlisted types value equality and bit-identity coincide; a future
+  F64 amendment must say which, and
   per the repo invariant it will be bit patterns). Equal: use the value —
   either carrier, they are identical. **Unequal in any field: that column
   is `Precision::Absent` for the whole query.** One conflicted segment
@@ -934,7 +944,8 @@ defect. The segment is immutable and both carriers claim to be exact
 derivations of its contents, so disagreement means the writer's stamp
 fold, the fold's copy, the `.cstat` build, or the object itself is wrong —
 every one of those a bug or corruption. The query degrades safely to a
-scan (never a wrong answer), but the conflict metric and log line exist so
+scan (never a wrong answer), but the conflict metric and log line (both
+removed by the merged-value read amendment below) exist so
 an operator sees a ticket-shaped signal rather than a mysteriously slow
 query, and the per-query coverage figure below counts a conflicted segment
 as covered by neither carrier.
@@ -943,7 +954,7 @@ Tests that pin the union: both carriers present and equal — the rule fires
 and the literal equals a full scan of the same data; both present with one
 field unequal (once on min, once on null_count) — `Precision::Absent`, the
 rule does not fire, and the conflict metric increments by exactly one
-naming that segment; both present and equal with a nonzero null_count —
+naming that segment (the merged-value read amendment below retires these); both present and equal with a nonzero null_count —
 the `COUNT(col)` rewrite equals `sample_count − null_count` counted once,
 which is the assertion that fails if any path sums the carriers.
 
@@ -953,7 +964,9 @@ between pre-stamp records (covered, if at all, by `.cstat`) and post-stamp
 records. A reader consulting only stamps would stay `Absent` until retention
 clears every pre-stamp record; a reader consulting only `.cstat` gains
 nothing from the hoist. **The union reader is therefore a build obligation
-of this ADR, not a follow-up.**
+of this ADR, not a follow-up.** The merged-value read amendment below
+retires it: a `.cstat` entry does not describe the merged value SQL returns,
+so the reader consults only stamps and pre-stamp records scan.
 
 A per-query coverage figure (segments stamped / segments touched, per
 carrier) is emitted under the existing per-phase cost accounting, because
@@ -1001,7 +1014,9 @@ What that means for real tenants, stated without hedging:
   rewriting every data object to change a statistic, which is
   disproportionate and is not this ADR's plan.
 - **The backfill for sealed history is ADR-0942's, and it is a
-  precondition, not an option.** The union reader (decision 4) covers
+  precondition, not an option.** (No longer: the union is retired, and
+  sealed history without stamps scans; see the merged-value read
+  amendment below.) The union reader (decision 4) covers
   sealed history through the part-bound `.cstat`, whose forced-rebuild
   backfill pass ADR-0942 already names as a build obligation. For the
   reference tenant the dependency chain is explicit: q07 answers from
@@ -1067,12 +1082,16 @@ flowchart TD
 
   CR -->|"listed / token-resolved,<br/>above the fold watermark"| REF["SegmentRef.declared_column_stats"]
   SE -->|"sealed hours,<br/>below the watermark"| REF
+  %% The CST edge is retired by the merged-value read amendment: only REF answers.
   CST[".cstat (ADR-0850/0942)<br/>pre-stamp + sealed history"] -->|"union keyed by content_hash;<br/>both carriers must be equal,<br/>conflict = Absent"| STATS
 
   REF --> STATS["LogsScanExec::partition_statistics<br/>gate: stats_are_exact() AND every<br/>touched segment covered, else Absent"]
   STATS -->|"Precision::Exact min/max/null_count"| AGG["DataFusion AggregateStatistics rule:<br/>MIN/MAX/COUNT to literal, zero data GETs"]
   STATS -->|"any segment uncovered:<br/>Absent, rule does not fire"| SCAN["LogsScanExec scan<br/>(slower, never wrong)"]
 ```
+
+The `.cstat` edge into `partition_statistics` is retired by the merged-value
+read amendment below: a segment is covered only by its stamp.
 
 ## Rejected alternatives
 
@@ -1134,10 +1153,14 @@ flowchart TD
   reader and ADR-0942's backfill (decision 5); the pre-registered
   acceptance figure for q07-shape is the stock-DataFusion order
   (tens of ms) with the catalog-resolve cost dominating, stamped with the
-  backfill precondition.
+  backfill precondition. The merged-value read amendment below retires the
+  union reader, so unstamped `.cstat` history scans and only stamped
+  segments answer from statistics.
 - **What does not move.** q02 and q08 (predicate counts, `GROUP BY`
   counts): statistics cannot carry them; they remain `.cstat`-dictionary
-  territory (ADR-0850). String-column extrema remain `.cstat`-only. Declared
+  territory (ADR-0850). String-column extrema remain `.cstat`-only. (Since
+  the merged-value read amendment below, string-column extrema scan, and
+  the dictionary answers q02 and q08 only behind a matching stamp.) Declared
   `f64` columns (once ADR-0101's writer release lands) keep scanning until
   a future amendment clears the float gate. Pre-stamp records never gain
   the field; their coverage is `.cstat`'s or nothing.
@@ -1164,7 +1187,8 @@ flowchart TD
 - **Two new defect signals an operator must know.** Invalid entries
   dropped by the statistics validity predicate (decision 2, one metric
   labelled by carrier) and carrier conflicts (decision 4's equality rule)
-  each land on their own metric. Both mean a
+  each land on their own metric (the merged-value read amendment below
+  removes the conflict signal; the drop metric remains). Both mean a
   writer-side or copy-side bug against immutable data, not load: a nonzero
   rate is a ticket, and the only query-visible symptom is statistics
   shortcuts quietly not firing. A `.cstat` object-granular decode
@@ -1208,8 +1232,10 @@ flowchart TD
   whole-object figure — the only case that distinguishes the NULL-count
   representation from its complement); the union cases of decision 4 (equal
   carriers fire and match a scan, one unequal field yields `Absent` plus
-  exactly one conflict-metric increment, `COUNT(col)` proves null_count
-  is never summed across carriers); mixed coverage (stamped tail +
+  exactly one conflict-metric increment (the merged-value read amendment
+  below retires these cases and names the tests that replace them),
+  `COUNT(col)` proves null_count is never summed across carriers); mixed
+  coverage (stamped tail +
   `.cstat` history + one uncovered segment) leaving precision `Absent`;
   the `stats_are_exact` erasure refusal extended to the new columns;
   proptest round-trip of the new messages with corrupt-input rejection
@@ -1219,7 +1245,8 @@ flowchart TD
   clauses and per-carrier vocabulary, entry-granular
   null-count exactness with the fold stated in NULL units only and the
   block-statistics completeness invariant named with the code that
-  upholds it, equality-or-`Absent` union keyed by `content_hash`, and
+  upholds it, equality-or-`Absent` union keyed by `content_hash` (retired
+  by the merged-value read amendment below), and
   the fourth revision's three: the per-carrier granularity split,
   point-of-use binding through a constructor-gated validated type, and
   reader agreement through one shared resolution helper)
@@ -1283,7 +1310,8 @@ by scanning. Decision 2's "from today" claim for `STR` is withdrawn, and with
 it the positive regression test that decision mandates for a `STR` entry: no
 such test can pass against a reader that never reaches the entry. The `BYTES`
 half of that mandate stands unchanged, since `BYTES` is excluded from the
-stamp vocabulary, is read from `.cstat`, and does reach `Precision::Exact`.
+stamp vocabulary, is read from `.cstat`, and does reach `Precision::Exact`
+(withdrawn by the merged-value read amendment below: only the stamp answers).
 Where decision 4 describes the union degenerating to the `.cstat` carrier
 alone for a declared `STR` or `BYTES` column, that now describes `BYTES`
 only; the `STR` case is not a degenerate union but no union at all.
@@ -1363,6 +1391,97 @@ stamp at all (a direct record fold versus decision 3's fold over the
 writer's per-block NumStats). Read together: the stamp is a record fold
 (this amendment) over the merged attribute view (the merged-view
 amendment).
+
+## Amendment 2026-10-07: the stamp alone answers; the union of carriers is retired
+
+<!-- amendment-applies: sections="2. Eligibility: an explicit allowlist, {I64, BOOL}, gated fail-closed|4. Read side: union of carriers, behind the existing gate|5. Migration class and convergence — the #944 question, answered plainly|Data flow|Consequences|Amendment: the .cstat carrier joins by entry identity and STR extrema stay .cstat-only" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="The two carriers are a union, per segment, per column" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="the triples must be equal" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="both carriers must be equal" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="conflict = Absent" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="the conflict metric" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="conflict-metric increment" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="carrier conflicts (decision 4's equality rule)" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="The union reader is therefore a build obligation" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="covers sealed history through the part-bound `.cstat`" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="equality-or-`Absent` union" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="same case once more with `BYTES`" pointer="merged-value read amendment" -->
+<!-- amendment-supersedes: phrase="and does reach `Precision::Exact`" pointer="merged-value read amendment" -->
+
+Issue #2159. This is the merged-value read amendment the sections above
+point to. Decision 4 lets either carrier cover a segment on its own and,
+where both exist, requires them to be equal, treating a difference as a
+defect. That rests on both carriers being exact derivations of the same
+values, and they are not. The stamp is a fold over the merged attribute
+view SQL returns (the 2026-09-03 merged-view amendment): the record's own
+attribute when the record sets the key, otherwise the stream's resource or
+scope attribute of the same name. A `.cstat` entry tallies the record-level
+cells only, so a row whose value comes from the resource or scope reads
+NULL to it. With a declared key set to 100 on the resource of three rows
+and to 1 through 5 on the records of five others, the entry states min 1,
+max 5 and a sum of 15, while SQL returns min 1, max 100 and a sum of 315.
+Neither carrier is wrong, the two differ by construction, and a `.cstat`
+entry answering on its own returned the wrong figure.
+
+The decision, matching `crates/ravel-sql` as shipped:
+
+- **The stamp alone answers `MIN`, `MAX` and `COUNT(col)`.**
+  `partition_statistics` (`LogsScanExec::declared_min_max_all`, through
+  `segment_declared_coverage`) reports a declared column `Precision::Exact`
+  only when every touched segment carries a usable stamp for it. A touched
+  segment with no stamp declines the column, whether or not a `.cstat`
+  entry covers it. Where both carriers exist the stamp's triple is used as
+  it is and is not compared with the entry. Decision 4's union of carriers,
+  its "stamp only, or `.cstat` only: use it" case for the `.cstat` side, and
+  its equality rule (both triples equal, any difference making the column
+  `Precision::Absent`) are retired.
+- **No conflict metric and no conflict log line.** A difference between
+  the carriers is expected wherever a value comes from the resource or
+  scope, and no figure they carry separates that from a defect, so the
+  carrier-conflict counter (`declared_stat_carrier_conflicts`) and its
+  warning are removed. Decision 2's drop metric is unchanged: the `.cstat`
+  entry is still read where these paths visit a segment, and a defective
+  one is still counted under the `cstat` label. `partition_statistics`
+  stops visiting segments for a column at the first one without a stamp,
+  so on that path a defective entry on a later segment is not counted.
+- **`BYTES` extrema are never answered from statistics.** `BYTES` is
+  outside the stamp vocabulary (decision 2), so with the stamp as the only
+  answering carrier `MIN`/`MAX` over a declared `BYTES` column always scan.
+  The .cstat carrier amendment's statement that `BYTES` is read from
+  `.cstat` and reaches `Precision::Exact`, and decision 2's positive
+  `BYTES` regression case that rests on it, are withdrawn; `STR` was
+  already withdrawn there. There is no degenerate one-carrier union for
+  either type any more.
+- **The dictionary and sum paths read an entry only behind a matching
+  stamp.** `declared_not_equal_count`, `declared_group_counts` and
+  `declared_column_sum` read figures only the `.cstat` entry carries, so
+  they still read it, but only when the segment's stamp states the same
+  min, max and NULL count as the entry (`merged_view_entry`). Every row the
+  entry counts as non-null sets the key on the record, which is the value
+  SQL reads for that row, so equal NULL counts mean no row took its value
+  from the resource or scope. A segment with no stamp, or whose stamp
+  differs, is scanned. This is a precondition for using the entry, not a
+  conflict check: a difference is not counted or logged.
+- **The ADR-2121 plan-time skip** keeps its own rule, in
+  `logs_stats_prune.rs` `arm_excludes`: a segment is skipped only on its
+  stamp, and not when a loaded `.cstat` entry differs from that stamp. That
+  difference is not counted either.
+
+What this changes elsewhere in this document. Decision 5's statement that
+the union reader covers sealed history through `.cstat` no longer holds:
+sealed history without stamps scans for `MIN`/`MAX` until retention removes
+it, and ADR-0942's backfill does not make it answer from statistics. The
+Data flow diagram's `.cstat` edge into
+`partition_statistics` describes the retired union. In Consequences, the
+carrier-conflict signal is gone (the drop metric remains the one defect
+signal), the union test cases are replaced by
+`a_cstat_entry_without_a_stamp_answers_no_declared_statistic` and
+`a_stamp_answers_over_a_record_level_cstat_entry` in
+`crates/ravel-sql/src/logs_provider.rs`, which run the five statement
+shapes over a segment written by the real writer and folded by
+`Catalog::fold`, without and with a stamp, and the scope note's
+equality-or-`Absent` union no longer describes the reader. The validated
+form decision 2 requires still binds every read of either carrier.
 
 ## Out-of-scope findings, reported not fixed
 
