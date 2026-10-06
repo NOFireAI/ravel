@@ -438,3 +438,54 @@ fn attrs_map(batch: &RecordBatch, row: usize) -> Vec<(String, String)> {
 fn map_get(map: &[(String, String)], key: &str) -> Option<String> {
     map.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
+
+/// `LIMIT n` caps a plain projection over `audit`, the shape that
+/// over-returned on `logs` (issue #2616). The session is built by
+/// `build_session` as the executor builds one, so it runs the same physical
+/// optimizer rules over a one-object, five-record table.
+#[tokio::test]
+async fn limit_caps_rows_of_a_plain_projection() {
+    let store = MemoryStore::new();
+    let records: Vec<LogRecord> = (100..=104)
+        .map(|ts| {
+            audit_record(
+                ts,
+                "INFO",
+                &format!("audit {ts}"),
+                &[("kind", "query_audit")],
+            )
+        })
+        .collect();
+    let seg = write_object(&store, "audit/limit.rlog", &records).await;
+    let table = Arc::new(provider(store, vec![seg]));
+    let pool = Arc::new(ravel_sql::TenantDelegatingPool::new(
+        1 << 30,
+        ravel_sql::TenantMemoryAccountant::new(1 << 30),
+        ravel_sql::CeilingBreach::new(),
+        QueryAccounting::new(),
+    ));
+    let ctx = ravel_sql::build_session(
+        &ravel_sql::SqlConfig::default(),
+        pool,
+        ravel_sql::SessionTable::Audit(table),
+        false,
+        ravel_sql::SpillDecision::Disabled,
+    )
+    .expect("session builds");
+    for (sql, want) in [
+        ("SELECT body FROM audit LIMIT 1", 1),
+        ("SELECT body FROM audit LIMIT 2", 2),
+        ("SELECT * FROM audit LIMIT 3", 3),
+        ("SELECT body FROM audit LIMIT 9", 5),
+    ] {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must plan: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must execute: {e}"));
+        let got: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(got, want, "{sql}");
+    }
+}

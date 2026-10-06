@@ -1183,15 +1183,15 @@ pub struct LogsScanExec {
     /// (the default) reproduces the pre-#362 scan exactly: every segment this
     /// partition owns is opened.
     ///
-    /// Set, it bounds only what THIS PARTITION may stop early at: once a
-    /// partition's own emitted row count reaches `fetch`, [`LogScanStream`]
-    /// stops opening further owned segments (never mid-segment, and never
-    /// before `fetch` rows of its own are out). The real cross-partition
-    /// limit is still enforced above this node -- by the `CoalescePartitionsExec`
-    /// or `GlobalLimitExec` that absorbed the pushdown -- so a partition
-    /// emitting more than `fetch` rows (its last batch overshooting) is
-    /// harmless; emitting fewer than `fetch` while more of its own owned data
-    /// remains would silently under-answer the query and must never happen.
+    /// Set, it caps each partition's own output at exactly `fetch` rows:
+    /// [`LogScanStream`] truncates the batch that reaches it and opens no
+    /// further owned segment. The cap must be exact, because `LimitPushdown`
+    /// removes the `GlobalLimitExec` above a scan that accepted the fetch, and
+    /// a single-partition plan has no `CoalescePartitionsExec` above it either
+    /// (issue #2616). With several partitions the `CoalescePartitionsExec`
+    /// that absorbed the pushdown applies the cross-partition total. Emitting
+    /// fewer than `fetch` while more of a partition's owned data remains would
+    /// silently under-answer the query and must never happen.
     fetch: Option<usize>,
     /// The resolved full `logs` schema this scan projects, i.e.
     /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
@@ -4176,13 +4176,9 @@ struct LogScanStream {
     fetch: Option<usize>,
     /// Rows this partition has emitted so far, summed at every batch actually
     /// handed downstream (post content-filter and post `attrs_raw` erasure --
-    /// whatever a caller of this stream actually receives). Consulted only at
-    /// [`LogScanState::NextSegment`], and only to decide whether to open
-    /// another owned segment; it never truncates a batch or interrupts a
-    /// segment already being drained, so a partition can finish with more
-    /// than `fetch` rows of its own (the cross-partition limit is still
-    /// enforced above this node) but never with fewer while more of its own
-    /// owned work remained.
+    /// whatever a caller of this stream actually receives). Once it reaches
+    /// `fetch` the stream ends, so a partition finishes with exactly
+    /// `min(fetch, rows it owns)` rows, never more and never fewer.
     rows_emitted: usize,
     /// The exec's metric set, kept so per-segment timeline points can be
     /// published as labelled metrics (`segment=<ordinal>`) alongside the
@@ -4558,6 +4554,16 @@ impl LogScanStream {
         self.state = LogScanState::NextSegment;
     }
 
+    /// This partition has emitted its pushed `fetch` rows: stop, mid-segment
+    /// if need be, and release everything the scan still holds.
+    fn finish_at_fetch(&mut self) {
+        self.state = LogScanState::Done;
+        self.current_dirs = None;
+        self.work.clear();
+        self.prefetch_pool.clear(self.partition);
+        self.release_block();
+    }
+
     /// Abandon the stream on error, releasing everything the scan still holds.
     fn fail(&mut self, e: DataFusionError) -> Poll<Option<DFResult<RecordBatch>>> {
         self.state = LogScanState::Done;
@@ -4628,6 +4634,10 @@ impl LogScanStream {
             return this.fail(e);
         }
         loop {
+            if this.fetch.is_some_and(|fetch| this.rows_emitted >= fetch) {
+                this.finish_at_fetch();
+                return Poll::Ready(None);
+            }
             // Anything buffered from the current block goes out first.
             if this.has_pending() {
                 let emit_started = Instant::now();
@@ -4639,6 +4649,14 @@ impl LogScanStream {
                 this.blocks.emit_elapsed.add_elapsed(emit_started);
                 return match emitted {
                     Ok(batch) => {
+                        // DataFusion drops the limit above a scan that
+                        // accepted `with_fetch`, so the cap is exact here.
+                        let batch = match this.fetch {
+                            Some(fetch) if this.rows_emitted + batch.num_rows() > fetch => {
+                                batch.slice(0, fetch.saturating_sub(this.rows_emitted))
+                            }
+                            _ => batch,
+                        };
                         this.rows_emitted += batch.num_rows();
                         Poll::Ready(Some(Ok(batch)))
                     }
@@ -4683,21 +4701,6 @@ impl LogScanStream {
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
-                LogScanState::NextSegment
-                    if this.fetch.is_some_and(|fetch| this.rows_emitted >= fetch) =>
-                {
-                    // This partition's own emitted rows already meet the
-                    // pushed fetch (issue #362): stop opening further owned
-                    // segments. Never entered mid-segment (a segment already
-                    // in `Opening`/`Columnar`/`Rows` state drains to its own
-                    // completion first, so this partition never emits fewer
-                    // than `fetch` rows while more of its own owned data
-                    // remains), and never a truncation of what is already
-                    // buffered (`has_pending` above always runs first).
-                    this.work.clear();
-                    this.prefetch_pool.clear(this.partition);
-                    this.state = LogScanState::Done;
-                }
                 LogScanState::NextSegment => {
                     let prefetch = match this.take_next_prefetch() {
                         Ok(prefetch) => prefetch,

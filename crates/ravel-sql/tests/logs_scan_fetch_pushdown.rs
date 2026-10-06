@@ -8,7 +8,7 @@
 //! `fetch`, and that node already stops the scan from opening further
 //! segments once it stops polling. The actual change here is removing that
 //! extra plan node by making the leaf report its own fetch, not making the
-//! scan stop any earlier than it already did. Three properties are pinned:
+//! scan stop any earlier than it already did. Four properties are pinned:
 //!
 //! - `limit_removes_local_limit_and_reports_fetch_on_the_scan` (the plan-shape
 //!   test, and the one that actually distinguishes this change from the
@@ -20,6 +20,9 @@
 //!   count every time -- never fewer -- and every returned row is a real
 //!   written row, across a plain scan, `ORDER BY`, and a residual `WHERE`
 //!   above the scan.
+//! - `single_partition_fetch_is_exact_with_no_limit_above_the_scan` (issue
+//!   #2616): with one partition no limit operator is left above the scan, and
+//!   the scan alone returns exactly `min(k, total)` rows.
 //! - `fetch_stops_opening_segments_once_the_partition_limit_is_met` (GET-count
 //!   regression): a partition made to own two whole segments opens only the
 //!   first once the pushed per-partition fetch is satisfied by it.
@@ -413,6 +416,49 @@ async fn fetch_pushdown_returns_exact_counts_and_correct_rows() {
         assert!(
             got.is_subset(&matching),
             "every WHERE + LIMIT row must satisfy the residual predicate; got {got:?}"
+        );
+    }
+}
+
+/// With one partition, `LimitPushdown` leaves nothing above the scan to cap
+/// its output: no `GlobalLimitExec` and no `CoalescePartitionsExec` (issue
+/// #2616). The scan's own fetch is then the only limit, so it must be exact,
+/// including a limit that ends partway through a segment or a block.
+#[tokio::test]
+async fn single_partition_fetch_is_exact_with_no_limit_above_the_scan() {
+    let store = MemoryStore::new();
+    let (snapshot, want) = build_fixture(&store).await;
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(backend);
+    let table_provider = provider(snapshot, fetcher);
+
+    let config = SessionConfig::new().with_target_partitions(1);
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_table("logs", Arc::new(table_provider))
+        .expect("register table");
+
+    for k in [1usize, 2, PER_SEG, PER_SEG + 2, TOTAL, TOTAL + 7] {
+        let sql = format!("SELECT ts, body FROM logs LIMIT {k}");
+        let df = ctx.sql(&sql).await.expect("plan");
+        let plan = df.create_physical_plan().await.expect("physical plan");
+        for above in ["GlobalLimitExec", "CoalescePartitionsExec"] {
+            assert!(
+                find_by_name(&plan, above).is_none(),
+                "{sql}: the premise is a plan with no {above}; plan:\n{}",
+                displayable(plan.as_ref()).indent(true)
+            );
+        }
+        let batches = collect_plan(plan).await;
+        let want_count = k.min(TOTAL);
+        assert_eq!(
+            total_rows(&batches),
+            want_count,
+            "{sql} over {TOTAL} written rows must return exactly {want_count}"
+        );
+        let got = batches_to_rows(&batches);
+        assert!(
+            got.is_subset(&want),
+            "{sql} must return only rows that were actually written; got {got:?}"
         );
     }
 }

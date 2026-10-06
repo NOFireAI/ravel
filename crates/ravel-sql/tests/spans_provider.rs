@@ -520,6 +520,26 @@ async fn count_star_without_erasure_counts_every_span() {
     assert_eq!(scalar_count(outcome.output.batches()), 5);
 }
 
+/// `LIMIT n` caps a plain projection over `spans` through `SqlExecutor`, the
+/// shape that over-returned on `logs` (issue #2616), over the five-span
+/// fixture.
+#[tokio::test]
+async fn limit_caps_rows_of_a_plain_projection() {
+    let executor = executor_with_spans(&count_star_fixture()).await;
+    for (sql, want) in [
+        ("SELECT start_ts FROM spans LIMIT 1", 1),
+        ("SELECT start_ts FROM spans LIMIT 2", 2),
+        ("SELECT * FROM spans LIMIT 3", 3),
+        ("SELECT start_ts FROM spans LIMIT 9", 5),
+    ] {
+        let outcome = executor
+            .execute(tenant().hash(), &sql_request(sql))
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must execute: {e}"));
+        assert_eq!(outcome.output.num_rows(), want, "{sql}");
+    }
+}
+
 /// (ADR-0044) The spans scan path is request/byte accounted, the same way the
 /// logs path is (the sibling of `tests/query_accounting.rs`'s
 /// `a_logs_query_is_accounted`). A `QueryAccounting` handle is threaded through
