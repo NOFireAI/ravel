@@ -17,6 +17,7 @@ columns, 14.7 GB, about 419 bytes per row uncompressed.
 |---|---|---|---|---|
 | 150,000 | 4 | 16 | 8.7 GB | 1,204 s |
 | 500,000 | 4 | 16 | 20.3 GB | 1,439 s |
+| 500,000 | 1 | 16 | 16.8 GB | 2,789 s |
 | 1,000,000 | 4 | 16 | 35.7 GB | 1,489 s |
 | 1,000,000 | 1 | 16 | 31.7 GB | 2,892 s |
 
@@ -50,7 +51,10 @@ depth 4:
 Two findings drive this decision:
 
 - **The `AttrValue`-per-cell batch costs about 4.5 KB per row**, against 419
-  bytes of raw data: a tenfold blow-up before anything is copied. Up to
+  bytes of raw data: a tenfold blow-up before anything is copied. A 32-byte
+  `AttrValue` per cell across 105 columns is 3.3 KB per row, and every string
+  cell adds an owned `String` copied out of the Arrow buffer (the findings
+  document's "Where the memory is" and "Multiplicity" sections). Up to
   1 + Q + 2D copies of it can be alive (building, queued, the router's
   parent, the per-shard copies).
 - **No queue is bounded by bytes.** The decode queue, the write window and
@@ -58,10 +62,12 @@ Two findings drive this decision:
   every term until the machine runs out, which is the failure mode seen on
   every small box.
 
-### Already implemented in Stage 0 (reduction 1)
+### Stage 0 reduction 1 (landed with #2621)
 
-Each cursor's reader now decodes ceil(B / K) rows at a time, and
-`cursor_take_spans` deals rows up to the same virtual B-row boundary.
+Each cursor's reader decodes ceil(B / K) rows at a time
+(`services/ravel-cli/src/load/input.rs`), and `cursor_take_spans`
+(`services/ravel-cli/src/load/logs.rs`) deals rows up to the same virtual
+B-row boundary.
 - At B = 500,000, one 360 s run each on a 16-vCPU, 30 GB x86_64 fleet
   executor (K = 16, 4 shards, memory store, jemalloc profiling on): peak RSS
   22.68 → 15.48 GB, Parquet live 7,010 → about 410 MB.
@@ -73,9 +79,9 @@ partition ends short of its share was marked exhausted one round earlier
 than before. Every row still loaded exactly once, but batch composition
 changed (rows 1,000, K 4: batches of 950, 750, 667, 233 became 950, 917,
 733). The byte-identity test compared the new dealer with itself and could
-not see it. The fix round restores the old exhaustion round. It adds a
-differential test against a test-only copy of the pre-change dealer, which
-must pass before this lands as the epic's first task.
+not see it. The fix round restored the old exhaustion round and added
+`batch_composition_matches_the_pre_2613_dealer`, a differential test against
+a test-only copy of the pre-change dealer, and the change landed with it.
 
 ## Decision
 
@@ -94,7 +100,7 @@ flowchart LR
   B -. charges .- A
 ```
 
-### 1. Read cursors hold at most one reader batch each (done in Stage 0)
+### 1. Read cursors hold at most one reader batch each (landed, #2621)
 
 As above. The decoded Arrow rows held by the cursors drop from K × B to
 about B: one batch's worth across all cursors. Each cursor still keeps its
@@ -103,10 +109,12 @@ pre-change dealer exactly (see above).
 
 ### 2. One copy of a batch at a time
 
-- `write_columnar` takes the batch by value.
-- `partition_columnar` builds the per-shard batches by draining the parent's
-  columns (moving cells), not by cloning them.
-- The router no longer holds the parent until the acks.
+`write_columnar` already takes the batch by value, but it partitions by
+reference and keeps the parent alive until the shard acks. What changes:
+- `partition_columnar` consumes the parent and builds the per-shard batches
+  by draining its columns (moving cells), not by cloning them.
+- The parent is gone before any shard message is sent, so the router no
+  longer holds it until the acks.
 
 The per-shard batches carry the parent's column dictionaries
 (`dyn_col_dicts`), which the clone path drops today. The encoder re-interns,
@@ -142,7 +150,10 @@ memory (MemTotal, capped by a cgroup limit) less the loader's own
 non-budget floor: process baseline, Parquet reader and page-decode state per
 cursor, and the encoder's working set for the concurrent flushes. Those are
 the terms Stage 0 measured outside the batch copies. The implementing task
-pins the floor's constants and states them. Every built batch is charged its
+pins the floor's constants and states them. Where host memory cannot be read
+(no `/proc/meminfo`, as on macOS), the budget falls back to a named constant
+that the implementing task states, and the loader logs that it did so. Every
+built batch is charged its
 measured size while it is:
 - being built;
 - queued;
