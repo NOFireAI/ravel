@@ -1216,10 +1216,10 @@ below does not apply. The derived budget is cgroup-capped effective memory
 by the cgroup v2 `memory.max` or v1 `memory.limit_in_bytes` when the process
 runs under a finite one) minus an overhead reserve for the allocator, thread
 stacks, the ingest buffer, and everything outside this accounting. The
-reserve is 2 GiB from 8 GiB of memory up; below that it is a quarter of the
-memory, but never less than what the mode holds outside the budget (a
+reserve is a quarter of the memory, at most 2 GiB (so 2 GiB from 8 GiB of
+memory up), but never less than what the mode holds outside the budget (a
 256 MiB baseline, plus the `--max-ingest-buffer-bytes` ceiling in
-`--mode all`). A derived budget below 256 MiB refuses to start (ADR-1170's
+`--mode all`), even where that is more than 2 GiB. A derived budget below 256 MiB refuses to start (ADR-1170's
 2026-10-05 small-host reserve amendment). It is
 `u64::MAX` (unlimited, source `fallback`) when memory cannot be read, never
 `0`: "we could not measure the host" means no trustworthy ceiling can be
