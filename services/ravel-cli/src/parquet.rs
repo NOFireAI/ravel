@@ -544,7 +544,9 @@ mod tests {
     use bytes::Bytes;
     use ravel_maintain::{GcConfigValues, set_gc_config};
     use ravel_object_store::PutOptions;
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
     use ravel_object_store::memory::MemoryStore;
     use ravel_pqtable::keys::manifest_key;
@@ -782,7 +784,8 @@ mod tests {
     }
 
     /// A key is chosen by whoever put it, control characters included, so
-    /// every line that prints one escapes it.
+    /// every line that prints one escapes it, and so does the refusal to
+    /// delete it: the store's path encoding would send its delete elsewhere.
     #[tokio::test]
     async fn repair_prints_every_key_escaped() {
         let store = forged_table().await;
@@ -799,15 +802,29 @@ mod tests {
             .await
             .expect("put");
         for action in [RepairAction::List, RepairAction::DeleteFlagged] {
-            let lines = repair_lines(&store, "acme", "hits", action)
-                .await
-                .expect("repair");
-            let printed = lines.join("\n");
+            let mut lines = Vec::new();
+            let result = collect_repair(&store, "acme", "hits", action, &mut lines).await;
+            let mut printed = lines.join("\n");
+            if action == RepairAction::DeleteFlagged {
+                let err = result.expect_err("refused");
+                printed.push_str(&format!("\n{err:#}"));
+                assert!(
+                    printed.ends_with(&format!(
+                        "\nrefusing to delete {key:?}: the store's path encoding sends a delete \
+                         of it to {:?}, a different key; delete the exact key with the Maintain \
+                         credential through an S3 tool",
+                        store_path(&key)
+                    )),
+                    "{printed}"
+                );
+            } else {
+                result.expect("repair");
+            }
             assert!(!printed.contains('\u{1b}'), "{printed}");
             assert!(!printed.contains('\u{7}'), "{printed}");
             assert!(printed.contains(&format!("{key:?}")), "{printed}");
         }
-        assert_eq!(deletes(&store), 3);
+        assert_eq!(deletes(&store), 0);
     }
 
     #[tokio::test]
@@ -1217,6 +1234,120 @@ mod tests {
             assert!(text.contains(&format!("{key:?}")), "{text}");
         }
         assert_eq!(store.deletes(), sorted(&STRAYS));
+    }
+
+    /// The listing after the deletes fails: the deleted keys are still
+    /// written, then the command fails with the listing's error.
+    #[tokio::test]
+    async fn repair_stray_prints_its_deletions_when_the_listing_after_them_fails() {
+        let store = forged_table().await;
+        for rest in STRAYS {
+            store
+                .inner()
+                .put(
+                    &acme_key(rest),
+                    Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+        }
+        let store = S3Keys::new(FaultStore::new(
+            store,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Permanent("listing refused".into()))
+                    .with_occurrence(Occurrence::Nth(2)),
+            ),
+        ));
+        let mut out = Vec::new();
+        let err = write_repair_stray(&store, "acme", true, false, &mut out)
+            .await
+            .expect_err("the second listing fails");
+        assert_eq!(store.inner.fault_count(Op::List, FaultKind::Permanent), 1);
+        let printed = String::from_utf8(out).expect("utf-8");
+        let mut deleted = vec!["deleted 3 key(s)".to_string()];
+        deleted.extend(sorted(&STRAYS).iter().map(|key| format!("  {key:?}")));
+        assert!(
+            printed.ends_with(&format!("{}\n", deleted.join("\n"))),
+            "{printed}"
+        );
+        assert_eq!(store.deletes(), sorted(&STRAYS));
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with(
+                "deleted the keys printed above, then could not list the tenant's keys under no \
+                 valid table name again to confirm none is left"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("listing refused"), "{text}");
+    }
+
+    /// A flagged key under the table's own `v/` prefix whose delete the
+    /// store's path encoding would send to a different key is marked in the
+    /// listing, and `--delete` prints the listing and then refuses, deleting
+    /// nothing.
+    #[tokio::test]
+    async fn repair_marks_and_refuses_a_flagged_key_the_path_encoding_changes() {
+        let hash = TenantId::new("acme").hash();
+        let tilde = format!(
+            "{}~~~~~~~~~~~~~~~~~~~~.pqm",
+            ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix")
+        );
+        let store = S3Keys::new(forged_table().await);
+        store
+            .inner
+            .inner()
+            .put(&tilde, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+        let mark = format!(
+            "    key: {tilde:?}\n    stored_unix_ms: 0 (the store's clock)\n    undeletable by \
+             Ravel: the store's path encoding sends a delete of this key to {:?}; delete the \
+             exact key with the Maintain credential through an S3 tool",
+            store_path(&tilde)
+        );
+        let lines = repair_lines(&store, "acme", "hits", RepairAction::List)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        assert!(printed.contains(&mark), "{printed}");
+        assert_eq!(printed.matches("undeletable by Ravel").count(), 2);
+        assert!(
+            printed.ends_with(
+                "3 version(s) flagged; 1 of them undeletable by Ravel, marked above, and \
+                 --delete refuses to delete any while one of those is listed"
+            ),
+            "{printed}"
+        );
+
+        let mut lines = Vec::new();
+        let err = collect_repair(
+            &store,
+            "acme",
+            "hits",
+            RepairAction::DeleteFlagged,
+            &mut lines,
+        )
+        .await
+        .expect_err("must refuse");
+        assert!(
+            format!("{err:#}").starts_with(&format!(
+                "refusing to delete {tilde:?}: the store's path encoding sends a delete of it to \
+                 {:?}",
+                store_path(&tilde)
+            )),
+            "{err:#}"
+        );
+        assert!(lines.join("\n").contains(&mark), "{lines:?}");
+        assert_eq!(store.deletes(), Vec::<String>::new());
+        assert_eq!(deletes(&store.inner), 0);
+        assert_eq!(
+            resolve::versions(&store, &hash, "hits")
+                .await
+                .expect("versions"),
+            vec![1, MAX_MANIFEST_VERSION, MAX_MANIFEST_VERSION + 1, u64::MAX]
+        );
     }
 
     #[tokio::test]
