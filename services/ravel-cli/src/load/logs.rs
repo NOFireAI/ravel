@@ -390,8 +390,14 @@ pub(super) async fn load_with_drain_reflush_period(
     let metadata = read_input_metadata(&input)?;
     let row_group_lens = row_group_row_counts(&metadata);
     let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
-    let cursors =
-        open_stride_cursors(&input, &metadata, &row_group_lens, cursor_count, batch_rows)?;
+    let cursors = open_stride_cursors(
+        &input,
+        &metadata,
+        &row_group_lens,
+        cursor_count,
+        batch_rows,
+        reader_batch_rows(batch_rows, cursor_count),
+    )?;
 
     let started = Instant::now();
     let mut report = LoadReport::default();
@@ -963,6 +969,15 @@ pub(super) struct CursorState {
     /// `partition_base + consumed` is the file-absolute index of the next row
     /// this cursor will yield.
     pub(super) consumed: u64,
+    /// The dealing block: [`cursor_take_spans`] never hands out rows across a
+    /// multiple of this many rows from the partition start. It is the
+    /// `batch_rows` the reader used to decode at, so the spans a round deals
+    /// are the same whatever Arrow batch size the reader decodes at now
+    /// (issue #2613).
+    pub(super) block_rows: usize,
+    /// Rows in this cursor's partition, from the footer's row-group counts:
+    /// where the pre-#2613 reader's last, short batch ended.
+    pub(super) partition_rows: u64,
 }
 
 impl CursorState {
@@ -1033,6 +1048,50 @@ pub(super) fn cursor_take(
     }
 }
 
+/// Deal one round's share of up to `want` rows from `cur`, as one or more
+/// contiguous spans: exactly the rows the pre-#2613 dealer's single
+/// [`cursor_take`] call on a `block_rows`-row reader would have returned
+/// (issue #2613). Returns an empty vector when that call would have returned
+/// nothing.
+///
+/// That call returned at most the rest of the reader's current batch, which
+/// ended at the next multiple of `block_rows` from the partition start or at
+/// the partition's end, whichever came first, so the share is capped at both.
+/// At the partition's end it asked the reader once, found it exhausted, and
+/// dropped it, so the cursor counted as live for that one round and dealt
+/// nothing. Refilling until the share is met instead would find the reader
+/// exhausted in the round that dealt the last rows, retire the cursor a round
+/// early and grow every other cursor's share from then on.
+///
+/// A reader decoding `block_rows`-row batches yields one span per call here.
+/// One decoding smaller batches yields the same rows as several spans, each
+/// with its own file-absolute base, so the rows a round deals do not depend on
+/// the reader's batch size, while the decoded Arrow a cursor holds between
+/// rounds does.
+pub(super) fn cursor_take_spans(
+    cur: &mut CursorState,
+    want: usize,
+) -> Result<Vec<(RecordBatch, u64)>, String> {
+    let block = cur.block_rows.max(1) as u64;
+    let to_boundary = block - cur.consumed % block;
+    let left_in_partition = cur.partition_rows.saturating_sub(cur.consumed);
+    if left_in_partition == 0 {
+        return Ok(cursor_take(cur, want.min(to_boundary as usize))?
+            .into_iter()
+            .collect());
+    }
+    let mut spans = Vec::new();
+    let mut remaining = (want as u64).min(to_boundary).min(left_in_partition) as usize;
+    while remaining > 0 {
+        let Some((span, file_base)) = cursor_take(cur, remaining)? else {
+            break;
+        };
+        remaining -= span.num_rows();
+        spans.push((span, file_base));
+    }
+    Ok(spans)
+}
+
 /// The spans making up one batch, or a terminal signal. Shared by the row and
 /// columnar decode paths so the K-cursor share dealing (issue #560) lives in
 /// exactly one place.
@@ -1048,8 +1107,9 @@ enum SpanOutcome {
 }
 
 /// Deal one batch's worth of rows across the live stride cursors (issue #560).
-/// Each live cursor contributes up to its share as one contiguous run via
-/// [`cursor_take`]; the resulting spans keep their own `file_base` so a rejected
+/// Each live cursor contributes up to its share as one contiguous run of rows
+/// via [`cursor_take_spans`], which may hand that run over as several spans;
+/// the spans keep their own `file_base` so a rejected
 /// row's reported index translates to its FILE-absolute position regardless of
 /// which cursor produced it.
 ///
@@ -1095,9 +1155,8 @@ fn collect_spans(
         if share == 0 {
             continue;
         }
-        match cursor_take(&mut state.cursors[idx], share) {
-            Ok(Some((batch, file_base))) if batch.num_rows() > 0 => spans.push((batch, file_base)),
-            Ok(_) => {}
+        match cursor_take_spans(&mut state.cursors[idx], share) {
+            Ok(taken) => spans.extend(taken.into_iter().filter(|(b, _)| b.num_rows() > 0)),
             Err(reason) => return SpanOutcome::Failed(reason),
         }
     }

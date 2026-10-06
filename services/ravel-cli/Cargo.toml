@@ -17,8 +17,10 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # crates/ravel-bench/src/profiling.rs). Off by default so a default build never
 # links `pprof`. When on and RAVEL_CLI_PROFILE_SVG names a path, `load`'s
 # measured region is wrapped in a `pprof` CPU sampler and a flamegraph SVG is
-# written there.
-profiling = ["dep:pprof"]
+# written there. It also turns on `tikv-jemallocator/profiling`, compiling in
+# jemalloc heap profiling, which stays inactive unless `_RJEM_MALLOC_CONF`
+# enables it (e.g. `prof:true`).
+profiling = ["dep:pprof", "tikv-jemallocator/profiling"]
 
 [dependencies]
 # Optional: see the `profiling` feature above. Same version/feature set as

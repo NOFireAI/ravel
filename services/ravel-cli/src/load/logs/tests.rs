@@ -516,13 +516,25 @@ async fn decode_object_hashes(
     batch_rows: usize,
     read_cursors: Option<usize>,
     queue_depth: usize,
+    reader_batch_rows_override: Option<usize>,
 ) -> Vec<[u8; 32]> {
     let input = FileInput { path: pq };
     let metadata = read_input_metadata(&input).expect("read metadata");
     let row_group_lens = row_group_row_counts(&metadata);
     let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
-    let cursors = open_stride_cursors(&input, &metadata, &row_group_lens, cursor_count, batch_rows)
-        .expect("cursors");
+    // `None` is what `load` passes; `Some(batch_rows)` reproduces the
+    // pre-#2613 reader (one `batch_rows`-row Arrow batch per block).
+    let reader_rows =
+        reader_batch_rows_override.unwrap_or_else(|| reader_batch_rows(batch_rows, cursor_count));
+    let cursors = open_stride_cursors(
+        &input,
+        &metadata,
+        &row_group_lens,
+        cursor_count,
+        batch_rows,
+        reader_rows,
+    )
+    .expect("cursors");
     let state = StrideCursors {
         cursors,
         deal_offset: 0,
@@ -578,8 +590,8 @@ async fn decode_object_hashes(
 async fn rlog_objects_are_byte_identical_across_decode_queue_depths() {
     let (_dir, pq, m) = multi_batch_dict_fixture();
     // batch_rows = 2 over 8 rows -> four batches.
-    let lockstep = decode_object_hashes(&pq, &m, 4, 2, None, 1).await;
-    let deep = decode_object_hashes(&pq, &m, 4, 2, None, 4).await;
+    let lockstep = decode_object_hashes(&pq, &m, 4, 2, None, 1, None).await;
+    let deep = decode_object_hashes(&pq, &m, 4, 2, None, 4, None).await;
     assert!(
         lockstep.len() >= 3,
         "the fixture splits into several batches: {}",
@@ -591,6 +603,197 @@ async fn rlog_objects_are_byte_identical_across_decode_queue_depths() {
         "RLOG object bytes must not depend on the decode-queue depth ({} objects)",
         lockstep.len()
     );
+}
+
+/// A file of five row groups of uneven sizes (700, 300, 500, 900, 200 rows);
+/// see [`seq_row_group_fixture`].
+fn uneven_row_group_fixture() -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    seq_row_group_fixture(&[700, 300, 500, 900, 200])
+}
+
+/// A file with one row group per entry of `group_rows` (none at all for an
+/// empty slice) whose every row is distinguishable: `seq` is the
+/// file-absolute row index as an i64 attribute and `tag` a per-row string, so
+/// a batch that gained, lost or reordered a single row encodes to different
+/// bytes. Resource identity rotates over four hosts so rows spread across
+/// shards.
+fn seq_row_group_fixture(group_rows: &[i64]) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    use parquet::arrow::ArrowWriter;
+
+    let seq_batch = |first: i64, rows: i64| {
+        let seq: Vec<i64> = (first..first + rows).collect();
+        let ts: Vec<i64> = seq.iter().map(|r| NOW_NS - r * 1_000).collect();
+        let tag: Vec<String> = seq.iter().map(|r| format!("tag-{r}")).collect();
+        let host: Vec<String> = seq.iter().map(|r| format!("host{}", r % 4)).collect();
+        batch(vec![
+            ("ts", Arc::new(Int64Array::from(ts)) as ArrayRef),
+            ("seq", Arc::new(Int64Array::from(seq)) as ArrayRef),
+            (
+                "tag",
+                Arc::new(StringArray::from_iter_values(tag)) as ArrayRef,
+            ),
+            (
+                "host",
+                Arc::new(StringArray::from_iter_values(host)) as ArrayRef,
+            ),
+        ])
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("seq.parquet");
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer =
+        ArrowWriter::try_new(file, seq_batch(0, 0).schema(), None).expect("arrow writer");
+    let mut file_row = 0i64;
+    for &rows in group_rows {
+        writer
+            .write(&seq_batch(file_row, rows))
+            .expect("write row group");
+        writer.flush().expect("flush row group");
+        file_row += rows;
+    }
+    writer.close().expect("close writer");
+
+    let mut m = base_mapping();
+    m.resource_attributes = vec![attr("host", "host", ColType::Str)];
+    m.attributes = vec![
+        attr("seq", "seq", ColType::I64),
+        attr("tag", "tag", ColType::Str),
+    ];
+    (dir, pq, m)
+}
+
+/// The production dealer's RLOG bytes do not depend on the cursors' Arrow
+/// batch size (issue #2613): the same dealer over readers decoding
+/// `batch_rows`-row batches and over readers decoding `ceil(batch_rows / K)`
+/// rows encodes the same per-batch RLOG bytes. Both arms run today's dealer,
+/// so this says nothing about the pre-#2613 dealer; that comparison is
+/// `pre_2613::batch_composition_matches_the_pre_2613_dealer`.
+///
+/// Prove-the-test: have `cursor_take_spans` make a single `cursor_take` call
+/// per round, so a share is capped at one reader batch, and it fails at
+/// (450, 3). A dealer change that applies to both arms, such as ignoring
+/// `block_rows`, passes here; the `pre_2613` tests catch that.
+#[tokio::test]
+async fn production_dealer_rlog_bytes_do_not_depend_on_reader_batch_size() {
+    let (_dir, pq, m) = uneven_row_group_fixture();
+    for (batch_rows, cursors) in [(450usize, 3usize), (1000, 4), (333, 5), (2600, 2), (100, 1)] {
+        let reference =
+            decode_object_hashes(&pq, &m, 4, batch_rows, Some(cursors), 2, Some(batch_rows)).await;
+        let bounded = decode_object_hashes(&pq, &m, 4, batch_rows, Some(cursors), 2, None).await;
+        assert!(
+            reference.len() >= 2,
+            "batch_rows {batch_rows} x cursors {cursors}: fixture splits into several batches, \
+             got {}",
+            reference.len()
+        );
+        assert_eq!(
+            reference,
+            bounded,
+            "batch_rows {batch_rows} x cursors {cursors} (reader batch {}): RLOG bytes must not \
+             depend on the reader's Arrow batch size",
+            reader_batch_rows(batch_rows, cursors)
+        );
+    }
+}
+
+mod pre_2613;
+
+/// Deal `k` cursors over `groups` row groups of `group_rows` rows each at
+/// `batch_rows` until they are exhausted, with the readers `load` opens, and
+/// return the rows each cursor holds decoded but undealt after every round.
+fn undealt_rows_per_round(
+    groups: u32,
+    group_rows: usize,
+    batch_rows: usize,
+    k: usize,
+) -> Vec<Vec<usize>> {
+    let (_dir, pq, _m) = sorted_by_shard_fixture(groups, group_rows);
+    let input = FileInput { path: &pq };
+    let metadata = read_input_metadata(&input).expect("read metadata");
+    let row_group_lens = row_group_row_counts(&metadata);
+    assert_eq!(row_group_lens, vec![group_rows as u64; groups as usize]);
+    let cursors = open_stride_cursors(
+        &input,
+        &metadata,
+        &row_group_lens,
+        k,
+        batch_rows,
+        reader_batch_rows(batch_rows, k),
+    )
+    .expect("cursors");
+    let mut state = StrideCursors {
+        cursors,
+        deal_offset: 0,
+        skip_rows: 0,
+    };
+    let total_rows = groups as usize * group_rows;
+    let full_rounds = total_rows / batch_rows;
+    let mut per_round = Vec::new();
+    for round in 1.. {
+        let dealt = match collect_spans(&mut state, batch_rows, None) {
+            SpanOutcome::Spans(spans) => spans.iter().map(|(b, _)| b.num_rows()).sum::<usize>(),
+            SpanOutcome::Done => break,
+            SpanOutcome::Failed(reason) => panic!("round {round}: {reason}"),
+        };
+        if round <= full_rounds {
+            assert_eq!(dealt, batch_rows, "round {round} deals one full batch");
+        }
+        assert!(
+            round <= total_rows + k + 1,
+            "still dealing at round {round}"
+        );
+        per_round.push(
+            state
+                .cursors
+                .iter()
+                .map(|c| c.buffered.as_ref().map_or(0, |b| b.num_rows()))
+                .collect(),
+        );
+    }
+    assert!(per_round.len() > full_rounds, "every full round was dealt");
+    per_round
+}
+
+/// The decoded Arrow rows the stride cursors hold between rounds (issue
+/// #2613). Before this change each of K cursors decoded a full
+/// `batch_rows`-row Arrow batch of every column and kept the undealt
+/// remainder, so K whole batches were alive after every round. Now a cursor
+/// decodes `ceil(batch_rows / K)` rows at a time and only when its buffer is
+/// empty and its share needs more, so it keeps fewer than that many rows
+/// undealt, and the total no longer scales with K.
+///
+/// Four 1,000-row groups, four cursors, 1,000-row batches: every share is 250
+/// rows, a whole reader batch, so nothing is left undealt. The pre-#2613
+/// reader left 750 per cursor after round one, and a reader decoding
+/// `2 * batch_rows / K` rows leaves 250.
+///
+/// Three 1,000-row groups, three cursors, 1,000-row batches: shares of 333
+/// and 334 rows against 334-row reader batches, so a cursor may keep a row or
+/// two, never 334. A `2 * batch_rows / K` (667-row) reader leaves 334 on the
+/// cursors that drew a 333-row share in round one.
+#[test]
+fn stride_cursors_hold_under_one_reader_batch_of_undealt_rows() {
+    for (round, undealt) in undealt_rows_per_round(4, 1000, 1000, 4).iter().enumerate() {
+        assert_eq!(
+            undealt,
+            &vec![0; 4],
+            "round {}: shares of a whole reader batch leave nothing undealt",
+            round + 1
+        );
+    }
+
+    // ceil(1000 / 3), written out so a change to `reader_batch_rows` cannot
+    // move the bound with it.
+    let reader_rows = 334;
+    for (round, undealt) in undealt_rows_per_round(3, 1000, 1000, 3).iter().enumerate() {
+        assert!(
+            undealt.iter().all(|&n| n < reader_rows),
+            "round {}: undealt rows per cursor {undealt:?}, each must be under one {reader_rows}-row \
+             reader batch",
+            round + 1
+        );
+    }
 }
 
 /// End-to-end structural invariance across decode-queue depths (issue #680):
