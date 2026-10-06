@@ -6,7 +6,8 @@
 //! its table wildcard also admits an extra path segment under a table's `v/`.
 //! Readers and the sweep already skip both ([`crate::resolve::newest`],
 //! [`crate::sweep::plan`]); [`list`] flags them and [`delete_flagged`]
-//! deletes exactly those.
+//! deletes exactly those, refusing a flagged key the S3 adapter would send a
+//! delete of to a different key ([`ListedEntry::undeletable`]).
 //!
 //! A forged version at or below the bound cannot be told apart by its key. One
 //! that is the table's highest is its newest, and one exactly at the bound
@@ -83,8 +84,8 @@ pub enum RepairError {
     )]
     NotStray { key: String },
     /// A key asked to be deleted that the S3 adapter would send the delete
-    /// of to `path`, a different key ([`StrayClass::Undeletable`]). Nothing
-    /// was deleted.
+    /// of to `path`, a different key ([`StrayClass::Undeletable`],
+    /// [`ListedEntry::undeletable`]). Nothing was deleted.
     #[error(
         "refusing to delete {key:?}: the store's path encoding sends a delete of it to {path:?}, \
          a different key; delete the exact key with the Maintain credential through an S3 tool"
@@ -122,8 +123,12 @@ pub struct ListedEntry {
     pub version: ListedVersion,
     /// True exactly when the key names a version above
     /// [`MAX_MANIFEST_VERSION`] or is [`ListedVersion::Invalid`]: the keys
-    /// [`delete_flagged`] deletes.
+    /// [`delete_flagged`] deletes, unless [`ListedEntry::undeletable`].
     pub flagged: bool,
+    /// True when the S3 adapter sends a delete of the key to
+    /// [`store_path`] of it, a different key, so Ravel cannot delete it;
+    /// [`delete_flagged`] refuses it.
+    pub undeletable: bool,
     /// When the store wrote the key, by the store's clock. Unlike a
     /// manifest's `created_unix_ns`, whoever put the key cannot choose it.
     pub last_modified_unix_ms: i64,
@@ -202,6 +207,7 @@ pub async fn list(
         .map(|meta| {
             let (version, flagged) = classify(tenant, table, &meta.key);
             ListedEntry {
+                undeletable: !is_store_path(&meta.key),
                 key: meta.key,
                 version,
                 flagged,
@@ -230,9 +236,10 @@ pub async fn describe(store: &dyn ObjectStoreBackend, entry: &ListedEntry) -> De
 
 /// Delete `keys`, each of which must be one [`list`] flags for `table`.
 /// Every key is checked before the first delete, so one that is not flagged
-/// ([`RepairError::NotFlagged`]) deletes nothing. A delete that fails stops
-/// the repair; the keys deleted before it are gone and a later listing no
-/// longer shows them. Returns the deleted keys.
+/// ([`RepairError::NotFlagged`]) or that the S3 adapter would send a delete
+/// of to a different key ([`RepairError::Undeletable`]) deletes nothing. A
+/// delete that fails stops the repair; the keys deleted before it are gone
+/// and a later listing no longer shows them. Returns the deleted keys.
 pub async fn delete_flagged(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -245,6 +252,12 @@ pub async fn delete_flagged(
             return Err(RepairError::NotFlagged {
                 key: key.clone(),
                 bound: MAX_MANIFEST_VERSION,
+            });
+        }
+        if !is_store_path(key) {
+            return Err(RepairError::Undeletable {
+                key: key.clone(),
+                path: store_path(key),
             });
         }
     }
@@ -1031,6 +1044,96 @@ mod tests {
         assert_eq!(deletes_sent(&store), 0);
         memory(&store).head(&mkey(3)).await.expect("version 3 kept");
         memory(&store).head(&doubled).await.expect("still there");
+    }
+
+    /// A version slot of 20 tildes, which `Path::from` percent-encodes.
+    const TILDES: &str = "~~~~~~~~~~~~~~~~~~~~";
+
+    /// A key under `hits`'s own `v/` prefix that the S3 adapter lists but
+    /// sends a delete of to a different key is flagged and marked
+    /// undeletable, and `delete_flagged` refuses it before any delete.
+    #[tokio::test]
+    async fn delete_flagged_refuses_a_flagged_key_the_s3_adapter_encodes() {
+        let store = S3KeyStore {
+            inner: segment_aligned_forged_store().await,
+        };
+        let tilde = invalid_key(TILDES);
+        memory(&store)
+            .put(&tilde, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+        assert_ne!(store_path(&tilde), tilde);
+        let listed = list(&store, &TENANT_A, "hits").await.expect("list");
+        let marked: Vec<(&str, bool)> = listed
+            .iter()
+            .filter(|e| e.flagged)
+            .map(|e| (e.key.as_str(), e.undeletable))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                (invalid_key(ZERO).as_str(), false),
+                (mkey(MAX_MANIFEST_VERSION + 1).as_str(), false),
+                (mkey(u64::MAX).as_str(), false),
+                (invalid_key(OVERFLOW).as_str(), false),
+                (invalid_key(NON_DIGIT).as_str(), false),
+                (invalid_key(NESTED).as_str(), false),
+                (tilde.as_str(), true),
+            ]
+        );
+        assert_eq!(listed.iter().filter(|e| e.undeletable).count(), 1);
+        let flagged: Vec<String> = listed
+            .into_iter()
+            .filter(|e| e.flagged)
+            .map(|e| e.key)
+            .collect();
+        let got = delete_flagged(&store, &TENANT_A, "hits", &flagged).await;
+        assert!(
+            matches!(&got, Err(RepairError::Undeletable { key, path })
+                if *key == tilde && *path == store_path(&tilde)),
+            "{got:?}"
+        );
+        assert_eq!(store.inner.deletes(), Vec::<String>::new());
+        assert_eq!(deletes_sent(&store), 0);
+        memory(&store).head(&tilde).await.expect("still there");
+        // Without it, every other flagged key is deleted, each at its own key.
+        let rest: Vec<String> = flagged.into_iter().filter(|k| *k != tilde).collect();
+        let deleted = delete_flagged(&store, &TENANT_A, "hits", &rest)
+            .await
+            .expect("delete");
+        assert_eq!(deleted, rest);
+        assert_eq!(store.inner.deletes(), rest);
+    }
+
+    /// `Path::from` drops the empty segment of `hits/v//<3>.pqm`, a key that
+    /// names no version of `hits`, so the S3 adapter would send its delete to
+    /// version 3.
+    #[tokio::test]
+    async fn delete_flagged_refuses_a_flagged_key_whose_delete_reaches_a_valid_version() {
+        let store = S3KeyStore {
+            inner: segment_aligned_forged_store().await,
+        };
+        let doubled = invalid_key("/00000000000000000003");
+        memory(&store)
+            .put(&doubled, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+        assert!(classify(&TENANT_A, "hits", &doubled).1);
+        assert_eq!(store_path(&doubled), mkey(3));
+        let got = delete_flagged(&store, &TENANT_A, "hits", std::slice::from_ref(&doubled)).await;
+        assert!(
+            matches!(&got, Err(RepairError::Undeletable { key, path })
+                if *key == doubled && *path == mkey(3)),
+            "{got:?}"
+        );
+        assert_eq!(store.inner.deletes(), Vec::<String>::new());
+        assert_eq!(deletes_sent(&store), 0);
+        memory(&store).head(&mkey(3)).await.expect("version 3 kept");
+        memory(&store).head(&doubled).await.expect("still there");
+        // A store that lists any key, unlike the S3 adapter, marks it too.
+        let listed = list(memory(&store), &TENANT_A, "hits").await.expect("list");
+        let entry = listed.iter().find(|e| e.key == doubled).expect("listed");
+        assert!(entry.flagged && entry.undeletable, "{entry:?}");
     }
 
     /// On S3 a stray key `Path::parse` refuses fails the listing that meets

@@ -41,13 +41,16 @@
 //! stored value is at least every process's `--gc-max-query-duration`, the
 //! floor ADR-2040 names, so taking it is the stricter choice.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use ravel_maintain::read_gc_config;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_pqtable::keys::{MAX_MANIFEST_VERSION, store_path};
 use ravel_pqtable::manifest::{Manifest, ParquetFile};
-use ravel_pqtable::repair::{self, Description, ListedVersion, StrayClass, StrayEntry};
+use ravel_pqtable::repair::{
+    self, Description, ListedVersion, RepairError, StrayClass, StrayEntry,
+};
 use ravel_pqtable::{resolve, sweep};
 use ravel_types::TenantId;
 
@@ -236,34 +239,58 @@ pub async fn repair(
     table: &str,
     action: RepairAction,
 ) -> anyhow::Result<()> {
-    for line in repair_lines(store.as_ref(), tenant, table, action).await? {
-        println!("{line}");
+    let mut lines = Vec::new();
+    let result = collect_repair(store.as_ref(), tenant, table, action, &mut lines).await;
+    print_lines(&lines, &mut std::io::stdout())?;
+    result
+}
+
+/// Write `lines` to `out`, one per line.
+fn print_lines(lines: &[String], out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
+    for line in lines {
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
 
-/// What [`repair`] prints. Keys, and the writer and statement fields, are
-/// chosen by whoever put a forged version, so they are printed quoted and
-/// escaped.
+/// [`collect_repair`]'s lines, or its error.
+#[cfg(test)]
 async fn repair_lines(
     store: &dyn ObjectStoreBackend,
     tenant: &str,
     table: &str,
     action: RepairAction,
 ) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    collect_repair(store, tenant, table, action, &mut lines).await?;
+    Ok(lines)
+}
+
+/// Push to `out` what [`repair`] prints, so a refusal after the listing
+/// still prints the listing. Keys, and the writer and statement fields, are
+/// chosen by whoever put a forged version, so they are printed quoted and
+/// escaped.
+async fn collect_repair(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    table: &str,
+    action: RepairAction,
+    out: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let hash = TenantId::new(tenant).hash();
     if let RepairAction::DeleteVersion(version) = action {
         let key = repair::delete_version(store, &hash, table, version).await?;
-        return Ok(vec![
+        out.extend([
             format!("deleted manifest version {version} of table {table}"),
             format!("  key: {key:?}"),
         ]);
+        return Ok(());
     }
     let entries = repair::list(store, &hash, table).await?;
-    let mut out = vec![format!(
+    out.push(format!(
         "table: {table} ({} keys listed, version bound {MAX_MANIFEST_VERSION})",
         entries.len()
-    )];
+    ));
     for entry in &entries {
         let version = match &entry.version {
             ListedVersion::Number(v) => v.to_string(),
@@ -281,6 +308,13 @@ async fn repair_lines(
             "    stored_unix_ms: {} (the store's clock)",
             entry.last_modified_unix_ms
         ));
+        if entry.flagged && entry.undeletable {
+            out.push(format!(
+                "    undeletable by Ravel: the store's path encoding sends a delete of this key \
+                 to {:?}; delete the exact key with the Maintain credential through an S3 tool",
+                store_path(&entry.key)
+            ));
+        }
         match repair::describe(store, entry).await {
             Description::Manifest(manifest) => {
                 out.push(format!("    created_by: {:?}", manifest.created_by));
@@ -300,19 +334,31 @@ async fn repair_lines(
         .collect();
     if flagged.is_empty() {
         out.push("no versions above the version bound and no keys naming no version".to_string());
-        return Ok(out);
+        return Ok(());
     }
+    let undeletable = entries
+        .iter()
+        .filter(|e| e.flagged && e.undeletable)
+        .count();
     if action != RepairAction::DeleteFlagged {
-        out.push(format!(
-            "{} version(s) flagged; rerun with --delete to remove exactly these",
-            flagged.len()
-        ));
-        return Ok(out);
+        out.push(if undeletable == 0 {
+            format!(
+                "{} version(s) flagged; rerun with --delete to remove exactly these",
+                flagged.len()
+            )
+        } else {
+            format!(
+                "{} version(s) flagged; {undeletable} of them undeletable by Ravel, marked above, \
+                 and --delete refuses to delete any while one of those is listed",
+                flagged.len()
+            )
+        });
+        return Ok(());
     }
     let deleted = repair::delete_flagged(store, &hash, table, &flagged).await?;
     out.push(format!("deleted {} manifest versions", deleted.len()));
     out.extend(deleted.iter().map(|key| format!("  {key:?}")));
-    Ok(out)
+    Ok(())
 }
 
 /// `parquet repair --stray`: list every key under the tenant's manifest
@@ -325,9 +371,32 @@ pub async fn repair_stray(
     delete: bool,
     include_reserved_names: bool,
 ) -> anyhow::Result<()> {
-    let report = repair_stray_lines(store.as_ref(), tenant, delete, include_reserved_names).await?;
-    for line in &report.lines {
-        println!("{line}");
+    write_repair_stray(
+        store.as_ref(),
+        tenant,
+        delete,
+        include_reserved_names,
+        &mut std::io::stdout(),
+    )
+    .await
+}
+
+/// [`repair_stray`], writing to `out` rather than stdout. The deletions are
+/// written before a failed listing after them is reported.
+async fn write_repair_stray(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    delete: bool,
+    include_reserved_names: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let report = repair_stray_lines(store, tenant, delete, include_reserved_names).await?;
+    print_lines(&report.lines, out)?;
+    if let Some(err) = report.relist_error {
+        return Err(anyhow::Error::from(err).context(
+            "deleted the keys printed above, then could not list the tenant's keys under no \
+             valid table name again to confirm none is left",
+        ));
     }
     if !report.remaining.is_empty() {
         let keys: Vec<String> = report.remaining.iter().map(|k| format!("{k:?}")).collect();
@@ -341,10 +410,11 @@ pub async fn repair_stray(
 }
 
 /// What [`repair_stray`] prints, and with `delete` the stray keys a listing
-/// after the deletes still found.
+/// after the deletes still found, or why that listing failed.
 struct StrayReport {
     lines: Vec<String>,
     remaining: Vec<String>,
+    relist_error: Option<RepairError>,
 }
 
 /// Why `--delete` leaves `entry` in place, if it does.
@@ -400,6 +470,7 @@ async fn repair_stray_lines(
     let mut report = StrayReport {
         lines,
         remaining: Vec::new(),
+        relist_error: None,
     };
     if entries.is_empty() {
         report
@@ -442,11 +513,10 @@ async fn repair_stray_lines(
     report
         .lines
         .extend(deleted.iter().map(|key| format!("  {key:?}")));
-    report.remaining = repair::list_stray(store, &hash)
-        .await?
-        .into_iter()
-        .map(|entry| entry.key)
-        .collect();
+    match repair::list_stray(store, &hash).await {
+        Ok(entries) => report.remaining = entries.into_iter().map(|entry| entry.key).collect(),
+        Err(err) => report.relist_error = Some(err),
+    }
     Ok(report)
 }
 
