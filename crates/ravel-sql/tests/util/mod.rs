@@ -276,6 +276,44 @@ pub fn request(sql: &str) -> SqlRequest {
     }
 }
 
+/// `seg` carrying the stamp a writer folds for the rows the I64 `.cstat` entry
+/// `stat` describes, through the commit-record carrier read. SQL answers a
+/// declared column's statistics from a `.cstat` entry only beside a stamp that
+/// states the same extrema and NULL count, since the entry alone describes
+/// record-level cells, not the merged value SQL returns.
+pub fn stamped_like(
+    seg: ravel_catalog::SegmentRef,
+    stat: &ravel_proto::catalog::v1::ColumnStat,
+) -> ravel_catalog::SegmentRef {
+    use ravel_proto::catalog::v1::column_value::Kind;
+    use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
+    let value = |v: &Option<ravel_proto::catalog::v1::ColumnValue>| {
+        v.as_ref().map(|v| match v.kind {
+            Some(Kind::I64(x)) => DeclaredStatValue::I64(x),
+            ref other => panic!("fixture stamps I64 entries only, got {other:?}"),
+        })
+    };
+    let stamp = DeclaredColumnStat::new(
+        &stat.name,
+        DeclaredStatType::I64,
+        value(&stat.min),
+        value(&stat.max),
+        stat.null_count,
+    )
+    .expect("valid stamp");
+    let mut record = ravel_proto::commit::v1::CommitRecord {
+        sample_count: seg.sample_count,
+        ..Default::default()
+    };
+    ravel_commit::declared_stats::stamp_commit_record(&mut record, &[stamp]);
+    let validated = ravel_commit::declared_stats::read_commit_record(&record);
+    assert_eq!(validated.covered().len(), 1, "fixture stamp is valid");
+    ravel_catalog::SegmentRef {
+        declared_column_stats: ravel_catalog::DeclaredColumnStats::from_validated(&validated),
+        ..seg
+    }
+}
+
 /// The default engine budgets, for tests that need to name them.
 pub fn engine_config() -> EngineConfig {
     EngineConfig::default()

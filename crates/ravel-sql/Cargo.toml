@@ -145,17 +145,12 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
-# `tracing` is unconditional, not gated behind `flight-sql`: two base-build
-# paths log through it. The Flight error boundary records the full, unredacted
-# error (the same discipline the HTTP endpoint follows), and
-# `logs_scan::record_carrier_conflict` records the declared-statistics carrier
-# conflict ADR-0873 decision 4 requires an operator be able to attribute to a
-# segment, which happens in `partition_statistics` with no Flight surface in
-# sight.
+# `tracing` is unconditional, not gated behind `flight-sql`: base-build paths
+# (spill, output) log through it, besides the Flight error boundary, which
+# records the full, unredacted error (the same discipline the HTTP endpoint
+# follows).
 tracing = { workspace = true }
-# Renders the conflicting segment's `content_hash` for that same log line: the
-# hash is what names the exact bytes both carriers claim to describe, so it is
-# the identity a report is filed against.
+# Unconditional: `page_plan` (base build) renders binary resume values as hex.
 hex = { workspace = true }
 # `ravel-proto` is a hard dependency, not gated behind `flight-sql`: ADR-0850's
 # metadata-only aggregate path (`logs_scan`/`metadata_agg`) reads
@@ -317,12 +312,8 @@ path = "tests/logs_scan_allocations.rs"
 name = "scan_batch_allocations"
 path = "tests/scan_batch_allocations.rs"
 
-# Exact deltas on process-wide monotonic tallies, which tests in another file
+# Exact deltas on a process-wide monotonic tally, which tests in another file
 # of the same process could move.
-[[test]]
-name = "declared_stat_carrier_conflicts"
-path = "tests/declared_stat_carrier_conflicts.rs"
-
 [[test]]
 name = "declared_stat_cstat_drops"
 path = "tests/declared_stat_cstat_drops.rs"
@@ -330,10 +321,6 @@ path = "tests/declared_stat_cstat_drops.rs"
 # Assert captured `tracing` output. `tracing` caches a callsite's interest
 # process-wide, so another file's test reaching the same callsite with no
 # subscriber can suppress the line asserted on.
-[[test]]
-name = "declared_stat_conflict_log"
-path = "tests/declared_stat_conflict_log.rs"
-
 [[test]]
 name = "flight_span"
 path = "tests/flight_span.rs"

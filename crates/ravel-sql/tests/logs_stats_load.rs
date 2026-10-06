@@ -45,7 +45,7 @@ use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::util;
-use util::CountingStore;
+use util::{CountingStore, stamped_like};
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
 
@@ -55,9 +55,10 @@ const DECLARED_TYPE_I64: u32 = 2;
 
 /// A fabricated L0 [`SegmentRef`]; the metadata path never fetches the object,
 /// so `data_object_key` need not name a real object. Only `content_hash` joins
-/// it to the injected `ColumnStatsSegment` (v3 keying, ADR-1413).
+/// it to the injected `ColumnStatsSegment` (v3 keying, ADR-1413). It carries
+/// the stamp matching [`status_stat`], without which the entry answers nothing.
 fn seg_ref(seq: u64, sample_count: u64) -> SegmentRef {
-    SegmentRef {
+    let seg = SegmentRef {
         data_object_key: format!("logs/seg-{seq}.rlog"),
         object_size: 1,
         min_event_ts_ns: 0,
@@ -79,7 +80,14 @@ fn seg_ref(seq: u64, sample_count: u64) -> SegmentRef {
         // if anything later did read it.
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         declared_column_stats: Default::default(),
-    }
+    };
+    stamped_like(seg, &status_stat())
+}
+
+/// The `status` entry every eligible test here installs: {200:3, 404:2}, no
+/// nulls, over a five-row segment.
+fn status_stat() -> ColumnStat {
+    i64_stat("status", &[(200, 3), (404, 2)], 0)
 }
 
 fn i64_value(v: i64) -> ColumnValue {
@@ -339,14 +347,14 @@ async fn ineligible_content_predicate_issues_zero_gets() {
 }
 
 /// Deliverable 1 regression, exact TWO. `MIN`/`MAX(status)` (q07) over a
-/// segment with exact statistics must still resolve the stats (the HEAD GET and
-/// the one `.cstat` GET, exactly two) and still answer from catalog metadata:
-/// the plan carries no `LogsScanExec` and no data object is read.
+/// stamped segment with exact statistics must still resolve the stats (the
+/// HEAD GET and the one `.cstat` GET, exactly two) and still answer from
+/// catalog metadata: the plan carries no `LogsScanExec` and no data object is
+/// read. The extrema come from the stamp, so the GET count is what pins the
+/// load.
 ///
 /// Pre-fix demonstration: making `logs_column_stats_eligible` return `false`
-/// skips the load, the provider gets no statistics, `partition_statistics`
-/// cannot report exact min/max, and `LogsScanExec` stays in the plan (and the
-/// GET count is not 2).
+/// skips the load and the GET count reads 0.
 #[tokio::test]
 async fn eligible_min_max_answers_from_metadata_with_two_gets() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -387,6 +395,7 @@ async fn eligible_min_max_answers_from_metadata_with_two_gets() {
 /// `plan.inputs()`, so an eligibility walk that only recurses inputs misses it
 /// and skips the stats load -- which fails open (the nested aggregate falls
 /// back to scanning) but throws away exactly the case ADR-0850 exists for.
+/// The MIN itself comes from the stamp, so the GET count is what pins the load.
 #[tokio::test]
 async fn eligible_min_max_inside_a_scalar_subquery_still_answers_from_metadata() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -423,6 +432,7 @@ async fn eligible_min_max_inside_a_scalar_subquery_still_answers_from_metadata()
 }
 
 /// Deliverable 1 regression, exact TWO. q02 (`COUNT(*) WHERE status <> 200`)
+/// over a segment whose stamp matches its entry
 /// keeps its `status <> 200` residual filter -- `<>` is NEVER pushed to the
 /// prune channel (`int_range_bounds` declines `NotEq`), so the hoist must not
 /// mistake it for a prune predicate and skip the load. The load fires (two
@@ -579,20 +589,25 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
 
     let executor = executor(&store);
 
+    // q02 rather than MIN/MAX: the stamp alone answers MIN/MAX, while this
+    // statement needs the loaded `.cstat` dictionary.
     let (plan, batches) = run(
         &executor,
         snapshot_of(vec![seg]),
-        "SELECT min(status), max(status) FROM logs",
+        "SELECT COUNT(*) FROM logs WHERE status <> 200",
         &status_col(),
     )
     .await;
 
     assert!(
         !plan.contains("LogsScanExec"),
-        "min/max must answer from stats, not a scan; plan was:\n{plan}"
+        "q02 must answer from stats, not a scan; plan was:\n{plan}"
     );
-    assert_eq!(scalar(&batches, 0), Some(200), "min(status)");
-    assert_eq!(scalar(&batches, 1), Some(404), "max(status)");
+    assert_eq!(
+        scalar(&batches, 0),
+        Some(2),
+        "5 non-null minus 3 with value 200"
+    );
     assert_eq!(
         store.gets(),
         2,

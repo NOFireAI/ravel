@@ -54,7 +54,7 @@ use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
 use crate::util;
-use util::CountingStore;
+use util::{CountingStore, stamped_like};
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
 
@@ -294,22 +294,29 @@ fn status_col() -> Vec<DeclaredColumn> {
     vec![DeclaredColumn::new("status", DeclaredType::I64)]
 }
 
-/// The two segments both q02 and q08 read: `status` dictionaries
-/// {200:3, 404:2} (no nulls) and {200:4, 500:1} (one null row).
+/// Segment A's `status` entry: {200:3, 404:2}, no nulls.
+fn status_a() -> ColumnStat {
+    i64_stat("status", &[(200, 3), (404, 2)], 0, true)
+}
+
+/// Segment B's `status` entry: {200:4, 500:1}, one null row.
+fn status_b() -> ColumnStat {
+    i64_stat("status", &[(200, 4), (500, 1)], 1, true)
+}
+
+/// The two segments both q02 and q08 read, [`status_a`] and [`status_b`],
+/// each stamped to match its entry.
 fn two_status_segments() -> (SegmentRef, SegmentRef) {
-    (seg_ref(1, 5), seg_ref(2, 6))
+    (
+        stamped_like(seg_ref(1, 5), &status_a()),
+        stamped_like(seg_ref(2, 6), &status_b()),
+    )
 }
 
 fn status_stats(a: &SegmentRef, b: &SegmentRef) -> Arc<LoadedColumnStats> {
     loaded_stats(vec![
-        (
-            a,
-            stats_segment(a, vec![i64_stat("status", &[(200, 3), (404, 2)], 0, true)]),
-        ),
-        (
-            b,
-            stats_segment(b, vec![i64_stat("status", &[(200, 4), (500, 1)], 1, true)]),
-        ),
+        (a, stats_segment(a, vec![status_a()])),
+        (b, stats_segment(b, vec![status_b()])),
     ])
 }
 
@@ -1052,7 +1059,8 @@ fn eq_record(ts: i64, status: Option<i64>) -> LogRecord {
 
 /// Write `rows` as one real RLOG object under `key` and return the
 /// `SegmentRef` describing it, with the ts span and sample count taken from
-/// the records actually written.
+/// the records actually written and the `status` stamp a writer folds from
+/// them.
 async fn write_real_segment(
     store: &Arc<CountingStore>,
     key: &str,
@@ -1078,7 +1086,7 @@ async fn write_real_segment(
         .put(key, bytes::Bytes::from(bytes), PutOptions::default())
         .await
         .expect("put");
-    SegmentRef {
+    let seg = SegmentRef {
         data_object_key: key.to_string(),
         object_size,
         min_event_ts_ns: rows.iter().map(|(ts, _)| *ts).min().expect("nonempty"),
@@ -1095,7 +1103,8 @@ async fn write_real_segment(
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         declared_column_stats: Default::default(),
-    }
+    };
+    stamped_like(seg, &stat_from_rows(rows))
 }
 
 /// The exact `status` statistics for `rows`: what a correct fold over that
@@ -1360,9 +1369,12 @@ async fn inconsistent_record_declines_at_use_and_scans_correct_answer() {
 /// only checked for the decline would pass against an implementation that
 /// declines on everything and silently deletes the optimisation.
 ///
-/// Prove-the-test: removing the `stat.non_null_count > 0 && (min.is_none() ||
-/// max.is_none())` decline in `declared_min_max_all` makes the plan report
-/// MetadataOnlyExec and the assertion below fails on the plan shape.
+/// The segments are unstamped, as in [`min_max_over`], whose note applies.
+///
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp and remove the
+/// `validate_min_max_presence` decline in `entry_coverage`; the plan then
+/// loses its `LogsScanExec` and the assertion below fails on the plan shape.
 #[tokio::test]
 async fn a_missing_extremum_with_non_null_rows_declines_and_scans() {
     let corpus = RealCorpus::build().await;
@@ -1379,7 +1391,7 @@ async fn a_missing_extremum_with_non_null_rows_declines_and_scans() {
         ),
     ]);
 
-    let snapshot = snapshot_of(vec![corpus.a.clone(), corpus.b.clone()], Vec::new());
+    let snapshot = snapshot_of(vec![unstamped(&corpus.a), unstamped(&corpus.b)], Vec::new());
     let ctx = logs_session(provider(
         &corpus.store,
         snapshot,
@@ -1449,13 +1461,28 @@ fn min_max_i64(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
     (None, None)
 }
 
+/// `seg` without its stamp, so a `.cstat` entry is the only carrier for it.
+fn unstamped(seg: &SegmentRef) -> SegmentRef {
+    SegmentRef {
+        declared_column_stats: Default::default(),
+        ..seg.clone()
+    }
+}
+
 /// Run `SELECT MIN(status), MAX(status) FROM logs` over `corpus`'s two real
-/// segments with `stats` injected, returning the plan text and the answer.
+/// segments, unstamped, with `stats` injected, returning the plan text and the
+/// answer.
+///
+/// The defective entries the callers inject were refused on this path by the
+/// `.cstat` reader's gates when an entry alone could answer MIN/MAX. An entry
+/// no longer answers MIN/MAX without a stamp, so these tests now pin the
+/// answer, not the gate; each gate is pinned per read in
+/// declared_stat_cstat_drops.rs.
 async fn min_max_over(
     corpus: &RealCorpus,
     stats: Arc<LoadedColumnStats>,
 ) -> (String, (Option<i64>, Option<i64>)) {
-    let snapshot = snapshot_of(vec![corpus.a.clone(), corpus.b.clone()], Vec::new());
+    let snapshot = snapshot_of(vec![unstamped(&corpus.a), unstamped(&corpus.b)], Vec::new());
     let ctx = logs_session(provider(&corpus.store, snapshot, status_col(), Some(stats)))
         .expect("session");
     let plan = ctx
@@ -1486,11 +1513,11 @@ async fn min_max_over(
 /// `MIN(status)` came back as 9 in the first ordering and 1 in the second,
 /// against a true minimum of 200 over the real corpus.
 ///
-/// Prove-the-test: replace the poisoned-entry map build in
-/// `declared_min_max_all` with the previous
-/// `.map(|c| (c.name.as_str(), c)).collect()` and both orderings report
-/// `MIN(status)` from a duplicate (9, then 1) with no `LogsScanExec` in the
-/// plan; the plan assertion fails first.
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp and make
+/// `reconciled_column_stat` pick the last entry under a name; both orderings
+/// then report `MIN(status)` from a duplicate with no `LogsScanExec` in the
+/// plan, and the plan assertion fails first.
 #[tokio::test]
 async fn duplicate_column_name_declines_in_either_order_and_scans() {
     for (first, second) in [(1i64, 9i64), (9i64, 1i64)] {
@@ -1534,10 +1561,11 @@ async fn duplicate_column_name_declines_in_either_order_and_scans() {
 /// the real corpus range (-1 and 999) precisely so a pre-fix answer cannot
 /// coincide with the correct one.
 ///
-/// Prove-the-test: delete the `stat.non_null_count == 0 && (min.is_some() ||
-/// max.is_some())` decline (the `validate_min_max_presence` call) in
-/// `declared_min_max_all` and the plan loses its `LogsScanExec` while the
-/// answer becomes `(-1, 999)`; both assertions fail.
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp and delete the
+/// `validate_min_max_presence` decline in `entry_coverage`; the plan loses its
+/// `LogsScanExec` while the answer becomes `(-1, 999)`, and both assertions
+/// fail.
 #[tokio::test]
 async fn all_null_column_carrying_extrema_declines_and_scans() {
     let corpus = RealCorpus::build().await;
@@ -1578,12 +1606,12 @@ async fn all_null_column_carrying_extrema_declines_and_scans() {
 /// the correct one. The plan keeps its `LogsScanExec`, the answer is the true
 /// scanned `(200, 500)`, and the scan reads objects (`gets() > 0`).
 ///
-/// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
-/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). The
-/// entry is
-/// then accepted, the plan loses its `LogsScanExec` for a `MetadataOnlyExec`,
-/// the answer becomes `(-1, 999)`, and `gets()` drops to 0; all three
-/// assertions fail.
+/// Prove-the-test: return the `.cstat` coverage from
+/// `segment_declared_coverage` when there is no stamp and delete the
+/// `accounted != Some(seg.sample_count)` refusal block in
+/// `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). The entry is
+/// then accepted, the plan loses its `LogsScanExec`, the answer becomes
+/// `(-1, 999)`, and `gets()` drops to 0; all three assertions fail.
 #[tokio::test]
 async fn a_row_accounting_mismatch_declines_and_scans() {
     let corpus = RealCorpus::build().await;

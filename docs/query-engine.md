@@ -216,6 +216,17 @@ cannot be proven. The full set of decline conditions:
   the whole-segment dictionary counts.
 - A `Str`-typed typed attribute column, a predicate or group key over a
   column that is not declared, or a segment with no loaded statistics.
+- A segment with no `SegmentRef` stamp for the column (see the next section),
+  or whose stamp does not state the same `min`, `max` and NULL count as its
+  `.cstat` entry. The fold builds the entry from the record-level cells only,
+  while SQL returns the merged value: the record's own attribute, or the
+  resource or scope attribute of the same name when the record does not set
+  it. A row whose value comes from the resource or scope reads NULL to the
+  entry, so the entry's dictionary and sum miss it. The stamp is folded from
+  the merged value, and every row the entry counts as non-null sets the key on
+  the record, which is the value SQL reads for that row; equal NULL counts
+  therefore mean no row took its value from the resource or scope. A `Bytes`
+  column has no stamp, so these shapes always scan it.
 - A segment whose per-value dictionary the fold omitted for exceeding the
   cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
   exact per-value counts, so a derived count could be wrong outright, not
@@ -229,7 +240,7 @@ The ts/content/prune declines are gated by `LogsScanExec::stats_are_exact`,
 which requires no pending erasure, an empty `content`, an empty `prune`, and a
 `ts` bound that contains every touched segment.
 
-## Declared-column MIN/MAX from two statistics carriers
+## Declared-column MIN/MAX from the segment stamps
 
 `SELECT MIN(<typed attribute column>), MAX(<typed attribute column>) FROM logs`
 (ClickBench
@@ -237,31 +248,33 @@ q07's shape) is answered at plan time, with no `LogsScanExec` in the plan and
 zero data GETs, through DataFusion's stock `AggregateStatistics` rule rather
 than through `MetadataOnlyAggregate`: `LogsScanExec::partition_statistics`
 reports the column's `min_value`/`max_value` as `Precision::Exact`, and its
-`null_count` too where that figure is proven, so
+`null_count` too unless the per-segment sum overflows `u64`, so
 `COUNT(<typed attribute column>)` takes the same path. A statement answered
 this way records zero
 `data_objects_touched`, since no segment is opened on either read route.
 
-Two carriers feed it, unioned per segment and per column (ADR-0873 decision
-4):
+The figures come from the `SegmentRef` stamp
+(`SegmentRef::declared_column_stats`, ADR-0873), an exact whole-object min/max
+and NULL count per eligible typed attribute column, read off the commit record
+(field 20), the compaction part (field 12), or the snapshot entry (field 15)
+that resolution already reads. Because it rides those records, it covers the
+live tail above the fold watermark and token-resolved segments, which no
+fold-built sibling object can. The stamp is folded from the merged value SQL
+returns: the record's own attribute when the record sets the key, otherwise
+the resource or scope attribute of the same name.
 
-- the `SegmentRef` stamp (`SegmentRef::declared_column_stats`, ADR-0873), an
-  exact whole-object min/max and NULL count per eligible typed attribute
-  column, read
-  off the commit record (field 20), the compaction part (field 12), or the
-  snapshot entry (field 15) that resolution already reads. Because it rides
-  those records, it covers the live tail above the fold watermark and
-  token-resolved segments, which no fold-built sibling object can;
-- the ADR-0850/0942/1413 `.cstat` entry, joined by the segment's content hash
-  first (`SegmentRef::content_hash`, the ADR-0942/1413 keying scheme for v2
-  whole-tenant and v3 per-part records) and falling back to the entry
-  identity (ingest hour bucket, shard, writer id, writer epoch, writer
-  sequence, the ADR-0850 v1 keying scheme) when no content-hash entry
-  matches, which is the carrier for pre-stamp sealed history and the only
-  carrier for `Bytes` extrema. A declared `Str` column is declined before
-  either carrier is read, since it is projected as a dictionary-encoded
-  string with no scalar form on this path, so `MIN`/`MAX` over one is always
-  answered by the scan.
+The ADR-0850/0942/1413 `.cstat` entry does not answer here. The fold builds it
+from the record-level cells only, so a row whose value comes from the resource
+or scope reads NULL to it, and its extrema and NULL count can differ from what
+SQL returns (a declared key set to 100 on the resource of some rows and 1 to 5
+on the records of others has the entry claim `[1, 5]`). A segment covered by a
+`.cstat` entry and no stamp is read, and where both exist the stamp answers
+and the entry is not compared with it. This replaces the union of the two
+carriers ADR-0873 decision 4 first specified; see that ADR's merged-value
+read amendment. A declared `Str` column is declined
+before any carrier is read, since it is projected as a dictionary-encoded
+string with no scalar form on this path, and a `Bytes` column has no stamp,
+so `MIN`/`MAX` over either is always answered by the scan.
 
 **Which records carry a stamp.** The logs flush stamps each commit record
 with the extrema it accumulated for the tenant's typed attribute columns
@@ -273,9 +286,9 @@ flush for a tenant with no typed attribute columns, or whose stream
 attributes could not be decoded; a compaction part whose inputs carry no
 stamps, or where a stream's attribute blob does not decode; every part an
 erasure rewrite writes, which stamps an empty list by design; and records
-written before the stamp writer shipped. For those segments the answer comes
-from `.cstat` alone. The metrics and span paths write no stamps, which does
-not affect this rule, since it reads only logs segments.
+written before the stamp writer shipped. Those segments are read. The metrics
+and span paths write no stamps, which does not affect this rule, since it
+reads only logs segments.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -287,30 +300,17 @@ The column reports `Absent` -- the rule silently does not fire and the query
 scans, ADR-0849's safety lemma -- whenever any of the following holds, on top
 of the `stats_are_exact` gate above:
 
-- a touched segment that neither carrier covers: never stamped and no `.cstat`
-  entry, which is the permanent state of every pre-ADR-0873 record and of
-  every metrics/spans segment;
-- an entry either carrier's reader refuses: a stamp of an ineligible type, a
-  stamp whose type disagrees with the tenant's declaration, a duplicated
-  entry name (ADR-0873 clause 6 drops every occurrence, so a duplicate never
-  reaches a reader as coverage), a `.cstat` entry whose extrema presence
-  disagrees with its `non_null_count`, or a `.cstat` entry whose row
-  accounting (`non_null_count + null_count`) does not reconcile against the
-  joined `SegmentRef::sample_count`;
-- the two carriers disagreeing about one segment in `min`, `max`, or
-  `null_count`. Nothing is ever combined across carriers: both claim to
-  describe the same rows of one immutable object exactly, so a disagreement
-  means one of them is wrong and no answer is safe.
+- a touched segment with no stamp for the column, whether or not a `.cstat`
+  entry covers it, which is the permanent state of every pre-ADR-0873 record
+  and of every metrics/spans segment;
+- a stamp the reader refuses: a stamp of an ineligible type, a stamp whose
+  type disagrees with the tenant's declaration, or a duplicated entry name
+  (ADR-0873 clause 6 drops every occurrence, so a duplicate never reaches a
+  reader as coverage).
 
-A `.cstat` entry's row accounting is reconciled against the joined
-`SegmentRef::sample_count` before the entry grants anything, and the refusal
-covers the whole entry, extrema included: an entry whose counts do not add up
-to the segment's rows describes rows the object does not have, so no figure it
-carries describes the object the query reads. A `null_count` is reported
-`Exact` only when every covering carrier proved its figure, which means the
-stamp: reconciliation is a fail-closed gate on what a `.cstat` entry may grant,
-not a promotion of its NULL count to a proven one, so a `.cstat`-only column
-answers `MIN`/`MAX` exactly and leaves `COUNT(col)` to the scan.
+The stamp's `null_count` passed the carrier read's row-count clauses, so it is
+reported `Exact` beside the extrema and `COUNT(col)` is answered at plan time
+as well.
 
 One statistics shape is exact and still does not shortcut the query. A declared
 column that reads NULL in every touched row has an exactly-NULL extremum, and
@@ -320,11 +320,11 @@ that is null, so `MIN`/`MAX` over such a column keeps its `LogsScanExec` and
 scans to the same NULL. `COUNT(<typed attribute column>)` on that same column
 is still a plan-time literal (`num_rows - null_count`, exactly 0).
 
-### Defect metrics for the two carriers
+### Defect metric for dropped statistics entries
 
-Two process-wide tallies make the defect classes visible, since a coverage
-regression otherwise reads as a slow query. Both count OBSERVATIONS, which is
-what their names and these paragraphs say, because the distinction decides how
+A process-wide tally makes the defect classes visible, since a coverage
+regression otherwise reads as a slow query. It counts OBSERVATIONS, which is
+what its name and these paragraphs say, because the distinction decides how
 the numbers may be read.
 
 `ravel_commit::declared_stats::declared_stat_drops_observed(carrier)` counts
@@ -345,15 +345,10 @@ through `read_commit_record`, so snapshot-entry drops are observed under the
 `commit-record` label until that call site moves to
 `read_snapshot_entry_twin`.
 
-`ravel_sql::declared_stat_carrier_conflicts` counts carrier disagreements, one
-per (typed attribute column, conflicting segment, `partition_statistics` call).
-Within one call a column counts at most once, since the first conflicting
-segment declines it; across calls nothing is deduplicated, and DataFusion may
-call `partition_statistics` several times while building one plan, so repeated
-statements over one defective segment keep incrementing it. Each observation
-also emits a `warn` log line carrying the segment's `content_hash` and both
-claimed `(min, max, null_count)` triples, which is the artefact a report is
-filed from; the counter is only its rate.
+A stamp and a `.cstat` entry for the same segment and column are not compared
+as a defect check. The entry describes record-level cells and the stamp the
+merged value, so they differ wherever a row takes its value from the resource
+or scope, and no figure they carry tells that difference apart from a defect.
 
 A per-query coverage figure (segments stamped over segments touched, per
 carrier, under phase accounting) is owed to the 996-9 measurement wave and is
@@ -3593,8 +3588,9 @@ record-level cells and a row whose value lives only in the resource or scope
 attributes can match outside its `[min, max]`. A segment with no stamp for the
 column is never skipped by that column's arm; another column's arm or the ts
 window can still drop it. When the scan has loaded the segment's `.cstat`
-entry and it disagrees with the stamp, the segment is not skipped either (the
-conflict rule the declared-column MIN/MAX shortcut uses). A filtered scan
+entry and it differs from the stamp, the segment is not skipped either. This
+is a rule of skipping alone: the declared-column MIN/MAX shortcut answers from
+the stamp whatever the entry says. A filtered scan
 usually does not load `.cstat`, so in practice the stamp alone decides. A segment whose
 column is NULL in every row is skipped for any arm, since its stamp proves the
 NULL count equal to the row count. The comparison runs in signed `i64` order

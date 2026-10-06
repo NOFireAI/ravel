@@ -10,16 +10,16 @@
 //! not an arm here: the provider already drops a ts-irrelevant segment by its
 //! catalog event-time span before this runs.
 //!
-//! The segment's min/max is the one its `SegmentRef` stamp carries, read
-//! through [`crate::logs_scan::segment_declared_coverage`] so a `.cstat` entry
-//! that conflicts with the stamp declines the column, the same conflict rule
-//! `LogsScanExec::partition_statistics` applies. A `.cstat` entry alone never
-//! skips a segment: it tallies only the record-level cells, while SQL returns
-//! the merged value (the record cell, or the resource or scope value a row
-//! falls back to) and the stamp is folded from that merged value, so a row
+//! The segment's min/max is the one its `SegmentRef` stamp carries, the same
+//! coverage `LogsScanExec::partition_statistics` answers from (see
+//! [`crate::logs_scan::segment_declared_coverage`]). A `.cstat` entry alone
+//! never skips a segment: it tallies only the record-level cells, while SQL
+//! returns the merged value (the record cell, or the resource or scope value a
+//! row falls back to) and the stamp is folded from that merged value, so a row
 //! whose value lives only in the resource or scope attributes can match
-//! outside the `.cstat` `[min, max]`. A segment with no stamp for the column,
-//! a conflicting `.cstat` entry, or a `Str` column is never skipped by that
+//! outside the `.cstat` `[min, max]`. A loaded `.cstat` entry that differs from
+//! the stamp also keeps the segment. A segment with no stamp for the column,
+//! a differing `.cstat` entry, or a `Str` column is never skipped by that
 //! column's arm; another column's arm or the `ts` window can still drop it. A
 //! segment whose column holds no non-null value is skippable for any arm,
 //! because NULL satisfies no comparison, and the stamp proves its NULL count
@@ -35,7 +35,7 @@ use ravel_logseg::{FieldSel, FieldType, Predicate};
 use ravel_proto::catalog::v1::ColumnStatsSegment;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
-use crate::logs_scan::{segment_column_stats, segment_declared_coverage, stamp_coverage};
+use crate::logs_scan::{cstat_coverage, segment_column_stats, stamp_coverage};
 
 /// One `NumRange` arm resolved to the declared column it constrains, with its
 /// inclusive bounds decoded back to i64 space (a `Bool` as `0`/`1`).
@@ -93,14 +93,16 @@ fn arm_excludes(
     seg: &SegmentRef,
     seg_stats: Option<&ColumnStatsSegment>,
 ) -> bool {
-    if stamp_coverage(arm.column, &seg.declared_column_stats).is_none() {
-        return false;
-    }
-    // With a stamp present this is the stamp's triple, or `None` when a
-    // `.cstat` entry disagrees with it.
-    let Some(coverage) = segment_declared_coverage(arm.column, seg, seg_stats) else {
+    let Some(coverage) = stamp_coverage(arm.column, &seg.declared_column_stats) else {
         return false;
     };
+    // ADR-2121 D1 skips only on a stamp no `.cstat` entry disagrees with. The
+    // difference is expected wherever a row takes its value from the resource
+    // or scope, so it is not reported as a defect; it only keeps the segment.
+    if cstat_coverage(arm.column, seg, seg_stats).is_some_and(|entry| !coverage.agrees_with(&entry))
+    {
+        return false;
+    }
     match (coverage.min.as_ref(), coverage.max.as_ref()) {
         (Some(min), Some(max)) => {
             let (Some(seg_min), Some(seg_max)) = (scalar_i64(min), scalar_i64(max)) else {
@@ -108,7 +110,7 @@ fn arm_excludes(
             };
             arm.max.is_some_and(|q| q < seg_min) || arm.min.is_some_and(|q| q > seg_max)
         }
-        (None, None) => coverage.null_count_proven && coverage.null_count == seg.sample_count,
+        (None, None) => coverage.null_count == seg.sample_count,
         _ => false,
     }
 }

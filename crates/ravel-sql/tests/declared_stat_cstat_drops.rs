@@ -1,6 +1,7 @@
-//! The `.cstat` half of the ADR-0873 decision 2 defect metric: the second
-//! carrier of the declared-statistics union is read in `ravel_sql`, so its
-//! refusals are reported to
+//! The `.cstat` half of the ADR-0873 decision 2 defect metric: the `.cstat`
+//! entry is read in `ravel_sql` (by `partition_statistics` too, although there
+//! it never answers, since it describes record-level cells rather than the
+//! merged value SQL returns), so its refusals are reported to
 //! `ravel_commit::declared_stats::declared_stat_drops_observed` under the
 //! `cstat` label. One metric, four carrier labels; a defect in the `.cstat`
 //! build would otherwise be the one carrier whose refusals nothing counts.
@@ -22,7 +23,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::common::stats::Precision;
-use datafusion::scalar::ScalarValue;
 use ravel_catalog::{
     DeclaredColumnStats, EntryIdentity, LoadedColumnStats, SegmentLevel, SegmentRef, Snapshot,
 };
@@ -207,9 +207,8 @@ fn a_duplicated_cstat_column_name_is_counted_once() {
 /// defect, both leave the column uncovered, and both are counted.
 ///
 /// Prove-the-test: replace the `if validate_min_max_presence(stat).is_err()`
-/// block in `cstat_coverage` with `let _ = validate_min_max_presence(stat);`
-/// and both deltas read 0 while the extrema come from a record that describes
-/// no live row.
+/// block in `entry_coverage` with `let _ = validate_min_max_presence(stat);`
+/// and both deltas read 0.
 #[test]
 fn a_presence_contradiction_is_counted_once_in_either_direction() {
     // Extrema present, zero non-null rows.
@@ -237,8 +236,8 @@ fn absence_and_validity_leave_the_cstat_label_untouched() {
     let (col, mine, others) = resolve(seg_ref(4), vec![cstat(COL, 200, 500, 1)]);
     assert_eq!(
         col.min_value,
-        Precision::Exact(ScalarValue::Int64(Some(200))),
-        "a valid entry still answers"
+        Precision::Absent,
+        "an entry with no stamp beside it answers nothing"
     );
     assert_eq!((mine, others), (0, 0), "a valid entry is not a defect");
 
@@ -287,10 +286,11 @@ fn raw_stat(
 /// reconciliation refuses it.
 ///
 /// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
-/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). Both
-/// extrema then reach `Precision::Exact(200)`/`Exact(500)` from an unreconciled entry
-/// and the delta reads 0, which is the exact state #1023 item 3 was filed
-/// about; the `Absent` and `mine == 1` assertions both fail.
+/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs) and
+/// the delta reads 0, failing `mine == 1`. The `Absent` assertions hold either
+/// way, since a `.cstat` entry no longer answers MIN/MAX at all; the dictionary
+/// and sum paths' reconciliation is pinned in `logs_scan`'s
+/// `cstat_reconcile_tests`.
 #[test]
 fn a_row_accounting_mismatch_grants_nothing_and_is_counted() {
     let (col, mine, others) = resolve(seg_ref(7), vec![raw_stat(2, 1, Some(200), Some(500))]);
@@ -318,10 +318,8 @@ fn a_row_accounting_mismatch_grants_nothing_and_is_counted() {
 /// exact NULL over a segment that actually holds four rows.
 ///
 /// Prove-the-test: delete the same `accounted != Some(seg.sample_count)` block.
-/// The entry is then accepted, the single-segment column reports
-/// `Precision::Exact(Int64(None))` (an exact NULL) with the delta at 0, and the
-/// `Absent`/`mine == 1` assertions fail -- the silent nothing-contribution the
-/// wave-4 checkpoint named.
+/// The entry is then accepted with the delta at 0, and the `mine == 1`
+/// assertion fails. As above, the `Absent` assertions hold either way.
 #[test]
 fn a_stale_all_null_entry_grants_nothing_and_is_counted() {
     let (col, mine, others) = resolve(seg_ref(8), vec![raw_stat(0, 0, None, None)]);
@@ -336,19 +334,19 @@ fn a_stale_all_null_entry_grants_nothing_and_is_counted() {
     assert_eq!(others, 0, "and under the cstat label only");
 }
 
-/// A reconciled, consistent entry keeps today's behavior exactly: the
-/// [`cstat`] helper balances `non_null_count + null_count` to `SAMPLE_COUNT`, so
-/// the reconciliation is a no-op and the entry answers with `Exact` extrema and
-/// no drop, identical to `absence_and_validity_leave_the_cstat_label_untouched`
-/// above. Pinned separately so a reconciliation that rejected a VALID entry
-/// (an off-by-one, a wrong comparand) would fail here rather than pass silently.
+/// A reconciled, consistent entry is not counted: the [`cstat`] helper balances
+/// `non_null_count + null_count` to `SAMPLE_COUNT`, so the reconciliation is a
+/// no-op. The column stays `Absent` because the entry describes record-level
+/// cells and never answers without a stamp. Pinned separately so a
+/// reconciliation that rejected a VALID entry (an off-by-one, a wrong
+/// comparand) would fail here on the drop count rather than pass silently.
 #[test]
-fn a_reconciled_entry_keeps_todays_behavior() {
+fn a_reconciled_entry_is_not_counted() {
     let (col, mine, others) = resolve(seg_ref(9), vec![cstat(COL, 200, 500, 1)]);
+    assert_eq!(col.min_value, Precision::Absent, "no stamp, no answer");
     assert_eq!(
-        col.min_value,
-        Precision::Exact(ScalarValue::Int64(Some(200))),
-        "3 non-null + 1 null == 4 == sample_count, so the entry still answers"
+        (mine, others),
+        (0, 0),
+        "3 non-null + 1 null == 4 == sample_count, so the entry is not a defect"
     );
-    assert_eq!((mine, others), (0, 0), "a reconciled entry is not a defect");
 }
