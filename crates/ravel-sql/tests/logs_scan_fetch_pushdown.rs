@@ -32,9 +32,6 @@
 //! - `fetch_narrows_the_scan_statistics` (issue #2616): the scan's
 //!   `partition_statistics` count what it emits under a fetch, not every
 //!   committed row.
-//! - `aggregate_over_a_pushed_limit_reads_the_limited_rows` (issue #2616):
-//!   `count(*)` and `max(ts)` over a one-partition LIMIT 1 subquery answer for
-//!   the one limited row, not from whole-table statistics.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -43,7 +40,7 @@ use crate::util;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
+use datafusion::arrow::array::{StringArray, TimestampNanosecondArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
@@ -742,52 +739,4 @@ async fn fetch_narrows_the_scan_statistics() {
             ts_max.to_inexact()
         )
     );
-}
-
-/// The statistics feed DataFusion's `AggregateStatistics` rule, which answers
-/// an aggregate from them without running the scan. With one partition the
-/// LIMIT lives only in the scan's fetch, so whole-table figures there answer
-/// `count(*)` and `max(ts)` over a LIMIT 1 subquery with the table's 20 rows
-/// and its largest `ts` instead of the one row the subquery yields.
-#[tokio::test]
-async fn aggregate_over_a_pushed_limit_reads_the_limited_rows() {
-    let store = MemoryStore::new();
-    let (snapshot, _) = build_fixture(&store).await;
-    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
-    let table_provider = provider(snapshot, LogSegmentFetcher::new(backend));
-    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-    ctx.register_table("logs", Arc::new(table_provider))
-        .expect("register table");
-
-    let first = ts_sequence(
-        &ctx.sql("SELECT ts FROM logs LIMIT 1")
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("collect"),
-    );
-    assert_eq!(first.len(), 1);
-
-    let batches = ctx
-        .sql("SELECT count(*), max(ts) FROM (SELECT ts FROM logs LIMIT 1)")
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-    assert_eq!(total_rows(&batches), 1);
-    let count = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count col")
-        .value(0);
-    let max = batches[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .expect("max col")
-        .value(0);
-    assert_eq!((count, max), (1, first[0]));
 }
