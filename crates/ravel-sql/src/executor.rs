@@ -95,7 +95,8 @@ use datafusion::execution::SessionState;
 use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{
-    Aggregate, Distinct, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort, SortExpr, lit,
+    Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort,
+    SortExpr, lit,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
@@ -4058,7 +4059,16 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 ///   projected through it. A `Sort` the rewrite cannot reach this way -- its
 ///   input is any other shape (a `HAVING` filter, a nested projection), or
 ///   the aggregate groups by grouping sets -- is left unchanged and stays
-///   ineligible. `Join` and `Window` are outside the allowlist for the
+///   ineligible. A `DISTINCT ON` keeps its `ORDER BY` inside the `Distinct`
+///   node, which the optimizer turns into an ordered `first_value` aggregate,
+///   so an order that ties within an ON group picks its surviving row by
+///   input order, and a spill changes input order. `Distinct::On` is
+///   therefore admitted only when its `ORDER BY` is already total
+///   ([`distinct_on_order_is_total`]): every output column of the node must
+///   appear among the `ORDER BY` terms as a plain column reference. Nothing
+///   appends tiebreak terms to it; a `DISTINCT ON` without such an order is
+///   ineligible. Plain `DISTINCT` (`Distinct::All`) picks no row and is
+///   admitted. `Join` and `Window` are outside the allowlist for the
 ///   original reason, one level up: nothing here has classified their spill
 ///   behavior.
 /// - every aggregate expression is exactness-preserving under spill
@@ -4118,7 +4128,9 @@ fn clone_session_table(table: &SessionTable) -> SessionTable {
 }
 
 /// [`plan_is_spill_eligible`], except a `Sort` is always treated as a
-/// classifiable shape rather than requiring an already-total sort key.
+/// classifiable shape rather than requiring an already-total sort key. A
+/// `DISTINCT ON` is still held to [`distinct_on_order_is_total`], since the
+/// rewrite never edits its order.
 ///
 /// Used only to decide whether [`rewrite_sort_group_key_tie_order`] is worth
 /// attempting on a plan: a plan this predicate rejects cannot become eligible
@@ -4165,12 +4177,13 @@ fn plan_nodes_are_spill_classifiable_with(
 ) -> bool {
     let classifiable = match plan {
         LogicalPlan::Sort(sort) => sort_admits(sort),
+        LogicalPlan::Distinct(Distinct::On(distinct_on)) => distinct_on_order_is_total(distinct_on),
         _ => matches!(
             plan,
             LogicalPlan::Projection(_)
                 | LogicalPlan::Filter(_)
                 | LogicalPlan::Aggregate(_)
-                | LogicalPlan::Distinct(_)
+                | LogicalPlan::Distinct(Distinct::All(_))
                 | LogicalPlan::TableScan(_)
                 | LogicalPlan::SubqueryAlias(_)
                 | LogicalPlan::Limit(_)
@@ -4211,6 +4224,30 @@ fn plan_nodes_are_spill_classifiable_with(
         }
     }
     true
+}
+
+/// Whether a `DISTINCT ON` node's own `ORDER BY` decides which row of each ON
+/// group survives: every output column, its alias stripped, must be a plain
+/// column reference that some `ORDER BY` term names exactly, qualifier
+/// included. Two rows the order then ties on agree in every output column, so
+/// the input order a spill changes cannot change the answer. No `ORDER BY` at
+/// all is never total.
+fn distinct_on_order_is_total(distinct_on: &DistinctOn) -> bool {
+    let Some(sort_expr) = &distinct_on.sort_expr else {
+        return false;
+    };
+    distinct_on.select_expr.iter().all(|expr| {
+        let inner = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        };
+        let Expr::Column(column) = inner else {
+            return false;
+        };
+        sort_expr
+            .iter()
+            .any(|term| matches!(&term.expr, Expr::Column(term_column) if term_column == column))
+    })
 }
 
 /// Name prefix of the column a group key the `Projection` under a `Sort` drops
@@ -6118,6 +6155,62 @@ mod tests {
         );
     }
 
+    /// The grouped subquery the `DISTINCT` cases below read: its `Aggregate`
+    /// is spill-exact, so the `Distinct` node over it is what decides.
+    const GROUPED_Q33: &str = "(SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b) s";
+
+    /// Whether `plan` holds a `Distinct` node of the `DISTINCT ON` kind.
+    fn has_distinct_on(plan: &LogicalPlan) -> bool {
+        matches!(find_distinct(plan), Some(Distinct::On(_)))
+    }
+
+    /// A `DISTINCT ON` whose `ORDER BY c DESC` ties within a `b` group keeps
+    /// whichever tied row reaches it first, so it is not spill-eligible, and
+    /// the tie-order rewrite cannot make it so. Naming every output column in
+    /// the `ORDER BY` makes it eligible; plain `DISTINCT` stays eligible.
+    #[tokio::test]
+    async fn distinct_on_is_spill_eligible_only_with_a_total_order() {
+        let tied = q33_plan(&format!(
+            "SELECT DISTINCT ON (b) b, a, c FROM {GROUPED_Q33} ORDER BY b, c DESC"
+        ))
+        .await;
+        assert!(has_distinct_on(&tied), "the statement plans a DISTINCT ON");
+        assert!(
+            !plan_is_spill_eligible(&tied),
+            "an ORDER BY that ties within an ON group must not spill"
+        );
+        assert!(!plan_is_spill_eligible_ignoring_sort_order(&tied));
+
+        let unordered = q33_plan(&format!("SELECT DISTINCT ON (b) b, a FROM {GROUPED_Q33}")).await;
+        assert!(has_distinct_on(&unordered));
+        assert!(!plan_is_spill_eligible(&unordered));
+
+        let total = q33_plan(&format!(
+            "SELECT DISTINCT ON (b) b, a, c FROM {GROUPED_Q33} ORDER BY b, c DESC, a"
+        ))
+        .await;
+        assert!(has_distinct_on(&total));
+        assert!(
+            plan_is_spill_eligible(&total),
+            "an ORDER BY naming every output column decides the surviving row"
+        );
+
+        let plain = q33_plan(&format!("SELECT DISTINCT b, c FROM {GROUPED_Q33}")).await;
+        assert!(matches!(find_distinct(&plain), Some(Distinct::All(_))));
+        assert!(
+            plan_is_spill_eligible(&plain),
+            "plain DISTINCT is unaffected"
+        );
+    }
+
+    /// The first `Distinct` node found by depth-first walk.
+    fn find_distinct(plan: &LogicalPlan) -> Option<&Distinct> {
+        if let LogicalPlan::Distinct(distinct) = plan {
+            return Some(distinct);
+        }
+        plan.inputs().into_iter().find_map(find_distinct)
+    }
+
     /// Every term of the first `Sort` in `plan`, as `(qualifier, name, asc,
     /// nulls_first)`, so a test can pin the exact key including which
     /// relation each column belongs to.
@@ -6438,6 +6531,16 @@ mod tests {
 
     /// Pin a spill-eligible statement over an empty `samples` snapshot.
     async fn pin_spill_eligible(executor: &SqlExecutor) -> PinnedQuery {
+        pin_samples_statement(
+            executor,
+            "SELECT ts, series_id, count(*) AS c FROM samples \
+             GROUP BY ts, series_id ORDER BY c DESC LIMIT 10",
+        )
+        .await
+    }
+
+    /// Pin `sql` over an empty `samples` snapshot.
+    async fn pin_samples_statement(executor: &SqlExecutor, sql: &str) -> PinnedQuery {
         let snapshot = Snapshot {
             segments: Vec::new(),
             segments_pruned: 0,
@@ -6447,13 +6550,63 @@ mod tests {
             .plan_pinned(
                 TenantHash([110u8; 16]),
                 snapshot,
-                "SELECT ts, series_id, count(*) AS c FROM samples \
-                 GROUP BY ts, series_id ORDER BY c DESC LIMIT 10",
+                sql,
                 &QueryAccounting::new(),
                 &[],
             )
             .await
             .expect("the statement plans")
+    }
+
+    /// The grouped subquery the `DISTINCT ON` spill-grant case reads: its
+    /// `Aggregate` is spill-exact, so the plan is eligible unless the
+    /// `Distinct` node over it is not.
+    const GROUPED_SAMPLES: &str =
+        "(SELECT ts, series_id, count(*) AS c FROM samples GROUP BY ts, series_id) s";
+
+    /// A `DISTINCT ON` whose `ORDER BY` ties within an ON group pins with
+    /// spill disabled, so a spilled run cannot keep a different tied row than
+    /// an in-memory one; the same statement with every output column in its
+    /// `ORDER BY` is granted spill. Granted only one at a time, since the
+    /// first grant reserves the whole ceiling.
+    #[tokio::test]
+    async fn a_distinct_on_with_tied_ordering_is_not_granted_spill() {
+        let root = tempfile::tempdir().expect("spill root");
+        let executor = spill_test_executor(root.path(), 1 << 30);
+
+        let tied = pin_samples_statement(
+            &executor,
+            &format!(
+                "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
+                 ORDER BY series_id, c DESC"
+            ),
+        )
+        .await;
+        assert!(has_distinct_on(tied.frame.logical_plan()));
+        assert!(
+            tied.scratch.is_none(),
+            "a DISTINCT ON whose order ties within a group must not be granted spill"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            0,
+            "no scratch directory is created for it"
+        );
+        drop(tied);
+
+        let total = pin_samples_statement(
+            &executor,
+            &format!(
+                "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
+                 ORDER BY series_id, c DESC, ts"
+            ),
+        )
+        .await;
+        assert!(has_distinct_on(total.frame.logical_plan()));
+        assert!(
+            total.scratch.is_some(),
+            "a DISTINCT ON whose order names every output column keeps its spill grant"
+        );
     }
 
     /// ADR-0954 requirement 2 (issue #2416): one executor's statements share
