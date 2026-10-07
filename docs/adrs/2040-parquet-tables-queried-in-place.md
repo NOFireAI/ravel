@@ -1151,10 +1151,14 @@ deleted. Without either flag it deletes nothing. It runs under the Maintain
 credential, whose `MaintainDelete` statement grants `s3:DeleteObject` on
 `t/*/pq/t/*` and whose `MaintainList` statement grants the `t/*/pq/t/*`
 listing. Maintain reads no manifest (`MaintainRead` has no grant under
-`t/*/pq/`), so which versions are flagged is decided from the listing alone,
-and the command reports `created_by` and `statement` as unreadable under it;
-running it without a delete flag under a credential that may read manifests,
-such as Query, shows them.
+`t/*/pq/`; superseded by the manifest authentication amendment below), so
+which versions are flagged is decided from the listing alone, and the command
+reports `created_by` and `statement` as unreadable under it; running it
+without a delete flag under a credential that may read manifests, such as
+Query, shows them. (The manifest authentication amendment below grants
+Maintain `s3:GetObject` on the manifests, so `created_by` and `statement`
+become readable under it too; which versions are flagged is still decided from
+the listing.)
 
 **A forged version at or below the bound.** The bound removes the automatic
 wedge from versions above 2^32 and from keys that name no version. It does
@@ -1190,10 +1194,11 @@ which the invalid table segment amendment below closes for the keys the
 store can list. A key whose extra segments
 sit under a valid table's own `v/` prefix, by contrast, is now a key that
 names no version, skipped and flagged like the rest. Narrowing the Query
-grant, item 1 of issue #2430, remains the root
+grant, item 1 of issue #2430 (renumbered to item 3 by the manifest
+authentication amendment below), remains the root
 fix for all of these; until then the sweep also still deletes predecessors
 on the word of a manifest no one can attribute, when that manifest is at or
-below the bound.
+below the bound (retired by the manifest authentication amendment below).
 
 ## Amendment (2026-10-05): the concurrency bar judges no error ratio
 
@@ -1339,7 +1344,8 @@ recreated under a name that is not reserved, `--stray --delete
 --include-reserved-names` removes the old manifests that amendment says to
 delete by hand.
 
-**What stays open.** Narrowing the Query grant, item 1 of issue #2430, is
+**What stays open.** Narrowing the Query grant, item 1 of issue #2430
+(renumbered to item 3 by the manifest authentication amendment below), is
 still the root fix: until it lands, a stolen Query credential can put such
 keys, every tenant-wide listing pages through them until an operator
 removes them, and on S3 one key of a shape the adapter cannot list fails
@@ -1374,3 +1380,29 @@ differently:
    error ratio but not in rule 2, so rule 2 can pass beside a nonzero
    ratio over those statements; the run still fails, through
    `ConcurrencyPhaseFailed`.
+
+## Amendment (2026-10-08, ADR-2430): the sweep authenticates the newest manifest before deleting predecessors
+
+<!-- amendment-supersedes: phrase="the sweep also still deletes predecessors on the word of a manifest no one can attribute" pointer="manifest authentication amendment" -->
+<!-- amendment-supersedes: phrase="Maintain reads no manifest" pointer="manifest authentication amendment" -->
+<!-- amendment-supersedes: phrase="item 1 of issue #2430" pointer="manifest authentication amendment" -->
+
+ADR-2430 closes the sweep's data-loss path. The writer now MACs each manifest
+with a key derived from the deployment key, and the sweep verifies the newest
+version's MAC before deleting any predecessor. A version a create-only
+credential forged carries no valid MAC, so the sweep holds its predecessors
+rather than deleting them on its word.
+
+The sweep (Maintain role) gains `s3:GetObject` on `t/*/pq/t/*/v/*.pqm` to read
+the manifest it verifies, a posture change this ADR had withheld: Maintain now
+reads manifests, so the earlier "Maintain reads no manifest" statement and the
+repair command's reporting of `created_by` and `statement` as unreadable are
+superseded; the repair command can show them under the grant, and still flags
+versions from the listing.
+
+Numbering: issue #2430's Decision lists item 1 as the sweep attribution landed
+here, item 2 as the version bound (above), and item 3 as a narrower control
+credential for DDL. This ADR's earlier text called the Query-grant narrowing
+"item 1 of issue #2430"; that narrowing is issue #2430's item 3, still the
+root fix and still open. See ADR-2430 for the two-release readers-first
+rollout, the unkeyed-bucket fallback, and the quiescent-table consequence.
