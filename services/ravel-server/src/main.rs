@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         .resolve_performance(host)
         .context("failed to resolve the host-derived performance defaults")?;
     performance.emit(host);
+    configure_allocator();
     // ADR-1702 decision 3: the read and write CPU gates' permits, derived from
     // the same host profile unless a flag sets them.
     let cpu_gate_permits = cli.resolve_cpu_gate_permits(host);
@@ -704,6 +705,16 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Enables jemalloc's background purge thread unless `_RJEM_MALLOC_CONF`
+/// sets it, and stamps the read-back state beside the memory defaults
+/// (issue #2633). Runs before any listener binds.
+fn configure_allocator() -> ravel_server::mem_stats::BackgroundThread {
+    let malloc_conf = std::env::var(ravel_server::mem_stats::MALLOC_CONF_ENV).ok();
+    let state = ravel_server::mem_stats::configure_background_thread(malloc_conf.as_deref());
+    state.emit();
+    state
+}
+
 /// Whether a loaded rules file will never be evaluated because the process mode
 /// does not run the alert evaluator. The evaluator spawns only in the
 /// modes that build a query engine ([`Mode::All`] and [`Mode::Query`]; see
@@ -769,6 +780,79 @@ mod tests {
              allocation: the process is not running under the jemalloc global allocator"
         );
         std::hint::black_box(big);
+    }
+
+    /// A `tracing` writer appending every emitted byte to a shared buffer.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #2633: the startup step this binary's `main` runs leaves
+    /// jemalloc's background purge thread enabled in the process that links
+    /// jemalloc as its global allocator, and the startup stamp names the
+    /// read-back state.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn startup_enables_and_stamps_the_allocator_background_thread() {
+        use tikv_jemalloc_ctl::background_thread;
+
+        assert!(
+            std::env::var_os(ravel_server::mem_stats::MALLOC_CONF_ENV).is_none(),
+            "this test asserts the default path; unset _RJEM_MALLOC_CONF to run it"
+        );
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CapturedLog(buffer.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let state = tracing::subscriber::with_default(subscriber, configure_allocator);
+
+        assert!(
+            background_thread::read().expect("background_thread read must succeed"),
+            "the startup step must leave jemalloc's background thread enabled"
+        );
+        assert!(state.enabled);
+        assert_eq!(state.source, "server");
+        let logged = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+            .expect("log bytes are utf-8");
+        assert_eq!(
+            logged.matches("allocator_background_thread=true").count(),
+            1,
+            "the startup stamp must name the read-back state once, got: {logged:?}"
+        );
+        assert!(
+            logged.contains("source=\"server\""),
+            "got: {logged:?}"
+        );
+    }
+
+    /// `main` runs the allocator step exactly once, before any listener
+    /// binds: it sits beside the performance stamps, which precede `start`.
+    #[test]
+    fn main_runs_the_allocator_step_once_before_start() {
+        const SRC: &str = include_str!("main.rs");
+        let call = concat!("\n    configure_", "allocator();\n");
+        assert_eq!(SRC.matches(call).count(), 1);
+        let call_at = SRC.find(call).expect("call present");
+        let start_at = SRC
+            .find(concat!("ravel_server::", "start_with_heartbeat("))
+            .expect("main starts the server");
+        assert!(call_at < start_at, "the allocator step must run before start");
     }
 
     /// ADR-1733 decision 2 reachability: the one production `ServerConfig`
