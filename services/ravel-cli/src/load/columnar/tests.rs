@@ -25,11 +25,16 @@ fn roundtrip_parquet(batch: &RecordBatch) -> RecordBatch {
 /// through plain inference, and the two RLOG objects must be equal and hash
 /// to the pinned BLAKE3.
 ///
+/// The typed fixture (#2625) adds every attribute type in one file:
+/// dictionary-encoded and plain strings, ints of two widths, floats holding
+/// NaN payloads, -0.0 and 0.0, bools, bytes, empty values and nulls, plus a
+/// string key two columns share.
+///
 /// Prove-the-test: change `observed_ts_ns` to `push(0)` (instead of
 /// `raw_ts`), or drop the `TsUnit` scaling in `TsSrc::get` (return the raw
-/// value), or set `use_dict` to `false` unconditionally -- each flips a byte
-/// and the `assert_eq!` on the objects fails. Confirmed by making the
-/// `observed_ts_ns` flip: the objects diverged and the assertion tripped.
+/// value) -- each flips a byte and the `assert_eq!` on the objects fails.
+/// Confirmed by making the `observed_ts_ns` flip: the objects diverged and
+/// the assertion tripped.
 #[test]
 fn columnar_load_matches_row_load_byte_for_byte() {
     use arrow::array::DictionaryArray;
@@ -194,43 +199,141 @@ fn columnar_load_matches_row_load_byte_for_byte() {
         "object bytes with the dictionary-preserving schema"
     );
 
-    let dict_pos = col_on
-        .dyn_columns
-        .iter()
-        .position(|c| c.name == "dictkey")
-        .expect("dictkey column");
-    let plain_pos = col_on
-        .dyn_columns
-        .iter()
-        .position(|c| c.name == "plainkey")
-        .expect("plainkey column");
+    // The loader reads a dictionary column's cells in place and attaches no
+    // dictionary (#2625), whichever way the file was read.
+    assert!(
+        col_off.dyn_col_dicts.is_empty() && col_on.dyn_col_dicts.is_empty(),
+        "the columnar build attaches no StrColumnDict"
+    );
 
-    // Without the loader's schema, only the arrow-written dictionary column
-    // reaches the StrColumnDict fast path (#605's original expectation).
-    assert!(
-        col_dict(&col_off, dict_pos).is_some(),
-        "the arrow-written dictionary column passes through as a StrColumnDict"
-    );
-    assert!(
-        col_dict(&col_off, plain_pos).is_none(),
-        "without the loader's schema the plain-written column stays plain"
-    );
-    // With it, so does the plain-written one, because the file
-    // dictionary-encodes it (#660).
-    assert!(
-        col_dict(&col_on, dict_pos).is_some(),
-        "the arrow-written dictionary column still passes through as a StrColumnDict"
-    );
-    assert!(
-        col_dict(&col_on, plain_pos).is_some(),
-        "the plain-written but dictionary-encoded column now passes through as a StrColumnDict"
-    );
+    // The typed fixture: every attribute type, with the float bit patterns
+    // a value comparison cannot tell apart.
+    let nan_payload = f64::from_bits(0x7ff8_0000_0000_0001);
+    let typed = batch(vec![
+        (
+            "ts",
+            i64_col(vec![NOW_NS, NOW_NS + 1, NOW_NS + 2, NOW_NS + 3, NOW_NS + 4]),
+        ),
+        (
+            "dstr",
+            Arc::new(
+                vec![Some("x"), Some(""), None, Some("x"), Some("yy")]
+                    .into_iter()
+                    .collect::<DictionaryArray<Int32Type>>(),
+            ) as ArrayRef,
+        ),
+        (
+            "pstr",
+            Arc::new(StringArray::from(vec![
+                Some("p0"),
+                None,
+                Some(""),
+                Some("p3"),
+                Some("p4"),
+            ])) as ArrayRef,
+        ),
+        (
+            "i64",
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                Some(-1),
+                None,
+                Some(0),
+                Some(i64::MAX),
+            ])) as ArrayRef,
+        ),
+        (
+            "i32",
+            Arc::new(Int32Array::from(vec![
+                None,
+                Some(-7),
+                Some(7),
+                None,
+                Some(0),
+            ])) as ArrayRef,
+        ),
+        (
+            "f64",
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(-0.0),
+                Some(0.0),
+                None,
+                Some(nan_payload),
+            ])) as ArrayRef,
+        ),
+        (
+            "bool",
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                None,
+                Some(false),
+                Some(false),
+                None,
+            ])) as ArrayRef,
+        ),
+        (
+            "bin",
+            Arc::new(BinaryArray::from(vec![
+                Some(&b""[..]),
+                Some(&b"\x00\xff"[..]),
+                None,
+                Some(&b"b"[..]),
+                None,
+            ])) as ArrayRef,
+        ),
+    ]);
+    let (_typed_dir, typed_pq) = write_parquet(&typed);
+    let mut m = base_mapping();
+    m.attributes = vec![
+        attr("s", "dstr", ColType::Str),
+        attr("s", "pstr", ColType::Str),
+        attr("p", "pstr", ColType::Str),
+        attr("n", "i64", ColType::I64),
+        attr("m", "i32", ColType::I64),
+        attr("f", "f64", ColType::F64),
+        attr("b", "bool", ColType::Bool),
+        attr("x", "bin", ColType::Bytes),
+    ];
+    for loader_schema in [true, false] {
+        let read = read_parquet(&typed_pq, loader_schema);
+        let dstr = read.schema().index_of("dstr").expect("dstr present");
+        assert!(
+            matches!(read.column(dstr).data_type(), DataType::Dictionary(_, _)),
+            "the dictionary string column arrives a Dictionary"
+        );
+        let col = assert_paths_match(&read, &m);
+        let f = col
+            .dyn_columns
+            .iter()
+            .find(|c| c.name == "f")
+            .expect("f column");
+        let bits: Vec<u64> = match &f.cells {
+            DynCells::F64(v) => v.iter().map(|x| x.to_bits()).collect(),
+            other => panic!("f is not an F64 column: {other:?}"),
+        };
+        assert_eq!(
+            bits,
+            vec![
+                f64::NAN.to_bits(),
+                (-0.0_f64).to_bits(),
+                0.0_f64.to_bits(),
+                nan_payload.to_bits()
+            ],
+            "NaN payloads and -0.0 survive the load bit for bit"
+        );
+        assert!(
+            col.residual_attrs[0] == vec![("s".to_string(), AttrValue::Str("p0".to_string()))],
+            "the second column of a shared key is the row's residual"
+        );
+    }
 }
 
 /// With no id column mapped, the columnar path reads its mapped dictionary
 /// columns in place: none is flattened ahead of it (only a mapped id column
 /// is, which `the_columnar_path_resolves_each_mapped_id_column_once` pins),
-/// and a dictionary attribute still reaches the `StrColumnDict` fast path.
+/// and a dictionary attribute's cells are read in place, with no
+/// `StrColumnDict` attached (#2625).
 /// The row path resolves the same batch's dictionary columns once each, and
 /// the two build the same batch.
 ///
@@ -281,15 +384,16 @@ fn the_columnar_path_resolves_no_dictionary_column_when_no_id_column_is_mapped()
         "nor resolves a dictionary key per cell"
     );
     assert_eq!(col.num_rows, ROWS, "every row is built");
-    let pos = col
+    let cat = col
         .dyn_columns
         .iter()
-        .position(|c| c.name == "cat")
+        .find(|c| c.name == "cat")
         .expect("cat column");
     assert!(
-        col_dict(&col, pos).is_some(),
-        "the dictionary attribute keeps its StrColumnDict"
+        col.dyn_col_dicts.is_empty(),
+        "the dictionary attribute's cells are read in place, with no StrColumnDict"
     );
+    assert_eq!(cat.cells.len(), ROWS, "every cat cell is stored dense");
 
     let counters = dict_counters();
     let matched = assert_paths_match(&b, &m);
@@ -354,11 +458,11 @@ fn the_columnar_path_resolves_each_mapped_id_column_once() {
 
 // ---- #689: the dynamic-column slot table, against the map build ----
 
-/// [`build_columnar_batch`] as it stood before #689, copied verbatim: every
-/// cell resolves its destination column through a
-/// `BTreeMap<(String, u8), _>` entry lookup keyed by a freshly cloned
-/// attribute name, and a per-row `HashSet` decides the first-occurrence
-/// winner. This is the differential oracle for the slot-table build. The two
+/// [`build_columnar_batch`] as it stood before #689: every cell resolves its
+/// destination column through a `BTreeMap<(String, u8), _>` entry lookup
+/// keyed by a freshly cloned attribute name, and a per-row `HashSet` decides
+/// the first-occurrence winner. Since #2625 it attaches no dictionary and
+/// converts each column's owned cells to typed ones at the end. This is the differential oracle for the slot-table build. The two
 /// must agree on every field of the batch: the RLOG object the columnar
 /// writer produces is byte-identical only for identical batches, and the
 /// RSEG layout is a frozen contract.
@@ -384,11 +488,8 @@ fn build_columnar_batch_reference(
     batch.residual_attrs = vec![Vec::new(); total_rows];
 
     // Dynamic columns, keyed by (name, type byte) as `from_records` keys
-    // them, so their materialized order matches. `col_dict` tracks whether
-    // every winning cell of a column came from a dictionary-encoded Arrow
-    // source.
+    // them, so their materialized order matches.
     let mut col_cells: BTreeMap<(String, u8), Vec<Option<AttrValue>>> = BTreeMap::new();
-    let mut col_dict: BTreeMap<(String, u8), bool> = BTreeMap::new();
 
     // Stream identity: hashed once per distinct resource tuple, keyed by the
     // STREAM_DIR blob (the canonical resource bytes) so the blake3 in
@@ -536,10 +637,8 @@ fn build_columnar_batch_reference(
                     let key = (spec.key.clone(), field_type_of(spec.value_type).to_u8());
                     if taken.insert(key.clone()) {
                         col_cells
-                            .entry(key.clone())
+                            .entry(key)
                             .or_insert_with(|| vec![None; total_rows])[grow] = Some(v);
-                        let flag = col_dict.entry(key).or_insert(true);
-                        *flag &= src.is_dict();
                     } else {
                         batch.residual_attrs[grow].push((spec.key.clone(), v));
                     }
@@ -600,13 +699,8 @@ fn build_columnar_batch_reference(
     }
     batch.stream_refs = row_stream_id.iter().map(|id| ref_of[id]).collect();
 
-    // Materialize dynamic columns in (name, type) order; attach a
-    // StrColumnDict to a Str/Bytes column whose every winning cell came from
-    // a dictionary source. If no column carries a dictionary, leave
-    // `dyn_col_dicts` empty (its default), so a plain load is byte-identical
-    // to `from_records` without `with_dictionaries`.
-    let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(col_cells.len());
-    let mut any_dict = false;
+    // Materialize dynamic columns in (name, type) order. No dictionary is
+    // attached (#2625), so `dyn_col_dicts` stays empty.
     for ((name, ty_byte), cells) in col_cells {
         let field_type = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
         let mut validity = Bitmap::new();
@@ -620,26 +714,13 @@ fn build_columnar_batch_reference(
                 None => validity.push(false),
             }
         }
-        let use_dict = matches!(field_type, FieldType::Str | FieldType::Bytes)
-            && col_dict
-                .get(&(name.clone(), ty_byte))
-                .copied()
-                .unwrap_or(false);
-        if use_dict {
-            any_dict = true;
-            dicts.push(Some(str_column_dict_from_cells(&dense)));
-        } else {
-            dicts.push(None);
-        }
         batch.dyn_columns.push(DynColumn {
             name,
             field_type,
-            cells: dense,
+            cells: DynCells::from_values(field_type, &dense)
+                .map_err(|e| ColBuildError::Batch(e.to_string()))?,
             validity,
         });
-    }
-    if any_dict {
-        batch.dyn_col_dicts = dicts;
     }
 
     Ok(batch)
@@ -662,7 +743,7 @@ fn mix(seed: u64, col: usize, row: usize) -> u64 {
 
 /// One generated attribute column: its source Parquet column, the record key
 /// it maps to, its declared type, and whether the Arrow array arrives
-/// dictionary-encoded (which drives the `StrColumnDict` decision).
+/// dictionary-encoded (which selects the `StrSrc::Dict` read).
 #[derive(Debug, Clone)]
 struct GenCol {
     column: String,
@@ -917,6 +998,36 @@ fn assert_same_batch(
 /// A fixed 48-column case (mixed types, dictionary and plain strings, key
 /// collisions, 20% nulls) that runs on every test run, independent of the
 /// proptest budget below.
+/// A dynamic cell that would take its column past the byte limit is a load
+/// error naming the column and `--batch-rows`, and is not stored. The limit is
+/// lowered from 4 GiB to 4 bytes so the test does not hold 4 GiB.
+#[test]
+fn a_dynamic_cell_past_the_column_byte_limit_is_a_load_error_naming_the_column() {
+    use ravel_logseg::{BytesCells, VarBytes};
+
+    let mut cells = DynCells::Str(VarBytes::with_byte_limit(0, 0, 4));
+    push_cell("url", &mut cells, CellRef::Str("abcd")).expect("4 of 4 bytes");
+    let err = push_cell("url", &mut cells, CellRef::Str("e")).expect_err("past 4 bytes");
+    assert!(
+        err.starts_with("column \"url\" holds too many bytes for one batch (")
+            && err.contains("past its limit of 4 bytes")
+            && err.ends_with("rerun with a smaller --batch-rows"),
+        "{err}"
+    );
+    assert_eq!(cells.len(), 1, "the refused cell is not stored");
+
+    let mut cells = DynCells::Bytes(BytesCells {
+        values: VarBytes::with_byte_limit(0, 0, 4),
+        nested: Vec::new(),
+    });
+    let err = push_cell("blob", &mut cells, CellRef::Bytes(b"abcde")).expect_err("past 4 bytes");
+    assert!(
+        err.starts_with("column \"blob\" holds too many bytes"),
+        "{err}"
+    );
+    assert_eq!(cells.len(), 0, "the refused cell is not stored");
+}
+
 #[test]
 fn slot_table_build_matches_map_build_48_columns() {
     assert_same_batch(1_000, 3, 48, 20, 20, 0x5EED_0000_0000_0001);

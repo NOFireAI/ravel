@@ -222,8 +222,9 @@ fn data_page_encodings(pq: &Path, column: &str) -> Vec<Vec<parquet::basic::Encod
 
 /// #660: a plain `StringArray` with repeated values, written by
 /// `ArrowWriter` (which dictionary-encodes `BYTE_ARRAY` by default), now
-/// comes back through the loader's reader as a `Dictionary` and reaches the
-/// `StrColumnDict` fast path with the file's exact distinct set.
+/// comes back through the loader's reader as a `Dictionary` and is read in
+/// place through it. Since #2625 the loader attaches no `StrColumnDict`: the
+/// column stores one typed cell per row holding the file's distinct set.
 ///
 /// This deliberately flips #605's expectation. Before the loader supplied a
 /// reader schema, the embedded Arrow schema said Utf8, arrow-rs fused the
@@ -237,7 +238,7 @@ fn data_page_encodings(pq: &Path, column: &str) -> Vec<Vec<parquet::basic::Encod
 /// unconditionally, which is exactly the pre-#660 reader. That assertion
 /// tripped with `left: Utf8, right: Dictionary(Int32, Utf8)`.
 #[test]
-fn repeated_value_string_column_reaches_the_dictionary_path() {
+fn repeated_value_string_column_is_read_as_a_dictionary_and_attaches_none() {
     const ROWS: usize = 1_000;
     const DISTINCT: usize = 3;
     let values = ["alpha", "beta", "gamma"];
@@ -269,18 +270,24 @@ fn repeated_value_string_column_reaches_the_dictionary_path() {
 
     let col_on = assert_paths_match(&on, &m);
     assert_eq!(col_on.num_rows, ROWS, "every row is built");
-    let pos = col_on
+    let cat_col = col_on
         .dyn_columns
         .iter()
-        .position(|c| c.name == "cat")
+        .find(|c| c.name == "cat")
         .expect("cat column");
-    let dict = col_dict(&col_on, pos).expect("the column carries a StrColumnDict");
-    assert_eq!(
-        dict.distinct.len(),
-        DISTINCT,
-        "the StrColumnDict holds exactly the 3 distinct values"
+    assert!(
+        col_on.dyn_col_dicts.is_empty(),
+        "the columnar build attaches no StrColumnDict"
     );
-    assert_eq!(dict.ids.len(), ROWS, "one dictionary id per present cell");
+    assert_eq!(cat_col.cells.len(), ROWS, "one stored cell per present row");
+    let distinct: std::collections::BTreeSet<&[u8]> = (0..ROWS)
+        .filter_map(|i| cat_col.cells.bytes_at(i))
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        DISTINCT,
+        "the cells hold exactly the 3 distinct values"
+    );
 
     // The pre-#660 reader on the same file, for contrast: Utf8, plain path.
     let off = read_parquet(&pq, false);
@@ -289,9 +296,9 @@ fn repeated_value_string_column_reaches_the_dictionary_path() {
         "plain inference fuses the Parquet dictionary away"
     );
     let col_off = assert_paths_match(&off, &m);
-    assert!(
-        col_dict(&col_off, pos).is_none(),
-        "the plain path attaches no StrColumnDict"
+    assert_eq!(
+        col_off, col_on,
+        "the plain read builds the same batch as the dictionary read"
     );
 }
 
@@ -345,13 +352,8 @@ fn unique_per_row_string_column_stays_plain() {
     m.attributes = vec![attr("uniq", "uniq", ColType::Str)];
     let col = build_columnar_or_panic(&on, &m);
     assert_eq!(col.num_rows, ROWS, "every row is built");
-    let pos = col
-        .dyn_columns
-        .iter()
-        .position(|c| c.name == "uniq")
-        .expect("uniq column");
     assert!(
-        col_dict(&col, pos).is_none(),
+        col.dyn_col_dicts.is_empty(),
         "no StrColumnDict is built for a plain column"
     );
 }

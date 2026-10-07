@@ -47,7 +47,10 @@ mod bloom_coverage_tests;
 pub use columnar::{
     AttrColumn, BoolCursor, BytesCursor, ColumnarBlockView, F64BitsCursor, I64Cursor, StrDictColumn,
 };
-pub use columnar_batch::{Bitmap, ColumnarLogBatch, DynColumn, StrColumnDict, VarBytes};
+pub use columnar_batch::{
+    Bitmap, BytesCells, ColumnarLogBatch, DynCells, DynColumn, StrColumnDict, VAR_BYTES_MAX,
+    VarBytes,
+};
 pub use columns::ColumnSelection;
 pub use error::LogSegError;
 pub use footer::{

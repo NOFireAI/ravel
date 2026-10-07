@@ -82,7 +82,8 @@ fn batch() -> ColumnarLogBatch {
         batch.dyn_columns.push(DynColumn {
             name: format!("attr_{j:03}"),
             field_type: FieldType::Str,
-            cells,
+            cells: ravel_logseg::DynCells::from_values(FieldType::Str, &cells)
+                .expect("typed cells"),
             validity,
         });
     }

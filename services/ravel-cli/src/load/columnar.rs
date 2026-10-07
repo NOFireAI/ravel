@@ -2,6 +2,7 @@
 //! instead of one record at a time.
 
 use super::*;
+use ravel_logseg::LogSegError;
 
 /// A columnar-build failure: a batch-level decode/resolve error, or a per-row
 /// admission rejection carrying its FILE-absolute index (#541).
@@ -10,40 +11,45 @@ pub(super) enum ColBuildError {
     Row { row: u64, reason: String },
 }
 
-/// The `StrColumnDict` for one Str/Bytes dynamic column, interned from its final
-/// dense cells (ADR-0109 decision 3). Distinct values are first-seen order; the
-/// writer sorts them to match `encode_strings`, so ordering here is free. The
-/// bytes are `resolve_value(cell).1` for a Str/Bytes value: the string/byte
-/// payload verbatim, so the writer's dict path re-interns to exactly the same
-/// per-object dictionary the plain path derives, and the object bytes match.
-fn str_column_dict_from_cells(cells: &[AttrValue]) -> StrColumnDict {
-    let mut interner: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
-    let mut distinct: Vec<Vec<u8>> = Vec::new();
-    let mut ids: Vec<u32> = Vec::with_capacity(cells.len());
-    for cell in cells {
-        let bytes = match cell {
-            AttrValue::Str(s) => s.as_bytes().to_vec(),
-            AttrValue::Bytes(b) => b.clone(),
-            // A Str/Bytes column holds only Str/Bytes values; anything else is a
-            // mis-typed column that never reaches here.
-            _ => Vec::new(),
-        };
-        let next = distinct.len() as u32;
-        let id = *interner.entry(bytes.clone()).or_insert_with(|| {
-            distinct.push(bytes);
-            next
-        });
-        ids.push(id);
+/// The load error for a value that would take `column` past the 4 GiB one
+/// batch's `u32` offsets address: the column's bytes grow with the batch's
+/// rows, so a smaller `--batch-rows` is the lever.
+fn column_too_large(column: &str, e: &LogSegError) -> String {
+    format!(
+        "column {column:?} holds too many bytes for one batch ({e}); rerun with a smaller \
+         --batch-rows"
+    )
+}
+
+/// Appends `cell` to `column`'s `cells`. A slot's cells and every source
+/// feeding it take their type from the same declared [`ColType`], so a
+/// mismatch is a bug. A `Str` or `Bytes` cell that would take the column past
+/// its byte limit is refused with [`column_too_large`].
+fn push_cell(column: &str, cells: &mut DynCells, cell: CellRef<'_>) -> Result<(), String> {
+    let too_large = |e: LogSegError| column_too_large(column, &e);
+    match (cells, cell) {
+        (DynCells::Str(v), CellRef::Str(s)) => v.try_push(s.as_bytes()).map_err(too_large)?,
+        (DynCells::Bytes(b), CellRef::Bytes(x)) => b.values.try_push(x).map_err(too_large)?,
+        (DynCells::I64(v), CellRef::I64(x)) => v.push(x),
+        (DynCells::F64(v), CellRef::F64(x)) => v.push(x),
+        (DynCells::Bool(v), CellRef::Bool(x)) => v.push(x),
+        (cells, _) => {
+            return Err(format!(
+                "a cell of another type reached a {:?} dynamic column",
+                cells.field_type()
+            ));
+        }
     }
-    StrColumnDict { distinct, ids }
+    Ok(())
 }
 
 /// Build a [`ColumnarLogBatch`] directly from a batch's Arrow spans and the
-/// mapping (ADR-0109 decisions 1, 3, 6). Every downcast and the `ts` unit
-/// scaling are resolved once per column per span; stream identity is hashed once
-/// per distinct resource tuple; a mapped Str/Bytes column that arrived
-/// dictionary-encoded is carried as a `StrColumnDict` so the writer pays string
-/// encoding and token bloom per distinct value, not per row.
+/// mapping (ADR-0109 decisions 1, 6). Every downcast and the `ts` unit scaling
+/// are resolved once per column per span; stream identity is hashed once per
+/// distinct resource tuple. Each dynamic column is filled typed and dense in
+/// row order: a string or byte cell is copied once, out of its Arrow buffer
+/// (dictionary-encoded or not) into the column, with no owned value per cell,
+/// and no dictionary is attached (`dyn_col_dicts` stays empty).
 ///
 /// The result is byte-identical, once written, to
 /// [`ColumnarLogBatch::from_records`] over the [`NormalizedLogRecord`]s
@@ -98,17 +104,47 @@ pub(super) fn build_columnar_batch(
         slot_of_attr[mi] = slot_keys.len().saturating_sub(1);
     }
 
-    // A slot's cells vector is allocated on its first present value: a mapped
-    // attribute that is null across the whole batch never created a map entry
-    // before, so it must materialize no column now either.
-    let mut slot_cells: Vec<Option<Vec<Option<AttrValue>>>> = Vec::new();
-    slot_cells.resize_with(slot_keys.len(), || None);
-    // Whether every winning cell of a slot came from a dictionary-encoded Arrow
-    // source, and the row that most recently won each slot (1-based, 0 meaning
-    // never). The stamp replaces the per-row `HashSet<(String, u8)>` that
-    // decided the first-occurrence winner: same relation, no allocation and no
-    // key clone per cell.
-    let mut slot_dict: Vec<bool> = vec![true; slot_keys.len()];
+    let slot_types: Vec<FieldType> = slot_keys
+        .iter()
+        .map(|(_, ty)| FieldType::from_u8(*ty).unwrap_or(FieldType::Bytes))
+        .collect();
+
+    // Each slot's reservation: the [`cell_capacity_hint`] of every column
+    // mapped to it, summed over the spans, then capped. The sum over-counts a
+    // slot fed by several columns (one cell per row wins it) and a dictionary
+    // column's hint is unbounded, so the cap is what the slot can hold: one
+    // cell per row, each at most `max_attribute_value_len` bytes, which the row
+    // loop's admission check enforces before any push. A span whose columns
+    // cannot be located adds nothing; the row loop raises its error in order.
+    let mut slot_hint: Vec<(usize, usize)> = vec![(0, 0); slot_keys.len()];
+    for (span, _) in spans {
+        let Ok(cols) = ColumnIndex::locate(span, mapping) else {
+            continue;
+        };
+        for (ci, mi) in &cols.record {
+            let (cells, bytes) =
+                cell_capacity_hint(span.column(*ci), mapping.attributes[*mi].value_type);
+            let hint = &mut slot_hint[slot_of_attr[*mi]];
+            hint.0 = hint.0.saturating_add(cells);
+            hint.1 = hint.1.saturating_add(bytes);
+        }
+    }
+    for hint in &mut slot_hint {
+        hint.0 = hint.0.min(total_rows);
+        hint.1 = hint
+            .1
+            .min(hint.0.saturating_mul(limits.max_attribute_value_len));
+    }
+
+    // A slot's cells and validity are allocated on its first present value: a
+    // mapped attribute that is null across the whole batch materializes no
+    // column. Validity is padded with absent rows up to each present one.
+    let mut slot_cols: Vec<Option<(DynCells, Bitmap)>> = Vec::new();
+    slot_cols.resize_with(slot_keys.len(), || None);
+    // The row that most recently won each slot (1-based, 0 meaning never). The
+    // stamp replaces the per-row `HashSet<(String, u8)>` that decided the
+    // first-occurrence winner: same relation, no allocation and no key clone
+    // per cell.
     let mut slot_taken_at: Vec<u64> = vec![0; slot_keys.len()];
 
     // Stream identity: hashed once per distinct resource tuple, keyed by the
@@ -212,8 +248,8 @@ pub(super) fn build_columnar_batch(
 
             // 3. body (optional) and its length cap.
             let body_val = match &body {
-                Some(s) => s.get(local).map_err(row_err)?.unwrap_or_default(),
-                None => String::new(),
+                Some(s) => s.get_ref(local).map_err(row_err)?.unwrap_or_default(),
+                None => "",
             };
             if body_val.len() > limits.max_body_len {
                 return Err(row_err(format!(
@@ -233,8 +269,8 @@ pub(super) fn build_columnar_batch(
                 None => 0,
             };
             let severity_text = match &sev_text {
-                Some(s) => s.get(local).map_err(row_err)?.unwrap_or_default(),
-                None => String::new(),
+                Some(s) => s.get_ref(local).map_err(row_err)?.unwrap_or_default(),
+                None => "",
             };
 
             // 5. trace/span ids: exact length or absent.
@@ -270,16 +306,24 @@ pub(super) fn build_columnar_batch(
             let row_stamp = grow as u64 + 1;
             for (mi, slot, src) in &record {
                 let spec = &mapping.attributes[*mi];
-                if let Some(v) = src.get(local).map_err(row_err)? {
-                    check_attr(&spec.key, &v, limits).map_err(row_err)?;
+                if let Some(cell) = src.get_ref(local).map_err(row_err)? {
+                    check_attr_len(&spec.key, cell.value_len(), limits).map_err(row_err)?;
                     present_record += 1;
                     if slot_taken_at[*slot] == row_stamp {
-                        batch.residual_attrs[grow].push((spec.key.clone(), v));
+                        batch.residual_attrs[grow].push((spec.key.clone(), cell.to_value()));
                     } else {
                         slot_taken_at[*slot] = row_stamp;
-                        slot_cells[*slot].get_or_insert_with(|| vec![None; total_rows])[grow] =
-                            Some(v);
-                        slot_dict[*slot] &= src.is_dict();
+                        let (cells, validity) = slot_cols[*slot].get_or_insert_with(|| {
+                            let (n, bytes) = slot_hint[*slot];
+                            (
+                                DynCells::with_capacity(slot_types[*slot], n, bytes),
+                                Bitmap::with_capacity(total_rows),
+                            )
+                        });
+                        validity.pad_to(grow);
+                        validity.push(true);
+                        push_cell(&slot_keys[*slot].0, cells, cell)
+                            .map_err(ColBuildError::Batch)?;
                     }
                 }
             }
@@ -308,8 +352,14 @@ pub(super) fn build_columnar_batch(
             batch.observed_ts_ns.push(raw_ts);
             batch.severity_num.push(severity_num);
             batch.flags.push(0);
-            batch.severity_text.push(severity_text.as_bytes());
-            batch.body.push(body_val.as_bytes());
+            batch
+                .severity_text
+                .try_push(severity_text.as_bytes())
+                .map_err(|e| ColBuildError::Batch(column_too_large("severity_text", &e)))?;
+            batch
+                .body
+                .try_push(body_val.as_bytes())
+                .map_err(|e| ColBuildError::Batch(column_too_large("body", &e)))?;
             match trace_id {
                 Some(t) => {
                     batch.trace_id.extend_from_slice(&t);
@@ -352,45 +402,19 @@ pub(super) fn build_columnar_batch(
         })
         .collect::<Result<Vec<u32>, ColBuildError>>()?;
 
-    // Materialize dynamic columns in (name, type) order; attach a StrColumnDict
-    // to a Str/Bytes column whose every winning cell came from a dictionary
-    // source. If no column carries a dictionary, leave `dyn_col_dicts` empty (its
-    // default), so a plain load is byte-identical to `from_records` without
-    // `with_dictionaries`.
-    let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(slot_keys.len());
-    let mut any_dict = false;
-    for (slot, ((name, ty_byte), cells)) in slot_keys.into_iter().zip(slot_cells).enumerate() {
-        // No cells vector means the slot never took a present value, which is
-        // exactly the case where the map this replaced held no entry at all.
-        let Some(cells) = cells else { continue };
-        let field_type = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
-        let mut validity = Bitmap::new();
-        let mut dense = Vec::new();
-        for cell in cells {
-            match cell {
-                Some(v) => {
-                    validity.push(true);
-                    dense.push(v);
-                }
-                None => validity.push(false),
-            }
-        }
-        let use_dict = matches!(field_type, FieldType::Str | FieldType::Bytes) && slot_dict[slot];
-        if use_dict {
-            any_dict = true;
-            dicts.push(Some(str_column_dict_from_cells(&dense)));
-        } else {
-            dicts.push(None);
-        }
+    // Dynamic columns in (name, type) order. A slot that never took a present
+    // value has no column.
+    for ((name, _), slot) in slot_keys.into_iter().zip(slot_cols) {
+        let Some((cells, mut validity)) = slot else {
+            continue;
+        };
+        validity.pad_to(total_rows);
         batch.dyn_columns.push(DynColumn {
             name,
-            field_type,
-            cells: dense,
+            field_type: cells.field_type(),
+            cells,
             validity,
         });
-    }
-    if any_dict {
-        batch.dyn_col_dicts = dicts;
     }
 
     Ok(batch)

@@ -46,7 +46,7 @@ use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::rng::RngSource;
 use ravel_logseg::{
-    ColumnarLogBatch, LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
+    ColumnarLogBatch, DynCells, LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -208,9 +208,8 @@ pub(crate) fn est_columnar_bytes(batch: &ColumnarLogBatch) -> usize {
 
     let mut attr_bytes = 0usize;
     for col in &batch.dyn_columns {
-        for cell in &col.cells {
-            attr_bytes += size_of::<(String, AttrValue)>() + col.name.len() + attr_value_len(cell);
-        }
+        attr_bytes += col.cells.len() * (size_of::<(String, AttrValue)>() + col.name.len())
+            + cells_value_len(&col.cells, attr_value_len);
     }
     for row in &batch.residual_attrs {
         for (k, v) in row {
@@ -219,6 +218,30 @@ pub(crate) fn est_columnar_bytes(batch: &ColumnarLogBatch) -> usize {
     }
 
     body + severity_text + stream_attrs + attr_bytes + 32 * batch.num_rows
+}
+
+/// The sum of `value_len` over a typed column's cells, read off the typed
+/// payload: a `Str` or `Bytes` cell is its stored length, an `I64` or `F64`
+/// cell 8 and a `Bool` cell 1, as both value-length rules count them. A `List`
+/// or `Map` cell's stored bytes are its canonical encoding, which neither rule
+/// counts, so those cells are charged `value_len` of their original value
+/// instead.
+fn cells_value_len(cells: &DynCells, value_len: fn(&AttrValue) -> usize) -> usize {
+    match cells {
+        DynCells::Str(v) => v.data().len(),
+        DynCells::Bytes(b) => {
+            let canonical: usize = b
+                .nested
+                .iter()
+                .map(|(slot, _)| b.values.get(*slot as usize).len())
+                .sum();
+            let original: usize = b.nested.iter().map(|(_, v)| value_len(v)).sum();
+            b.values.data().len() - canonical + original
+        }
+        DynCells::I64(v) => 8 * v.len(),
+        DynCells::F64(v) => 8 * v.len(),
+        DynCells::Bool(v) => v.len(),
+    }
 }
 
 /// Fixed per-record cost in the object a log flush writes: the two i64
@@ -292,9 +315,8 @@ pub(crate) fn est_columnar_object_bytes(batch: &ColumnarLogBatch) -> usize {
 
     let mut attr_bytes = 0usize;
     for col in &batch.dyn_columns {
-        for cell in &col.cells {
-            attr_bytes += col.name.len() + attr_value_object_len(cell);
-        }
+        attr_bytes +=
+            col.cells.len() * col.name.len() + cells_value_len(&col.cells, attr_value_object_len);
     }
     for row in &batch.residual_attrs {
         for (k, v) in row {
@@ -1559,9 +1581,13 @@ impl LogShardActor {
             }
             BufContent::Columnar(batches) => {
                 for batch in batches {
-                    // Every buffered batch validated on admission or came out of
-                    // a partition, so a refusal is a bug; it is dropped loudly,
-                    // as a hand-back that cannot merge is below.
+                    // This refusal cannot happen: every buffered batch is a write
+                    // the router's `validate()` accepted, or a partition of one,
+                    // and a partition of a valid batch validates. `validate()`
+                    // checks a strict superset of what `partition_columnar`
+                    // refuses on (column lengths, stream refs, cell counts). A
+                    // refusal is a bug, dropped loudly as a hand-back that
+                    // cannot merge is below.
                     let parts = match partition_columnar(batch, count) {
                         Ok(parts) => parts,
                         Err(err) => {

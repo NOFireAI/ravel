@@ -17,8 +17,8 @@ pub(super) struct ColumnIndex {
     pub(super) record: Vec<(usize, usize)>,
     /// The batch's columns with every mapped dictionary column resolved once.
     /// Read by the row path ([`build_record`]). Empty for an index built by
-    /// [`ColumnIndex::locate`], whose columnar caller keys its `StrColumnDict`
-    /// fast path on the dictionary itself and reads the batch's own columns.
+    /// [`ColumnIndex::locate`], whose columnar caller reads a dictionary
+    /// column's cells in place out of the batch's own columns.
     columns: ResolvedColumns,
 }
 
@@ -243,6 +243,16 @@ pub(super) fn check_attr(
     value: &AttrValue,
     limits: &LogIngestLimits,
 ) -> Result<(), String> {
+    check_attr_len(key, attr_value_len(value), limits)
+}
+
+/// [`check_attr`] for a value whose payload is `len` bytes, as
+/// [`attr_value_len`] counts it.
+pub(super) fn check_attr_len(
+    key: &str,
+    len: usize,
+    limits: &LogIngestLimits,
+) -> Result<(), String> {
     if key.len() > limits.max_attribute_key_len {
         return Err(format!(
             "attribute key {key:?} is {} bytes, more than the limit of {}",
@@ -250,7 +260,6 @@ pub(super) fn check_attr(
             limits.max_attribute_key_len
         ));
     }
-    let len = attr_value_len(value);
     if len > limits.max_attribute_value_len {
         return Err(format!(
             "attribute {key:?} value is {len} bytes, more than the limit of {}",
@@ -611,23 +620,24 @@ impl DictCounters {
 
 /// Read a UTF-8 string cell, accepting `Utf8` and `LargeUtf8`.
 pub(super) fn read_string(arr: &ArrayRef, row: usize) -> Result<Option<String>, String> {
+    Ok(read_str_ref(arr, row)?.map(str::to_string))
+}
+
+/// [`read_string`] borrowing the cell out of the array.
+fn read_str_ref(arr: &ArrayRef, row: usize) -> Result<Option<&str>, String> {
     if arr.is_null(row) {
         return Ok(None);
     }
     match arr.data_type() {
-        DataType::Utf8 => Ok(Some(downcast::<StringArray>(arr)?.value(row).to_string())),
-        DataType::LargeUtf8 => Ok(Some(
-            downcast::<LargeStringArray>(arr)?.value(row).to_string(),
-        )),
+        DataType::Utf8 => Ok(Some(downcast::<StringArray>(arr)?.value(row))),
+        DataType::LargeUtf8 => Ok(Some(downcast::<LargeStringArray>(arr)?.value(row))),
         // A dictionary-encoded string column (Arrow reconstructs one from a
         // Parquet file that carries Arrow dictionary schema metadata): resolve
-        // the row's key to its value and read that. The columnar fast path
-        // passes such a column through as a `StrColumnDict`; the row path here,
-        // its differential reference, must read the same values. The row paths
-        // reach this arm only for a column [`ResolvedColumns`] did not resolve.
+        // the row's key to its value and read that. The row paths reach this
+        // arm only for a column [`ResolvedColumns`] did not resolve.
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
-            read_string(dict.values(), dictionary_key(arr, row)?)
+            read_str_ref(dict.values(), dictionary_key(arr, row)?)
         }
         other => Err(format!("expected a string column, found {other:?}")),
     }
@@ -635,20 +645,23 @@ pub(super) fn read_string(arr: &ArrayRef, row: usize) -> Result<Option<String>, 
 
 /// Read a binary cell, accepting `Binary`, `LargeBinary`, and `FixedSizeBinary`.
 pub(super) fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
+    Ok(read_bytes_ref(arr, row)?.map(<[u8]>::to_vec))
+}
+
+/// [`read_bytes`] borrowing the cell out of the array.
+fn read_bytes_ref(arr: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {
     if arr.is_null(row) {
         return Ok(None);
     }
     match arr.data_type() {
-        DataType::Binary => Ok(Some(downcast::<BinaryArray>(arr)?.value(row).to_vec())),
-        DataType::LargeBinary => Ok(Some(downcast::<LargeBinaryArray>(arr)?.value(row).to_vec())),
-        DataType::FixedSizeBinary(_) => Ok(Some(
-            downcast::<FixedSizeBinaryArray>(arr)?.value(row).to_vec(),
-        )),
+        DataType::Binary => Ok(Some(downcast::<BinaryArray>(arr)?.value(row))),
+        DataType::LargeBinary => Ok(Some(downcast::<LargeBinaryArray>(arr)?.value(row))),
+        DataType::FixedSizeBinary(_) => Ok(Some(downcast::<FixedSizeBinaryArray>(arr)?.value(row))),
         // Dictionary-encoded binary column: resolve the key to its value, as in
-        // [`read_string`].
+        // [`read_str_ref`].
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
-            read_bytes(dict.values(), dictionary_key(arr, row)?)
+            read_bytes_ref(dict.values(), dictionary_key(arr, row)?)
         }
         other => Err(format!("expected a binary column, found {other:?}")),
     }
@@ -944,8 +957,8 @@ impl BoolSrc<'_> {
 
 /// A UTF-8 source resolved to a concrete Arrow array. `Dict` carries a
 /// dictionary-encoded column (Arrow reconstructs one from a Parquet file that
-/// embeds Arrow dictionary schema metadata); its presence is what the columnar
-/// builder keys the `StrColumnDict` fast path on (ADR-0109 decision 3).
+/// embeds Arrow dictionary schema metadata), read in place through its
+/// normalized keys.
 pub(super) enum StrSrc<'a> {
     Utf8(&'a StringArray),
     LargeUtf8(&'a LargeStringArray),
@@ -986,16 +999,26 @@ pub(super) fn str_src(arr: &ArrayRef) -> StrSrc<'_> {
     }
 }
 
-impl StrSrc<'_> {
+impl<'a> StrSrc<'a> {
+    #[cfg(test)]
     pub(super) fn get(&self, row: usize) -> Result<Option<String>, String> {
-        match self {
-            StrSrc::Utf8(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_string())),
-            StrSrc::LargeUtf8(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_string())),
-            StrSrc::Dict { arr, values, keys } => {
+        Ok(self.get_ref(row)?.map(str::to_string))
+    }
+
+    /// The cell at `row`, borrowed out of the Arrow array.
+    pub(super) fn get_ref(&self, row: usize) -> Result<Option<&'a str>, String> {
+        match *self {
+            StrSrc::Utf8(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            StrSrc::LargeUtf8(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            StrSrc::Dict {
+                arr,
+                values,
+                ref keys,
+            } => {
                 if arr.is_null(row) {
                     return Ok(None);
                 }
-                read_string(values, keys[row])
+                read_str_ref(values, keys[row])
             }
             StrSrc::AllNull => Ok(None),
             StrSrc::Bad(arr) => {
@@ -1010,9 +1033,57 @@ impl StrSrc<'_> {
             }
         }
     }
+}
 
-    fn is_dict(&self) -> bool {
-        matches!(self, StrSrc::Dict { .. })
+/// A reservation hint for the cells one mapped attribute column adds to its
+/// dynamic column: its non-null cell count and, for a string or byte column,
+/// the value bytes those cells hold. Exact for a plain array. A dictionary
+/// array's bytes are its cell count times the mean length of its DISTINCT
+/// values, not of its cells, so it over- or under-reserves when cells
+/// reference the distinct values unevenly, without bound: the caller caps the
+/// sum. Read from array metadata, never per cell.
+pub(super) fn cell_capacity_hint(arr: &ArrayRef, ty: ColType) -> (usize, usize) {
+    let cells = arr.len().saturating_sub(arr.null_count());
+    let bytes = match ty {
+        ColType::Str | ColType::Bytes => value_bytes_hint(arr, cells),
+        ColType::I64 | ColType::F64 | ColType::Bool => 0,
+    };
+    (cells, bytes)
+}
+
+fn value_bytes_hint(arr: &ArrayRef, cells: usize) -> usize {
+    match arr.data_type() {
+        DataType::Utf8 => {
+            downcast_opt::<StringArray>(arr).map_or(0, |a| offsets_span(a.value_offsets()))
+        }
+        DataType::LargeUtf8 => {
+            downcast_opt::<LargeStringArray>(arr).map_or(0, |a| offsets_span(a.value_offsets()))
+        }
+        DataType::Binary => {
+            downcast_opt::<BinaryArray>(arr).map_or(0, |a| offsets_span(a.value_offsets()))
+        }
+        DataType::LargeBinary => {
+            downcast_opt::<LargeBinaryArray>(arr).map_or(0, |a| offsets_span(a.value_offsets()))
+        }
+        DataType::FixedSizeBinary(width) => {
+            usize::try_from(*width).unwrap_or(0).saturating_mul(cells)
+        }
+        DataType::Dictionary(_, _) => {
+            let values = arr.as_any_dictionary().values();
+            match values.len() {
+                0 => 0,
+                distinct => value_bytes_hint(values, distinct).saturating_mul(cells) / distinct,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// The value bytes between the first and the last of `offsets`.
+fn offsets_span<O: Copy + Into<i64>>(offsets: &[O]) -> usize {
+    match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => usize::try_from((*last).into() - (*first).into()).unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -1060,17 +1131,22 @@ fn bytes_src(arr: &ArrayRef) -> BytesSrc<'_> {
     }
 }
 
-impl BytesSrc<'_> {
-    fn get(&self, row: usize) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            BytesSrc::Bin(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_vec())),
-            BytesSrc::LargeBin(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_vec())),
-            BytesSrc::FixedBin(a) => Ok((!a.is_null(row)).then(|| a.value(row).to_vec())),
-            BytesSrc::Dict { arr, values, keys } => {
+impl<'a> BytesSrc<'a> {
+    /// The cell at `row`, borrowed out of the Arrow array.
+    fn get_ref(&self, row: usize) -> Result<Option<&'a [u8]>, String> {
+        match *self {
+            BytesSrc::Bin(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            BytesSrc::LargeBin(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            BytesSrc::FixedBin(a) => Ok((!a.is_null(row)).then(|| a.value(row))),
+            BytesSrc::Dict {
+                arr,
+                values,
+                ref keys,
+            } => {
                 if arr.is_null(row) {
                     return Ok(None);
                 }
-                read_bytes(values, keys[row])
+                read_bytes_ref(values, keys[row])
             }
             BytesSrc::AllNull => Ok(None),
             BytesSrc::Bad(arr) => {
@@ -1084,10 +1160,6 @@ impl BytesSrc<'_> {
                 }
             }
         }
-    }
-
-    fn is_dict(&self) -> bool {
-        matches!(self, BytesSrc::Dict { .. })
     }
 }
 
@@ -1250,10 +1322,42 @@ impl IdSrc<'_> {
     }
 }
 
+/// One present attribute cell read in place: a string or byte cell borrows the
+/// Arrow array's buffer, so its bytes are copied once, into the column the cell
+/// lands in.
+#[derive(Clone, Copy)]
+pub(super) enum CellRef<'a> {
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    Str(&'a str),
+    Bytes(&'a [u8]),
+}
+
+impl CellRef<'_> {
+    /// Payload bytes, as [`attr_value_len`] counts the owned value.
+    pub(super) fn value_len(self) -> usize {
+        match self {
+            CellRef::Str(s) => s.len(),
+            CellRef::Bytes(b) => b.len(),
+            CellRef::I64(_) | CellRef::F64(_) => 8,
+            CellRef::Bool(_) => 1,
+        }
+    }
+
+    pub(super) fn to_value(self) -> AttrValue {
+        match self {
+            CellRef::I64(v) => AttrValue::I64(v),
+            CellRef::F64(v) => AttrValue::F64(v),
+            CellRef::Bool(v) => AttrValue::Bool(v),
+            CellRef::Str(s) => AttrValue::Str(s.to_string()),
+            CellRef::Bytes(b) => AttrValue::Bytes(b.to_vec()),
+        }
+    }
+}
+
 /// One mapped scalar attribute column's source, resolved once to its declared
-/// [`ColType`]. Yields the typed [`AttrValue`] per present cell and exposes
-/// whether the Arrow column arrived dictionary-encoded (for the `StrColumnDict`
-/// fast path).
+/// [`ColType`].
 pub(super) enum AttrSrc<'a> {
     Int(IntSrc<'a>),
     Float(FloatSrc<'a>),
@@ -1272,23 +1376,20 @@ pub(super) fn attr_src(arr: &ArrayRef, ty: ColType) -> AttrSrc<'_> {
     }
 }
 
-impl AttrSrc<'_> {
+impl<'a> AttrSrc<'a> {
     pub(super) fn get(&self, row: usize) -> Result<Option<AttrValue>, String> {
-        Ok(match self {
-            AttrSrc::Int(s) => s.get(row)?.map(AttrValue::I64),
-            AttrSrc::Float(s) => s.get(row)?.map(AttrValue::F64),
-            AttrSrc::Bool(s) => s.get(row)?.map(AttrValue::Bool),
-            AttrSrc::Str(s) => s.get(row)?.map(AttrValue::Str),
-            AttrSrc::Bytes(s) => s.get(row)?.map(AttrValue::Bytes),
-        })
+        Ok(self.get_ref(row)?.map(CellRef::to_value))
     }
 
-    pub(super) fn is_dict(&self) -> bool {
-        match self {
-            AttrSrc::Str(s) => s.is_dict(),
-            AttrSrc::Bytes(s) => s.is_dict(),
-            _ => false,
-        }
+    /// The cell at `row`, a string or byte cell borrowed out of the array.
+    pub(super) fn get_ref(&self, row: usize) -> Result<Option<CellRef<'a>>, String> {
+        Ok(match self {
+            AttrSrc::Int(s) => s.get(row)?.map(CellRef::I64),
+            AttrSrc::Float(s) => s.get(row)?.map(CellRef::F64),
+            AttrSrc::Bool(s) => s.get(row)?.map(CellRef::Bool),
+            AttrSrc::Str(s) => s.get_ref(row)?.map(CellRef::Str),
+            AttrSrc::Bytes(s) => s.get_ref(row)?.map(CellRef::Bytes),
+        })
     }
 }
 

@@ -655,6 +655,140 @@ up as the freed parents, in peak RSS. Sizing each shard's cell vectors from
 the row counts already computed would remove the slack; that is not done
 here.
 
+## Wave 2 (#2625): typed dynamic columns, built dense
+
+`DynColumn.cells` is no longer a `Vec<AttrValue>`. It is a `DynCells`, one
+typed payload per field type: `Str` is a `VarBytes` (offsets plus bytes),
+`Bytes` is a `VarBytes` plus a side list of the original `List`/`Map`
+values whose canonical bytes it stores, `I64` and `F64` are plain vectors
+and `Bool` is a `Vec<bool>`. `DynCells` equality compares `F64` cells by
+bit pattern and `I64` cells by value; `DynCells` has no `Hash` impl.
+Validity, `residual_attrs` and the RLOG bytes are unchanged; the writer
+reads the typed payloads and the pinned rich-object hash in ravel-cli's
+byte-identity test did not move.
+
+The loader's `build_columnar_batch` fills each column in row order under
+the first-occurrence rule: a string or binary cell is borrowed out of the
+Arrow array and copied once into the column, with no per-slot
+`Option<AttrValue>`, no compaction and no owned `String` per cell. Each
+column reserves its cells and value bytes from a metadata-only pass over the
+spans (the non-null count, and the offsets span, or for a dictionary column
+its cell count times the mean length of its distinct values, which is not
+the cells' mean). Each slot's summed byte reservation is capped at its
+summed cell count, itself capped at the batch's rows, times
+`max_attribute_value_len`: one cell per row, each no longer than admission
+allows. The loader attaches no `StrColumnDict`, so `dyn_col_dicts` stays
+empty on this path; the writer's dictionary path is unchanged.
+`partition_columnar` deals each typed payload by row into per-part vectors
+reserved from that part's present count and value bytes. A string, byte,
+body or severity text value that would take its column past the 4 GiB its
+`u32` offsets address in one batch is refused (`VarBytes::try_push`,
+`LimitExceeded`), and the loader reports it naming the column and a
+smaller `--batch-rows`.
+
+### Pre-registered expectations
+
+Stated in the #2625 task before the runs: about 0.5 to 1 KB per batch row;
+`build_columnar_batch` and `partition_columnar` each under 1 GB at
+B=500,000; peak RSS about 5 to 7 GB at B=500,000; no OOM at B=1,000,000.
+
+### Measurement
+
+Same command and flags as wave 1 (`--shards 4 --target-bytes 1
+--read-cursors 16 --pipeline-depth 4`, memory store, `timeout -s INT 360`,
+RSS and `rchar` every 2 s (177 and 154 samples landed),
+`prof:true,lg_prof_sample:20,lg_prof_interval:33`), at B=500,000 and
+B=1,000,000, one run each. Binary: 27583d6 (its code is that of 1ba2a58)
+built with `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release -p
+ravel-cli --features profiling`.
+
+The host is NOT wave 1's: a fleet executor with `uname -m` x86_64, `nproc`
+8, MemTotal 15,988,672 kB and 16 GB of swap (wave 1: 16 vCPU, 32 GB, no
+swap). `VmSwap` of the loader was 0 in every sample of both runs. This host
+read Parquet faster (the `rchar` rows below), and the memory store keeps
+every object it is given, so a run's RSS grows with rows read; the row
+"peak RSS until 4,901 MB read" compares at the bytes wave 1 had read by the
+end of its run.
+
+Site figures are the function's `cum` in `jeprof --text --inuse_space`
+(one figure per function, which equals wave 1's per-line sum for a
+non-recursive function). Medians are over dumps from +60 s. `push_section`
+is the RLOG object buffers, which the memory store keeps.
+
+| | wave 1, dictionaries dropped, B=500,000 (other host) | wave 2, B=500,000 | wave 2, B=1,000,000 |
+|---|---|---|---|
+| peak RSS | 11.37 GB (11,367,488 kB, +326 s) | 11.02 GB (11,024,452 kB, +359 s) | 13.33 GB (13,330,464 kB, +196 s) |
+| peak RSS until 4,901 MB read | 11.37 GB | 9.14 GB (9,141,620 kB, +214 s; 4,901 MB read at +216 s) | 12.94 GB (12,942,420 kB, +175 s; 4,901 MB read at +186 s) |
+| lowest host MemAvailable | | | 924,636 kB (+196 s) |
+| exit | | 124 (the SIGINT timeout) | 124 (the SIGINT timeout) |
+| Parquet bytes read by +60 / +180 / +358 s | 931 / 2,553 / 4,901 MB | 1,938 / 4,131 / 7,892 MB | 1,997 / 4,840 / 7,239 MB |
+| rows read by +358 s, estimated (`rchar` / 147.8) | 33.2 million | 53.4 million | 49.0 million |
+| `build_columnar_batch` at dump 100 | 3,064 MB | 1,290 MB (+156 s) | 2,732 MB (+149 s) |
+| same, median | 2,284 MB | 1,793 MB | 3,083 MB |
+| same, highest dump | | 2,590 MB (dump 147) | 4,430 MB (dump 68) |
+| `partition_columnar` at dump 100 | 2,579 MB | 1,935 MB | 3,329 MB |
+| same, median | 2,934 MB | 1,648 MB | 3,412 MB |
+| same, highest dump | | 2,449 MB (dump 32) | 4,444 MB (dump 81) |
+| writer (`build_object_columnar` less `push_section`), median / highest | | 877 / 1,134 MB | 1,190 / 1,536 MB |
+| `push_section`, last dump | 5,706 MB | 9,397 MB (dump 243) | 8,022 MB (dump 208) |
+| total live at dump 100 | 9,821 MB | 8,780 MB | 12,495 MB |
+| total live, median | 10,267 MB | 10,871 MB | 13,615 MB |
+| total live less `push_section`, median | | 4,954 MB | 8,915 MB |
+| highest total live of any dump | 13,588 MB (dump 187) | 15,106 MB (dump 244) | 17,146 MB (dump 207) |
+| heap dumps | 203 | 245 | 209 |
+
+As in wave 1, the highest total live exceeds the peak RSS sample. The
+profile is sampled and counts allocated capacity whether or not its pages
+were touched; the difference is not resolved here.
+
+### One batch, measured once
+
+A one-off measurement, not a committed test and not repeated: a scratch
+test built one B=500,000 batch the way the loader does (16 spans of 31,250
+rows, one from each of row groups 0, 14, ..., 210, read with the loader's
+reader schema), with jemalloc as the test binary's allocator, and read
+jemalloc's per-thread allocated minus deallocated bytes around the one
+`build_columnar_batch` call:
+
+```
+SCRATCH2 i64_cols=75 i64_bytes=300000000 str_cols=28 str_bytes=276800549 validity=6437500 body=0 sevtext=0
+SCRATCH rows=500000 heap=666825608 est=4006706687 est/heap=6.009 heap/row=1333.7 est/row=8013.4 arrow_in=478356866 dyn_cols=103 cells=51500000 residual=0 after_drop=0
+```
+
+The batch's heap is 667 MB, 1,334 bytes per row. Every one of the 103
+mapped attribute columns is present on every row: the 75 `I64` columns
+hold 600 bytes per row by themselves, and the 28 `Str` columns 554 bytes
+per row (bytes plus 4-byte offsets). The remaining 90 MB, 13% of the
+heap, is validity (6.4 MB), the fixed per-row vectors and reservation
+slack; it is not split further here. `after_drop=0` shows every byte the
+build allocated on that thread was the batch's.
+
+`est_columnar_bytes` for the same batch is 4,007 MB, 6.0 times the heap.
+It stays equal to the row path's `est_record_bytes` sum (an invariant its
+proptests pin), so it still charges every cell the row form's
+`(String, AttrValue)` header and key bytes, which the typed form does not
+allocate. A byte budget built on it (follow-up 3) would overcharge a typed
+batch about 6x on this corpus.
+
+### Against the expectations
+
+- **Bytes per row: missed.** 1,334 bytes per row in the one-off
+  measurement above, against 0.5 to 1 KB. The estimate did not count that
+  every one of this corpus's 75 integer columns is present on every row,
+  600 bytes per row with no payload to shrink.
+- **Both sites under 1 GB at B=500,000: missed.** Medians 1,793 MB at
+  `build_columnar_batch` and 1,648 MB at `partition_columnar`, against
+  wave 1's 2,284 and 2,934 MB. At 667 MB a batch, those medians are about
+  2.7 and 2.5 batches held at each site.
+- **Peak RSS 5 to 7 GB: missed.** 11.02 GB at B=500,000, rising to the
+  end of the run with the objects the memory store holds (9.4 GB at
+  `push_section` in the last dump). Total live less `push_section` has a
+  median of 4.95 GB. At the bytes wave 1 had read by its end, this run's
+  peak was 9.14 GB against wave 1's 11.37 GB, on a different host, so
+  neither comparison isolates the change.
+- **No OOM at B=1,000,000: met** on this 16 GB host, with no swap used by
+  the loader, but the host's MemAvailable fell to 925 MB at +196 s.
+
 ## Follow-ups, in order, with the expected saving each
 
 Per batch row at `--read-cursors 16 --shards 4` on this corpus; the
@@ -674,7 +808,8 @@ multiplicity section above gives the terms.
 2. **Build dense `DynColumn`s directly** (ravel-cli `columnar.rs`): drop the
    per-slot `Vec<Option<AttrValue>>` intermediate. Saves 2.4 to 2.8 KB per
    row (320 MB to 1.2 GB measured). The existing row-path differential test
-   is the byte-identity anchor.
+   is the byte-identity anchor. Landed in wave 2 (#2625, above), together
+   with 4.
 3. **A byte budget on the decode queue and the write window** (ravel-cli
    `logs.rs`): charge each built batch its `est_columnar_bytes` and block
    the decoder on a `--max-inflight-bytes`-style budget instead of counting
@@ -690,6 +825,10 @@ multiplicity section above gives the terms.
    afresh, since wave 1 drops dictionaries at the shard split. Largest
    change; its own task with a byte-identity
    differential test against the current writer over the ClickBench fixture.
+   Landed in wave 2 (#2625, above), with no dictionary form on the typed
+   column: the batch measured 1,334 bytes per row, not 0.5 KB, because all
+   75 integer columns are present on every row, and B=1,000,000 peaked at
+   13.33 GB on a 16 GB host with the memory store holding every object.
 5. **Operator recipe for large objects from small batches** (docs): with 4
    landed, document `--batch-rows 100000 --target-bytes <one object's
    footprint> --max-flush-delay <fill time>` as the way to 25 MB objects on
