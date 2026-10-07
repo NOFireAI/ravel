@@ -2,14 +2,20 @@
 //! each with its own engine, cycle the suite's statements until the phase's
 //! duration has passed, and the figures D7 reports (queries per second,
 //! error ratio, per-statement counts) come out of what they completed.
+//!
+//! An error the engine answers with (any HTTP status, a failed execution) is
+//! a statement error. A connection-level failure
+//! ([`EngineError::Unreachable`]: the request could not be sent, or the
+//! connection was refused or dropped) ends the phase for every task, and the
+//! figures record it as [`ConcurrencyFigures::engine_unreachable`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
-use super::engine::SuiteEngine;
+use super::engine::{EngineError, SuiteEngine};
 use super::suite::Statement;
 
 /// Task `i` starts at statement `i * TASK_OFFSET_STRIDE` (mod the statement
@@ -66,14 +72,50 @@ pub struct PhaseTask {
 pub struct ConcurrencyStatement {
     pub number: u32,
     pub completed: u64,
+    /// Every failed run, statement errors and connection-level failures.
     pub errors: u64,
+    /// The connection-level failures among `errors`.
+    #[serde(default)]
+    pub unreachable: u64,
     /// Nearest-rank percentiles over completed runs; `None` when none
     /// completed.
     pub p50_s: Option<f64>,
     pub p95_s: Option<f64>,
-    /// The error text from the lowest-numbered task that saw this statement
-    /// fail.
+    /// The statement error text from the lowest-numbered task that saw this
+    /// statement fail; a connection-level failure is in
+    /// [`ConcurrencyFigures::engine_unreachable`] instead.
     pub first_error: Option<String>,
+}
+
+impl ConcurrencyStatement {
+    /// Errors the engine answered with, leaving out connection-level
+    /// failures.
+    pub fn statement_errors(&self) -> u64 {
+        self.errors.saturating_sub(self.unreachable)
+    }
+}
+
+/// The first connection-level failure in the phase, which ended it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineUnreachable {
+    /// Seconds from the phase's start to the failing request returning.
+    pub at_s: f64,
+    /// The index of the task that saw it.
+    pub task: usize,
+    /// The suite number of the statement that task sent.
+    pub statement: u32,
+    pub error: String,
+}
+
+impl std::fmt::Display for EngineUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the engine became unreachable {} s into the phase; task {} saw it first, \
+             on q{:02}: {}",
+            self.at_s, self.task, self.statement, self.error
+        )
+    }
 }
 
 /// What the phase measured.
@@ -85,19 +127,30 @@ pub struct ConcurrencyFigures {
     /// The measured window, on the tasks' clocks: from the earliest task
     /// start to the last statement returning, answered or errored. A
     /// statement still running at the deadline finishes, so this is at
-    /// least `duration_s`.
+    /// least `duration_s` unless the engine became unreachable first.
     pub elapsed_s: f64,
     pub queries_completed: u64,
+    /// Every failed run, statement errors and connection-level failures.
     pub errors: u64,
-    /// `queries_completed / elapsed_s`. A statement still running at the
-    /// deadline finishes and counts, and the window runs until it returns.
+    /// The connection-level failures among `errors`: the one that ended the
+    /// phase and any from statements already in flight then, so at most
+    /// `tasks`.
+    #[serde(default)]
+    pub unreachable: u64,
+    /// `queries_completed / elapsed_s`, 0 when `elapsed_s` is 0. A statement
+    /// still running at the deadline finishes and counts, and the window
+    /// runs until it returns.
     pub qps: f64,
     /// `errors / (queries_completed + errors)`, 0 when nothing ran.
     pub error_ratio: f64,
     /// One entry per suite statement, in suite order.
     pub statements: Vec<ConcurrencyStatement>,
-    /// Statements that errored at least once.
+    /// Statements the engine answered with an error at least once.
     pub errored_statements: Vec<u32>,
+    /// Set when a connection-level failure ended the phase: no task started
+    /// a statement after it, and the figures above cover the phase up to it.
+    #[serde(default)]
+    pub engine_unreachable: Option<EngineUnreachable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -114,7 +167,16 @@ pub enum ConcurrencyError {
 
 struct Outcome {
     index: usize,
-    result: Result<Duration, String>,
+    result: Result<Duration, EngineError>,
+}
+
+/// The first connection-level failure any task saw, on that task's clock.
+/// Every task reads it before starting a statement.
+struct Stop {
+    at: Duration,
+    task: usize,
+    index: usize,
+    error: String,
 }
 
 /// One task's outcomes and when, on its clock, it began and its last
@@ -130,27 +192,38 @@ async fn run_task(
     task_index: usize,
     statements: Arc<Vec<Statement>>,
     duration: Duration,
+    stop: Arc<OnceLock<Stop>>,
 ) -> TaskRun {
     let len = statements.len();
     let offset = (task_index * TASK_OFFSET_STRIDE) % len;
     let began = task.clock.now();
     let deadline = began + duration;
     // Each return's reading is the next statement's start, so the loop ends
-    // only once `ended` reaches the deadline.
+    // only once `ended` reaches the deadline or a task has set `stop`.
     let mut ended = began;
     let mut outcomes = Vec::new();
     for k in 0.. {
         let started = ended;
-        if started >= deadline {
+        if started >= deadline || stop.get().is_some() {
             break;
         }
         let index = (offset + k) % len;
         let result = task.engine.query(&statements[index].sql).await;
         ended = task.clock.now();
+        if let Err(error @ EngineError::Unreachable(_)) = &result {
+            // Only the first task to fail this way is recorded; a later
+            // `set` finds the cell full and changes nothing.
+            let _ = stop.set(Stop {
+                at: ended,
+                task: task_index,
+                index,
+                error: error.to_string(),
+            });
+        }
         let latency = ended.saturating_sub(started);
         outcomes.push(Outcome {
             index,
-            result: result.map(|_| latency).map_err(|e| e.to_string()),
+            result: result.map(|_| latency),
         });
     }
     TaskRun {
@@ -191,8 +264,9 @@ pub fn check_shape(
 
 /// Runs the phase: task `i` cycles `statements` from position
 /// `i * TASK_OFFSET_STRIDE` (mod their count) and starts no statement once
-/// `duration` has passed on its clock since it began. A statement already
-/// running at that point runs to completion and counts.
+/// `duration` has passed on its clock since it began, or once any task has
+/// seen a connection-level failure. A statement already running at that
+/// point runs to completion and counts, answered or failed.
 pub async fn run(
     tasks: Vec<PhaseTask>,
     statements: &[Statement],
@@ -201,13 +275,15 @@ pub async fn run(
     check_shape(tasks.len(), statements.len(), duration)?;
     let task_count = tasks.len();
     let shared = Arc::new(statements.to_vec());
+    let stop = Arc::new(OnceLock::new());
     let mut set = JoinSet::new();
     for (task_index, task) in tasks.into_iter().enumerate() {
         let shared = Arc::clone(&shared);
+        let stop = Arc::clone(&stop);
         set.spawn(async move {
             (
                 task_index,
-                run_task(task, task_index, shared, duration).await,
+                run_task(task, task_index, shared, duration, stop).await,
             )
         });
     }
@@ -216,25 +292,40 @@ pub async fn run(
         per_task.push(joined.map_err(|e| ConcurrencyError::TaskFailed(e.to_string()))?);
     }
     per_task.sort_by_key(|(task_index, _)| *task_index);
-    // Every task's `ended` is at least its `began` plus `duration`, so the
-    // window is at least `duration`, which check_shape keeps above zero.
+    // Unless a task set `stop`, every task's `ended` is at least its `began`
+    // plus `duration`, so the window is at least `duration`, which
+    // check_shape keeps above zero. A stop can end it sooner, even at zero.
     let phase_start = per_task.iter().map(|(_, r)| r.began).min();
     let last_return = per_task.iter().map(|(_, r)| r.ended).max();
     let elapsed = match (phase_start, last_return) {
         (Some(start), Some(end)) => end.saturating_sub(start),
         _ => duration,
     };
+    let engine_unreachable = stop.get().map(|stop| EngineUnreachable {
+        at_s: stop
+            .at
+            .saturating_sub(phase_start.unwrap_or_default())
+            .as_secs_f64(),
+        task: stop.task,
+        statement: statements[stop.index].number,
+        error: stop.error.clone(),
+    });
 
     let mut latencies: Vec<Vec<f64>> = vec![Vec::new(); statements.len()];
     let mut errors = vec![0u64; statements.len()];
+    let mut unreachable = vec![0u64; statements.len()];
     let mut first_errors: Vec<Option<String>> = vec![None; statements.len()];
     for (_, task_run) in per_task {
         for outcome in task_run.outcomes {
             match outcome.result {
                 Ok(latency) => latencies[outcome.index].push(latency.as_secs_f64()),
+                Err(EngineError::Unreachable(_)) => {
+                    errors[outcome.index] += 1;
+                    unreachable[outcome.index] += 1;
+                }
                 Err(error) => {
                     errors[outcome.index] += 1;
-                    first_errors[outcome.index].get_or_insert(error);
+                    first_errors[outcome.index].get_or_insert(error.to_string());
                 }
             }
         }
@@ -248,6 +339,7 @@ pub async fn run(
             number: statement.number,
             completed: sample.len() as u64,
             errors: errors[index],
+            unreachable: unreachable[index],
             p50_s: percentile(sample, 0.50),
             p95_s: percentile(sample, 0.95),
             first_error: first_errors[index].take(),
@@ -262,7 +354,12 @@ pub async fn run(
         elapsed_s: elapsed.as_secs_f64(),
         queries_completed,
         errors: error_total,
-        qps: queries_completed as f64 / elapsed.as_secs_f64(),
+        unreachable: figures.iter().map(|s| s.unreachable).sum(),
+        qps: if elapsed.is_zero() {
+            0.0
+        } else {
+            queries_completed as f64 / elapsed.as_secs_f64()
+        },
         error_ratio: if attempted == 0 {
             0.0
         } else {
@@ -270,10 +367,11 @@ pub async fn run(
         },
         errored_statements: figures
             .iter()
-            .filter(|s| s.errors > 0)
+            .filter(|s| s.statement_errors() > 0)
             .map(|s| s.number)
             .collect(),
         statements: figures,
+        engine_unreachable,
     })
 }
 
@@ -281,8 +379,8 @@ pub async fn run(
 #[allow(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, PoisonError};
 
     use async_trait::async_trait;
     use datafusion::arrow::record_batch::RecordBatch;
@@ -497,6 +595,223 @@ mod tests {
             .map(|s| (s.number, s.completed, s.errors))
             .collect();
         assert_eq!(per_statement, vec![(1, 2, 0), (2, 0, 2), (3, 0, 2)]);
+    }
+
+    /// One server every task reaches, on one clock. It answers its first
+    /// `answers` requests, one second each, and refuses every connection
+    /// after them. With `dies`, a request in flight when the first refusal
+    /// happens fails the same way. A statement in `unavailable` is answered
+    /// with an HTTP 503.
+    struct SharedServer {
+        clock: Arc<ScriptedClock>,
+        answers: usize,
+        dies: bool,
+        unavailable: Vec<String>,
+        requests: Mutex<Vec<Request>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Request {
+        task: usize,
+        sql: String,
+        /// Clock seconds at its start.
+        at: u64,
+        refused: bool,
+    }
+
+    impl SharedServer {
+        fn new(answers: usize, dies: bool, unavailable: &[&str]) -> Arc<Self> {
+            Arc::new(SharedServer {
+                clock: Arc::new(ScriptedClock::default()),
+                answers,
+                dies,
+                unavailable: unavailable.iter().map(|s| (*s).to_string()).collect(),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<Request> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn refused(&self) -> bool {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                > self.answers
+        }
+    }
+
+    struct Connection {
+        server: Arc<SharedServer>,
+        task: usize,
+    }
+
+    #[async_trait]
+    impl SuiteEngine for Connection {
+        async fn ddl(&self, _sql: &str) -> Result<DdlReceipt, EngineError> {
+            Err(EngineError::Ddl("stub runs no DDL".to_string()))
+        }
+
+        async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
+            let server = &self.server;
+            let refused = {
+                let mut requests = server
+                    .requests
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                assert!(requests.len() < CALL_CAP, "driver kept starting statements");
+                let refused = requests.len() >= server.answers;
+                requests.push(Request {
+                    task: self.task,
+                    sql: sql.to_string(),
+                    at: server.clock.now().as_secs(),
+                    refused,
+                });
+                refused
+            };
+            let unreachable = || Err(EngineError::Unreachable("connection refused".to_string()));
+            if refused {
+                return unreachable();
+            }
+            server.clock.advance(Duration::from_secs(1));
+            tokio::task::yield_now().await;
+            if server.dies && server.refused() {
+                unreachable()
+            } else if server.unavailable.iter().any(|s| s == sql) {
+                Err(EngineError::Query(
+                    "HTTP 503 Service Unavailable".to_string(),
+                ))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn connections(server: &Arc<SharedServer>, count: usize) -> Vec<PhaseTask> {
+        (0..count)
+            .map(|task| PhaseTask {
+                engine: Arc::new(Connection {
+                    server: Arc::clone(server),
+                    task,
+                }) as Arc<dyn SuiteEngine>,
+                clock: Arc::clone(&server.clock) as Arc<dyn Clock>,
+            })
+            .collect()
+    }
+
+    /// The suite number of `statements(n)`'s statement `sql`.
+    fn number(sql: &str) -> u32 {
+        sql.trim_start_matches('s')
+            .parse()
+            .expect("stub SQL is s<n>")
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_stops_every_task() {
+        // Every answered request moves the shared clock one second, so the
+        // sixth request, the first refused, starts at 5 s whichever task
+        // sends it. The other two tasks have a request in flight then, see it
+        // answered, and start nothing more.
+        let server = SharedServer::new(5, false, &[]);
+        let figures = run(
+            connections(&server, 3),
+            &statements(5),
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("phase runs");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 6, "no request starts after the refusal");
+        let refused = &requests[5];
+        assert_eq!((refused.at, refused.refused), (5, true), "{requests:?}");
+        assert!(requests[..5].iter().all(|r| !r.refused), "{requests:?}");
+        assert_eq!(
+            figures.engine_unreachable,
+            Some(EngineUnreachable {
+                at_s: 5.0,
+                task: refused.task,
+                statement: number(&refused.sql),
+                error: "engine unreachable: connection refused".to_string(),
+            })
+        );
+        assert_eq!(figures.queries_completed, 5);
+        assert_eq!(figures.errors, 1);
+        assert_eq!(figures.unreachable, 1);
+        assert_eq!(figures.elapsed_s.to_bits(), 5.0f64.to_bits());
+        assert_eq!(figures.qps.to_bits(), 1.0f64.to_bits());
+        let failed = &figures.statements[number(&refused.sql) as usize - 1];
+        assert_eq!(
+            (failed.errors, failed.unreachable, failed.statement_errors()),
+            (1, 1, 0)
+        );
+        assert_eq!(failed.first_error, None);
+        assert_eq!(figures.errored_statements, Vec::<u32>::new());
+    }
+
+    #[tokio::test]
+    async fn requests_in_flight_when_the_engine_dies_fail_the_same_way() {
+        // As above, but the server dies at the sixth request: the other two
+        // tasks' requests, in flight then, fail too. Each task fails once, so
+        // errors equal tasks.
+        let server = SharedServer::new(5, true, &[]);
+        let figures = run(
+            connections(&server, 3),
+            &statements(5),
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("phase runs");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 6, "no request starts after the refusal");
+        let first = figures.engine_unreachable.as_ref().expect("phase ended");
+        assert_eq!(
+            (first.task, first.statement),
+            (requests[5].task, number(&requests[5].sql))
+        );
+        assert_eq!(first.at_s.to_bits(), 5.0f64.to_bits());
+        assert_eq!(figures.queries_completed, 3);
+        assert_eq!(figures.errors, 3);
+        assert_eq!(figures.unreachable, 3);
+        assert_eq!(figures.errors, figures.tasks as u64);
+        assert_eq!(figures.errored_statements, Vec::<u32>::new());
+        assert!(figures.statements.iter().all(|s| s.first_error.is_none()));
+    }
+
+    #[tokio::test]
+    async fn an_http_error_answer_does_not_end_the_phase() {
+        let server = SharedServer::new(usize::MAX, false, &["s2"]);
+        let figures = run(
+            connections(&server, 3),
+            &statements(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("phase runs");
+
+        let requests = server.requests();
+        assert!(requests.iter().all(|r| !r.refused));
+        let s2_requests = requests.iter().filter(|r| r.sql == "s2").count() as u64;
+        assert!(s2_requests > 0);
+        assert_eq!(figures.engine_unreachable, None);
+        assert!(figures.elapsed_s >= figures.duration_s);
+        assert_eq!(figures.errors, s2_requests);
+        assert_eq!(figures.unreachable, 0);
+        assert_eq!(
+            figures.queries_completed + figures.errors,
+            requests.len() as u64
+        );
+        assert_eq!(figures.errored_statements, vec![2]);
+        assert_eq!(
+            figures.statements[1].first_error.as_deref(),
+            Some("query failed: HTTP 503 Service Unavailable")
+        );
     }
 
     #[tokio::test]
