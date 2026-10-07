@@ -32,7 +32,7 @@ rlog_hot_ceiling_s = 101.7
 
 # D7's concurrency bar is exactly two rules (issue #2055):
 #   1. at least 0.400 queries per second, ADR-2023's figure on the RLOG entry;
-#   2. zero errors from any statement outside `failures`.
+#   2. zero statement errors (HTTP error answers) outside `failures`.
 #
 # There is no error-ratio ceiling: the five registered failures alone put the
 # raw ratio at 5/43, about 0.116, above the RLOG entry's 0.101 on every run.

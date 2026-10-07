@@ -1205,7 +1205,8 @@ per second and 0.101 error ratio on the RLOG entry. The concurrency bar is
 now exactly two rules (issue #2055):
 
 1. at least 0.400 queries per second;
-2. zero errors from any statement outside the pre-registered failure set.
+2. zero errors from any statement outside the pre-registered failure set
+   (statement errors only, per the dead engine amendment below).
 
 The 0.101 error ratio is no longer a bar. The phase's raw error ratio stays
 in the report, and the bench prints it beside the RLOG entry's 0.101. Both
@@ -1218,10 +1219,11 @@ pre-registered failures (q19, q29, q33, q34, q35) failing exactly as
 predicted put the raw ratio at 5/43, about 0.116, over 0.101 on every run.
 Judging the ceiling instead on the statements outside the registered set
 cannot fire either: rule 2 already fails the run on the first error from
-any of them, so whenever rule 2 passes that ratio is 0. The
-per-statement rule is strictly stronger than any ceiling over the same
-statements. `prereg.toml` drops its `concurrency_error_ratio_ceiling` key,
-and the bench refuses a file that still carries it.
+any of them, so whenever rule 2 passes that ratio is 0 (for statement
+errors only since the dead engine amendment below). The per-statement rule
+is strictly stronger than any ceiling over the same statements.
+`prereg.toml` drops its `concurrency_error_ratio_ceiling` key, and the
+bench refuses a file that still carries it.
 
 ## Amendment (2026-10-06): a manifest key under an invalid table segment is skipped, and repair removes it
 
@@ -1342,3 +1344,33 @@ still the root fix: until it lands, a stolen Query credential can put such
 keys, every tenant-wide listing pages through them until an operator
 removes them, and on S3 one key of a shape the adapter cannot list fails
 those listings outright.
+
+## Amendment (2026-10-07): a dead engine is one concurrency violation
+
+<!-- amendment-applies: sections="Amendment (2026-10-05): the concurrency bar judges no error ratio" pointer="dead engine amendment" -->
+<!-- amendment-supersedes: phrase="zero errors from any statement outside the pre-registered failure set" pointer="dead engine amendment" -->
+<!-- amendment-supersedes: phrase="so whenever rule 2 passes that ratio is 0" pointer="dead engine amendment" -->
+
+The concurrency bar amendment states rule 2 as zero errors from any
+statement outside the pre-registered failure set. Since issue #2632 the
+concurrency phase tells two kinds of error apart, and the bar judges them
+differently:
+
+1. Rule 2 counts statement errors only: errors the server answers with, an
+   HTTP error status of any code, 422 and 503 included.
+2. A connection-level failure (the request could not be sent, the server
+   refused or dropped the connection, or the response body could not be
+   read) is not a statement error. It ends the phase: no task starts a
+   statement after it. D7 reports it once, as `ConcurrencyPhaseFailed`,
+   with no queries-per-second violation and no per-statement violation
+   beside it, since the phase's qps then measures the outage, not the
+   engine.
+3. The bench does not retry a failed request, so one connection the server
+   drops while a request is on it, a reused keep-alive connection included,
+   ends the phase. A phase that ended early costs a rerun.
+4. The concurrency bar amendment's argument that rule 2 makes an error
+   ceiling over the unregistered statements redundant now holds for
+   statement errors only. A connection-level failure counts in the raw
+   error ratio but not in rule 2, so rule 2 can pass beside a nonzero
+   ratio over those statements; the run still fails, through
+   `ConcurrencyPhaseFailed`.
