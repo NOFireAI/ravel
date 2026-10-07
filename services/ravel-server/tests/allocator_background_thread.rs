@@ -113,7 +113,10 @@ const DISABLED: &str =
 #[tokio::test]
 async fn background_thread_gauge_reads_back_the_allocator_state() {
     let state = ravel_server::mem_stats::configure_background_thread(None);
-    assert!(state.enabled, "the startup step enables the thread: {state:?}");
+    assert!(
+        state.enabled,
+        "the startup step enables the thread: {state:?}"
+    );
 
     let running = start_test_server().await;
     let base = format!("http://{}", running.http_addr);

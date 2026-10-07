@@ -835,10 +835,7 @@ mod tests {
             1,
             "the startup stamp must name the read-back state once, got: {logged:?}"
         );
-        assert!(
-            logged.contains("source=\"server\""),
-            "got: {logged:?}"
-        );
+        assert!(logged.contains("source=\"server\""), "got: {logged:?}");
     }
 
     /// `main` runs the allocator step exactly once, before any listener
@@ -852,7 +849,10 @@ mod tests {
         let start_at = SRC
             .find(concat!("ravel_server::", "start_with_heartbeat("))
             .expect("main starts the server");
-        assert!(call_at < start_at, "the allocator step must run before start");
+        assert!(
+            call_at < start_at,
+            "the allocator step must run before start"
+        );
     }
 
     /// ADR-1733 decision 2 reachability: the one production `ServerConfig`

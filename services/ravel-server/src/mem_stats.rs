@@ -92,9 +92,10 @@ impl BackgroundThread {
 /// Whether a jemalloc option string sets `background_thread` itself.
 /// jemalloc's option syntax is comma-separated `key:value` pairs.
 fn malloc_conf_names_background_thread(malloc_conf: &str) -> bool {
-    malloc_conf
-        .split(',')
-        .any(|pair| pair.split_once(':').is_some_and(|(key, _)| key == "background_thread"))
+    malloc_conf.split(',').any(|pair| {
+        pair.split_once(':')
+            .is_some_and(|(key, _)| key == "background_thread")
+    })
 }
 
 /// Enables jemalloc's background thread, which purges freed dirty pages on a
