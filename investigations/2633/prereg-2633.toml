@@ -1,0 +1,6 @@
+memory_cap_bytes = 3960000000
+arm_b_hot_s = 1000.0
+arm_b_cold_s = 1000.0
+failures = ["q19", "q29", "q33", "q34", "q35"]
+rlog_hot_ceiling_s = 101.7
+concurrency_qps_floor = 0.400

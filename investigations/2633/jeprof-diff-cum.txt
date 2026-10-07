@@ -1,0 +1,41 @@
+Total: 2473715368 B
+       0   0.0%   0.0% 2473715368 100.0% ::call_once (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::call_once::{shim:vtable#0}
+       0   0.0%   0.0% 2473715368 100.0% ::launch::{closure#0} (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::new::thread_start
+       0   0.0%   0.0% 2473715368 100.0% ::poll (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::poll::{closure#0} (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::poll_inner (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::run (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::run_task
+       0   0.0%   0.0% 2473715368 100.0% ::run_task::{closure#0} (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::set:: (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::spawn_thread::{closure#0} (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::try_with:: (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::with:: (inline)
+       0   0.0%   0.0% 2473715368 100.0% ::with_mut:: (inline)
+       0   0.0%   0.0% 2473715368 100.0% __clone@@GLIBC_2.2.5
+       0   0.0%   0.0% 2473715368 100.0% _rjem_je_prof_backtrace
+       0   0.0%   0.0% 2473715368 100.0% _rjem_je_prof_tctx_create
+       0   0.0%   0.0% 2473715368 100.0% prof_alloc_prep (inline)
+2473715368 100.0% 100.0% 2473715368 100.0% prof_backtrace_impl
+       0   0.0% 100.0% 2473715368 100.0% pthread_condattr_setpshared@GLIBC_2.2.5
+       0   0.0% 100.0% 2473715368 100.0% std::panic::catch_unwind:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% std::panicking::catch_unwind:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% std::panicking::catch_unwind::do_call:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% std::sys::backtrace::__rust_begin_short_backtrace::
+       0   0.0% 100.0% 2473715368 100.0% std::thread::lifecycle::spawn_unchecked::::{closure#1} (inline)
+       0   0.0% 100.0% 2473715368 100.0% std::thread::lifecycle::spawn_unchecked::::{closure#1}::{closure#0} (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::context::runtime::enter_runtime:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::context::set_scheduler:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::context::set_scheduler::::{closure#0} (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::scheduler::multi_thread::worker::run
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0} (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0} (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::task::harness::poll_future:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::task::harness::poll_future::::{closure#0} (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::runtime::task::raw::poll::@652abd0
+       0   0.0% 100.0% 2473715368 100.0% tokio::task::coop::budget:: (inline)
+       0   0.0% 100.0% 2473715368 100.0% tokio::task::coop::with_budget:: (inline)
+       0   0.0% 100.0% 2472656528 100.0% ::poll
+       0   0.0% 100.0% 2444174244  98.8% datafusion_common_runtime::trace_utils::trace_future::::{closure#0}

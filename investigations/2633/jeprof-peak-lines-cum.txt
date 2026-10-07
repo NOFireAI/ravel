@@ -1,0 +1,705 @@
+Total: 5702495657 B
+       0   0.0%   0.0% 5702495657 100.0% _rjem_je_prof_backtrace /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/prof_sys.c:530
+       0   0.0%   0.0% 5702495657 100.0% _rjem_je_prof_tctx_create /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/prof.c:232
+       0   0.0%   0.0% 5702495657 100.0% prof_alloc_prep (inline) /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/include/jemalloc/internal/prof_inlines.h:171
+5702495657 100.0% 100.0% 5702495657 100.0% prof_backtrace_impl /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/prof_sys.c:107
+       0   0.0% 100.0% 5702495657 100.0% std::panic::catch_unwind:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panic.rs:359
+       0   0.0% 100.0% 5702495657 100.0% std::panicking::catch_unwind:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:544
+       0   0.0% 100.0% 5702495657 100.0% std::panicking::catch_unwind::do_call:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:581
+       0   0.0% 100.0% 5701971365 100.0% tokio::runtime::context::runtime::enter_runtime:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/runtime.rs:65
+       0   0.0% 100.0% 5701971365 100.0% tokio::task::coop::budget:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:133
+       0   0.0% 100.0% 5701971365 100.0% tokio::task::coop::with_budget:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:167
+       0   0.0% 100.0% 5700387917 100.0% ::poll (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/future/future.rs:133
+       0   0.0% 100.0% 5700125551 100.0% ::try_with:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/local.rs:462
+       0   0.0% 100.0% 5699075566  99.9% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:2275
+       0   0.0% 100.0% 5699075566  99.9% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panic/unwind_safe.rs:275
+       0   0.0% 100.0% 5699075566  99.9% ::call_once::{shim:vtable#0} /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250
+       0   0.0% 100.0% 5699075566  99.9% ::launch::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:514
+       0   0.0% 100.0% 5699075566  99.9% ::new::thread_start /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/thread/unix.rs:118
+       0   0.0% 100.0% 5699075566  99.9% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/blocking/task.rs:42
+       0   0.0% 100.0% 5699075566  99.9% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/core.rs:369
+       0   0.0% 100.0% 5699075566  99.9% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/harness.rs:155
+       0   0.0% 100.0% 5699075566  99.9% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:273
+       0   0.0% 100.0% 5699075566  99.9% ::poll::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/core.rs:380
+       0   0.0% 100.0% 5699075566  99.9% ::poll_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/harness.rs:210
+       0   0.0% 100.0% 5699075566  99.9% ::run (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/blocking/pool.rs:161
+       0   0.0% 100.0% 5699075566  99.9% ::run (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/blocking/pool.rs:518
+       0   0.0% 100.0% 5699075566  99.9% ::run (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/mod.rs:519
+       0   0.0% 100.0% 5699075566  99.9% ::run (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/mod.rs:565
+       0   0.0% 100.0% 5699075566  99.9% ::run_task /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:689
+       0   0.0% 100.0% 5699075566  99.9% ::set:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/scoped.rs:40
+       0   0.0% 100.0% 5699075566  99.9% ::spawn_thread::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/blocking/pool.rs:474
+       0   0.0% 100.0% 5699075566  99.9% ::with:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/local.rs:426
+       0   0.0% 100.0% 5699075566  99.9% ::with_mut:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/loom/std/unsafe_cell.rs:16
+       0   0.0% 100.0% 5699075566  99.9% __clone@@GLIBC_2.2.5 ??:?
+       0   0.0% 100.0% 5699075566  99.9% pthread_condattr_setpshared@GLIBC_2.2.5 ??:?
+       0   0.0% 100.0% 5699075566  99.9% std::sys::backtrace::__rust_begin_short_backtrace:: /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/backtrace.rs:166
+       0   0.0% 100.0% 5699075566  99.9% std::thread::lifecycle::spawn_unchecked::::{closure#1} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/lifecycle.rs:68
+       0   0.0% 100.0% 5699075566  99.9% std::thread::lifecycle::spawn_unchecked::::{closure#1}::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/lifecycle.rs:70
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::context::set_scheduler:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::context::set_scheduler::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::scheduler::multi_thread::worker::run /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:548
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:556
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:561
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::task::harness::poll_future:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/harness.rs:523
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::task::harness::poll_future::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/harness.rs:535
+       0   0.0% 100.0% 5699075566  99.9% tokio::runtime::task::raw::poll::@652abd0 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0% 5694257085  99.9% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/future/map.rs:55
+       0   0.0% 100.0% 5694257085  99.9% ::poll /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/lib.rs:85
+       0   0.0% 100.0% 5152786409  90.4% datafusion_common_runtime::trace_utils::trace_future::::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-runtime-54.1.0/src/trace_utils.rs:137
+       0   0.0% 100.0% 5152786409  90.4% tokio::runtime::task::raw::poll::@412fb60 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0% 4885377362  85.7% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/stream/next.rs:32
+       0   0.0% 100.0% 4885377362  85.7% ::poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-core-0.3.33/src/stream.rs:130
+       0   0.0% 100.0% 4885377362  85.7% ::poll_next_unpin (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/stream/mod.rs:1637
+       0   0.0% 100.0% 4538755592  79.6% alloc::alloc::alloc (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:101
+       0   0.0% 100.0% 4538755592  79.6% imalloc (inline) /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1750
+       0   0.0% 100.0% 4538755592  79.6% imalloc_body (inline) /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1613
+       0   0.0% 100.0% 4536909778  79.6% __rustc::__rust_alloc (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/main.rs:22
+       0   0.0% 100.0% 4535818059  79.5% ::alloc (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemallocator-0.7.0/src/lib.rs:100
+       0   0.0% 100.0% 4535818059  79.5% _rjem_je_malloc_default /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1785
+       0   0.0% 100.0% 4225875516  74.1% ::run (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:596
+       0   0.0% 100.0% 3792145093  66.5% ::alloc_impl (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:332
+       0   0.0% 100.0% 3792145093  66.5% ::alloc_impl_runtime (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:210
+       0   0.0% 100.0% 3792145093  66.5% ::allocate (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:449
+       0   0.0% 100.0% 3735833301  65.5% ::run_input::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:360
+       0   0.0% 100.0% 3653007289  64.1% ::try_allocate_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:465
+       0   0.0% 100.0% 3653007289  64.1% ::with_capacity_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:177
+       0   0.0% 100.0% 3653007289  64.1% ::with_capacity_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:434
+       0   0.0% 100.0% 3653007289  64.1% ::with_capacity_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:977
+       0   0.0% 100.0% 3577857320  62.7% ::run_task::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:698
+       0   0.0% 100.0% 3555469314  62.3% ::with_capacity (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:524
+       0   0.0% 100.0% 3324835633  58.3% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/try_future/into_future.rs:34
+       0   0.0% 100.0% 3324835633  58.3% ::try_poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-core-0.3.33/src/future.rs:92
+       0   0.0% 100.0% 2834578989  49.7% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250
+       0   0.0% 100.0% 2834054697  49.7% ::poll_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_stream/mod.rs:96
+       0   0.0% 100.0% 2834054697  49.7% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_stream/mod.rs:125
+       0   0.0% 100.0% 2834054697  49.7% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/coop.rs:154
+       0   0.0% 100.0% 2834054697  49.7% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:739
+       0   0.0% 100.0% 2834054697  49.7% ::poll_next /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/boundary.rs:257
+       0   0.0% 100.0% 2834054697  49.7% ::poll_next::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/boundary.rs:257
+       0   0.0% 100.0% 2834054697  49.7% ::poll_upstream (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:700
+       0   0.0% 100.0% 2833006041  49.7% ::poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/unfold.rs:107
+       0   0.0% 100.0% 2833006041  49.7% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/stream/fuse.rs:53
+       0   0.0% 100.0% 2829759900  49.6% ::into_stream::{closure#0}::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/push_decoder.rs:131
+       0   0.0% 100.0% 2829759900  49.6% ::poll_scan (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_stream/scan_state.rs:159
+       0   0.0% 100.0% 2783364957  48.8% ::fetch_once::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:361
+       0   0.0% 100.0% 2783364957  48.8% ::get_byte_ranges::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:699
+       0   0.0% 100.0% 2783364957  48.8% ::get_or_fetch::::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/cache.rs:255
+       0   0.0% 100.0% 2783364957  48.8% ::get_or_fetch_outcome::::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/cache.rs:287
+       0   0.0% 100.0% 2783364957  48.8% ::read_reserved::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:250
+       0   0.0% 100.0% 2783364957  48.8% ::run::::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/single_flight.rs:120
+       0   0.0% 100.0% 2783364957  48.8% ::run_as_leader::::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/single_flight.rs:174
+       0   0.0% 100.0% 2783364957  48.8% ::transition::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/push_decoder.rs:159
+       0   0.0% 100.0% 2781321140  48.8% ::bytes::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/object_store-0.14.1/src/lib.rs:1846
+       0   0.0% 100.0% 2781321140  48.8% ::fetch_once::{closure#0}::{closure#0}::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:343
+       0   0.0% 100.0% 2781321140  48.8% ::get_inner::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3.rs:2268
+       0   0.0% 100.0% 2781321140  48.8% ::get_one::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3.rs:2318
+       0   0.0% 100.0% 2781321140  48.8% ::get_or_fetch_outcome::::{closure#0}::{closure#0}::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/cache.rs:283
+       0   0.0% 100.0% 2781321140  48.8% ::get_pinned::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/external.rs:759
+       0   0.0% 100.0% 2781321140  48.8% ::get_pinned::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/lib.rs:744
+       0   0.0% 100.0% 2781321140  48.8% ::get_pinned::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3.rs:2694
+       0   0.0% 100.0% 2781321140  48.8% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:399
+       0   0.0% 100.0% 2781321140  48.8% ::poll::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:401
+       0   0.0% 100.0% 2781321140  48.8% ::scope_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:217
+       0   0.0% 100.0% 2781321140  48.8% object_store::util::collect_bytes::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/object_store-0.14.1/src/util.rs:59
+       0   0.0% 100.0% 2781321140  48.8% ravel_object_store::s3::connector::scope::::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3/connector.rs:110
+       0   0.0% 100.0% 2121218246  37.2% ::run_task::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:775
+       0   0.0% 100.0% 1897696764  33.3% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:745
+       0   0.0% 100.0% 1872188370  32.8% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/projection.rs:535
+       0   0.0% 100.0% 1473200050  25.8% ::run (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:608
+       0   0.0% 100.0% 1407718612  24.7% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/try_join_all.rs:162
+       0   0.0% 100.0% 1407718612  24.7% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/try_maybe_done.rs:79
+       0   0.0% 100.0% 1377221820  24.2% ::try_poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-core-0.3.33/src/stream.rs:206
+       0   0.0% 100.0% 1375646345  24.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/try_join_all.rs:188
+       0   0.0% 100.0% 1375646345  24.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/futures_ordered.rs:56
+       0   0.0% 100.0% 1375646345  24.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/try_stream/try_collect.rs:46
+       0   0.0% 100.0% 1375646345  24.1% ::poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/futures_ordered.rs:206
+       0   0.0% 100.0% 1375646345  24.1% ::poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/futures_unordered/mod.rs:539
+       0   0.0% 100.0% 1267257161  22.2% ::group_aggregate_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:965
+       0   0.0% 100.0% 1230359209  21.6% ::grow_amortized (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:528
+       0   0.0% 100.0% 1171259336  20.5% ::intern /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:1081
+       0   0.0% 100.0% 1163740065  20.4% __rustc::__rust_realloc (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/main.rs:22
+       0   0.0% 100.0% 1163740065  20.4% alloc::alloc::realloc_nonnull (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:155
+       0   0.0% 100.0% 1163740065  20.4% do_rallocx /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:2517
+       0   0.0% 100.0% 1163740065  20.4% irallocx_prof (inline) /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:2458
+       0   0.0% 100.0% 1149544060  20.2% ::pull_from_input::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1630
+       0   0.0% 100.0% 1103466606  19.4% ::finish_grow /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:556
+       0   0.0% 100.0% 1103466606  19.4% ::grow (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:474
+       0   0.0% 100.0% 1103466606  19.4% ::grow_impl (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:362
+       0   0.0% 100.0% 1103466606  19.4% ::grow_impl_runtime (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:259
+       0   0.0% 100.0% 1103466606  19.4% ::realloc (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemallocator-0.7.0/src/lib.rs:133
+       0   0.0% 100.0% 1036439358  18.2% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:728
+       0   0.0% 100.0% 764041672  13.4% ::reserve (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:341
+       0   0.0% 100.0% 764041672  13.4% ::reserve (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:675
+       0   0.0% 100.0% 764041672  13.4% ::reserve (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:1471
+       0   0.0% 100.0% 764041672  13.4% ::reserve::do_reserve_and_handle:: /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:668
+       0   0.0% 100.0% 746043964  13.1% ::alloc_impl (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/allocator-api2-0.2.21/src/stable/alloc/global.rs:35
+       0   0.0% 100.0% 746043964  13.1% ::allocate (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/allocator-api2-0.2.21/src/stable/alloc/global.rs:100
+       0   0.0% 100.0% 746043964  13.1% ::fallible_with_capacity:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:1634
+       0   0.0% 100.0% 746043964  13.1% ::new_uninitialized:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:1576
+       0   0.0% 100.0% 746043964  13.1% ::prepare_resize:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:2696
+       0   0.0% 100.0% 746043964  13.1% ::reserve:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:914
+       0   0.0% 100.0% 746043964  13.1% ::reserve_rehash:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:962
+       0   0.0% 100.0% 746043964  13.1% ::reserve_rehash_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:2784
+       0   0.0% 100.0% 746043964  13.1% ::resize_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:2898
+       0   0.0% 100.0% 746043964  13.1% hashbrown::alloc::inner::do_alloc:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/alloc.rs:40
+       0   0.0% 100.0% 740234312  13.0% ::insert_accounted:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/utils/proxy.rs:180
+       0   0.0% 100.0% 740234312  13.0% ::reserve:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/table.rs:846
+       0   0.0% 100.0% 731857499  12.8% ::vectorized_intern (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:482
+       0   0.0% 100.0% 719062472  12.6% ::collect_vectorized_process_context (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:540
+       0   0.0% 100.0% 624105614  10.9% ::group_aggregate_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:1013
+       0   0.0% 100.0% 544705709   9.6% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:496
+       0   0.0% 100.0% 544705709   9.6% ::poll_catch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:128
+       0   0.0% 100.0% 544705709   9.6% ::poll_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:150
+       0   0.0% 100.0% 542909695   9.5% ::extend_with (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3649
+       0   0.0% 100.0% 541470675   9.5% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/lib.rs:85
+       0   0.0% 100.0% 541470675   9.5% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/client/conn/http1.rs:630
+       0   0.0% 100.0% 541470675   9.5% ::poll_loop (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:173
+       0   0.0% 100.0% 541470675   9.5% ::poll_read (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:238
+       0   0.0% 100.0% 541470675   9.5% ::poll_read_from_io /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/io.rs:230
+       0   0.0% 100.0% 541470675   9.5% ::reserve (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bytes-1.12.1/src/bytes_mut.rs:621
+       0   0.0% 100.0% 541470675   9.5% tokio::runtime::task::raw::poll::@6110650 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0% 529583185   9.3% ::resize (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3526
+       0   0.0% 100.0% 492581781   8.6% ::reserve_inner /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bytes-1.12.1/src/bytes_mut.rs:790
+       0   0.0% 100.0% 486711475   8.5% ::maybe_notify /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/conn.rs:541
+       0   0.0% 100.0% 486711475   8.5% ::poll_read_body /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/conn.rs:425
+       0   0.0% 100.0% 486711475   8.5% ::try_keep_alive (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/conn.rs:570
+       0   0.0% 100.0% 472781194   8.3% ::new::{closure#0}::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/no_grouping.rs:342
+       0   0.0% 100.0% 466317537   8.2% ::grow_one (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:492
+       0   0.0% 100.0% 466317537   8.2% ::grow_one /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:188
+       0   0.0% 100.0% 465493530   8.2% ::push (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:1004
+       0   0.0% 100.0% 465493530   8.2% ::push_mut (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:1041
+       0   0.0% 100.0% 431035171   7.6% ::vectorized_append (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:596
+       0   0.0% 100.0% 431035171   7.6% ::vectorized_append /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/primitive.rs:224
+       0   0.0% 100.0% 431035171   7.6% ::vectorized_intern (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:485
+       0   0.0% 100.0% 248946274   4.4% ::merge_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-54.1.0/src/count.rs:681
+       0   0.0% 100.0% 246134150   4.3% ::update_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-common-54.1.0/src/aggregate/groups_accumulator/prim_op.rs:100
+       0   0.0% 100.0% 221022363   3.9% ::collect:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/traits/iterator.rs:2090
+       0   0.0% 100.0% 219963523   3.9% ::from_iter:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3926
+       0   0.0% 100.0% 216534567   3.8% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/filter.rs:1023
+       0   0.0% 100.0% 197534439   3.5% ::coalesce /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:170
+       0   0.0% 100.0% 197534439   3.5% ::pull_from_input::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1650
+       0   0.0% 100.0% 197534439   3.5% ::push_and_drain (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:247
+       0   0.0% 100.0% 197534439   3.5% ::push_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce.rs:499
+       0   0.0% 100.0% 197534439   3.5% ::push_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/coalesce/mod.rs:118
+       0   0.0% 100.0% 155485621   2.7% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs:52
+       0   0.0% 100.0% 153100537   2.7% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/in_place_collect.rs:245
+       0   0.0% 100.0% 152050425   2.7% ::emit /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:1122
+       0   0.0% 100.0% 152050425   2.7% ::evaluate /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/avg.rs:796
+       0   0.0% 100.0% 152050425   2.7% ::from_iter:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-array-58.4.0/src/array/primitive_array.rs:1475
+       0   0.0% 100.0% 152050425   2.7% ::from_iter:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/buffer/immutable.rs:619
+       0   0.0% 100.0% 152050425   2.7% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:813
+       0   0.0% 100.0% 152050425   2.7% ::set_input_done_and_produce_output /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:1344
+       0   0.0% 100.0% 126892602   2.2% ::finish_grow /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:559
+       0   0.0% 100.0% 110864384   1.9% ::update_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-54.1.0/src/min_max/min_max_bytes.rs:127
+       0   0.0% 100.0% 100666507   1.8% ::copy_rows /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/primitive.rs:70
+       0   0.0% 100.0% 100666507   1.8% ::ensure_capacity (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/primitive.rs:59
+       0   0.0% 100.0% 97537974   1.7% ::to_vec (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/slice.rs:376
+       0   0.0% 100.0% 97537974   1.7% ::to_vec:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/slice.rs:448
+       0   0.0% 100.0% 97537974   1.7% ::to_vec_in:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/slice.rs:400
+       0   0.0% 100.0% 97537874   1.7% ::update_batch:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-54.1.0/src/min_max/min_max_bytes.rs:475
+       0   0.0% 100.0% 96489074   1.7% ::set_value /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-54.1.0/src/min_max/min_max_bytes.rs:414
+       0   0.0% 100.0% 95431291   1.7% ::insert_if_new:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:227
+       0   0.0% 100.0% 95431291   1.7% ::intern /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/single_group_by/bytes_view.rs:57
+       0   0.0% 100.0% 87450776   1.5% ::copy_rows /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/byte_view.rs:341
+       0   0.0% 100.0% 87450776   1.5% ::next_buffer (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/byte_view.rs:384
+       0   0.0% 100.0% 84732722   1.5% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:819
+       0   0.0% 100.0% 74032858   1.3% ::append_views_and_copy_strings /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/byte_view.rs:162
+       0   0.0% 100.0% 69797229   1.2% ::insert_if_new_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:360
+       0   0.0% 100.0% 67913098   1.2% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter.rs:33
+       0   0.0% 100.0% 63049569   1.1% ::pull_from_input::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1644
+       0   0.0% 100.0% 62159627   1.1% ::append_elements (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:2932
+       0   0.0% 100.0% 62159627   1.1% ::extend_from_slice (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3557
+       0   0.0% 100.0% 62159627   1.1% ::spec_extend (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_extend.rs:56
+       0   0.0% 100.0% 61847906   1.1% ::from_iter:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/result.rs:2156
+       0   0.0% 100.0% 61847906   1.1% ::from_iter::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/result.rs:2156
+       0   0.0% 100.0% 61847906   1.1% ::try_fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/map.rs:121
+       0   0.0% 100.0% 61847906   1.1% ::try_fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs:195
+       0   0.0% 100.0% 61847906   1.1% ::try_fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/traits/iterator.rs:2494
+       0   0.0% 100.0% 61847906   1.1% core::iter::adapters::map::map_try_fold::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/map.rs:95
+       0   0.0% 100.0% 61847906   1.1% core::iter::adapters::try_process:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs:163
+       0   0.0% 100.0% 61323570   1.1% ::extend_desugared:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:4030
+       0   0.0% 100.0% 61323570   1.1% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs:41
+       0   0.0% 100.0% 61323570   1.1% ::spec_extend (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_extend.rs:18
+       0   0.0% 100.0% 61110827   1.1% ::append_value /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:446
+       0   0.0% 100.0% 60797794   1.1% ::try_for_each:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/traits/iterator.rs:2556
+       0   0.0% 100.0% 60273458   1.1% ::call (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:2289
+       0   0.0% 100.0% 60273458   1.1% ::extend (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-data-58.4.0/src/transform/mod.rs:733
+       0   0.0% 100.0% 60273458   1.1% ::extend_from_slice:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/buffer/mutable.rs:594
+       0   0.0% 100.0% 60273458   1.1% ::next (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs:177
+       0   0.0% 100.0% 60273458   1.1% ::partition_grouped_take (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:881
+       0   0.0% 100.0% 60273458   1.1% ::partition_iter /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:822
+       0   0.0% 100.0% 60273458   1.1% ::realloc (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemallocator-0.7.0/src/lib.rs:135
+       0   0.0% 100.0% 60273458   1.1% ::reallocate /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/buffer/mutable.rs:390
+       0   0.0% 100.0% 60273458   1.1% ::reserve (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/buffer/mutable.rs:289
+       0   0.0% 100.0% 60273458   1.1% alloc::alloc::realloc (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:148
+       0   0.0% 100.0% 60273458   1.1% arrow_data::transform::primitive::build_extend::::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-data-58.4.0/src/transform/primitive.rs:31
+       0   0.0% 100.0% 60273458   1.1% arrow_select::take::take /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/take.rs:100
+       0   0.0% 100.0% 60273458   1.1% arrow_select::take::take_arrays /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/take.rs:162
+       0   0.0% 100.0% 60273458   1.1% arrow_select::take::take_arrays::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/take.rs:161
+       0   0.0% 100.0% 60273458   1.1% arrow_select::take::take_impl:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/take.rs:237
+       0   0.0% 100.0% 60273458   1.1% arrow_select::take::take_list:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/take.rs:649
+       0   0.0% 100.0% 54759200   1.0% ::decode:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/decode.rs:156
+       0   0.0% 100.0% 54759200   1.0% ::poll_read_body /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/conn.rs:371
+       0   0.0% 100.0% 54759200   1.0% ::read_mem /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/io.rs:354
+       0   0.0% 100.0% 48888894   0.9% ::reserve_inner /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bytes-1.12.1/src/bytes_mut.rs:770
+       0   0.0% 100.0% 46394942   0.8% ::transition::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/push_decoder.rs:154
+       0   0.0% 100.0% 46394942   0.8% ::try_decode /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/mod.rs:277
+       0   0.0% 100.0% 38206682   0.7% ::next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1361
+       0   0.0% 100.0% 27486837   0.5% ::transition (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/mod.rs:501
+       0   0.0% 100.0% 27486837   0.5% ::try_build (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/reader_builder/mod.rs:276
+       0   0.0% 100.0% 27486837   0.5% ::try_next_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/mod.rs:443
+       0   0.0% 100.0% 27486837   0.5% ::try_next_reader (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/remaining.rs:87
+       0   0.0% 100.0% 26920303   0.5% ::try_transition (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/reader_builder/mod.rs:492
+       0   0.0% 100.0% 23981238   0.4% ::get_next_page /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/serialized_reader.rs:965
+       0   0.0% 100.0% 23981238   0.4% parquet::file::serialized_reader::decode_page /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/serialized_reader.rs:448
+       0   0.0% 100.0% 21541905   0.4% ::read_new_page /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:406
+       0   0.0% 100.0% 21171840   0.4% ::insert_if_new_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:371
+       0   0.0% 100.0% 21055801   0.4% ::read_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/struct_array.rs:68
+       0   0.0% 100.0% 19990754   0.4% ::read_records (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/record_reader/mod.rs:131
+       0   0.0% 100.0% 19298577   0.3% ::with_predicate_options /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/read_plan.rs:230
+       0   0.0% 100.0% 18908105   0.3% ::next (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed/iter.rs:21
+       0   0.0% 100.0% 18908105   0.3% ::try_next_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/mod.rs:460
+       0   0.0% 100.0% 18160805   0.3% ::merge_batch /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/avg.rs:759
+       0   0.0% 100.0% 17150881   0.3% ::skip_records (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/record_reader/mod.rs:146
+       0   0.0% 100.0% 17150881   0.3% ::skip_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/struct_array.rs:193
+       0   0.0% 100.0% 17125391   0.3% parquet::arrow::array_reader::read_records:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/mod.rs:196
+       0   0.0% 100.0% 15477377   0.3% ::read_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/byte_view_array.rs:105
+       0   0.0% 100.0% 13714191   0.2% ::skip_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/byte_view_array.rs:121
+       0   0.0% 100.0% 13714191   0.2% parquet::arrow::array_reader::skip_records:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/mod.rs:230
+       0   0.0% 100.0% 13417917   0.2% ::append_views_and_copy_strings /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/byte_view.rs:203
+       0   0.0% 100.0% 13326510   0.2% ::resize /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3526
+       0   0.0% 100.0% 13326510   0.2% ::update_batch:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-54.1.0/src/min_max/min_max_bytes.rs:442
+       0   0.0% 100.0% 13057496   0.2% ::resize /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/avg.rs:724
+       0   0.0% 100.0% 12254687   0.2% ::has_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:552
+       0   0.0% 100.0% 12254687   0.2% ::read_one_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/record_reader/mod.rs:237
+       0   0.0% 100.0% 12254687   0.2% ::read_records (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:213
+       0   0.0% 100.0% 11603416   0.2% ::skip_records (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:320
+       0   0.0% 100.0% 11427743   0.2% ::next_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1490
+       0   0.0% 100.0% 10958038   0.2% ::next_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1454
+       0   0.0% 100.0%  9442259   0.2% ::new (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:286
+       0   0.0% 100.0%  9442259   0.2% alloc::boxed::box_new_uninit (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:248
+       0   0.0% 100.0%  8892610   0.2% ::copy_rows /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/byte_view.rs:309
+       0   0.0% 100.0%  8892610   0.2% ::ensure_capacity (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/byte_view.rs:102
+       0   0.0% 100.0%  8686402   0.2% ::append_value /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:451
+       0   0.0% 100.0%  8563010   0.2% ::next_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1408
+       0   0.0% 100.0%  7736067   0.1% ::get_or_insert_with:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/option.rs:1823
+       0   0.0% 100.0%  7736067   0.1% ::read_one_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/record_reader/mod.rs:234
+       0   0.0% 100.0%  7736067   0.1% ::read_one_batch::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/record_reader/mod.rs:234
+       0   0.0% 100.0%  7251110   0.1% ::collect_vectorized_process_context (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:549
+       0   0.0% 100.0%  6875257   0.1% ::with_capacity (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/buffer/view_buffer.rs:39
+       0   0.0% 100.0%  6825039   0.1% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/mod.rs:1607
+       0   0.0% 100.0%  6825039   0.1% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/projection.rs:342
+       0   0.0% 100.0%  6825039   0.1% ::execute_typed (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/mod.rs:968
+       0   0.0% 100.0%  6825039   0.1% ::run_input::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:340
+       0   0.0% 100.0%  6300591   0.1% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:476
+       0   0.0% 100.0%  6192843   0.1% ::next_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1389
+       0   0.0% 100.0%  5809652   0.1% ::find_or_find_insert_index:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:1126
+       0   0.0% 100.0%  5809652   0.1% ::group_aggregate_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:999
+       0   0.0% 100.0%  5669842   0.1% ::resize /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/avg.rs:725
+       0   0.0% 100.0%  5547464   0.1% ::skip_records (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:298
+       0   0.0% 100.0%  5482794   0.1% ::from_consecutive_ranges:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/selection.rs:182
+       0   0.0% 100.0%  5482794   0.1% ::from_filters /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/selection.rs:160
+       0   0.0% 100.0%  5482794   0.1% ::with_predicate_options /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/read_plan.rs:281
+       0   0.0% 100.0%  5324399   0.1% ::read_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/cached_array_reader.rs:236
+       0   0.0% 100.0%  5251791   0.1% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1242
+       0   0.0% 100.0%  5243488   0.1% ::new (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/sync.rs:427
+       0   0.0% 100.0%  5243118   0.1% ::insert (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/set.rs:1075
+       0   0.0% 100.0%  5243118   0.1% ::insert /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/map.rs:1812
+       0   0.0% 100.0%  5243118   0.1% ::update_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-common-54.1.0/src/aggregate/count_distinct/groups.rs:76
+       0   0.0% 100.0%  5243118   0.1% ::update_batch::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-common-54.1.0/src/aggregate/count_distinct/groups.rs:77
+       0   0.0% 100.0%  5243118   0.1% datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-common-54.1.0/src/aggregate/groups_accumulator/accumulate.rs:388
+       0   0.0% 100.0%  5019999   0.1% ::vectorized_intern (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:454
+       0   0.0% 100.0%  4870704   0.1% ::with_capacity (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/buffer/view_buffer.rs:75
+       0   0.0% 100.0%  4513377   0.1% ::read_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/primitive_array.rs:152
+       0   0.0% 100.0%  4259352   0.1% ::fetch_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/cached_array_reader.rs:138
+       0   0.0% 100.0%  4202987   0.1% ::build (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:135
+       0   0.0% 100.0%  3436689   0.1% ::skip_records /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/primitive_array.rs:212
+       0   0.0% 100.0%  3436689   0.1% parquet::arrow::array_reader::skip_records:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/mod.rs:230
+       0   0.0% 100.0%  3420134   0.1% core::ops::function::FnOnce>::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250
+       0   0.0% 100.0%  3420090   0.1% __libc_init_first@@GLIBC_2.2.5 ??:?
+       0   0.0% 100.0%  3420090   0.1% __libc_start_main@GLIBC_2.2.5 ??:?
+       0   0.0% 100.0%  3420090   0.1% _start ??:?
+       0   0.0% 100.0%  3420090   0.1% main ??:?
+       0   0.0% 100.0%  3420090   0.1% std::rt::lang_start_internal /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/rt.rs:171
+       0   0.0% 100.0%  3346666   0.1% ::vectorized_intern (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:458
+       0   0.0% 100.0%  3329736   0.1% ::collect_vectorized_process_context (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:576
+       0   0.0% 100.0%  3235033   0.1% ::call::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/handler/mod.rs:255
+       0   0.0% 100.0%  3235033   0.1% ::poll (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/future/poll_fn.rs:151
+       0   0.0% 100.0%  3235033   0.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/macros.rs:42
+       0   0.0% 100.0%  3235033   0.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/server/conn/http1.rs:553
+       0   0.0% 100.0%  3235033   0.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-util-0.1.20/src/service/oneshot.rs:54
+       0   0.0% 100.0%  3235033   0.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-0.5.3/src/util/oneshot.rs:96
+       0   0.0% 100.0%  3235033   0.1% ::poll /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/routing/route.rs:149
+       0   0.0% 100.0%  3235033   0.1% ::poll /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/util.rs:94
+       0   0.0% 100.0%  3235033   0.1% ::poll /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-util-0.1.20/src/server/conn/auto/mod.rs:693
+       0   0.0% 100.0%  3235033   0.1% ::poll /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-util-0.1.20/src/service/glue.rs:70
+       0   0.0% 100.0%  3235033   0.1% ::poll_loop (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:174
+       0   0.0% 100.0%  3235033   0.1% ::poll_msg (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:595
+       0   0.0% 100.0%  3235033   0.1% ::poll_write /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-1.11.0/src/proto/h1/dispatch.rs:355
+       0   0.0% 100.0%  3235033   0.1% axum::serve::handle_connection::::{closure#0}::{closure#3} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/serve/mod.rs:400
+       0   0.0% 100.0%  3235033   0.1% axum::serve::handle_connection::::{closure#0}::{closure#3}::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/macros/select.rs:710
+       0   0.0% 100.0%  3235033   0.1% core::future::future::Future>::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/future/map.rs:55
+       0   0.0% 100.0%  3235033   0.1% core::future::future::Future>::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/lib.rs:85
+       0   0.0% 100.0%  3235033   0.1% ravel_server::sql::handle::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/sql.rs:222
+       0   0.0% 100.0%  3235033   0.1% ravel_server::sql::run::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/sql.rs:257
+       0   0.0% 100.0%  3235033   0.1% tokio::runtime::task::raw::poll::@5a92210 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0%  3233815   0.1% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/time/timeout.rs:217
+       0   0.0% 100.0%  3190415   0.1% ::map:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/option.rs:1162
+       0   0.0% 100.0%  3154331   0.1% ::spec_extend (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_extend.rs:27
+       0   0.0% 100.0%  3146180   0.1% ::ensure_input_streams_initialized /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:379
+       0   0.0% 100.0%  3108131   0.1% ::read_dictionary_page (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:395
+       0   0.0% 100.0%  2895798   0.1% ::block_on:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/blocking.rs:66
+       0   0.0% 100.0%  2895798   0.1% ::block_on:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/park.rs:284
+       0   0.0% 100.0%  2895798   0.1% ::block_on:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:341
+       0   0.0% 100.0%  2895798   0.1% ::block_on:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/mod.rs:91
+       0   0.0% 100.0%  2895798   0.1% ::block_on::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/park.rs:284
+       0   0.0% 100.0%  2895798   0.1% ::block_on::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/mod.rs:92
+       0   0.0% 100.0%  2895798   0.1% ::block_on_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:376
+       0   0.0% 100.0%  2895798   0.1% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:287
+       0   0.0% 100.0%  2895798   0.1% core::result::Result> /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/backtrace.rs:166
+       0   0.0% 100.0%  2895798   0.1% ravel_server::main /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/main.rs:704
+       0   0.0% 100.0%  2895798   0.1% std::rt::lang_start::::{closure#0} /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/rt.rs:206
+       0   0.0% 100.0%  2895798   0.1% std::rt::lang_start_internal::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/rt.rs:175
+       0   0.0% 100.0%  2895408   0.1% ::set_dict (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/encodings/decoding.rs:374
+       0   0.0% 100.0%  2895408   0.1% ::set_dict /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader/decoder.rs:187
+       0   0.0% 100.0%  2865363   0.1% ::with_capacity (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/record_reader/buffer.rs:53
+       0   0.0% 100.0%  2865363   0.1% parquet::arrow::array_reader::read_records:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/mod.rs:196
+       0   0.0% 100.0%  2788888   0.0% ::insert_if_new_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:258
+       0   0.0% 100.0%  2721757   0.0% ::decode_metadata (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/metadata/reader.rs:823
+       0   0.0% 100.0%  2721757   0.0% ::get_metadata::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:713
+       0   0.0% 100.0%  2721757   0.0% ::load::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:765
+       0   0.0% 100.0%  2721757   0.0% ::load_async::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/async_reader/mod.rs:197
+       0   0.0% 100.0%  2721757   0.0% ::metadata::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:451
+       0   0.0% 100.0%  2721757   0.0% ::plan::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:531
+       0   0.0% 100.0%  2721757   0.0% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/morsel/mod.rs:232
+       0   0.0% 100.0%  2721757   0.0% ::poll_scan (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_stream/scan_state.rs:133
+       0   0.0% 100.0%  2721757   0.0% ::poll_unpin (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/future/mod.rs:556
+       0   0.0% 100.0%  2721757   0.0% ::read_footer::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:502
+       0   0.0% 100.0%  2721757   0.0% ::schedule_io::::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:507
+       0   0.0% 100.0%  2721757   0.0% parquet::file::metadata::parser::decode_metadata (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/metadata/parser.rs:233
+       0   0.0% 100.0%  2721757   0.0% ravel_parquet::reader::decode_footer:: (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:581
+       0   0.0% 100.0%  2721757   0.0% ravel_parquet::reader::decode_footer::::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/reader.rs:581
+       0   0.0% 100.0%  2709207   0.0% ::execute_accounted::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:1314
+       0   0.0% 100.0%  2709207   0.0% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/instrument.rs:321
+       0   0.0% 100.0%  2709207   0.0% ::run::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:1531
+       0   0.0% 100.0%  2709207   0.0% ::sql_execute::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/service/mod.rs:593
+       0   0.0% 100.0%  2629995   0.0% ::ensure_input_streams_initialized /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:376
+       0   0.0% 100.0%  2629995   0.0% ::extend_trusted:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:4062
+       0   0.0% 100.0%  2629995   0.0% ::fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/map.rs:128
+       0   0.0% 100.0%  2629995   0.0% ::fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/traits/iterator.rs:2671
+       0   0.0% 100.0%  2629995   0.0% ::for_each:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/traits/iterator.rs:887
+       0   0.0% 100.0%  2629995   0.0% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs:60
+       0   0.0% 100.0%  2629995   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1081
+       0   0.0% 100.0%  2629995   0.0% core::iter::adapters::map::map_fold::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/map.rs:88
+       0   0.0% 100.0%  2439333   0.0% ::read_dictionary_page (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:387
+       0   0.0% 100.0%  2370998   0.0% ravel_server::main::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/main.rs:664
+       0   0.0% 100.0%  2316198   0.0% ::read_new_page /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader.rs:419
+       0   0.0% 100.0%  2278650   0.0% ::new_uninitialized:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:1576
+       0   0.0% 100.0%  2278650   0.0% ::prepare_resize:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:2696
+       0   0.0% 100.0%  2278650   0.0% ::reserve:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:914
+       0   0.0% 100.0%  2278650   0.0% ::reserve_rehash:: /rust/deps/hashbrown-0.17.1/src/raw.rs:962
+       0   0.0% 100.0%  2278650   0.0% ::reserve_rehash_inner:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:2784
+       0   0.0% 100.0%  2278650   0.0% ::resize_inner:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:2898
+       0   0.0% 100.0%  2278650   0.0% hashbrown::alloc::inner::do_alloc:: (inline) /rust/deps/hashbrown-0.17.1/src/alloc.rs:18
+       0   0.0% 100.0%  2214180   0.0% ::collect_vectorized_process_context (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/multi_group_by/mod.rs:579
+       0   0.0% 100.0%  2197421   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/metadata/mod.rs:729
+       0   0.0% 100.0%  2197421   0.0% parquet::file::metadata::thrift::parquet_metadata_from_bytes /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/metadata/thrift/mod.rs:814
+       0   0.0% 100.0%  2197421   0.0% parquet::file::metadata::thrift::read_row_group (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/metadata/thrift/mod.rs:627
+       0   0.0% 100.0%  2184823   0.0% ::attempt::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:3148
+       0   0.0% 100.0%  2138931   0.0% ::and_then /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/selection.rs:383
+       0   0.0% 100.0%  2138931   0.0% ::with_predicate_options /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/read_plan.rs:283
+       0   0.0% 100.0%  2105579   0.0% ::subset_time:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:266
+       0   0.0% 100.0%  2100323   0.0% ::pin (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:356
+       0   0.0% 100.0%  2043817   0.0% ::get_or_fetch_outcome::::{closure#0}::{closure#0}::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/cache.rs:284
+       0   0.0% 100.0%  2043817   0.0% ::insert (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/cache.rs:205
+       0   0.0% 100.0%  2043817   0.0% ::insert /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/cache.rs:377
+       0   0.0% 100.0%  2004553   0.0% ::set_dict /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/byte_view_array.rs:170
+       0   0.0% 100.0%  1845813   0.0% ::alloc_zeroed (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemallocator-0.7.0/src/lib.rs:112
+       0   0.0% 100.0%  1845813   0.0% ::from_iter:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed/iter.rs:144
+       0   0.0% 100.0%  1845813   0.0% ::with_capacity (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-ingest/src/metrics.rs:496
+       0   0.0% 100.0%  1845813   0.0% __rustc::__rust_alloc_zeroed (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/main.rs:22
+       0   0.0% 100.0%  1845813   0.0% _rjem_calloc /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1919
+       0   0.0% 100.0%  1724459   0.0% ::partition_iter /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:806
+       0   0.0% 100.0%  1673333   0.0% ::insert_if_new_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:?
+       0   0.0% 100.0%  1673333   0.0% ::intern::{closure#1} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/single_group_by/bytes_view.rs:68
+       0   0.0% 100.0%  1581227   0.0% ::new::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1079
+       0   0.0% 100.0%  1575875   0.0% ::boxed (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/future/future/mod.rs:516
+       0   0.0% 100.0%  1575875   0.0% datafusion_common_runtime::trace_utils::trace_future:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-runtime-54.1.0/src/trace_utils.rs:140
+       0   0.0% 100.0%  1575475   0.0% ::execute::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1257
+       0   0.0% 100.0%  1575475   0.0% ::poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/once.rs:46
+       0   0.0% 100.0%  1575475   0.0% ::poll_next (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.33/src/stream/try_stream/try_flatten.rs:66
+       0   0.0% 100.0%  1575475   0.0% ::poll_next /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:473
+       0   0.0% 100.0%  1574404   0.0% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:310
+       0   0.0% 100.0%  1573152   0.0% ::with_label (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:86
+       0   0.0% 100.0%  1573040   0.0% ::plan_file /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:159
+       0   0.0% 100.0%  1573040   0.0% ::poll_scan (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_stream/scan_state.rs:275
+       0   0.0% 100.0%  1573040   0.0% ::try_new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:480
+       0   0.0% 100.0%  1219810   0.0% ::fallible_with_capacity:: /rust/deps/hashbrown-0.17.1/src/raw.rs:1634
+       0   0.0% 100.0%  1219810   0.0% ::find_or_find_insert_index:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:1126
+       0   0.0% 100.0%  1219810   0.0% ::insert (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/collections/hash/map.rs:1334
+       0   0.0% 100.0%  1219810   0.0% ::insert (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/s3fifo.rs:166
+       0   0.0% 100.0%  1219810   0.0% ::insert /rust/deps/hashbrown-0.17.1/src/map.rs:1812
+       0   0.0% 100.0%  1134710   0.0% ::execute::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:3307
+       0   0.0% 100.0%  1134710   0.0% ::start_with_scratch /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:3431
+       0   0.0% 100.0%  1134710   0.0% datafusion_physical_plan::execution_plan::execute_stream /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/execution_plan.rs:1283
+       0   0.0% 100.0%  1091718   0.0% ::alloc (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemallocator-0.7.0/src/lib.rs:102
+       0   0.0% 100.0%  1091718   0.0% _rjem_mallocx /var/lib/fleet/cache/cargo-target/6cd1ef60-6bf8-4058-830c-884fcdd4f760/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:2404
+       0   0.0% 100.0%  1065046   0.0% ::consume_batch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/primitive_array.rs:202
+       0   0.0% 100.0%  1065046   0.0% ::fetch_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/cached_array_reader.rs:147
+       0   0.0% 100.0%  1065046   0.0% ::next_inner (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1483
+       0   0.0% 100.0%  1065046   0.0% ::unary:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-array-58.4.0/src/array/primitive_array.rs:902
+       0   0.0% 100.0%  1065046   0.0% parquet::arrow::array_reader::primitive_array::coerce_array /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/primitive_array.rs:239
+       0   0.0% 100.0%  1065046   0.0% parquet::arrow::array_reader::primitive_array::coerce_i32 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/array_reader/primitive_array.rs:257
+       0   0.0% 100.0%  1058839   0.0% ::call (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/routing/mod.rs:564
+       0   0.0% 100.0%  1058839   0.0% ::extend:: (inline) /rust/deps/hashbrown-0.17.1/src/map.rs:4878
+       0   0.0% 100.0%  1058839   0.0% ::extend:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/collections/hash/map.rs:2966
+       0   0.0% 100.0%  1058839   0.0% ::fallible_with_capacity:: (inline) /rust/deps/hashbrown-0.17.1/src/raw.rs:1634
+       0   0.0% 100.0%  1058839   0.0% ::from_iter:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/collections/hash/map.rs:2950
+       0   0.0% 100.0%  1058839   0.0% ::into_future::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/serve/mod.rs:347
+       0   0.0% 100.0%  1058839   0.0% ::poll (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/serve/mod.rs:462
+       0   0.0% 100.0%  1058839   0.0% ::reserve (inline) /rust/deps/hashbrown-0.17.1/src/map.rs:1083
+       0   0.0% 100.0%  1058839   0.0% ::run::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/serve/mod.rs:293
+       0   0.0% 100.0%  1058839   0.0% ::with_state:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/routing/mod.rs:410
+       0   0.0% 100.0%  1058839   0.0% ::with_state:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/routing/path_router.rs:360
+       0   0.0% 100.0%  1058839   0.0% axum::serve::handle_connection::::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/serve/mod.rs:377
+       0   0.0% 100.0%  1058839   0.0% ravel_server::start_with_heartbeat::{closure#0}::{closure#21} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/lib.rs:3672
+       0   0.0% 100.0%  1058839   0.0% tokio::runtime::task::raw::poll::@5a92d30 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0%  1051651   0.0% ::partition_indices (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:611
+       0   0.0% 100.0%  1051651   0.0% ::partition_iter /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:816
+       0   0.0% 100.0%  1051139   0.0% ::consume_input_streams (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:528
+       0   0.0% 100.0%  1051139   0.0% ::spawn:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-runtime-54.1.0/src/common.rs:48
+       0   0.0% 100.0%  1050112   0.0% ::collect_in_place (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/in_place_collect.rs:378
+       0   0.0% 100.0%  1050112   0.0% ::collect_vec (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itertools-0.14.0/src/lib.rs:2352
+       0   0.0% 100.0%  1050112   0.0% ::create_physical_plan::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-54.1.0/src/execution/session_state.rs:759
+       0   0.0% 100.0%  1050112   0.0% ::create_physical_plan::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-54.1.0/src/dataframe/mod.rs:302
+       0   0.0% 100.0%  1050112   0.0% ::create_physical_plan::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-54.1.0/src/execution/session_state.rs:2317
+       0   0.0% 100.0%  1050112   0.0% ::create_physical_plan::{closure#0} /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-54.1.0/src/physical_planner.rs:283
+       0   0.0% 100.0%  1050112   0.0% ::execute::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:3305
+       0   0.0% 100.0%  1050112   0.0% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs:30
+       0   0.0% 100.0%  1050112   0.0% ::map_children:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:1342
+       0   0.0% 100.0%  1050112   0.0% ::map_until_stop_and_collect:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:1219
+       0   0.0% 100.0%  1050112   0.0% ::map_until_stop_and_collect::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:1211
+       0   0.0% 100.0%  1050112   0.0% ::next /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/map.rs:107
+       0   0.0% 100.0%  1050112   0.0% ::optimize /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:219
+       0   0.0% 100.0%  1050112   0.0% ::optimize::{closure#1} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:220
+       0   0.0% 100.0%  1050112   0.0% ::optimize_physical_plan:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-54.1.0/src/physical_planner.rs:2850
+       0   0.0% 100.0%  1050112   0.0% ::optimize_with_context /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-optimizer-54.1.0/src/optimizer.rs:117
+       0   0.0% 100.0%  1050112   0.0% ::repartition_evenly_by_size /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_groups.rs:264
+       0   0.0% 100.0%  1050112   0.0% ::repartition_evenly_by_size::{closure#3} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_groups.rs:263
+       0   0.0% 100.0%  1050112   0.0% ::repartition_file_groups /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_groups.rs:?
+       0   0.0% 100.0%  1050112   0.0% ::repartitioned /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file.rs:173
+       0   0.0% 100.0%  1050112   0.0% ::repartitioned /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/file_scan_config/mod.rs:742
+       0   0.0% 100.0%  1050112   0.0% ::repartitioned /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-54.1.0/src/source.rs:377
+       0   0.0% 100.0%  1050112   0.0% ::transform_parent:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:769
+       0   0.0% 100.0%  1050112   0.0% ::transform_up:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:268
+       0   0.0% 100.0%  1050112   0.0% ::try_fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/into_iter.rs:401
+       0   0.0% 100.0%  1050112   0.0% alloc::vec::in_place_collect::from_iter_in_place:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/in_place_collect.rs:269
+       0   0.0% 100.0%  1050112   0.0% datafusion_common::tree_node::TreeNode::transform_up::transform_up_impl:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:264
+       0   0.0% 100.0%  1050112   0.0% datafusion_common::tree_node::TreeNode::transform_up::transform_up_impl:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:265
+       0   0.0% 100.0%  1050112   0.0% datafusion_common::tree_node::TreeNode::transform_up::transform_up_impl::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-54.1.0/src/tree_node.rs:264
+       0   0.0% 100.0%  1050112   0.0% datafusion_physical_optimizer::enforce_distribution::ensure_distribution /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:1451
+       0   0.0% 100.0%  1050112   0.0% datafusion_physical_optimizer::enforce_distribution::ensure_distribution::{closure#1} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:1354
+       0   0.0% 100.0%  1049136   0.0% ::call /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183
+       0   0.0% 100.0%  1049136   0.0% ::call_once_force:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226
+       0   0.0% 100.0%  1049136   0.0% ::call_once_force::::{closure#0} /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226
+       0   0.0% 100.0%  1048900   0.0% ::to_owned (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/slice.rs:842
+       0   0.0% 100.0%  1048896   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:597
+       0   0.0% 100.0%  1048896   0.0% datafusion_physical_plan::aggregates::group_values::new_group_values /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/mod.rs:205
+       0   0.0% 100.0%  1048800   0.0% ::set_value /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-aggregate-54.1.0/src/min_max/min_max_bytes.rs:422
+       0   0.0% 100.0%  1048768   0.0% ::new::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1078
+       0   0.0% 100.0%  1048736   0.0% ::prepare_open_file (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:572
+       0   0.0% 100.0%  1048704   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/filter.rs:555
+       0   0.0% 100.0%  1048704   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:477
+       0   0.0% 100.0%   922906   0.0% ::new (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-ingest/src/metrics.rs:881
+       0   0.0% 100.0%   922906   0.0% ::new (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-ingest/src/span_metrics.rs:347
+       0   0.0% 100.0%   922906   0.0% ::new /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-ingest/src/router.rs:245
+       0   0.0% 100.0%   922906   0.0% ::new /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-ingest/src/span_router.rs:135
+       0   0.0% 100.0%   922906   0.0% ::with_rng /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-ingest/src/router.rs:262
+       0   0.0% 100.0%   922906   0.0% ravel_server::start_with_heartbeat::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/lib.rs:2382
+       0   0.0% 100.0%   922906   0.0% ravel_server::start_with_heartbeat::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/lib.rs:2494
+       0   0.0% 100.0%   824006   0.0% ::grow /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/collections/vec_deque/mod.rs:2799
+       0   0.0% 100.0%   824006   0.0% ::insert (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-cache/src/s3fifo.rs:178
+       0   0.0% 100.0%   824006   0.0% ::push_back (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/collections/vec_deque/mod.rs:2278
+       0   0.0% 100.0%   824006   0.0% ::push_back_mut (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/collections/vec_deque/mod.rs:2297
+       0   0.0% 100.0%   609974   0.0% ::empty_rows /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-row-58.4.0/src/lib.rs:1098
+       0   0.0% 100.0%   609974   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/limit.rs:209
+       0   0.0% 100.0%   609974   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/sorts/sort.rs:1226
+       0   0.0% 100.0%   609974   0.0% ::try_new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/topk/mod.rs:207
+       0   0.0% 100.0%   566534   0.0% ::build /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/read_plan.rs:308
+       0   0.0% 100.0%   566534   0.0% ::build::{closure#1} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/read_plan.rs:313
+       0   0.0% 100.0%   566534   0.0% ::entry:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/table.rs:418
+       0   0.0% 100.0%   566534   0.0% ::intern /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/group_values/single_group_by/primitive.rs:131
+       0   0.0% 100.0%   566534   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/buffer/mutable.rs:121
+       0   0.0% 100.0%   566534   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/builder/boolean.rs:61
+       0   0.0% 100.0%   566534   0.0% ::new_mask_from_selectors (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/selection.rs:907
+       0   0.0% 100.0%   566534   0.0% ::try_transition (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/push_decoder/reader_builder/mod.rs:642
+       0   0.0% 100.0%   566534   0.0% ::update_batch /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/avg.rs:737
+       0   0.0% 100.0%   566534   0.0% ::with_capacity (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-58.4.0/src/buffer/mutable.rs:139
+       0   0.0% 100.0%   566534   0.0% parquet::arrow::arrow_reader::selection::boolean_mask_from_selectors (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/arrow/arrow_reader/selection.rs:928
+       0   0.0% 100.0%   532523   0.0% ::push (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/mod.rs:228
+       0   0.0% 100.0%   532523   0.0% ::register /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/mod.rs:493
+       0   0.0% 100.0%   525826   0.0% ::allocate /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sharded-slab-0.1.7/src/page/mod.rs:297
+       0   0.0% 100.0%   525826   0.0% ::create (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sharded-slab-0.1.7/src/pool.rs:454
+       0   0.0% 100.0%   525826   0.0% ::create_with:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sharded-slab-0.1.7/src/pool.rs:656
+       0   0.0% 100.0%   525826   0.0% ::init_with:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sharded-slab-0.1.7/src/page/mod.rs:272
+       0   0.0% 100.0%   525826   0.0% ::init_with:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sharded-slab-0.1.7/src/shard.rs:174
+       0   0.0% 100.0%   525826   0.0% ::make_with /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/span.rs:570
+       0   0.0% 100.0%   525826   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/span.rs:438
+       0   0.0% 100.0%   525826   0.0% ::new_span (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-core-0.1.36/src/dispatcher.rs:556
+       0   0.0% 100.0%   525826   0.0% ::new_span (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/layer/layered.rs:131
+       0   0.0% 100.0%   525826   0.0% ::new_span /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/mod.rs:391
+       0   0.0% 100.0%   525826   0.0% ::new_span /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/registry/sharded.rs:253
+       0   0.0% 100.0%   525826   0.0% ::sql_execute::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/service/mod.rs:588
+       0   0.0% 100.0%   525826   0.0% ravel_server::service::query_span /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/service/mod.rs:716
+       0   0.0% 100.0%   525826   0.0% tracing_core::dispatcher::get_default:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/span.rs:?
+       0   0.0% 100.0%   525184   0.0% ::bind:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/list.rs:99
+       0   0.0% 100.0%   525184   0.0% ::bind_new_task:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/handle.rs:91
+       0   0.0% 100.0%   525184   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/core.rs:261
+       0   0.0% 100.0%   525184   0.0% ::new:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:221
+       0   0.0% 100.0%   525184   0.0% ::spawn:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/mod.rs:161
+       0   0.0% 100.0%   525184   0.0% ::spawn:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/multi_thread/handle.rs:65
+       0   0.0% 100.0%   525184   0.0% ravel_server::metadata_sink_task::spawn /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/metadata_sink_task.rs:68
+       0   0.0% 100.0%   525184   0.0% ravel_server::start_with_heartbeat::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/lib.rs:4275
+       0   0.0% 100.0%   525184   0.0% tokio::runtime::context::current::with_current:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/current.rs:41
+       0   0.0% 100.0%   525184   0.0% tokio::runtime::context::current::with_current::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/current.rs:41
+       0   0.0% 100.0%   525184   0.0% tokio::runtime::task::new_task:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/mod.rs:348
+       0   0.0% 100.0%   525184   0.0% tokio::task::spawn::spawn:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/spawn.rs:183
+       0   0.0% 100.0%   525184   0.0% tokio::task::spawn::spawn_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/spawn.rs:211
+       0   0.0% 100.0%   525184   0.0% tokio::task::spawn::spawn_inner::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/spawn.rs:211
+       0   0.0% 100.0%   524800   0.0% ::dispatch /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-core-0.1.36/src/event.rs:34
+       0   0.0% 100.0%   524800   0.0% ::dispatch::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-core-0.1.36/src/event.rs:35
+       0   0.0% 100.0%   524800   0.0% ::emit /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/config.rs:4481
+       0   0.0% 100.0%   524800   0.0% ::emit::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/macros.rs:905
+       0   0.0% 100.0%   524800   0.0% ::event (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-core-0.1.36/src/dispatcher.rs:610
+       0   0.0% 100.0%   524800   0.0% ::event (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/layer/layered.rs:157
+       0   0.0% 100.0%   524800   0.0% ::event (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/layer/layered.rs:158
+       0   0.0% 100.0%   524800   0.0% ::event /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/mod.rs:411
+       0   0.0% 100.0%   524800   0.0% ::get_or_init:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321
+       0   0.0% 100.0%   524800   0.0% ::get_or_init::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321
+       0   0.0% 100.0%   524800   0.0% ::get_or_try_init:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410
+       0   0.0% 100.0%   524800   0.0% ::initialize:: /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542
+       0   0.0% 100.0%   524800   0.0% ::initialize::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543
+       0   0.0% 100.0%   524800   0.0% ::new (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/io/buffered/linewriter.rs:90
+       0   0.0% 100.0%   524800   0.0% ::on_event (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/fmt_layer.rs:1022
+       0   0.0% 100.0%   524800   0.0% ::on_event::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/fmt_layer.rs:1049
+       0   0.0% 100.0%   524800   0.0% ::with:: /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/local.rs:426
+       0   0.0% 100.0%   524800   0.0% ::with_capacity (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/io/buffered/bufwriter.rs:122
+       0   0.0% 100.0%   524800   0.0% ::with_capacity (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/io/buffered/linewriter.rs:110
+       0   0.0% 100.0%   524800   0.0% core::ops::function::Fn>::call (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:79
+       0   0.0% 100.0%   524800   0.0% ravel_server::main::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/main.rs:69
+       0   0.0% 100.0%   524800   0.0% std::io::stdio::stdout /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/io/stdio.rs:720
+       0   0.0% 100.0%   524800   0.0% std::io::stdio::stdout::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/io/stdio.rs:720
+       0   0.0% 100.0%   524800   0.0% tracing_core::dispatcher::get_default:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-core-0.1.36/src/dispatcher.rs:386
+       0   0.0% 100.0%   524800   0.0% tracing_subscriber::fmt::writer::MakeWriter>::make_writer (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/writer.rs:690
+       0   0.0% 100.0%   524800   0.0% tracing_subscriber::fmt::writer::MakeWriter>::make_writer_for (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/writer.rs:210
+       0   0.0% 100.0%   524736   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/coalesce_partitions.rs:213
+       0   0.0% 100.0%   524736   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/sorts/sort.rs:1205
+       0   0.0% 100.0%   524736   0.0% ::run_input /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:339
+       0   0.0% 100.0%   524736   0.0% ::spawn:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-common-runtime-54.1.0/src/join_set.rs:66
+       0   0.0% 100.0%   524736   0.0% ::spawn:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/stream.rs:87
+       0   0.0% 100.0%   524608   0.0% ::add_parsable_certificates:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/webpki/anchors.rs:43
+       0   0.0% 100.0%   524608   0.0% ::build /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/reqwest-0.13.4/src/async_impl/client.rs:757
+       0   0.0% 100.0%   524608   0.0% ::build /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3.rs:1029
+       0   0.0% 100.0%   524608   0.0% ::execute_ddl::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/ddl.rs:680
+       0   0.0% 100.0%   524608   0.0% ::execute_ddl_within_deadline::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/ddl.rs:749
+       0   0.0% 100.0%   524608   0.0% ::new (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3.rs:955
+       0   0.0% 100.0%   524608   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-platform-verifier-0.7.0/src/verification/others.rs:28
+       0   0.0% 100.0%   524608   0.0% ::new_inner:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-platform-verifier-0.7.0/src/verification/others.rs:93
+       0   0.0% 100.0%   524608   0.0% ::open /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/external.rs:358
+       0   0.0% 100.0%   524608   0.0% ::store /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/parquet.rs:365
+       0   0.0% 100.0%   524608   0.0% ::to_owned /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-pki-types-1.15.1/src/lib.rs:527
+       0   0.0% 100.0%   524608   0.0% ::with_http_config (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3.rs:962
+       0   0.0% 100.0%   524608   0.0% ravel_object_store::external::open_s3 (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/external.rs:468
+       0   0.0% 100.0%   524608   0.0% ravel_object_store::s3::bucket_config::control_plane_http_client (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-object-store/src/s3/bucket_config.rs:460
+       0   0.0% 100.0%   524608   0.0% ravel_server::sql::run_ddl::{closure#0}::{closure#1} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/sql.rs:430
+       0   0.0% 100.0%   524608   0.0% ravel_server::sql::run_ddl::{closure#0}::{closure#1}::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/services/ravel-server/src/sql.rs:420
+       0   0.0% 100.0%   524608   0.0% tokio::runtime::task::raw::poll::@52f3e70 /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0%   524544   0.0% ::copy_rows /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce/generic.rs:59
+       0   0.0% 100.0%   524448   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1350
+       0   0.0% 100.0%   524384   0.0% ::attempt::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:3128
+       0   0.0% 100.0%   524384   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/metrics.rs:174
+       0   0.0% 100.0%   524384   0.0% ::plan_pinned_with::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/executor.rs:1854
+       0   0.0% 100.0%   524384   0.0% ::try_new::{closure#0} /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-parquet/src/provider.rs:183
+       0   0.0% 100.0%   524384   0.0% ::with_new_label:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:111
+       0   0.0% 100.0%   524384   0.0% ravel_sql::parquet::build_tables::{closure#0} (inline) /var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/crates/ravel-sql/src/parquet.rs:958
+       0   0.0% 100.0%   524368   0.0% ::set_dict /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/column/reader/decoder.rs:188
+       0   0.0% 100.0%   524352   0.0% ::counter:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:211
+       0   0.0% 100.0%   524352   0.0% ::end_timestamp /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:289
+       0   0.0% 100.0%   524352   0.0% ::execute /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1221
+       0   0.0% 100.0%   524352   0.0% ::global_counter:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:228
+       0   0.0% 100.0%   524352   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:649
+       0   0.0% 100.0%   524352   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/metrics.rs:172
+       0   0.0% 100.0%   524352   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/baseline.rs:292
+       0   0.0% 100.0%   524352   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/baseline.rs:86
+       0   0.0% 100.0%   524352   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/baseline.rs:95
+       0   0.0% 100.0%   524352   0.0% ::output_bytes /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:182
+       0   0.0% 100.0%   524352   0.0% ::spilled_rows /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:173
+       0   0.0% 100.0%   524336   0.0% ::build /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.13.1/src/builders.rs:233
+       0   0.0% 100.0%   524336   0.0% ::build /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/meta/regex.rs:3447
+       0   0.0% 100.0%   524336   0.0% ::build /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/nfa/thompson/builder.rs:439
+       0   0.0% 100.0%   524336   0.0% ::build_many:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/meta/regex.rs:3528
+       0   0.0% 100.0%   524336   0.0% ::build_many_from_hir:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/meta/regex.rs:3640
+       0   0.0% 100.0%   524336   0.0% ::build_many_from_hir:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/nfa/thompson/compiler.rs:903
+       0   0.0% 100.0%   524336   0.0% ::build_one_string (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.13.1/src/builders.rs:82
+       0   0.0% 100.0%   524336   0.0% ::call_once /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250
+       0   0.0% 100.0%   524336   0.0% ::compile:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/nfa/thompson/compiler.rs:1012
+       0   0.0% 100.0%   524336   0.0% ::consume_input_streams (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:477
+       0   0.0% 100.0%   524336   0.0% ::consume_input_streams::{closure#3} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:478
+       0   0.0% 100.0%   524336   0.0% ::deref (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/lazy_lock.rs:357
+       0   0.0% 100.0%   524336   0.0% ::evaluate /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-54.1.0/src/scalar_function.rs:255
+       0   0.0% 100.0%   524336   0.0% ::extend:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3994
+       0   0.0% 100.0%   524336   0.0% ::extend_trusted:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:4058
+       0   0.0% 100.0%   524336   0.0% ::force (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/lazy_lock.rs:242
+       0   0.0% 100.0%   524336   0.0% ::force::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/lazy_lock.rs:250
+       0   0.0% 100.0%   524336   0.0% ::from_iter (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs:24
+       0   0.0% 100.0%   524336   0.0% ::group_aggregate_batch (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:928
+       0   0.0% 100.0%   524336   0.0% ::invoke_with_args (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-expr-54.1.0/src/udf.rs:274
+       0   0.0% 100.0%   524336   0.0% ::invoke_with_args /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-54.1.0/src/regex/regexpreplace.rs:163
+       0   0.0% 100.0%   524336   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/coalesce/mod.rs:63
+       0   0.0% 100.0%   524336   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/repartition/mod.rs:233
+       0   0.0% 100.0%   524336   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/meta/strategy.rs:522
+       0   0.0% 100.0%   524336   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-58.4.0/src/coalesce.rs:163
+       0   0.0% 100.0%   524336   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/schema/types.rs:1092
+       0   0.0% 100.0%   524336   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.13.1/src/regex/string.rs:230
+       0   0.0% 100.0%   524336   0.0% ::new:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/util/captures.rs:1612
+       0   0.0% 100.0%   524336   0.0% ::next /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs:177
+       0   0.0% 100.0%   524336   0.0% ::set_captures (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/nfa/thompson/nfa.rs:1434
+       0   0.0% 100.0%   524336   0.0% ::then:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/bool.rs:66
+       0   0.0% 100.0%   524336   0.0% ::try_fold:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/enumerate.rs:125
+       0   0.0% 100.0%   524336   0.0% ::try_fold::enumerate::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/enumerate.rs:119
+       0   0.0% 100.0%   524336   0.0% datafusion_functions::regex::regexpreplace::regex_replace_posix_groups /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-54.1.0/src/regex/regexpreplace.rs:200
+       0   0.0% 100.0%   524336   0.0% datafusion_functions::regex::regexpreplace::regex_replace_posix_groups::CAPTURE_GROUPS_RE_LOCK::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-54.1.0/src/regex/regexpreplace.rs:199
+       0   0.0% 100.0%   524336   0.0% datafusion_functions::regex::regexpreplace::regexp_replace_func (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-54.1.0/src/regex/regexpreplace.rs:?
+       0   0.0% 100.0%   524336   0.0% datafusion_functions::regex::regexpreplace::regexp_replace_static_pattern_replace:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-54.1.0/src/regex/regexpreplace.rs:553
+       0   0.0% 100.0%   524336   0.0% datafusion_functions::regex::regexpreplace::specialize_regexp_replace:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-functions-54.1.0/src/regex/regexpreplace.rs:676
+       0   0.0% 100.0%   524336   0.0% datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/utils.rs:404
+       0   0.0% 100.0%   524336   0.0% datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays_with_metrics:: (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/utils.rs:425
+       0   0.0% 100.0%   524336   0.0% datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays_with_metrics::::{closure#0} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/utils.rs:422
+       0   0.0% 100.0%   524336   0.0% datafusion_physical_plan::aggregates::evaluate_group_by /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/mod.rs:2189
+       0   0.0% 100.0%   524336   0.0% parquet::file::metadata::thrift::parquet_metadata_from_bytes /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/file/metadata/thrift/mod.rs:792
+       0   0.0% 100.0%   524336   0.0% parquet::schema::types::build_tree /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-58.4.0/src/schema/types.rs:1252
+       0   0.0% 100.0%   524336   0.0% regex_automata::meta::strategy::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-automata-0.4.16/src/meta/strategy.rs:158
+       0   0.0% 100.0%   524304   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/value.rs:67
+       0   0.0% 100.0%   524304   0.0% ::new /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/baseline.rs:98
+       0   0.0% 100.0%   524304   0.0% ::output_batches /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:188
+       0   0.0% 100.0%   524304   0.0% ::prepare_open_file (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:573
+       0   0.0% 100.0%   524292   0.0% ::clone_from_ref (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:793
+       0   0.0% 100.0%   524292   0.0% ::clone_from_ref_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:840
+       0   0.0% 100.0%   524292   0.0% ::from (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed/convert.rs:138
+       0   0.0% 100.0%   524292   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-54.1.0/src/expressions/column.rs:79
+       0   0.0% 100.0%   524292   0.0% ::new (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:561
+       0   0.0% 100.0%   524292   0.0% ::new:: /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-expr-common-54.1.0/src/sort_expr.rs:375
+       0   0.0% 100.0%   524292   0.0% ::new::{closure#1} (inline) /var/lib/fleet/cache/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:551
+       0   0.0% 100.0%   524292   0.0% ::next (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/map.rs:107
+       0   0.0% 100.0%   524292   0.0% ::to_owned (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/str.rs:251
+       0   0.0% 100.0%   524292   0.0% ::try_clone_from_ref_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:881
+       0   0.0% 100.0%   524292   0.0% std::rt::init (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/rt.rs:118
+       0   0.0% 100.0%   524292   0.0% std::rt::lang_start_internal::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/rt.rs:173
+       0   0.0% 100.0%   524292   0.0% std::sys::pal::unix::init (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/pal/unix/mod.rs:41
+       0   0.0% 100.0%   524292   0.0% std::sys::pal::unix::stack_overflow::imp::init (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/pal/unix/stack_overflow.rs:179
+       0   0.0% 100.0%   524292   0.0% std::sys::pal::unix::stack_overflow::thread_info::set_current_info /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/pal/unix/stack_overflow/thread_info.rs:114
+       0   0.0% 100.0%   524292   0.0% std::sys::pal::unix::stack_overflow::thread_info::set_current_info::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/pal/unix/stack_overflow/thread_info.rs:114
+       0   0.0% 100.0%   524292   0.0% std::thread::current::try_with_current:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/current.rs:204
+       0   0.0% 100.0%   524292   0.0% std::thread::current::with_current_name:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/current.rs:216
+       0   0.0% 100.0%   524292   0.0% std::thread::current::with_current_name::::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/current.rs:234

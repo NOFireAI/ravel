@@ -1,0 +1,41 @@
+Total: 7267433212 B
+7267433212 100.0% 100.0% 7267433212 100.0% prof_backtrace_impl
+       0   0.0% 100.0%   524608   0.0% ::add_parsable_certificates:: (inline)
+       0   0.0% 100.0% 5679442196  78.1% ::alloc (inline)
+       0   0.0% 100.0% 5680747162  78.2% ::alloc_impl (inline)
+       0   0.0% 100.0% 4463846261  61.4% ::alloc_impl_runtime (inline)
+       0   0.0% 100.0%  1845813   0.0% ::alloc_zeroed (inline)
+       0   0.0% 100.0%   525826   0.0% ::allocate
+       0   0.0% 100.0% 5680747162  78.2% ::allocate (inline)
+       0   0.0% 100.0%  1574585   0.0% ::and_then:: (inline)
+       0   0.0% 100.0%   706869   0.0% ::append
+       0   0.0% 100.0% 241668726   3.3% ::append_elements (inline)
+       0   0.0% 100.0% 688995316   9.5% ::append_value
+       0   0.0% 100.0% 100495083   1.4% ::append_views_and_copy_strings
+       0   0.0% 100.0%  3022772   0.0% ::attempt::{closure#0} (inline)
+       0   0.0% 100.0%   525184   0.0% ::bind:: (inline)
+       0   0.0% 100.0%   525184   0.0% ::bind_new_task:: (inline)
+       0   0.0% 100.0%  2895798   0.0% ::block_on:: (inline)
+       0   0.0% 100.0%  2895798   0.0% ::block_on::::{closure#0} (inline)
+       0   0.0% 100.0%  2895798   0.0% ::block_on_inner:: (inline)
+       0   0.0% 100.0%  2102668   0.0% ::build
+       0   0.0% 100.0%  2097408   0.0% ::build (inline)
+       0   0.0% 100.0%  1574585   0.0% ::build_array_reader
+       0   0.0% 100.0%  1574585   0.0% ::build_array_reader::{closure#0} (inline)
+       0   0.0% 100.0%   524336   0.0% ::build_many:: (inline)
+       0   0.0% 100.0%   524336   0.0% ::build_many_from_hir::
+       0   0.0% 100.0%   524336   0.0% ::build_many_from_hir:: (inline)
+       0   0.0% 100.0%   524336   0.0% ::build_one_string (inline)
+       0   0.0% 100.0%  1574585   0.0% ::build_primitive_reader (inline)
+       0   0.0% 100.0%  1574585   0.0% ::build_reader
+       0   0.0% 100.0%  1574585   0.0% ::build_struct_reader (inline)
+       0   0.0% 100.0% 2781321140  38.3% ::bytes::{closure#0}
+       0   0.0% 100.0%  1049136   0.0% ::call
+       0   0.0% 100.0%  3548598   0.0% ::call::{closure#0}
+       0   0.0% 100.0%   524336   0.0% ::call_once
+       0   0.0% 100.0% 7267433212 100.0% ::call_once (inline)
+       0   0.0% 100.0% 7264013122 100.0% ::call_once::{shim:vtable#0}
+       0   0.0% 100.0%  1049136   0.0% ::call_once_force:: (inline)
+       0   0.0% 100.0%  1049136   0.0% ::call_once_force::::{closure#0}
+       0   0.0% 100.0%   524292   0.0% ::clone_from_ref (inline)
+       0   0.0% 100.0%   524292   0.0% ::clone_from_ref_in (inline)

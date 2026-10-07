@@ -1,0 +1,58 @@
+# base i137
+# total 3228780270 B (3.229 GB)
+
+## top 40 by site (first non-plumbing frame below the allocator)
+         bytes  share    cum  frame
+    2699648722  83.6%  83.6%  object_store::util::collect_bytes::<core::pin::Pin<alloc::boxed::Box<dyn futures_core::stream::Stream<Item = core::result::Result<bytes::bytes::Bytes, object_store::Error>> + core::marker::Send>>, object_store::Error>::{
+     513992691  15.9%  99.5%  <bytes::bytes_mut::BytesMut>::reserve_inner
+       2197421   0.1%  99.6%  <parquet::file::metadata::RowGroupMetaDataBuilder>::new
+       2043816   0.1%  99.7%  <ravel_cache::s3fifo::S3Fifo<ravel_cache::cache::CacheEntry>>::insert
+       1845812   0.1%  99.7%  <ravel_ingest::metrics::ShardSkew>::with_capacity
+       1176508   0.0%  99.8%  <arrow_row::RowConverter>::empty_rows
+       1048768   0.0%  99.8%  <datafusion_physical_expr_common::metrics::builder::MetricBuilder>::with_label
+       1048704   0.0%  99.8%  <datafusion_physical_expr_common::metrics::builder::MetricBuilder>::build
+        528394   0.0%  99.8%  <hyper::proto::h1::io::WriteBuf<hyper::proto::h1::encode::EncodedBuf<bytes::bytes::Bytes>>>::new
+        527364   0.0%  99.9%  <datafusion_common::dfschema::DFSchema as core::convert::TryFrom<alloc::sync::Arc<arrow_schema::schema::Schema>>>::try_from
+        525826   0.0%  99.9%  <sharded_slab::page::Shared<tracing_subscriber::registry::sharded::DataInner, sharded_slab::cfg::DefaultConfig>>::allocate
+        525184   0.0%  99.9%  <tokio::runtime::task::core::Cell<ravel_server::metadata_sink_task::spawn::{closure#0}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::new
+        524800   0.0%  99.9%  <fn() -> std::io::stdio::Stdout as core::ops::function::Fn<()>>::call
+        524608   0.0%  99.9%  <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+        524352   0.0%  99.9%  datafusion_datasource_parquet::schema_coercion::field_with_new_type
+        524336   0.0% 100.0%  datafusion_physical_plan::aggregates::aggregate_expressions
+        524336   0.0% 100.0%  parquet::schema::types::build_tree
+        524336   0.0% 100.0%  <regex_automata::util::captures::GroupInfo>::new::<core::iter::adapters::map::Map<core::slice::iter::Iter<alloc::vec::Vec<core::option::Option<alloc::sync::Arc<str>>>>, <regex_automata::nfa::thompson::nfa::Inner>::set_ca
+        524292   0.0% 100.0%  main
+
+## top 40 by crate of that site
+         bytes  share    cum  frame
+    2699648722  83.6%  83.6%  object_store
+     513992691  15.9%  99.5%  bytes
+       2721757   0.1%  99.6%  parquet
+       2097472   0.1%  99.7%  datafusion_physical_expr_common
+       2043816   0.1%  99.7%  ravel_cache
+       1845812   0.1%  99.8%  ravel_ingest
+       1573700   0.0%  99.8%  ?
+       1176508   0.0%  99.9%  arrow_row
+        528394   0.0%  99.9%  hyper
+        527364   0.0%  99.9%  datafusion_common
+        525826   0.0%  99.9%  sharded_slab
+        525184   0.0% 100.0%  tokio
+        524352   0.0% 100.0%  datafusion_datasource_parquet
+        524336   0.0% 100.0%  datafusion_physical_plan
+        524336   0.0% 100.0%  regex_automata
+
+## top 40 by innermost ravel_* frame on the stack
+         bytes  share    cum  frame
+    2699648722  83.6%  83.6%  <ravel_object_store::s3::S3Store>::get_one::{closure#0}
+     516614423  16.0%  99.6%  <no ravel frame>
+       2721757   0.1%  99.7%  ravel_parquet::reader::decode_footer::<ravel_parquet::error::ParquetReadError, <ravel_parquet::reader::PinnedParquetReader>::read_footer::{closure#0}::{closure#0}>::{closure#0}
+       2100420   0.1%  99.8%  <ravel_parquet::boundary::BoundaryStream as futures_core::stream::Stream>::poll_next::{closure#0}
+       1845812   0.1%  99.8%  <alloc::raw_vec::RawVec<ravel_ingest::metrics::ShardSkewAtomics>>::with_capacity_in
+       1219810   0.0%  99.9%  <hashbrown::raw::RawTable<(ravel_cache::key::CacheKey, ravel_cache::s3fifo::Entry<ravel_cache::cache::CacheEntry>)>>::reserve_rehash::<hashbrown::map::make_hasher<ravel_cache::key::CacheKey, ravel_cache::s3fifo::Entry<ra
+       1176508   0.0%  99.9%  <ravel_sql::executor::PinnedStream>::start_with_scratch
+        824006   0.0%  99.9%  <alloc::raw_vec::RawVec<ravel_cache::key::CacheKey>>::grow_one
+        528394   0.0%  99.9%  <ravel_object_store::s3::connector::S3HttpService as object_store::client::http::connection::HttpService>::call::{closure#0}
+        525826   0.0% 100.0%  ravel_server::service::query_span
+        525184   0.0% 100.0%  <alloc::boxed::Box<tokio::runtime::task::core::Cell<ravel_server::metadata_sink_task::spawn::{closure#0}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>::new
+        524800   0.0% 100.0%  <ravel_server::config::ResolvedPerformanceDefaults>::emit::{closure#0}
+        524608   0.0% 100.0%  ravel_object_store::s3::bucket_config::control_plane_http_client

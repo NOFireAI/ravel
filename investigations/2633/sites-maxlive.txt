@@ -1,0 +1,86 @@
+# max-live sample +157.4 s, dump i1305
+# total 7267433128 B (7.267 GB)
+
+## top 40 by site (first non-plumbing frame below the allocator)
+         bytes  share    cum  frame
+    2781321133  38.3%  38.3%  object_store::util::collect_bytes::<core::pin::Pin<alloc::boxed::Box<dyn futures_core::stream::Stream<Item = core::result::Result<bytes::bytes::Bytes, object_store::Error>> + core::marker::Send>>, object_store::Error>::{
+    1216900898  16.7%  55.0%  <allocator_api2::stable::alloc::global::Global>::alloc_impl
+     688995310   9.5%  64.5%  <datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap<usize>>::append_value
+     541470670   7.5%  71.9%  <bytes::bytes_mut::BytesMut>::reserve_inner
+     363184623   5.0%  76.9%  <datafusion_functions_aggregate::count::CountGroupsAccumulator as datafusion_expr_common::groups_accumulator::GroupsAccumulator>::merge_batch
+     315745639   4.3%  81.3%  <datafusion_physical_plan::aggregates::group_values::multi_group_by::primitive::PrimitiveGroupValueBuilder<arrow_array::types::Int64Type, true> as datafusion_physical_plan::aggregates::group_values::multi_group_by::Group
+     268435486   3.7%  85.0%  <datafusion_functions_aggregate_common::aggregate::groups_accumulator::prim_op::PrimitiveGroupsAccumulator<arrow_array::types::Int64Type, <datafusion_functions_aggregate::sum::Sum as datafusion_expr::udaf::AggregateUDFIm
+     246503759   3.4%  88.4%  parquet::file::serialized_reader::decode_page
+     213956132   2.9%  91.3%  <datafusion_physical_plan::aggregates::group_values::multi_group_by::bytes_view::ByteViewGroupValueBuilder<arrow_array::types::StringViewType>>::do_append_val_inner
+     167779778   2.3%  93.6%  <arrow_buffer::buffer::immutable::Buffer as core::iter::traits::collect::FromIterator<f64>>::from_iter::<core::iter::adapters::map::Map<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip<alloc::vec::into_iter:
+     136401833   1.9%  95.5%  <datafusion_physical_plan::aggregates::group_values::multi_group_by::primitive::PrimitiveGroupValueBuilder<arrow_array::types::Int32Type, true> as datafusion_physical_plan::aggregates::group_values::multi_group_by::Group
+     100495083   1.4%  96.9%  <arrow_select::coalesce::byte_view::BufferSource>::next_buffer
+      81279400   1.1%  98.0%  <datafusion_physical_plan::aggregates::group_values::multi_group_by::bytes_view::ByteViewGroupValueBuilder<arrow_array::types::StringViewType>>::ensure_in_progress_big_enough
+      46407804   0.6%  98.6%  <parquet::arrow::buffer::view_buffer::ViewBuffer>::with_capacity
+      20466330   0.3%  98.9%  <datafusion_functions_aggregate::count::CountGroupsAccumulator as datafusion_expr_common::groups_accumulator::GroupsAccumulator>::update_batch
+      12271108   0.2%  99.1%  <arrow_select::coalesce::primitive::InProgressPrimitiveArray<arrow_array::types::Int64Type>>::ensure_capacity
+      11856812   0.2%  99.3%  <arrow_select::coalesce::byte_view::InProgressByteViewArray<arrow_array::types::StringViewType>>::ensure_capacity
+       9465285   0.1%  99.4%  <datafusion_physical_plan::aggregates::group_values::multi_group_by::GroupValuesColumn<false>>::collect_vectorized_process_context
+       7808883   0.1%  99.5%  <datafusion_physical_plan::aggregates::group_values::multi_group_by::GroupValuesColumn<false>>::vectorized_intern
+       7167820   0.1%  99.6%  <parquet::encodings::decoding::DictDecoder<parquet::data_type::Int64Type>>::set_dict
+       3346665   0.0%  99.6%  <parquet::arrow::record_reader::GenericRecordReader<alloc::vec::Vec<i64>, parquet::column::reader::decoder::ColumnValueDecoderImpl<parquet::data_type::Int64Type>>>::read_one_batch::{closure#0}
+       2197421   0.0%  99.7%  <parquet::file::metadata::RowGroupMetaDataBuilder>::new
+       2163391   0.0%  99.7%  <parquet::arrow::record_reader::GenericRecordReader<alloc::vec::Vec<i32>, parquet::column::reader::decoder::ColumnValueDecoderImpl<parquet::data_type::Int32Type>>>::read_one_batch::{closure#0}
+       2097408   0.0%  99.7%  <datafusion_physical_expr_common::metrics::builder::MetricBuilder>::build
+       2043816   0.0%  99.8%  <ravel_cache::s3fifo::S3Fifo<ravel_cache::cache::CacheEntry>>::insert
+       1845812   0.0%  99.8%  <ravel_ingest::metrics::ShardSkew>::with_capacity
+       1786482   0.0%  99.8%  <arrow_row::RowConverter>::empty_rows
+       1115555   0.0%  99.8%  <datafusion_physical_plan::aggregates::group_values::single_group_by::bytes_view::GroupValuesBytesView as datafusion_physical_plan::aggregates::group_values::GroupValues>::intern::{closure#1}
+       1048900   0.0%  99.8%  <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+        706869   0.0%  99.8%  <arrow_row::RowConverter>::append
+        583341   0.0%  99.9%  <datafusion_physical_plan::repartition::BatchPartitioner>::partition_iter
+        557777   0.0%  99.9%  <datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap<usize>>::insert_if_new_inner::<<datafusion_physical_plan::aggregates::group_values::single_group_by::bytes_view::GroupValuesBytesView as datafusion_phy
+        545120   0.0%  99.9%  <arrow_buffer::buffer::scalar::ScalarBuffer<i128> as core::iter::traits::collect::FromIterator<i128>>::from_iter::<core::iter::adapters::map::Map<core::slice::iter::Iter<u32>, arrow_select::take::take_native<i128, arrow_
+        540847   0.0%  99.9%  <arrow_select::coalesce::primitive::InProgressPrimitiveArray<arrow_array::types::Int32Type>>::ensure_capacity
+        540847   0.0%  99.9%  <arrow_buffer::buffer::mutable::MutableBuffer>::with_capacity
+        529420   0.0%  99.9%  <datafusion::execution::session_state::SessionState as datafusion_expr::registry::FunctionRegistry>::register_udf
+        525826   0.0%  99.9%  <sharded_slab::page::Shared<tracing_subscriber::registry::sharded::DataInner, sharded_slab::cfg::DefaultConfig>>::allocate
+        525569   0.0%  99.9%  parquet::compression::create_codec
+        525184   0.0%  99.9%  <tokio::runtime::task::core::Cell<ravel_server::metadata_sink_task::spawn::{closure#0}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::new
+        524800   0.0%  99.9%  <fn() -> std::io::stdio::Stdout as core::ops::function::Fn<()>>::call
+
+## top 40 by crate of that site
+         bytes  share    cum  frame
+    2781321133  38.3%  38.3%  object_store
+    1216900898  16.7%  55.0%  allocator_api2
+     766880740  10.6%  65.6%  datafusion_physical_plan
+     693747791   9.5%  75.1%  datafusion_physical_expr_common
+     541470670   7.5%  82.6%  bytes
+     383650953   5.3%  87.8%  datafusion_functions_aggregate
+     309885781   4.3%  92.1%  parquet
+     268435486   3.7%  95.8%  datafusion_functions_aggregate_common
+     168865745   2.3%  98.1%  arrow_buffer
+     125163850   1.7%  99.8%  arrow_select
+       2493351   0.0%  99.9%  arrow_row
+       2097992   0.0%  99.9%  ?
+       2043816   0.0%  99.9%  ravel_cache
+       1845812   0.0% 100.0%  ravel_ingest
+        529420   0.0% 100.0%  datafusion
+        525826   0.0% 100.0%  sharded_slab
+        525184   0.0% 100.0%  tokio
+        524344   0.0% 100.0%  arrow_array
+        524336   0.0% 100.0%  regex_automata
+
+## top 40 by innermost ravel_* frame on the stack
+         bytes  share    cum  frame
+    3997336275  55.0%  55.0%  <no ravel frame>
+    2781321133  38.3%  93.3%  <ravel_object_store::s3::S3Store>::get_one::{closure#0}
+     308737064   4.2%  97.5%  <ravel_parquet::boundary::BoundaryStream as futures_core::stream::Stream>::poll_next::{closure#0}
+     167779778   2.3%  99.8%  <alloc::vec::Vec<f64> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<f64, core::iter::adapters::map::Map<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip<alloc::vec::into_iter::IntoIter<i128>, allo
+       2721757   0.0%  99.9%  ravel_parquet::reader::decode_footer::<ravel_parquet::error::ParquetReadError, <ravel_parquet::reader::PinnedParquetReader>::read_footer::{closure#0}::{closure#0}>::{closure#0}
+       1845812   0.0%  99.9%  <alloc::raw_vec::RawVec<ravel_ingest::metrics::ShardSkewAtomics>>::with_capacity_in
+       1786482   0.0%  99.9%  <ravel_sql::executor::PinnedStream>::start_with_scratch
+       1219810   0.0%  99.9%  <hashbrown::raw::RawTable<(ravel_cache::key::CacheKey, ravel_cache::s3fifo::Entry<ravel_cache::cache::CacheEntry>)>>::reserve_rehash::<hashbrown::map::make_hasher<ravel_cache::key::CacheKey, ravel_cache::s3fifo::Entry<ra
+        824006   0.0%  99.9%  <alloc::raw_vec::RawVec<ravel_cache::key::CacheKey>>::grow_one
+        706869   0.0% 100.0%  <ravel_sql::executor::PinnedStream as futures_core::stream::Stream>::poll_next::{closure#0}
+        529420   0.0% 100.0%  ravel_sql::session::build_session
+        525826   0.0% 100.0%  ravel_server::service::query_span
+        525184   0.0% 100.0%  <alloc::boxed::Box<tokio::runtime::task::core::Cell<ravel_server::metadata_sink_task::spawn::{closure#0}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>::new
+        524800   0.0% 100.0%  <ravel_server::config::ResolvedPerformanceDefaults>::emit::{closure#0}
+        524608   0.0% 100.0%  ravel_object_store::s3::bucket_config::control_plane_http_client
+        524304   0.0% 100.0%  <ravel_parquet::boundary::ParquetPanicBoundaryExec as datafusion_physical_plan::execution_plan::ExecutionPlan>::execute
