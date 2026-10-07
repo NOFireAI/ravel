@@ -424,6 +424,9 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use clap::error::ErrorKind;
     use datafusion::arrow::record_batch::RecordBatch;
     use ravel_bench::clickbench_parquet::engine::{DdlReceipt, EngineError};
@@ -693,6 +696,192 @@ mod tests {
             .as_deref()
             .expect("the phase failure is recorded");
         assert!(recorded.contains("panicked"), "{recorded}");
+    }
+
+    /// A clock that moves only when [`ScriptedServer`] answers.
+    #[derive(Default)]
+    struct ScriptedClock {
+        nanos: AtomicU64,
+    }
+
+    impl Clock for ScriptedClock {
+        fn now(&self) -> Duration {
+            Duration::from_nanos(self.nanos.load(Ordering::SeqCst))
+        }
+    }
+
+    /// Never takes more than this many requests, so a phase that keeps
+    /// sending after a refusal fails the test instead of hanging it.
+    const REQUEST_CAP: usize = 1000;
+
+    /// The text `HttpEngine` gives a request that could not be sent.
+    const REFUSED: &str = "POST /api/v1/sql: error sending request for url \
+                           (http://127.0.0.1:4318/api/v1/sql)";
+
+    /// One server every concurrency task reaches. It answers its first
+    /// `answers` requests, each taking one second of scripted time, and
+    /// refuses every connection after them. A statement whose SQL is in
+    /// `unavailable` is answered with an HTTP 503 instead of rows.
+    struct ScriptedServer {
+        clock: Arc<ScriptedClock>,
+        answers: usize,
+        unavailable: Vec<String>,
+        /// Per request: its SQL, the clock seconds at its start, and whether
+        /// it was refused.
+        requests: Mutex<Vec<(String, u64, bool)>>,
+    }
+
+    impl ScriptedServer {
+        fn new(answers: usize, unavailable: Vec<String>) -> Arc<Self> {
+            Arc::new(ScriptedServer {
+                clock: Arc::new(ScriptedClock::default()),
+                answers,
+                unavailable,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<(String, u64, bool)> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    struct ServerConnection(Arc<ScriptedServer>);
+
+    #[async_trait::async_trait]
+    impl SuiteEngine for ServerConnection {
+        async fn ddl(&self, _sql: &str) -> Result<DdlReceipt, EngineError> {
+            Err(EngineError::Ddl("the phase runs no DDL".to_string()))
+        }
+
+        async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
+            let server = &self.0;
+            let refused = {
+                let mut requests = server.requests.lock().expect("requests lock");
+                assert!(
+                    requests.len() < REQUEST_CAP,
+                    "the phase kept sending requests"
+                );
+                let refused = requests.len() >= server.answers;
+                requests.push((sql.to_string(), server.clock.now().as_secs(), refused));
+                refused
+            };
+            if refused {
+                return Err(EngineError::Unreachable(REFUSED.to_string()));
+            }
+            server
+                .clock
+                .nanos
+                .fetch_add(Duration::from_secs(1).as_nanos() as u64, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            if server.unavailable.iter().any(|s| s == sql) {
+                Err(EngineError::Query(
+                    "HTTP 503 Service Unavailable: overloaded".to_string(),
+                ))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn measure_against(
+        server: &Arc<ScriptedServer>,
+        seconds: &str,
+    ) -> (Vec<Violation>, ClickBenchParquetReport) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = parse(&["--concurrency-seconds", seconds], None).expect("parses");
+        stage_inputs(dir.path(), &mut args);
+        let setup = prepare(&args, token_env).expect("setup passes");
+        let violations = measure(
+            &args,
+            setup,
+            &StubEngine { panics: false },
+            || Arc::new(ServerConnection(Arc::clone(server))) as Arc<dyn SuiteEngine>,
+            Arc::clone(&server.clock) as Arc<dyn Clock>,
+        )
+        .await
+        .expect("past setup the run returns its violations");
+        let text = std::fs::read_to_string(&args.out).expect("the report was written");
+        let report = serde_json::from_str(&text).expect("report parses");
+        (violations, report)
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_refuses_connections_ends_the_phase_for_every_task() {
+        // Ten tasks send requests round-robin, one second each, so request k
+        // starts at k s. Request 25 is task 5's third (q21, q22, q23) and is
+        // refused at 25 s. The nine tasks with a request in flight see it
+        // answered at 25 s and send nothing more.
+        let server = ScriptedServer::new(25, Vec::new());
+        let (violations, report) = measure_against(&server, "600").await;
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 26, "no request starts after the refusal");
+        let refused: Vec<u64> = requests
+            .iter()
+            .filter(|(_, _, refused)| *refused)
+            .map(|(_, at, _)| *at)
+            .collect();
+        assert_eq!(refused, vec![25]);
+
+        assert_eq!(
+            report.concurrency_error.as_deref(),
+            Some(
+                format!(
+                    "the engine became unreachable 25 s into the phase; task 5 saw it \
+                     first, on q23: engine unreachable: {REFUSED}"
+                )
+                .as_str()
+            )
+        );
+        let figures = report
+            .concurrency
+            .as_ref()
+            .expect("the figures up to the refusal are kept");
+        assert_eq!(figures.queries_completed, 25);
+        assert_eq!(figures.errors, 1);
+        assert!(figures.errors <= figures.tasks as u64);
+        assert_eq!(figures.elapsed_s.to_bits(), 25.0f64.to_bits());
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert!(
+            matches!(
+                &violations[0],
+                Violation::ConcurrencyPhaseFailed { error }
+                    if Some(error) == report.concurrency_error.as_ref()
+            ),
+            "{violations:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http_error_from_a_serving_engine_is_a_statement_error() {
+        let suite = suite::load_default().expect("suite loads");
+        let q07 = suite.statements[6].sql.clone();
+        let server = ScriptedServer::new(usize::MAX, vec![q07.clone()]);
+        let (violations, report) = measure_against(&server, "60").await;
+
+        let requests = server.requests();
+        assert!(requests.iter().all(|(_, _, refused)| !refused));
+        let q07_requests = requests.iter().filter(|(sql, _, _)| *sql == q07).count() as u64;
+        assert!(q07_requests > 0);
+
+        assert_eq!(report.concurrency_error, None);
+        let figures = report.concurrency.as_ref().expect("the phase ran");
+        assert!(figures.elapsed_s >= figures.duration_s);
+        assert_eq!(figures.errors, q07_requests);
+        assert_eq!(
+            figures.queries_completed + figures.errors,
+            requests.len() as u64
+        );
+        assert_eq!(figures.errored_statements, vec![7]);
+        assert_eq!(
+            violations,
+            vec![Violation::ConcurrencyUnregisteredError {
+                number: 7,
+                errors: q07_requests,
+            }]
+        );
     }
 
     #[test]
