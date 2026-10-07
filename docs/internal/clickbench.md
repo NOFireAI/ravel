@@ -1172,7 +1172,10 @@ An error the server answers with, any HTTP status including 422 and 503,
 is a statement error: it counts against that statement and the phase goes
 on. A connection-level failure, where the request could not be sent or the
 server refused or dropped the connection (the error text starts with
-`engine unreachable:`), ends the phase early. No task starts a statement
+`engine unreachable:`), ends the phase early. A single one is enough,
+including a reused keep-alive connection the server drops while a request
+is on it: `HttpEngine` makes no retry of its own, so a phase that ended
+early costs a rerun. No task starts a statement
 after the first one; a statement already in flight finishes, answered or
 failed the same way, so at most one connection-level failure per task is
 counted. The bench prints `concurrency: the engine became unreachable <N> s
@@ -1182,10 +1185,11 @@ report keeps the `concurrency` block with the figures up to that point:
 `duration_s`, `engine_unreachable` holds the time, task, statement and
 error, and each statement's `unreachable` counts its connection-level
 failures, which its `errors` includes. The same line is the report's
-`concurrency_error`, which the D7 check reports as one violation. A
-connection-level failure is not a statement error, so it adds no
-per-statement violation and leaves `errored_statements` and `first_error`
-alone.
+`concurrency_error`, which the D7 check reports as exactly one violation,
+`ConcurrencyPhaseFailed`. The check skips the `qps` rule for a phase the
+engine ended, since its `qps` measures the outage. A connection-level
+failure is not a statement error, so it adds no per-statement violation and
+leaves `errored_statements` and `first_error` alone.
 
 D7's concurrency bar is two rules (issue #2055): `qps` at least
 `concurrency_qps_floor` (0.400), and no statement error from any statement

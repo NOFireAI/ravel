@@ -832,7 +832,11 @@ fn check_against(
     }
 
     if let Some(concurrency) = &report.concurrency {
-        if concurrency.qps < prereg.concurrency_qps_floor {
+        // A phase the engine ended is judged once, through
+        // `concurrency_error`; its qps measures the outage, not the engine.
+        if concurrency.engine_unreachable.is_none()
+            && concurrency.qps < prereg.concurrency_qps_floor
+        {
             violations.push(Violation::ConcurrencyQpsBelowFloor {
                 qps: concurrency.qps,
                 floor: prereg.concurrency_qps_floor,
@@ -1568,6 +1572,77 @@ mod tests {
                 number: 8,
                 errors: 2
             }]
+        );
+    }
+
+    #[test]
+    fn an_engine_dead_before_the_phase_is_one_violation_and_no_qps_miss() {
+        // The server died during the timed statements: every task's first
+        // concurrency request was refused, so nothing completed.
+        let mut report = clean_report();
+        let concurrency = report.concurrency.as_mut().expect("ran");
+        for statement in &mut concurrency.statements {
+            statement.completed = 0;
+            statement.errors = 0;
+            statement.p50_s = None;
+            statement.p95_s = None;
+            statement.first_error = None;
+        }
+        for statement in concurrency.statements.iter_mut().step_by(4).take(10) {
+            statement.errors = 1;
+            statement.unreachable = 1;
+        }
+        concurrency.elapsed_s = 0.0;
+        concurrency.queries_completed = 0;
+        concurrency.errors = 10;
+        concurrency.unreachable = 10;
+        concurrency.qps = 0.0;
+        concurrency.error_ratio = 1.0;
+        concurrency.errored_statements = Vec::new();
+        let unreachable = EngineUnreachable {
+            at_s: 0.0,
+            task: 0,
+            statement: 1,
+            error: "engine unreachable: POST /api/v1/sql: connection refused".to_string(),
+        };
+        concurrency.engine_unreachable = Some(unreachable.clone());
+        report.concurrency_error = Some(unreachable.to_string());
+        let violations =
+            check_against(&report, &prereg(), Ok(declared())).expect_err("the phase failed");
+        assert_eq!(
+            violations,
+            vec![Violation::ConcurrencyPhaseFailed {
+                error: unreachable.to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_phase_the_engine_did_not_end_is_still_judged_on_qps() {
+        let mut report = clean_report();
+        report.concurrency.as_mut().expect("ran").qps = 0.1;
+        assert_eq!(
+            only_violation(&report),
+            Violation::ConcurrencyQpsBelowFloor {
+                qps: 0.1,
+                floor: 0.400
+            }
+        );
+        // The qps rule keys on `engine_unreachable`, not on
+        // `concurrency_error`: a phase failure of any other kind leaves it.
+        report.concurrency_error = Some("task 3 panicked".to_string());
+        let violations = check(&report, &prereg()).expect_err("qps is under the floor");
+        assert_eq!(
+            violations,
+            vec![
+                Violation::ConcurrencyQpsBelowFloor {
+                    qps: 0.1,
+                    floor: 0.400
+                },
+                Violation::ConcurrencyPhaseFailed {
+                    error: "task 3 panicked".to_string()
+                },
+            ]
         );
     }
 
