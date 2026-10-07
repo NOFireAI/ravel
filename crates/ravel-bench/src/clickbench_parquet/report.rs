@@ -832,7 +832,11 @@ fn check_against(
     }
 
     if let Some(concurrency) = &report.concurrency {
-        if concurrency.qps < prereg.concurrency_qps_floor {
+        // A phase the engine ended is judged once, through
+        // `concurrency_error`; its qps measures the outage, not the engine.
+        if concurrency.engine_unreachable.is_none()
+            && concurrency.qps < prereg.concurrency_qps_floor
+        {
             violations.push(Violation::ConcurrencyQpsBelowFloor {
                 qps: concurrency.qps,
                 floor: prereg.concurrency_qps_floor,
