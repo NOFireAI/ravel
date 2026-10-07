@@ -726,7 +726,9 @@ async fn region_segment_plan(sql: &str) -> Arc<dyn ExecutionPlan> {
 /// postings step dropped from the segment, as it does on the full scan.
 #[tokio::test]
 async fn fetch_stopped_segment_keeps_its_postings_prune_figure() {
-    let sql = "SELECT body FROM logs WHERE attrs['region'] = 'eu'";
+    // The function form of `attrs['region']`, which a bare `SessionContext`
+    // plans without ravel-sql's expression planner.
+    let sql = "SELECT body FROM logs WHERE get_field(attrs, 'region') = 'eu'";
 
     let full = region_segment_plan(sql).await;
     assert_eq!(
