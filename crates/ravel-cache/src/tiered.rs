@@ -337,7 +337,7 @@ where
                     // Read-through: repopulate RAM so the next read is a RAM
                     // hit, not another disk consult. Clean bytes are admitted;
                     // corruption, if on, is a serve-time transform below.
-                    self.ram.insert(key, bytes.clone());
+                    let bytes = self.ram.admit(key, bytes);
                     return Ok((bytes, Served::Disk));
                 }
                 // Both tiers missed: the caller owns the upstream fetch. On
@@ -345,8 +345,7 @@ where
                 // a later RAM eviction is served from disk. `DiskCache::insert`
                 // silently declines bytes whose length disagrees with
                 // `key.len`, so a well-formed funnel key admits cleanly.
-                let bytes = fetch().await?;
-                self.ram.insert(key, bytes.clone());
+                let bytes = self.ram.admit(key, fetch().await?);
                 // Same spawn_blocking treatment for the disk write. A
                 // `JoinError` here drops the disk admission silently: the RAM
                 // tier is already populated, so a lost disk write only costs
@@ -466,8 +465,7 @@ where
                 if let Some(bytes) = self.ram.get_uncounted(&key) {
                     return Ok((bytes, Served::RamRecheck));
                 }
-                let bytes = fetch().await?;
-                self.ram.insert(key, bytes.clone());
+                let bytes = self.ram.admit(key, fetch().await?);
                 // `DiskCache::insert` is std::fs I/O; run it on the blocking
                 // pool rather than the async worker thread (issue #1702). A
                 // `JoinError` drops the disk admission silently: the RAM
@@ -634,7 +632,7 @@ where
     /// caller uses [`insert_off_worker`](Self::insert_off_worker) instead
     /// (issue #1891).
     pub fn insert(&self, key: CacheKey, value: Bytes) {
-        self.ram.insert(key, value.clone());
+        let value = self.ram.admit(key, value);
         self.disk.insert(key, &value);
     }
 
@@ -653,10 +651,10 @@ where
     /// tier is already populated, so a lost disk write costs a future disk miss,
     /// never a wrong result.
     pub async fn insert_off_worker(&self, key: CacheKey, value: Bytes) {
-        self.ram.insert(key, value.clone());
+        let value = self.ram.admit(key, value);
         // The blocking closure must own its bytes: `DiskCache::insert` borrows a
-        // slice, and a `spawn_blocking` closure has to be `'static`. `Bytes` is
-        // refcounted, so this clone copies no payload.
+        // slice, and a `spawn_blocking` closure has to be `'static`. It takes the
+        // handle `admit` returned, which shares the RAM entry's payload.
         let disk = self.disk.clone();
         let _ = tokio::task::spawn_blocking(move || disk.insert(key, &value)).await;
     }
@@ -714,7 +712,7 @@ where
     /// admission order or corruption gating; the only difference between them is
     /// which thread ran `DiskCache::get`.
     fn admit_disk_hit(&self, key: CacheKey, bytes: Bytes) -> Bytes {
-        self.ram.insert(key, bytes.clone());
+        let bytes = self.ram.admit(key, bytes);
         self.maybe_corrupt(bytes, true)
     }
 
@@ -2232,5 +2230,62 @@ mod tests {
                 });
             },
         );
+    }
+
+    /// Issue #2633 through the tiered handle: an upstream fetch that returns a
+    /// 64 KiB slice of a 1 MiB buffer is admitted to RAM as an owned copy, so
+    /// once the served handle drops the 1 MiB buffer is uniquely owned again.
+    /// The RAM charge is 64 KiB and a RAM hit serves identical bytes.
+    #[tokio::test]
+    async fn get_or_fetch_of_a_slice_admits_an_owned_copy_to_ram() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let tiered = TieredCache::new(Cache::<&'static str>::new(generous_limits()), disk);
+
+        let big = Bytes::from((0..1024 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let slice_len = 64 * 1024;
+        let expected = big.slice(0..slice_len).to_vec();
+        let key = test_key(1, slice_len as u64);
+
+        let fetched = big.slice(0..slice_len);
+        let (served, _) = tiered
+            .get_or_fetch(key, move || async move { Ok::<Bytes, &'static str>(fetched) })
+            .await
+            .unwrap();
+        assert_eq!(served.as_ref(), expected.as_slice());
+        drop(served);
+
+        assert!(
+            big.is_unique(),
+            "the RAM entry must not hold a handle on the 1 MiB buffer"
+        );
+        assert_eq!(tiered.ram.total_bytes(), slice_len as u64);
+        assert_eq!(tiered.ram_metrics().admission_copies(), 1);
+        assert_eq!(
+            tiered.ram.get(&key).as_deref(),
+            Some(expected.as_slice())
+        );
+    }
+
+    /// A disk-served hit is promoted to RAM without a copy: the disk tier reads
+    /// each payload into an exact-size buffer it hands over whole.
+    #[tokio::test]
+    async fn disk_promotion_admits_without_a_copy() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let clean = Bytes::from_static(b"disk-resident payload");
+        let key = test_key(1, clean.len() as u64);
+        disk.insert(key, &clean);
+        let tiered = TieredCache::new(Cache::<&'static str>::new(generous_limits()), disk);
+
+        let (served, _) = tiered
+            .get_or_fetch(key, || async {
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(served, clean);
+        assert_eq!(tiered.ram.get(&key).as_deref(), Some(clean.as_ref()));
+        assert_eq!(tiered.ram_metrics().admission_copies(), 0);
     }
 }

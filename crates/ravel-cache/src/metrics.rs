@@ -22,6 +22,8 @@ pub struct CacheMetrics {
     single_flight_collapses: AtomicU64,
     disk_errors_degraded_to_misses: AtomicU64,
     disk_entries_expired_max_age: AtomicU64,
+    admission_copies: AtomicU64,
+    admission_copied_bytes: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -72,7 +74,31 @@ impl CacheMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Point-in-time copy of every counter. Not atomic across fields:
+    /// A RAM-tier admission stored an exact-size copy of the value rather than
+    /// the value itself, because the value did not solely own an allocation of
+    /// exactly its own length (see `Cache::insert`).
+    pub(crate) fn record_admission_copy(&self, bytes: u64) {
+        self.admission_copies.fetch_add(1, Ordering::Relaxed);
+        self.admission_copied_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// RAM-tier admissions that stored a copy rather than the value given
+    /// (`ravel_cache_admission_copies_total`). Read on its own rather than
+    /// through [`Self::snapshot`] because [`CacheMetricsSnapshot`] is built
+    /// field by field outside this crate.
+    pub fn admission_copies(&self) -> u64 {
+        self.admission_copies.load(Ordering::Relaxed)
+    }
+
+    /// Bytes copied by those admissions
+    /// (`ravel_cache_admission_copied_bytes_total`).
+    pub fn admission_copied_bytes(&self) -> u64 {
+        self.admission_copied_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Point-in-time copy of every counter but the two admission-copy ones
+    /// above. Not atomic across fields:
     /// concurrent calls may land between two loads, so a snapshot can show
     /// `hits` from a hair later than `misses`. It is a scrape, not a
     /// consistent cut, and nothing correctness-bearing reads it.

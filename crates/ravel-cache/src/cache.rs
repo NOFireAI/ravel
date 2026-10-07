@@ -34,6 +34,34 @@ pub(crate) fn corrupt_bytes(bytes: &Bytes) -> Bytes {
     )
 }
 
+/// `value` as the sole handle to an allocation of exactly its length: kept
+/// as is when it already is one, otherwise copied once into a fresh
+/// exact-size allocation and the copy counted. Shared, static, and
+/// owner-backed `Bytes` are not unique, so they are copied.
+fn owned_exact(value: Bytes, metrics: &CacheMetrics) -> Bytes {
+    if value.is_empty() {
+        return Bytes::new();
+    }
+    let unique = match value.try_into_mut() {
+        Ok(unique) if unique.capacity() == unique.len() => unique,
+        Ok(oversized) => return copy_counted(&oversized, metrics),
+        Err(shared) => return copy_counted(&shared, metrics),
+    };
+    // `BytesMut::capacity` does not count bytes before the view's start; the
+    // `Vec` it converts into does, so its capacity is the whole allocation.
+    let vec = Vec::from(unique);
+    if vec.capacity() == vec.len() {
+        Bytes::from(vec)
+    } else {
+        copy_counted(&vec, metrics)
+    }
+}
+
+fn copy_counted(bytes: &[u8], metrics: &CacheMetrics) -> Bytes {
+    metrics.record_admission_copy(bytes.len() as u64);
+    Bytes::copy_from_slice(bytes)
+}
+
 /// One RAM-tier entry: the cached bytes plus the wall-clock time they were
 /// admitted, in nanoseconds since the Unix epoch, read from the injected
 /// [`Clock`]. The stamp is what the per-`get` age check and the background
@@ -201,8 +229,25 @@ where
     /// Admit `value` under `key`. Not an error, and a no-op on the
     /// eviction state, if `value` is larger than the configured maximum
     /// single-entry size: the caller still has its own copy of the bytes.
+    ///
+    /// The entry is charged `value.len()`, so it must not keep a larger
+    /// allocation alive: unless `value` is the only handle to an allocation of
+    /// exactly its length, an exact-size copy is stored instead (counted by
+    /// [`CacheMetrics::admission_copies`]). A slice of a larger buffer, such as
+    /// a response body that is a view into an HTTP read buffer, therefore
+    /// stops pinning that buffer once the caller's handles drop. A caller that
+    /// keeps a clone of `value` makes it shared, so it is always copied; pass
+    /// it by value and use [`admit`](Self::admit) to get the stored bytes back.
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         self.inner.insert(key, value);
+    }
+
+    /// [`insert`](Self::insert), returning a handle to the bytes the tier now
+    /// stores (or `value` itself if it was over the size limit), so an
+    /// admitting caller that also serves the bytes need not hold a second
+    /// handle to `value` across the admission and force a copy.
+    pub(crate) fn admit(&self, key: CacheKey, value: Bytes) -> Bytes {
+        self.inner.insert(key, value)
     }
 
     /// Whether this cache is in the ADR-0046 acceptance-gate corruption mode
@@ -280,8 +325,7 @@ where
                 if let Some(bytes) = self.inner.lookup(&key) {
                     return Ok((bytes, true));
                 }
-                let bytes = fetch().await?;
-                self.insert(key, bytes.clone());
+                let bytes = self.admit(key, fetch().await?);
                 Ok((bytes, false))
             })
             .await;
@@ -368,13 +412,23 @@ impl Inner {
         Some(entry.bytes)
     }
 
-    fn insert(&self, key: CacheKey, value: Bytes) {
+    /// Admits `value` as an allocation the entry owns outright (see
+    /// [`owned_exact`]) and returns a handle to what was stored. An over-size
+    /// value is declined by the eviction structure, so it is passed through
+    /// uncopied.
+    fn insert(&self, key: CacheKey, value: Bytes) -> Bytes {
         let size = value.len() as u64;
+        let value = if size > self.limits.max_entry_bytes {
+            value
+        } else {
+            owned_exact(value, &self.metrics)
+        };
         let entry = CacheEntry {
             written_at_ns: self.clock.now_ns(),
-            bytes: value,
+            bytes: value.clone(),
         };
         self.fifo.lock().insert(key, entry, size, &self.metrics);
+        value
     }
 
     /// Drops every entry whose stamped write time is older than
@@ -954,5 +1008,150 @@ mod tests {
         );
         cache.sweep_expired_now();
         assert_eq!(cache.len(), 1, "the sweep must not drop it either");
+    }
+
+    const BIG: usize = 1024 * 1024;
+    const SLICE: usize = 64 * 1024;
+
+    /// A 1 MiB buffer with no repeating 64 KiB window, so a hit that returned
+    /// the wrong range would not compare equal.
+    fn big_buffer() -> Bytes {
+        Bytes::from((0..BIG).map(|i| (i % 251) as u8).collect::<Vec<u8>>())
+    }
+
+    /// Issue #2633: an entry admitted as a 64 KiB slice of a 1 MiB buffer is
+    /// charged 64 KiB, so it must not keep the 1 MiB buffer alive. Once the
+    /// cache's returned handles drop, the caller's original handle is the only
+    /// one left on that buffer.
+    ///
+    /// FLIP (non-vacuity): store `value` itself in `Inner::insert` instead of
+    /// `owned_exact(value, ..)`. The entry then holds the slice, and
+    /// `big.is_unique()` fails.
+    #[test]
+    fn insert_of_a_slice_stores_an_owned_copy_and_frees_the_larger_buffer() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let big = big_buffer();
+        let expected = big.slice(0..SLICE).to_vec();
+        let key = test_key_with_len(1, SLICE as u64);
+
+        cache.insert(key, big.slice(0..SLICE));
+        let hit = cache.get(&key).unwrap();
+        assert_eq!(hit.as_ref(), expected.as_slice());
+        drop(hit);
+
+        assert!(
+            big.is_unique(),
+            "the cache entry must not hold a handle on the 1 MiB buffer"
+        );
+        assert_eq!(cache.total_bytes(), SLICE as u64, "charged 64 KiB");
+        let metrics = cache.metrics();
+        assert_eq!(metrics.admission_copies(), 1);
+        assert_eq!(metrics.admission_copied_bytes(), SLICE as u64);
+
+        // A hit serves the stored copy; it copies nothing more.
+        let again = cache.get(&key).unwrap();
+        assert_eq!(again.as_ref(), expected.as_slice());
+        assert_eq!(metrics.admission_copies(), 1, "a hit is never a copy");
+    }
+
+    /// The other side of the rule: a value that is already the sole handle to
+    /// an allocation of exactly its length is stored as is. The served bytes
+    /// are the inserted allocation (same pointer), and the counter stays 0.
+    #[test]
+    fn exact_size_unique_value_is_stored_without_a_copy() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let value = Bytes::from(vec![0x5Au8; SLICE]);
+        let ptr = value.as_ptr();
+        let key = test_key_with_len(1, SLICE as u64);
+
+        cache.insert(key, value);
+        let hit = cache.get(&key).unwrap();
+        assert_eq!(hit.as_ptr(), ptr, "the original allocation is stored");
+        assert_eq!(hit.as_ref(), vec![0x5Au8; SLICE].as_slice());
+        assert_eq!(cache.metrics().admission_copies(), 0);
+        assert_eq!(cache.metrics().admission_copied_bytes(), 0);
+    }
+
+    /// A sole handle can still pin more than its length: the tail of a buffer
+    /// whose head was dropped (`BytesMut::capacity` reads exactly its length,
+    /// but the allocation starts before it), and a `Vec` with spare capacity.
+    /// Both are copied.
+    ///
+    /// FLIP (non-vacuity): in `owned_exact`, return `Bytes::from(vec)` without
+    /// the `vec.capacity() == vec.len()` check. The tail case is then stored
+    /// uncopied and the first count reads 0.
+    #[test]
+    fn unique_value_on_a_larger_allocation_is_copied() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let metrics = cache.metrics();
+
+        let mut head = big_buffer();
+        let tail = head.split_off(BIG - SLICE);
+        drop(head);
+        assert!(tail.is_unique(), "precondition: the tail is a sole handle");
+        cache.insert(test_key_with_len(1, SLICE as u64), tail);
+        assert_eq!(metrics.admission_copies(), 1, "the tail is copied");
+
+        let mut spare = Vec::with_capacity(BIG);
+        spare.extend_from_slice(&[7u8; SLICE]);
+        let spare = Bytes::from(spare);
+        assert!(spare.is_unique(), "precondition: a sole handle");
+        cache.insert(test_key_with_len(2, SLICE as u64), spare);
+        assert_eq!(metrics.admission_copies(), 2, "spare capacity is copied");
+        assert_eq!(metrics.admission_copied_bytes(), 2 * SLICE as u64);
+        assert_eq!(cache.total_bytes(), 2 * SLICE as u64);
+    }
+
+    /// The `get_or_fetch` admission path, which admits inside the flight, gets
+    /// the same treatment as `insert`: a fetch that returns a slice of a 1 MiB
+    /// buffer leaves that buffer uniquely owned once the returned handle drops.
+    ///
+    /// FLIP (non-vacuity): in `get_or_fetch_outcome`, admit with
+    /// `self.inner.fifo.lock().insert(..)` on the raw fetched value (or any
+    /// admission that bypasses `owned_exact`). `big.is_unique()` then fails.
+    #[tokio::test]
+    async fn get_or_fetch_of_a_slice_stores_an_owned_copy() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let big = big_buffer();
+        let expected = big.slice(0..SLICE).to_vec();
+        let key = test_key_with_len(1, SLICE as u64);
+
+        let fetched = big.slice(0..SLICE);
+        let got = cache
+            .get_or_fetch(key, move || async move { Ok::<Bytes, &'static str>(fetched) })
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), expected.as_slice());
+        drop(got);
+
+        assert!(
+            big.is_unique(),
+            "the cache entry must not hold a handle on the 1 MiB buffer"
+        );
+        assert_eq!(cache.total_bytes(), SLICE as u64, "charged 64 KiB");
+        let metrics = cache.metrics();
+        assert_eq!(metrics.admission_copies(), 1);
+        assert_eq!(metrics.admission_copied_bytes(), SLICE as u64);
+        let hit = cache.get(&key).unwrap();
+        assert_eq!(hit.as_ref(), expected.as_slice());
+        assert_eq!(metrics.admission_copies(), 1, "a hit is never a copy");
+    }
+
+    /// `get_or_fetch` admits an exact-size fetched value without a copy and
+    /// serves the caller that same allocation.
+    #[tokio::test]
+    async fn get_or_fetch_of_an_exact_size_value_is_not_copied() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let value = Bytes::from(vec![0x5Au8; SLICE]);
+        let ptr = value.as_ptr();
+        let key = test_key_with_len(1, SLICE as u64);
+
+        let got = cache
+            .get_or_fetch(key, move || async move { Ok::<Bytes, &'static str>(value) })
+            .await
+            .unwrap();
+        assert_eq!(got.as_ptr(), ptr);
+        assert_eq!(cache.get(&key).unwrap().as_ptr(), ptr);
+        assert_eq!(cache.metrics().admission_copies(), 0);
     }
 }
