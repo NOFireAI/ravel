@@ -24,7 +24,6 @@ use ravel_catalog::{
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_maintain::MaintainReport;
 use ravel_maintain::scan::MaintainMemo;
 use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY};
 use ravel_maintain::{
@@ -38,7 +37,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::fold::{self, FOLD_UNIT_SHARD, FoldTickReport, RefoldQueue};
-use ravel_server::maintain::{self, MaintenanceOwnershipMetrics, MaintenanceSafetyMetrics};
+use ravel_server::maintain::{
+    self, MaintenanceOwnershipMetrics, MaintenanceSafetyMetrics, SupersededHeldReason,
+};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId};
 use uuid::Uuid;
 
@@ -137,6 +138,12 @@ async fn publish_l0(store: &MemoryStore, tenant: &TenantId, shard: u32, hour: u3
         .expect("publish commit record");
 }
 
+/// The metrics one maintain tick recorded.
+struct TickMetrics {
+    safety: MaintenanceSafetyMetrics,
+    ownership: MaintenanceOwnershipMetrics,
+}
+
 /// One maintain-role process over the shared store: its catalog, its worker
 /// identity, and the memo its maintain loop keeps across ticks. `fold_store`
 /// is what the catalog and the fold tick read and write; `store` is the
@@ -213,26 +220,43 @@ impl Process {
         now_ns: i64,
         live_set: &[Uuid],
         refold: &RefoldQueue,
-    ) -> MaintainReport {
+    ) -> TickMetrics {
+        let store = self.store.clone();
+        self.maintain_tick_on(store.as_ref(), now_ns, live_set, refold, 3)
+            .await
+    }
+
+    /// [`Self::maintain_tick`] over `store` instead of the process's own
+    /// memory store, with a unit counted stalled after `stalled_after` failed
+    /// ticks.
+    async fn maintain_tick_on(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        now_ns: i64,
+        live_set: &[Uuid],
+        refold: &RefoldQueue,
+        stalled_after: u32,
+    ) -> TickMetrics {
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(stalled_after);
         safety.begin_scan_cycle();
-        let report = maintain::run_tick_with_refold(
+        maintain::run_tick_with_refold(
             &FixedClock::new(now_ns),
-            self.store.as_ref(),
+            store,
             &self.tenant.hash(),
             &compactor_config(),
             &RetentionConfig::default(),
             self.shard_count,
             &mut self.memo,
             &safety,
-            &MaintenanceOwnershipMetrics::new(3),
+            &ownership,
             &self.worker,
             live_set,
             Some(refold),
         )
         .await;
         safety.publish_scan_cycle();
-        report
+        TickMetrics { safety, ownership }
     }
 
     /// One scheduled metrics fold tick at `now_ns`, taking from `refold`.
@@ -345,8 +369,9 @@ fn past_horizon_ns() -> i64 {
 /// snapshot then names the compaction's output and no L0 input.
 ///
 /// Flip either line to watch it fail:
-/// - in `maintain::send_refold_hours`, delete `queue.send(*tenant, signal,
-///   hours);`: the queue stays empty and `pending_len` is 0, not 1;
+/// - in `maintain::run_tick_with_refold`, delete `queue.send(*tenant, signal,
+///   blocked_named_hours);`: the queue stays empty and `pending_len` is 0, not
+///   1;
 /// - in `fold::run_tenant_tick`, call `catalog.fold(tenant, signal, folder_id,
 ///   now_ns, &[], default_retention_ns)` instead of
 ///   `fold_with_refold_request`: `refold_hours_reconciled` is 0, not 1.
@@ -591,17 +616,20 @@ async fn a_request_past_the_per_fold_cap_keeps_its_remainder() {
     assert_eq!(queue.dropped_requests(), 0);
 }
 
-/// With more than one maintain process, a process that sweeps a shard of a
-/// pair but does not own shard 0 of it does not fold the pair, so it queues
-/// nothing for it: no fold in that process would take the entry, and its fold
-/// tick would only remove it. It counts nothing as dropped either. The same tick with this
-/// process alone in the live set does queue the hour, so the hold is real.
+/// With more than one maintain process, a process that owns a shard of a pair
+/// but not shard 0 of it neither folds the pair nor sweeps any of it (issue
+/// #2606): it runs no sweep pass on the shard it owns, so it finds no hold
+/// there and queues nothing. It counts nothing as dropped either. The same
+/// tick with this process alone in the live set sweeps the shard, finds the
+/// hold and queues the hour, so the hold is real.
 ///
-/// Flip to watch it fail: in `maintain::send_refold_hours`, delete the
-/// `!worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD)` early return.
-/// The first tick then queues one entry.
+/// Flip to watch it fail: in `maintain::run_tick_with_refold`, replace
+/// `(owned || sweeps_pair).then_some((shard, owned))` with
+/// `owned.then_some((shard, owned))` and the `if !sweeps_pair` early return in
+/// the unit future with `if !owned`, so each process sweeps the shards it owns
+/// again. A then holds the hour's inputs as Named, 4 of them, not 0.
 #[tokio::test]
-async fn a_process_that_does_not_fold_the_pair_sends_nothing() {
+async fn a_process_that_does_not_fold_the_pair_sweeps_none_of_it() {
     const SHARDS: u32 = 8;
     let live_ab = vec![PROCESS_A, PROCESS_B];
     let store = Arc::new(MemoryStore::new());
@@ -614,17 +642,182 @@ async fn a_process_that_does_not_fold_the_pair_sends_nothing() {
     seed_late_compaction(&a, shard, &solo_a).await;
 
     let queue = RefoldQueue::default();
-    a.maintain_tick(past_horizon_ns(), &live_ab, &queue).await;
+    let metrics = a.maintain_tick(past_horizon_ns(), &live_ab, &queue).await;
+    assert_eq!(
+        metrics
+            .safety
+            .superseded_inputs_held(Signal::Metrics, SupersededHeldReason::Named),
+        0,
+        "A swept none of the pair's superseded state, so it found no hold"
+    );
+    assert_eq!(
+        metrics.ownership.full_sweep_passes_total(),
+        cold_full_sweep_passes(&a, &live_ab),
+        "A swept only the pairs whose shard 0 it owns, every shard of each"
+    );
     assert_eq!(queue.pending_len(), 0, "A does not fold the pair");
     assert_eq!(queue.dropped_requests(), 0, "and drops nothing");
 
-    // Control: A alone owns shard 0 too, and the same hold is queued.
+    // Control: A alone owns shard 0 too, and the same hold is found and queued.
     let mut alone = Process::new(&store, &tenant, PROCESS_A, SHARDS);
     let control = RefoldQueue::default();
-    alone
+    let metrics = alone
         .maintain_tick(past_horizon_ns(), &solo_a, &control)
         .await;
+    assert_eq!(
+        metrics
+            .safety
+            .superseded_inputs_held(Signal::Metrics, SupersededHeldReason::Named),
+        4,
+        "two commit records and two data objects are held"
+    );
     assert_eq!(control.pending_len(), 1, "the hold exists and is queued");
+}
+
+/// Issue #2606: a named-snapshot hold whose hour lives on a shard the folder
+/// does not own still reaches the folder's fold, in the folder's own process.
+/// Under {A, B}, B owns shard 0 of the pair and so folds it; A owns shard
+/// `shard` and B does not. B's maintain tick sweeps `shard` anyway, because
+/// the pair's whole sweep is B's, finds the hour held because the snapshot
+/// still names its superseded inputs, and queues it. B's next fold tick takes
+/// it, and the snapshot then names the compaction's parts and no input.
+///
+/// Flip to watch it fail: in `maintain::run_tick_with_refold`, replace
+/// `(owned || sweeps_pair).then_some((shard, owned))` with
+/// `owned.then_some((shard, owned))` and the `if !sweeps_pair` early return in
+/// the unit future with `if !owned` (each process sweeps the shards it owns, as
+/// before this fix). B then never sweeps `shard` and holds 0 inputs, not 4,
+/// so its queue stays empty and its fold reconciles nothing; the hold is found
+/// by A instead, which does not fold the pair.
+#[tokio::test]
+async fn a_hold_on_a_shard_the_folder_does_not_own_reaches_its_fold() {
+    const SHARDS: u32 = 8;
+    let live_ab = vec![PROCESS_A, PROCESS_B];
+    let store = Arc::new(MemoryStore::new());
+    let (tenant, shard) = split_tenant(&live_ab, SHARDS);
+    let mut a = Process::new(&store, &tenant, PROCESS_A, SHARDS);
+    let mut b = Process::new(&store, &tenant, PROCESS_B, SHARDS);
+    let pair = tenant.hash();
+    assert!(
+        b.worker
+            .owns_unit(&live_ab, &pair, Signal::Metrics, FOLD_UNIT_SHARD),
+        "B folds the pair"
+    );
+    assert!(
+        !b.worker.owns_unit(&live_ab, &pair, Signal::Metrics, shard),
+        "and does not own the shard the hold is on"
+    );
+    let solo_a = a.worker.solo_live_set();
+    let parts = seed_late_compaction(&a, shard, &solo_a).await;
+    let now = past_horizon_ns();
+
+    // A owns the shard and runs its retention and compaction, but no sweep.
+    let a_queue = RefoldQueue::default();
+    a.maintain_tick(now, &live_ab, &a_queue).await;
+
+    let b_queue = RefoldQueue::default();
+    let metrics = b.maintain_tick(now, &live_ab, &b_queue).await;
+    assert_eq!(
+        metrics
+            .safety
+            .superseded_inputs_held(Signal::Metrics, SupersededHeldReason::Named),
+        4,
+        "B swept the shard it does not own and held the hour's inputs"
+    );
+    assert_eq!(
+        metrics.ownership.full_sweep_passes_total(),
+        cold_full_sweep_passes(&b, &live_ab),
+        "a cold first tick runs a full sweep pass of every shard of each pair B folds"
+    );
+    assert_eq!(
+        pending_hours(&b_queue, &tenant),
+        vec![OLD_HOUR],
+        "the hold reached the folder's queue"
+    );
+
+    let report = b.fold_tick(now, &live_ab, &b_queue).await;
+    assert_eq!(report.owned, vec![pair]);
+    assert_eq!(report.folded, vec![pair], "{report:?}");
+    assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
+    assert_eq!(b_queue.pending_len(), 0, "the fold took the entry");
+    assert_eq!(
+        head_levels(&store, &tenant, OLD_HOUR).await,
+        (0, parts),
+        "the snapshot names the compaction's parts and none of its inputs"
+    );
+    assert_eq!(
+        a_queue.pending_len(),
+        0,
+        "A, which does not fold the pair, found no hold to queue"
+    );
+}
+
+/// A sweep of a shard the folder does not own that keeps failing reaches the
+/// stalled-unit gauge on the folder, through the pair's FOLD_UNIT_SHARD unit,
+/// although no unit of that shard is the folder's. The fault refuses every
+/// LIST under the shard's commit prefix, which only the sweep issues on B, and
+/// is counted so the test proves it fired.
+///
+/// Flip to watch it fail: in `maintain::run_tick_with_refold`, drop
+/// `&& (shard != FOLD_UNIT_SHARD || unscanned_sweeps_ok)` from `sweeps_ok`.
+/// `units_stalled` is then 0, not 1.
+#[tokio::test]
+async fn a_failing_sweep_of_an_unowned_shard_stalls_the_fold_unit() {
+    const SHARDS: u32 = 8;
+    let live_ab = vec![PROCESS_A, PROCESS_B];
+    let store = Arc::new(MemoryStore::new());
+    let (tenant, shard) = split_tenant(&live_ab, SHARDS);
+    publish_l0(&store, &tenant, shard, OLD_HOUR, 1).await;
+    let prefix =
+        keys::commit_shard_prefix(&tenant.hash(), Signal::Metrics, shard).expect("shard prefix");
+    let faults = FaultStore::new(
+        store.clone(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::List, ScriptedFault::Permanent("refused".to_string()))
+                .with_key_contains(prefix),
+        ),
+    );
+    let mut b = Process::new(&store, &tenant, PROCESS_B, SHARDS);
+
+    let metrics = b
+        .maintain_tick_on(
+            &faults,
+            past_horizon_ns(),
+            &live_ab,
+            &RefoldQueue::default(),
+            1,
+        )
+        .await;
+    assert_eq!(
+        faults.fault_count(Op::List, FaultKind::Permanent),
+        1,
+        "the fault fired, on the shard sweep's first LIST"
+    );
+    assert_eq!(
+        metrics.ownership.full_sweep_passes_total(),
+        cold_full_sweep_passes(&b, &live_ab) - 1,
+        "every other shard's sweep pass completed"
+    );
+    assert_eq!(
+        metrics.ownership.units_stalled(),
+        1,
+        "the failed sweep stalls B's fold unit"
+    );
+}
+
+/// The full sweep passes a cold first maintain tick of `process` runs under
+/// `live_set`: every shard of each maintained signal whose shard 0 it owns,
+/// and nothing for any other signal.
+fn cold_full_sweep_passes(process: &Process, live_set: &[Uuid]) -> u64 {
+    let swept_pairs = [Signal::Metrics, Signal::Logs, Signal::Spans]
+        .into_iter()
+        .filter(|signal| {
+            process
+                .worker
+                .owns_unit(live_set, &process.tenant.hash(), *signal, FOLD_UNIT_SHARD)
+        })
+        .count() as u64;
+    swept_pairs * u64::from(process.shard_count)
 }
 
 /// The first tenant (in a fixed list) for which, under `live_ab`, B owns shard

@@ -1524,7 +1524,7 @@ dimension.
 |---|---|
 | `ravel_maintain_workers_live` | Gauge. In-process maintenance workers this supervisor currently sees as live. |
 | `ravel_maintain_units_owned` | Gauge. Owned (tenant, signal, shard) units this process is currently maintaining. |
-| `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. Alert on a sustained nonzero value, not on any single scrape. |
+| `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. A pair's shard 0 unit also fails a tick when this process's sweep of another shard of the pair fails, since the owner of shard 0 sweeps every shard of the pair. Alert on a sustained nonzero value, not on any single scrape. |
 | `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
 | `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
 

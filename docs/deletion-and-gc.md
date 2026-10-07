@@ -280,9 +280,9 @@ schedule. The maintain-role sweep supplies those hours: each tick hands the
 hours it held because the live HEAD still names their superseded inputs to
 the scheduled fold of the pair, through an in-process queue, when the
 process runs the scheduled fold and owns shard 0 of the pair, and therefore
-folds it
-(docs/catalog-and-mvcc.md, "Targeted re-fold requests", including the limit
-for a hold found on another shard). A request submitted to a fold call that
+folds it. Only that process sweeps the pair, every shard of it, so a hold on
+any shard reaches the fold
+(docs/catalog-and-mvcc.md, "Targeted re-fold requests"). A request submitted to a fold call that
 turns out to be a **no-op** (nothing newly sealed beyond the previous
 watermark) reconciles **zero hours**, whatever hours it named: the targeted
 pass sits inside the same reconcile branch as the fixed window and the
