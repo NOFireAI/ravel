@@ -607,8 +607,16 @@ mod tests {
         answers: usize,
         dies: bool,
         unavailable: Vec<String>,
-        /// (statement SQL, clock seconds at start, refused) per request.
-        requests: Mutex<Vec<(String, u64, bool)>>,
+        requests: Mutex<Vec<Request>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Request {
+        task: usize,
+        sql: String,
+        /// Clock seconds at its start.
+        at: u64,
+        refused: bool,
     }
 
     impl SharedServer {
@@ -622,7 +630,7 @@ mod tests {
             })
         }
 
-        fn requests(&self) -> Vec<(String, u64, bool)> {
+        fn requests(&self) -> Vec<Request> {
             self.requests
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -638,7 +646,10 @@ mod tests {
         }
     }
 
-    struct Connection(Arc<SharedServer>);
+    struct Connection {
+        server: Arc<SharedServer>,
+        task: usize,
+    }
 
     #[async_trait]
     impl SuiteEngine for Connection {
@@ -647,7 +658,7 @@ mod tests {
         }
 
         async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
-            let server = &self.0;
+            let server = &self.server;
             let refused = {
                 let mut requests = server
                     .requests
@@ -655,7 +666,12 @@ mod tests {
                     .unwrap_or_else(PoisonError::into_inner);
                 assert!(requests.len() < CALL_CAP, "driver kept starting statements");
                 let refused = requests.len() >= server.answers;
-                requests.push((sql.to_string(), server.clock.now().as_secs(), refused));
+                requests.push(Request {
+                    task: self.task,
+                    sql: sql.to_string(),
+                    at: server.clock.now().as_secs(),
+                    refused,
+                });
                 refused
             };
             let unreachable = || Err(EngineError::Unreachable("connection refused".to_string()));
@@ -676,18 +692,26 @@ mod tests {
 
     fn connections(server: &Arc<SharedServer>, count: usize) -> Vec<PhaseTask> {
         (0..count)
-            .map(|_| PhaseTask {
-                engine: Arc::new(Connection(Arc::clone(server))) as Arc<dyn SuiteEngine>,
+            .map(|task| PhaseTask {
+                engine: Arc::new(Connection {
+                    server: Arc::clone(server),
+                    task,
+                }) as Arc<dyn SuiteEngine>,
                 clock: Arc::clone(&server.clock) as Arc<dyn Clock>,
             })
             .collect()
     }
 
+    /// The suite number of `statements(n)`'s statement `sql`.
+    fn number(sql: &str) -> u32 {
+        sql.trim_start_matches('s').parse().expect("stub SQL is s<n>")
+    }
+
     #[tokio::test]
     async fn a_refused_connection_stops_every_task() {
-        // Three tasks send requests round-robin, one second each, so request
-        // k starts at k s. Request 5 is task 2's second (s4, then s5) and is
-        // refused at 5 s; tasks 0 and 1 have requests in flight, see them
+        // Every answered request moves the shared clock one second, so the
+        // sixth request, the first refused, starts at 5 s whichever task
+        // sends it. The other two tasks have a request in flight then, see it
         // answered, and start nothing more.
         let server = SharedServer::new(5, false, &[]);
         let figures = run(
@@ -700,13 +724,15 @@ mod tests {
 
         let requests = server.requests();
         assert_eq!(requests.len(), 6, "no request starts after the refusal");
-        assert_eq!(requests[5], ("s5".to_string(), 5, true));
+        let refused = &requests[5];
+        assert_eq!((refused.at, refused.refused), (5, true), "{requests:?}");
+        assert!(requests[..5].iter().all(|r| !r.refused), "{requests:?}");
         assert_eq!(
             figures.engine_unreachable,
             Some(EngineUnreachable {
                 at_s: 5.0,
-                task: 2,
-                statement: 5,
+                task: refused.task,
+                statement: number(&refused.sql),
                 error: "engine unreachable: connection refused".to_string(),
             })
         );
@@ -715,16 +741,20 @@ mod tests {
         assert_eq!(figures.unreachable, 1);
         assert_eq!(figures.elapsed_s.to_bits(), 5.0f64.to_bits());
         assert_eq!(figures.qps.to_bits(), 1.0f64.to_bits());
-        let s5 = &figures.statements[4];
-        assert_eq!((s5.errors, s5.unreachable, s5.statement_errors()), (1, 1, 0));
-        assert_eq!(s5.first_error, None);
+        let failed = &figures.statements[number(&refused.sql) as usize - 1];
+        assert_eq!(
+            (failed.errors, failed.unreachable, failed.statement_errors()),
+            (1, 1, 0)
+        );
+        assert_eq!(failed.first_error, None);
         assert_eq!(figures.errored_statements, Vec::<u32>::new());
     }
 
     #[tokio::test]
     async fn requests_in_flight_when_the_engine_dies_fail_the_same_way() {
-        // As above, but the server dies at request 5: requests 3 and 4, in
-        // flight then, fail too. Each task fails once, so errors equal tasks.
+        // As above, but the server dies at the sixth request: the other two
+        // tasks' requests, in flight then, fail too. Each task fails once, so
+        // errors equal tasks.
         let server = SharedServer::new(5, true, &[]);
         let figures = run(
             connections(&server, 3),
@@ -734,9 +764,13 @@ mod tests {
         .await
         .expect("phase runs");
 
-        assert_eq!(server.requests().len(), 6);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 6, "no request starts after the refusal");
         let first = figures.engine_unreachable.as_ref().expect("phase ended");
-        assert_eq!((first.task, first.statement), (2, 5));
+        assert_eq!(
+            (first.task, first.statement),
+            (requests[5].task, number(&requests[5].sql))
+        );
         assert_eq!(first.at_s.to_bits(), 5.0f64.to_bits());
         assert_eq!(figures.queries_completed, 3);
         assert_eq!(figures.errors, 3);
@@ -758,7 +792,8 @@ mod tests {
         .expect("phase runs");
 
         let requests = server.requests();
-        let s2_requests = requests.iter().filter(|(sql, _, _)| sql == "s2").count() as u64;
+        assert!(requests.iter().all(|r| !r.refused));
+        let s2_requests = requests.iter().filter(|r| r.sql == "s2").count() as u64;
         assert!(s2_requests > 0);
         assert_eq!(figures.engine_unreachable, None);
         assert!(figures.elapsed_s >= figures.duration_s);

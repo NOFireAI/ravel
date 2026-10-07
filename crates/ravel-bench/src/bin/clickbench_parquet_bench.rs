@@ -428,7 +428,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
 
     use clap::error::ErrorKind;
@@ -730,9 +730,16 @@ mod tests {
         clock: Arc<ScriptedClock>,
         answers: usize,
         unavailable: Vec<String>,
-        /// Per request: its SQL, the clock seconds at its start, and whether
-        /// it was refused.
-        requests: Mutex<Vec<(String, u64, bool)>>,
+        requests: Mutex<Vec<Request>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Request {
+        task: usize,
+        sql: String,
+        /// Clock seconds at its start.
+        at: u64,
+        refused: bool,
     }
 
     impl ScriptedServer {
@@ -746,7 +753,7 @@ mod tests {
         }
 
         /// Readable after a capped request panicked while holding the lock.
-        fn requests(&self) -> Vec<(String, u64, bool)> {
+        fn requests(&self) -> Vec<Request> {
             self.requests
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -754,7 +761,10 @@ mod tests {
         }
     }
 
-    struct ServerConnection(Arc<ScriptedServer>);
+    struct ServerConnection {
+        server: Arc<ScriptedServer>,
+        task: usize,
+    }
 
     #[async_trait::async_trait]
     impl SuiteEngine for ServerConnection {
@@ -763,7 +773,7 @@ mod tests {
         }
 
         async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
-            let server = &self.0;
+            let server = &self.server;
             let refused = {
                 let mut requests = server
                     .requests
@@ -774,7 +784,12 @@ mod tests {
                     "the phase kept sending requests"
                 );
                 let refused = requests.len() >= server.answers;
-                requests.push((sql.to_string(), server.clock.now().as_secs(), refused));
+                requests.push(Request {
+                    task: self.task,
+                    sql: sql.to_string(),
+                    at: server.clock.now().as_secs(),
+                    refused,
+                });
                 refused
             };
             if refused {
@@ -803,11 +818,19 @@ mod tests {
         let mut args = parse(&["--concurrency-seconds", seconds], None).expect("parses");
         stage_inputs(dir.path(), &mut args);
         let setup = prepare(&args, token_env).expect("setup passes");
+        // `measure` makes task i's engine i-th, so creation order is the
+        // task index.
+        let connections = AtomicUsize::new(0);
         let violations = measure(
             &args,
             setup,
             &StubEngine { panics: false },
-            || Arc::new(ServerConnection(Arc::clone(server))) as Arc<dyn SuiteEngine>,
+            || {
+                Arc::new(ServerConnection {
+                    server: Arc::clone(server),
+                    task: connections.fetch_add(1, Ordering::SeqCst),
+                }) as Arc<dyn SuiteEngine>
+            },
             Arc::clone(&server.clock) as Arc<dyn Clock>,
         )
         .await
@@ -832,28 +855,33 @@ mod tests {
 
     #[tokio::test]
     async fn an_engine_that_refuses_connections_ends_the_phase_for_every_task() {
-        // Ten tasks send requests round-robin, one second each, so request k
-        // starts at k s. Request 25 is task 5's third (q21, q22, q23) and is
-        // refused at 25 s. The nine tasks with a request in flight see it
-        // answered at 25 s and send nothing more.
+        // Every answered request moves the shared clock one second, so the
+        // 26th request, the first refused, starts at 25 s whichever task
+        // sends it. The nine tasks with a request in flight then see it
+        // answered and send nothing more.
         let server = ScriptedServer::new(25, Vec::new());
         let (violations, report) = measure_against(&server, "600").await;
 
         let requests = server.requests();
         assert_eq!(requests.len(), 26, "no request starts after the refusal");
-        let refused: Vec<u64> = requests
+        let refused = &requests[25];
+        assert_eq!((refused.at, refused.refused), (25, true));
+        assert!(requests[..25].iter().all(|r| !r.refused));
+        let suite = suite::load_default().expect("suite loads");
+        let number = suite
+            .statements
             .iter()
-            .filter(|(_, _, refused)| *refused)
-            .map(|(_, at, _)| *at)
-            .collect();
-        assert_eq!(refused, vec![25]);
+            .find(|s| s.sql == refused.sql)
+            .expect("a suite statement")
+            .number;
 
         assert_eq!(
             report.concurrency_error.as_deref(),
             Some(
                 format!(
-                    "the engine became unreachable 25 s into the phase; task 5 saw it \
-                     first, on q23: engine unreachable: {REFUSED}"
+                    "the engine became unreachable 25 s into the phase; task {} saw it \
+                     first, on q{number:02}: engine unreachable: {REFUSED}",
+                    refused.task
                 )
                 .as_str()
             )
@@ -886,8 +914,8 @@ mod tests {
         let (violations, report) = measure_against(&server, "60").await;
 
         let requests = server.requests();
-        assert!(requests.iter().all(|(_, _, refused)| !refused));
-        let q07_requests = requests.iter().filter(|(sql, _, _)| *sql == q07).count() as u64;
+        assert!(requests.iter().all(|r| !r.refused));
+        let q07_requests = requests.iter().filter(|r| r.sql == q07).count() as u64;
         assert!(q07_requests > 0);
 
         assert_eq!(report.concurrency_error, None);
