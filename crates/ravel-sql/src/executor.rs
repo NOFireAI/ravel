@@ -6608,6 +6608,16 @@ mod tests {
 
     /// Pin `sql` over an empty `samples` snapshot.
     async fn pin_samples_statement(executor: &SqlExecutor, sql: &str) -> PinnedQuery {
+        try_pin_samples_statement(executor, sql)
+            .await
+            .expect("the statement plans")
+    }
+
+    /// [`pin_samples_statement`], returning a refusal instead of panicking.
+    async fn try_pin_samples_statement(
+        executor: &SqlExecutor,
+        sql: &str,
+    ) -> Result<PinnedQuery, SqlError> {
         let snapshot = Snapshot {
             segments: Vec::new(),
             segments_pruned: 0,
@@ -6622,7 +6632,6 @@ mod tests {
                 &[],
             )
             .await
-            .expect("the statement plans")
     }
 
     /// The grouped subquery the `DISTINCT ON` spill-grant case reads: its
@@ -6631,35 +6640,35 @@ mod tests {
     const GROUPED_SAMPLES: &str =
         "(SELECT ts, series_id, count(*) AS c FROM samples GROUP BY ts, series_id) s";
 
-    /// A `DISTINCT ON` whose `ORDER BY` ties within an ON group pins with
-    /// spill disabled, so a spilled run cannot keep a different tied row than
-    /// an in-memory one; the same statement with every output column in its
-    /// `ORDER BY` is granted spill. Granted only one at a time, since the
-    /// first grant reserves the whole ceiling.
+    /// A `DISTINCT ON` whose `ORDER BY` ties within an ON group is refused
+    /// when it is pinned, leaving no scratch directory behind, so neither a
+    /// spilled nor an in-memory run can keep a tied row chosen by input order;
+    /// the same statement with every output column in its `ORDER BY` is
+    /// granted spill.
     #[tokio::test]
-    async fn a_distinct_on_with_tied_ordering_is_not_granted_spill() {
+    async fn a_distinct_on_with_tied_ordering_is_refused_and_a_total_one_spills() {
         let root = tempfile::tempdir().expect("spill root");
         let executor = spill_test_executor(root.path(), 1 << 30);
 
-        let tied = pin_samples_statement(
-            &executor,
-            &format!(
-                "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
-                 ORDER BY series_id, c DESC"
-            ),
-        )
-        .await;
-        assert!(has_distinct_on(tied.frame.logical_plan()));
+        let tied = format!(
+            "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
+             ORDER BY series_id, c DESC"
+        );
+        let refused = try_pin_samples_statement(&executor, &tied).await;
         assert!(
-            tied.scratch.is_none(),
-            "a DISTINCT ON whose order ties within a group must not be granted spill"
+            matches!(
+                refused,
+                Err(SqlError::Validation(
+                    ValidationError::DistinctOnOrderNotTotal
+                ))
+            ),
+            "a DISTINCT ON whose order ties within a group must be refused"
         );
         assert_eq!(
             std::fs::read_dir(root.path()).expect("readable").count(),
             0,
-            "no scratch directory is created for it"
+            "no scratch directory is left for it"
         );
-        drop(tied);
 
         let total = pin_samples_statement(
             &executor,
