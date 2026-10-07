@@ -170,7 +170,8 @@ struct Outcome {
     result: Result<Duration, EngineError>,
 }
 
-/// The first connection-level failure any task saw, on that task's clock.
+/// The connection-level failure recorded first, on its task's clock: among
+/// failures in several tasks at once, the one whose `OnceLock::set` won.
 /// Every task reads it before starting a statement.
 struct Stop {
     at: Duration,
