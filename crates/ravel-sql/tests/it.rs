@@ -28,6 +28,8 @@ mod bounded_topk_aggregate;
 mod ceiling_breach;
 #[path = "deadline.rs"]
 mod deadline;
+#[path = "distinct_on.rs"]
+mod distinct_on;
 #[path = "erasure_dedup_positions.rs"]
 mod erasure_dedup_positions;
 #[path = "expr_planner_surface.rs"]
