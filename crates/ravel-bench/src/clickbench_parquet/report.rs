@@ -381,10 +381,12 @@ pub struct ClickBenchParquetReport {
     /// finding to post with the report.
     pub registered_failures_answered: Vec<u32>,
     /// `None` when no concurrency phase ran (`--concurrency-seconds 0`) or
-    /// when it failed after it started.
+    /// when a task stopped abnormally. When the engine became unreachable it
+    /// holds the figures up to that point.
     pub concurrency: Option<ConcurrencyFigures>,
     /// Why the concurrency phase failed after it started (a task panicked
-    /// or stopped abnormally); `None` when it completed or did not run.
+    /// or stopped abnormally, or the engine became unreachable, which ends
+    /// the phase early); `None` when it ran its duration or did not run.
     pub concurrency_error: Option<String>,
 }
 
@@ -838,12 +840,15 @@ fn check_against(
         }
         // No error-ratio ceiling: one error outside `failures` already fails
         // the phase here, which is stricter than any ceiling over those
-        // statements (issue #2055).
+        // statements (issue #2055). A connection-level failure is not a
+        // statement's error: it ended the phase and is judged once, through
+        // `concurrency_error`.
         for statement in &concurrency.statements {
-            if statement.errors > 0 && !prereg.failures.contains(&statement.number) {
+            let errors = statement.statement_errors();
+            if errors > 0 && !prereg.failures.contains(&statement.number) {
                 violations.push(Violation::ConcurrencyUnregisteredError {
                     number: statement.number,
-                    errors: statement.errors,
+                    errors,
                 });
             }
         }
@@ -1015,7 +1020,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
 
     use super::*;
-    use crate::clickbench_parquet::concurrency::ConcurrencyStatement;
+    use crate::clickbench_parquet::concurrency::{ConcurrencyStatement, EngineUnreachable};
 
     const CHECKED_IN_PREREG: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1124,6 +1129,7 @@ mod tests {
                 elapsed_s: 600.0,
                 queries_completed: 600,
                 errors: 6,
+                unreachable: 0,
                 qps: 1.0,
                 error_ratio: 0.01,
                 statements: (1..=STATEMENT_COUNT as u32)
@@ -1131,12 +1137,14 @@ mod tests {
                         number,
                         completed: 14,
                         errors: u64::from(number == 33) * 6,
+                        unreachable: 0,
                         p50_s: Some(1.0),
                         p95_s: Some(2.0),
                         first_error: (number == 33).then(|| "budget".to_string()),
                     })
                     .collect(),
                 errored_statements: vec![33],
+                engine_unreachable: None,
             }),
             concurrency_error: None,
         }
@@ -1509,6 +1517,57 @@ mod tests {
             Violation::ConcurrencyPhaseFailed {
                 error: "task 3 panicked".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn an_unreachable_engine_is_one_violation_however_many_statements_it_failed() {
+        let mut report = clean_report();
+        let concurrency = report.concurrency.as_mut().expect("ran");
+        // Ten tasks in flight when the engine died, each on a different
+        // statement outside `failures`.
+        for statement in concurrency.statements.iter_mut().take(10) {
+            statement.errors += 1;
+            statement.unreachable = 1;
+        }
+        concurrency.errors += 10;
+        concurrency.unreachable = 10;
+        let unreachable = EngineUnreachable {
+            at_s: 210.0,
+            task: 3,
+            statement: 1,
+            error: "engine unreachable: POST /api/v1/sql: connection refused".to_string(),
+        };
+        concurrency.engine_unreachable = Some(unreachable.clone());
+        report.concurrency_error = Some(unreachable.to_string());
+        assert_eq!(
+            only_violation(&report),
+            Violation::ConcurrencyPhaseFailed {
+                error: "the engine became unreachable 210 s into the phase; task 3 saw it \
+                        first, on q01: engine unreachable: POST /api/v1/sql: connection refused"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_statement_error_beside_connection_failures_is_still_named() {
+        let mut report = clean_report();
+        let concurrency = report.concurrency.as_mut().expect("ran");
+        let q8 = concurrency
+            .statements
+            .iter_mut()
+            .find(|s| s.number == 8)
+            .expect("q8 present");
+        q8.errors = 3;
+        q8.unreachable = 1;
+        let violations = check(&report, &prereg()).expect_err("q8 errored twice");
+        assert_eq!(
+            violations,
+            vec![Violation::ConcurrencyUnregisteredError {
+                number: 8,
+                errors: 2
+            }]
         );
     }
 

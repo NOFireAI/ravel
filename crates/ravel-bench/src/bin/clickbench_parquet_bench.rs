@@ -234,9 +234,9 @@ async fn run(args: Args) -> Result<Vec<Violation>, String> {
 /// writes the report and judges it. An error before the first timed
 /// statement is a setup error; past it, the report is written before it is
 /// judged, and the D7 violations are returned. A concurrency phase that
-/// fails once started is recorded in the report's `concurrency_error`, not
-/// returned as an error. `phase_engine` makes one engine per concurrency
-/// task.
+/// fails once started, or that the engine becoming unreachable ended early,
+/// is recorded in the report's `concurrency_error`, not returned as an
+/// error. `phase_engine` makes one engine per concurrency task.
 async fn measure(
     args: &Args,
     setup: Setup,
@@ -346,7 +346,11 @@ async fn measure(
                     figures.error_ratio,
                     report::RLOG_ERROR_RATIO
                 );
-                (Some(figures), None)
+                let unreachable = figures.engine_unreachable.as_ref().map(|u| {
+                    eprintln!("concurrency: {u}");
+                    u.to_string()
+                });
+                (Some(figures), unreachable)
             }
             Err(error) => {
                 eprintln!("concurrency: phase failed: {error}");
