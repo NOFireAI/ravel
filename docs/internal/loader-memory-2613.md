@@ -681,8 +681,9 @@ allows. The loader attaches no `StrColumnDict`, so `dyn_col_dicts` stays
 empty on this path; the writer's dictionary path is unchanged.
 `partition_columnar` deals each typed payload by row into per-part vectors
 reserved from that part's present count and value bytes. A string, byte,
-body or severity text value that would take its column past the 4 GiB its
-`u32` offsets address in one batch is refused (`VarBytes::try_push`,
+body or severity text value that would take its column past the
+`u32::MAX` bytes its `u32` offsets address (one byte short of 4 GiB) in one
+batch is refused (`VarBytes::try_push`,
 `LimitExceeded`), and the loader reports it naming the column and a
 smaller `--batch-rows`.
 
@@ -789,6 +790,130 @@ batch about 6x on this corpus.
 - **No OOM at B=1,000,000: met** on this 16 GB host, with no swap used by
   the loader, but the host's MemAvailable fell to 925 MB at +196 s.
 
+## Wave 3 (#2626): one byte budget, object size by bytes
+
+`--load-memory-bytes` is the loader's byte budget (ADR-2614 decisions 5
+and 6). Each batch is charged from before it is built until the flush that
+consumes it returns, at `ColumnarLogBatch::heap_bytes` (the sum of its
+buffers' capacities) once built: the charge is carried into
+`LogRouter::write_columnar_charged`, cloned into every shard slice's
+message, held by the shard buffers and the flush tasks, and released when
+the last `run_flush` holding any of the batch's rows returns, just after it
+answers the Strict waiters, on success and on failure. The pre-build
+charge is the previous batch's measured bytes per row times the rows (zero
+for the first batch), corrected to the measured size once built, so the
+first batch and any batch wider than its estimate are built partly
+uncharged. Unset,
+the budget is MemTotal (capped by a cgroup memory limit, read by
+`ravel_maintain::detect_host_memory_total_bytes`) less a floor of three
+uncalibrated constants taken from the profiles above: 128 MiB of process
+baseline, 32 MiB per read cursor and 72 MiB per concurrent flush
+(`--shards` x `--max-inflight-flushes`).
+
+### Pre-registered expectations
+
+Stated in the #2626 task before the runs: (i) stock defaults at B=500,000,
+report the derived budget and peak RSS; (ii) `--load-memory-bytes
+6000000000` at B=500,000, peak RSS under budget plus floor plus 15%, and
+rows read by +358 s within 20% of (i); (iii) `--batch-rows 50000
+--target-bytes 25000000 --load-memory-bytes 6000000000`, peak RSS, rows by
++358 s and stored object sizes, which should be near 25 MB. Also report the
+live heap less the memory store's object buffers, the figure the budget
+bounds.
+
+### Measurement
+
+Host: `uname -m` x86_64, `nproc` 16, MemTotal 32,132,612 kB, no swap (wave
+1's host class, not wave 2's). `VmSwap` of the loader was 0 in every
+sample. Binary: 7fef75e built with `CARGO_PROFILE_RELEASE_DEBUG=true cargo
+build --release -p ravel-cli --features profiling`. Command as in waves 1
+and 2: memory store, `--shards 4 --read-cursors 16 --pipeline-depth 4`,
+`--target-bytes 1` unless stated, `timeout -s INT 360`, RSS and `rchar`
+every 2 s, `prof:true,lg_prof_sample:20,lg_prof_interval:33`. One run each.
+Site figures are each function's `cum` in `jeprof --text --inuse_space`,
+medians over the dumps from +60 s. All three runs ended at the SIGINT
+timeout (exit 124), so none printed the load summary and the peak charge
+was not read from them; the binary test in `tests/load.rs` reads it on a
+completed load.
+
+At these flags the floor is 128 MiB + 16 x 32 MiB + 4 x 4 x 72 MiB =
+1,879,048,192 bytes. Run (i)'s derived budget is computed from that and
+the host, not read from the run: 32,132,612 kB x 1024 - 1,879,048,192 =
+31,024,746,496 bytes (no cgroup memory limit was set).
+
+| | (i) defaults, B=500,000 | (ii) budget 6e9, B=500,000 | (iii) B=50,000, target 25e6, budget 6e9 |
+|---|---|---|---|
+| budget | 31,024,746,496 (derived) | 6,000,000,000 | 6,000,000,000 |
+| peak RSS | 11.85 GB (11,851,984 kB, +329 s) | 12.02 GB (12,023,664 kB, +349 s) | 10.74 GB (10,743,956 kB, +359 s) |
+| lowest host MemAvailable | 15,785,504 kB | 16,603,388 kB | 17,557,908 kB |
+| Parquet bytes read by +60 / +180 / +358 s | 1,826 / 4,841 / 8,812 MB | 1,748 / 4,841 / 8,812 MB | 1,590 / 3,872 / 7,388 MB |
+| rows read by +358 s (`rchar` / 147.8) | 59.6 million | 59.6 million | 50.0 million |
+| `build_columnar_batch`, median / highest | 631 / 1,839 MB | 635 / 1,317 MB | 115 / 224 MB |
+| `partition_columnar`, median / highest | 1,458 / 2,214 MB | 1,438 / 2,104 MB | 168 / 263 MB |
+| `push_section`, median / last dump | 6,311 / 10,963 MB | 6,280 / 10,923 MB | 5,369 / 8,908 MB |
+| total live, median / highest | 10,139 / 15,676 MB | 10,148 / 15,567 MB | 6,734 / 10,544 MB |
+| total live less `push_section`, median / highest | 3,982 / 5,173 MB | 3,991 / 5,430 MB | 1,514 / 2,136 MB |
+| heap dumps (from +60 s) | 284 (241) | 283 (240) | 264 (216) |
+
+The writer's own working set (wave 2's `build_object_columnar` less
+`push_section` row) is not split out: `build_object_columnar` does not
+appear as a frame in this binary's profiles.
+
+Object sizes for (iii) come from a second run of the same flags with a
+scratch build that printed each data object's length before its PUT (one
+`eprintln!` in `log_shard.rs`, reverted, never committed). That run read
+7,439 MB by +358 s (50.3 million rows) and peaked at 10,829,952 kB,
+within 1% of (iii). It wrote 2,651 objects:
+
+| min | p10 | median | p90 | max | mean | total |
+|---|---|---|---|---|---|---|
+| 14,520 | 1,124,879 | 1,673,156 | 2,407,479 | 3,458,731 | 1,733,022 | 4,594,241,542 bytes |
+
+### Against the expectations
+
+- **(i):** derived budget 31.0 GB, peak RSS 11.85 GB. On this 32 GB host
+  the derived budget does not bind at B=500,000: (i) and (ii) read the same
+  bytes at +180 and +358 s.
+- **(ii) peak RSS under budget + floor + 15%: missed.** The bound is
+  (6,000,000,000 + 1,879,048,192) x 1.15 = 9,060,905,421 bytes (8,848,540
+  kB); the peak was 12,023,664 kB. The memory store keeps every object in
+  the measured process and the budget does not count them: `push_section`
+  held 10,923 MB at the last dump. The live heap less `push_section`, which
+  is what the budget and the floor cover, had a median of 3,991 MB and a
+  highest dump of 5,430 MB, under the 6,000,000,000-byte budget alone.
+  This is sampled heap, not RSS, and as in waves 1 and 2 the highest total
+  live (15,567 MB) exceeds the peak RSS sample, so it is evidence about
+  where the memory is, not a proof of the bound.
+- **(ii) gives no evidence that the budget bound.** (i) and (ii) read the
+  same bytes at +180 and +358 s, the heap outside the memory store stayed
+  under 6 GB, and the peak charge and the decoder's waits were not read
+  from either run. Run (ii) is consistent with a 6 GB budget that never
+  filled. The tests in `tests/load.rs` are what show a budget binding: a
+  held object PUT leaves the decoder waiting on a full budget, and the
+  summary counts the waits.
+- **(ii) rows within 20% of (i): met.** 59.6 million in both.
+- **(iii) objects near 25 MB: missed.** The median stored object is
+  1.67 MB and the largest 3.46 MB, 7 to 15 times below the target.
+  `--target-bytes` compares the shard buffer's estimated UNCOMPRESSED
+  content (`est_columnar_object_bytes` in `log_shard.rs`, checked by
+  `size_trigger_fires` in `config.rs`) with the target, and the stored
+  object is the zstd-compressed RLOG. The objects held about 19,000 rows
+  on average (50.3 million rows read over 2,651 objects, an overestimate
+  since rows in flight at the stop are counted), about 1.5 of the 12,500
+  rows a 50,000-row batch puts on each of 4 shards. A second cap applies
+  beside the estimate: each Strict write waits for the flush of its own
+  batch, so one object can merge at most `--pipeline-depth` batches'
+  slices (4 here). The per-row estimate itself was not measured here, so
+  which of the target, the age trigger or that cap closed each object is
+  not split out. If stored size scales with the target, about 25 MB stored
+  objects on this corpus need a target about 15 times larger and a
+  `--pipeline-depth` at least the batches one object takes; that was not
+  run, and the wave 4 measurement (#2627) settles the recipe.
+- **(iii) peak RSS and rows:** 10.74 GB, 50.0 million rows by +358 s, 16%
+  fewer than (i). The live heap less `push_section` fell from a 3,991 MB
+  median at B=500,000 to 1,514 MB, because a 50,000-row batch is a tenth
+  the size and the queue and window still count batches.
+
 ## Follow-ups, in order, with the expected saving each
 
 Per batch row at `--read-cursors 16 --shards 4` on this corpus; the
@@ -815,7 +940,12 @@ multiplicity section above gives the terms.
    the decoder on a `--max-inflight-bytes`-style budget instead of counting
    batches. Saves nothing at the measured steady state but caps the 10 to
    15.5 GB swing at a number the operator chose; this is what makes a 16 GB
-   machine refuse rather than swap.
+   machine refuse rather than swap. Landed in wave 3 (#2626, above) as
+   `--load-memory-bytes`, charging an estimate before the build and the
+   measured `heap_bytes` after it rather than `est_columnar_bytes`, and
+   holding the charge through the shard buffers and the flush. With the
+   memory store, peak RSS at a 6 GB budget was still 12.02 GB, because the
+   store's objects are outside the budget.
 4. **A typed columnar batch in ravel-logseg** (API, not format): Str columns
    as offsets plus bytes or dictionary ids, I64/F64/Bool as plain vectors.
    Takes the `ColumnarLogBatch` from about 4.5 KB per row to about 0.5 KB
@@ -834,4 +964,9 @@ multiplicity section above gives the terms.
    footprint> --max-flush-delay <fill time>` as the way to 25 MB objects on
    a small machine, with the memory formula from this file; the mechanism
    already exists (`BufContent::Columnar(Vec<_>)` merges batches into one
-   object) and needs no code.
+   object) and needs no code. Wave 3 (#2626, above) added a stall flusher
+   so a target the budget cannot hold yields smaller objects instead of a
+   stalled load, and first documented `--batch-rows 50000 --target-bytes
+   25000000`. That target is estimated uncompressed bytes: on this corpus
+   it stored objects of 1.1 to 2.4 MB (p10 to p90), not 25 MB, so the
+   recipe was withdrawn and is pending the wave 4 measurement (#2627).

@@ -550,11 +550,12 @@ async fn decode_object_hashes(
         None,
         None,
         queue_depth,
+        None,
     );
     let mut hashes = Vec::new();
     while let Some(p) = rx.recv().await {
         match p {
-            Prefetched::Batch(Built::Columnar(b)) => {
+            Prefetched::Batch(Built::Columnar(b, _)) => {
                 if b.num_rows > 0 {
                     hashes.push(*blake3::hash(&columnar_object(*b)).as_bytes());
                 }
@@ -2239,6 +2240,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         Some(on_batch_queued),
         RlogZstdLevel::DEFAULT,
         UNREACHED_REFLUSH_PERIOD,
+        None,
     );
 
     let driver = async {
@@ -2420,6 +2422,7 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         DEFAULT_TARGET_BYTES,
         None,
         RlogZstdLevel::DEFAULT,
+        None,
         NOW_NS,
         &mut sink,
     )
@@ -2453,6 +2456,7 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         DEFAULT_TARGET_BYTES,
         None,
         RlogZstdLevel::DEFAULT,
+        None,
         NOW_NS,
         &mut sink,
     )
@@ -2500,6 +2504,7 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         DEFAULT_TARGET_BYTES,
         None,
         RlogZstdLevel::DEFAULT,
+        None,
         NOW_NS,
         &mut sink,
     )
@@ -3622,6 +3627,7 @@ mod load_skip_rows {
             DEFAULT_TARGET_BYTES,
             None,
             RlogZstdLevel::DEFAULT,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -3703,6 +3709,7 @@ mod load_skip_rows {
             DEFAULT_TARGET_BYTES,
             None,
             RlogZstdLevel::DEFAULT,
+            None,
             NOW_NS,
             &mut sink,
         )

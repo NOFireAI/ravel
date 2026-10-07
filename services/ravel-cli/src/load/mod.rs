@@ -39,9 +39,10 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
-    Clock, FlushTriggerMix, IngestConfig, IngestRouter, LogIngestMetricsSnapshot, LogIngestRouter,
-    LogWriteError, LogWriteReceipt, RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter,
-    SpanWriteError, SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
+    Clock, FlushTriggerMix, IngestByteBudget, IngestByteCharge, IngestConfig, IngestRouter,
+    LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt, RlogZstdLevel,
+    STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError, SpanWriteReceipt, SystemClock,
+    WriteError, WriteMode, WriteReceipt,
 };
 use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
@@ -90,8 +91,8 @@ pub const DEFAULT_BATCH_ROWS: usize = 10_000;
 /// buffer before it flushes, which defers those earlier batches' acks (see
 /// [`load_instrumented`]).
 ///
-/// The target is compared against the shard buffer's *estimated in-memory
-/// footprint* (`est_bytes`), not against encoded RLOG bytes, and the comparison
+/// The target is compared against the shard buffer's estimated *uncompressed
+/// object content*, not against encoded RLOG bytes, and the comparison
 /// runs once per write after a whole batch's slice has merged, so a target at or
 /// below one batch's per-shard slice produces exactly the layout `1` does. See
 /// [`target_bytes_no_effect_warning`] for the arithmetic and for what the loader
@@ -249,6 +250,8 @@ mod cli;
 pub use cli::*;
 mod logs;
 pub use logs::*;
+mod memory;
+pub use memory::*;
 mod input;
 pub use input::*;
 mod columns;
@@ -333,6 +336,27 @@ pub struct LoadReport {
     /// the reachability signal a caller of the real entry point can observe to
     /// prove the columnar path ran, not merely that its builder compiles.
     pub columnar_batches_built: u64,
+    /// The memory budget the columnar logs path ran under (issue #2626).
+    /// Zeroed on the metrics, spans and row paths, which charge nothing.
+    pub load_memory: LoadMemory,
+    /// The highest reading of the load's memory budget gauge: the most bytes
+    /// CHARGED at once, not the bytes the pipeline held. A batch is charged an
+    /// estimate before its build (0 for the first) and its measured size only
+    /// after, so a batch being built can hold more than it is charged. The
+    /// peak can exceed `load_memory.budget_bytes`: a charge or a growing
+    /// resize larger than the room left is admitted once nothing else is held,
+    /// which a derived budget below one batch does for every batch.
+    pub load_memory_peak_bytes: u64,
+    /// The largest measured heap bytes of one built batch the load charged.
+    pub load_memory_max_batch_bytes: u64,
+    /// How many times the decoder found no room in the budget and waited,
+    /// counted since the load's budget was created. 0 when the budget never
+    /// bound.
+    pub load_memory_waits: u64,
+    /// Set at most once, the first time a batch larger than a derived budget
+    /// is admitted on its own (issue #2626 decision A). `None` under an
+    /// explicit `--load-memory-bytes`, which refuses such a batch instead.
+    pub load_memory_warning: Option<String>,
     /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
     /// snapshotted once the load finished. Present only under the
     /// `stage-timing` feature; with it off this field does not exist, so a

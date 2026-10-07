@@ -108,6 +108,7 @@ async fn the_entry_point_emits_the_overflow_warning() {
         DEFAULT_TARGET_BYTES,
         None,
         RlogZstdLevel::DEFAULT,
+        None,
         NOW_NS,
         &mut sink,
     )
@@ -221,6 +222,7 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
                 target_bytes,
                 None,
                 RlogZstdLevel::DEFAULT,
+                None,
                 NOW_NS,
                 &mut sink,
             )
@@ -236,7 +238,8 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
         "the ineffective target is named with its value: {emitted}"
     );
     assert!(
-        emitted.contains("ESTIMATED in-memory footprint") && emitted.contains("about 4 rows here"),
+        emitted.contains("estimated UNCOMPRESSED object content")
+            && emitted.contains("about 4 rows here"),
         "and the message states the unit and the slice it had to clear: {emitted}"
     );
 

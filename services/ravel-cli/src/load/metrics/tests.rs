@@ -802,6 +802,7 @@ mod metrics_pipeline_review {
             DEFAULT_TARGET_BYTES,
             None,
             RlogZstdLevel::DEFAULT,
+            None,
             NOW_NS,
             &mut sink,
         )

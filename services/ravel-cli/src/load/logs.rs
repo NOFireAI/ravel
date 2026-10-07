@@ -74,6 +74,51 @@ pub async fn load(
     .await
 }
 
+/// [`load`] with the object-size levers and the memory budget given: the
+/// flush target (`--target-bytes`), the age trigger (`--max-flush-delay`,
+/// `None` = the default) and the memory budget's inputs (see
+/// [`LoadMemory::resolve`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn load_with_memory(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    load_memory: LoadMemoryOptions,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<LoadReport, LoadError> {
+    load_instrumented_at(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        0,
+        read_cursors,
+        pipeline_depth,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        target_bytes,
+        max_flush_delay,
+        now_ns,
+        clock,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        Some(load_memory),
+    )
+    .await
+}
+
 /// A test-only hook invoked at the start of each batch's decode/build. It lets a
 /// test observe that batch N+1's decode/build begins while batch N's
 /// `router.write` is still in flight (issue #541), which a purely
@@ -152,13 +197,16 @@ pub(super) async fn load_instrumented(
         on_build_start,
         on_batch_queued,
         RlogZstdLevel::DEFAULT,
+        None,
     )
     .await
 }
 
 /// [`load_instrumented`] with the `--zstd-level` lever: `zstd_level` becomes
 /// the router's [`IngestConfig::rlog_zstd_level`], the level every page and
-/// section of each object the load writes compresses at.
+/// section of each object the load writes compresses at. `load_memory` is the
+/// memory budget's inputs, resolved once the read-cursor count is known;
+/// `None` derives the budget from this host's memory.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_instrumented_at(
     store: Arc<dyn ObjectStoreBackend>,
@@ -180,6 +228,7 @@ pub(super) async fn load_instrumented_at(
     on_build_start: Option<BuildStartHook>,
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
+    load_memory: Option<LoadMemoryOptions>,
 ) -> Result<LoadReport, LoadError> {
     load_with_drain_reflush_period(
         store,
@@ -202,6 +251,7 @@ pub(super) async fn load_instrumented_at(
         on_batch_queued,
         zstd_level,
         DRAIN_REFLUSH_PERIOD,
+        load_memory,
     )
     .await
 }
@@ -235,6 +285,7 @@ pub(super) async fn load_with_drain_reflush_period(
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
     drain_reflush_period: Duration,
+    load_memory: Option<LoadMemoryOptions>,
 ) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
@@ -285,7 +336,7 @@ pub(super) async fn load_with_drain_reflush_period(
     }
     // Same shape as the guards above: `--target-bytes` is the operator-facing
     // flush-target lever (issue #801). A target of 0 is not a smaller target
-    // than 1, it is the same one (`est_bytes >= 0` holds for an empty buffer),
+    // than 1, it is the same one (an estimate `>= 0` holds for an empty buffer),
     // so it is rejected rather than silently behaving as 1.
     if target_bytes == 0 {
         return Err(LoadError::Setup(
@@ -348,9 +399,9 @@ pub(super) async fn load_with_drain_reflush_period(
     // in-flight window. `None` here leaves the age trigger at its default, so an
     // unset flag changes nothing.
     //
-    // "Larger" is measured against the shard's `est_bytes` footprint estimate,
-    // not the encoded object, and tested once per write after a whole batch's
-    // slice has merged: below one slice's footprint the target is unreachable
+    // "Larger" is measured against the shard's uncompressed object-content
+    // estimate, not the encoded object, and tested once per write after a whole
+    // batch's slice has merged: below one slice's content the target is unreachable
     // as a lever, whatever byte figure it names
     // (`target_bytes_no_effect_warning`).
     //
@@ -399,8 +450,35 @@ pub(super) async fn load_with_drain_reflush_period(
         reader_batch_rows(batch_rows, cursor_count),
     )?;
 
+    // The memory budget (issue #2626) charges every built columnar batch from
+    // before its build until the last flush carrying its rows finishes. The
+    // row path is the differential reference and charges nothing. The floor
+    // is sized with the resolved cursor count, not the flag.
+    let memory_options = load_memory
+        .unwrap_or_else(|| LoadMemoryOptions::new(LoadMemoryRequest::from_flag_on_host(None)));
+    let load_memory = LoadMemory::resolve(
+        memory_options.request,
+        cursor_count,
+        u64::from(shards) * u64::from(max_inflight_flushes),
+    )
+    .map_err(LoadError::Setup)?;
+    let charger = match load_memory {
+        Some(load_memory) if path == LoadPath::Columnar => {
+            Some(BatchCharger::new(load_memory.budget()))
+        }
+        _ => None,
+    };
+    let budget = charger.as_ref().map(|c| Arc::clone(&c.budget));
+    if let (Some(budget), Some(on_budget)) = (&budget, &memory_options.on_budget) {
+        on_budget(budget);
+    }
+    let load_memory = load_memory.unwrap_or_default();
+
     let started = Instant::now();
     let mut report = LoadReport::default();
+    if budget.is_some() {
+        report.load_memory = load_memory;
+    }
     // `--skip-rows` is a positional offset against the file's total row count,
     // known entirely from the footer metadata already parsed above -- no need
     // to wait for the decode pipeline to find out how many rows it dropped.
@@ -460,7 +538,24 @@ pub(super) async fn load_with_drain_reflush_period(
         on_build_start,
         on_batch_queued,
         decode_queue_batches,
+        charger,
     );
+
+    // Above the default target a shard buffer holds charged batches until it
+    // reaches the target or ages out. If the decoder is waiting for memory and
+    // the held bytes do not drop for a whole period, nothing new can reach
+    // those buffers, so only a flush can make room: flush them rather than leave the
+    // load parked on the age trigger, or forever on a raised one. At the
+    // default target every write flushes itself and this never runs, so the
+    // default layout is unchanged.
+    let _stall_flusher = match &budget {
+        Some(budget) if target_bytes > DEFAULT_TARGET_BYTES => Some(spawn_stall_flusher(
+            Arc::clone(&router),
+            Arc::clone(budget),
+            memory_options.stall_flush_period,
+        )),
+        _ => None,
+    };
 
     // `true` once the decoder signals clean exhaustion (`Prefetched::Done`). If
     // the channel instead closes without a `Done` (the decoder task panicked),
@@ -542,7 +637,44 @@ pub(super) async fn load_with_drain_reflush_period(
                         .await
                 })
             }
-            Built::Columnar(batch) => {
+            Built::Columnar(batch, charge) => {
+                // A batch larger than the whole budget is admitted only alone,
+                // so it holds the budget past its limit. An explicit budget
+                // refuses it (the first batch before anything is written); a
+                // derived one runs one batch at a time and says so once.
+                if let Some(charge) = &charge
+                    && charge.bytes() > load_memory.budget_bytes
+                    && !load_memory.is_explicit()
+                {
+                    if report.load_memory_warning.is_none() {
+                        report.load_memory_warning =
+                            Some(load_memory.one_batch_warning(charge.bytes(), batch.num_rows));
+                    }
+                } else if let Some(charge) = &charge
+                    && charge.bytes() > load_memory.budget_bytes
+                {
+                    let reason = load_memory.batch_too_large(charge.bytes(), batch.num_rows);
+                    if report.columnar_batches_built == 0 {
+                        return Err(LoadError::Setup(reason));
+                    }
+                    drain_inflight(
+                        &mut inflight,
+                        &mut report,
+                        &mut shards_seen,
+                        &mut data_batches_flushed,
+                        shards,
+                    )
+                    .await?;
+                    return Err(LoadError::BatchFailed {
+                        reason,
+                        durable: report.tokens.clone(),
+                        resume: ResumeFigures::from_report(&report),
+                    });
+                }
+                if let Some(charge) = &charge {
+                    report.load_memory_max_batch_bytes =
+                        report.load_memory_max_batch_bytes.max(charge.bytes());
+                }
                 // Reachability signal (ADR-0109): count each batch actually
                 // driven through `write_columnar`, so a caller of the real entry
                 // point can prove the columnar path ran.
@@ -550,9 +682,24 @@ pub(super) async fn load_with_drain_reflush_period(
                 let router = Arc::clone(&router);
                 let tenant = tenant_id.clone();
                 tokio::spawn(async move {
-                    router
-                        .write_columnar(tenant, *batch, WriteMode::Strict, ack_deadline)
-                        .await
+                    match charge {
+                        Some(charge) => {
+                            router
+                                .write_columnar_charged(
+                                    tenant,
+                                    *batch,
+                                    WriteMode::Strict,
+                                    ack_deadline,
+                                    charge,
+                                )
+                                .await
+                        }
+                        None => {
+                            router
+                                .write_columnar(tenant, *batch, WriteMode::Strict, ack_deadline)
+                                .await
+                        }
+                    }
                 })
             }
         };
@@ -686,8 +833,90 @@ pub(super) async fn load_with_drain_reflush_period(
     {
         report.stage_timings = router.stage_timings().snapshot();
     }
+    report.load_memory_peak_bytes = budget.as_ref().map_or(0, |b| b.peak_bytes());
+    report.load_memory_waits = budget.as_ref().map_or(0, |b| b.waits_total());
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// Aborts its task when dropped, so every return path of the loader stops it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Flushes every shard buffer when two consecutive samples `period` apart
+/// both find the decoder waiting on `budget` and the gauge no lower than the
+/// first sample read. The gauge is net: a refund and a new admission between
+/// the samples can cancel out, and a refund can come from a flush already
+/// running rather than a buffer, so this can flush when room was on its way.
+/// That costs an early flush and a smaller object, never a hang.
+fn spawn_stall_flusher(
+    router: Arc<LogIngestRouter>,
+    budget: Arc<IngestByteBudget>,
+    period: Duration,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        let mut stalled_at: Option<u64> = None;
+        loop {
+            tokio::time::sleep(period).await;
+            if budget.waiting() == 0 {
+                stalled_at = None;
+                continue;
+            }
+            let held = budget.in_flight_bytes();
+            if stalled_at.is_some_and(|before| held >= before) {
+                router.flush_all().await;
+                stalled_at = None;
+            } else {
+                stalled_at = Some(held);
+            }
+        }
+    }))
+}
+
+/// Charges each built columnar batch to the load's memory budget (issue
+/// #2626): an estimate before the build, from the previous batch's measured
+/// bytes per row (zero for the first batch, which nothing else is held
+/// beside, so its correction is admitted however large it is), corrected to
+/// the built batch's measured
+/// [`ColumnarLogBatch::heap_bytes`] once it exists. Both steps wait for room
+/// and never fail.
+pub(super) struct BatchCharger {
+    budget: Arc<IngestByteBudget>,
+    bytes_per_row: Option<u64>,
+}
+
+impl BatchCharger {
+    pub(super) fn new(budget: Arc<IngestByteBudget>) -> Self {
+        Self {
+            budget,
+            bytes_per_row: None,
+        }
+    }
+
+    fn charge_before_build(&self, rows: usize) -> IngestByteCharge {
+        let estimate = self
+            .bytes_per_row
+            .map_or(0, |per_row| per_row.saturating_mul(rows as u64));
+        self.budget.charge_waiting(estimate)
+    }
+
+    fn settle(
+        &mut self,
+        mut charge: IngestByteCharge,
+        batch: &ColumnarLogBatch,
+    ) -> IngestByteCharge {
+        let bytes = batch.heap_bytes() as u64;
+        charge.resize_waiting(bytes);
+        if batch.num_rows > 0 {
+            self.bytes_per_row = Some(bytes.div_ceil(batch.num_rows as u64));
+        }
+        charge
+    }
 }
 
 /// Spawn the decode/build stage (issue #680) as one blocking task that owns the
@@ -712,6 +941,7 @@ fn spawn_decode_pipeline(
     on_build_start: Option<BuildStartHook>,
     on_batch_queued: Option<BuildStartHook>,
     queue_depth: usize,
+    mut charger: Option<BatchCharger>,
 ) -> (
     tokio::sync::mpsc::Receiver<Prefetched>,
     tokio::task::JoinHandle<()>,
@@ -735,6 +965,7 @@ fn spawn_decode_pipeline(
                     now_ns,
                     batch_rows,
                     on_build_start.as_ref(),
+                    charger.as_mut(),
                 ),
             };
             state = next_state;
@@ -924,10 +1155,11 @@ enum Prefetched {
 
 /// The built form of one prefetched batch, selected by [`LoadPath`]. The row
 /// form is kept as the differential reference (ADR-0109 decision 7); `load`
-/// drives the columnar form through `write_columnar`.
+/// drives the columnar form through `write_columnar`. A columnar batch carries
+/// its memory-budget charge (issue #2626) when the load has a budget.
 enum Built {
     Row(Vec<NormalizedLogRecord>),
-    Columnar(Box<ColumnarLogBatch>),
+    Columnar(Box<ColumnarLogBatch>, Option<IngestByteCharge>),
 }
 
 impl Built {
@@ -935,7 +1167,7 @@ impl Built {
     fn num_rows(&self) -> usize {
         match self {
             Built::Row(records) => records.len(),
-            Built::Columnar(batch) => batch.num_rows,
+            Built::Columnar(batch, _) => batch.num_rows,
         }
     }
 }
@@ -1234,7 +1466,10 @@ fn decode_and_build_stride(
 /// Assemble one batch's spans and build a [`ColumnarLogBatch`] directly, column
 /// by column, without materializing a per-row struct (ADR-0109 decision 1, the
 /// path [`load`] drives). Byte-identical output to [`decode_and_build_stride`]
-/// on the same spans is the acceptance anchor (decision 7).
+/// on the same spans is the acceptance anchor (decision 7). With a `charger`
+/// the batch is charged after its spans are collected and before it is built,
+/// so the decoder waits there, holding only the spans, while the budget is
+/// full.
 fn decode_and_build_stride_columnar(
     mut state: StrideCursors,
     mapping: Arc<Mapping>,
@@ -1242,6 +1477,7 @@ fn decode_and_build_stride_columnar(
     now_ns: i64,
     batch_rows: usize,
     on_build_start: Option<&BuildStartHook>,
+    charger: Option<&mut BatchCharger>,
 ) -> (StrideCursors, Prefetched) {
     let spans = match collect_spans(&mut state, batch_rows, on_build_start) {
         SpanOutcome::Done => return (state, Prefetched::Done),
@@ -1249,8 +1485,19 @@ fn decode_and_build_stride_columnar(
         SpanOutcome::Spans(spans) => spans,
     };
 
+    let rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
+    let charge = charger.as_deref().map(|c| c.charge_before_build(rows));
     match build_columnar_batch(&spans, &mapping, &limits, now_ns) {
-        Ok(batch) => (state, Prefetched::Batch(Built::Columnar(Box::new(batch)))),
+        Ok(batch) => {
+            let charge = match (charger, charge) {
+                (Some(charger), Some(charge)) => Some(charger.settle(charge, &batch)),
+                _ => None,
+            };
+            (
+                state,
+                Prefetched::Batch(Built::Columnar(Box::new(batch), charge)),
+            )
+        }
         Err(ColBuildError::Batch(reason)) => (state, Prefetched::BatchFailed { reason }),
         Err(ColBuildError::Row { row, reason }) => (state, Prefetched::RowRejected { row, reason }),
     }

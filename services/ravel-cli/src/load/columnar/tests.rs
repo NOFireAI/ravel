@@ -995,12 +995,9 @@ fn assert_same_batch(
     assert_eq!(got, want, "the whole batch");
 }
 
-/// A fixed 48-column case (mixed types, dictionary and plain strings, key
-/// collisions, 20% nulls) that runs on every test run, independent of the
-/// proptest budget below.
 /// A dynamic cell that would take its column past the byte limit is a load
 /// error naming the column and `--batch-rows`, and is not stored. The limit is
-/// lowered from 4 GiB to 4 bytes so the test does not hold 4 GiB.
+/// lowered from `u32::MAX` bytes to 4 bytes so the test does not hold 4 GiB.
 #[test]
 fn a_dynamic_cell_past_the_column_byte_limit_is_a_load_error_naming_the_column() {
     use ravel_logseg::{BytesCells, VarBytes};
@@ -1028,6 +1025,9 @@ fn a_dynamic_cell_past_the_column_byte_limit_is_a_load_error_naming_the_column()
     assert_eq!(cells.len(), 0, "the refused cell is not stored");
 }
 
+/// A fixed 48-column case (mixed types, dictionary and plain strings, key
+/// collisions, 20% nulls) that runs on every test run, independent of the
+/// proptest budget below.
 #[test]
 fn slot_table_build_matches_map_build_48_columns() {
     assert_same_batch(1_000, 3, 48, 20, 20, 0x5EED_0000_0000_0001);

@@ -18,7 +18,9 @@ use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
+use crate::budget::{
+    BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge,
+};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
@@ -557,18 +559,61 @@ impl LogIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<LogWriteReceipt, LogWriteError> {
-        self.write_columnar_partitioned(tenant, batch, mode, ack_deadline, partition_columnar)
+        self.write_columnar_partitioned(tenant, batch, mode, ack_deadline, None, partition_columnar)
             .await
+    }
+
+    /// [`Self::write_columnar`] for a caller that already holds a charge for
+    /// this batch (ADR-2614 decision 5): the bulk loader charges its own
+    /// memory budget the batch's measured [`ColumnarLogBatch::heap_bytes`]
+    /// before it builds the batch, and this carries that charge to the shard
+    /// buffers in place of a fresh ADR-0069 charge, so the batch is charged
+    /// once and never refused for budget here.
+    ///
+    /// The charge is held exactly as a fresh one would be: cloned into every
+    /// shard message, held by each shard buffer, moved into the flush task
+    /// (including one queued behind the flush permit), and dropped when the
+    /// last flush holding any of these rows completes or fails. The charge is
+    /// the only thing that differs from [`Self::write_columnar`]: the shard
+    /// buffers' flush-trigger and queued-flush-cap accounting count the batch
+    /// at `est_columnar_bytes` exactly as that path does, so a charged write
+    /// lays out the same objects as an uncharged one.
+    ///
+    /// When the call returns relative to the release: a Strict ack is sent
+    /// from the flush task after the object and commit record are published,
+    /// and the charge drops when that task returns, just after. A Buffered
+    /// write, or a Strict one that hit `ack_deadline`, returns before its
+    /// flush; the charge is still held until that flush finishes.
+    pub async fn write_columnar_charged(
+        &self,
+        tenant: ravel_types::TenantId,
+        batch: ColumnarLogBatch,
+        mode: WriteMode,
+        ack_deadline: Duration,
+        charge: IngestByteCharge,
+    ) -> Result<LogWriteReceipt, LogWriteError> {
+        self.write_columnar_partitioned(
+            tenant,
+            batch,
+            mode,
+            ack_deadline,
+            Some(charge),
+            partition_columnar,
+        )
+        .await
     }
 
     /// [`Self::write_columnar`] with the partition step supplied, so a test can
     /// run the same write through a reference partition and compare objects.
+    /// `held` is a caller's existing charge ([`Self::write_columnar_charged`]);
+    /// `None` charges the router's budget the batch's estimate.
     async fn write_columnar_partitioned<P>(
         &self,
         tenant: ravel_types::TenantId,
         batch: ColumnarLogBatch,
         mode: WriteMode,
         ack_deadline: Duration,
+        held: Option<IngestByteCharge>,
         partition: P,
     ) -> Result<LogWriteReceipt, LogWriteError>
     where
@@ -595,12 +640,13 @@ impl LogIngestRouter {
         // exactly, so the shared ceiling means the same thing on both paths. As
         // in `write`, the charge is cloned into every shard message and refunded
         // when the flush(es) holding these bytes complete or fail.
-        let estimate = est_columnar_bytes(&batch) as u64;
-        let charge = Arc::new(
-            self.budget
-                .try_charge(estimate)
+        let charge = Arc::new(match held {
+            Some(charge) => charge,
+            None => self
+                .budget
+                .try_charge(est_columnar_bytes(&batch) as u64)
                 .map_err(|_| LogWriteError::BufferBudgetExceeded)?,
-        );
+        });
 
         // Route against the tenant's current generation view, exactly as `write`.
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
@@ -2310,6 +2356,7 @@ mod tests {
                 batch.clone(),
                 WriteMode::Buffered,
                 Duration::from_secs(5),
+                None,
                 |b, n| Ok(cloning_partition_reference_pre_2624(&b, n)),
             )
             .await
@@ -2509,6 +2556,7 @@ mod tests {
                     batch.clone(),
                     WriteMode::Buffered,
                     Duration::from_secs(5),
+                    None,
                     |b, n| Ok(cloning_partition_reference_pre_2624(&b, n)),
                 )
                 .await

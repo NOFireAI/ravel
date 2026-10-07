@@ -499,11 +499,18 @@ enum Command {
         /// that record. Defaults to the server's default of 4.
         #[arg(long, default_value_t = 4)]
         shards: u32,
-        /// Rows per Strict flush. One flush is one RLOG object per involved
-        /// shard, so on a large load this is the lever that controls how many
-        /// RLOG objects the load leaves behind (a first-order query-cost
-        /// variable). Must be at least 1; 0 is rejected. Defaults to
-        /// `DEFAULT_BATCH_ROWS` (10000), leaving current behaviour unchanged.
+        /// Rows the loader decodes and builds into one batch, and writes as one
+        /// Strict write. It is the unit of decode, build and write. What the
+        /// loader holds in built batches is bounded by `--load-memory-bytes`,
+        /// but memory outside that budget still scales with this value: the
+        /// read cursors' decode holds about one batch of rows in total, and
+        /// each flush's working set scales with the per-shard slice. The
+        /// budget's estimated floor for those was measured at 500,000-row
+        /// batches (issue #2613). At the default `--target-bytes 1` each
+        /// batch also flushes as its own RLOG object per involved shard, so
+        /// there this sets the object size; to choose the object size
+        /// independently, use `--target-bytes`. Must be at least 1; 0 is
+        /// rejected. Defaults to `DEFAULT_BATCH_ROWS` (10000).
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
         batch_rows: usize,
         /// Number of leading rows, by file-absolute position, to drop before
@@ -550,7 +557,9 @@ enum Command {
         /// the window seldom fills, and on the 100M-row ClickBench corpus
         /// depth 4 against depth 1 was 11-17% of peak RSS at 500,000- and
         /// 1,000,000-row batches (issue #2613; docs/internal/loader-memory-2613.md
-        /// attributes the peak by allocation site). The reported
+        /// attributes the peak by allocation site). Those batches are charged
+        /// to `--load-memory-bytes`, so the depth cannot take them past it: the
+        /// decoder waits instead. The reported
         /// durable-token list is unaffected by the depth. It is always exactly
         /// the batches strictly before the failing one, in submission order,
         /// followed by whatever a batch submitted after the failing one had
@@ -594,44 +603,41 @@ enum Command {
         /// overlap instead of running in lockstep. The reader blocks when the
         /// channel is full, so the queue holds at most this many built batches;
         /// the extra memory is roughly this count times one batch's built size,
-        /// on top of `--pipeline-depth`'s in-flight-write working set. Defaults
-        /// to 2. Must be at least 1; 0 is rejected.
+        /// on top of `--pipeline-depth`'s in-flight-write working set, and both
+        /// are charged to `--load-memory-bytes`. Defaults to 2. Must be at
+        /// least 1; 0 is rejected.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
         decode_queue_batches: usize,
-        /// Estimated in-memory bytes a shard's buffer accumulates before it
-        /// flushes as one RLOG object (issue #801). At the default `1` every
-        /// batch flushes as its own object the moment it is written: one object
-        /// per involved shard per batch, `--batch-rows` sets its size, and no
-        /// buffer lingers. A larger value lets a shard hold several batches'
-        /// records in one buffer until the target is reached, so objects grow
-        /// without any more Arrow batches being held in memory -- unlike
-        /// raising `--batch-rows`, whose memory cost is linear because each
-        /// batch is buffered whole.
+        /// The object-size setting: the estimated UNCOMPRESSED content a
+        /// shard's buffer accumulates before it flushes as one RLOG object
+        /// (issue #801). Stored objects are compressed and come out much
+        /// smaller than the target, about 15x on the ClickBench corpus. At
+        /// the default `1` every batch flushes as its own object the moment it
+        /// is written: one object per involved shard per batch, so
+        /// `--batch-rows` sets its size. A larger value lets a shard merge
+        /// several batches' slices into one buffer until the target is
+        /// reached, but each Strict write waits for the flush of its own
+        /// batch, so a buffer merges at most `--pipeline-depth` batches'
+        /// slices. Which `--batch-rows` and `--target-bytes` give large
+        /// objects at a fraction of a large batch's memory is pending
+        /// measurement (issue #2627).
         ///
-        /// Two facts decide whether a given value can do anything at all
-        /// (issue #971), and both bite at ClickBench scale:
+        /// The estimate sums body, severity text, stream attributes,
+        /// attribute names and values, and fixed per-row fields over the rows
+        /// the buffer holds. The check runs once per
+        /// write, after a batch's per-shard slice has merged, so a target at
+        /// or below one slice's estimate (`--batch-rows / --shards` rows) is
+        /// exceeded by the first write into an empty buffer and reproduces the
+        /// `1` layout. A load whose `--target-bytes` turned out to lay the
+        /// objects out exactly as `1` would have says so on stderr.
         ///
-        /// - The unit is the router's buffered-footprint ESTIMATE, not encoded
-        ///   object bytes. Every attribute occurrence charges a 56-byte
-        ///   (name, value) pair header plus its key bytes and its uncompressed
-        ///   value bytes, plus the stream-attribute blob and 32 bytes per row.
-        ///   For the 104-column ClickBench mapping that is roughly 8 KB per
-        ///   row, while the objects the same load writes average a bit over
-        ///   100 bytes per row. A target picked from an observed object size is
-        ///   therefore tens of times too small to matter.
-        /// - The check runs once per write, after a whole batch's per-shard
-        ///   slice has merged. A target at or below one slice's estimated
-        ///   footprint (`--batch-rows / --shards` rows' worth of the estimate
-        ///   above) is already exceeded by the first write into an empty
-        ///   buffer, so it flushes every write and reproduces the `1` layout
-        ///   exactly. At `--batch-rows 40000 --shards 4` that threshold is tens
-        ///   of megabytes: a target of a few MiB changes nothing, and only the
-        ///   small slices a batch leaves on a lightly-hit shard accumulate at
-        ///   all.
-        ///
-        /// A load whose `--target-bytes` turned out to lay the objects out
-        /// exactly as `1` would have says so on stderr, with the threshold it
-        /// missed.
+        /// Buffered batches stay charged to `--load-memory-bytes` until their
+        /// flush finishes. When two checks 250 ms apart both find the decoder
+        /// waiting for room in that budget and the bytes charged not lower
+        /// than at the first, the loader flushes every shard buffer early
+        /// rather than wait for the
+        /// target or the age trigger, so a target the budget cannot hold
+        /// yields smaller objects, never a stalled load.
         ///
         /// The trade is ack timing, not durability. A Strict write's ack is
         /// still sent only after its records' object and commit record are
@@ -706,6 +712,32 @@ enum Command {
             value_parser = ravel_cli::parse_zstd_level
         )]
         zstd_level: ravel_ingest::RlogZstdLevel,
+        /// The bytes of built batches a logs load may hold at once (issue
+        /// #2626). Every batch is charged before it is built, at an estimate
+        /// from the previous batch's bytes per row (zero for the first batch),
+        /// and corrected to its measured in-memory size once built, so the
+        /// first batch and any batch wider than its estimate are built partly
+        /// uncharged. A batch stays charged through the decode queue, the
+        /// write window, the shard buffers and its flush; when the budget is
+        /// full the decoder waits for room. With this flag set, a batch larger
+        /// than the whole budget fails the load: the first one is refused at
+        /// start, before anything is written, naming the budget and the batch;
+        /// a later one once the writes in flight have resolved.
+        ///
+        /// Unset, it is derived from host (or cgroup) memory less an
+        /// estimated floor for what batches do not account for: 128 MiB of
+        /// process baseline, 32 MiB per read cursor and 72 MiB per concurrent
+        /// flush (`--shards` x `--max-inflight-flushes`), from the issue #2613
+        /// profiles. When host memory cannot be read, a 4 GiB fallback is used
+        /// and a warning says so. A derived budget smaller than one batch does
+        /// not fail the load: it admits one batch at a time and a warning
+        /// names the budget, its source and the floor. The summary prints the
+        /// budget, its source, the floor, the peak bytes charged (above the
+        /// budget only when one batch alone is larger) and how often the
+        /// decoder waited. A metrics or spans load ignores this flag and warns
+        /// when it is set. `0` is rejected.
+        #[arg(long, value_name = "BYTES")]
+        load_memory_bytes: Option<u64>,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -2768,6 +2800,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             target_bytes,
             max_flush_delay,
             zstd_level,
+            load_memory_bytes,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -2786,6 +2819,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 target_bytes,
                 max_flush_delay,
                 zstd_level,
+                load_memory_bytes,
                 now_ns()?,
             )
             .await;
