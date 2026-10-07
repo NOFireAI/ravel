@@ -683,7 +683,9 @@ mod tests {
             if server.dies && server.refused() {
                 unreachable()
             } else if server.unavailable.iter().any(|s| s == sql) {
-                Err(EngineError::Query("HTTP 503 Service Unavailable".to_string()))
+                Err(EngineError::Query(
+                    "HTTP 503 Service Unavailable".to_string(),
+                ))
             } else {
                 Ok(Vec::new())
             }
@@ -704,7 +706,9 @@ mod tests {
 
     /// The suite number of `statements(n)`'s statement `sql`.
     fn number(sql: &str) -> u32 {
-        sql.trim_start_matches('s').parse().expect("stub SQL is s<n>")
+        sql.trim_start_matches('s')
+            .parse()
+            .expect("stub SQL is s<n>")
     }
 
     #[tokio::test]
