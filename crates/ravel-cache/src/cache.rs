@@ -1118,7 +1118,10 @@ mod tests {
 
         let fetched = big.slice(0..SLICE);
         let got = cache
-            .get_or_fetch(key, move || async move { Ok::<Bytes, &'static str>(fetched) })
+            .get_or_fetch(
+                key,
+                move || async move { Ok::<Bytes, &'static str>(fetched) },
+            )
             .await
             .unwrap();
         assert_eq!(got.as_ref(), expected.as_slice());

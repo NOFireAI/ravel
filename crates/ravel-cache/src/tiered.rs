@@ -2242,14 +2242,21 @@ mod tests {
         let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
         let tiered = TieredCache::new(Cache::<&'static str>::new(generous_limits()), disk);
 
-        let big = Bytes::from((0..1024 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let big = Bytes::from(
+            (0..1024 * 1024)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<u8>>(),
+        );
         let slice_len = 64 * 1024;
         let expected = big.slice(0..slice_len).to_vec();
         let key = test_key(1, slice_len as u64);
 
         let fetched = big.slice(0..slice_len);
         let (served, _) = tiered
-            .get_or_fetch(key, move || async move { Ok::<Bytes, &'static str>(fetched) })
+            .get_or_fetch(
+                key,
+                move || async move { Ok::<Bytes, &'static str>(fetched) },
+            )
             .await
             .unwrap();
         assert_eq!(served.as_ref(), expected.as_slice());
@@ -2261,10 +2268,7 @@ mod tests {
         );
         assert_eq!(tiered.ram.total_bytes(), slice_len as u64);
         assert_eq!(tiered.ram_metrics().admission_copies(), 1);
-        assert_eq!(
-            tiered.ram.get(&key).as_deref(),
-            Some(expected.as_slice())
-        );
+        assert_eq!(tiered.ram.get(&key).as_deref(), Some(expected.as_slice()));
     }
 
     /// A disk-served hit is promoted to RAM without a copy: the disk tier reads
