@@ -33,9 +33,25 @@
 //! caps and unlike the fleet-reconciled query admission (ADR-0061): it holds no
 //! durable state and coordinates nothing across processes. With N ingest
 //! replicas the fleet-wide effective ceiling is N times the configured one.
+//!
+//! # Waiting charges (ADR-2614 decision 5)
+//!
+//! The server sheds at the ceiling; the bulk loader cannot, because its input
+//! is a file it must finish. [`IngestByteBudget::charge_waiting`] and
+//! [`IngestByteCharge::resize_waiting`] block the calling thread until the
+//! bytes fit instead of shedding. One charge larger than the whole ceiling is
+//! admitted once nothing else is held, so a waiter can always make progress;
+//! [`IngestByteBudget::peak_bytes`] records the highest gauge reading, which
+//! only exceeds the ceiling in that case.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+/// Upper bound on one condvar wait in [`IngestByteBudget::wait_for_room`]. The
+/// wake-up protocol does not lose notifications; the bound only keeps a waiter
+/// re-checking if it ever did.
+const WAIT_RECHECK: Duration = Duration::from_millis(100);
 
 /// `--max-ingest-buffer-bytes`: `Bounded(n)` caps the process-wide sum of
 /// estimated buffered ingest bytes at `n`; `Unlimited` (the flag's `0` value)
@@ -76,6 +92,16 @@ pub struct IngestByteBudget {
     in_flight: AtomicU64,
     /// Cumulative sheds since process start, for the `/metrics` counter.
     shed_total: AtomicU64,
+    /// Highest `in_flight` reading any charge or resize produced.
+    peak: AtomicU64,
+    /// Threads blocked in [`Self::wait_for_room`].
+    waiters: AtomicUsize,
+    /// Cumulative count of charges and resizes that had to block.
+    waits_total: AtomicU64,
+    /// Held by a waiter between its check and its wait, and by a refund
+    /// before it notifies, so a refund cannot slip between the two.
+    wake_lock: Mutex<()>,
+    wake: Condvar,
 }
 
 impl IngestByteBudget {
@@ -87,6 +113,11 @@ impl IngestByteBudget {
             },
             in_flight: AtomicU64::new(0),
             shed_total: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+            waits_total: AtomicU64::new(0),
+            wake_lock: Mutex::new(()),
+            wake: Condvar::new(),
         }
     }
 
@@ -130,10 +161,104 @@ impl IngestByteBudget {
                 }
             }
         }
+        self.note_peak();
         Ok(IngestByteCharge {
             budget: Arc::clone(self),
             bytes,
         })
+    }
+
+    /// Charges `bytes`, blocking the calling thread until they fit under the
+    /// ceiling instead of shedding. A charge larger than the ceiling is
+    /// admitted once nothing else is held. Never call this from an async task:
+    /// it parks the thread, and the refunds it waits for may need that thread.
+    pub fn charge_waiting(self: &Arc<Self>, bytes: u64) -> IngestByteCharge {
+        self.wait_for_room(bytes, 0);
+        IngestByteCharge {
+            budget: Arc::clone(self),
+            bytes,
+        }
+    }
+
+    /// Adds `bytes` to the gauge once `in_flight + bytes` fits under the
+    /// ceiling, or once the gauge holds no more than `own` (the caller's
+    /// already-held bytes, so a resize of the only held charge never waits on
+    /// itself).
+    fn wait_for_room(&self, bytes: u64, own: u64) {
+        let Some(limit) = self.limit else {
+            self.in_flight.fetch_add(bytes, Ordering::AcqRel);
+            self.note_peak();
+            return;
+        };
+        let admit = |current: u64| current.saturating_add(bytes) <= limit || current <= own;
+        let mut guard = None;
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if admit(current) {
+                match self.in_flight.compare_exchange_weak(
+                    current,
+                    current.saturating_add(bytes),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => {
+                        current = observed;
+                        continue;
+                    }
+                }
+            }
+            match guard.take() {
+                None => {
+                    // Register, take the lock, and re-check before waiting: a
+                    // refund that lands after this re-check must take the
+                    // lock to notify, which it cannot do until the wait below
+                    // has released it.
+                    self.waiters.fetch_add(1, Ordering::SeqCst);
+                    self.waits_total.fetch_add(1, Ordering::Relaxed);
+                    guard = Some(self.wake_lock.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+                Some(held) => {
+                    let (held, _) = self
+                        .wake
+                        .wait_timeout(held, WAIT_RECHECK)
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = Some(held);
+                }
+            }
+            current = self.in_flight.load(Ordering::SeqCst);
+        }
+        if guard.is_some() {
+            self.waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+        drop(guard);
+        self.note_peak();
+    }
+
+    fn note_peak(&self) {
+        self.peak
+            .fetch_max(self.in_flight.load(Ordering::Acquire), Ordering::AcqRel);
+    }
+
+    /// The highest gauge reading since construction. Under a bounded ceiling
+    /// it exceeds the ceiling only when a single charge larger than the
+    /// ceiling was admitted alone.
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+
+    /// Threads currently blocked in [`Self::charge_waiting`] or
+    /// [`IngestByteCharge::resize_waiting`].
+    pub fn waiting(&self) -> usize {
+        self.waiters.load(Ordering::SeqCst)
+    }
+
+    /// How many [`Self::charge_waiting`] or [`IngestByteCharge::resize_waiting`]
+    /// calls found no room and registered to wait, since construction. One
+    /// that registers counts even if its re-check under the lock admits it
+    /// before it parks.
+    pub fn waits_total(&self) -> u64 {
+        self.waits_total.load(Ordering::Relaxed)
     }
 
     /// Estimated buffered bytes currently held, for the
@@ -181,12 +306,16 @@ impl IngestByteBudget {
             match self.in_flight.compare_exchange_weak(
                 current,
                 next,
-                Ordering::AcqRel,
+                Ordering::SeqCst,
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
                 Err(observed) => current = observed,
             }
+        }
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            let _held = self.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.wake.notify_all();
         }
     }
 }
@@ -253,6 +382,25 @@ impl IngestByteCharge {
     /// The charged amount, for tests and diagnostics.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The budget this charge is held against.
+    pub fn budget(&self) -> &Arc<IngestByteBudget> {
+        &self.budget
+    }
+
+    /// Changes the charged amount to `bytes`, for a charge taken on an
+    /// estimate and corrected once the real size is known. Shrinking refunds
+    /// the difference at once. Growing blocks the calling thread, as
+    /// [`IngestByteBudget::charge_waiting`] does, until the difference fits or
+    /// this charge is the only one held.
+    pub fn resize_waiting(&mut self, bytes: u64) {
+        if bytes < self.bytes {
+            self.budget.refund(self.bytes - bytes);
+        } else if bytes > self.bytes {
+            self.budget.wait_for_room(bytes - self.bytes, self.bytes);
+        }
+        self.bytes = bytes;
     }
 }
 
@@ -343,5 +491,117 @@ mod tests {
         assert_eq!(budget.in_flight_bytes(), 300, "held while a clone survives");
         drop(clone_b);
         assert_eq!(budget.in_flight_bytes(), 0, "refunded on last clone drop");
+    }
+
+    /// Spins until `n` threads are parked in the budget's wait, which is the
+    /// proof a charge blocked rather than a timing guess.
+    fn await_waiters(budget: &IngestByteBudget, n: usize) {
+        while budget.waiting() != n {
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn charge_waiting_blocks_until_a_refund_makes_room() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000));
+        let held = budget.try_charge(700).expect("under ceiling");
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            std::thread::spawn(move || budget.charge_waiting(400))
+        };
+        await_waiters(&budget, 1);
+        assert_eq!(
+            budget.in_flight_bytes(),
+            700,
+            "the waiter charged nothing yet"
+        );
+        drop(held);
+        let charge = waiter.join().expect("waiter thread");
+        assert_eq!(charge.bytes(), 400);
+        assert_eq!(budget.in_flight_bytes(), 400);
+        assert_eq!(budget.waiting(), 0);
+        assert_eq!(budget.waits_total(), 1, "the blocked charge is counted");
+        assert_eq!(budget.shed_total(), 0, "waiting never sheds");
+    }
+
+    #[test]
+    fn charge_larger_than_the_ceiling_is_admitted_alone() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000));
+        let held = budget.try_charge(1).expect("under ceiling");
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            std::thread::spawn(move || budget.charge_waiting(5_000))
+        };
+        await_waiters(&budget, 1);
+        drop(held);
+        let big = waiter.join().expect("waiter thread");
+        assert_eq!(budget.in_flight_bytes(), 5_000);
+        assert_eq!(budget.peak_bytes(), 5_000);
+        drop(big);
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn resize_shrink_refunds_and_wakes_a_waiter() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000));
+        let mut estimate = budget.charge_waiting(1_000);
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            std::thread::spawn(move || budget.charge_waiting(600))
+        };
+        await_waiters(&budget, 1);
+        estimate.resize_waiting(300);
+        let second = waiter.join().expect("waiter thread");
+        assert_eq!(budget.in_flight_bytes(), 900);
+        drop(estimate);
+        drop(second);
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "resized charge refunds its new size"
+        );
+    }
+
+    #[test]
+    fn resize_grow_waits_for_room_but_not_on_itself() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000));
+        // Alone, a grow past the ceiling never waits on its own bytes.
+        let mut alone = budget.charge_waiting(400);
+        alone.resize_waiting(1_500);
+        assert_eq!(budget.in_flight_bytes(), 1_500);
+        drop(alone);
+
+        let other = budget.try_charge(500).expect("under ceiling");
+        let grower = {
+            let budget = Arc::clone(&budget);
+            std::thread::spawn(move || {
+                let mut charge = budget.charge_waiting(400);
+                charge.resize_waiting(800);
+                charge
+            })
+        };
+        await_waiters(&budget, 1);
+        assert_eq!(
+            budget.in_flight_bytes(),
+            900,
+            "grow waits; base charge held"
+        );
+        drop(other);
+        let grown = grower.join().expect("grower thread");
+        assert_eq!(grown.bytes(), 800);
+        assert_eq!(budget.in_flight_bytes(), 800);
+    }
+
+    #[test]
+    fn peak_tracks_the_highest_gauge_reading() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000));
+        let a = budget.charge_waiting(300);
+        let b = budget.try_charge(600).expect("under ceiling");
+        drop(a);
+        let _c = budget.charge_waiting(100);
+        assert_eq!(budget.peak_bytes(), 900);
+        assert_eq!(budget.waits_total(), 0, "no charge here had to wait");
+        drop(b);
+        assert_eq!(budget.peak_bytes(), 900, "a refund never lowers the peak");
     }
 }

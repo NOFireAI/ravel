@@ -197,7 +197,8 @@ The decoder waits when the budget is spent.
   remain upper bounds on counts.
 - Exceeding memory becomes waiting, not swapping and a shard-ack timeout.
 - When the budget cannot hold even one batch, the loader refuses at start
-  with a message naming the budget and the batch's estimated size.
+  with a message naming the budget and the batch's estimated size. (Only
+  an explicit budget refuses; see the one-batch amendment below.)
 
 ### 6. Object size is set by bytes, not by batch rows
 
@@ -205,7 +206,8 @@ Shard actors already merge several batches into one object
 (`BufContent::Columnar(Vec<_>)`). With 2–5 in place, the recommended way to
 get large objects is a small `--batch-rows` (for example 50,000) and a
 `--target-bytes` at the object size wanted, with the shard buffers inside the
-byte budget. `--batch-rows` stops being a memory setting. The ClickBench
+byte budget (see the target-bytes amendment below: the target counts
+uncompressed content). `--batch-rows` stops being a memory setting. The ClickBench
 entry's `load` sizes `--target-bytes` and `--load-memory-bytes` from the
 machine. The default object size is unchanged.
 
@@ -343,7 +345,8 @@ vectors, and `Bool` cells as a vector of flags.
   cloned. Only residual attribute lists and stream blobs still move.
   Decision 2's "moving cells" described the `AttrValue` cells this
   replaced.
-- One column's bytes in one batch are bounded by its `u32` offsets, 4 GiB.
+- One column's bytes in one batch are bounded by its `u32` offsets:
+  `u32::MAX` bytes, one byte short of 4 GiB.
   A value that would pass that is refused with `LimitExceeded`, which the
   loader reports as a load error naming the column and suggesting a smaller
   `--batch-rows`, and `validate()` refuses offsets that are not monotonic.
@@ -372,3 +375,73 @@ At about 667 MB a batch in that one-off measurement, the two site medians
 are about 2.7 and 2.5 batches held at once. Wave 3's byte budget (decision
 5) targets that remaining multiplicity, the number of batch copies alive,
 rather than the size of one batch.
+
+## Amendment (2026-10-07): --target-bytes counts uncompressed content and pipeline depth caps batches per object (issue #2626)
+
+<!-- amendment-applies: sections="6. Object size is set by bytes, not by batch rows" pointer="target-bytes amendment" -->
+<!-- amendment-supersedes: phrase="`--target-bytes` at the object size wanted" pointer="target-bytes amendment" -->
+<!-- amendment-supersedes: phrase="`--batch-rows` stops being a memory setting" pointer="target-bytes amendment" -->
+
+Decision 6 set `--target-bytes` at the object size wanted. Wave 3 measured
+that setting and the stored objects came out far smaller, for two reasons:
+
+- The target is compared with the shard buffer's estimated uncompressed
+  content (`est_columnar_object_bytes` in `log_shard.rs`, checked by
+  `size_trigger_fires`), and the stored object is the zstd-compressed
+  RLOG. On ClickBench `hits.parquet` at `--batch-rows 50000 --target-bytes
+  25000000 --shards 4 --read-cursors 16 --pipeline-depth 4`, one run of
+  2,651 objects stored a median of 1.67 MB (p10 1.12 MB, p90 2.41 MB,
+  largest 3.46 MB), about 15 times below the target.
+- Each Strict write waits for the flush of its own batch, and the loader
+  keeps at most `--pipeline-depth` writes in flight, so one object merges
+  at most `--pipeline-depth` batches' slices however large the target. The
+  measured objects held about 1.5 of the 12,500-row slices a 50,000-row
+  batch puts on each of 4 shards, under that cap of 4; which trigger
+  closed each object was not split out.
+
+Figures from docs/internal/loader-memory-2613.md, "Wave 3 (#2626)".
+
+The recipe for large stored objects from small batches, and the
+ClickBench entry's sizing of `--target-bytes`, are not settled by wave 3.
+The wave 4 measurement (#2627) settles them; until then the
+`--target-bytes` help and docs/guides/ingest.md say the recipe is pending.
+
+`--batch-rows` is not a memory setting for the batches the budget charges,
+but memory outside the budget still scales with it: the read cursors'
+decode holds about one batch of rows in total, and each flush's working
+set scales with its per-shard slice. The floor constants were measured at
+500,000-row batches.
+
+The rest of decision 6 stands. Shard actors merge batches, the shard
+buffers are inside the byte budget, and the default object size is
+unchanged. When the decoder stays waiting on a full budget, the loader
+flushes every shard buffer early, so a target the budget cannot hold
+yields smaller objects rather than a stalled load.
+
+## Amendment (2026-10-07): a derived budget below one batch admits one batch at a time (issue #2626)
+
+<!-- amendment-applies: sections="5. One byte budget for the whole load" pointer="one-batch amendment" -->
+
+Decision 5 has the loader refuse at start when the budget cannot hold one
+batch, and charge each batch its measured size from the moment it is
+built. As implemented:
+
+- Only an explicit `--load-memory-bytes` below one batch refuses: the
+  first batch at start, before anything is written, and a later one once
+  the writes in flight have resolved, reported as a partial load. A
+  derived budget (host memory less the floor, or the 4 GiB fallback) below
+  one batch admits one batch at a time and logs a warning naming the
+  batch, the budget, its source and the floor. The floor is sized with the
+  resolved read-cursor count. A derived budget is the loader's own estimate
+  of headroom, and refusing on it would fail a load on a small host that
+  can run one batch at a time.
+- The charge before the build is an estimate: the previous batch's bytes
+  per row times the rows, and zero for the first batch. It is resized to
+  the measured `heap_bytes` once the batch is built. The first batch and a
+  batch wider than its estimate are therefore built partly uncharged, and
+  the reported peak is bytes charged, not bytes held.
+- The shard buffers keep registering `est_columnar_bytes` for their own
+  accounting (the backstop, the queued-flush cap and the buffered-bytes
+  metric), as before the budget. Only the loader's charge uses the measured
+  size, so a budget that never binds lays objects out as an unbudgeted load
+  does.

@@ -117,6 +117,7 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         DEFAULT_TARGET_BYTES,
         None,
         RlogZstdLevel::new(level).expect("in range"),
+        None,
         now_ns,
     )
     .await

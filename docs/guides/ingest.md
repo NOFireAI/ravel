@@ -1165,10 +1165,12 @@ unsorted input costs every later query the fetch of the bulk objects.
 
 ### `--batch-rows` and object count
 
-`load` writes one Strict flush per batch, and one flush is one RLOG object
-per involved shard. `--batch-rows` sets the batch size (default 10000), so
-it controls how many RLOG objects a load leaves behind. A 100M-row load at
-the default is on the order of 10000 flushes, each an RLOG object per shard.
+`load` writes each batch as one Strict write. At the default
+`--target-bytes 1`, each write flushes at once, and one flush is one RLOG
+object per involved shard. So at that default `--batch-rows` sets the
+batch size (default 10000) and with it how many RLOG objects a load leaves
+behind. A 100M-row load at the default is on the order of 10000 flushes,
+each an RLOG object per shard.
 
 Object count is a first-order query-cost variable. Every later query over
 the affected range pays the per-object cost (LIST, footer read, per-object
@@ -1177,6 +1179,89 @@ less per-object overhead and more memory held per batch. A smaller one
 writes more, smaller objects.
 
 `--batch-rows 0` is rejected with an error.
+
+### Object size by bytes: `--target-bytes`
+
+`--target-bytes` above `1` makes each shard merge several batches' slices
+into one buffer and flush it as one object once the buffer's estimate
+reaches the target, so objects grow without growing the batch.
+
+The target counts the buffer's estimated **uncompressed** content (body,
+severity text, stream attributes, attribute names and values, and fixed
+per-row fields), not the stored object size. Stored objects are compressed
+and come out much smaller: on ClickBench `hits.parquet` with `--shards 4`,
+`--batch-rows 50000 --target-bytes 25000000` stored objects of 1.1 to
+2.4 MB (10th to 90th percentile, median 1.67 MB), about 15 times below the
+target. Which `--batch-rows` and `--target-bytes` give large objects from
+small batches is pending measurement.
+
+A Strict write's ack waits for the flush that holds its rows, and the
+loader keeps at most `--pipeline-depth` writes in flight, so one object
+merges at most `--pipeline-depth` batches' slices. Above `1` a batch's ack
+can wait for later batches to fill the buffer. Set `--pipeline-depth` to
+at least the number of batches that accumulate into one flush; otherwise
+every flush waits out the router's age trigger (`--max-flush-delay`, 2s by
+default). A buffer that never reaches the target flushes on that trigger,
+or at the end of the input. When two checks 250 ms apart both find the
+decoder waiting for room in `--load-memory-bytes` and the bytes charged
+not lower than at the first, the loader flushes every shard buffer early,
+so a target the budget cannot hold yields smaller objects rather than a
+stalled load.
+
+### Load memory: `--load-memory-bytes`
+
+A logs load holds its built batches under one byte budget,
+`--load-memory-bytes`. Each batch is charged before it is built, at an
+estimate from the previous batch's bytes per row (zero for the first
+batch), and corrected to its measured in-memory size once built, so the
+first batch and any batch wider than its estimate are built partly
+uncharged. The charge stays through the decode queue, the write window
+(`--pipeline-depth`), the shard buffers and the flush that writes its
+rows. When the budget is full the decoder waits; it does not fail.
+
+With `--load-memory-bytes` set, a load whose first batch alone does not
+fit the budget is refused before
+anything is written, with a message naming that batch's size, the budget,
+where the budget came from and the floor, and suggesting a smaller
+`--batch-rows` or a larger `--load-memory-bytes`. A later batch that does
+not fit fails the load the same way once the writes already in flight
+have resolved, and the failure reports what they made durable.
+
+Unset, the budget is the host's memory (`MemTotal`, or a lower cgroup
+memory limit) less an estimated floor for what batches do not account for:
+128 MiB of process baseline, 32 MiB per read cursor and 72 MiB per
+concurrent flush (`--shards` x `--max-inflight-flushes`). These are
+estimates from profiling one corpus, not calibrated figures. Where host
+memory cannot be read, the budget falls back to 4 GiB and a warning says
+so. A derived budget smaller than one batch, on a small host or under a
+large floor, does not refuse the load: the loader admits one batch at a
+time and prints a warning naming the batch, the budget, its source and the
+floor. Set `--load-memory-bytes` to get the refusal instead.
+
+The load summary prints the budget, where it came from, the floor, the
+peak bytes charged, the largest batch, and how many times the decoder
+waited for room:
+
+```text
+  load memory      : budget <BYTES> bytes (<SOURCE>), floor <BYTES> bytes, peak <BYTES> bytes, largest batch <BYTES> bytes, decoder waits <N>
+```
+
+`<SOURCE>` is `--load-memory-bytes`, `host memory <BYTES> bytes less the
+floor`, or `fallback, host memory unreadable`. The peak is the most bytes
+charged at once, not held: it can exceed the budget when one batch alone
+is larger than it. `decoder waits 0` means the budget never bound.
+
+The budget covers batches, not the whole process, and memory outside it
+still scales with `--batch-rows`: the read cursors' decode holds about one
+batch of rows in total, and each flush's working set scales with its
+per-shard slice. The floor constants were measured at 500,000-row batches.
+Process memory is
+roughly the budget plus the floor, plus whatever the object store holds:
+`--store memory` keeps every written object in the process, so a
+memory-store load grows past the budget with the data it writes.
+
+A metrics or spans load ignores `--load-memory-bytes` and warns when it is
+set.
 
 ### The dynamic-column budget and its warnings
 

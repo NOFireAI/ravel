@@ -226,17 +226,37 @@ pub(crate) fn est_columnar_bytes(batch: &ColumnarLogBatch) -> usize {
 /// or `Map` cell's stored bytes are its canonical encoding, which neither rule
 /// counts, so those cells are charged `value_len` of their original value
 /// instead.
+///
+/// Exact on a batch that passes `ColumnarLogBatch::validate()`, which requires
+/// every nested slot to index a stored cell and the offsets to be monotonic. On
+/// one that does not, the arithmetic saturates and a slot past the column
+/// counts 0 bytes, so the estimate is wrong but never panics.
 fn cells_value_len(cells: &DynCells, value_len: fn(&AttrValue) -> usize) -> usize {
     match cells {
         DynCells::Str(v) => v.data().len(),
         DynCells::Bytes(b) => {
+            let offsets = b.values.offsets();
             let canonical: usize = b
                 .nested
                 .iter()
-                .map(|(slot, _)| b.values.get(*slot as usize).len())
-                .sum();
-            let original: usize = b.nested.iter().map(|(_, v)| value_len(v)).sum();
-            b.values.data().len() - canonical + original
+                .map(|(slot, _)| {
+                    let slot = *slot as usize;
+                    match (offsets.get(slot), offsets.get(slot.saturating_add(1))) {
+                        (Some(&start), Some(&end)) => end.saturating_sub(start) as usize,
+                        _ => 0,
+                    }
+                })
+                .fold(0, usize::saturating_add);
+            let original: usize = b
+                .nested
+                .iter()
+                .map(|(_, v)| value_len(v))
+                .fold(0, usize::saturating_add);
+            b.values
+                .data()
+                .len()
+                .saturating_sub(canonical)
+                .saturating_add(original)
         }
         DynCells::I64(v) => 8 * v.len(),
         DynCells::F64(v) => 8 * v.len(),
@@ -349,15 +369,17 @@ fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     }
 }
 
-/// Row-major records as the one columnar batch `ColumnarLogBatch::from_records`
-/// builds from them.
-fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> ColumnarLogBatch {
-    ColumnarLogBatch::from_records(
+/// Row-major records as the one columnar batch
+/// `ColumnarLogBatch::try_from_records` builds from them, or its refusal of a
+/// value that would take a column past its byte limit.
+fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> Result<ColumnarLogBatch, LogWriteError> {
+    ColumnarLogBatch::try_from_records(
         &records
             .into_iter()
             .map(to_logseg_record)
             .collect::<Vec<_>>(),
     )
+    .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
 }
 
 /// A tenant's buffered payload: one representation at a time (ADR-0109 decision
@@ -548,15 +570,16 @@ impl LogTenantBuf {
         match payload {
             FlushPayload::Rows(records) => {
                 if matches!(self.content, BufContent::Columnar(_)) {
-                    self.merge_columnar_unstamped(rows_to_batch(records))?;
+                    self.merge_columnar_unstamped(rows_to_batch(records)?)?;
                 } else {
                     self.merge_rows_unstamped(records)?;
                 }
             }
             FlushPayload::Columnar(batches) => {
-                if let BufContent::Rows(records) = &mut self.content {
-                    let rows = std::mem::take(records);
-                    self.content = BufContent::Columnar(vec![rows_to_batch(rows)]);
+                if let BufContent::Rows(records) = &self.content {
+                    // Copied so a refusal leaves the buffered records in place.
+                    let batch = rows_to_batch(records.clone())?;
+                    self.content = BufContent::Columnar(vec![batch]);
                 }
                 for batch in batches {
                     self.merge_columnar_unstamped(batch)?;

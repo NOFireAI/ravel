@@ -29,8 +29,8 @@ pub enum LogSegError {
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u16),
     /// A build-side limit or precondition was not met. Among them: a value
-    /// that would take a `VarBytes` column past the 4 GiB its `u32` offsets
-    /// address (`VarBytes::try_push`).
+    /// that would take a `VarBytes` column past the `u32::MAX` bytes its `u32`
+    /// offsets address, one byte short of 4 GiB (`VarBytes::try_push`).
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
     /// A read of `[start, end)` from a [`crate::source::SparseObject`] that
@@ -62,7 +62,7 @@ pub enum LogSegError {
     /// other than the column's `field_type`; a `dyn_col_dicts` that is
     /// non-empty but not one entry per dyn column; a `VarBytes` column
     /// (`severity_text`, `body`, a `Str` or `Bytes` dyn column) whose offsets
-    /// do not describe its bytes, as after more than 4 GiB wraps them; a
+    /// do not describe its bytes, as after more than `u32::MAX` bytes wraps them; a
     /// present dictionary whose
     /// `ids` is not parallel to its column's present cells, holds an id at or
     /// past its own `distinct.len()`, or names a `distinct` entry that differs

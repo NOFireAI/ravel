@@ -103,6 +103,38 @@ impl Bitmap {
     pub fn bytes(&self) -> &[u8] {
         &self.bits
     }
+
+    /// Heap bytes allocated for the bits (capacity, not length).
+    pub fn heap_bytes(&self) -> usize {
+        self.bits.capacity()
+    }
+}
+
+/// Heap bytes a `Vec<T>`'s buffer holds: its capacity, not its length.
+fn vec_heap<T>(v: &Vec<T>) -> usize {
+    v.capacity() * size_of::<T>()
+}
+
+/// Heap bytes owned by one [`AttrValue`], beyond its own inline size.
+fn attr_value_heap(value: &AttrValue) -> usize {
+    match value {
+        AttrValue::Str(s) => s.capacity(),
+        AttrValue::Bytes(b) => b.capacity(),
+        AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 0,
+        AttrValue::List(items) => {
+            vec_heap(items) + items.iter().map(attr_value_heap).sum::<usize>()
+        }
+        AttrValue::Map(entries) => vec_heap(entries) + attr_pairs_heap(entries),
+    }
+}
+
+/// Heap bytes owned by the keys and values of `(name, value)` pairs, beyond the
+/// vector holding the pairs.
+fn attr_pairs_heap(pairs: &[(String, AttrValue)]) -> usize {
+    pairs
+        .iter()
+        .map(|(k, v)| k.capacity() + attr_value_heap(v))
+        .sum()
 }
 
 /// A variable-length byte column: contiguous `data` with `offsets` marking each
@@ -122,7 +154,8 @@ pub struct VarBytes {
     limit: usize,
 }
 
-/// The most value bytes one [`VarBytes`] holds: the largest `u32` offset.
+/// The most value bytes one [`VarBytes`] holds: the largest `u32` offset,
+/// `u32::MAX` bytes, one byte short of 4 GiB.
 pub const VAR_BYTES_MAX: usize = u32::MAX as usize;
 
 impl Default for VarBytes {
@@ -158,7 +191,7 @@ impl VarBytes {
     /// [`Self::with_capacity`], with [`Self::try_push`] refusing a value that
     /// would take the column past `limit` bytes. A `limit` above
     /// [`VAR_BYTES_MAX`] is lowered to it. Lets a test reach the refusal
-    /// without holding 4 GiB.
+    /// without holding `u32::MAX` bytes, one byte short of 4 GiB.
     pub fn with_byte_limit(values: usize, bytes: usize, limit: usize) -> Self {
         let mut offsets = Vec::with_capacity(values.saturating_add(1));
         offsets.push(0);
@@ -263,6 +296,11 @@ impl VarBytes {
     /// The raw contiguous value bytes.
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Heap bytes allocated for offsets and data (capacity, not length).
+    pub fn heap_bytes(&self) -> usize {
+        vec_heap(&self.offsets) + self.data.capacity()
     }
 }
 
@@ -412,6 +450,25 @@ impl DynCells {
     /// Whether there are zero cells.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Heap bytes allocated for the cells (capacity, not length), including
+    /// the original value of every nested `Bytes` cell.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            DynCells::Str(v) => v.heap_bytes(),
+            DynCells::Bytes(b) => {
+                b.values.heap_bytes()
+                    + vec_heap(&b.nested)
+                    + b.nested
+                        .iter()
+                        .map(|(_, v)| attr_value_heap(v))
+                        .sum::<usize>()
+            }
+            DynCells::I64(v) => vec_heap(v),
+            DynCells::F64(v) => vec_heap(v),
+            DynCells::Bool(v) => vec_heap(v),
+        }
     }
 
     /// Appends `value`, refusing one whose resolved type is not this column's
@@ -928,6 +985,56 @@ impl ColumnarLogBatch {
         &self.span_id[slot * 8..slot * 8 + 8]
     }
 
+    /// The heap bytes this batch holds, measured: the summed capacity of every
+    /// buffer it owns, nested ones included, each times its element size. The
+    /// batch struct itself is not counted (it is inline wherever the batch
+    /// lives). The bulk loader charges its memory budget this figure
+    /// (ADR-2614 decision 5); unlike the shard's `est_columnar_bytes`, which
+    /// models the row-major footprint the same records would have, it counts
+    /// what the typed columns actually allocate.
+    pub fn heap_bytes(&self) -> usize {
+        let dyn_columns: usize = self
+            .dyn_columns
+            .iter()
+            .map(|c| c.name.capacity() + c.cells.heap_bytes() + c.validity.heap_bytes())
+            .sum();
+        let dicts: usize = self
+            .dyn_col_dicts
+            .iter()
+            .flatten()
+            .map(|d| {
+                vec_heap(&d.distinct)
+                    + d.distinct.iter().map(Vec::capacity).sum::<usize>()
+                    + vec_heap(&d.ids)
+            })
+            .sum();
+        let residual: usize = self
+            .residual_attrs
+            .iter()
+            .map(|row| vec_heap(row) + attr_pairs_heap(row))
+            .sum();
+        vec_heap(&self.ts_ns)
+            + vec_heap(&self.observed_ts_ns)
+            + vec_heap(&self.severity_num)
+            + vec_heap(&self.flags)
+            + self.severity_text.heap_bytes()
+            + self.body.heap_bytes()
+            + vec_heap(&self.trace_id)
+            + self.trace_id_validity.heap_bytes()
+            + vec_heap(&self.span_id)
+            + self.span_id_validity.heap_bytes()
+            + vec_heap(&self.stream_refs)
+            + vec_heap(&self.stream_ids)
+            + vec_heap(&self.stream_attrs)
+            + self.stream_attrs.iter().map(Vec::capacity).sum::<usize>()
+            + vec_heap(&self.dyn_columns)
+            + dyn_columns
+            + vec_heap(&self.dyn_col_dicts)
+            + dicts
+            + vec_heap(&self.residual_attrs)
+            + residual
+    }
+
     /// Builds a batch from a sequence of records, column by column. This is the
     /// bridge the writer-level differential test and the loader (#604) use to
     /// reach the columnar path with the same records the row path sees.
@@ -939,7 +1046,38 @@ impl ColumnarLogBatch {
     /// the same record become `residual_attrs`. It does not decide the budget,
     /// the stream directory ordering across batches, or the block layout -- all
     /// of which the writer owns.
+    ///
+    /// For callers whose values cannot reach a column's byte limit (tests and
+    /// benches). A value that would take its column past [`VAR_BYTES_MAX`]
+    /// bytes is not stored and its row stays marked present, so the batch
+    /// fails [`Self::validate`]; [`Self::try_from_records`] returns that
+    /// refusal instead.
     pub fn from_records(records: &[LogRecord]) -> Self {
+        Self::build_from_records(records, VAR_BYTES_MAX).0
+    }
+
+    /// [`Self::from_records`], returning [`LogSegError::LimitExceeded`] naming
+    /// the column when a value would take it past its byte limit.
+    pub fn try_from_records(records: &[LogRecord]) -> Result<Self, LogSegError> {
+        Self::try_from_records_with_limit(records, VAR_BYTES_MAX)
+    }
+
+    /// [`Self::try_from_records`] with each `Str`/`Bytes` column's byte limit
+    /// lowered to `limit`, so a test reaches the refusal without holding
+    /// `u32::MAX` bytes.
+    fn try_from_records_with_limit(
+        records: &[LogRecord],
+        limit: usize,
+    ) -> Result<Self, LogSegError> {
+        match Self::build_from_records(records, limit) {
+            (batch, None) => Ok(batch),
+            (_, Some(refused)) => Err(refused),
+        }
+    }
+
+    /// The batch [`Self::from_records`] builds, and the first push its byte
+    /// limit refused, with the column named.
+    fn build_from_records(records: &[LogRecord], limit: usize) -> (Self, Option<LogSegError>) {
         use std::collections::BTreeMap;
 
         let n = records.len();
@@ -955,6 +1093,7 @@ impl ColumnarLogBatch {
         let mut col_cells: BTreeMap<(String, u8), (DynCells, Bitmap)> = BTreeMap::new();
 
         batch.residual_attrs = vec![Vec::new(); n];
+        let mut refused: Option<LogSegError> = None;
 
         for (row, r) in records.iter().enumerate() {
             batch.ts_ns.push(r.ts_ns);
@@ -994,15 +1133,31 @@ impl ColumnarLogBatch {
                 let ty = attr_field_type(v);
                 let key = (k.clone(), ty.to_u8());
                 if taken.insert(key.clone()) {
-                    let (cells, validity) = col_cells
-                        .entry(key)
-                        .or_insert_with(|| (DynCells::new(ty), Bitmap::with_capacity(n)));
+                    let (cells, validity) = col_cells.entry(key).or_insert_with(|| {
+                        let mut cells = DynCells::new(ty);
+                        match &mut cells {
+                            DynCells::Str(v) => *v = VarBytes::with_byte_limit(0, 0, limit),
+                            DynCells::Bytes(b) => {
+                                b.values = VarBytes::with_byte_limit(0, 0, limit);
+                            }
+                            DynCells::I64(_) | DynCells::F64(_) | DynCells::Bool(_) => {}
+                        }
+                        (cells, Bitmap::with_capacity(n))
+                    });
                     // The column was created for this value's resolved type,
                     // so only the byte limit can refuse the push. The row is
                     // marked present either way: a refused cell leaves the
                     // column one cell short of its validity, which `validate`
                     // refuses, rather than silently dropping the value.
-                    let _ = cells.push_value(v);
+                    if let Err(e) = cells.push_value(v) {
+                        let detail = match e {
+                            LogSegError::LimitExceeded(detail) => detail,
+                            other => other.to_string(),
+                        };
+                        refused.get_or_insert_with(|| {
+                            LogSegError::LimitExceeded(format!("column {k:?}: {detail}"))
+                        });
+                    }
                     validity.pad_to(row);
                     validity.push(true);
                 } else {
@@ -1040,7 +1195,7 @@ impl ColumnarLogBatch {
             });
         }
 
-        batch
+        (batch, refused)
     }
 
     /// Fills [`Self::dyn_col_dicts`] with the dictionary shape of every
@@ -1086,6 +1241,48 @@ impl Default for ColumnarLogBatch {
 mod tests {
     use super::*;
     use crate::record::{resolve_value, stream_attrs_bytes};
+
+    #[test]
+    fn heap_bytes_sums_buffer_capacities_not_lengths() {
+        let mut batch = ColumnarLogBatch::new();
+        // `new` allocates only the two text columns' leading offset.
+        assert_eq!(batch.heap_bytes(), 2 * size_of::<u32>());
+
+        batch.ts_ns = Vec::with_capacity(10);
+        batch.ts_ns.push(1);
+        batch.body = VarBytes::with_capacity(4, 100);
+        batch.stream_attrs = vec![Vec::with_capacity(7)];
+        let cells = VarBytes::with_capacity(3, 33);
+        let mut nested = BytesCells::new();
+        nested.values = VarBytes::with_capacity(0, 0);
+        nested.nested = vec![(0, AttrValue::Str(String::with_capacity(9)))];
+        let nested_pairs = nested.nested.capacity() * size_of::<(u32, AttrValue)>();
+        batch.dyn_columns = vec![
+            DynColumn {
+                name: String::with_capacity(5),
+                field_type: FieldType::Str,
+                cells: DynCells::Str(cells),
+                validity: Bitmap::with_capacity(16),
+            },
+            DynColumn {
+                name: String::new(),
+                field_type: FieldType::Bytes,
+                cells: DynCells::Bytes(nested),
+                validity: Bitmap::new(),
+            },
+        ];
+        let want = 2 * size_of::<u32>() // severity_text offsets, body replaced below
+            - size_of::<u32>()
+            + 10 * 8 // ts_ns: capacity 10, length 1
+            + 5 * size_of::<u32>() + 100 // body: 5 offsets, 100 data
+            + size_of::<Vec<u8>>() + 7 // stream_attrs
+            + 2 * size_of::<DynColumn>()
+            + 5 + 4 * size_of::<u32>() + 33 + 2 // Str column: name, offsets, data, bits
+            + size_of::<u32>() // Bytes column offsets
+            + nested_pairs
+            + 9;
+        assert_eq!(batch.heap_bytes(), want);
+    }
 
     /// A distinct stream id per `n` (up to `u32::MAX` streams), with the
     /// ordering of `n` matching `LogStreamId`'s own `Ord` (big-endian bytes in
@@ -1562,6 +1759,32 @@ mod tests {
             VarBytes::with_byte_limit(0, 0, usize::MAX).limit,
             VAR_BYTES_MAX,
             "a limit above what u32 offsets address is lowered to it"
+        );
+    }
+
+    /// `try_from_records` returns the byte-limit refusal of a dynamic cell,
+    /// naming the column, where `from_records` leaves a batch `validate`
+    /// refuses.
+    #[test]
+    fn try_from_records_names_the_column_a_value_overflows() {
+        let mut first = wide_record(0, 1);
+        first.attrs = vec![("url".into(), AttrValue::Str("abcd".into()))];
+        let mut second = wide_record(0, 2);
+        second.attrs = vec![("url".into(), AttrValue::Str("e".into()))];
+        let records = [first, second];
+
+        ColumnarLogBatch::try_from_records_with_limit(&records[..1], 4).expect("4 of 4 bytes");
+        match ColumnarLogBatch::try_from_records_with_limit(&records, 4) {
+            Err(LogSegError::LimitExceeded(msg)) => assert!(
+                msg.starts_with("column \"url\": ") && msg.contains("past its limit of 4 bytes"),
+                "the refusal names the column and the limit: {msg}"
+            ),
+            other => panic!("expected Err(LimitExceeded), got {other:?}"),
+        }
+        let unchecked = ColumnarLogBatch::build_from_records(&records, 4).0;
+        assert!(
+            unchecked.validate().is_err(),
+            "the batch from_records would return fails validate"
         );
     }
 

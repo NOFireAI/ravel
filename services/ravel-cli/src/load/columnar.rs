@@ -11,8 +11,9 @@ pub(super) enum ColBuildError {
     Row { row: u64, reason: String },
 }
 
-/// The load error for a value that would take `column` past the 4 GiB one
-/// batch's `u32` offsets address: the column's bytes grow with the batch's
+/// The load error for a value that would take `column` past the `u32::MAX`
+/// bytes (one byte short of 4 GiB) one batch's `u32` offsets address: the
+/// column's bytes grow with the batch's
 /// rows, so a smaller `--batch-rows` is the lever.
 fn column_too_large(column: &str, e: &LogSegError) -> String {
     format!(
@@ -114,7 +115,8 @@ pub(super) fn build_columnar_batch(
     // slot fed by several columns (one cell per row wins it) and a dictionary
     // column's hint is unbounded, so the cap is what the slot can hold: one
     // cell per row, each at most `max_attribute_value_len` bytes, which the row
-    // loop's admission check enforces before any push. A span whose columns
+    // loop's admission check enforces before any push, and never more than the
+    // `VAR_BYTES_MAX` a column can hold before `try_push` refuses. A span whose columns
     // cannot be located adds nothing; the row loop raises its error in order.
     let mut slot_hint: Vec<(usize, usize)> = vec![(0, 0); slot_keys.len()];
     for (span, _) in spans {
@@ -133,7 +135,8 @@ pub(super) fn build_columnar_batch(
         hint.0 = hint.0.min(total_rows);
         hint.1 = hint
             .1
-            .min(hint.0.saturating_mul(limits.max_attribute_value_len));
+            .min(hint.0.saturating_mul(limits.max_attribute_value_len))
+            .min(ravel_logseg::VAR_BYTES_MAX);
     }
 
     // A slot's cells and validity are allocated on its first present value: a

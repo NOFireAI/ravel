@@ -79,6 +79,7 @@ async fn zero_levers_are_rejected() {
             DEFAULT_TARGET_BYTES,
             None,
             RlogZstdLevel::DEFAULT,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -112,6 +113,7 @@ async fn the_entry_point_warns_about_the_levers_it_ignores() {
         DEFAULT_TARGET_BYTES,
         None,
         RlogZstdLevel::DEFAULT,
+        None,
         NOW_NS,
         &mut sink,
     )

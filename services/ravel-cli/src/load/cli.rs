@@ -97,16 +97,14 @@ pub fn dynamic_column_warnings(
 ///
 /// Why a target of a few MiB is a no-op on a wide corpus. The value reaches
 /// `IngestConfig::target_bytes` unmodified and the shard actor does consult it,
-/// but against `est_bytes`: the buffer's *estimated in-memory footprint*
-/// (`est_record_bytes`/`est_columnar_bytes` in
-/// crates/ravel-ingest/src/log_shard.rs), where every attribute occurrence
-/// charges a `size_of::<(String, AttrValue)>()` pair header plus its key bytes
-/// and its uncompressed value bytes. For the 104-column ClickBench mapping that
-/// is roughly 8 KB per row, against objects the same load writes at a bit over
-/// 100 bytes per row. A target read off an observed object size is therefore
-/// tens of times below the footprint of the rows that object holds. On top of
+/// but against the buffer's estimated *uncompressed object content*
+/// (`est_record_object_bytes`/`est_columnar_object_bytes` in
+/// crates/ravel-ingest/src/log_shard.rs): body, severity text, stream
+/// attributes, attribute names and values, and fixed per-row fields. Stored
+/// objects are compressed, so a target read off an observed object size is
+/// several times below the content of the rows that object holds. On top of
 /// that the comparison runs once per write, after a whole batch's per-shard
-/// slice has merged, so any target at or below one slice's footprint
+/// slice has merged, so any target at or below one slice's content
 /// (`--batch-rows / --shards` rows' worth) is already exceeded by the first
 /// write into an empty buffer and flushes it, exactly as `1` does.
 ///
@@ -150,16 +148,14 @@ pub fn target_bytes_no_effect_warning(
          with --pipeline-depth 1, or when the gap between a shard's writes exceeds the \
          max-flush-delay clock, the age trigger flushes a waiting buffer before the next \
          batch arrives and no target value can make it accumulate -- check the pipeline \
-         depth and write cadence before changing the target. Separately, the target is compared against the shard buffer's ESTIMATED in-memory \
-         footprint, not the encoded object size: every attribute occurrence charges a {pair}-byte \
-         (name, value) pair header plus its key and uncompressed value bytes, plus the \
-         stream-attribute blob and 32 bytes per row, and the check runs once per write after a \
-         whole batch has merged. So a target at or below one batch's per-shard slice (about \
-         {slice} rows here, at --batch-rows {batch_rows} over {shards} shards) is already exceeded \
-         by the first write into an empty buffer and flushes it. For objects that span several \
-         batches, raise --target-bytes above that slice's estimated footprint, or lower \
-         --batch-rows.",
-        pair = size_of::<(String, AttrValue)>(),
+         depth and write cadence before changing the target. Separately, the target is compared \
+         against the buffer's estimated UNCOMPRESSED object content (body, severity text, stream \
+         attributes, attribute names and values, fixed per-row fields), not the stored object \
+         size, and the check runs once per write after a whole batch has merged. So a target at \
+         or below one batch's per-shard slice (about {slice} rows here, at --batch-rows \
+         {batch_rows} over {shards} shards) is already exceeded by the first write into an empty \
+         buffer and flushes it. For objects that span several batches, raise --target-bytes \
+         above that slice's estimated content, or lower --batch-rows.",
         slice = batch_rows / (shards.max(1) as usize),
     ))
 }
@@ -195,6 +191,7 @@ pub async fn run(
     target_bytes: usize,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
+    load_memory_bytes: Option<u64>,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -213,6 +210,7 @@ pub async fn run(
         target_bytes,
         max_flush_delay,
         zstd_level,
+        load_memory_bytes,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -243,6 +241,7 @@ pub(crate) async fn run_warning_to(
     target_bytes: usize,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
+    load_memory_bytes: Option<u64>,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -255,6 +254,9 @@ pub(crate) async fn run_warning_to(
     };
     let _ = writeln!(warnings, "{admission_warning}");
     if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_load_memory_warning(load_memory_bytes, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
 
@@ -305,6 +307,13 @@ pub(crate) async fn run_warning_to(
         MappingSection::Logs(logs) => logs,
     };
 
+    // The loader resolves the budget once it knows the read-cursor count the
+    // floor depends on.
+    let load_memory = LoadMemoryRequest::from_flag_on_host(load_memory_bytes);
+    if let Some(warning) = load_memory.fallback_warning() {
+        let _ = writeln!(warnings, "{warning}");
+    }
+
     // The production entry point drives the columnar fast path (ADR-0109) with
     // the operator-configured decode-queue depth; `load` keeps a stable
     // signature for tests and callers that want the default depth.
@@ -328,11 +337,15 @@ pub(crate) async fn run_warning_to(
         None,
         None,
         zstd_level,
+        Some(LoadMemoryOptions::new(load_memory)),
     )
     .await
     {
         Ok(report) => {
             print_summary(&report);
+            if let Some(warning) = &report.load_memory_warning {
+                let _ = writeln!(warnings, "{warning}");
+            }
             // A requested offset past the end of the file is always an operator
             // error: resuming an already-complete file needs
             // `--skip-rows == total rows` exactly, and anything larger is a
@@ -653,6 +666,26 @@ pub(super) fn unused_zstd_level_warning(
     })
 }
 
+/// The warning for a `--load-memory-bytes` a metrics or spans load cannot
+/// use, or `None` when the flag is unset or the load is a logs load. Only the
+/// logs loader's columnar path charges its batches to the budget.
+pub(super) fn unused_load_memory_warning(
+    load_memory_bytes: Option<u64>,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    load_memory_bytes.map(|bytes| {
+        format!(
+            "warning: a {noun} load ignores --load-memory-bytes {bytes}. The budget applies \
+             only to the batches a logs load holds."
+        )
+    })
+}
+
 /// Print the metrics load's completion summary to stdout.
 fn print_metrics_summary(report: &MetricsLoadReport) {
     let secs = report.elapsed.as_secs_f64();
@@ -785,6 +818,20 @@ fn print_summary(report: &LoadReport) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    let memory = &report.load_memory;
+    // A resolved budget always has a nonzero floor; a derived budget can be 0.
+    if memory.floor_bytes > 0 {
+        println!(
+            "  load memory      : budget {} bytes ({}), floor {} bytes, peak {} bytes, \
+             largest batch {} bytes, decoder waits {}",
+            memory.budget_bytes,
+            memory.source_label(),
+            memory.floor_bytes,
+            report.load_memory_peak_bytes,
+            report.load_memory_max_batch_bytes,
+            report.load_memory_waits,
+        );
+    }
     print_flush_mix(report);
     #[cfg(feature = "stage-timing")]
     print_stage_timings(report);
