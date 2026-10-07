@@ -4398,6 +4398,13 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
   merge-order-stable representative bit pattern for a float group key is
   proven.
 
+A `DISTINCT ON` is classified by its ON keys the same way: a non-float key
+is eligible. The optimizer turns it into a `first_value` aggregate ordered by
+the statement's `ORDER BY`, and the statement is admitted only when every
+selected column is an `ORDER BY` term (ADR-0022, DISTINCT ON amendment), so
+the row each group keeps is the same whichever order the partial states merge
+in.
+
 DataFusion's built-in `avg` coerces every non-decimal, non-duration argument
 to `Float64` before planning finishes, so an integer argument would never
 reach an accumulator as an integer, and the classifier would have no resolved

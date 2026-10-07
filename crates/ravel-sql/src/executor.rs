@@ -4073,7 +4073,8 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 ///   ([`distinct_on_order_is_total`]): every output column of the node must
 ///   appear among the `ORDER BY` terms as a plain column reference. Nothing
 ///   appends tiebreak terms to it; a `DISTINCT ON` without such an order is
-///   ineligible. Plain `DISTINCT` (`Distinct::All`) picks no row and is
+///   ineligible, and [`refuse_unadmitted_planned_shapes`] refuses it before
+///   it runs at all. Plain `DISTINCT` (`Distinct::All`) picks no row and is
 ///   admitted. `Join` and `Window` are outside the allowlist for the
 ///   original reason, one level up: nothing here has classified their spill
 ///   behavior.

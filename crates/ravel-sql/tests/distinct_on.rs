@@ -8,7 +8,7 @@
 //! row, so a `DISTINCT ON` whose `ORDER BY` ties is refused before it plans.
 //!
 //! - `a_total_order_distinct_on_is_exact_under_parallel_final_aggregation`:
-//!   two total-order statements over three segments, at several partition
+//!   three total-order statements over three segments, at several partition
 //!   counts with their final aggregation fanned out across partitions, each
 //!   return the exact rows a hand derivation gives, signed zero and NaN
 //!   payloads included.
@@ -110,7 +110,11 @@ const LATEST_PER_METRIC: &str = "SELECT DISTINCT ON (metric) metric, ts, value \
 /// The rows [`LATEST_PER_METRIC`] must return, in its `ORDER BY` order.
 fn latest_per_metric_rows() -> Vec<Row> {
     let row = |metric: &str, ts: i64, value: f64| {
-        vec![Cell::Text(metric.to_string()), Cell::Int(ts), Cell::float(value)]
+        vec![
+            Cell::Text(metric.to_string()),
+            Cell::Int(ts),
+            Cell::float(value),
+        ]
     };
     vec![
         row("a", 300, 3.0),
@@ -138,6 +142,31 @@ fn smallest_per_ts_rows() -> Vec<Row> {
         row(500, -0.0),
         row(600, nan_a()),
     ]
+}
+
+/// The latest sample of each series, as the user guide writes it.
+const LATEST_PER_SERIES: &str = "SELECT DISTINCT ON (series_id) series_id, ts, value \
+     FROM samples ORDER BY series_id, ts DESC, value";
+
+/// [`latest_per_metric_rows`] keyed by series id instead of metric name, in
+/// series id order. Each metric is one series.
+fn latest_per_series_rows() -> Vec<Row> {
+    let t = tenant();
+    let mut rows: Vec<Row> = latest_per_metric_rows()
+        .into_iter()
+        .map(|row| {
+            let Cell::Text(metric) = &row[0] else {
+                panic!("metric cell")
+            };
+            let id = util::series_id_for(&t, metric).to_vec();
+            vec![Cell::Bytes(id), row[1].clone(), row[2].clone()]
+        })
+        .collect();
+    rows.sort_by(|a, b| match (&a[0], &b[0]) {
+        (Cell::Bytes(a), Cell::Bytes(b)) => a.cmp(b),
+        _ => unreachable!("series id cells"),
+    });
+    rows
 }
 
 async fn rows(fixture: &Fixture, sql: &str) -> Vec<Row> {
@@ -174,11 +203,16 @@ async fn a_total_order_distinct_on_is_exact_under_parallel_final_aggregation() {
     let cases = [
         (LATEST_PER_METRIC, latest_per_metric_rows()),
         (SMALLEST_PER_TS, smallest_per_ts_rows()),
+        (LATEST_PER_SERIES, latest_per_series_rows()),
     ];
 
     let single = fixture_with(1, false).await;
     for (sql, expected) in &cases {
-        assert_eq!(&rows(&single, sql).await, expected, "single partition: {sql}");
+        assert_eq!(
+            &rows(&single, sql).await,
+            expected,
+            "single partition: {sql}"
+        );
     }
 
     for fetch_concurrency in [4usize, 8, 16] {
