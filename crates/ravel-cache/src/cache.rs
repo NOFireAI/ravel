@@ -1106,9 +1106,9 @@ mod tests {
     /// the same treatment as `insert`: a fetch that returns a slice of a 1 MiB
     /// buffer leaves that buffer uniquely owned once the returned handle drops.
     ///
-    /// FLIP (non-vacuity): in `get_or_fetch_outcome`, admit with
-    /// `self.inner.fifo.lock().insert(..)` on the raw fetched value (or any
-    /// admission that bypasses `owned_exact`). `big.is_unique()` then fails.
+    /// FLIP (non-vacuity): move the `owned_exact` call out of `Inner::insert`
+    /// and into the public `insert` only. The `insert` test above still
+    /// passes, and `big.is_unique()` here fails.
     #[tokio::test]
     async fn get_or_fetch_of_a_slice_stores_an_owned_copy() {
         let cache: Cache<&'static str> = Cache::new(generous_limits());
