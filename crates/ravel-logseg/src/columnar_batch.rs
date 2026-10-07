@@ -8,25 +8,25 @@
 //! buffer holds only the present rows and a per-row [`Bitmap`] records which
 //! rows are present -- so an all-absent column costs no per-row materialization.
 //!
-//! ## Dynamic attribute cells carry the original [`AttrValue`]
+//! ## Dynamic attribute cells are typed and dense
 //!
-//! A dynamic column stores one [`AttrValue`] per present cell rather than a
-//! pre-resolved typed buffer. The reason is byte-identity: when a `List`/`Map`
-//! value (which [`resolve_value`] canonicalizes into a `Bytes` column) or a
-//! value past the `max_dynamic_columns` budget folds into `attrs_raw`, the row
-//! path canonicalizes the *original* attribute, and the canonical bytes of
-//! `List`/`Map` differ from the canonical bytes of the `Bytes` column value it
-//! resolves to. Keeping the original attribute makes the writer's `attrs_raw`
-//! reproduction exact. Pre-resolved typed value buffers (`Vec<i64>` and the
-//! like) are a follow-up performance refinement (#603 covers the dictionary
-//! shape); this task builds the plain-value, correctness-anchoring form.
+//! A dynamic column stores its present cells as one typed buffer
+//! ([`DynCells`]): string bytes behind `u32` offsets, `Vec<i64>`, `Vec<f64>`,
+//! `Vec<bool>`, or resolved bytes for a `Bytes` column. A `List`/`Map` cell
+//! resolves to a `Bytes` column holding its `canonical_value_bytes`, but when it
+//! folds into `attrs_raw` (past the `max_dynamic_columns` budget) or competes in
+//! the merged view, the row path canonicalizes the *original* attribute, whose
+//! canonical bytes differ from those of the `Bytes` value it resolves to. So a
+//! `Bytes` column also keeps the original `List`/`Map` values in a sparse side
+//! list ([`BytesCells::nested`]); every other cell type round-trips exactly from
+//! its typed form.
 
 use std::collections::HashMap;
 
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::error::LogSegError;
-use crate::record::{ColumnValue, FieldType, LogRecord, resolve_value};
+use crate::record::{ColumnValue, FieldType, LogRecord, canonical_value_bytes};
 
 /// A packed presence bitmap, one bit per row, LSB-first within each byte.
 ///
@@ -44,6 +44,23 @@ impl Bitmap {
         Bitmap {
             bits: Vec::new(),
             len: 0,
+        }
+    }
+
+    /// An empty bitmap with room for `rows` rows.
+    pub fn with_capacity(rows: usize) -> Self {
+        Bitmap {
+            bits: Vec::with_capacity(rows.div_ceil(8)),
+            len: 0,
+        }
+    }
+
+    /// Extends the bitmap to `len` rows with absent rows. A no-op when it
+    /// already describes `len` or more rows.
+    pub fn pad_to(&mut self, len: usize) {
+        if len > self.len {
+            self.bits.resize(len.div_ceil(8), 0);
+            self.len = len;
         }
     }
 
@@ -91,25 +108,129 @@ impl Bitmap {
 /// A variable-length byte column: contiguous `data` with `offsets` marking each
 /// value's end. `offsets` has one more entry than there are values; value `i`
 /// is `data[offsets[i]..offsets[i + 1]]`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// The `u32` offsets address at most [`VAR_BYTES_MAX`] bytes per column.
+/// [`Self::try_push`] refuses a value that would pass that limit;
+/// [`Self::push`] does not check, and a column it took past the limit fails
+/// [`ColumnarLogBatch::validate`].
+#[derive(Clone, Debug)]
 pub struct VarBytes {
     offsets: Vec<u32>,
     data: Vec<u8>,
+    /// The most value bytes [`Self::try_push`] admits, at most
+    /// [`VAR_BYTES_MAX`]. Not part of the column's value: equality ignores it.
+    limit: usize,
 }
+
+/// The most value bytes one [`VarBytes`] holds: the largest `u32` offset.
+pub const VAR_BYTES_MAX: usize = u32::MAX as usize;
+
+impl Default for VarBytes {
+    /// No offsets at all, not even the leading `0` [`Self::new`] puts in place.
+    fn default() -> Self {
+        VarBytes {
+            offsets: Vec::new(),
+            data: Vec::new(),
+            limit: VAR_BYTES_MAX,
+        }
+    }
+}
+
+impl PartialEq for VarBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.offsets == other.offsets && self.data == other.data
+    }
+}
+
+impl Eq for VarBytes {}
 
 impl VarBytes {
     /// An empty column with the leading `0` offset in place.
     pub fn new() -> Self {
+        Self::with_capacity(0, 0)
+    }
+
+    /// An empty column with room for `values` values totalling `bytes` bytes.
+    pub fn with_capacity(values: usize, bytes: usize) -> Self {
+        Self::with_byte_limit(values, bytes, VAR_BYTES_MAX)
+    }
+
+    /// [`Self::with_capacity`], with [`Self::try_push`] refusing a value that
+    /// would take the column past `limit` bytes. A `limit` above
+    /// [`VAR_BYTES_MAX`] is lowered to it. Lets a test reach the refusal
+    /// without holding 4 GiB.
+    pub fn with_byte_limit(values: usize, bytes: usize, limit: usize) -> Self {
+        let mut offsets = Vec::with_capacity(values.saturating_add(1));
+        offsets.push(0);
         VarBytes {
-            offsets: vec![0],
-            data: Vec::new(),
+            offsets,
+            data: Vec::with_capacity(bytes),
+            limit: limit.min(VAR_BYTES_MAX),
         }
     }
 
-    /// Appends one value.
+    /// Appends one value without checking the column's byte limit: past
+    /// [`VAR_BYTES_MAX`] bytes the offset wraps, and
+    /// [`ColumnarLogBatch::validate`] refuses the column. A producer that can
+    /// reach that size uses [`Self::try_push`].
     pub fn push(&mut self, value: &[u8]) {
         self.data.extend_from_slice(value);
         self.offsets.push(self.data.len() as u32);
+    }
+
+    /// Appends one value, or refuses it with [`LogSegError::LimitExceeded`]
+    /// when the column would then hold more bytes than its limit
+    /// ([`VAR_BYTES_MAX`] unless set by [`Self::with_byte_limit`]). A refused
+    /// value is not stored.
+    pub fn try_push(&mut self, value: &[u8]) -> Result<(), LogSegError> {
+        let end = self
+            .data
+            .len()
+            .checked_add(value.len())
+            .filter(|&end| end <= self.limit)
+            .and_then(|end| u32::try_from(end).ok());
+        let Some(end) = end else {
+            return Err(LogSegError::LimitExceeded(format!(
+                "a {}-byte value would take a column holding {} bytes past its limit of {} \
+                 bytes, the most its u32 offsets address in one batch",
+                value.len(),
+                self.data.len(),
+                self.limit,
+            )));
+        };
+        self.data.extend_from_slice(value);
+        self.offsets.push(end);
+        Ok(())
+    }
+
+    /// Why the offsets do not describe `data`, if they do not: an offset
+    /// smaller than the one before it, a first offset other than `0`, or a
+    /// last offset other than `data.len()`. An empty `offsets` (the
+    /// [`Default`] column) describes zero values and passes. [`Self::get`]
+    /// cannot panic on a column this accepts.
+    pub fn offsets_error(&self) -> Option<String> {
+        let (Some(&first), Some(&last)) = (self.offsets.first(), self.offsets.last()) else {
+            return None;
+        };
+        if first != 0 {
+            return Some(format!("its first offset is {first}, not 0"));
+        }
+        if let Some(i) = self.offsets.windows(2).position(|w| w[1] < w[0]) {
+            return Some(format!(
+                "offset {} is {} but offset {i} before it is {}: the offsets are not \
+                 monotonic, as when more than {VAR_BYTES_MAX} bytes wrap them",
+                i + 1,
+                self.offsets[i + 1],
+                self.offsets[i],
+            ));
+        }
+        if last as usize != self.data.len() {
+            return Some(format!(
+                "its last offset is {last} but it holds {} bytes",
+                self.data.len()
+            ));
+        }
+        None
     }
 
     /// Number of values stored. `Default::default()` produces an empty
@@ -145,11 +266,270 @@ impl VarBytes {
     }
 }
 
+/// The present cells of a `Bytes` dynamic column.
+#[derive(Clone, Debug)]
+pub struct BytesCells {
+    /// One resolved value per present cell: a `Bytes` value's own bytes, or a
+    /// `List`/`Map` value's [`canonical_value_bytes`].
+    pub values: VarBytes,
+    /// `(slot, original value)` for every cell that is a `List` or `Map`,
+    /// strictly ascending by slot, with `values[slot]` its canonical bytes.
+    /// `attrs_raw` and the merged-view stamp canonicalize the original value,
+    /// whose encoding differs from that of the `Bytes` value it resolves to.
+    pub nested: Vec<(u32, AttrValue)>,
+}
+
+impl BytesCells {
+    /// An empty set of cells.
+    pub fn new() -> Self {
+        BytesCells {
+            values: VarBytes::new(),
+            nested: Vec::new(),
+        }
+    }
+
+    /// The original `List`/`Map` value of cell `slot`, when it is one.
+    pub fn nested_at(&self, slot: usize) -> Option<&AttrValue> {
+        let slot = u32::try_from(slot).ok()?;
+        self.nested
+            .binary_search_by_key(&slot, |(s, _)| *s)
+            .ok()
+            .map(|i| &self.nested[i].1)
+    }
+}
+
+impl Default for BytesCells {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The present cells of one dynamic column, dense in row order, one variant per
+/// [`FieldType`]. Cell `slot` is the column's `slot`-th present row.
+#[derive(Clone, Debug)]
+pub enum DynCells {
+    /// UTF-8 string bytes.
+    Str(VarBytes),
+    /// Resolved bytes, with the original of every `List`/`Map` cell.
+    Bytes(BytesCells),
+    I64(Vec<i64>),
+    /// Compared by bit pattern: NaN payloads and `-0.0` are significant.
+    F64(Vec<f64>),
+    Bool(Vec<bool>),
+}
+
+/// Structural equality with floats compared by bit pattern.
+fn attr_bits_eq(a: &AttrValue, b: &AttrValue) -> bool {
+    match (a, b) {
+        (AttrValue::F64(x), AttrValue::F64(y)) => x.to_bits() == y.to_bits(),
+        (AttrValue::List(x), AttrValue::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| attr_bits_eq(p, q))
+        }
+        (AttrValue::Map(x), AttrValue::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((kp, p), (kq, q))| kp == kq && attr_bits_eq(p, q))
+        }
+        _ => a == b,
+    }
+}
+
+impl PartialEq for DynCells {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DynCells::Str(a), DynCells::Str(b)) => a == b,
+            (DynCells::Bytes(a), DynCells::Bytes(b)) => {
+                a.values == b.values
+                    && a.nested.len() == b.nested.len()
+                    && a.nested
+                        .iter()
+                        .zip(&b.nested)
+                        .all(|((sa, va), (sb, vb))| sa == sb && attr_bits_eq(va, vb))
+            }
+            (DynCells::I64(a), DynCells::I64(b)) => a == b,
+            (DynCells::F64(a), DynCells::F64(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (DynCells::Bool(a), DynCells::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl DynCells {
+    /// No cells, of type `field_type`.
+    pub fn new(field_type: FieldType) -> Self {
+        Self::with_capacity(field_type, 0, 0)
+    }
+
+    /// No cells, with room for `cells` cells and, for `Str`/`Bytes`, `bytes`
+    /// value bytes.
+    pub fn with_capacity(field_type: FieldType, cells: usize, bytes: usize) -> Self {
+        match field_type {
+            FieldType::Str => DynCells::Str(VarBytes::with_capacity(cells, bytes)),
+            FieldType::Bytes => DynCells::Bytes(BytesCells {
+                values: VarBytes::with_capacity(cells, bytes),
+                nested: Vec::new(),
+            }),
+            FieldType::I64 => DynCells::I64(Vec::with_capacity(cells)),
+            FieldType::F64 => DynCells::F64(Vec::with_capacity(cells)),
+            FieldType::Bool => DynCells::Bool(Vec::with_capacity(cells)),
+        }
+    }
+
+    /// The cells of `values`, in order, as a column of type `field_type`.
+    pub fn from_values(field_type: FieldType, values: &[AttrValue]) -> Result<Self, LogSegError> {
+        let mut cells = Self::with_capacity(field_type, values.len(), 0);
+        for v in values {
+            cells.push_value(v)?;
+        }
+        Ok(cells)
+    }
+
+    /// The column type this variant stores.
+    pub fn field_type(&self) -> FieldType {
+        match self {
+            DynCells::Str(_) => FieldType::Str,
+            DynCells::Bytes(_) => FieldType::Bytes,
+            DynCells::I64(_) => FieldType::I64,
+            DynCells::F64(_) => FieldType::F64,
+            DynCells::Bool(_) => FieldType::Bool,
+        }
+    }
+
+    /// Number of cells.
+    pub fn len(&self) -> usize {
+        match self {
+            DynCells::Str(v) => v.len(),
+            DynCells::Bytes(b) => b.values.len(),
+            DynCells::I64(v) => v.len(),
+            DynCells::F64(v) => v.len(),
+            DynCells::Bool(v) => v.len(),
+        }
+    }
+
+    /// Whether there are zero cells.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Appends `value`, refusing one whose resolved type is not this column's
+    /// ([`LogSegError::MalformedColumnarBatch`]) or one that would take a
+    /// `Str`/`Bytes` column past its byte limit ([`VarBytes::try_push`]). A
+    /// refused value is not stored.
+    pub fn push_value(&mut self, value: &AttrValue) -> Result<(), LogSegError> {
+        match (&mut *self, value) {
+            (DynCells::Str(v), AttrValue::Str(s)) => v.try_push(s.as_bytes())?,
+            (DynCells::Bytes(b), AttrValue::Bytes(x)) => b.values.try_push(x)?,
+            (DynCells::Bytes(b), AttrValue::List(_) | AttrValue::Map(_)) => {
+                let slot = u32::try_from(b.values.len()).map_err(|_| {
+                    LogSegError::MalformedColumnarBatch("more than u32::MAX cells".into())
+                })?;
+                b.values.try_push(&canonical_value_bytes(value))?;
+                b.nested.push((slot, value.clone()));
+            }
+            (DynCells::I64(v), AttrValue::I64(x)) => v.push(*x),
+            (DynCells::F64(v), AttrValue::F64(x)) => v.push(*x),
+            (DynCells::Bool(v), AttrValue::Bool(x)) => v.push(*x),
+            (cells, _) => {
+                return Err(LogSegError::MalformedColumnarBatch(format!(
+                    "a {:?} value cannot be a cell of a {:?} column",
+                    attr_field_type(value),
+                    cells.field_type(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends cell `slot` of `src`, which must be of the same type, copying
+    /// its bytes and cloning a nested original. Refuses a cell that would take
+    /// a `Str`/`Bytes` column past its byte limit ([`VarBytes::try_push`]),
+    /// storing nothing.
+    pub fn push_from(&mut self, src: &DynCells, slot: usize) -> Result<(), LogSegError> {
+        match (&mut *self, src) {
+            (DynCells::Str(d), DynCells::Str(s)) => d.try_push(s.get(slot))?,
+            (DynCells::Bytes(d), DynCells::Bytes(s)) => {
+                let at = u32::try_from(d.values.len()).map_err(|_| {
+                    LogSegError::MalformedColumnarBatch("more than u32::MAX cells".into())
+                })?;
+                d.values.try_push(s.values.get(slot))?;
+                if let Some(original) = s.nested_at(slot) {
+                    d.nested.push((at, original.clone()));
+                }
+            }
+            (DynCells::I64(d), DynCells::I64(s)) => d.push(s[slot]),
+            (DynCells::F64(d), DynCells::F64(s)) => d.push(s[slot]),
+            (DynCells::Bool(d), DynCells::Bool(s)) => d.push(s[slot]),
+            (d, s) => {
+                return Err(LogSegError::MalformedColumnarBatch(format!(
+                    "a {:?} cell cannot be appended to a {:?} column",
+                    s.field_type(),
+                    d.field_type(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored bytes of cell `slot` of a `Str` or `Bytes` column; `None` for
+    /// any other type.
+    pub fn bytes_at(&self, slot: usize) -> Option<&[u8]> {
+        match self {
+            DynCells::Str(v) => Some(v.get(slot)),
+            DynCells::Bytes(b) => Some(b.values.get(slot)),
+            _ => None,
+        }
+    }
+
+    /// Cell `slot` as the attribute value the row path would have held: the
+    /// original `List`/`Map` for a nested cell. Fails only on a `Str` cell
+    /// that is not UTF-8, which [`ColumnarLogBatch::validate`] refuses.
+    pub fn value(&self, slot: usize) -> Result<AttrValue, LogSegError> {
+        Ok(match self {
+            DynCells::Str(v) => {
+                AttrValue::Str(String::from_utf8(v.get(slot).to_vec()).map_err(|_| {
+                    LogSegError::MalformedColumnarBatch(format!("Str cell {slot} is not UTF-8"))
+                })?)
+            }
+            DynCells::Bytes(b) => match b.nested_at(slot) {
+                Some(original) => original.clone(),
+                None => AttrValue::Bytes(b.values.get(slot).to_vec()),
+            },
+            DynCells::I64(v) => AttrValue::I64(v[slot]),
+            DynCells::F64(v) => AttrValue::F64(v[slot]),
+            DynCells::Bool(v) => AttrValue::Bool(v[slot]),
+        })
+    }
+
+    /// Cell `slot` resolved for storage: what [`resolve_value`] returns for the
+    /// value the cell holds.
+    pub fn column_value(&self, slot: usize) -> ColumnValue {
+        match self {
+            DynCells::Str(v) => ColumnValue::Str(v.get(slot).to_vec()),
+            DynCells::Bytes(b) => ColumnValue::Bytes(b.values.get(slot).to_vec()),
+            DynCells::I64(v) => ColumnValue::I64(v[slot]),
+            DynCells::F64(v) => ColumnValue::F64(v[slot].to_bits()),
+            DynCells::Bool(v) => ColumnValue::Bool(v[slot]),
+        }
+    }
+
+    /// Cell `slot`'s share of the writer's per-row block-size estimate: the
+    /// stored length plus two for `Str`/`Bytes`, a flat eight otherwise.
+    pub fn estimate(&self, slot: usize) -> usize {
+        match self.bytes_at(slot) {
+            Some(b) => b.len() + 2,
+            None => 8,
+        }
+    }
+}
+
 /// One dynamic attribute column: an attribute `name` observed with one resolved
-/// [`FieldType`], its dense per-present-row [`AttrValue`] cells, and a per-row
-/// presence [`Bitmap`]. A `(name, type)` pair is unique within a batch; a name
-/// seen with two value types yields two columns (per-type splitting, exactly as
-/// the row path splits). `cells.len()` equals `validity.count_present()`.
+/// [`FieldType`], its dense per-present-row typed cells, and a per-row presence
+/// [`Bitmap`]. A `(name, type)` pair is unique within a batch; a name seen with
+/// two value types yields two columns (per-type splitting, exactly as the row
+/// path splits). `cells.len()` equals `validity.count_present()`.
 ///
 /// The cell that lands here is the *first* occurrence of the `(name, type)`
 /// pair within a record, matching the row path's rule that the first occurrence
@@ -159,10 +539,10 @@ impl VarBytes {
 pub struct DynColumn {
     /// The attribute name.
     pub name: String,
-    /// The resolved column type (`resolve_value(cell).0` for every cell).
+    /// The resolved column type; `cells` is the variant of this type.
     pub field_type: FieldType,
     /// Dense present-row values, in row order.
-    pub cells: Vec<AttrValue>,
+    pub cells: DynCells,
     /// Presence over all `num_rows` rows.
     pub validity: Bitmap,
 }
@@ -171,10 +551,11 @@ pub struct DynColumn {
 /// mirroring a decoded RLOG dictionary string column, ADR-0099 decision 4):
 /// a `distinct` value set and one `id` per PRESENT cell, parallel to the
 /// column's [`DynColumn::cells`]. `ids[slot]` indexes `distinct`, and
-/// `distinct[ids[slot]]` equals `resolve_value(&cells[slot]).1`'s bytes, so the
-/// writer can map each distinct value to its RLOG entry once per block instead
-/// of once per row. `distinct` may hold entries no id references. The set order
-/// is the producer's; the writer sorts it to match [`encode_strings`].
+/// `distinct[ids[slot]]` equals the cell's stored bytes
+/// ([`DynCells::bytes_at`]), so the writer can map each distinct value to its
+/// RLOG entry once per block instead of once per row. `distinct` may hold
+/// entries no id references. The set order is the producer's; the writer sorts
+/// it to match [`encode_strings`].
 ///
 /// [`encode_strings`]: crate::encoding::encode_strings
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,34 +684,36 @@ impl ColumnarLogBatch {
     /// - Every `stream_refs` entry is a valid index into `stream_ids`.
     /// - Every `dyn_columns` entry's `validity` describes `num_rows` rows, and
     ///   its `cells` has exactly as many entries as `validity` marks present.
-    /// - Every cell of a dyn column has the column's `field_type`, using the
-    ///   writer's own mapping (`resolve_value`, `record.rs`): `Str`, `I64`,
-    ///   `F64`, `Bool` and `Bytes` map to themselves, and `List` and `Map`
-    ///   map to `Bytes`.
+    /// - Every dyn column's `cells` is the [`DynCells`] variant of its
+    ///   `field_type`.
+    /// - The offsets of `severity_text`, `body`, and every `Str`/`Bytes` dyn
+    ///   column describe their bytes ([`VarBytes::offsets_error`]): a column
+    ///   whose unchecked [`VarBytes::push`] wrapped them past
+    ///   [`VAR_BYTES_MAX`] bytes is refused here, not indexed.
+    /// - Every cell of a `Str` column is UTF-8.
+    /// - A `Bytes` column's `nested` slots are strictly ascending and below its
+    ///   cell count, each holds a `List` or `Map`, and that value's
+    ///   `canonical_value_bytes` equals the cell's stored bytes.
     /// - `dyn_col_dicts`, when non-empty, has exactly one entry per
     ///   `dyn_columns` entry; a present (`Some`) entry's `ids` has exactly one
     ///   id per present cell in its column, and every id is a valid index into
     ///   that entry's own `distinct`.
-    /// - For a present dictionary on a `Str` column, `distinct[ids[slot]]`
-    ///   equals each cell's bytes. On a `Bytes` column the same holds for
-    ///   every cell that is a `Bytes` value.
+    /// - For a present dictionary on a `Str` or `Bytes` column,
+    ///   `distinct[ids[slot]]` equals every cell's stored bytes.
     ///
     /// Does not check:
     ///
     /// - Two `dyn_columns` entries with the same `(name, field_type)`: the
     ///   writer does not check this either, and nothing here compares column
     ///   identities.
-    /// - More than 4 GiB of text in one `VarBytes` column, which wraps its
-    ///   `u32` offsets: `VarBytes` has no checked append path to detect it from.
-    /// - A dictionary entry's equality with its cell when the cell is a `List`
-    ///   or `Map` in a `Bytes` column: the cell's bytes exist only as
-    ///   `canonical_value_bytes`, which allocates, and this pass allocates
-    ///   nothing per cell.
     /// - The entries of a dictionary on an `I64`, `F64` or `Bool` column
     ///   against its cells. Its `ids` are checked for count and range like
     ///   any other dictionary's; the writer does not read such a dictionary.
     /// - `distinct` entries no id references, and the payload content of
-    ///   `stream_attrs`, `residual_attrs` and `AttrValue`s.
+    ///   `stream_attrs` and `residual_attrs`.
+    ///
+    /// The pass allocates only for a `nested` cell, whose canonical encoding
+    /// it recomputes.
     pub fn validate(&self) -> Result<(), LogSegError> {
         let malformed = |message: String| Err(LogSegError::MalformedColumnarBatch(message));
         let n = self.num_rows;
@@ -349,6 +732,11 @@ impl ColumnarLogBatch {
         for (name, len) in per_row {
             if len != n {
                 return malformed(format!("{name} has {len} entries but num_rows is {n}"));
+            }
+        }
+        for (name, values) in [("severity_text", &self.severity_text), ("body", &self.body)] {
+            if let Some(why) = values.offsets_error() {
+                return malformed(format!("{name} offsets are malformed: {why}"));
             }
         }
         let trace_len = self.trace_id_validity.count_present() * 16;
@@ -423,14 +811,62 @@ impl ColumnarLogBatch {
                     c.cells.len(),
                 ));
             }
-            for (cell, value) in c.cells.iter().enumerate() {
-                let found = attr_field_type(value);
-                if found != c.field_type {
-                    return malformed(format!(
-                        "dyn column {:?} (index {ci:#x}) cell {cell} has type {found:?} but the column's field_type is {:?}",
-                        c.name, c.field_type,
-                    ));
+            let found = c.cells.field_type();
+            if found != c.field_type {
+                return malformed(format!(
+                    "dyn column {:?} (index {ci:#x}) holds {found:?} cells but the column's field_type is {:?}",
+                    c.name, c.field_type,
+                ));
+            }
+            let var_bytes = match &c.cells {
+                DynCells::Str(v) => Some(v),
+                DynCells::Bytes(b) => Some(&b.values),
+                DynCells::I64(_) | DynCells::F64(_) | DynCells::Bool(_) => None,
+            };
+            if let Some(why) = var_bytes.and_then(VarBytes::offsets_error) {
+                return malformed(format!(
+                    "dyn column {:?} (index {ci:#x}) offsets are malformed: {why}",
+                    c.name,
+                ));
+            }
+            match &c.cells {
+                DynCells::Str(v) => {
+                    if let Some(cell) =
+                        (0..v.len()).find(|&i| std::str::from_utf8(v.get(i)).is_err())
+                    {
+                        return malformed(format!(
+                            "dyn column {:?} (index {ci:#x}) cell {cell} is not UTF-8",
+                            c.name,
+                        ));
+                    }
                 }
+                DynCells::Bytes(b) => {
+                    let mut floor = 0usize;
+                    for (slot, value) in &b.nested {
+                        let slot = *slot as usize;
+                        if slot < floor || slot >= present {
+                            return malformed(format!(
+                                "dyn column {:?} (index {ci:#x}) nested slot {slot:#x} is out of order or past its {present} cells",
+                                c.name,
+                            ));
+                        }
+                        floor = slot + 1;
+                        if !matches!(value, AttrValue::List(_) | AttrValue::Map(_)) {
+                            return malformed(format!(
+                                "dyn column {:?} (index {ci:#x}) nested slot {slot:#x} holds a {:?} value, not a List or Map",
+                                c.name,
+                                attr_field_type(value),
+                            ));
+                        }
+                        if canonical_value_bytes(value) != b.values.get(slot) {
+                            return malformed(format!(
+                                "dyn column {:?} (index {ci:#x}) cell {slot:#x} differs from its nested value's canonical bytes",
+                                c.name,
+                            ));
+                        }
+                    }
+                }
+                DynCells::I64(_) | DynCells::F64(_) | DynCells::Bool(_) => {}
             }
         }
 
@@ -465,11 +901,9 @@ impl ColumnarLogBatch {
                         dict.distinct.len(),
                     ));
                 }
-                for (slot, (cell, id)) in c.cells.iter().zip(&dict.ids).enumerate() {
-                    let cell_bytes: &[u8] = match (c.field_type, cell) {
-                        (FieldType::Str | FieldType::Bytes, AttrValue::Str(s)) => s.as_bytes(),
-                        (FieldType::Str | FieldType::Bytes, AttrValue::Bytes(b)) => b,
-                        _ => continue,
+                for (slot, id) in dict.ids.iter().enumerate() {
+                    let Some(cell_bytes) = c.cells.bytes_at(slot) else {
+                        break;
                     };
                     if dict.distinct[*id as usize] != cell_bytes {
                         return malformed(format!(
@@ -516,9 +950,9 @@ impl ColumnarLogBatch {
         // order; the binary search below depends on that order.
         let mut stream_blob: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
 
-        // Dynamic columns keyed by (name, type byte), each accumulating a value
-        // per row (None when absent).
-        let mut col_cells: BTreeMap<(String, u8), Vec<Option<AttrValue>>> = BTreeMap::new();
+        // Dynamic columns keyed by (name, type byte), each accumulating its
+        // typed cells and its presence up to the last row it was seen in.
+        let mut col_cells: BTreeMap<(String, u8), (DynCells, Bitmap)> = BTreeMap::new();
 
         batch.residual_attrs = vec![Vec::new(); n];
 
@@ -557,11 +991,20 @@ impl ColumnarLogBatch {
             let mut taken: std::collections::HashSet<(String, u8)> =
                 std::collections::HashSet::new();
             for (k, v) in &r.attrs {
-                let (ty, _) = resolve_value(v);
+                let ty = attr_field_type(v);
                 let key = (k.clone(), ty.to_u8());
                 if taken.insert(key.clone()) {
-                    let col = col_cells.entry(key).or_insert_with(|| vec![None; n]);
-                    col[row] = Some(v.clone());
+                    let (cells, validity) = col_cells
+                        .entry(key)
+                        .or_insert_with(|| (DynCells::new(ty), Bitmap::with_capacity(n)));
+                    // The column was created for this value's resolved type,
+                    // so only the byte limit can refuse the push. The row is
+                    // marked present either way: a refused cell leaves the
+                    // column one cell short of its validity, which `validate`
+                    // refuses, rather than silently dropping the value.
+                    let _ = cells.push_value(v);
+                    validity.pad_to(row);
+                    validity.push(true);
                 } else {
                     batch.residual_attrs[row].push((k.clone(), v.clone()));
                 }
@@ -587,23 +1030,12 @@ impl ColumnarLogBatch {
         }
 
         // Materialize dynamic columns in (name, type) order.
-        for ((name, ty_byte), cells) in col_cells {
-            let field_type = FieldType::from_u8(ty_byte).unwrap_or(FieldType::Bytes);
-            let mut validity = Bitmap::new();
-            let mut dense = Vec::new();
-            for cell in cells {
-                match cell {
-                    Some(v) => {
-                        validity.push(true);
-                        dense.push(v);
-                    }
-                    None => validity.push(false),
-                }
-            }
+        for ((name, _), (cells, mut validity)) in col_cells {
+            validity.pad_to(n);
             batch.dyn_columns.push(DynColumn {
                 name,
-                field_type,
-                cells: dense,
+                field_type: cells.field_type(),
+                cells,
                 validity,
             });
         }
@@ -612,47 +1044,31 @@ impl ColumnarLogBatch {
     }
 
     /// Fills [`Self::dyn_col_dicts`] with the dictionary shape of every
-    /// Str/Bytes dynamic column, derived from its plain `cells`: the distinct
-    /// value bytes in first-seen order plus one id per present cell. This is
-    /// the bridge the writer-level differential test uses to drive the writer's
-    /// dictionary fast path from records; a producer that already holds Parquet
-    /// dictionaries (#604) supplies the shape directly instead. Non-string
-    /// columns get `None`. Idempotent in effect; overwrites any prior value.
+    /// Str/Bytes dynamic column, derived from its stored cell bytes: the
+    /// distinct value bytes in first-seen order plus one id per present cell.
+    /// This is the bridge the writer-level differential test uses to drive the
+    /// writer's dictionary fast path from records. Non-string columns get
+    /// `None`. Idempotent in effect; overwrites any prior value.
     pub fn with_dictionaries(mut self) -> Self {
         let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(self.dyn_columns.len());
         for c in &self.dyn_columns {
-            match c.field_type {
-                FieldType::Str | FieldType::Bytes => {
-                    let mut interner: HashMap<Vec<u8>, u32> = HashMap::new();
-                    let mut distinct: Vec<Vec<u8>> = Vec::new();
-                    let mut ids: Vec<u32> = Vec::with_capacity(c.cells.len());
-                    for cell in &c.cells {
-                        let bytes = match resolve_value(cell).1 {
-                            ColumnValue::Str(b) | ColumnValue::Bytes(b) => b,
-                            // A Str/Bytes column resolves only to Str/Bytes; any
-                            // other value would be a mis-typed column, so fall
-                            // back to the plain path rather than guess.
-                            _ => {
-                                distinct.clear();
-                                ids.clear();
-                                break;
-                            }
-                        };
-                        let next = distinct.len() as u32;
-                        let id = *interner.entry(bytes.clone()).or_insert_with(|| {
-                            distinct.push(bytes);
-                            next
-                        });
-                        ids.push(id);
-                    }
-                    if ids.len() == c.cells.len() {
-                        dicts.push(Some(StrColumnDict { distinct, ids }));
-                    } else {
-                        dicts.push(None);
-                    }
-                }
-                _ => dicts.push(None),
+            if !matches!(c.cells, DynCells::Str(_) | DynCells::Bytes(_)) {
+                dicts.push(None);
+                continue;
             }
+            let mut interner: HashMap<&[u8], u32> = HashMap::new();
+            let mut distinct: Vec<Vec<u8>> = Vec::new();
+            let mut ids: Vec<u32> = Vec::with_capacity(c.cells.len());
+            for slot in 0..c.cells.len() {
+                let bytes = c.cells.bytes_at(slot).unwrap_or_default();
+                let next = distinct.len() as u32;
+                let id = *interner.entry(bytes).or_insert_with(|| {
+                    distinct.push(bytes.to_vec());
+                    next
+                });
+                ids.push(id);
+            }
+            dicts.push(Some(StrColumnDict { distinct, ids }));
         }
         self.dyn_col_dicts = dicts;
         self
@@ -669,7 +1085,7 @@ impl Default for ColumnarLogBatch {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::record::stream_attrs_bytes;
+    use crate::record::{resolve_value, stream_attrs_bytes};
 
     /// A distinct stream id per `n` (up to `u32::MAX` streams), with the
     /// ordering of `n` matching `LogStreamId`'s own `Ord` (big-endian bytes in
@@ -895,7 +1311,7 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type: FieldType::I64,
-            cells: Vec::new(),
+            cells: DynCells::I64(Vec::new()),
             validity,
         });
         assert_malformed(
@@ -913,7 +1329,7 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type: FieldType::I64,
-            cells: vec![AttrValue::I64(1)],
+            cells: DynCells::I64(vec![1]),
             validity,
         });
         assert_malformed(
@@ -930,7 +1346,7 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type: FieldType::Str,
-            cells: vec![AttrValue::Str("v".into())],
+            cells: str_cells(&["v"]),
             validity,
         });
         batch.dyn_col_dicts = vec![None, None];
@@ -948,7 +1364,7 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type: FieldType::Str,
-            cells: vec![AttrValue::Str("v".into())],
+            cells: str_cells(&["v"]),
             validity,
         });
         batch.dyn_col_dicts = vec![Some(StrColumnDict {
@@ -969,7 +1385,7 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type: FieldType::Str,
-            cells: vec![AttrValue::Str("v".into())],
+            cells: str_cells(&["v"]),
             validity,
         });
         batch.dyn_col_dicts = vec![Some(StrColumnDict {
@@ -997,15 +1413,28 @@ mod tests {
         );
     }
 
-    /// A one-row batch with one dynamic column over a single present cell.
+    /// `Str` cells holding `values`, in order.
+    fn str_cells(values: &[&str]) -> DynCells {
+        let mut v = VarBytes::new();
+        for s in values {
+            v.push(s.as_bytes());
+        }
+        DynCells::Str(v)
+    }
+
+    /// A one-row batch with one dynamic column over a single present cell. The
+    /// cell is stored in the variant of its own resolved type, so a
+    /// `field_type` naming another type builds a mis-typed column.
     fn one_cell_batch(field_type: FieldType, cell: AttrValue) -> ColumnarLogBatch {
         let mut batch = minimal_batch(1);
         let mut validity = Bitmap::new();
         validity.push(true);
+        let cells =
+            DynCells::from_values(attr_field_type(&cell), &[cell]).expect("cell of its own type");
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type,
-            cells: vec![cell],
+            cells,
             validity,
         });
         batch
@@ -1029,12 +1458,10 @@ mod tests {
         }
     }
 
-    /// A Bool column with two present rows and cells `[Bool, I64]`. Before
-    /// the type check, this passed validate; `write_block_columnar` kept two
-    /// present bits but wrote one value (it filters cells by the column's
-    /// type), and the second row read back `false` from an immutable object.
+    /// A Bool column whose cells are stored as `I64`: the writer would write
+    /// the column under the wrong type.
     #[test]
-    fn bool_column_with_a_non_bool_cell_is_rejected() {
+    fn bool_column_with_i64_cells_is_rejected() {
         let mut batch = minimal_batch(2);
         let mut validity = Bitmap::new();
         validity.push(true);
@@ -1042,31 +1469,298 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "flag".into(),
             field_type: FieldType::Bool,
-            cells: vec![AttrValue::Bool(true), AttrValue::I64(1)],
+            cells: DynCells::I64(vec![1, 2]),
             validity,
         });
         assert_malformed(
             batch.validate(),
-            "dyn column \"flag\" (index 0x0) cell 1 has type I64 but the column's field_type is Bool",
+            "dyn column \"flag\" (index 0x0) holds I64 cells but the column's field_type is Bool",
         );
     }
 
     #[test]
-    fn i64_column_with_a_non_i64_cell_is_rejected() {
+    fn i64_column_with_str_cells_is_rejected() {
         let batch = one_cell_batch(FieldType::I64, AttrValue::Str("x".into()));
         assert_malformed(
             batch.validate(),
-            "dyn column \"k\" (index 0x0) cell 0 has type Str but the column's field_type is I64",
+            "dyn column \"k\" (index 0x0) holds Str cells but the column's field_type is I64",
         );
     }
 
     #[test]
-    fn str_column_with_a_list_cell_is_rejected() {
+    fn str_column_with_bytes_cells_is_rejected() {
         let batch = one_cell_batch(FieldType::Str, AttrValue::List(Vec::new()));
         assert_malformed(
             batch.validate(),
-            "cell 0 has type Bytes but the column's field_type is Str",
+            "holds Bytes cells but the column's field_type is Str",
         );
+    }
+
+    #[test]
+    fn push_value_refuses_a_value_of_another_type() {
+        let mut cells = DynCells::new(FieldType::Bool);
+        match cells.push_value(&AttrValue::I64(1)) {
+            Err(LogSegError::MalformedColumnarBatch(msg)) => assert_eq!(
+                msg, "a I64 value cannot be a cell of a Bool column",
+                "refusal names both types"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(cells.len(), 0, "a refused value is not stored");
+        let mut str_cells = DynCells::new(FieldType::Str);
+        assert!(str_cells.push_value(&AttrValue::List(Vec::new())).is_err());
+        assert!(
+            DynCells::new(FieldType::Bytes)
+                .push_from(&DynCells::I64(vec![1]), 0)
+                .is_err(),
+            "push_from refuses a source of another type"
+        );
+    }
+
+    #[test]
+    fn str_cell_that_is_not_utf8_is_rejected() {
+        let mut batch = minimal_batch(1);
+        let mut validity = Bitmap::new();
+        validity.push(true);
+        let mut v = VarBytes::new();
+        v.push(&[0xff, 0xfe]);
+        batch.dyn_columns.push(DynColumn {
+            name: "k".into(),
+            field_type: FieldType::Str,
+            cells: DynCells::Str(v),
+            validity,
+        });
+        assert_malformed(
+            batch.validate(),
+            "dyn column \"k\" (index 0x0) cell 0 is not UTF-8",
+        );
+    }
+
+    /// Asserts `result` is `Err(LimitExceeded)` naming the column's limit.
+    fn assert_limit_exceeded(result: Result<(), LogSegError>, limit: usize) {
+        match result {
+            Err(LogSegError::LimitExceeded(msg)) => assert!(
+                msg.contains(&format!("past its limit of {limit} bytes")),
+                "refusal names the limit: {msg}"
+            ),
+            other => panic!("expected Err(LimitExceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_push_refuses_a_value_past_the_byte_limit_and_stores_nothing() {
+        let mut v = VarBytes::with_byte_limit(0, 0, 8);
+        v.try_push(b"abcd").expect("4 of 8 bytes");
+        v.try_push(b"efgh").expect("exactly 8 of 8 bytes");
+        assert_limit_exceeded(v.try_push(b"i"), 8);
+        assert_eq!(v.len(), 2, "the refused value adds no offset");
+        assert_eq!(v.data(), b"abcdefgh", "the refused value adds no bytes");
+        assert_eq!(v.offsets(), &[0, 4, 8]);
+        v.try_push(b"").expect("an empty value adds no bytes");
+        assert_eq!(v.len(), 3);
+        assert_eq!(
+            VarBytes::with_byte_limit(0, 0, usize::MAX).limit,
+            VAR_BYTES_MAX,
+            "a limit above what u32 offsets address is lowered to it"
+        );
+    }
+
+    #[test]
+    fn dyn_cell_pushes_refuse_a_cell_past_the_byte_limit() {
+        let mut s = DynCells::Str(VarBytes::with_byte_limit(0, 0, 3));
+        s.push_value(&AttrValue::Str("abc".into()))
+            .expect("3 of 3 bytes");
+        assert_limit_exceeded(s.push_value(&AttrValue::Str("d".into())), 3);
+        assert_eq!(s.len(), 1, "a refused Str value is not stored");
+
+        let src = str_cells(&["abc", "d"]);
+        let mut d = DynCells::Str(VarBytes::with_byte_limit(0, 0, 3));
+        d.push_from(&src, 0).expect("3 of 3 bytes");
+        assert_limit_exceeded(d.push_from(&src, 1), 3);
+        assert_eq!(d.len(), 1, "a refused Str cell is not copied");
+
+        let list = AttrValue::List(vec![AttrValue::I64(1)]);
+        let canon_len = canonical_value_bytes(&list).len();
+        let small = || {
+            DynCells::Bytes(BytesCells {
+                values: VarBytes::with_byte_limit(0, 0, canon_len - 1),
+                nested: Vec::new(),
+            })
+        };
+        let mut b = small();
+        assert_limit_exceeded(b.push_value(&list), canon_len - 1);
+        let DynCells::Bytes(cells) = &b else {
+            panic!("a Bytes column")
+        };
+        assert_eq!(cells.values.len(), 0, "a refused List value is not stored");
+        assert!(cells.nested.is_empty(), "nor is its nested original");
+
+        let src = DynCells::from_values(FieldType::Bytes, std::slice::from_ref(&list))
+            .expect("a List resolves to Bytes");
+        let mut b = small();
+        assert_limit_exceeded(b.push_from(&src, 0), canon_len - 1);
+        let DynCells::Bytes(cells) = &b else {
+            panic!("a Bytes column")
+        };
+        assert_eq!(cells.values.len(), 0, "a refused nested cell is not copied");
+        assert!(cells.nested.is_empty(), "nor is its nested original");
+    }
+
+    /// Two values whose offsets go back from 5 to 3, the shape a `u32` wrap
+    /// leaves: value 1 would be `data[5..3]`.
+    fn non_monotonic() -> VarBytes {
+        VarBytes {
+            offsets: vec![0, 5, 3],
+            data: b"abc".to_vec(),
+            limit: VAR_BYTES_MAX,
+        }
+    }
+
+    #[test]
+    fn validate_refuses_non_monotonic_offsets_in_every_var_bytes_column() {
+        let want = "offsets are malformed: offset 2 is 3 but offset 1 before it is 5";
+
+        let mut batch = minimal_batch(2);
+        batch.body = non_monotonic();
+        assert_malformed(batch.validate(), &format!("body {want}"));
+
+        let mut batch = minimal_batch(2);
+        batch.severity_text = non_monotonic();
+        assert_malformed(batch.validate(), &format!("severity_text {want}"));
+
+        for cells in [
+            DynCells::Str(non_monotonic()),
+            DynCells::Bytes(BytesCells {
+                values: non_monotonic(),
+                nested: Vec::new(),
+            }),
+        ] {
+            let mut batch = minimal_batch(2);
+            let mut validity = Bitmap::new();
+            validity.push(true);
+            validity.push(true);
+            batch.dyn_columns.push(DynColumn {
+                name: "k".into(),
+                field_type: cells.field_type(),
+                cells,
+                validity,
+            });
+            assert_malformed(
+                batch.validate(),
+                &format!("dyn column \"k\" (index 0x0) {want}"),
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_offsets_that_do_not_start_at_zero_or_end_at_the_data() {
+        let mut batch = minimal_batch(1);
+        batch.body = VarBytes {
+            offsets: vec![1, 3],
+            data: b"abc".to_vec(),
+            limit: VAR_BYTES_MAX,
+        };
+        assert_malformed(
+            batch.validate(),
+            "body offsets are malformed: its first offset is 1, not 0",
+        );
+        let mut batch = minimal_batch(1);
+        batch.body = VarBytes {
+            offsets: vec![0, 2],
+            data: b"abc".to_vec(),
+            limit: VAR_BYTES_MAX,
+        };
+        assert_malformed(
+            batch.validate(),
+            "body offsets are malformed: its last offset is 2 but it holds 3 bytes",
+        );
+    }
+
+    /// A one-row `Bytes` column whose single cell stores `stored` with
+    /// `nested` as its side list.
+    fn nested_batch(stored: &[u8], nested: Vec<(u32, AttrValue)>) -> ColumnarLogBatch {
+        let mut batch = minimal_batch(1);
+        let mut validity = Bitmap::new();
+        validity.push(true);
+        let mut values = VarBytes::new();
+        values.push(stored);
+        batch.dyn_columns.push(DynColumn {
+            name: "k".into(),
+            field_type: FieldType::Bytes,
+            cells: DynCells::Bytes(BytesCells { values, nested }),
+            validity,
+        });
+        batch
+    }
+
+    #[test]
+    fn nested_cells_are_checked_against_their_stored_bytes() {
+        let list = AttrValue::List(vec![AttrValue::I64(1)]);
+        let canon = canonical_value_bytes(&list);
+        nested_batch(&canon, vec![(0, list.clone())])
+            .validate()
+            .expect("canonical bytes match");
+        assert_malformed(
+            nested_batch(b"x", vec![(0, list.clone())]).validate(),
+            "cell 0x0 differs from its nested value's canonical bytes",
+        );
+        assert_malformed(
+            nested_batch(&canon, vec![(1, list.clone())]).validate(),
+            "nested slot 0x1 is out of order or past its 1 cells",
+        );
+        assert_malformed(
+            nested_batch(&canon, vec![(0, list.clone()), (0, list)]).validate(),
+            "nested slot 0x0 is out of order",
+        );
+        assert_malformed(
+            nested_batch(b"x", vec![(0, AttrValue::Bytes(b"x".to_vec()))]).validate(),
+            "nested slot 0x0 holds a Bytes value, not a List or Map",
+        );
+    }
+
+    /// Every cell round-trips to the value the row path holds: the original
+    /// `List`/`Map` for a nested cell, the bit pattern for a float.
+    #[test]
+    fn cells_round_trip_to_their_original_values() {
+        let values = [
+            AttrValue::Bytes(vec![1, 2]),
+            AttrValue::Map(vec![("a".into(), AttrValue::F64(-0.0))]),
+            AttrValue::Bytes(Vec::new()),
+            AttrValue::List(vec![AttrValue::Str(String::new())]),
+        ];
+        let cells = DynCells::from_values(FieldType::Bytes, &values).expect("bytes cells");
+        for (slot, want) in values.iter().enumerate() {
+            let got = cells.value(slot).expect("value");
+            assert!(attr_bits_eq(&got, want), "slot {slot}: {got:?} vs {want:?}");
+            assert_eq!(
+                cells.column_value(slot),
+                resolve_value(want).1,
+                "slot {slot} resolves as the row path resolves it"
+            );
+        }
+        let floats = [f64::NAN, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_0001)];
+        let fv: Vec<AttrValue> = floats.iter().map(|f| AttrValue::F64(*f)).collect();
+        let cells = DynCells::from_values(FieldType::F64, &fv).expect("f64 cells");
+        for (slot, f) in floats.iter().enumerate() {
+            assert_eq!(cells.column_value(slot), ColumnValue::F64(f.to_bits()));
+        }
+    }
+
+    /// Float cells compare by bit pattern: NaN equals itself and `-0.0` does
+    /// not equal `0.0`.
+    #[test]
+    fn float_cells_compare_by_bits() {
+        assert_eq!(DynCells::F64(vec![f64::NAN]), DynCells::F64(vec![f64::NAN]));
+        assert_ne!(DynCells::F64(vec![-0.0]), DynCells::F64(vec![0.0]));
+        let nan_list = |f: f64| {
+            DynCells::from_values(
+                FieldType::Bytes,
+                &[AttrValue::List(vec![AttrValue::F64(f)])],
+            )
+            .expect("bytes cells")
+        };
+        assert_eq!(nan_list(f64::NAN), nan_list(f64::NAN));
+        assert_ne!(nan_list(-0.0), nan_list(0.0));
     }
 
     fn with_dict(
@@ -1103,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_dictionary_passes_and_list_cells_are_not_compared() {
+    fn matching_dictionary_passes_and_list_cells_are_compared() {
         with_dict(
             one_cell_batch(FieldType::Str, AttrValue::Str("v".into())),
             vec![b"v", b"unused"],
@@ -1111,13 +1805,24 @@ mod tests {
         )
         .validate()
         .expect("matching dictionary");
+        let list = AttrValue::List(Vec::new());
+        let canon = canonical_value_bytes(&list);
         with_dict(
-            one_cell_batch(FieldType::Bytes, AttrValue::List(Vec::new())),
-            vec![b"whatever"],
+            one_cell_batch(FieldType::Bytes, list.clone()),
+            vec![&canon],
             vec![0],
         )
         .validate()
-        .expect("List cell in a Bytes column is documented as unchecked");
+        .expect("a List cell's dictionary entry is its canonical bytes");
+        assert_malformed(
+            with_dict(
+                one_cell_batch(FieldType::Bytes, list),
+                vec![b"whatever"],
+                vec![0],
+            )
+            .validate(),
+            "differs from the cell's bytes",
+        );
     }
 
     #[test]
@@ -1144,7 +1849,10 @@ mod tests {
     #[test]
     fn dyn_column_with_more_cells_than_present_bits_is_rejected() {
         let mut batch = one_cell_batch(FieldType::I64, AttrValue::I64(1));
-        batch.dyn_columns[0].cells.push(AttrValue::I64(2));
+        batch.dyn_columns[0]
+            .cells
+            .push_value(&AttrValue::I64(2))
+            .expect("an I64 cell");
         assert_malformed(
             batch.validate(),
             "has 2 cells but validity marks 1 rows present",
@@ -1159,7 +1867,7 @@ mod tests {
         batch.dyn_columns.push(DynColumn {
             name: "k".into(),
             field_type: FieldType::I64,
-            cells: vec![AttrValue::I64(1)],
+            cells: DynCells::I64(vec![1]),
             validity,
         });
         assert_malformed(

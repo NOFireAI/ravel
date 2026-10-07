@@ -1286,7 +1286,9 @@ impl RlogWriter {
         // are computed here in one source pass. Overflow attributes are gathered
         // in the same order (dyn-column order, then residual order) the row path
         // folds them, so `canonical_attr_bytes` reproduces it byte for byte; the
-        // estimate reads source cell sizes without copying any value.
+        // estimate reads source cell sizes without copying any value. An
+        // overflowed cell is rebuilt as the attribute the row path held (the
+        // original `List`/`Map` for a nested `Bytes` cell).
         let mut g_overflow: Vec<Vec<(String, AttrValue)>> = vec![Vec::new(); total_rows];
         let mut g_est_dyn: Vec<usize> = vec![0; total_rows];
         for (bi, b) in batches.iter().enumerate() {
@@ -1298,13 +1300,13 @@ impl RlogWriter {
                     if !c.validity.get(row) {
                         continue;
                     }
-                    let cell = &c.cells[slot];
+                    let cell = slot;
                     slot += 1;
                     let grow = base + row;
                     if in_budget {
-                        g_est_dyn[grow] += columnar_estimate(cell);
+                        g_est_dyn[grow] += c.cells.estimate(cell);
                     } else {
-                        g_overflow[grow].push((c.name.clone(), cell.clone()));
+                        g_overflow[grow].push((c.name.clone(), c.cells.value(cell)?));
                     }
                 }
             }
@@ -1335,15 +1337,13 @@ impl RlogWriter {
         let mut global_dict: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_plans];
         let mut col_dict_ids: Vec<Vec<Option<u32>>> = vec![Vec::new(); num_plans];
         {
-            let mut interners: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::new(); num_plans];
             for (pi, (_, ty, _)) in columns.iter().enumerate() {
-                if matches!(ty, FieldType::Str | FieldType::Bytes) {
-                    plan_uses_dict[pi] = true;
-                    col_dict_ids[pi] = vec![None; total_rows];
-                }
+                plan_uses_dict[pi] = matches!(ty, FieldType::Str | FieldType::Bytes);
             }
-            for (bi, b) in batches.iter().enumerate() {
-                let base = bases[bi];
+            // Which plans keep the dictionary path is decided over every
+            // contributor before any per-row id table is allocated, so a plan
+            // with a plain contributor never pays for one.
+            for b in batches {
                 for (ci, c) in b.dyn_columns.iter().enumerate() {
                     if !matches!(c.field_type, FieldType::Str | FieldType::Bytes) {
                         continue;
@@ -1351,12 +1351,31 @@ impl RlogWriter {
                     let Some(cid) = column_lookup(&column_of, &c.name, c.field_type.to_u8()) else {
                         continue; // overflowed the budget: folds into attrs_raw
                     };
+                    if b.dyn_col_dicts.get(ci).and_then(Option::as_ref).is_none() {
+                        plan_uses_dict[plan_of_cid[&cid]] = false; // plain contributor
+                    }
+                }
+            }
+            for (pi, uses) in plan_uses_dict.iter().enumerate() {
+                if *uses {
+                    col_dict_ids[pi] = vec![None; total_rows];
+                }
+            }
+            let mut interners: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::new(); num_plans];
+            for (bi, b) in batches.iter().enumerate() {
+                let base = bases[bi];
+                for (ci, c) in b.dyn_columns.iter().enumerate() {
+                    if !matches!(c.field_type, FieldType::Str | FieldType::Bytes) {
+                        continue;
+                    }
+                    let Some(cid) = column_lookup(&column_of, &c.name, c.field_type.to_u8()) else {
+                        continue;
+                    };
                     let pi = plan_of_cid[&cid];
                     if !plan_uses_dict[pi] {
-                        continue; // already poisoned by a plain contributor
+                        continue;
                     }
                     let Some(d) = b.dyn_col_dicts.get(ci).and_then(Option::as_ref) else {
-                        plan_uses_dict[pi] = false; // plain contributor: fall back
                         continue;
                     };
                     let mut slot = 0usize;
@@ -1490,19 +1509,18 @@ impl RlogWriter {
                         continue;
                     }
                     let dense = presence_rank(&col_rank[bi][ci], c.validity.bytes(), local);
-                    let cell = &c.cells[dense];
                     let meta = &col_meta[bi][ci];
                     match meta.column_id {
                         Some(cid) => {
-                            let (ty, cv) = resolve_value(cell);
+                            let cv = c.cells.column_value(dense);
                             if let Some(slot) = meta.slot {
-                                stamp.push_columnar(slot, ty.to_u8(), cv.clone());
+                                stamp.push_columnar(slot, c.field_type.to_u8(), cv.clone());
                             }
                             cols.push((cid, cv));
                         }
                         None => {
                             if let Some(slot) = meta.slot {
-                                stamp.push_overflow(slot, cell.clone());
+                                stamp.push_overflow(slot, c.cells.value(dense)?);
                             }
                         }
                     }
@@ -2794,21 +2812,6 @@ fn presence_rank(prefix: &[u32], bytes: &[u8], local: usize) -> usize {
     rank
 }
 
-/// The `row_estimate` contribution of one in-budget columnar cell, read from the
-/// source attribute without resolving (copying) its value. Matches the value
-/// sizing [`row_estimate`] applies to a [`ColumnValue`]: string/bytes columns
-/// count their byte length plus two, every numeric column a flat eight, and a
-/// `List`/`Map` its canonical `Bytes` encoding (the only case that must encode).
-fn columnar_estimate(cell: &ravel_types::logstream::AttrValue) -> usize {
-    use ravel_types::logstream::AttrValue;
-    match cell {
-        AttrValue::Str(s) => s.len() + 2,
-        AttrValue::Bytes(b) => b.len() + 2,
-        AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 8,
-        other => canonical_value_bytes(other).len() + 2,
-    }
-}
-
 /// Splits row indices into block spans by record target and an estimated
 /// uncompressed byte cap.
 fn chunk_blocks(rows: &[ResolvedRow], cfg: &RlogConfig) -> Vec<std::ops::Range<usize>> {
@@ -2943,6 +2946,12 @@ fn key_value(value: &AttrValue, ty: FieldType) -> Option<KeyValue> {
     if resolved_ty != ty {
         return None;
     }
+    column_key_value(cv)
+}
+
+/// The key value a resolved column value gives; `None` for a float, which is
+/// never a clustering key type.
+fn column_key_value(cv: ColumnValue) -> Option<KeyValue> {
     match cv {
         ColumnValue::I64(v) => Some(KeyValue::I64(v)),
         ColumnValue::Bool(b) => Some(KeyValue::Bool(b)),
@@ -2985,10 +2994,10 @@ fn columnar_key_values(
                         if !c.validity.get(row) {
                             continue;
                         }
-                        let cell = &c.cells[slot];
+                        let cell = slot;
                         slot += 1;
                         if values[base + row].is_none() {
-                            values[base + row] = key_value(cell, *ty);
+                            values[base + row] = column_key_value(c.cells.column_value(cell));
                         }
                     }
                 }
@@ -5611,7 +5620,7 @@ mod tests {
     /// (`push` + `finish_with_stats`) for the same records.
     mod columnar_differential {
         use super::*;
-        use crate::columnar_batch::ColumnarLogBatch;
+        use crate::columnar_batch::{ColumnarLogBatch, DynCells, DynColumn};
         use proptest::prelude::*;
         use proptest::test_runner::TestCaseError;
 
@@ -5865,6 +5874,139 @@ mod tests {
                 let (cb, cs) = columnar_object_dict(cfg, &records, nbatches);
                 prop_stats_match(&rs, &cs)?;
                 prop_assert!(rb == cb, "object bytes differ: row {} vs col {}", rb.len(), cb.len());
+            }
+        }
+
+        /// Attribute values weighted toward the cases the typed cells must
+        /// carry exactly: NaN payloads, `-0.0`, empty strings and bytes, and
+        /// `List`/`Map` values (floats nested inside them too).
+        fn arb_typed_value() -> impl Strategy<Value = AttrValue> {
+            let float = prop_oneof![
+                Just(f64::NAN),
+                Just(-f64::NAN),
+                Just(f64::from_bits(0x7ff8_0000_0000_0001)),
+                Just(-0.0),
+                Just(0.0),
+                Just(f64::INFINITY),
+                any::<f64>(),
+            ];
+            let leaf = prop_oneof![
+                any::<i64>().prop_map(AttrValue::I64),
+                float.prop_map(AttrValue::F64),
+                any::<bool>().prop_map(AttrValue::Bool),
+                "[a-z]{0,3}".prop_map(AttrValue::Str),
+                proptest::collection::vec(any::<u8>(), 0..3).prop_map(AttrValue::Bytes),
+            ];
+            leaf.prop_recursive(2, 6, 3, |inner| {
+                prop_oneof![
+                    proptest::collection::vec(inner.clone(), 0..3).prop_map(AttrValue::List),
+                    proptest::collection::vec(("[a-c]{1,2}", inner), 0..3).prop_map(AttrValue::Map),
+                ]
+            })
+        }
+
+        fn arb_typed_record() -> impl Strategy<Value = LogRecord> {
+            (
+                arb_record(),
+                proptest::collection::vec((arb_name(), arb_typed_value()), 0..6),
+            )
+                .prop_map(|(mut r, attrs)| {
+                    r.attrs = attrs;
+                    r
+                })
+        }
+
+        /// One attribute of every value kind under one name, so every
+        /// [`FieldType`] column exists; the `F64(NaN)` after `F64(-0.0)` and
+        /// the `List` and `Map` after `Bytes` are duplicate losers of their
+        /// `(name, type)` and become residuals.
+        fn every_kind() -> Vec<(String, AttrValue)> {
+            let map = AttrValue::Map(vec![
+                ("z".into(), AttrValue::F64(-0.0)),
+                ("a".into(), AttrValue::Str(String::new())),
+            ]);
+            [
+                AttrValue::Str(String::new()),
+                AttrValue::I64(-1),
+                AttrValue::F64(-0.0),
+                AttrValue::F64(f64::NAN),
+                AttrValue::Bool(false),
+                AttrValue::Bytes(Vec::new()),
+                AttrValue::List(vec![AttrValue::F64(f64::NAN), map.clone()]),
+                map,
+            ]
+            .into_iter()
+            .map(|v| ("all".to_string(), v))
+            .collect()
+        }
+
+        /// `columns` rebuilt one cell at a time with [`DynCells::push_from`].
+        fn cell_by_cell(columns: &[DynColumn]) -> Vec<DynColumn> {
+            columns
+                .iter()
+                .map(|c| {
+                    let mut cells = DynCells::new(c.field_type);
+                    for slot in 0..c.cells.len() {
+                        cells.push_from(&c.cells, slot).expect("same type");
+                    }
+                    DynColumn { cells, ..c.clone() }
+                })
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The #2625 acceptance anchor: objects built from typed columnar
+            /// batches are byte-identical to the row builder's, and their
+            /// `WriteStats` field-identical, over every `FieldType`, absent
+            /// cells, `List`/`Map` values in `Bytes` columns (in budget and
+            /// overflowed, so both their stored canonical bytes and their
+            /// original value are read), empty strings, NaN payloads and
+            /// `-0.0`, duplicate-loser residuals, plain and dictionary-shaped
+            /// batches, and several batches pushed into one object.
+            #[test]
+            fn typed_batch_objects_match_row_builder(
+                mut records in proptest::collection::vec(arb_typed_record(), 2..25),
+                max_dyn in 1usize..12,
+                nbatches in 1usize..4,
+                dict in any::<bool>(),
+                kinds_at in any::<prop::sample::Index>(),
+            ) {
+                let at = kinds_at.index(records.len());
+                records[at].attrs.extend(every_kind());
+                for chunk in split(&records, nbatches) {
+                    let batch = ColumnarLogBatch::from_records(chunk);
+                    prop_assert!(batch.validate().is_ok(), "{:?}", batch.validate());
+                    let copy = cell_by_cell(&batch.dyn_columns);
+                    prop_assert!(copy == batch.dyn_columns, "push_from must carry every cell by bits");
+                }
+                let mut positive = records.clone();
+                for (_, v) in positive[at].attrs.iter_mut().filter(|(n, _)| n == "all") {
+                    if matches!(v, AttrValue::F64(f) if f.to_bits() == (-0.0f64).to_bits()) {
+                        *v = AttrValue::F64(0.0);
+                        break;
+                    }
+                }
+                prop_assert!(
+                    ColumnarLogBatch::from_records(&positive).dyn_columns
+                        != ColumnarLogBatch::from_records(&records).dyn_columns,
+                    "a -0.0 cell and a 0.0 cell are different cells"
+                );
+                let cfg = RlogConfig {
+                    max_dynamic_columns: max_dyn,
+                    block_target_records: 5,
+                    block_max_bytes: 8192,
+                    ..RlogConfig::default()
+                };
+                let (rb, rs) = row_object(cfg, &records);
+                let (cb, cs) = if dict {
+                    columnar_object_dict(cfg, &records, nbatches)
+                } else {
+                    columnar_object(cfg, &records, nbatches)
+                };
+                prop_stats_match(&rs, &cs)?;
+                prop_assert!(rb == cb, "object bytes differ: row {} vs typed {}", rb.len(), cb.len());
             }
         }
 

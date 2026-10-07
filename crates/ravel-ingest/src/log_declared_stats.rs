@@ -50,7 +50,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use ravel_catalog::DeclaredColumnType;
-use ravel_logseg::{ColumnarLogBatch, stream_attr_pairs};
+use ravel_logseg::{ColumnarLogBatch, DynCells, stream_attr_pairs};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_types::declared_stats::{
     DeclaredColumnStat, DeclaredStatType, DeclaredStatValue, TYPED_ATTR_COLUMN_TYPE_BOOL,
@@ -72,6 +72,15 @@ pub(crate) fn declared_type_tag(ty: DeclaredColumnType) -> u32 {
         DeclaredColumnType::Bool => TYPED_ATTR_COLUMN_TYPE_BOOL,
         DeclaredColumnType::Bytes => TYPED_ATTR_COLUMN_TYPE_BYTES,
     }
+}
+
+/// A contested name's winning occurrence in one row, reduced to what the fold
+/// reads: the declared kinds' values, or a value of any other type.
+#[derive(Clone, Copy, Debug)]
+enum Winner {
+    I64(i64),
+    Bool(bool),
+    Other,
 }
 
 /// Running min/max and non-null row count for one `(column, kind)` over the
@@ -501,44 +510,22 @@ impl DeclaredStatAccum {
             if contested.contains(col.name.as_str()) {
                 continue;
             }
-            match col.cells.first() {
-                Some(AttrValue::I64(_)) => {
+            match &col.cells {
+                DynCells::I64(cells) => {
                     let mut min = i64::MAX;
                     let mut max = i64::MIN;
-                    let mut count = 0u64;
-                    for cell in &col.cells {
-                        if let AttrValue::I64(v) = cell {
-                            if *v < min {
-                                min = *v;
-                            }
-                            if *v > max {
-                                max = *v;
-                            }
-                            count += 1;
-                        }
+                    for &v in cells {
+                        min = min.min(v);
+                        max = max.max(v);
                     }
-                    if count > 0 {
-                        self.merge_i64(&col.name, min, max, count);
+                    if !cells.is_empty() {
+                        self.merge_i64(&col.name, min, max, cells.len() as u64);
                     }
                 }
-                Some(AttrValue::Bool(_)) => {
-                    let mut min = true;
-                    let mut max = false;
-                    let mut count = 0u64;
-                    for cell in &col.cells {
-                        if let AttrValue::Bool(b) = cell {
-                            if !*b {
-                                min = false;
-                            }
-                            if *b {
-                                max = true;
-                            }
-                            count += 1;
-                        }
-                    }
-                    if count > 0 {
-                        self.merge_bool(&col.name, min, max, count);
-                    }
+                DynCells::Bool(cells) if !cells.is_empty() => {
+                    let min = cells.iter().all(|&b| b);
+                    let max = cells.iter().any(|&b| b);
+                    self.merge_bool(&col.name, min, max, cells.len() as u64);
                 }
                 _ => {}
             }
@@ -568,13 +555,18 @@ impl DeclaredStatAccum {
             let mut i64_run: Option<Running<i64>> = None;
             let mut bool_run: Option<Running<bool>> = None;
             for row in 0..batch.num_rows {
-                let mut best: Option<(u8, &AttrValue)> = None;
+                let mut best: Option<(u8, Winner)> = None;
                 for (i, col) in cols.iter().enumerate() {
                     if !col.validity.get(row) {
                         continue;
                     }
-                    let cell = col.cells.get(ranks[i]);
+                    let rank = ranks[i];
                     ranks[i] += 1;
+                    let cell = match &col.cells {
+                        DynCells::I64(v) => v.get(rank).map(|&x| Winner::I64(x)),
+                        DynCells::Bool(v) => v.get(rank).map(|&b| Winner::Bool(b)),
+                        other => (rank < other.len()).then_some(Winner::Other),
+                    };
                     let Some(cell) = cell else {
                         continue;
                     };
@@ -599,17 +591,19 @@ impl DeclaredStatAccum {
                     }
                 }
                 let winner = match overflow.as_ref().map(|(_, value)| *value) {
-                    Some(value) => Some(value),
+                    Some(AttrValue::I64(v)) => Some(Winner::I64(*v)),
+                    Some(AttrValue::Bool(b)) => Some(Winner::Bool(*b)),
+                    Some(_) => Some(Winner::Other),
                     None => best.map(|(_, value)| value),
                 };
                 match winner {
-                    Some(AttrValue::I64(v)) => match &mut i64_run {
-                        Some(run) => run.observe(*v),
-                        slot @ None => *slot = Some(Running::start(*v)),
+                    Some(Winner::I64(v)) => match &mut i64_run {
+                        Some(run) => run.observe(v),
+                        slot @ None => *slot = Some(Running::start(v)),
                     },
-                    Some(AttrValue::Bool(b)) => match &mut bool_run {
-                        Some(run) => run.observe(*b),
-                        slot @ None => *slot = Some(Running::start(*b)),
+                    Some(Winner::Bool(b)) => match &mut bool_run {
+                        Some(run) => run.observe(b),
+                        slot @ None => *slot = Some(Running::start(b)),
                     },
                     _ => {}
                 }

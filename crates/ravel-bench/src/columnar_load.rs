@@ -23,7 +23,9 @@
 //!   does not attach dictionaries, so the dictionary-preserving column and
 //!   dictionary-aware bloom path (#660) never engages -- exactly as it fails to
 //!   engage on ClickBench-shaped plain-`BYTE_ARRAY` Parquet. Decision 8's
-//!   arithmetic counted those savings; this harness does not see them.
+//!   arithmetic counted those savings; this harness does not see them. Since
+//!   #2625 the loader's own columnar build attaches no dictionary either, so
+//!   on this point the harness and `ravel-cli load` build the same shape.
 //! - **In-memory store.** The router writes to a [`MemoryStore`]. S3 latency,
 //!   multi-shard fan-out scaling, and real PUT round trips are invisible here;
 //!   the CRC32C over the in-memory PUT is the only object-store work timed.

@@ -12,10 +12,9 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
-use ravel_logseg::{Bitmap, ColumnarLogBatch, DynColumn, LogSegError};
+use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, LogSegError, VarBytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
-use ravel_types::logstream::AttrValue;
 use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
 
@@ -780,12 +779,13 @@ impl LogIngestRouter {
 /// is #602). Returns ascending-shard order; a shard with no rows is omitted,
 /// exactly as the row path omits it.
 ///
-/// The parent is consumed column by column: every cell, residual attribute list
-/// and stream blob moves into its shard's sub-batch rather than being cloned,
-/// and the parent is freed column by column, each column once its rows are
-/// dealt (#2624). The severity text, body, and trace and span id bytes are
-/// copied, and each column's per-shard vectors coexist with the parent's while
-/// it is dealt.
+/// The parent is consumed column by column and freed column by column, each
+/// column once its rows are dealt (#2624). Residual attribute lists and stream
+/// blobs move into their shard's sub-batch. Dynamic cells are copied by row
+/// ([`DynCells::push_from`]: string and byte cells are copied, a nested
+/// `List`/`Map` original is cloned), as are the severity text, body, and trace
+/// and span id bytes. Each column's per-shard buffers coexist with the
+/// parent's while it is dealt.
 ///
 /// The parent's column dictionaries (`dyn_col_dicts`) are dropped: every
 /// sub-batch has an empty `dyn_col_dicts` and the writer takes its plain
@@ -875,6 +875,7 @@ pub(crate) fn partition_columnar(
         .iter()
         .map(|&num_rows| ColumnarLogBatch {
             num_rows,
+            stream_refs: Vec::with_capacity(num_rows),
             ..ColumnarLogBatch::new()
         })
         .collect();
@@ -915,12 +916,18 @@ pub(crate) fn partition_columnar(
     )?) {
         part.residual_attrs = v;
     }
-    for (row, &p) in row_part.iter().enumerate() {
-        out[p].severity_text.push(severity_text.get(row));
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_var_bytes(&severity_text, &row_part, &rows_per_part)?)
+    {
+        part.severity_text = v;
     }
     drop(severity_text);
-    for (row, &p) in row_part.iter().enumerate() {
-        out[p].body.push(body.get(row));
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_var_bytes(&body, &row_part, &rows_per_part)?)
+    {
+        part.body = v;
     }
     drop(body);
     for (part, (ids, validity)) in out.iter_mut().zip(deal_fixed_width(
@@ -976,21 +983,39 @@ pub(crate) fn partition_columnar(
             cells,
             validity,
         } = column;
-        let mut part_cells: Vec<Vec<AttrValue>> = (0..shards.len()).map(|_| Vec::new()).collect();
-        let mut part_validity: Vec<Bitmap> = (0..shards.len()).map(|_| Bitmap::new()).collect();
-        let mut cells = cells.into_iter();
+        let mut present = vec![0usize; shards.len()];
+        let mut bytes = vec![0usize; shards.len()];
+        let mut slot = 0usize;
         for (row, &p) in row_part.iter().enumerate() {
-            let cell = if validity.get(row) {
-                cells.next()
-            } else {
-                None
-            };
-            match cell {
-                Some(cell) => {
-                    part_cells[p].push(cell);
+            if validity.get(row) {
+                present[p] += 1;
+                bytes[p] += cells.bytes_at(slot).map_or(0, <[u8]>::len);
+                slot += 1;
+            }
+        }
+        let mut part_cells: Vec<DynCells> = present
+            .iter()
+            .zip(&bytes)
+            .map(|(&n, &b)| DynCells::with_capacity(field_type, n, b))
+            .collect();
+        let mut part_validity: Vec<Bitmap> = rows_per_part
+            .iter()
+            .map(|&n| Bitmap::with_capacity(n))
+            .collect();
+        let mut slot = 0usize;
+        for (row, &p) in row_part.iter().enumerate() {
+            match (validity.get(row), slot < cells.len()) {
+                (true, true) => {
+                    part_cells[p].push_from(&cells, slot)?;
                     part_validity[p].push(true);
+                    slot += 1;
                 }
-                None => part_validity[p].push(false),
+                (true, false) => {
+                    return Err(LogSegError::MalformedColumnarBatch(format!(
+                        "partition: {name} row {row} is present past its {slot} cells"
+                    )));
+                }
+                (false, _) => part_validity[p].push(false),
             }
         }
         drop(cells);
@@ -1039,6 +1064,30 @@ fn deal_rows<T>(
     Ok(parts)
 }
 
+/// Copies each row's value into its part's buffer, in row order, each part
+/// reserved for its rows' bytes. `values` must hold one value per row. A part
+/// holds a subset of a validated parent's bytes, so its checked push cannot
+/// refuse; a refusal is returned rather than wrapping the part's offsets.
+fn deal_var_bytes(
+    values: &VarBytes,
+    row_part: &[usize],
+    rows_per_part: &[usize],
+) -> Result<Vec<VarBytes>, LogSegError> {
+    let mut bytes = vec![0usize; rows_per_part.len()];
+    for (row, &p) in row_part.iter().enumerate() {
+        bytes[p] += values.get(row).len();
+    }
+    let mut parts: Vec<VarBytes> = rows_per_part
+        .iter()
+        .zip(&bytes)
+        .map(|(&n, &b)| VarBytes::with_capacity(n, b))
+        .collect();
+    for (row, &p) in row_part.iter().enumerate() {
+        parts[p].try_push(values.get(row))?;
+    }
+    Ok(parts)
+}
+
 /// Deals a packed fixed-width optional column (dense over present rows, with a
 /// per-row presence bitmap) into one packed column and bitmap per part.
 fn deal_fixed_width(
@@ -1051,9 +1100,16 @@ fn deal_fixed_width(
 ) -> Result<Vec<(Vec<u8>, Bitmap)>, LogSegError> {
     rows_agree(column, validity.len(), row_part.len())?;
     rows_agree(column, packed.len(), validity.count_present() * width)?;
+    let mut present = vec![0usize; rows_per_part.len()];
+    for (row, &p) in row_part.iter().enumerate() {
+        if validity.get(row) {
+            present[p] += 1;
+        }
+    }
     let mut out: Vec<(Vec<u8>, Bitmap)> = rows_per_part
         .iter()
-        .map(|_| (Vec::new(), Bitmap::new()))
+        .zip(&present)
+        .map(|(&rows, &n)| (Vec::with_capacity(n * width), Bitmap::with_capacity(rows)))
         .collect();
     let mut slot = 0usize;
     for (row, &p) in row_part.iter().enumerate() {
@@ -1082,6 +1138,7 @@ mod tests {
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::TenantHash;
+    use ravel_types::logstream::AttrValue;
 
     use super::*;
 
@@ -1780,8 +1837,11 @@ mod tests {
 
     /// The reference `partition_columnar` is checked against: the partition as
     /// it stood before #2624, which borrows the parent, clones every cell,
-    /// residual list and stream blob, and builds no dictionaries. Kept verbatim
-    /// apart from its name.
+    /// residual list and stream blob, and builds no dictionaries. Kept as it
+    /// was apart from its name and the cell type: it reads each dynamic cell
+    /// back as an `AttrValue` through [`DynCells::value`] and rebuilds each
+    /// shard's typed cells with [`DynCells::from_values`], where it once
+    /// cloned the parent's `AttrValue` cells directly.
     pub(crate) fn cloning_partition_reference_pre_2624(
         batch: &ColumnarLogBatch,
         shard_count: u32,
@@ -1849,7 +1909,7 @@ mod tests {
             for (c, slot) in col_slot.iter_mut().enumerate() {
                 let col = &batch.dyn_columns[c];
                 if col.validity.get(row) {
-                    acc.dyn_cells[c].push(col.cells[*slot].clone());
+                    acc.dyn_cells[c].push(col.cells.value(*slot).expect("a valid cell"));
                     acc.dyn_validity[c].push(true);
                     *slot += 1;
                 } else {
@@ -1894,7 +1954,8 @@ mod tests {
                 out.dyn_columns.push(DynColumn {
                     name: batch.dyn_columns[c].name.clone(),
                     field_type: batch.dyn_columns[c].field_type,
-                    cells,
+                    cells: DynCells::from_values(batch.dyn_columns[c].field_type, &cells)
+                        .expect("cells of the column's type"),
                     validity,
                 });
             }
@@ -2014,9 +2075,10 @@ mod tests {
     /// several shards of uneven size, absent cells, a dynamic column present in
     /// only one shard, and shards that receive no rows. The parent carries
     /// dictionaries on Str, Bytes (one holding a `Map` cell) and I64 columns;
-    /// no sub-batch carries any. The parent's string cells, residual lists and
-    /// stream blobs reappear in the sub-batches at their original heap
-    /// addresses: they were moved, not copied.
+    /// no sub-batch carries any. The parent's residual lists and stream blobs
+    /// reappear in the sub-batches at their original heap addresses: they were
+    /// moved, not copied. Typed cells have no per-cell allocation to move; they
+    /// are copied by row into each part's packed buffers.
     #[test]
     fn partition_columnar_moves_cells_and_drops_dictionaries() {
         let shard_count = 8u32;
@@ -2072,14 +2134,9 @@ mod tests {
 
         let str_ptrs = |b: &ColumnarLogBatch| {
             let mut ptrs: Vec<usize> = b
-                .dyn_columns
+                .stream_attrs
                 .iter()
-                .flat_map(|c| &c.cells)
-                .filter_map(|c| match c {
-                    AttrValue::Str(s) => Some(s.as_ptr() as usize),
-                    _ => None,
-                })
-                .chain(b.stream_attrs.iter().map(|a| a.as_ptr() as usize))
+                .map(|a| a.as_ptr() as usize)
                 .chain(
                     b.residual_attrs
                         .iter()
@@ -2096,7 +2153,7 @@ mod tests {
         child_ptrs.sort_unstable();
         assert_eq!(
             child_ptrs, parent_ptrs,
-            "every string cell, stream blob and residual list is moved, not reallocated"
+            "every stream blob and residual list is moved, not reallocated"
         );
     }
 
@@ -2121,7 +2178,11 @@ mod tests {
             }),
             ("k_str", |b| {
                 if let Some(c) = b.dyn_columns.iter_mut().find(|c| c.name == "k_str") {
-                    c.cells.pop();
+                    let mut shorter = DynCells::new(c.field_type);
+                    for slot in 0..c.cells.len() - 1 {
+                        shorter.push_from(&c.cells, slot).expect("same type");
+                    }
+                    c.cells = shorter;
                 }
             }),
         ];
@@ -2311,8 +2372,10 @@ mod tests {
             .dyn_columns
             .iter()
             .filter(|c| c.name == map_column)
-            .flat_map(|c| &c.cells)
-            .any(|c| matches!(c, AttrValue::Map(_)));
+            .any(|c| match &c.cells {
+                DynCells::Bytes(b) => b.nested.iter().any(|(_, v)| matches!(v, AttrValue::Map(_))),
+                _ => false,
+            });
         assert!(has_map, "the parent's {map_column} holds a Map cell");
     }
 

@@ -112,7 +112,9 @@ pre-change dealer exactly (see above).
 `write_columnar` already takes the batch by value, but it partitions by
 reference and keeps the parent alive until the shard acks. What changes:
 - `partition_columnar` consumes the parent and builds the per-shard batches
-  by draining its columns (moving cells), not by cloning them.
+  by draining its columns (moving cells), not by cloning them. Since wave 2
+  the typed cells are copied by row instead; see the typed column amendment
+  below.
 - The parent is gone before any shard message is sent, so the router no
   longer holds it until the acks.
 
@@ -142,7 +144,8 @@ order. It keeps the first-occurrence rule, and drops the per-slot
 
 `ColumnarLogBatch` carries:
 - string columns as offsets plus bytes (or dictionary ids plus one
-  dictionary);
+  dictionary; wave 2 took offsets plus bytes only and the loader attaches
+  no dictionary, see the typed column amendment below);
 - I64, F64 and Bool columns as plain vectors;
 - validity as a bitmap.
 
@@ -285,6 +288,8 @@ drops them, and every per-shard batch has an empty `dyn_col_dicts`, as the
 clone path did. The move itself stands as decision 2 states it: cells,
 residual attribute lists and stream blobs move into the shards, the parent
 is freed column by column, and it is gone before any shard message is sent.
+(Wave 2's typed cells are copied by row rather than moved; residual lists
+and stream blobs still move. See the typed column amendment below.)
 
 An earlier revision of wave 1 kept them, cut down and re-indexed per
 decision 2, and was reverted:
@@ -315,3 +320,55 @@ Stored objects are byte-identical either way, since the writer interns
 dictionary entries by their bytes. Decision 4 decides the typed string
 column's dictionary form afresh, inside a batch whose bytes the budget
 counts; decision 2's subset-and-reindex rule for it no longer binds.
+
+## Amendment (2026-10-07): the typed column has no dictionary form (issue #2625)
+
+<!-- amendment-applies: sections="4. A typed columnar batch (an in-memory API change in `ravel-logseg`, not a format change)" pointer="typed column amendment" -->
+
+Decision 4 offered string columns as offsets plus bytes "or dictionary ids
+plus one dictionary". Wave 2 took only the first form. A `DynColumn`'s cells
+are a `DynCells` payload: `Str` and `Bytes` cells as one byte buffer with
+`u32` offsets per column per batch (a `Bytes` column also keeps the original
+of each `List` or `Map` cell in a side list), `I64` and `F64` cells as plain
+vectors, and `Bool` cells as a vector of flags.
+
+- The loader attaches no dictionary: `build_columnar_batch` leaves
+  `dyn_col_dicts` empty.
+- The writer's dictionary path (`StrColumnDict`, ADR-0109 decision 3)
+  remains for other producers that supply one. No production producer in
+  this repository does after this change; the differential tests drive it
+  through `ColumnarLogBatch::with_dictionaries`.
+- `partition_columnar` copies typed cells by row (`DynCells::push_from`):
+  string and byte cells are copied and a nested `List` or `Map` original is
+  cloned. Only residual attribute lists and stream blobs still move.
+  Decision 2's "moving cells" described the `AttrValue` cells this
+  replaced.
+- One column's bytes in one batch are bounded by its `u32` offsets, 4 GiB.
+  A value that would pass that is refused with `LimitExceeded`, which the
+  loader reports as a load error naming the column and suggesting a smaller
+  `--batch-rows`, and `validate()` refuses offsets that are not monotonic.
+
+Measured outcome, `ravel-cli load` on ClickBench `hits.parquet` at
+`--batch-rows 500000 --read-cursors 16 --shards 4`, stopped after 360 s,
+one run per setting (docs/internal/loader-memory-2613.md, "Wave 2
+(#2625)"):
+
+- Peak RSS over the run was 11.02 GB, against 11.37 GB in wave 1. The
+  host differed (8 cores and 16.0 GB of memory, against 16 cores and
+  32.1 GB), so the comparison does not isolate the change.
+- The load wrote to the in-memory object store, which holds every written
+  object in the measured process: `push_section` held 9.4 GB in the last
+  heap dump.
+- Three of the four pre-registered targets were missed. Bytes per batch
+  row: 1,334 in a one-off measurement, against 0.5 to 1 KB, so decision 4's
+  "about 0.5 KB per row" did not hold on this corpus, whose 75 integer
+  columns are present on every row and take 600 bytes per row by
+  themselves. Under 1 GB at batch build and at shard partitioning: medians
+  1,793 MB and 1,648 MB. Peak RSS 5 to 7 GB: 11.02 GB.
+- One target was met: at `--batch-rows 1000000` the load ran its 360 s
+  without running out of memory, at a 13.33 GB peak.
+
+At about 667 MB a batch in that one-off measurement, the two site medians
+are about 2.7 and 2.5 batches held at once. Wave 3's byte budget (decision
+5) targets that remaining multiplicity, the number of batch copies alive,
+rather than the size of one batch.

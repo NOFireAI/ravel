@@ -209,7 +209,6 @@ fn empty_dictionary_str_column_is_all_null() {
         matches!(src, StrSrc::AllNull),
         "empty-dictionary string column takes the all-null path"
     );
-    assert!(!src.is_dict(), "an all-null column is not a dictionary");
     for row in 0..arr.len() {
         assert_eq!(
             src.get(row).expect("no error"),
@@ -233,10 +232,9 @@ fn empty_dictionary_bytes_column_is_all_null() {
         matches!(src, BytesSrc::AllNull),
         "empty-dictionary binary column takes the all-null path"
     );
-    assert!(!src.is_dict(), "an all-null column is not a dictionary");
     for row in 0..arr.len() {
         assert_eq!(
-            src.get(row).expect("no error"),
+            src.get_ref(row).expect("no error"),
             None,
             "every row of an empty-dictionary binary column is null"
         );

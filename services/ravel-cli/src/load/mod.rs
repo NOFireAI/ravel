@@ -43,9 +43,7 @@ use ravel_ingest::{
     LogWriteError, LogWriteReceipt, RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter,
     SpanWriteError, SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
 };
-use ravel_logseg::{
-    Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
-};
+use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_limits::LogIngestLimits;
 use ravel_otlp::normalize::{prometheus_family_name, sanitize_label_name, sanitize_metric_name};

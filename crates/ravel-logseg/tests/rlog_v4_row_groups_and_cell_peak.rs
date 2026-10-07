@@ -153,7 +153,7 @@ fn build_batch(n: usize) -> (ColumnarLogBatch, u64) {
         batch.dyn_columns.push(DynColumn {
             name: format!("attr_{j:03}"),
             field_type,
-            cells,
+            cells: ravel_logseg::DynCells::from_values(field_type, &cells).expect("typed cells"),
             validity,
         });
     }

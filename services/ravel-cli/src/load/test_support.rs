@@ -384,13 +384,6 @@ pub(super) fn read_parquet(pq: &Path, loader_schema: bool) -> RecordBatch {
     batches.pop().expect("one batch")
 }
 
-/// The `StrColumnDict` attached to dynamic column `pos`, if any.
-/// `dyn_col_dicts` is left empty (not a vec of `None`) when no column in the
-/// batch carries a dictionary, so indexing it directly is not safe.
-pub(super) fn col_dict(b: &ColumnarLogBatch, pos: usize) -> Option<&StrColumnDict> {
-    b.dyn_col_dicts.get(pos).and_then(Option::as_ref)
-}
-
 /// A pinned object identity so two objects are comparable byte for byte: the
 /// footer stamps `writer_id`/`epoch`/`seq` verbatim, so only a real drift in
 /// the encoded records could move a byte.
@@ -432,20 +425,18 @@ pub(super) fn build_columnar_or_panic(batch: &RecordBatch, mapping: &Mapping) ->
 }
 
 /// Build `batch` through both the row path and the columnar builder and
-/// assert (a) the columnar batch equals `from_records` of the row records
-/// (ignoring the additive dictionary shapes), and (b) the encoded RLOG
-/// objects are byte-for-byte identical (ADR-0109 decision 7). Returns the
-/// columnar batch for further inspection (e.g. dictionary attachment).
+/// assert (a) the columnar batch equals `from_records` of the row records,
+/// dictionary list included (the loader attaches none, #2625), and (b) the
+/// encoded RLOG objects are byte-for-byte identical (ADR-0109 decision 7).
+/// Returns the columnar batch for further inspection.
 pub(super) fn assert_paths_match(batch: &RecordBatch, mapping: &Mapping) -> ColumnarLogBatch {
     let records = row_records(batch, mapping);
     let col = build_columnar_or_panic(batch, mapping);
 
     let logrecords: Vec<ravel_logseg::LogRecord> = records.iter().map(to_logrecord).collect();
     let expected = ColumnarLogBatch::from_records(&logrecords);
-    let mut col_no_dict = col.clone();
-    col_no_dict.dyn_col_dicts = Vec::new();
     assert_eq!(
-        col_no_dict, expected,
+        col, expected,
         "columnar builder must produce the same batch as from_records of the row records"
     );
 

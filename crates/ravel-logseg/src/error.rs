@@ -28,6 +28,9 @@ pub enum LogSegError {
     /// `ravel_segment::SegmentError::UnsupportedVersion`.
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u16),
+    /// A build-side limit or precondition was not met. Among them: a value
+    /// that would take a `VarBytes` column past the 4 GiB its `u32` offsets
+    /// address (`VarBytes::try_push`).
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
     /// A read of `[start, end)` from a [`crate::source::SparseObject`] that
@@ -57,14 +60,17 @@ pub enum LogSegError {
     /// `validity` does not describe `num_rows` rows, whose `cells` count does
     /// not match `validity`'s present count, or one of whose cells has a type
     /// other than the column's `field_type`; a `dyn_col_dicts` that is
-    /// non-empty but not one entry per dyn column; a present dictionary whose
+    /// non-empty but not one entry per dyn column; a `VarBytes` column
+    /// (`severity_text`, `body`, a `Str` or `Bytes` dyn column) whose offsets
+    /// do not describe its bytes, as after more than 4 GiB wraps them; a
+    /// present dictionary whose
     /// `ids` is not parallel to its column's present cells, holds an id at or
     /// past its own `distinct.len()`, or names a `distinct` entry that differs
     /// from its cell's bytes (for a `Str` cell or a `Bytes` cell; `List` and
     /// `Map` cells are not compared). Not covered, see `validate`: duplicate
-    /// `(name, field_type)` columns, more than 4 GiB in one `VarBytes`, and
-    /// dictionary contents for `List`/`Map` cells. A caller-side input error,
-    /// not a stream id collision and not object corruption.
+    /// `(name, field_type)` columns and dictionary contents for `List`/`Map`
+    /// cells. A caller-side input error, not a stream id collision and not
+    /// object corruption.
     #[error("malformed columnar batch: {0}")]
     MalformedColumnarBatch(String),
     /// The sort descriptor handed to the writer cannot be recorded for this
