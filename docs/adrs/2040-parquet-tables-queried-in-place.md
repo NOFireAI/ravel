@@ -1361,10 +1361,11 @@ differently:
 2. A connection-level failure (the request could not be sent, the server
    refused or dropped the connection, or the response body could not be
    read) is not a statement error. It ends the phase: no task starts a
-   statement after it. D7 reports it once, as `ConcurrencyPhaseFailed`,
-   with no queries-per-second violation and no per-statement violation
-   beside it, since the phase's qps then measures the outage, not the
-   engine.
+   statement after it. D7 reports it once, as `ConcurrencyPhaseFailed`.
+   The check skips the queries-per-second rule for that phase, since its
+   qps then measures the outage, not the engine, and the failure adds no
+   per-statement violation of its own. A statement error the server
+   answered before the engine died is still named under rule 2.
 3. The bench does not retry a failed request, so one connection the server
    drops while a request is on it, a reused keep-alive connection included,
    ends the phase. A phase that ended early costs a rerun.

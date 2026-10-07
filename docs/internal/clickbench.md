@@ -1185,11 +1185,13 @@ report keeps the `concurrency` block with the figures up to that point:
 `duration_s`, `engine_unreachable` holds the time, task, statement and
 error, and each statement's `unreachable` counts its connection-level
 failures, which its `errors` includes. The same line is the report's
-`concurrency_error`, which the D7 check reports as exactly one violation,
+`concurrency_error`, which the D7 check reports as one violation,
 `ConcurrencyPhaseFailed`. The check skips the `qps` rule for a phase the
 engine ended, since its `qps` measures the outage. A connection-level
 failure is not a statement error, so it adds no per-statement violation and
-leaves `errored_statements` and `first_error` alone.
+leaves `errored_statements` and `first_error` alone. A statement error the
+server answered before the engine died is still a per-statement violation
+beside it.
 
 D7's concurrency bar is two rules (issue #2055): `qps` at least
 `concurrency_qps_floor` (0.400), and no statement error from any statement
