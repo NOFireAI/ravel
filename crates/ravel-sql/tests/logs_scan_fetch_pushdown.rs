@@ -2,36 +2,34 @@
 //! DataFusion's `LimitPushdown` physical optimizer push a LIMIT straight into
 //! the scan instead of wrapping every partition's leaf in a `LocalLimitExec`.
 //!
-//! A prior attempt at this issue built an internal rows-emitted stop inside
-//! the scan and measured no effect, because `LimitPushdown` already inserts a
-//! `LocalLimitExec` above any multi-partition leaf that does not implement
-//! `fetch`, and that node already stops the scan from opening further
-//! segments once it stops polling. The actual change here is removing that
-//! extra plan node by making the leaf report its own fetch, not making the
-//! scan stop any earlier than it already did. Four properties are pinned:
+//! Since issue #2616 the pushed fetch is an exact per-partition cap: each
+//! partition truncates the batch that reaches it to `fetch` rows, ends its
+//! stream there even partway through a segment, and opens no further owned
+//! segment. The tests pin:
 //!
-//! - `limit_removes_local_limit_and_reports_fetch_on_the_scan` (the plan-shape
-//!   test, and the one that actually distinguishes this change from the
-//!   no-op predecessor -- it comes first): `SELECT ts FROM logs LIMIT 10`'s
-//!   optimized physical plan has no `LocalLimitExec` above the scan, and the
-//!   scan itself reports `fetch() == Some(10)`.
-//! - `fetch_pushdown_returns_exact_counts_and_correct_rows` (soundness): a
-//!   LIMIT below, at, and above the total row count returns exactly the right
-//!   count every time -- never fewer -- and every returned row is a real
-//!   written row, across a plain scan, `ORDER BY`, and a residual `WHERE`
-//!   above the scan.
-//! - `single_partition_fetch_is_exact_with_no_limit_above_the_scan` (issue
-//!   #2616): with one partition no limit operator is left above the scan, and
-//!   the scan alone returns exactly `min(k, total)` rows.
-//! - `fetch_stops_opening_segments_once_the_partition_limit_is_met` (GET-count
-//!   regression): a partition made to own two whole segments opens only the
-//!   first once the pushed per-partition fetch is satisfied by it.
-//! - `fetch_stopped_segment_publishes_its_scan_metrics` (issue #2616): a
-//!   segment the fetch stops partway through still publishes the blocks and
-//!   pages its scan decoded, and on the fast path its whole-segment totals.
-//! - `fetch_narrows_the_scan_statistics` (issue #2616): the scan's
-//!   `partition_statistics` count what it emits under a fetch, not every
-//!   committed row.
+//! - `limit_removes_local_limit_and_reports_fetch_on_the_scan`: the optimized
+//!   plan of `SELECT ts FROM logs LIMIT 10` has no `LocalLimitExec`, and the
+//!   scan reports `fetch() == Some(10)`.
+//! - `fetch_pushdown_returns_exact_counts_and_correct_rows`: over four
+//!   partitions, a LIMIT below, at, and above the row count returns exactly
+//!   `min(k, total)` written rows, for a plain scan, `ORDER BY`, and a
+//!   residual `WHERE`.
+//! - `single_partition_fetch_is_exact_with_no_limit_above_the_scan`: with one
+//!   partition no limit operator is left above the scan, and the scan alone
+//!   returns exactly `min(k, total)` rows, including a limit that ends inside a
+//!   segment or a block.
+//! - `fetch_stops_opening_segments_once_the_partition_limit_is_met`: a
+//!   partition that owns two whole segments opens only the first when that
+//!   one already meets its fetch.
+//! - `fetch_stopped_segment_publishes_its_scan_metrics`: a fast-path segment
+//!   the fetch stops inside its first block publishes the blocks and pages
+//!   decoded up to the stop and the segment's whole `blocks_total`.
+//! - `fetch_stopped_segment_keeps_its_postings_prune_figure`: under an
+//!   attribute equality the postings index prunes one of three blocks, and a
+//!   fetch that stops the scan inside the first surviving block still reports
+//!   that one pruned block.
+//! - `fetch_narrows_the_scan_statistics`: the scan's `partition_statistics`
+//!   count what it emits under a fetch, not every committed row.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -105,7 +103,19 @@ async fn write_object(
     content_hash: [u8; 32],
     records: &[LogRecord],
 ) -> SegmentRef {
-    let mut w = RlogWriter::new(small_blocks(), identity());
+    write_object_indexed(store, key, content_hash, records, &[]).await
+}
+
+/// [`write_object`] with POSTINGS built for the `indexed` record attributes.
+async fn write_object_indexed(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    content_hash: [u8; 32],
+    records: &[LogRecord],
+    indexed: &[&str],
+) -> SegmentRef {
+    let mut w = RlogWriter::new(small_blocks(), identity())
+        .with_indexed_fields(indexed.iter().map(|s| s.to_string()).collect());
     for r in records {
         w.push(r.clone()).expect("push");
     }
@@ -667,9 +677,85 @@ async fn fetch_stopped_segment_publishes_its_scan_metrics() {
         MB_BLOCKS,
         "the whole-segment total is known from the open"
     );
+}
+
+/// The physical plan of `sql` over one segment of `MB_BLOCKS` three-record
+/// blocks on one partition, where the indexed record attribute `region` is
+/// `us` in the first block and `eu` in the rest. Not executed, so the caller
+/// may install a fetch on its scan first.
+async fn region_segment_plan(sql: &str) -> Arc<dyn ExecutionPlan> {
+    let store = MemoryStore::new();
+    let recs: Vec<LogRecord> = (0..MB_BLOCKS * 3)
+        .map(|i| {
+            let region = if i < 3 { "us" } else { "eu" };
+            LogRecord {
+                attrs: vec![("region".to_string(), AttrValue::Str(region.to_string()))],
+                ..record(i as i64, &format!("r{i}"))
+            }
+        })
+        .collect();
+    let seg = write_object_indexed(
+        &store,
+        "logs/region-seg0.rlog",
+        [10u8; 32],
+        &recs,
+        &["region"],
+    )
+    .await;
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let table_provider = provider(snapshot, LogSegmentFetcher::new(backend));
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_table("logs", Arc::new(table_provider))
+        .expect("register table");
+    ctx.sql(sql)
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan")
+}
+
+/// An attribute equality the postings index answers prunes the first of the
+/// three blocks. A fetch of 1 then stops the scan inside the first surviving
+/// block, and `blocks_pruned_by_postings` must still read the one block the
+/// postings step dropped from the segment, as it does on the full scan.
+#[tokio::test]
+async fn fetch_stopped_segment_keeps_its_postings_prune_figure() {
+    let sql = "SELECT body FROM logs WHERE attrs['region'] = 'eu'";
+
+    let full = region_segment_plan(sql).await;
     assert_eq!(
-        sum_metric(&limited, "blocks_pruned_by_postings"),
-        sum_metric(&full, "blocks_pruned_by_postings")
+        total_rows(&collect_plan(Arc::clone(&full)).await),
+        (MB_BLOCKS - 1) * 3
+    );
+    assert_eq!(sum_metric(&full, "blocks_total"), MB_BLOCKS);
+    assert_eq!(sum_metric(&full, "blocks_scanned"), MB_BLOCKS - 1);
+    assert_eq!(
+        sum_metric(&full, "blocks_pruned_by_postings"),
+        1,
+        "postings drops the one block holding only region = us"
+    );
+
+    let scan = find_by_name(&region_segment_plan(sql).await, "LogsScanExec")
+        .expect("a LogsScanExec leaf")
+        .with_fetch(Some(1))
+        .expect("the scan takes a fetch");
+    assert_eq!(total_rows(&collect_plan(Arc::clone(&scan)).await), 1);
+    assert_eq!(
+        sum_metric(&scan, "blocks_scanned"),
+        1,
+        "the stop came inside the first surviving block"
+    );
+    assert_eq!(sum_metric(&scan, "blocks_total"), MB_BLOCKS);
+    assert_eq!(
+        sum_metric(&scan, "blocks_pruned_by_postings"),
+        1,
+        "the fetch stop keeps the segment's postings prune figure"
     );
 }
 
