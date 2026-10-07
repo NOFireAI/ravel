@@ -177,6 +177,9 @@ flowchart TB
   the sweep that finds a named-snapshot block on shard 0 and the fold that
   reconciles it run in the same maintain process for the same unit key, but
   another shard of the pair may be swept by another process.
+  The 2026-10-07 sweep ownership amendment below retires that last clause:
+  the owner of shard 0 now sweeps every shard of the pair, so the premise
+  holds for every shard.
 - ADR-0065 decision 2's list of ownership-gated work gains the fold, keyed
   on shard 0 of the pair. docs/catalog-and-mvcc.md records the ownership
   rule in its fold section.
@@ -290,7 +293,7 @@ construction, because the sweep and the fold of a pair run in one process.
 That is true of shard 0 of the pair only. Decision 1 assigns the fold to the
 owner of shard 0, while every other shard of the pair is swept by its own
 owner under the same rendezvous hash, which with more than one maintain
-process is often a different process.
+process is often a different process (until the 2026-10-07 sweep ownership amendment below).
 
 The channel is an in-process queue (ADR-0063, the 2026-10-05 requester
 amendment), so a hold found by a process that does not fold the pair has no
@@ -310,4 +313,88 @@ sweeps no queue, so in neither is anything swept into the queue and no hold
 reaches the fold this way. A hold on another shard swept by another
 process reaches no fold and its inputs stay held until the fold's frontier
 band reaches the hour. Closing that gap needs a cross-process channel and is tracked as issue
-#2606. No ownership rule, key layout or mode gate changes.
+#2606 (the 2026-10-07 sweep ownership amendment below closes it in process instead). No ownership rule, key layout or mode gate changes.
+
+## Amendment (2026-10-07): the fold owner sweeps every shard of the pair
+
+<!-- amendment-applies: sections="Consequences|Amendment (2026-10-05): the refold channel holds for shard 0 only" pointer="2026-10-07 sweep ownership amendment" -->
+<!-- amendment-supersedes: phrase="another shard of the pair may be swept by another process" pointer="2026-10-07 sweep ownership amendment" -->
+<!-- amendment-supersedes: phrase="every other shard of the pair is swept by its own owner" pointer="2026-10-07 sweep ownership amendment" -->
+<!-- amendment-supersedes: phrase="Closing that gap needs a cross-process channel" pointer="2026-10-07 sweep ownership amendment" -->
+
+Issue #2606. The 2026-10-05 refold channel amendment left a gap: a
+named-snapshot hold the superseded-input sweep found on shard N of a pair,
+N not 0, was found by the owner of shard N, which with more than one
+maintain process is often not the process that folds the pair, and the hold
+reached no fold. This amendment closes the gap by moving the sweep rather
+than adding a channel.
+
+1. **The owner of shard 0 sweeps every shard of the pair.** The sweep pass
+   of a `(tenant, signal)` pair runs only in the process that owns shard 0
+   of it (`FOLD_UNIT_SHARD`) under the live set of the tick, and there it
+   runs for every shard in the pair's scan range, the union of every shard
+   generation's range, whether or not that process owns the shard. A process
+   that owns shard N of the pair and not shard 0 runs no sweep pass for the
+   pair. The sweep pass is the per-shard pass the maintain tick ran after
+   each unit's retention and compaction: the superseded-input sweep (rule 2)
+   together with the unreferenced-part sweep (rule 3) and orphan GC with its
+   quarantine reaper (rule 1), which `ravel-maintain` runs as one pass per
+   shard. They move together, so the cadence that pass already has is kept
+   whole, and no rule runs in two processes.
+
+2. **Retention and compaction stay per shard.** Each shard's retention and
+   compaction still run on that shard's own rendezvous owner, with ADR-0065's
+   memo slicing and bounded intra-process concurrency. The per-signal sweeps
+   and the erasure pass were already keyed on shard 0 and are unchanged.
+
+3. **The zone split is kept.** ADR-0065 decision 3's cadence runs on the
+   sweeping process, tracked in its memo per `(tenant, signal, shard)`: a
+   full pass on a shard's first tick there and every `interior_reverify_ns`
+   after, and a pass scoped to the head and tail hours on the other ticks.
+   For a shard it also scans, the head and tail hours come from its own scan,
+   as before. For a shard it does not scan, it lists the shard's hours (one
+   delimited LIST of the shard's commit prefix) and classifies them with the
+   same zone rule against the tenant's retention window, read once per pair
+   per tick. A failed read or listing takes a full pass, as a failed scan
+   already did. That listing is the one request this amendment adds, per
+   shard swept but not scanned per tick.
+
+4. **The premise holds for every shard.** The sweep that finds a
+   named-snapshot block and the fold that reconciles it run in the same
+   maintain process for the same unit key, shard 0 of the pair, for a hold on
+   any shard of the pair. Every hold the pair's sweep finds is queued in the
+   process whose fold takes it, so the in-process queue reaches the fold for
+   every shard, with no cross-process channel and no new object key. The
+   queue's other limits are unchanged: it is bounded and lost with the
+   process, and a lost entry is sent again by the next pass that finds the
+   hold.
+
+Exactly one process sweeps a pair's shards under one live set, because
+rendezvous ownership gives the unit `(tenant, signal, 0)` exactly one owner,
+and every member computes the same owner from the same live set. That owner
+sweeps every shard in the scan range, so no shard is left unswept while the
+live set is stable, and every other member skips the pair's sweep, so none is
+swept twice. During a membership transition the overlap ADR-0065 bounds
+applies unchanged: two processes may both sweep a pair for at most `3 * H`
+plus one heartbeat, and every sweep rule is idempotent and gated per pass.
+
+The sweep of shard N now runs, in the steady state, in a different process
+from shard N's compaction, which before happened only inside a transition.
+No delete rule depends on the two sharing a process. Rule 2 deletes only the
+inputs of compaction and rewrite records past their protection horizon, and
+only when no hold covers them (a HEAD that names them or cannot be read, the
+pinned-query window, a legal hold); rule 3 deletes only an `l1/` object older
+than the unreferenced-part age gate, which outlasts any compactor's
+abandonment deadline, and re-lists before each delete; rule 1 deletes only a
+record-less `l0/` object older than the orphan age gate, behind its breaker.
+The erasure pass already runs this way, on the owner of shard 0 over every
+shard while other processes compact theirs. No hold rule changes.
+
+The superseded-sweep metrics are per signal, so the sweeping process's
+counters sum every shard it sweeps, which is every shard of each pair it
+folds. A sweep of a shard the process does not own that fails counts as a
+failed tick of its shard 0 unit, the unit the pair's sweep is keyed on, so a
+sweep that keeps failing still reaches the stalled-unit gauge. The cost is
+placement: a pair's sweep work concentrates on its shard 0 owner, and stays
+balanced across processes over many pairs because rendezvous hashing spreads
+shard 0 of each pair. No key layout, mode gate or hold rule changes.

@@ -56,7 +56,11 @@ one pass by hand. See
 
 A unit is one `(tenant, signal, shard)` triple. In a multi-replica maintain
 deployment, the live workers share the units so that one live worker owns each
-unit. [The observability guide](../observability.md) catalogues the metric
+unit. A unit's owner runs its retention and compaction. The sweep pass
+(superseded inputs, unreferenced parts, orphan collection) of every shard of a
+`(tenant, signal)` pair runs on the owner of the pair's shard 0, which is the
+process that folds the pair, so a hold the sweep finds on any shard reaches
+that pair's fold. [The observability guide](../observability.md) catalogues the metric
 families that report ownership, stalls and merge memory.
 
 ## Catalog fold and verify

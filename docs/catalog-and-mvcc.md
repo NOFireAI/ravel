@@ -1230,11 +1230,12 @@ and tail hours, the hours still sealing and those within a protection horizon
 after their retention expiry. Any other hold below the fold's reconcile
 window is found by the full sweep, which runs every `interior_reverify_ns`
 (`--maintain-interior-reverify`, 6 hours by default), so it can wait that
-long before it is queued. A process sends only for pairs whose
-shard 0 it owns, because only that process folds the pair. A hold found on
-another shard, swept by a process that does not own shard 0 of the pair,
-therefore reaches no fold, and those inputs stay held as described above
-until the frontier band reaches the hour. Only a process that runs the
+long before it is queued. Only the process that owns shard 0 of a pair
+under the live set sweeps the pair, and it sweeps every shard of it,
+including the shards other processes own for retention and compaction
+(ADR-1693, the 2026-10-07 sweep ownership amendment). That is the process
+that folds the pair, so a hold found on any shard of the pair is queued in
+the process whose fold takes it. Only a process that runs the
 scheduled fold feeds the queue: in `--mode all` no maintain loop runs, and a
 maintain process whose scheduled fold is disabled (`--disable-fold`) hands
 its sweeps no queue, so neither queues anything and every fold request in
