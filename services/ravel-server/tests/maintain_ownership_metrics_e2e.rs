@@ -309,19 +309,24 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
          by the poll's first yield, so the window is a 20x margin over H"
     );
 
-    // Poll until one scrape pair shows the final partition AND a completed
-    // cold first tick on both workers. The partition sum alone is not that
-    // state: the earlier worker's first heartbeat tick read a solo live set,
-    // and if its first discovery cycle reads the live set before its own
+    // Poll until one scrape pair shows the final partition on both workers
+    // AND a cold full sweep of every unit. The partition sum alone is not
+    // that state: the earlier worker's first heartbeat tick read a solo live
+    // set, and if its first discovery cycle reads the live set before its own
     // second tick republishes it, that cycle claims all 24 units while the
-    // later worker, whose first cycle has not run yet, still reports 0 owned
-    // and 0 full sweeps. 24 + 0 matches `expected_total` with the later
-    // worker never having ticked. Requiring `full_sweeps >= owned > 0` on each
-    // side rules that state out: the inequality rules out a worker that has
-    // never ticked, and because `units_owned` is written per signal before
-    // that signal's sweeps run and a cold memo full-sweeps every owned unit,
-    // it holds together with the joint sum only once each worker has
-    // finished a cycle.
+    // later worker, whose first cycle has not run yet, still reports 0 owned.
+    // 24 + 0 matches `expected_total` with the later worker never having
+    // ticked. Requiring `owned > 0` on each side rules that state out, and a
+    // worker whose cycle is still accumulating `units_owned` reports less than
+    // its share, so the joint sum is exact only once both report a whole
+    // cycle's ownership.
+    //
+    // Full sweeps are not per owned unit: the owner of a pair's shard 0 runs
+    // the sweep of every shard of the pair (ADR-1693, the 2026-10-07 sweep
+    // ownership amendment), so a worker that owns shard 0 of no signal runs
+    // none, and the split depends on the process ids. Every unit's sweep runs
+    // on a cold memo somewhere, so the two counters together reach at least
+    // `expected_total`.
     //
     // The state is reached within one discovery cycle after convergence: the
     // later worker converged on its first heartbeat tick, before its first
@@ -334,10 +339,7 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     let expected_total = u64::from(SHARD_COUNT) * 3;
     let owned_line = "ravel_maintain_units_owned{mode=\"maintain\"}";
     let sweeps_line = "ravel_maintain_full_sweep_passes_total{mode=\"maintain\"}";
-    let cold_tick_done = |owned: Option<u64>, sweeps: Option<u64>| match (owned, sweeps) {
-        (Some(owned), Some(sweeps)) => owned > 0 && sweeps >= owned,
-        _ => false,
-    };
+    let owns_some = |owned: Option<u64>| owned.is_some_and(|owned| owned > 0);
     let mut observed = None;
     let mut settled = None;
     for _ in 0..100 {
@@ -349,9 +351,11 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
         let sweeps_b = sample_value(&body_b, sweeps_line);
         observed = Some((owned_a, sweeps_a, owned_b, sweeps_b));
         let joint = owned_a.zip(owned_b).map(|(a, b)| a + b);
+        let joint_sweeps = sweeps_a.zip(sweeps_b).map(|(a, b)| a + b);
         if joint == Some(expected_total)
-            && cold_tick_done(owned_a, sweeps_a)
-            && cold_tick_done(owned_b, sweeps_b)
+            && owns_some(owned_a)
+            && owns_some(owned_b)
+            && joint_sweeps.is_some_and(|sweeps| sweeps >= expected_total)
         {
             settled = Some((body_a, body_b));
             break;
@@ -362,9 +366,9 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
         let (owned_a, sweeps_a, owned_b, sweeps_b) = observed.unwrap_or_default();
         panic!(
             "within 100 iterations * 200ms = 20s of convergence, the two workers must jointly own \
-             every (signal, shard) unit exactly once, no double-pay (ADR-0065 decision 2), and \
-             each worker's cold-started first tick must have recorded at least one full sweep \
-             pass per owned unit; last observed: worker a units_owned={owned_a:?} \
+             every (signal, shard) unit exactly once, no double-pay (ADR-0065 decision 2), each \
+             must own some, and their cold ticks must together have recorded at least one full \
+             sweep pass per unit; last observed: worker a units_owned={owned_a:?} \
              full_sweep_passes_total={sweeps_a:?}, worker b units_owned={owned_b:?} \
              full_sweep_passes_total={sweeps_b:?}, expected units_owned total {expected_total}"
         );

@@ -1524,7 +1524,7 @@ dimension.
 |---|---|
 | `ravel_maintain_workers_live` | Gauge. In-process maintenance workers this supervisor currently sees as live. |
 | `ravel_maintain_units_owned` | Gauge. Owned (tenant, signal, shard) units this process is currently maintaining. |
-| `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. Alert on a sustained nonzero value, not on any single scrape. |
+| `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. A pair's shard 0 unit also fails a tick when this process's sweep of another shard of the pair fails, since the owner of shard 0 sweeps every shard of the pair. Alert on a sustained nonzero value, not on any single scrape. |
 | `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
 | `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
 
@@ -1629,12 +1629,17 @@ groups:
         # The counter advances per swept unit, so a process that owns none
         # never moves it while completing cycles normally: an empty cluster,
         # or a replica whose peers hold every unit under the ADR-0065 split.
-        # The `ravel_maintain_units_owned` term is what keeps that healthy
-        # case quiet, and it is why this rule is not a bare counter check.
+        # Since ADR-1693's sweep-ownership amendment, only the owner of a
+        # pair's shard 0 sweeps it, so a replica can own units for retention
+        # and compaction yet run no sweep pass; a per-process check would then
+        # false-fire on that replica forever. This rule therefore aggregates
+        # over the cluster: it fires only when no process advanced the counter
+        # while the cluster still owns units, the true "nobody is sweeping"
+        # condition.
         expr: |
-          increase(ravel_maintain_full_sweep_passes_total[3h]) == 0
+          sum(increase(ravel_maintain_full_sweep_passes_total[3h])) == 0
           and
-          ravel_maintain_units_owned > 0
+          sum(ravel_maintain_units_owned) > 0
         for: 30m
         labels:
           severity: warning
