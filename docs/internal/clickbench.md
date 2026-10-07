@@ -1126,9 +1126,10 @@ server, so a refused argument runs nothing. That check creates `--out`'s
 directory if it is missing and opens `--out` without truncating it, so a
 report from an earlier run survives until a new one replaces it.
 Past setup it writes the report before judging it: a concurrency phase that
-fails once started is recorded in the report's `concurrency_error`, the
-report is written with every statement's figures, and the bench exits 1. A
-violation is any of:
+fails once started, or that the engine becoming unreachable ends early (step
+7), is recorded in the report's `concurrency_error`, the report is written
+with every statement's figures, and the bench exits 1. A violation is any
+of:
 
 - a statement missing from the report, repeated, or not in the suite;
 - a stamp differing from `--sql-max-query-bytes` or `--sql-tenant-max-bytes`
@@ -1142,8 +1143,10 @@ violation is any of:
 - hot or cold sum above 1.25x the arm B prediction, or a hot sum not under
   `rlog_hot_ceiling_s`;
 - in the concurrency phase, queries per second under
-  `concurrency_qps_floor`, or any error from a statement not in `failures`;
-- a concurrency phase that failed after it started (`concurrency_error`).
+  `concurrency_qps_floor`, or any statement error from a statement not in
+  `failures`;
+- a concurrency phase that failed after it started, including one the engine
+  becoming unreachable ended (`concurrency_error`).
 
 A pre-registered failure that answered is printed as a finding, not a
 violation. The 1.25x bar against the *measured* arm B is not mechanical:
@@ -1161,8 +1164,28 @@ The report's
 nearest-rank p50 and p95, and the first error. No task starts a statement
 after `duration_s`, but one already running finishes and counts, so
 `elapsed_s` runs from the phase's start to the last statement returning and
-is at least `duration_s`; `qps` is completed queries over `elapsed_s`.
+is at least `duration_s` unless the phase ended early (below); `qps` is
+completed queries over `elapsed_s`.
 `error_ratio` is every error over completed plus errors.
+
+An error the server answers with, any HTTP status including 422 and 503,
+is a statement error: it counts against that statement and the phase goes
+on. A connection-level failure, where the request could not be sent or the
+server refused or dropped the connection (the error text starts with
+`engine unreachable:`), ends the phase early. No task starts a statement
+after the first one; a statement already in flight finishes, answered or
+failed the same way, so at most one connection-level failure per task is
+counted. The bench prints `concurrency: the engine became unreachable <N> s
+into the phase; task <T> saw it first, on q<NN>: <error>` once, and the
+report keeps the `concurrency` block with the figures up to that point:
+`elapsed_s` then ends at the last return after the failure and can be below
+`duration_s`, `engine_unreachable` holds the time, task, statement and
+error, and each statement's `unreachable` counts its connection-level
+failures, which its `errors` includes. The same line is the report's
+`concurrency_error`, which the D7 check reports as one violation. A
+connection-level failure is not a statement error, so it adds no
+per-statement violation and leaves `errored_statements` and `first_error`
+alone.
 
 D7's concurrency bar is two rules (issue #2055): `qps` at least
 `concurrency_qps_floor` (0.400), and no error from any statement outside
