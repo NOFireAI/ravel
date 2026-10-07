@@ -3,7 +3,10 @@
 Status: Accepted. Amended by ADR-0825: decision 3's grouped execution
 path (the plain-accumulator-behind-the-adapter clause) is replaced by a
 sequential-order GroupsAccumulator with identical bits, and integer input
-moves to exact i128 accumulation instead of the f64 fold.
+moves to exact i128 accumulation instead of the f64 fold. Amended by the
+DISTINCT ON amendment below: `first_value` stays registered for the
+optimizer's `DISTINCT ON` rewrite while statements that name it are still
+refused.
 
 Companion to ADR-0013; amends the v1 aggregate subset it defines. Grouped
 min/max total-order semantics are a sibling gap decided separately in
@@ -122,7 +125,8 @@ What the pinned datafusion 54.1.0 accumulators actually do
 2. **Allowlist enforcement.** The admitted set is `count`, `sum`, `min`,
    `max`, plus `avg`/`mean` once decision 4 is implemented.
    `build_session` becomes the hard boundary: it enumerates the
-   registered UDAFs and deregisters every name not in the admitted set,
+   registered UDAFs and deregisters every name not in the admitted set
+   (except `first_value`, which the DISTINCT ON amendment below keeps),
    replacing today's enumerated `avg`/`mean` deregistration, so a
    DataFusion upgrade that registers new default aggregates fails
    closed. validate.rs replaces `reject_avg` with a walk that rejects,
@@ -191,7 +195,9 @@ What the pinned datafusion 54.1.0 accumulators actually do
 - The unverified-aggregate gap is resolved by exclusion, and the aggregate surface becomes
   fail-closed under dependency upgrades: the reachable aggregates are
   the enumerated admitted set, nothing else, enforced at both validation
-  and registration. The audit acceptance test
+  and registration. The DISTINCT ON amendment below keeps `first_value`
+  registered for one optimizer rewrite and enforces its exclusion on the
+  planned statement instead of at registration. The audit acceptance test
   (`stddev_and_variance_family_must_be_handled_like_avg`) passes without
   a per-function reject list to maintain.
 - The public `sum` aggregate is untouched by this ADR: its bits, and its
@@ -258,3 +264,70 @@ What this does not change:
 A user-visible consequence, which the user documentation must not
 contradict: the sign and payload of a NaN returned by `sum`, `avg` or `mean`
 are not specified, and may differ between builds of Ravel.
+
+## Amendment: DISTINCT ON and the registered `first_value`
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="DISTINCT ON amendment" -->
+<!-- amendment-supersedes: phrase="deregisters every name not in the admitted set" pointer="DISTINCT ON amendment" -->
+
+Dated 2026-10-07. Tracked in issue #2629.
+
+DataFusion's `replace_distinct_aggregate` optimizer rule rewrites every
+`SELECT DISTINCT ON (...)` into an aggregate grouped by the ON expressions,
+whose other output columns are `first_value(column ORDER BY <the statement's
+ORDER BY>)`. The rule looks `first_value` up by name in the session registry,
+after the statement has been planned. Decision 2's deregistration removed it,
+so every `DISTINCT ON` failed with "There is no UDAF named first_value in the
+registry".
+
+What changes:
+
+1. **`first_value` stays registered, and stays excluded.** `build_session`
+   spares the names in `REWRITE_ONLY_AGGREGATES` (crates/ravel-sql/src/
+   session.rs), today `first_value` alone, from the deregistration loop.
+   The name stays in validate.rs's `EXCLUDED_AGGREGATES`, so the text walk
+   still refuses a statement that names it, with the same
+   `ExcludedAggregate` error. For this one name, the fail-closed boundary
+   that deregistration provided moves to the planned statement: the
+   executor walks the plan `SessionContext::sql` returns, subqueries
+   included, before any optimizer rule runs, and refuses any
+   `first_value` call it finds, as an aggregate or as a window aggregate.
+   That plan holds only what the statement itself wrote, so the check
+   covers every spelling that resolves to the function, a quoted
+   identifier the text walk does not match included, and never sees the
+   calls the rewrite adds later. The window registry still deregisters
+   `first_value` (ADR-0097 decision 6).
+2. **`DISTINCT ON` is admitted only with a total-order `ORDER BY`.** Every
+   selected column must be a plain column that an `ORDER BY` term names.
+   This is the condition the spill-eligibility check already applies to a
+   `DISTINCT ON` node (ADR-0954). A statement that fails it, including one
+   with no `ORDER BY`, is refused on the planned statement with
+   `ValidationError::DistinctOnOrderNotTotal`, an HTTP 400. Under a total
+   order, two rows that tie on the `ORDER BY` agree in every returned
+   column, so the row each ON group keeps does not depend on scan order,
+   partition count, or the order partial `first_value` states merge in,
+   and decision 1's exactness holds. Under a tied order the rewrite keeps
+   whichever tied row it meets first, which the statement does not
+   determine.
+3. **Parallel final aggregation is unchanged.** ADR-0094 already
+   classifies a `DISTINCT ON` by its ON keys; with a non-float key the
+   final `first_value` aggregation fans out across partitions, which is
+   exact under a total order.
+
+Evidence: `tests/distinct_on.rs` in ravel-sql runs three total-order
+statements over three segments at 4, 8 and 16 partitions with the final
+aggregation fanned out, five times each, and asserts the exact rows,
+including a group whose candidates are `0.0` and `-0.0` and one whose
+candidates are two NaN payloads, each split across segments. The same file
+asserts the refusals. `session::tests::distinct_on_keeps_an_input_order_row_unless_its_order_is_total`
+shows, on the bare session, that a tied order returns a different row when
+the same two rows arrive in the other order, and a total order does not.
+`admitted_and_excluded_cover_all_registries_for_every_table` now requires
+every rewrite-only name to be excluded and `build_session` to register
+exactly the admitted aggregates plus the rewrite-only ones.
+
+The condition is conservative. `SELECT DISTINCT ON (series_id) series_id, ts,
+value FROM samples ORDER BY series_id, ts DESC` is refused although `ts` is
+unique within a series; adding `value` as a trailing term admits it.
+`first_value` itself is not admitted: readmitting it under its own name is a
+decision 1 admission, not a consequence of this amendment.

@@ -200,7 +200,8 @@ pub enum SessionTable {
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
 /// enumerates the aggregate UDAFs the default session registers and
-/// deregisters every name outside this set, so exclusion is the default state
+/// deregisters every name outside this set and [`REWRITE_ONLY_AGGREGATES`],
+/// so exclusion is the default state
 /// and a DataFusion upgrade that adds a default aggregate fails closed.
 /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): they are kept in this
 /// set so the deregistration loop preserves the built-in entries, which
@@ -210,6 +211,18 @@ pub enum SessionTable {
 /// [`crate::validate::EXCLUDED_AGGREGATES`]; the two are kept exhaustive by
 /// `admitted_and_excluded_aggregates_cover_the_default_registrations` below.
 pub const ADMITTED_AGGREGATES: [&str; 6] = ["count", "sum", "min", "max", "avg", "mean"];
+
+/// Aggregates [`build_session`] keeps registered although no statement may
+/// name them (ADR-0022, DISTINCT ON amendment). DataFusion's
+/// `replace_distinct_aggregate` optimizer rule rewrites a `DISTINCT ON` into
+/// an ordered `first_value` aggregate that it looks up by name in the session
+/// registry, after the caller's statement has been planned. Each name here is
+/// also in [`crate::validate::EXCLUDED_AGGREGATES`], so the text walk refuses
+/// it, and `crate::executor` refuses a planned statement that still calls one
+/// before any optimizer rule runs, which is the gate for every spelling the
+/// text walk misses. The rewrite is exact only under the total-order gate on
+/// `DISTINCT ON` in `crate::executor`.
+pub const REWRITE_ONLY_AGGREGATES: [&str; 1] = ["first_value"];
 
 /// The v1 SQL scalar allowlist (ADR-0097 decisions 2, 4). [`build_session`]
 /// enumerates the scalar UDFs the default session registers and deregisters
@@ -781,11 +794,17 @@ pub fn build_session(
     // set, so a DataFusion upgrade that registers a new default aggregate fails
     // closed instead of silently widening the SQL surface. Names are collected
     // first because deregistration mutates the same map the accessor borrows.
+    // The rewrite-only aggregates stay registered for the optimizer; statements
+    // naming them are refused before it runs (see REWRITE_ONLY_AGGREGATES).
     let excluded: Vec<String> = ctx
         .state()
         .aggregate_functions()
         .keys()
-        .filter(|name| !ADMITTED_AGGREGATES.contains(&name.to_ascii_lowercase().as_str()))
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !ADMITTED_AGGREGATES.contains(&lower.as_str())
+                && !REWRITE_ONLY_AGGREGATES.contains(&lower.as_str())
+        })
         .cloned()
         .collect();
     for name in &excluded {
@@ -1246,6 +1265,87 @@ mod tests {
              or crate::validate::EXCLUDED_AGGREGATES): {unclassified:?}\n  \
              classified but not registered (stale entry to remove): {stale:?}"
         );
+
+        // A rewrite-only aggregate stays registered for the optimizer, so the
+        // reject-list is what refuses a statement naming it: it must be a
+        // default registration, excluded, and never admitted.
+        for name in REWRITE_ONLY_AGGREGATES {
+            assert!(
+                registered.contains(name),
+                "rewrite-only aggregate {name} is not a default registration"
+            );
+            assert!(
+                crate::validate::EXCLUDED_AGGREGATES.contains(&name),
+                "rewrite-only aggregate {name} must stay in crate::validate::EXCLUDED_AGGREGATES"
+            );
+            assert!(
+                !ADMITTED_AGGREGATES.contains(&name),
+                "rewrite-only aggregate {name} must not be admitted"
+            );
+        }
+    }
+
+    /// The `v` a `DISTINCT ON (k) k, v` statement over two rows of one ON
+    /// group returns, run straight through a [`build_session`] session, with
+    /// none of the executor's checks in front of it.
+    async fn distinct_on_survivor(rows: &str, order_by: &str) -> String {
+        use datafusion::arrow::array::{Array, StringArray};
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ctx = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            metrics_table(&store),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("session builds");
+        let sql = format!(
+            "SELECT DISTINCT ON (k) k, v FROM (VALUES {rows}) AS t(k, v) ORDER BY {order_by}"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("the DISTINCT ON rewrite finds first_value in the session registry");
+        let values: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8 v");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values.len(), 1, "one ON group, one row: {sql}");
+        values.into_iter().next().expect("one row")
+    }
+
+    /// What the executor's total-order gate on `DISTINCT ON` stands in front
+    /// of. The session plans a `DISTINCT ON` (it failed with "There is no UDAF
+    /// named first_value in the registry" while `first_value` was
+    /// deregistered), and with an `ORDER BY` that ties, the row it keeps
+    /// follows the input's row order: the same two rows in the other order
+    /// give the other answer. With every selected column in the `ORDER BY`,
+    /// the answer is the same for both orders.
+    #[tokio::test]
+    async fn distinct_on_keeps_an_input_order_row_unless_its_order_is_total() {
+        let forward = "(1, 'a'), (1, 'b')";
+        let reversed = "(1, 'b'), (1, 'a')";
+
+        assert_eq!(distinct_on_survivor(forward, "k").await, "a");
+        assert_eq!(distinct_on_survivor(reversed, "k").await, "b");
+
+        assert_eq!(distinct_on_survivor(forward, "k, v").await, "a");
+        assert_eq!(distinct_on_survivor(reversed, "k, v").await, "a");
+        assert_eq!(distinct_on_survivor(forward, "k, v DESC").await, "b");
+        assert_eq!(distinct_on_survivor(reversed, "k, v DESC").await, "b");
     }
 
     fn empty_snapshot() -> Snapshot {
@@ -1328,7 +1428,8 @@ mod tests {
     /// naming it), and a session built by [`build_session`] must register
     /// exactly the upstream admitted names plus that table's own Ravel UDFs (so
     /// a per-table UDF that goes missing or lands on the wrong table also fails
-    /// it). All comparisons are lowercased.
+    /// it), plus [`REWRITE_ONLY_AGGREGATES`] in the aggregate registry, each of
+    /// which must also be excluded. All comparisons are lowercased.
     #[test]
     fn admitted_and_excluded_cover_all_registries_for_every_table() {
         use std::collections::BTreeSet;
@@ -1345,8 +1446,10 @@ mod tests {
         /// UDFs); `all_ravel` is every Ravel-added name in this registry across
         /// all tables (empty except for scalars); `ravel_for_table` is the
         /// subset registered for THIS table; `default_upstream` is what a plain
-        /// `SessionContext::new()` registers; `registered` is what
-        /// `build_session` left after the gate.
+        /// `SessionContext::new()` registers; `rewrite_only` is the excluded
+        /// names the gate keeps registered for an optimizer rewrite (empty
+        /// except for aggregates); `registered` is what `build_session` left
+        /// after the gate.
         #[allow(clippy::too_many_arguments)]
         fn check(
             table: &str,
@@ -1356,8 +1459,15 @@ mod tests {
             all_ravel: &BTreeSet<String>,
             ravel_for_table: &BTreeSet<String>,
             default_upstream: &BTreeSet<String>,
+            rewrite_only: &BTreeSet<String>,
             registered: &BTreeSet<String>,
         ) {
+            let not_excluded: Vec<&String> = rewrite_only.difference(excluded).collect();
+            assert!(
+                not_excluded.is_empty(),
+                "{table}/{registry}: rewrite-only names missing from the excluded set: \
+                 {not_excluded:?}"
+            );
             let overlap: Vec<&String> = admitted.intersection(excluded).collect();
             assert!(
                 overlap.is_empty(),
@@ -1380,10 +1490,16 @@ mod tests {
             );
 
             // build_session must leave exactly the upstream admitted names plus
-            // this table's own Ravel UDFs: nothing excluded survives, and the
-            // per-table UDFs land on the right table.
-            let expected: BTreeSet<String> =
-                admitted_upstream.union(ravel_for_table).cloned().collect();
+            // this table's own Ravel UDFs plus the rewrite-only names: nothing
+            // else excluded survives, and the per-table UDFs land on the right
+            // table.
+            let expected: BTreeSet<String> = admitted_upstream
+                .union(ravel_for_table)
+                .cloned()
+                .collect::<BTreeSet<String>>()
+                .union(rewrite_only)
+                .cloned()
+                .collect();
             let missing: Vec<&String> = expected.difference(registered).collect();
             let extra: Vec<&String> = registered.difference(&expected).collect();
             assert!(
@@ -1410,6 +1526,7 @@ mod tests {
         let excluded_aggregates = set(crate::validate::EXCLUDED_AGGREGATES.iter());
         let admitted_tables = set(ADMITTED_TABLE_FUNCTIONS.iter());
         let excluded_tables = set(EXCLUDED_TABLE_FUNCTIONS.iter());
+        let rewrite_only_aggregates = set(REWRITE_ONLY_AGGREGATES.iter());
 
         // Every Ravel-added scalar UDF across all tables, and the per-table
         // subset. Non-scalar registries have no per-table addendum.
@@ -1459,6 +1576,7 @@ mod tests {
                 &all_ravel_scalars,
                 &ravel_scalars,
                 &default_scalars,
+                &empty,
                 &reg_scalars,
             );
             check(
@@ -1469,6 +1587,7 @@ mod tests {
                 &empty,
                 &empty,
                 &default_windows,
+                &empty,
                 &reg_windows,
             );
             check(
@@ -1479,6 +1598,7 @@ mod tests {
                 &empty,
                 &empty,
                 &default_aggregates,
+                &rewrite_only_aggregates,
                 &reg_aggregates,
             );
             check(
@@ -1489,6 +1609,7 @@ mod tests {
                 &empty,
                 &empty,
                 &default_tables,
+                &empty,
                 &reg_tables,
             );
         }

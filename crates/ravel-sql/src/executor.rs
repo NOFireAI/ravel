@@ -96,7 +96,7 @@ use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{
     Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort,
-    SortExpr, lit,
+    SortExpr, WindowFunctionDefinition, lit,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
@@ -137,15 +137,17 @@ use crate::parquet::{
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
 use crate::session::{
-    ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, SpillDecision,
-    build_session,
+    ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SPANS_TABLE,
+    SessionTable, SpillDecision, build_session,
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
 use crate::spill::{
     OperatorSpill, SpillBudget, SpillCounts, SpillScratch, accumulate_spill_counts,
 };
-use crate::validate::{referenced_base_tables, unreadable_table_reference, validate_query};
+use crate::validate::{
+    ValidationError, referenced_base_tables, unreadable_table_reference, validate_query,
+};
 
 /// Which of the five v1 tables (and thus which `Signal`) a query targets, or
 /// whether it reads Parquet tables instead (ADR-2040).
@@ -2115,6 +2117,10 @@ impl SqlExecutor {
             .await
             .map_err(plan_error)?
             .into_unoptimized_plan();
+        // Before any optimizer rule runs: `replace_distinct_aggregate` adds the
+        // rewrite-only `first_value` calls this check refuses in the caller's
+        // own statement.
+        refuse_unadmitted_planned_shapes(&plan)?;
         if plan_has_tie_order_edit(&plan) {
             plan = tie_ordered_or_unchanged(plan);
         }
@@ -4067,7 +4073,8 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 ///   ([`distinct_on_order_is_total`]): every output column of the node must
 ///   appear among the `ORDER BY` terms as a plain column reference. Nothing
 ///   appends tiebreak terms to it; a `DISTINCT ON` without such an order is
-///   ineligible. Plain `DISTINCT` (`Distinct::All`) picks no row and is
+///   ineligible, and [`refuse_unadmitted_planned_shapes`] refuses it before
+///   it runs at all. Plain `DISTINCT` (`Distinct::All`) picks no row and is
 ///   admitted. `Join` and `Window` are outside the allowlist for the
 ///   original reason, one level up: nothing here has classified their spill
 ///   behavior.
@@ -4247,6 +4254,67 @@ fn distinct_on_order_is_total(distinct_on: &DistinctOn) -> bool {
         sort_expr
             .iter()
             .any(|term| matches!(&term.expr, Expr::Column(term_column) if term_column == column))
+    })
+}
+
+/// Refuse a planned statement, before any optimizer rule runs over it, that
+/// the session's registries alone would let through (ADR-0022, DISTINCT ON
+/// amendment). Walks every node, subquery plans included:
+///
+/// - a `DISTINCT ON` whose `ORDER BY` is not total
+///   ([`distinct_on_order_is_total`]) is
+///   [`ValidationError::DistinctOnOrderNotTotal`]. The optimizer turns it into
+///   an ordered `first_value` aggregate, and an order that ties within an ON
+///   group keeps whichever tied row the scan and the partition merge happen
+///   to deliver first.
+/// - a call to a [`REWRITE_ONLY_AGGREGATES`] name is the excluded-aggregate
+///   or, with `OVER`, the excluded-window refusal `crate::validate` gives the
+///   same name. The name stays registered for the `DISTINCT ON` rewrite, so
+///   this is the check that keeps a caller from naming it in a spelling the
+///   text walk does not match, such as a quoted identifier.
+fn refuse_unadmitted_planned_shapes(plan: &LogicalPlan) -> Result<(), ValidationError> {
+    let mut refusal = None;
+    // Never errors: the closures only inspect and return a recursion verb.
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Distinct(Distinct::On(distinct_on)) = node
+            && !distinct_on_order_is_total(distinct_on)
+        {
+            refusal = Some(ValidationError::DistinctOnOrderNotTotal);
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        node.apply_expressions(|expr| {
+            expr.apply(|inner| {
+                if let Some(found) = rewrite_only_call(inner) {
+                    refusal = Some(found);
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    refusal.map_or(Ok(()), Err)
+}
+
+/// The refusal for `expr` when it calls a [`REWRITE_ONLY_AGGREGATES`] name
+/// directly, as an aggregate or as a window aggregate.
+fn rewrite_only_call(expr: &Expr) -> Option<ValidationError> {
+    let (name, windowed) = match expr {
+        Expr::AggregateFunction(call) => (call.func.name().to_ascii_lowercase(), false),
+        Expr::WindowFunction(window) => match &window.fun {
+            WindowFunctionDefinition::AggregateUDF(udaf) => {
+                (udaf.name().to_ascii_lowercase(), true)
+            }
+            WindowFunctionDefinition::WindowUDF(_) => return None,
+        },
+        _ => return None,
+    };
+    if !REWRITE_ONLY_AGGREGATES.contains(&name.as_str()) {
+        return None;
+    }
+    Some(if windowed {
+        ValidationError::ExcludedWindow { name }
+    } else {
+        ValidationError::ExcludedAggregate { name }
     })
 }
 
@@ -6541,6 +6609,16 @@ mod tests {
 
     /// Pin `sql` over an empty `samples` snapshot.
     async fn pin_samples_statement(executor: &SqlExecutor, sql: &str) -> PinnedQuery {
+        try_pin_samples_statement(executor, sql)
+            .await
+            .expect("the statement plans")
+    }
+
+    /// [`pin_samples_statement`], returning a refusal instead of panicking.
+    async fn try_pin_samples_statement(
+        executor: &SqlExecutor,
+        sql: &str,
+    ) -> Result<PinnedQuery, SqlError> {
         let snapshot = Snapshot {
             segments: Vec::new(),
             segments_pruned: 0,
@@ -6555,7 +6633,6 @@ mod tests {
                 &[],
             )
             .await
-            .expect("the statement plans")
     }
 
     /// The grouped subquery the `DISTINCT ON` spill-grant case reads: its
@@ -6564,35 +6641,35 @@ mod tests {
     const GROUPED_SAMPLES: &str =
         "(SELECT ts, series_id, count(*) AS c FROM samples GROUP BY ts, series_id) s";
 
-    /// A `DISTINCT ON` whose `ORDER BY` ties within an ON group pins with
-    /// spill disabled, so a spilled run cannot keep a different tied row than
-    /// an in-memory one; the same statement with every output column in its
-    /// `ORDER BY` is granted spill. Granted only one at a time, since the
-    /// first grant reserves the whole ceiling.
+    /// A `DISTINCT ON` whose `ORDER BY` ties within an ON group is refused
+    /// when it is pinned, leaving no scratch directory behind, so neither a
+    /// spilled nor an in-memory run can keep a tied row chosen by input order;
+    /// the same statement with every output column in its `ORDER BY` is
+    /// granted spill.
     #[tokio::test]
-    async fn a_distinct_on_with_tied_ordering_is_not_granted_spill() {
+    async fn a_distinct_on_with_tied_ordering_is_refused_and_a_total_one_spills() {
         let root = tempfile::tempdir().expect("spill root");
         let executor = spill_test_executor(root.path(), 1 << 30);
 
-        let tied = pin_samples_statement(
-            &executor,
-            &format!(
-                "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
-                 ORDER BY series_id, c DESC"
-            ),
-        )
-        .await;
-        assert!(has_distinct_on(tied.frame.logical_plan()));
+        let tied = format!(
+            "SELECT DISTINCT ON (series_id) series_id, ts, c FROM {GROUPED_SAMPLES} \
+             ORDER BY series_id, c DESC"
+        );
+        let refused = try_pin_samples_statement(&executor, &tied).await;
         assert!(
-            tied.scratch.is_none(),
-            "a DISTINCT ON whose order ties within a group must not be granted spill"
+            matches!(
+                refused,
+                Err(SqlError::Validation(
+                    ValidationError::DistinctOnOrderNotTotal
+                ))
+            ),
+            "a DISTINCT ON whose order ties within a group must be refused"
         );
         assert_eq!(
             std::fs::read_dir(root.path()).expect("readable").count(),
             0,
-            "no scratch directory is created for it"
+            "no scratch directory is left for it"
         );
-        drop(tied);
 
         let total = pin_samples_statement(
             &executor,

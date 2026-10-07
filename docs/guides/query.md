@@ -615,6 +615,30 @@ join Parquet tables with each other but not with any of the five. One of the
 five beside a Parquet table is the same HTTP 400. Ravel returns it after one
 listing per other name finds that the name is a Parquet table.
 
+### `DISTINCT ON`
+
+`SELECT DISTINCT ON (...)` is supported only when its `ORDER BY` fully
+determines the row it keeps for each group. Every selected column must also
+be an `ORDER BY` term, written as the plain column:
+
+```sql
+SELECT DISTINCT ON (series_id) series_id, ts, value
+FROM samples
+ORDER BY series_id, ts DESC, value
+```
+
+This returns the latest sample of each series. The same statement without
+the trailing `value` is refused with an HTTP 400 that names `DISTINCT ON`,
+even though `ts` is unique within a series, and so is a `DISTINCT ON` with
+no `ORDER BY`. Without that rule, two rows that tie on the `ORDER BY` could
+differ in a selected column, and which one came back would depend on how the
+data is stored rather than on the statement. When the rule holds, the result
+is the same on every run.
+
+`first_value` is not a supported aggregate or window function. Ravel uses it
+internally to answer `DISTINCT ON`, but a statement that calls it directly is
+refused with an HTTP 400.
+
 ### Parquet table DDL
 
 The same endpoint creates and drops Parquet tables. The server routes a
