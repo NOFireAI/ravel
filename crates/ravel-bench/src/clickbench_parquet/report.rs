@@ -1607,8 +1607,8 @@ mod tests {
         };
         concurrency.engine_unreachable = Some(unreachable.clone());
         report.concurrency_error = Some(unreachable.to_string());
-        let violations = check_against(&report, &prereg(), Ok(declared()))
-            .expect_err("the phase failed");
+        let violations =
+            check_against(&report, &prereg(), Ok(declared())).expect_err("the phase failed");
         assert_eq!(
             violations,
             vec![Violation::ConcurrencyPhaseFailed {
