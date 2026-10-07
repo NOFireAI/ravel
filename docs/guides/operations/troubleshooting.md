@@ -1485,6 +1485,27 @@ splits the memory of the process three ways:
 | `stat="active"` minus `stat="allocated"` | Size-class fragmentation inside live allocations. |
 | `stat="allocated"` | The live allocations. If this is close to resident, live buffers hold the memory, and a heap profile names the allocation sites. |
 
+Freed pages that jemalloc has not yet returned count toward `stat="resident"`.
+At startup the server enables jemalloc's background thread, which returns
+them to the operating system on a timer. Without it, jemalloc returns them
+only during later allocator calls, so an idle server keeps them. The startup
+log stamps the state, as read back from the allocator:
+
+```
+INFO allocator background purge thread resolved allocator_background_thread=true source="server"
+```
+
+- `source="malloc_conf"` means that `_RJEM_MALLOC_CONF` sets
+  `background_thread`, and the server left that setting as it was.
+- `/metrics` reports the same state, read at scrape time, as
+  `ravel_process_allocator_background_thread{allocator="jemalloc"}`: `1` when
+  the thread is enabled, `0` when it is not.
+- If the server cannot enable the thread, it logs a warning, stamps `false`,
+  and starts anyway.
+- To turn the thread off, start the server with
+  `_RJEM_MALLOC_CONF=background_thread:false`. To combine it with the
+  profiling options below, separate the options with commas.
+
 **Action.** Take a heap profile:
 
 1. Build the server with jemalloc's profiler compiled in. The profiler is off
