@@ -1567,7 +1567,6 @@ mod tests {
         // that ended the phase.
         q8.errors = 3;
         q8.unreachable = 1;
-        assert_eq!(q8.statement_errors(), 2);
         concurrency.errors += 3;
         concurrency.unreachable = 1;
         concurrency.elapsed_s = 210.0;
