@@ -424,8 +424,8 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, PoisonError};
 
     use clap::error::ErrorKind;
     use datafusion::arrow::record_batch::RecordBatch;
@@ -741,8 +741,12 @@ mod tests {
             })
         }
 
+        /// Readable after a capped request panicked while holding the lock.
         fn requests(&self) -> Vec<(String, u64, bool)> {
-            self.requests.lock().expect("requests lock").clone()
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
     }
 
@@ -757,7 +761,10 @@ mod tests {
         async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
             let server = &self.0;
             let refused = {
-                let mut requests = server.requests.lock().expect("requests lock");
+                let mut requests = server
+                    .requests
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 assert!(
                     requests.len() < REQUEST_CAP,
                     "the phase kept sending requests"
@@ -803,7 +810,20 @@ mod tests {
         .expect("past setup the run returns its violations");
         let text = std::fs::read_to_string(&args.out).expect("the report was written");
         let report = serde_json::from_str(&text).expect("report parses");
-        (violations, report)
+        // The stub's empty answers fail q24's ordering check; only the
+        // concurrency phase's own violations are under test here.
+        let concurrency_violations = violations
+            .into_iter()
+            .filter(|v| {
+                matches!(
+                    v,
+                    Violation::ConcurrencyQpsBelowFloor { .. }
+                        | Violation::ConcurrencyUnregisteredError { .. }
+                        | Violation::ConcurrencyPhaseFailed { .. }
+                )
+            })
+            .collect();
+        (concurrency_violations, report)
     }
 
     #[tokio::test]
