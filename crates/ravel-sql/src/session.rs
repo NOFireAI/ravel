@@ -200,7 +200,8 @@ pub enum SessionTable {
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
 /// enumerates the aggregate UDAFs the default session registers and
-/// deregisters every name outside this set, so exclusion is the default state
+/// deregisters every name outside this set and [`REWRITE_ONLY_AGGREGATES`],
+/// so exclusion is the default state
 /// and a DataFusion upgrade that adds a default aggregate fails closed.
 /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): they are kept in this
 /// set so the deregistration loop preserves the built-in entries, which
@@ -210,6 +211,18 @@ pub enum SessionTable {
 /// [`crate::validate::EXCLUDED_AGGREGATES`]; the two are kept exhaustive by
 /// `admitted_and_excluded_aggregates_cover_the_default_registrations` below.
 pub const ADMITTED_AGGREGATES: [&str; 6] = ["count", "sum", "min", "max", "avg", "mean"];
+
+/// Aggregates [`build_session`] keeps registered although no statement may
+/// name them (ADR-0022, DISTINCT ON amendment). DataFusion's
+/// `replace_distinct_aggregate` optimizer rule rewrites a `DISTINCT ON` into
+/// an ordered `first_value` aggregate that it looks up by name in the session
+/// registry, after the caller's statement has been planned. Each name here is
+/// also in [`crate::validate::EXCLUDED_AGGREGATES`], so the text walk refuses
+/// it, and `crate::executor` refuses a planned statement that still calls one
+/// before any optimizer rule runs, which is the gate for every spelling the
+/// text walk misses. The rewrite is exact only under the total-order gate on
+/// `DISTINCT ON` in `crate::executor`.
+pub const REWRITE_ONLY_AGGREGATES: [&str; 1] = ["first_value"];
 
 /// The v1 SQL scalar allowlist (ADR-0097 decisions 2, 4). [`build_session`]
 /// enumerates the scalar UDFs the default session registers and deregisters
@@ -781,11 +794,17 @@ pub fn build_session(
     // set, so a DataFusion upgrade that registers a new default aggregate fails
     // closed instead of silently widening the SQL surface. Names are collected
     // first because deregistration mutates the same map the accessor borrows.
+    // The rewrite-only aggregates stay registered for the optimizer; statements
+    // naming them are refused before it runs (see REWRITE_ONLY_AGGREGATES).
     let excluded: Vec<String> = ctx
         .state()
         .aggregate_functions()
         .keys()
-        .filter(|name| !ADMITTED_AGGREGATES.contains(&name.to_ascii_lowercase().as_str()))
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !ADMITTED_AGGREGATES.contains(&lower.as_str())
+                && !REWRITE_ONLY_AGGREGATES.contains(&lower.as_str())
+        })
         .cloned()
         .collect();
     for name in &excluded {
