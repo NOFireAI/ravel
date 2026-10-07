@@ -1563,15 +1563,35 @@ mod tests {
             .iter_mut()
             .find(|s| s.number == 8)
             .expect("q8 present");
+        // Two statement errors the server answered, then the refused request
+        // that ended the phase.
         q8.errors = 3;
         q8.unreachable = 1;
+        concurrency.errors += 3;
+        concurrency.unreachable = 1;
+        concurrency.elapsed_s = 210.0;
+        // Under the floor, and not judged: the outage ended the phase.
+        concurrency.qps = 0.2;
+        let unreachable = EngineUnreachable {
+            at_s: 210.0,
+            task: 3,
+            statement: 8,
+            error: "engine unreachable: POST /api/v1/sql: connection refused".to_string(),
+        };
+        concurrency.engine_unreachable = Some(unreachable.clone());
+        report.concurrency_error = Some(unreachable.to_string());
         let violations = check(&report, &prereg()).expect_err("q8 errored twice");
         assert_eq!(
             violations,
-            vec![Violation::ConcurrencyUnregisteredError {
-                number: 8,
-                errors: 2
-            }]
+            vec![
+                Violation::ConcurrencyUnregisteredError {
+                    number: 8,
+                    errors: 2
+                },
+                Violation::ConcurrencyPhaseFailed {
+                    error: unreachable.to_string()
+                },
+            ]
         );
     }
 
