@@ -1,0 +1,955 @@
+{
+  "provenance": {
+    "git_sha": "2f7728f43fd6aafb3eeae83d4fbc9389032fd575",
+    "binary": "/var/lib/fleet/work/6cd1ef60-6bf8-4058-830c-884fcdd4f760/.gate-logs/bin/clickbench_parquet_bench",
+    "arm": "a",
+    "location": "s3://clickbench-parquet/hits/",
+    "server": "http://127.0.0.1:4318",
+    "server_log": ".gate-logs/server-run.log",
+    "server_settings": [
+      {
+        "setting": "cache_max_bytes",
+        "values": [
+          3200000000
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "catalog_cache_max_bytes",
+        "values": [
+          400000000
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "fetch_concurrency",
+        "values": [
+          32
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "sql_max_query_bytes",
+        "values": [
+          3960000000
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "sql_tenant_max_bytes",
+        "values": [
+          3960000000
+        ],
+        "unreadable_lines": []
+      }
+    ],
+    "sql_max_query_bytes": 3960000000,
+    "sql_tenant_max_bytes": 3960000000,
+    "reference_dir": ".gate-logs/ref-dummy",
+    "reference_version": "datafusion-cli 54.1.0",
+    "ddl_files": 20
+  },
+  "statements": [
+    {
+      "number": 1,
+      "cold_s": 0.027683656,
+      "hot_s": 0.01528746,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 2,
+      "cold_s": 0.038756918,
+      "hot_s": 0.027529751,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 3,
+      "cold_s": 0.05062852,
+      "hot_s": 0.035418092,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 4,
+      "cold_s": 0.059425184,
+      "hot_s": 0.031877093,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 5,
+      "cold_s": 0.113460142,
+      "hot_s": 0.097606917,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 6,
+      "cold_s": 0.177357659,
+      "hot_s": 0.126205596,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 7,
+      "cold_s": 0.033509194,
+      "hot_s": 0.01686099,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 8,
+      "cold_s": 0.026928107,
+      "hot_s": 0.025727686,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 9,
+      "cold_s": 0.145553129,
+      "hot_s": 0.133611865,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 10,
+      "cold_s": 0.183945187,
+      "hot_s": 0.168292909,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 11,
+      "cold_s": 0.103085288,
+      "hot_s": 0.076292994,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 12,
+      "cold_s": 0.097472255,
+      "hot_s": 0.078105311,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 13,
+      "cold_s": 0.257844201,
+      "hot_s": 0.228262857,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 14,
+      "cold_s": 0.296755453,
+      "hot_s": 0.303253058,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 15,
+      "cold_s": 0.250210527,
+      "hot_s": 0.21619174,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 16,
+      "cold_s": 0.128223038,
+      "hot_s": 0.109345506,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 17,
+      "cold_s": 0.331735284,
+      "hot_s": 0.296062885,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 18,
+      "cold_s": 0.276041005,
+      "hot_s": 0.278101107,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 19,
+      "cold_s": 0.695066853,
+      "hot_s": 0.56739218,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 20,
+      "cold_s": 0.028935867,
+      "hot_s": 0.026596248,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 21,
+      "cold_s": 0.381502502,
+      "hot_s": 0.177085123,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 22,
+      "cold_s": 0.207531099,
+      "hot_s": 0.191791707,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 23,
+      "cold_s": 0.831229513,
+      "hot_s": 0.513555568,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 24,
+      "cold_s": 1.16738889,
+      "hot_s": 0.474213255,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 25,
+      "cold_s": 0.129129231,
+      "hot_s": 0.115218987,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 26,
+      "cold_s": 0.134413075,
+      "hot_s": 0.12870839,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 27,
+      "cold_s": 0.158693574,
+      "hot_s": 0.149839539,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 28,
+      "cold_s": 0.175222836,
+      "hot_s": 0.175144773,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 29,
+      "cold_s": 1.150440239,
+      "hot_s": 1.028556322,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 30,
+      "cold_s": 0.053807291,
+      "hot_s": 0.050861106,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 31,
+      "cold_s": 0.16991225,
+      "hot_s": 0.157792991,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 32,
+      "cold_s": 0.199454692,
+      "hot_s": 0.179150395,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 33,
+      "cold_s": 0.755007341,
+      "hot_s": 0.727967601,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 34,
+      "cold_s": 0.651897033,
+      "hot_s": 0.67417951,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 35,
+      "cold_s": 0.695985646,
+      "hot_s": 0.652003356,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 36,
+      "cold_s": 0.116538699,
+      "hot_s": 0.105492089,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 37,
+      "cold_s": 0.124875333,
+      "hot_s": 0.124394599,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 38,
+      "cold_s": 0.076182951,
+      "hot_s": 0.073572095,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 39,
+      "cold_s": 0.06354535,
+      "hot_s": 0.066244079,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 40,
+      "cold_s": 0.808666428,
+      "hot_s": 0.802340487,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 41,
+      "cold_s": 0.068394723,
+      "hot_s": 0.051122193,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 42,
+      "cold_s": 0.058007938,
+      "hot_s": 0.047628754,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    },
+    {
+      "number": 43,
+      "cold_s": 0.0443383,
+      "hot_s": 0.03882735,
+      "verdict": null,
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": "reference is not datafusion-cli JSON: invalid type: map, expected a sequence at line 1 column 0",
+      "error": null
+    }
+  ],
+  "totals": {
+    "cold_sum_s": 11.544782401,
+    "hot_sum_s": 9.563712514,
+    "answered": 43,
+    "failed": []
+  },
+  "registered_failures_answered": [
+    19,
+    29,
+    33,
+    34,
+    35
+  ],
+  "concurrency": {
+    "tasks": 10,
+    "duration_s": 360.0,
+    "elapsed_s": 360.382051076,
+    "queries_completed": 2626,
+    "errors": 46,
+    "unreachable": 0,
+    "qps": 7.2867114001918205,
+    "error_ratio": 0.01721556886227545,
+    "statements": [
+      {
+        "number": 1,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.829031682,
+        "p95_s": 1.540383381,
+        "first_error": null
+      },
+      {
+        "number": 2,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.53703289,
+        "p95_s": 1.24655058,
+        "first_error": null
+      },
+      {
+        "number": 3,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.994805482,
+        "p95_s": 1.780091922,
+        "first_error": null
+      },
+      {
+        "number": 4,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.980649983,
+        "p95_s": 1.813290586,
+        "first_error": null
+      },
+      {
+        "number": 5,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.715652724,
+        "p95_s": 2.747184264,
+        "first_error": null
+      },
+      {
+        "number": 6,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.119642411,
+        "p95_s": 2.176924894,
+        "first_error": null
+      },
+      {
+        "number": 7,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.481950924,
+        "p95_s": 1.03027837,
+        "first_error": null
+      },
+      {
+        "number": 8,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.730255995,
+        "p95_s": 1.217004408,
+        "first_error": null
+      },
+      {
+        "number": 9,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.904344151,
+        "p95_s": 2.9898966639999998,
+        "first_error": null
+      },
+      {
+        "number": 10,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.593972752,
+        "p95_s": 2.887950489,
+        "first_error": null
+      },
+      {
+        "number": 11,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.796367753,
+        "p95_s": 1.617011732,
+        "first_error": null
+      },
+      {
+        "number": 12,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.800688917,
+        "p95_s": 1.8131528970000002,
+        "first_error": null
+      },
+      {
+        "number": 13,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.296495226,
+        "p95_s": 2.25153599,
+        "first_error": null
+      },
+      {
+        "number": 14,
+        "completed": 60,
+        "errors": 2,
+        "unreachable": 0,
+        "p50_s": 1.687827871,
+        "p95_s": 3.003585329,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 237597617 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 15,
+        "completed": 61,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.377058796,
+        "p95_s": 2.221906045,
+        "first_error": null
+      },
+      {
+        "number": 16,
+        "completed": 60,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.6234528990000001,
+        "p95_s": 2.89493296,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 917504 more bytes on top of 3959990145 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 17,
+        "completed": 60,
+        "errors": 2,
+        "unreachable": 0,
+        "p50_s": 1.8945986879999999,
+        "p95_s": 2.92176486,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 181310672 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 18,
+        "completed": 61,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.998844091,
+        "p95_s": 2.798285747,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 288991800 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 19,
+        "completed": 53,
+        "errors": 8,
+        "unreachable": 0,
+        "p50_s": 2.770787603,
+        "p95_s": 4.346338656,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 1835008 more bytes on top of 3958761311 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 20,
+        "completed": 61,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.552996973,
+        "p95_s": 1.283640718,
+        "first_error": null
+      },
+      {
+        "number": 21,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.72595885,
+        "p95_s": 1.584226344,
+        "first_error": null
+      },
+      {
+        "number": 22,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.880257214,
+        "p95_s": 1.533479574,
+        "first_error": null
+      },
+      {
+        "number": 23,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.3242348879999999,
+        "p95_s": 1.992371825,
+        "first_error": null
+      },
+      {
+        "number": 24,
+        "completed": 61,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.148964973,
+        "p95_s": 2.158726419,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: process memory budget exhausted: 8192013 more bytes on top of 4396760823 already reserved exceeds process limit 4400000000 (tenant reserved 3381793077 of tenant limit 3960000000)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 25,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.800503462,
+        "p95_s": 1.4366435339999999,
+        "first_error": null
+      },
+      {
+        "number": 26,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.831819708,
+        "p95_s": 1.419198844,
+        "first_error": null
+      },
+      {
+        "number": 27,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.703779339,
+        "p95_s": 1.434253775,
+        "first_error": null
+      },
+      {
+        "number": 28,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.294391276,
+        "p95_s": 2.060327207,
+        "first_error": null
+      },
+      {
+        "number": 29,
+        "completed": 61,
+        "errors": 2,
+        "unreachable": 0,
+        "p50_s": 2.461398162,
+        "p95_s": 3.316997575,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 3081030 more bytes on top of 3959809244 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 30,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.952616966,
+        "p95_s": 1.673966199,
+        "first_error": null
+      },
+      {
+        "number": 31,
+        "completed": 63,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.981808583,
+        "p95_s": 1.918826511,
+        "first_error": null
+      },
+      {
+        "number": 32,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.148959553,
+        "p95_s": 2.010140362,
+        "first_error": null
+      },
+      {
+        "number": 33,
+        "completed": 47,
+        "errors": 16,
+        "unreachable": 0,
+        "p50_s": 3.706561084,
+        "p95_s": 4.710954319,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 13631488 more bytes on top of 3950588973 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 34,
+        "completed": 57,
+        "errors": 5,
+        "unreachable": 0,
+        "p50_s": 2.333118517,
+        "p95_s": 3.966016479,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 2175972 more bytes on top of 3958722466 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 35,
+        "completed": 55,
+        "errors": 6,
+        "unreachable": 0,
+        "p50_s": 2.354314444,
+        "p95_s": 3.583315284,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 1555712 more bytes on top of 3958688532 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 36,
+        "completed": 60,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.4439957319999999,
+        "p95_s": 2.524804546,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 83494192 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 37,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.93131604,
+        "p95_s": 1.743768174,
+        "first_error": null
+      },
+      {
+        "number": 38,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.780282034,
+        "p95_s": 1.379124747,
+        "first_error": null
+      },
+      {
+        "number": 39,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.690438206,
+        "p95_s": 1.380985497,
+        "first_error": null
+      },
+      {
+        "number": 40,
+        "completed": 61,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 2.419591658,
+        "p95_s": 3.511206336,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 154742536 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 41,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.880534532,
+        "p95_s": 1.552755004,
+        "first_error": null
+      },
+      {
+        "number": 42,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.758312079,
+        "p95_s": 1.543411756,
+        "first_error": null
+      },
+      {
+        "number": 43,
+        "completed": 62,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.711049901,
+        "p95_s": 1.3533545249999999,
+        "first_error": null
+      }
+    ],
+    "errored_statements": [
+      14,
+      16,
+      17,
+      18,
+      19,
+      24,
+      29,
+      33,
+      34,
+      35,
+      36,
+      40
+    ],
+    "engine_unreachable": null
+  },
+  "concurrency_error": null
+}
