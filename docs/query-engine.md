@@ -4358,9 +4358,15 @@ pays. The query-audit shard keeps its own separate compaction and 90-day sweep.
 The bounds a `logs` query runs under hold here unchanged: segment admission caps
 the resolved snapshot, every emitted batch grows the query's memory reservation
 so an over-budget scan fails with `ResourcesExhausted` at the tenant's pool
-ceiling, and the request deadline bounds wall time. The bytes-scanned budget and
-the LIMIT fetch-stop hint that the RLOG and RSPAN scan loops still lack apply
-here too, and these two tables add two more callers without changing that scope.
+ceiling, and the request deadline bounds wall time. The bytes-scanned budget the
+RLOG and RSPAN scan loops still lack is missing here too, and these two tables
+add two more callers without changing that scope. Neither scan takes a pushed
+LIMIT: `AlertsScanExec` and `AuditScanExec` implement no `fetch`, so the LIMIT
+stays a limit operator above the scan, which ends a partition only by no longer
+polling it. `SpansScanExec` is the same, and the `spans` provider forwards a
+LIMIT only on its distributed coordinator path. `LogsScanExec` is the one that
+takes it: each partition stops at exactly the pushed `fetch` rows, partway
+through a segment if need be, and opens no further owned segment.
 
 The operator-facing pages are [docs/guides/alerting.md](guides/alerting.md) for
 alert history and [docs/guides/audit.md](guides/audit.md) for the audit trail.
