@@ -58,7 +58,13 @@
 //! naming the admitted set, and `crate::session::build_session` enforces the
 //! same allowlist at registration by deregistering every default UDAF outside
 //! the admitted set. The walk exists for the good error message; the
-//! deregistration is the backstop. A CI test
+//! deregistration is the backstop. `first_value` is the one excluded name the
+//! session keeps registered, because the optimizer's `DISTINCT ON` rewrite
+//! looks it up by name
+//! ([`REWRITE_ONLY_AGGREGATES`](crate::session::REWRITE_ONLY_AGGREGATES)); its
+//! backstop is the check `crate::executor` runs on the planned statement
+//! before that rewrite, which refuses any call the statement itself makes to
+//! it. A CI test
 //! (`crate::session`'s `admitted_and_excluded_aggregates_cover_the_default_\
 //! registrations`) asserts the excluded list plus the admitted set exactly
 //! cover the default registrations, so a DataFusion upgrade that adds a default
@@ -95,7 +101,10 @@ use std::ops::ControlFlow;
 /// ([`ADMITTED_AGGREGATES`](crate::session::ADMITTED_AGGREGATES): `count`,
 /// `sum`, `min`, `max`, `avg`, `mean`). ADR-0022 decision 2 makes exclusion the default: the
 /// aggregate walk rejects any call spelled as one of these, and
-/// `crate::session::build_session` deregisters the same names at registration.
+/// `crate::session::build_session` deregisters the same names at registration,
+/// except the [`REWRITE_ONLY_AGGREGATES`](crate::session::REWRITE_ONLY_AGGREGATES)
+/// it keeps for the optimizer's `DISTINCT ON` rewrite. Those stay listed here,
+/// so a statement naming one is still refused.
 ///
 /// This list is kept exhaustive by a CI test in `crate::session`
 /// (`admitted_and_excluded_aggregates_cover_the_default_registrations`) that
@@ -148,7 +157,10 @@ pub(crate) const EXCLUDED_AGGREGATES: [&str; 39] = [
 ];
 
 /// A request rejected by the read-only single-statement gate, before any
-/// planning happened.
+/// planning happened, or by the subset check `crate::executor` runs on the
+/// planned statement before any optimizer rule
+/// ([`ValidationError::DistinctOnOrderNotTotal`], and a rewrite-only
+/// aggregate the text walk did not match).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
     /// The body contained no statement at all.
@@ -189,6 +201,19 @@ pub enum ValidationError {
          (docs/adrs/0022-floating-aggregate-exactness.md)"
     )]
     ExcludedAggregate { name: String },
+
+    /// A `SELECT DISTINCT ON (...)` whose `ORDER BY` does not decide which row
+    /// of each ON group it keeps: some selected column is not a plain column
+    /// that an `ORDER BY` term names, or the statement has no `ORDER BY`. Two
+    /// rows that tie on the ordering could then differ in a returned column,
+    /// and the one kept would depend on scan and partition order (ADR-0022,
+    /// DISTINCT ON amendment). Raised from the planned statement, after the
+    /// snapshot resolve, since the selected columns are known only there.
+    #[error(
+        "DISTINCT ON is supported only when its ORDER BY fully determines the row \
+         each ON group keeps: every selected column must also be an ORDER BY term"
+    )]
+    DistinctOnOrderNotTotal,
 
     /// A scalar function excluded from the v1 subset appeared in the query.
     /// The admitted scalar surface is every default-registered deterministic
@@ -1101,7 +1126,10 @@ fn classify_excluded(bare: &str, windowed: bool) -> Option<ValidationError> {
 /// One spelling is not covered: a quoted identifier such as `"uuid"()` keeps
 /// its quote characters in `func.name.to_string()`, so the exact-equality
 /// match misses it. That query is still refused, by the registry gate, but
-/// with the opaque plan error this walk exists to replace. Because the walk
+/// with the opaque plan error this walk exists to replace. A rewrite-only
+/// aggregate (`"first_value"(...)`) has no registry gate; the check
+/// `crate::executor` runs on the planned statement refuses it instead, with
+/// the same typed error this walk gives the bare spelling. Because the walk
 /// is only a message layer, a miss costs error quality and never admits
 /// anything.
 /// It admits nothing on its own -- a name absent here is still refused by the
