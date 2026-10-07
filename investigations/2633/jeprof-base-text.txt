@@ -1,0 +1,41 @@
+Total: 3228780288 B
+3228780288 100.0% 100.0% 3228780288 100.0% prof_backtrace_impl
+       0   0.0% 100.0%   524608   0.0% ::add_parsable_certificates:: (inline)
+       0   0.0% 100.0% 3181234795  98.5% ::alloc (inline)
+       0   0.0% 100.0% 3183080609  98.6% ::alloc_impl (inline)
+       0   0.0% 100.0% 3183080609  98.6% ::alloc_impl_runtime (inline)
+       0   0.0% 100.0%  1845813   0.1% ::alloc_zeroed (inline)
+       0   0.0% 100.0%   525826   0.0% ::allocate
+       0   0.0% 100.0% 3183080609  98.6% ::allocate (inline)
+       0   0.0% 100.0%  1176508   0.0% ::attempt::{closure#0} (inline)
+       0   0.0% 100.0%   525184   0.0% ::bind:: (inline)
+       0   0.0% 100.0%   525184   0.0% ::bind_new_task:: (inline)
+       0   0.0% 100.0%  2895798   0.1% ::block_on:: (inline)
+       0   0.0% 100.0%  2895798   0.1% ::block_on::::{closure#0} (inline)
+       0   0.0% 100.0%  2895798   0.1% ::block_on_inner:: (inline)
+       0   0.0% 100.0%  1048944   0.0% ::build
+       0   0.0% 100.0%  1048704   0.0% ::build (inline)
+       0   0.0% 100.0%   524336   0.0% ::build_many:: (inline)
+       0   0.0% 100.0%   524336   0.0% ::build_many_from_hir::
+       0   0.0% 100.0%   524336   0.0% ::build_many_from_hir:: (inline)
+       0   0.0% 100.0%   524336   0.0% ::build_one_string (inline)
+       0   0.0% 100.0% 2699648729  83.6% ::bytes::{closure#0}
+       0   0.0% 100.0%  1049136   0.0% ::call
+       0   0.0% 100.0%  2230729   0.1% ::call::{closure#0}
+       0   0.0% 100.0%   524336   0.0% ::call_once
+       0   0.0% 100.0% 3228780288 100.0% ::call_once (inline)
+       0   0.0% 100.0% 3225360198  99.9% ::call_once::{shim:vtable#0}
+       0   0.0% 100.0%  1049136   0.0% ::call_once_force:: (inline)
+       0   0.0% 100.0%  1049136   0.0% ::call_once_force::::{closure#0}
+       0   0.0% 100.0%   524292   0.0% ::clone_from_ref (inline)
+       0   0.0% 100.0%   524292   0.0% ::clone_from_ref_in (inline)
+       0   0.0% 100.0%  4467605   0.1% ::collect:: (inline)
+       0   0.0% 100.0%   524336   0.0% ::compile:: (inline)
+       0   0.0% 100.0%   528394   0.0% ::connect_to::{closure#0}::{closure#1}::{closure#0}
+       0   0.0% 100.0%   528394   0.0% ::connection_for::{closure#0} (inline)
+       0   0.0% 100.0%   525826   0.0% ::create (inline)
+       0   0.0% 100.0%   525826   0.0% ::create_with:: (inline)
+       0   0.0% 100.0% 50745978   1.6% ::decode:: (inline)
+       0   0.0% 100.0%  2721757   0.1% ::decode_metadata (inline)
+       0   0.0% 100.0%   524336   0.0% ::deref (inline)
+       0   0.0% 100.0%   524800   0.0% ::dispatch
