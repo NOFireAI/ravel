@@ -397,7 +397,7 @@ that setting and the stored objects came out far smaller, for two reasons:
   largest 3.46 MB), about 15 times below the target (corrected in the
   acceptance amendment below: that run's objects closed before the target,
   under the pipeline-depth cap and the 2 s age trigger, and the
-  estimate-to-stored ratio on this corpus is about 65 times).
+  estimate-to-stored ratio on this corpus is about 65 to 75 times).
 - Each Strict write waits for the flush of its own batch, and the loader
   keeps at most `--pipeline-depth` writes in flight, so one object merges
   at most `--pipeline-depth` batches' slices however large the target. The
@@ -481,24 +481,31 @@ geometric mean.
 
 Verdicts against the acceptance table:
 
-- **Large objects under a fixed RSS: met** by R1d and R1e. Their median
-  objects (21.9 and 22.1 MB) match the B0 layout the criterion names
-  (~25 MB at 1,000,000-row batches) to within 13%, at a peak loader RSS of
-  5.77 and 6.42 GB against the 8 GB limit.
+- **Large objects under a fixed RSS: the RSS limit is met, the object
+  size is not quite.** R1d and R1e peaked at 5.77 and 6.42 GB of loader
+  RSS against the 8 GB limit. Their median objects are 21.9 and 22.1 MB
+  (90th percentile about 30 MB), against the 25 MB this table names. The
+  wave 4 pre-registration on #2627 set a 20 MB median as the pass band,
+  which they meet; against this table's own figure they fall about 12%
+  short.
 - **Load time no worse: met.** The baseline is B0 at 1,461 s, so the limit
   is 1,534 s; R1d took 1,139 s (0.78x) and R1e 858 s (0.59x).
 - **Objects byte-identical: met** by the row-versus-columnar tests in
   `ravel-logseg` (`row_and_columnar_paths_identical_under_a_key` and its
   siblings), which pass on this tree.
-- **4 GB: met** by R4. The load completed, so no shard-ack timeout ended
-  it, where stock v0.22.0 failed. The budget bound: the decoder waited 163
-  times and the peak charge was 1,199,715,423 bytes.
-- **8 GB and 16 GB: met** by R3 (0.66x the stock load time) and R2
-  (0.72x), against the 1.5x limit.
+- **4 GB: the load is met, the object size is not measured.** R4's load
+  completed, so no shard-ack timeout ended it, where stock v0.22.0 failed;
+  the budget bound (163 decoder waits, peak charge 1,199,715,423 bytes).
+  But R4 ran the R1b flags and stored 10.4 MB median objects, not the
+  25 MB this row names.
+- **8 GB and 16 GB: the load time is met, the object size is not
+  measured.** R3 took 0.66x and R2 0.72x the stock load time, against the
+  1.5x limit, at 11.5 and 8.6 MB median objects, not 25 MB.
 
 The small-host runs used the R1b flags, at depth 16 and the 2 s age
-trigger, so their objects are 8.6 to 11.5 MB, not the 25 MB the 4, 8 and
-16 GB rows name; the R1e recipe was run only on the r6a.4xlarge.
+trigger, so their objects are 8.6 to 11.5 MB; the R1e recipe was run only
+on the r6a.4xlarge. Large objects on 4, 8 and 16 GB hosts remain to be
+measured, with `--load-memory-bytes` scaled to each host.
 
 The recipe for large stored objects from small batches, which the
 target-bytes amendment left open, is R1e:
@@ -511,11 +518,14 @@ target-bytes amendment left open, is R1e:
 The target-bytes amendment's "about 15 times below the target" is wrong as
 a ratio. The size trigger counts the row-path estimate, about 5.9 KB per
 row on this corpus, and a stored object holds about 89 bytes per row, so
-stored objects are about 65 times below `--target-bytes` once nothing else
-closes them first: 375,000,000 stored 5.7 MB (R1), and 1,650,000,000 about
-22 MB (R1c to R1e). The wave 3 run's objects were closed early by the
-pipeline-depth cap and the age trigger, so its 15x measured those caps.
-The 65x figure is a property of this corpus, not of the format.
+stored objects are about 65 to 75 times below `--target-bytes` once
+nothing else closes them first: 375,000,000 stored 5.7 MB (R1, 66x), and
+1,650,000,000 about 22 MB (R1c to R1e, 75x). The per-row model predicts
+about 25 MB at the larger target, so it over-predicts there by about 12%,
+which is the shortfall against the 25 MB criterion. The wave 3 run's
+objects were closed early by the pipeline-depth cap and the age trigger, so
+its 15x measured those caps. The ratio is a property of this corpus, not
+of the format.
 
 All three settings are needed. Without `--max-flush-delay 30s` the age
 trigger closes most objects first (R1b). With objects that large, load

@@ -908,7 +908,8 @@ within 1% of (iii). It wrote 2,651 objects:
   not split out. Wave 4 (below) corrects the ratio: this run's objects
   closed before the target, so 7 to 15 times measured the depth cap and
   the age trigger, not the estimate. With nothing else closing them,
-  stored objects come out about 65 times below the target on this corpus,
+  stored objects come out about 65 to 75 times below the target on this
+  corpus,
   and about 22 MB objects took a 1,650,000,000 target, a 30 s age trigger
   and `--pipeline-depth 32`.
 - **(iii) peak RSS and rows:** 10.74 GB, 50.0 million rows by +358 s, 16%
@@ -938,9 +939,10 @@ cold total seconds, hot total seconds and the geometric mean.
 
 - **The target ratio.** The size trigger counts the row-path estimate,
   about 5.9 KB per row here, and a stored object holds about 89 bytes per
-  row, so stored objects are about 65 times below `--target-bytes` when
-  the target is what closes them: 375,000,000 stored 5.7 MB (R1),
-  1,650,000,000 about 22 MB (R1c to R1e). Wave 3's 7 to 15 times was a run
+  row, so stored objects are about 65 to 75 times below `--target-bytes`
+  when the target is what closes them: 375,000,000 stored 5.7 MB (R1,
+  66x), 1,650,000,000 about 22 MB (R1c to R1e, 75x; the per-row model
+  predicts about 25 MB there). Wave 3's 7 to 15 times was a run
   whose objects closed early; it did not measure the estimate. The ratio
   is a property of this corpus.
 - **The age trigger.** At the 2 s default, 798 of R1b's 916 objects closed
@@ -949,13 +951,15 @@ cold total seconds, hot total seconds and the geometric mean.
   write waits for its batch's flush, so the depth bounds how many batches
   fill a shard buffer at once: 16, 24 and 32 took 1,990, 1,139 and 858 s.
   The budget grows with the depth.
-- **Verdicts.** Large objects under 8 GB RSS and load time no worse: met
-  by R1d and R1e (21.9 and 22.1 MB median objects against B0's ~25 MB;
-  5.77 and 6.42 GB; 0.78x and 0.59x of B0's 1,461 s). 4 GB: met by R4, the
-  load completed where stock failed, and the budget bound (163 decoder
-  waits, peak charge 1,199,715,423 bytes). 8 and 16 GB: met by R3 (0.66x
-  stock) and R2 (0.72x). The small-host runs used the R1b flags, so their
-  objects are 8.6 to 11.5 MB rather than 25 MB.
+- **Verdicts.** RSS under 8 GB and load time no worse: met by R1d and R1e
+  (5.77 and 6.42 GB; 0.78x and 0.59x of B0's 1,461 s). Object size: 21.9
+  and 22.1 MB median, which meets the 20 MB median band wave 4
+  pre-registered but falls about 12% short of the ADR table's 25 MB. 4 GB:
+  the load completed where stock failed, and the budget bound (163 decoder
+  waits, peak charge 1,199,715,423 bytes). 8 and 16 GB: load time met by
+  R3 (0.66x stock) and R2 (0.72x). The small-host runs used the R1b flags,
+  so their objects are 8.6 to 11.5 MB: large objects on 4, 8 and 16 GB
+  hosts were not measured.
 
 ## Follow-ups, in order, with the expected saving each
 
