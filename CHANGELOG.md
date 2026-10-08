@@ -6,6 +6,439 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-09
+
+### Changed
+
+- **The server role templates allow the key-epoch record only conditional
+  writes** (issue #2462). `deploy/iam/gateway.json`, `query.json` and
+  `maintain.json` now allow writing a tenant's key-epoch record `t/<hash>/enc`
+  only as a create-if-absent or a compare-and-swap, not as an unconditional
+  overwrite. The code already wrote it only those ways, so nothing a server or
+  `ravel-cli` does changes. Operators must re-apply the three templates.
+- **`/metrics` says why a flush was handed back** (issue #2600).
+  `ravel_ingest_rerouted_flushes_total` gains a `reason` label,
+  `retired_index` or `generation_mismatch`, so a query that selects the family
+  without the label now gets two series per signal. Every hand-back is counted
+  under exactly one reason.
+- **`ravel-cli load`'s stride cursors no longer each hold a whole batch of
+  decoded Arrow rows** (issue #2613). Each stride cursor used to decode a
+  full `--batch-rows` Arrow batch of every column and keep the undealt
+  remainder, so K cursors held K whole batches at once: about 7 GB of a
+  21 GB live heap at 16 cursors and 500,000-row batches on ClickBench. A
+  cursor now decodes `ceil(--batch-rows / K)` rows at a time, so the decoded
+  rows held across all cursors no longer scale with K; each cursor still
+  keeps its own Parquet reader and page-decode state. Batches are dealt
+  exactly as before: a differential test compares every batch's rows with a
+  copy of the previous dealer over uneven row groups, `--batch-rows` not
+  divisible by K, short and empty partitions, `--skip-rows` and K = 1, plus
+  generated files, and the RLOG encodings match the previous dealer's at
+  (`--batch-rows`, K) = (1000, 4), (333, 5), (1000, 3) and (700, 1). In one
+  360 s measurement per version (ClickBench `hits.parquet`, `--batch-rows
+  500000 --read-cursors 16 --shards 4`, memory store, a 16-vCPU 30 GB x86_64
+  host, jemalloc heap profiling on in both runs) peak RSS fell from 22.7 GB
+  to 15.5 GB. The after-run predates the batch-composition fix, which
+  changes only which rows a batch takes at a partition's end, not how many
+  rows a cursor holds.
+- **The columnar log write path moves each batch into its shards instead of
+  copying it** (issue #2624). `LogIngestRouter::write_columnar` used to clone
+  every cell, residual attribute list and stream blob of the batch into
+  per-shard copies while the batch itself stayed alive until the write
+  returned. The batch is now freed column by column as its rows are dealt,
+  and is gone before any shard is sent its part; the severity text, body and
+  trace and span ids are still copied. String and byte column dictionaries
+  are still dropped at the split, as before: carrying them would keep one
+  copy of each distinct value per shard, memory the ingest byte budget does
+  not count. Stored objects do not change: tests compare every per-shard
+  batch, dictionaries included, with the previous partition's over fixed and
+  generated input,
+  and every stored object the two partitions write, including two writes
+  merged into one flush and a shard's buffer handed back to new targets.
+  Peak RSS of `ravel-cli load` on ClickBench `hits.parquet` at `--batch-rows
+  500000 --read-cursors 16 --shards 4` fell from 15.48 GB to 11.37 GB.
+- **Columnar log batches store attribute cells as typed columns** (issue
+  #2625). A `ColumnarLogBatch` dynamic column used to hold one `AttrValue`
+  per cell; it now holds one dense payload per type: string and byte values
+  as offsets plus bytes, integers and floats as plain vectors, and bools as
+  a vector of flags. `ravel-cli load` fills those columns straight from the
+  Arrow arrays, copying each string's bytes once, and no longer attaches a
+  string column dictionary to the batch. Stored objects do not change: the
+  row and columnar builders still write byte-identical RLOG objects, which
+  tests check over generated batches and a Parquet file holding every
+  type the loader maps, NaN payloads and -0.0 included. A string, byte,
+  body or severity text column that would pass `u32::MAX` bytes in one
+  batch (the most its 32-bit offsets address, one byte short of 4 GiB) is
+  now a load error naming the column and suggesting a smaller
+  `--batch-rows`, where it used to panic.
+  Measured on ClickBench `hits.parquet` at `--batch-rows 500000
+  --read-cursors 16 --shards 4`, stopped after 360 seconds, peak RSS over
+  the whole run was 11.02 GB, against 11.37 GB for the previous change, on
+  a different host (8 cores and 16.0 GB of memory, against 16 cores and
+  32.1 GB), so the comparison does not isolate this change. The run kept
+  every written object in the measured process, since the load wrote to the
+  in-memory object store (9.4 GB of object buffers in its last heap dump).
+  Of the four targets set before measuring, three were missed: 0.5 to 1 KB
+  of heap per batch row, under 1 GB held at batch build and at shard
+  partitioning, and a peak RSS of 5 to 7 GB. The fourth was met: at
+  `--batch-rows 1000000` the load ran its 360 seconds without running out
+  of memory, at a 13.33 GB peak.
+- **`ravel-cli load` holds its log batches under one byte budget,
+  `--load-memory-bytes`** (issue #2626). Each batch is charged before it
+  is built, at an estimate from the previous batch's bytes per row (zero
+  for the first), and corrected to its measured in-memory size once built,
+  so the first batch and any batch wider than its estimate are built partly
+  uncharged. The charge stays through the decode queue, the write window,
+  the shard buffers and the flush that writes its rows; when the budget is
+  full the decoder waits instead of failing. With the flag set, a load
+  whose first batch alone does not fit is refused before anything is
+  written, naming the batch's size, the budget and the floor. Unset, the
+  budget is host memory (or a lower cgroup limit) less an estimated floor
+  of 128 MiB plus 32 MiB per read cursor and 72 MiB per concurrent flush,
+  with a 4 GiB fallback, logged, where host memory cannot be read; a
+  derived budget below one batch admits one batch at a time with a
+  warning instead of refusing. The load summary prints the budget, its
+  source, the floor, the peak bytes charged, the largest batch and the
+  decoder's waits. Stored bytes are unchanged unless the budget binds
+  above `--target-bytes 1`, where the loader flushes the shard buffers
+  early when the decoder waits on the budget with nothing released:
+  smaller objects, never a hang. `--target-bytes` above `1` lets shards
+  merge several batches into one object, up to `--pipeline-depth`
+  batches, since each Strict write waits for its own batch's flush. The
+  target counts estimated uncompressed content: on ClickBench
+  `hits.parquet`, `--batch-rows 50000 --target-bytes 25000000` stored
+  objects of 1.1 to 2.4 MB (10th to 90th percentile); the recipe for
+  larger objects from small batches is documented separately (issue #2627).
+  Measured with the
+  in-memory object store at `--batch-rows 500000` and a 6 GB budget, peak
+  RSS, which includes the store's held objects, was 12.02 GB against
+  11.85 GB with the host-derived budget on the same host. That run is no
+  evidence the budget bound: both runs read the same bytes, the sampled
+  heap outside the store's objects stayed under 6 GB (at most 5,430 MB),
+  and the peak charge was not read.
+- **`ravel-cli load` documents a measured recipe for large log objects**
+  (issues #2627 and #2651). The `--target-bytes` and `--pipeline-depth` help
+  and the ingest guide now give the measured settings for large stored
+  objects from small batches, in place of "pending": on ClickBench
+  `--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s
+  --pipeline-depth 32 --load-memory-bytes 6500000000` stored 25.1 MB mean
+  objects in 896 s at a 7.03 GB peak loader RSS, and the guide gives the
+  depth and budget used on 16, 8 and 4 GB hosts with the object size each
+  stored (24.5, 23.9 and 17.1 MB median).
+  The earlier statement that
+  stored objects come out about 15 times below `--target-bytes` was wrong:
+  on that corpus they come out about 65 to 75 times below it, and the
+  ratio depends on the data. The help and guide also say that `--pipeline-depth`
+  must cover the batches one object needs on a shard and that
+  `--max-flush-delay` must be long enough for one object to fill.
+- **A failed logs load still prints the one-batch memory warning.** When the
+  memory budget derived from host memory is smaller than one batch, the
+  loader admits one batch at a time and warns. That warning was printed only
+  when the load succeeded; it is now printed beside the error too.
+- **A columnar hand-back no longer holds the buffered rows twice.** When a
+  shard buffer holding row records receives a columnar batch, it converts
+  those records by moving them rather than copying them, and puts them back
+  unchanged if the conversion is refused.
+
+### Fixed
+
+- **Inputs a stale snapshot still names are now re-folded instead of held
+  until retention** (issue #1763). When the maintain-role sweep holds a late
+  compaction's or erasure rewrite's superseded inputs because the catalog
+  snapshot still names them, in an hour outside the fold's reconcile window,
+  it now hands that hour to the scheduled fold of the same tenant and signal
+  in the same process. The hour stays queued through no-op, skipped and failed
+  folds, and the pair's next successful fold that advances the watermark
+  re-lists it so the inputs can be collected. Each fold takes at most
+  `frontier_reconcile_max_hours` of a pair's oldest queued hours, the most it
+  reconciles, and leaves the rest queued for the next such fold. A maintain
+  process whose scheduled fold is disabled queues nothing. The queue holds up
+  to 256 tenant and signal pairs and evicts the earliest-inserted pair when
+  full, counted on `ravel_catalog_fold_refold_requests_dropped_total`; an
+  evicted hour, or one lost when the process restarts, is sent again by the
+  next sweep pass that finds the hold. Issue #2606 extends the hand-off to a
+  hold found on any shard of the pair when more than one maintain process
+  runs.
+- **SQL reads a segment whose declared-column statistics ignore resource and
+  scope values** (issue #2159). SQL could answer `MIN`, `MAX`, a count or a
+  sum of a declared log column from `.cstat` column statistics that ignored
+  values set on the resource or scope, so the answer could be wrong. This was
+  not limited to segments without a stamp: on a segment with a valid stamp,
+  `SUM`, `COUNT(*) WHERE col <> k` and `GROUP BY col` read the column
+  statistics without consulting the stamp, so they could be wrong there too.
+  A segment without a stamp is now read. Where a segment has a stamp, `MIN`,
+  `MAX` and `COUNT` of the column come from the stamp, and the not-equal
+  count, `GROUP BY` count, `SUM` and `AVG` come from the column statistics
+  only when the stamp states the same minimum, maximum and NULL count;
+  otherwise the segment is read. `ravel_sql::declared_stat_carrier_conflicts`
+  and its warning are removed: the two carriers differ by design wherever a
+  value comes from the resource or scope, so the difference was not a defect.
+- **A late flush no longer writes into an ingest hour another shard generation
+  owns** (issue #2429). After a reshard, a flush routed under the earlier shard
+  count that opened in an hour the new generation owns alone wrote its rows at
+  the old count's indices, where a distributed pushdown, which splits an owned
+  hour by shard index, could split a series across two slice workers and
+  answer a count differently from a single node; the flush now hands its rows
+  to the owning generation's shards, counted on
+  `ravel_ingest_rerouted_flushes_total`, and the activation overlap hours still
+  write in place. A shard closes its mailbox before its shutdown flush and
+  writes every hand-back already queued, so rows handed to a shard set that is
+  shutting down are no longer lost. When such a hand-back finds its target
+  dead, condemned or closed, the rows are written in place at once; when it
+  finds the target's mailbox full on a hand-back to a larger shard set, they
+  are retried until the flush deferral cap, or until a drain's last pass, and
+  then written in place. Either way the write logs a WARN: readers find the
+  rows, but that hour can still split their series in a distributed query.
+  Rows written in place by a
+  binary without this fix stay split, and a rolling deploy keeps writing them
+  until the last process running such a binary exits.
+- **Column-statistics decode failures are now on `/metrics`** (issue #2457).
+  `ravel_catalog_column_stats_decode_refusals_total` and
+  `ravel_catalog_column_stats_decode_panics_total` count the column-statistics
+  objects a query could not decode and fell back from. The query guide and the
+  HTTP API reference no longer list a segment decode job as a cause of a 500 or
+  503, since no segment decode runs on the read CPU gate, and the
+  `--max-queued-flushes` help now calls the 2 h term the flush slack, not the
+  3 h read-side scan slack.
+- **A query that races a compaction or retention delete retries on AWS S3**
+  (issue #2462). On AWS S3 a query whose read of a segment raced a compaction
+  or retention delete failed with an access-denied error. The Query role
+  template `deploy/iam/query.json` now carries the list grant on the `l0/` and
+  `l1/` data prefixes that makes S3 report the deleted object as missing, which
+  the query already retries once. Operators must re-apply
+  `deploy/iam/query.json`.
+- **Every flush cadence check now refuses a server started from code** (issue
+  #2465). An idle flush delay below the fast one, a fast delay whose strict
+  visibility budget reaches 3 s, and a `min_flush_bytes` at or above the ingest
+  `target_bytes` were refused only on the command line; a server started from
+  code now refuses each with the same message. A flush delay past about 292
+  years no longer wraps negative in the flush trigger age bound, the flush
+  deferral cap or the idle age threshold: those conversions saturate, so such
+  a delay leaves no flush deferral cap instead of a positive one. The shard
+  actors' own thresholds saturate as well (issue #2600, below).
+- **A manifest key under an invalid table name no longer fails a tenant's
+  Parquet table listings** (issue #2510). A `.pqm` key the Query grant admits
+  under `t/<tenant_hash>/pq/t/` whose segment before `/v/` is not a valid
+  table name (upper case, reserved, or a path such as `a/b`) made
+  `ravel-cli parquet ls` and `parquet sweep` fail for the whole tenant; both
+  listings now skip it, count it and warn once per tenant, and
+  `ravel-cli parquet repair --tenant <t> --stray --delete` removes it. On S3
+  a key holding a control character, an empty segment or a `.` or `..`
+  segment still fails those listings and `--stray` itself, because the store
+  adapter cannot list it; delete that exact key with the Maintain credential
+  through an S3 tool. `--stray` marks and `--delete` skips a key the store's
+  path encoding would send a delete of to a different key (one holding a
+  character such as `~` or `%`), which needs the same S3 tool, and a key under
+  a name reserved after tables could be created, such as `l0`, unless
+  `--include-reserved-names` is passed; the command then prints what it
+  deleted, lists again and fails naming every such key still there. A key the
+  encoding changes is listed, and every key still there named, only when no
+  such key sits at a list page boundary, where the store adapter encodes the
+  page's continuation too and the listing repeats keys and fails, or skips
+  the keys after it. `parquet repair --table <name> --delete` marks such a
+  key under the table's own `v/` prefix the same way, deletes the deletable
+  flagged keys, and skips only the undeletable ones, leaving them in place
+  and exiting non-zero naming them, where it reported such a key deleted and
+  an empty segment could send the delete to a real version.
+- **`ravel-cli parquet repair --delete-version` no longer refuses every
+  existing version on S3** (issue #2577). It confirmed the key by listing the
+  whole key as a prefix, which matches nothing once the S3 adapter appends
+  the path delimiter, so every version answered as not listed; it now lists
+  the table's `v/` prefix starting just below the key.
+- **One unwritable log object no longer stalls erasure or migration beyond its
+  own bucket** (issue #2580). A log object whose `stream_attrs` blob the RLOG
+  writer refuses, in a bucket with no compaction record, used to fail that
+  bucket's erasure rewrite on every tick, and any failed bucket held back
+  completion of every pending erasure request for the tenant and signal. The
+  rewrite now reports the bucket as blocked by the object and writes nothing
+  to it, so every live object in it, healthy ones included, stays live: a
+  request whose window reaches any of them stays pending while the object
+  exists, and a request whose window reaches no live object of a blocked
+  bucket completes. Each such object is counted once per process on
+  the new `ravel_maintain_erasure_unwritable_objects_total` and warned once
+  with its key. `ravel-cli maintain migrate` no longer stops its walk at such
+  a bucket: it skips it, walks on, prints an `unwritable_skipped` line naming
+  the object, leaves the family's format floor unraised, and exits nonzero.
+  `ravel_maintain_retention_held_out_of_window_objects_total` and
+  `ravel_maintain_retention_held_by_lease_buckets_total`, which were described
+  as metrics but never rendered, are now on `/metrics`.
+- **The size limit on a log attribute value counts empty containers** (issue
+  #2589). The limit did not count empty lists, empty maps or map entries with
+  empty keys, so a value made of them passed the limit at any size the request
+  body allowed. Each list, map and map entry now counts at least one byte, and
+  such an attribute past the limit is refused like any other oversized
+  attribute, as `AttributeValueTooLong`: dropped from a record, which is
+  kept, and on a resource or scope rejecting every record under it.
+- **The shard actors' flush age thresholds and deadlines saturate instead of
+  wrapping** (issue #2600). Each of `max_flush_delay`, `put_retry_base_delay`
+  and `max_flush_lifetime` was converted to nanoseconds with a cast: past about
+  292 years the count wrapped negative, and at or past 2^64 nanoseconds it was
+  truncated to an arbitrary value, not necessarily a negative one. All three
+  now saturate. A `max_flush_delay` that wrapped negative flushed a waiting
+  buffer on every tick; it now gives an age threshold no buffer reaches. A
+  `max_flush_lifetime` that wrapped negative abandoned every flush as past its
+  lifetime; it is now an effectively unbounded lifetime. A
+  `put_retry_base_delay` that wrapped negative widened the adaptive flush
+  delay's ceiling by the wrapped amount (one nanosecond at the largest value);
+  it now leaves no retry headroom under the visibility budget, so the ceiling
+  collapses to the `max_flush_delay` floor. The server refuses such a flush
+  delay at startup and exposes neither of the other two as a flag, so only
+  code that builds an `IngestConfig` directly could reach these values. The
+  WARN for a flush written in place in an hour another shard generation owns
+  now logs once per tenant, cause (a hand-back target not live or, on a
+  drain, still full; or the retry run out to the flush deferral cap) and
+  ingest hour on each shard, rather than on every such flush. Each shard
+  remembers at most 4096 tenant and cause pairs, and past that a pair can
+  log again in the same hour. A flush of that tenant that opens in the scan set
+  or hands all its rows over re-arms it, and a shard that writes such a flush
+  in place with no rows handed over logs its next hand-back again.
+- **A named-snapshot hold on any shard now reaches the pair's fold when more
+  than one maintain process runs** (issue #2606). The maintain process that
+  owns shard 0 of a tenant and signal, the one that folds the pair, now runs
+  the sweep pass (superseded inputs, unreferenced parts, orphan collection)
+  for every shard of the pair, including the shards other maintain processes
+  own. Those processes keep running retention and compaction for their own
+  shards and no longer sweep them. A hold the superseded-input sweep finds on
+  any shard is therefore found in the process that folds the pair and handed
+  to its next fold in that process, instead of staying held until the fold's
+  frontier band reaches the hour. The sweep keeps its cadence, a pass scoped
+  to the head and tail hours on most ticks and a full pass every
+  `--maintain-interior-reverify`; for a shard it does not own, the sweeping
+  process lists that shard's hours once per tick to find them. A sweep of
+  such a shard that fails counts as a failed tick of the pair's shard 0 unit
+  on `ravel_maintain_units_stalled`. No hold rule changes.
+- **`ravel-server` starts with default flags on hosts with 2 GiB of memory or
+  less** (issue #2607). The overhead reserve taken from memory before the
+  memory budget is derived is now a quarter of the memory capped at 2 GiB,
+  raised to the memory the process holds outside the budget when that is
+  more, under a cgroup memory limit as well as without one. The memory held
+  outside the budget is a provisional 256 MiB baseline, plus the
+  `--max-ingest-buffer-bytes` ceiling (512 MiB by default) in `--mode all`;
+  under `--max-ingest-buffer-bytes 0` the reserve is 2 GiB at every size,
+  because an unlimited buffer cannot be accounted. The fixed 2 GiB was more
+  than a t3a.small has (`MemTotal` 1,912 MiB), so the budget derived to 0 and
+  startup refused with a message about `--cache-max-bytes`; that host now
+  reserves 768 MiB in `--mode all` and derives a budget between 1 GiB and
+  1,144 MiB, and reserves 478 MiB in `--mode query` and `--mode maintain` for
+  a budget between 1 GiB and 1,434 MiB. At an ingest ceiling of 1.75 GiB or
+  less, hosts and containers with a `MemTotal` (or cgroup memory limit) of
+  8 GiB or more derive the same figures as before; a nominal 8 GiB cloud
+  instance usually reports a `MemTotal` of about 7.6-7.8 GiB, which falls
+  just under that line, so its reserve drops by about 50-100 MiB rather than
+  staying at the fixed 2 GiB. A bounded ingest ceiling above 1.75 GiB in
+  `--mode all` now raises the reserve above 2 GiB at every size, to the
+  ceiling plus 256 MiB: a 3 GiB ceiling reserves 3.25 GiB, so an 8 GiB host
+  derives a budget of at most 4,864 MiB instead of 6 GiB. That budget is
+  smaller, and it is the one that fits: the old budget plus the ceiling and
+  the baseline came to 9.25 GiB on an 8 GiB host. A derived budget below
+  256 MiB now refuses to start with its own message, naming `MemTotal` or
+  the cgroup limit, the reserve, the budget and `--memory-budget-bytes`, and
+  `--max-ingest-buffer-bytes` when the ingest ceiling set the reserve;
+  `--memory-budget-bytes` and `--disable-cache` still start there.
+  `--mode all` needs a bounded ingest ceiling plus 512 MiB of memory to
+  start, 1 GiB at the default ceiling, and `query` and `maintain` 512 MiB.
+  The `memory_overhead_reserve_bytes` startup log line is printed only for a
+  derived budget; a `flag` or `fallback` budget subtracts no reserve and no
+  longer logs one. `ravel-cli maintain` takes the same reserve at the
+  256 MiB baseline, which leaves its derived merge targets unchanged at the
+  default merge cursor budget.
+- **A SQL `LIMIT` over `logs` is exact again** (issue #2616).
+  `SELECT body FROM logs LIMIT n`, `SELECT * FROM logs LIMIT n` and any other
+  plain projection over `logs` with a `LIMIT` and no `OFFSET` returned every
+  row of the segment the scan was reading, more than `n`, when the scan ran as
+  one partition. The logs scan now caps each partition at exactly `n` rows,
+  so those statements return `n` rows. `spans`, `alerts`, `audit` and parquet
+  tables were not affected.
+- **`ravel-server` enables jemalloc's background purge thread at startup**
+  (issue #2633). Without it, jemalloc returns freed pages to the operating
+  system only during later allocator calls, so an idle server could keep them
+  resident. The startup log stamps the read-back state as
+  `allocator_background_thread`, and `/metrics` reports it as
+  `ravel_process_allocator_background_thread`. An `_RJEM_MALLOC_CONF` that
+  sets `background_thread` is left as set, so
+  `_RJEM_MALLOC_CONF=background_thread:false` turns the thread off. A failure
+  to enable it is a warning, not a startup failure.
+- **A read-cache RAM entry no longer keeps a larger buffer alive than it is
+  charged for** (issue #2633). The RAM tier charges an entry its length, but
+  stored the value it was given, so a value that was a slice of a larger
+  buffer (a response body that is a view into an HTTP read buffer) held that
+  whole buffer for as long as the entry stayed resident. Every RAM admission
+  (`insert`, the `get_or_fetch` admission, and the tiered cache's disk
+  promotion and dual-tier admissions) now stores an exact-size copy unless the
+  value is already the only handle to an allocation of exactly its length,
+  and copies nothing on a hit. `CacheMetrics` counts the copies and the bytes
+  they copied (`admission_copies`, `admission_copied_bytes`); they are not
+  yet rendered on `/metrics`.
+
+### Added
+
+- **SQL accepts `POSITION(x IN y)`, `SUBSTRING(x FROM n [FOR m])`, and
+  unquoted `substr(...)` / `substring(...)` calls** (issue #2583). Each
+  previously failed to plan; they now answer through the admitted `strpos`
+  and `substr` functions. The conformance registry also records the
+  `OVERLAY`, `STRUCT(...)`, `{'a': 1}`, struct field access, map subscript,
+  trace id hex literal, `count()`, and `count(*) OVER ()` syntax that already
+  planned.
+- **`/metrics` counts the in-place writes after a generation mismatch**
+  (issue #2600). The new counter
+  `ravel_ingest_generation_mismatch_in_place_writes_total` counts buffers
+  written in an ingest hour another shard generation owns, where a
+  distributed aggregate can differ from the single-node answer; alert on any
+  increase.
+- **SQL supports `SELECT DISTINCT ON (...)` when its `ORDER BY` fully
+  determines the row each group keeps** (issue #2629). Every such statement
+  used to fail to plan with "There is no UDAF named first_value in the
+  registry". Every selected column must also be an `ORDER BY` term, as in
+  `SELECT DISTINCT ON (series_id) series_id, ts, value FROM samples ORDER BY
+  series_id, ts DESC, value`; a statement whose `ORDER BY` leaves a selected
+  column out, or that has no `ORDER BY`, is refused with an HTTP 400 naming
+  `DISTINCT ON`, because the row it kept would depend on storage order. The
+  result is the same at every partition count. Calling `first_value`
+  directly is still refused, in every spelling: a quoted `"first_value"(...)`
+  used to fail with a generic planning error and now gets the same
+  excluded-aggregate error as the unquoted name.
+
+### Security
+
+- **A Parquet footer can no longer abort the server through an allocation
+  sized from a count it declares** (GHSA-p43g-f7vx-7qfr). The `parquet`
+  decoder sizes a list, a schema group's children and each row group's
+  column chunks from counts in the footer before it reads what they
+  describe, and reads a field by its id whatever type the field's header
+  gives, so a footer of a few bytes in an external table's file could ask
+  for an allocation of many gigabytes; one the allocator refused aborted
+  the server for every tenant on it. Reaching it needed a caller with the
+  `ddl` capability, an operator location grant and a server started with
+  `--parquet-profiles`, or write access to a granted bucket. Ravel now
+  walks the footer the way the decoder reads it before decoding, and
+  refuses as a corrupt file a footer longer than 64 MiB, a field whose
+  header type differs from the type the decoder reads for it, a collection
+  declaring more elements than the bytes after it could hold, a skipped
+  field the decoder would misread or cannot skip, a field the decoder
+  reads appearing twice in one struct, a schema whose
+  `num_children` values are negative, exceed the elements after them, do
+  not form exactly one tree or nest deeper than 64 levels, and more than
+  32,768 row groups. An embedded Arrow schema (the `ARROW:schema`
+  key-value) is refused when it is longer than 4 MiB, and is otherwise
+  verified before anything decodes it with bounds tied to its length (an
+  apparent size of four times its length, at most one table per eight
+  bytes). Ravel's tighter check runs before the decoder's own verification,
+  whose defaults of 2 GiB and a million tables let a small schema whose
+  fields share one long name convert to gigabytes. Decoding a footer that
+  passes first reserves an estimate of what the decoder allocates,
+  converting its Arrow schema included, from the memory budget, and is
+  refused as memory exhausted when the budget cannot hold it. Creating a
+  table holds the reservation until the table's schema is built from the
+  decoded footer. A scan releases it once the footer cache has admitted the
+  decoded footer, charging it at least that estimate. A footer charged more
+  than the cache's whole bound (`metadata_cache_bytes`, 64 MiB in the
+  server) is read uncached, and the scan's reader holds its reservation for
+  as long as the scan holds the reader, so the metadata stays charged to
+  the budget. Each scan
+  open still converts the footer's Arrow schema without a reservation,
+  within the estimate. A footer that
+  panics the decoder, such as an INT96 column whose statistics are longer
+  than 12 bytes, is refused as a corrupt file.
+
 ## [0.22.0] - 2026-10-05
 
 ### Changed
