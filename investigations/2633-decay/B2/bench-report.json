@@ -1,0 +1,1040 @@
+{
+  "provenance": {
+    "git_sha": "f99940bc3a0dbd88aceecb6e44c025456dfaf6b1",
+    "binary": "/var/lib/fleet/work/c3d2ad79-81ac-4554-8d4f-28a3be9c9ff0/.gate-logs/bin/clickbench_parquet_bench",
+    "arm": "a",
+    "location": "s3://clickbench-parquet/hits/",
+    "server": "http://127.0.0.1:4318",
+    "server_log": "server-run.log",
+    "server_settings": [
+      {
+        "setting": "cache_max_bytes",
+        "values": [
+          3200000000
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "catalog_cache_max_bytes",
+        "values": [
+          400000000
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "fetch_concurrency",
+        "values": [
+          32
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "sql_max_query_bytes",
+        "values": [
+          3960000000
+        ],
+        "unreadable_lines": []
+      },
+      {
+        "setting": "sql_tenant_max_bytes",
+        "values": [
+          3960000000
+        ],
+        "unreadable_lines": []
+      }
+    ],
+    "sql_max_query_bytes": 3960000000,
+    "sql_tenant_max_bytes": 3960000000,
+    "reference_dir": "/var/lib/fleet/work/c3d2ad79-81ac-4554-8d4f-28a3be9c9ff0/.gate-logs/ref-dummy",
+    "reference_version": "datafusion-cli 54.1.0",
+    "ddl_files": 20
+  },
+  "statements": [
+    {
+      "number": 1,
+      "cold_s": 0.050564345,
+      "hot_s": 0.012896361,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 2,
+      "cold_s": 0.031454696,
+      "hot_s": 0.024338534,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 3,
+      "cold_s": 0.043040052,
+      "hot_s": 0.029723101,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 4,
+      "cold_s": 0.058503079,
+      "hot_s": 0.026894029,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 5,
+      "cold_s": 0.097868207,
+      "hot_s": 0.084271199,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 6,
+      "cold_s": 0.160330087,
+      "hot_s": 0.104424076,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 7,
+      "cold_s": 0.029627729,
+      "hot_s": 0.016058551,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 8,
+      "cold_s": 0.051031848,
+      "hot_s": 0.024974009,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 12,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 9,
+      "cold_s": 0.123600436,
+      "hot_s": 0.112181434,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 10,
+      "cold_s": 0.155390071,
+      "hot_s": 0.13935378,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 11,
+      "cold_s": 0.089300588,
+      "hot_s": 0.069574163,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 12,
+      "cold_s": 0.088026135,
+      "hot_s": 0.071353308,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 13,
+      "cold_s": 0.221402332,
+      "hot_s": 0.180497775,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 14,
+      "cold_s": 0.256945324,
+      "hot_s": 0.231124602,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 15,
+      "cold_s": 0.200372794,
+      "hot_s": 0.168158859,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 16,
+      "cold_s": 0.098274908,
+      "hot_s": 0.091352241,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 17,
+      "cold_s": 0.234719654,
+      "hot_s": 0.232660761,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 18,
+      "cold_s": 0.224280706,
+      "hot_s": 0.214919347,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 19,
+      "cold_s": 0.456297951,
+      "hot_s": 0.401618391,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 20,
+      "cold_s": 0.025815332,
+      "hot_s": 0.025501833,
+      "verdict": {
+        "verdict": "pass"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 21,
+      "cold_s": 0.359417959,
+      "hot_s": 0.158799269,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 22,
+      "cold_s": 0.189896835,
+      "hot_s": 0.171841963,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 23,
+      "cold_s": 0.751056884,
+      "hot_s": 0.407427429,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 24,
+      "cold_s": 1.123151197,
+      "hot_s": 0.455272695,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 25,
+      "cold_s": 0.124233333,
+      "hot_s": 0.11436956,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 26,
+      "cold_s": 0.12683546,
+      "hot_s": 0.12024933,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 27,
+      "cold_s": 0.13035448,
+      "hot_s": 0.128680977,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 28,
+      "cold_s": 0.165963953,
+      "hot_s": 0.148039863,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 20,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 29,
+      "cold_s": 0.964556124,
+      "hot_s": 0.901634243,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 20,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 30,
+      "cold_s": 0.047435545,
+      "hot_s": 0.043685759,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 1,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 31,
+      "cold_s": 0.140924121,
+      "hot_s": 0.130810291,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 32,
+      "cold_s": 0.175138997,
+      "hot_s": 0.163352516,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 33,
+      "cold_s": 0.595333605,
+      "hot_s": 0.56398623,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 34,
+      "cold_s": 0.506046755,
+      "hot_s": 0.497724061,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 35,
+      "cold_s": 0.521266745,
+      "hot_s": 0.506071345,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 36,
+      "cold_s": 0.10181628,
+      "hot_s": 0.096559935,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 37,
+      "cold_s": 0.12125064,
+      "hot_s": 0.120632533,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 38,
+      "cold_s": 0.080769681,
+      "hot_s": 0.082078195,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 39,
+      "cold_s": 0.069276646,
+      "hot_s": 0.067978413,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 40,
+      "cold_s": 0.889882186,
+      "hot_s": 0.660201407,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 41,
+      "cold_s": 0.066075964,
+      "hot_s": 0.051796058,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 42,
+      "cold_s": 0.050818233,
+      "hot_s": 0.049641072,
+      "verdict": {
+        "verdict": "pass"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 0,
+      "compare_error": null,
+      "error": null
+    },
+    {
+      "number": 43,
+      "cold_s": 0.041898494,
+      "hot_s": 0.039425951,
+      "verdict": {
+        "verdict": "fail"
+      },
+      "float_mismatches": [],
+      "missing_rows": 0,
+      "extra_rows": 10,
+      "compare_error": null,
+      "error": null
+    }
+  ],
+  "totals": {
+    "cold_sum_s": 10.040246390999998,
+    "hot_sum_s": 7.942135449000001,
+    "answered": 43,
+    "failed": []
+  },
+  "registered_failures_answered": [
+    19,
+    29,
+    33,
+    34,
+    35
+  ],
+  "concurrency": {
+    "tasks": 10,
+    "duration_s": 360.0,
+    "elapsed_s": 360.74002197,
+    "queries_completed": 2504,
+    "errors": 46,
+    "unreachable": 0,
+    "qps": 6.941286931030454,
+    "error_ratio": 0.01803921568627451,
+    "statements": [
+      {
+        "number": 1,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.752004896,
+        "p95_s": 1.979170691,
+        "first_error": null
+      },
+      {
+        "number": 2,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.637288182,
+        "p95_s": 1.217474583,
+        "first_error": null
+      },
+      {
+        "number": 3,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.148232941,
+        "p95_s": 1.97555211,
+        "first_error": null
+      },
+      {
+        "number": 4,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.046651341,
+        "p95_s": 2.109731527,
+        "first_error": null
+      },
+      {
+        "number": 5,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.8400392129999998,
+        "p95_s": 2.693138064,
+        "first_error": null
+      },
+      {
+        "number": 6,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.339035464,
+        "p95_s": 2.137388815,
+        "first_error": null
+      },
+      {
+        "number": 7,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.620915463,
+        "p95_s": 1.120742206,
+        "first_error": null
+      },
+      {
+        "number": 8,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.709764218,
+        "p95_s": 1.751423823,
+        "first_error": null
+      },
+      {
+        "number": 9,
+        "completed": 61,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.858122121,
+        "p95_s": 2.96994418,
+        "first_error": null
+      },
+      {
+        "number": 10,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.61143664,
+        "p95_s": 2.614027879,
+        "first_error": null
+      },
+      {
+        "number": 11,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.835738609,
+        "p95_s": 1.6323276450000002,
+        "first_error": null
+      },
+      {
+        "number": 12,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.910804252,
+        "p95_s": 1.9030343360000002,
+        "first_error": null
+      },
+      {
+        "number": 13,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.33966393,
+        "p95_s": 2.497193594,
+        "first_error": null
+      },
+      {
+        "number": 14,
+        "completed": 59,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.6235638030000001,
+        "p95_s": 2.972985138,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 2247230 more bytes on top of 3959991166 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 15,
+        "completed": 58,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.241816678,
+        "p95_s": 2.218855551,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 854448 more bytes on top of 3959572068 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 16,
+        "completed": 57,
+        "errors": 2,
+        "unreachable": 0,
+        "p50_s": 1.566927219,
+        "p95_s": 3.143431385,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 177000 more bytes on top of 3959864182 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 17,
+        "completed": 59,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 2.194841801,
+        "p95_s": 3.229788531,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 392737144 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 18,
+        "completed": 56,
+        "errors": 3,
+        "unreachable": 0,
+        "p50_s": 1.94311444,
+        "p95_s": 2.990975106,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 360784 more bytes on top of 3959822952 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 19,
+        "completed": 48,
+        "errors": 11,
+        "unreachable": 0,
+        "p50_s": 2.870346943,
+        "p95_s": 4.455519658,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 1117464 more bytes on top of 3959934954 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 20,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.573151928,
+        "p95_s": 1.3393037300000001,
+        "first_error": null
+      },
+      {
+        "number": 21,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.874190838,
+        "p95_s": 1.757414876,
+        "first_error": null
+      },
+      {
+        "number": 22,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.935815363,
+        "p95_s": 1.832047113,
+        "first_error": null
+      },
+      {
+        "number": 23,
+        "completed": 58,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.369146622,
+        "p95_s": 2.491586816,
+        "first_error": null
+      },
+      {
+        "number": 24,
+        "completed": 58,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.210096621,
+        "p95_s": 2.352452778,
+        "first_error": null
+      },
+      {
+        "number": 25,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.83255478,
+        "p95_s": 1.636719449,
+        "first_error": null
+      },
+      {
+        "number": 26,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.840585852,
+        "p95_s": 1.81566698,
+        "first_error": null
+      },
+      {
+        "number": 27,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.78157936,
+        "p95_s": 1.546836888,
+        "first_error": null
+      },
+      {
+        "number": 28,
+        "completed": 58,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.1663986849999999,
+        "p95_s": 2.5051703180000002,
+        "first_error": null
+      },
+      {
+        "number": 29,
+        "completed": 58,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 2.517119411,
+        "p95_s": 3.840878213,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 253885370 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 30,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.969419974,
+        "p95_s": 2.391714324,
+        "first_error": null
+      },
+      {
+        "number": 31,
+        "completed": 58,
+        "errors": 1,
+        "unreachable": 0,
+        "p50_s": 1.143010789,
+        "p95_s": 2.53921571,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: the query memory pool is full and spill is disabled: 40839640 of 3960000000 bytes reserved across the query's operators when a spill was requested (attribution is by the consumers that filled the pool, not the operator that requested the spill)\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 32,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.329042748,
+        "p95_s": 1.895331939,
+        "first_error": null
+      },
+      {
+        "number": 33,
+        "completed": 45,
+        "errors": 15,
+        "unreachable": 0,
+        "p50_s": 3.3616906540000002,
+        "p95_s": 4.704367341,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 13631488 more bytes on top of 3950514240 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 34,
+        "completed": 57,
+        "errors": 3,
+        "unreachable": 0,
+        "p50_s": 2.721616455,
+        "p95_s": 4.253506466,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 2200096 more bytes on top of 3959981704 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 35,
+        "completed": 53,
+        "errors": 7,
+        "unreachable": 0,
+        "p50_s": 2.516279735,
+        "p95_s": 4.0451203,
+        "first_error": "query failed: HTTP 422 Unprocessable Entity: {\"error\":\"query memory budget exhausted: tenant memory budget exhausted: 2781092 more bytes on top of 3958005734 already reserved exceeds tenant limit 3960000000\",\"errorType\":\"execution\",\"status\":\"error\"}"
+      },
+      {
+        "number": 36,
+        "completed": 60,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 1.69891742,
+        "p95_s": 2.760266622,
+        "first_error": null
+      },
+      {
+        "number": 37,
+        "completed": 61,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.92472288,
+        "p95_s": 1.64015752,
+        "first_error": null
+      },
+      {
+        "number": 38,
+        "completed": 61,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.722494906,
+        "p95_s": 1.572696177,
+        "first_error": null
+      },
+      {
+        "number": 39,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.810682783,
+        "p95_s": 2.046422811,
+        "first_error": null
+      },
+      {
+        "number": 40,
+        "completed": 59,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 2.594280141,
+        "p95_s": 3.898309663,
+        "first_error": null
+      },
+      {
+        "number": 41,
+        "completed": 58,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.830810399,
+        "p95_s": 1.742073054,
+        "first_error": null
+      },
+      {
+        "number": 42,
+        "completed": 58,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.728900587,
+        "p95_s": 1.956854228,
+        "first_error": null
+      },
+      {
+        "number": 43,
+        "completed": 58,
+        "errors": 0,
+        "unreachable": 0,
+        "p50_s": 0.704168739,
+        "p95_s": 1.583992734,
+        "first_error": null
+      }
+    ],
+    "errored_statements": [
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      29,
+      31,
+      33,
+      34,
+      35
+    ],
+    "engine_unreachable": null
+  },
+  "concurrency_error": null
+}
