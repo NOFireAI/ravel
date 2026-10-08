@@ -382,5 +382,5 @@ What changes:
   columnar builder with its input dropped from 30.22 MB to 27.12 MB, 10.27%
   lower; at 1 and 1,000 streams neither moved by more than 1%. The drops of
   the columnar builder's per-row arrays after its block loop do not lower
-  that peak, because it falls inside the block loop, while those arrays are
-  still in use.
+  that peak on this corpus, because it falls inside the block loop, while
+  those arrays are still in use.
