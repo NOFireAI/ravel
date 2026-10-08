@@ -56,7 +56,8 @@ pub enum LogSegError {
     /// not `num_rows`; a packed `trace_id` or `span_id` buffer whose length
     /// does not match its present rows; `stream_ids` and `stream_attrs` of
     /// different lengths; a repeated id within `stream_ids`; a `stream_refs`
-    /// value at or past `stream_ids.len()`; a `dyn_columns` entry whose
+    /// value at or past `stream_ids.len()`; two `dyn_columns` entries with the
+    /// same `(name, field_type)`; a `dyn_columns` entry whose
     /// `validity` does not describe `num_rows` rows, whose `cells` count does
     /// not match `validity`'s present count, or one of whose cells has a type
     /// other than the column's `field_type`; a `dyn_col_dicts` that is
@@ -67,9 +68,8 @@ pub enum LogSegError {
     /// `ids` is not parallel to its column's present cells, holds an id at or
     /// past its own `distinct.len()`, or names a `distinct` entry that differs
     /// from its cell's bytes (for a `Str` cell or a `Bytes` cell; `List` and
-    /// `Map` cells are not compared). Not covered, see `validate`: duplicate
-    /// `(name, field_type)` columns and dictionary contents for `List`/`Map`
-    /// cells. A caller-side input error, not a stream id collision and not
+    /// `Map` cells are not compared). Not covered, see `validate`: dictionary
+    /// contents for `List`/`Map` cells. A caller-side input error, not a stream id collision and not
     /// object corruption.
     #[error("malformed columnar batch: {0}")]
     MalformedColumnarBatch(String),

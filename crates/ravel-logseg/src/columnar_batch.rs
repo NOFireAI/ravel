@@ -739,6 +739,9 @@ impl ColumnarLogBatch {
     /// - `stream_ids` and `stream_attrs` have the same length, and every id in
     ///   `stream_ids` is distinct (the field's own doc: "Distinct stream ids").
     /// - Every `stream_refs` entry is a valid index into `stream_ids`.
+    /// - No two `dyn_columns` entries share a `(name, field_type)`: the writer
+    ///   maps both to one column, so the second would overwrite the first's
+    ///   values and FIELD_DIR would count both columns' present rows.
     /// - Every `dyn_columns` entry's `validity` describes `num_rows` rows, and
     ///   its `cells` has exactly as many entries as `validity` marks present.
     /// - Every dyn column's `cells` is the [`DynCells`] variant of its
@@ -760,17 +763,15 @@ impl ColumnarLogBatch {
     ///
     /// Does not check:
     ///
-    /// - Two `dyn_columns` entries with the same `(name, field_type)`: the
-    ///   writer does not check this either, and nothing here compares column
-    ///   identities.
     /// - The entries of a dictionary on an `I64`, `F64` or `Bool` column
     ///   against its cells. Its `ids` are checked for count and range like
     ///   any other dictionary's; the writer does not read such a dictionary.
     /// - `distinct` entries no id references, and the payload content of
     ///   `stream_attrs` and `residual_attrs`.
     ///
-    /// The pass allocates only for a `nested` cell, whose canonical encoding
-    /// it recomputes.
+    /// The pass allocates two sets, of the stream ids and of the dyn columns'
+    /// `(name, field_type)` pairs, and for each `nested` cell, whose canonical
+    /// encoding it recomputes.
     pub fn validate(&self) -> Result<(), LogSegError> {
         let malformed = |message: String| Err(LogSegError::MalformedColumnarBatch(message));
         let n = self.num_rows;
