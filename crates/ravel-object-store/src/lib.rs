@@ -1765,15 +1765,30 @@ mod addressable_tests {
     }
 
     fn key_strategy() -> impl Strategy<Value = String> {
-        prop_oneof![any::<String>(), "[ab/. *#%+\\\\\u{1}é]{0,10}"]
+        prop_oneof![any::<String>(), "[ab/. *#%~+$\\\\\u{1}\u{7f}é]{0,10}"]
+    }
+
+    /// The addressability rule spelled out byte by byte, independent of
+    /// `Path::from`: the empty key, or printable ASCII outside the set `Path`
+    /// percent-encodes, with no leading or trailing `/` and no empty, `.` or
+    /// `..` segment.
+    fn addressable_by_rule(key: &str) -> bool {
+        const PATH_ENCODED: &[u8] = b"\\{^}%`]\">[~<#|*?";
+        key.is_empty()
+            || (key
+                .bytes()
+                .all(|b| (0x20..0x7f).contains(&b) && !PATH_ENCODED.contains(&b))
+                && key
+                    .split('/')
+                    .all(|segment| !segment.is_empty() && segment != "." && segment != ".."))
     }
 
     proptest! {
-        /// The predicate is exactly `Path::from` round-tripping, and the
-        /// oracle refuses exactly the keys it rejects.
+        /// The predicate matches the byte rule, and the oracle refuses
+        /// exactly the keys it rejects.
         #[test]
         fn memory_store_refuses_exactly_the_unaddressable_keys(key in key_strategy()) {
-            let addressable = object_store::path::Path::from(key.as_str()).as_ref() == key;
+            let addressable = addressable_by_rule(&key);
             prop_assert_eq!(is_addressable_key(&key), addressable);
 
             let store = MemoryStore::new();

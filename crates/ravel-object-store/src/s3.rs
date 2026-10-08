@@ -1439,9 +1439,23 @@ pub(crate) fn prefix_of(prefix: &str) -> Option<Path> {
 
 /// One page of an `object_store` listing of up to `page_size` keys, classified,
 /// with a continuation token when the page is full.
+///
+/// The token is the page's last addressable key. The next page resumes after
+/// `Path::from(token)`, which re-encodes an unaddressable key: resuming after
+/// `p/a#b` starts at `p/a%23b` and skips `p/a$`, and resuming after `p/é`
+/// starts at `p/%C3%A9` and re-delivers keys this page already returned. An
+/// unaddressable tail after the token is listed and reported again on the
+/// next page. A full page with no addressable key keeps its raw last key as
+/// the token, which still re-encodes until the raw listing of ADR-2637
+/// decision 1 replaces this one.
 pub(crate) fn assemble_page(prefix: &str, listed: Vec<ObjectMeta>, page_size: usize) -> ListPage {
     let next = if listed.len() == page_size {
-        listed.last().map(|m| PageToken(m.key.clone()))
+        listed
+            .iter()
+            .rev()
+            .find(|m| crate::is_addressable_key(&m.key))
+            .or(listed.last())
+            .map(|m| PageToken(m.key.clone()))
     } else {
         None
     };

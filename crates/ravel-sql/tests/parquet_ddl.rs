@@ -887,12 +887,18 @@ async fn ravel_bucket_location_is_refused() {
 #[tokio::test]
 async fn folder_marker_object_is_not_treated_as_the_probe_object() {
     // Some writers leave a zero-byte object named exactly like the directory
-    // (`t/hits/`) as a folder marker. Listing `t/hits/` returns it, but it is
-    // not a `.parquet` file and must not satisfy the probe.
-    let lake = Lake::memory_store();
+    // (`t/hits/`) as a folder marker. No store operation can write it
+    // (`Path::from` drops the trailing `/`), and listing `t/hits/` reports it
+    // in `unaddressable`, so it must not satisfy the probe.
+    let store = MemoryStore::new();
+    store.insert_foreign("t/hits/", Bytes::new());
+    let lake = Lake::unlimited(Arc::new(store));
     let t = tenant("acme");
     lake.grant(&t).await;
-    lake.put_file("t/hits/", Bytes::new()).await;
+    let listed = lake.lake.list("t/hits/", None).await.expect("list");
+    assert!(listed.objects.is_empty(), "{:?}", listed.objects);
+    let markers: Vec<&str> = listed.unaddressable.iter().map(|u| u.key.as_str()).collect();
+    assert_eq!(markers, ["t/hits/"]);
 
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
     let err = lake
