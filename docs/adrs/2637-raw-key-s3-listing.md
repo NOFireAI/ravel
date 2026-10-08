@@ -35,7 +35,7 @@ response reaches Ravel. `S3Store::list` (`s3.rs:2731-2757`) and
 `S3Store::list_after` (`s3.rs:2759-2795`) return it at `s3.rs:2745` and
 `s3.rs:2786` through `map_error_common`, which maps `InvalidPath` to
 `StoreError::Permanent` (`s3.rs:1471-1495`). `S3Store::list_delimited`
-(`s3.rs:2797-2820`) goes through `list_with_delimiter` and fails the same
+(`s3.rs:2800-2820`) goes through `list_with_delimiter` and fails the same
 way. A key with a leading or trailing `/` parses, but under a name that is
 not the stored key.
 
@@ -93,13 +93,13 @@ the 2026-10-06 amendment). A stolen Query credential can therefore:
 
 The ADR-2040 2026-10-06 amendment and the `resolve` module doc
 (`crates/ravel-pqtable/src/resolve.rs:1-28`) already describe these
-failures and name this issue as the adapter defect.
+failures, and the amendment names this issue as the adapter defect.
 
 ## Decision
 
 ```mermaid
 flowchart TD
-    A["list / list_after / list_delimited"] --> B["GET ?list-type=2&prefix=P&start-after=RAW&max-keys=N&encoding-type=url<br/>signed with the bucket_config SigV4 signer,<br/>sent through S3HttpConnector inside connector::scope(List)"]
+    A["list / list_after / list_delimited"] --> B["GET ?list-type=2&prefix=P&(start-after=RAW | continuation-token=T)&max-keys=N&encoding-type=url<br/>signed with the bucket_config SigV4 signer,<br/>sent through S3HttpConnector inside connector::scope(List)"]
     B -->|"5xx, 429, 408, connect/request/timeout"| R["retry: object_store's RetryConfig values<br/>(10 retries, 180 s, backoff 100 ms to 15 s, base 2)"]
     R --> B
     B -->|"other status"| E["typed StoreError (table in decision 1)"]
@@ -108,7 +108,9 @@ flowchart TD
     D -->|yes| O["ListPage.objects"]
     D -->|no| U["ListPage.unaddressable<br/>+ ravel_store_list_unaddressable_total<br/>+ sampled warn with {:?}-escaped K"]
     C --> T{"IsTruncated?"}
-    T -->|yes| N["next = PageToken(raw last key of the response,<br/>addressable or not)"]
+    T -->|"yes, call still needs keys<br/>(always, for list_delimited)"| F["follow NextContinuationToken"]
+    F --> B
+    T -->|"yes, ListPage full"| N["next = PageToken(raw last key received,<br/>addressable or not)"]
     T -->|no| Z["next = None"]
     G["get / get_pinned / head / put / put_multipart / delete (K)"] --> H{"is_addressable_key(K)?"}
     H -->|no| X["StoreError::UnaddressableKey, no request sent"]
@@ -131,12 +133,15 @@ they did before.
 `object_store`'s listing. They send one signed `GET` per wire page:
 
 - query parameters `list-type=2`, `prefix=<raw prefix>`,
-  `start-after=<raw key>` when resuming or when the caller gave one,
-  `max-keys=<n>`, `encoding-type=url`, and `delimiter=/` for
-  `list_delimited`. Never `continuation-token`: the `PageToken` stays the raw
-  last key of the previous response, which is what the contract already
-  calls it ("opaque"), and resuming from `start-after` needs no state S3
-  holds;
+  `start-after=<raw key>` when a call resumes from a `PageToken` or the
+  caller gave one, `continuation-token=<token>` when a call follows a
+  truncated response it received itself (see Paging), `max-keys=<n>`,
+  `encoding-type=url`, and `delimiter=/` for `list_delimited`. "Raw" here
+  is at the key level: `canonical_query` still URI-escapes each value into
+  the query string, and S3 decodes it back to the same key. The `PageToken`
+  handed back to a caller between calls stays the raw last key of the last
+  response, which is what the contract already calls it ("opaque"), so
+  resuming a listing in a later call needs no state S3 holds;
 - signed with the SigV4 pieces in `crates/ravel-object-store/src/s3/bucket_config.rs`
   (`canonical_query`, `canonical_request`, `string_to_sign`, `signature`,
   `request_target`) and the credential provider `S3Store` already holds,
@@ -157,14 +162,35 @@ they did before.
   same as today, and nothing is recorded in the `ravel_store_control_plane_*`
   block that ADR-1727's probes use.
 
-**Paging.** A `ListPage` requests `max-keys = min(remaining, 1000)` and keeps
-requesting until it holds `page_size` raw keys or a response says
-`IsTruncated=false`. Raw keys count toward `page_size`, addressable or not,
-so a page of unaddressable keys still makes progress. `next` is the raw last
-key of the last response when that response was truncated, and `None`
-otherwise. A truncated response with no `Contents` is
-`StoreError::Permanent` naming the prefix, since resuming from an unchanged
-`start-after` would spin.
+**Paging.** Within one call the adapter follows S3's own
+`NextContinuationToken`: an opaque token S3 issued, sent back unchanged, so
+no encoding can move it. Across calls it resumes with `start-after` and the
+raw last key. In detail:
+
+- A `ListPage` (`list`, `list_after`) requests `max-keys = min(remaining,
+  1000)` and keeps requesting until it holds `page_size` raw keys or a
+  response says `IsTruncated=false`. Raw keys count toward `page_size`,
+  addressable or not, so a page of unaddressable keys still makes progress.
+  A truncated response is followed with its `NextContinuationToken`, so a
+  truncated response that carries no `Contents`, which an S3-compatible
+  backend may legitimately send, is followed rather than refused. `next` is
+  the raw last key the call received when the last response was truncated,
+  and `None` otherwise. Because `max-keys` never asks for more than the page
+  still needs, a call stops at a response boundary, and the next call's
+  `start-after` resumes exactly after the last key delivered.
+- `list_delimited` returns the whole delimited listing in one call, as
+  `object_store`'s `list_with_delimiter` does today. It follows
+  `NextContinuationToken` until `IsTruncated=false` and returns every
+  `Contents` key and every `CommonPrefixes` entry across those responses.
+  Resuming a delimited listing from a key would be wrong, because a
+  response interleaves keys and common prefixes and a common prefix can sort
+  after the last key, so the delimited path never uses `start-after` for
+  its own continuation. `discover_tenants` (`list_delimited("t/")`, whose
+  responses carry only common prefixes) therefore lists past 1000 tenants
+  as it does today.
+- A truncated response with no `NextContinuationToken`, or one whose token
+  equals the token just sent, is `StoreError::Permanent` naming the prefix,
+  since following it would spin. This is the only shape refused.
 
 **Prefix.** The prefix is sent raw. This removes the known divergence in
 the `s3.rs` module doc, where `object_store` appended `/` to a non-empty
@@ -219,15 +245,27 @@ never fails the page, and is never dropped without a trace. The API callers
 use to learn about it:
 
 - `ListPage` gains `pub unaddressable: Vec<UnaddressableKey>`, and
-  `DelimitedList` the same field.
+  `DelimitedList` the same field for its `Contents` keys.
+- A common prefix is classified too, since `object_store` parses common
+  prefixes through `Path::parse` the same way. A common prefix `p` (which
+  ends in `/`) is addressable when `is_addressable_key` holds for `p`
+  without its trailing `/`; an empty prefix is addressable.
+  `DelimitedList` gains `pub unaddressable_prefixes: Vec<String>`, which
+  holds the raw common prefixes that fail this and never appear in
+  `common_prefixes`. A common prefix has no size or modification time, so it
+  gets its own field rather than an `UnaddressableKey`. Each one counts
+  toward the same metric and warning as a key. `discover_tenants` therefore
+  skips and reports a forged `t/<hash>\x01/` prefix rather than failing the
+  whole maintenance run with `InvalidTenantPrefix`.
 - `pub struct UnaddressableKey { pub key: String, pub addresses: String,
   pub size: u64, pub last_modified_unix_ms: i64 }`, where `addresses` is
   `Path::from(key)`, the key a request for it would reach.
 - `drain_pages` returns `Result<Unaddressable, E>` instead of
   `Result<(), E>`, with `pub struct Unaddressable { pub count: u64, pub
   sample: Vec<UnaddressableKey> }` holding the first
-  `UNADDRESSABLE_SAMPLE_MAX` (16) keys in listing order. A caller that ends
-  its statement in `.await?;` compiles unchanged.
+  `UNADDRESSABLE_SAMPLE_MAX` (16) keys in listing order. `Unaddressable` is
+  not `#[must_use]`, so a caller that ends its statement in `.await?;`
+  compiles unchanged.
 - `list_all` keeps its signature. `list_all_reporting(store, prefix) ->
   Result<Listing, StoreError>` with `pub struct Listing { pub objects:
   Vec<ObjectMeta>, pub unaddressable: Unaddressable }` serves a caller that
@@ -409,6 +447,17 @@ axum server already answers ListObjectsV2 (`Op::List`), extended to script a
   is skipped;
 - `get`, `put` and `delete` of an unaddressable key return
   `UnaddressableKey` and the server sees no request;
+- a truncated response with no `Contents`, followed by one that has keys:
+  the second request carries the first response's `continuation-token`,
+  and the listing returns the keys rather than failing;
+- `list_delimited` over three truncated responses of common prefixes only
+  (the `discover_tenants` shape): the second and third requests carry
+  `continuation-token`, none carries `start-after`, and every prefix comes
+  back once;
+- a common prefix with `\x01`: it lands in `unaddressable_prefixes`, not in
+  `common_prefixes`, and counts toward the metric;
+- a truncated response whose `NextContinuationToken` repeats the token just
+  sent: `StoreError::Permanent` naming the prefix;
 - a URL-encoded response (`encoding-type=url`) with `+` and `%0A` decodes,
   and one without `EncodingType` is read literally;
 - 403, 301, 400, 429-then-200 and 503-until-exhausted map per the table in
