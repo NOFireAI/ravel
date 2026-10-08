@@ -5875,6 +5875,7 @@ mod tick_tests {
             Ok(ListPage {
                 objects: Vec::new(),
                 next: Some(token),
+                unaddressable: Vec::new(),
             })
         }
 
@@ -6053,7 +6054,11 @@ mod tick_tests {
             } else {
                 None
             };
-            Ok(ListPage { objects, next })
+            Ok(ListPage {
+                objects,
+                next,
+                unaddressable: Vec::new(),
+            })
         }
 
         async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {

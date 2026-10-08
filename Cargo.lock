@@ -4992,6 +4992,7 @@ dependencies = [
  "futures",
  "object_store 0.14.1",
  "parking_lot",
+ "proptest",
  "quick-xml 0.41.0",
  "rand 0.10.2",
  "ravel-object-store",

@@ -10,7 +10,8 @@ use parking_lot::RwLock;
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
-    UploadChecksum, Version, multipart_finished, multipart_poisoned,
+    UploadChecksum, Version, check_addressable, classify_objects, classify_prefixes,
+    multipart_finished, multipart_poisoned,
 };
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,26 @@ impl MemoryStore {
         bytes[offset] ^= 1u8 << bit;
         entry.data = Bytes::from(bytes);
         Ok(())
+    }
+
+    /// Store `data` at `key` unconditionally, without the
+    /// [`crate::is_addressable_key`] check every operation applies: a writer
+    /// outside Ravel, which is how a store comes to hold a key no operation can
+    /// address (ADR-2637). Listings report such a key in `unaddressable`.
+    ///
+    /// Only compiled with the `test-support` feature, which no production
+    /// build enables.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_foreign(&self, key: &str, data: Bytes) {
+        let id = self.next_id();
+        let entry = Entry {
+            stored_checksum: crc32c(&data),
+            data,
+            etag: Etag(format!("mem-etag-{id}")),
+            version: Version(format!("mem-v-{id}")),
+            last_modified_unix_ms: self.now_ms(),
+        };
+        self.objects.write().insert(key.to_string(), entry);
     }
 
     fn next_id(&self) -> u64 {
@@ -320,6 +341,7 @@ impl ObjectStoreBackend for MemoryStore {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        check_addressable(key)?;
         Self::verify_checksum(&data, opts.checksum)?;
         let mut objects = self.objects.write();
         match &opts.mode {
@@ -352,6 +374,7 @@ impl ObjectStoreBackend for MemoryStore {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        check_addressable(key)?;
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
         Self::verify_full_read(key, entry, range)?;
@@ -386,6 +409,7 @@ impl ObjectStoreBackend for MemoryStore {
         range: GetRange,
         pin: &crate::Pin,
     ) -> Result<crate::PinnedRead, StoreError> {
+        check_addressable(key)?;
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
         if let Some(version) = pin.version.as_deref()
@@ -416,6 +440,7 @@ impl ObjectStoreBackend for MemoryStore {
         key: &str,
         range: GetRange,
     ) -> Result<crate::PinnedRead, StoreError> {
+        check_addressable(key)?;
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
         Self::verify_full_read(key, entry, range)?;
@@ -431,6 +456,7 @@ impl ObjectStoreBackend for MemoryStore {
     }
 
     async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        check_addressable(key)?;
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
         let pin = crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone()));
@@ -441,6 +467,7 @@ impl ObjectStoreBackend for MemoryStore {
         &'a self,
         key: &str,
     ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        check_addressable(key)?;
         Ok(Box::new(MemoryMultipartUpload {
             store: self,
             key: key.to_string(),
@@ -452,6 +479,7 @@ impl ObjectStoreBackend for MemoryStore {
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        check_addressable(key)?;
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
         Ok(entry.meta(key))
@@ -478,12 +506,19 @@ impl ObjectStoreBackend for MemoryStore {
                 break;
             }
         }
+        // Unaddressable keys count toward the page and can be its last key, as
+        // on S3: classification happens after the page is cut.
         let next = if out.len() == self.page_size {
             out.last().map(|m| PageToken(m.key.clone()))
         } else {
             None
         };
-        Ok(ListPage { objects: out, next })
+        let (objects, unaddressable) = classify_objects(prefix, out);
+        Ok(ListPage {
+            objects,
+            next,
+            unaddressable,
+        })
     }
 
     async fn list_after(
@@ -524,7 +559,12 @@ impl ObjectStoreBackend for MemoryStore {
         } else {
             None
         };
-        Ok(ListPage { objects: out, next })
+        let (objects, unaddressable) = classify_objects(prefix, out);
+        Ok(ListPage {
+            objects,
+            next,
+            unaddressable,
+        })
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -546,13 +586,18 @@ impl ObjectStoreBackend for MemoryStore {
                 None => direct.push(entry.meta(key)),
             }
         }
+        let (objects, unaddressable) = classify_objects(prefix, direct);
+        let (common_prefixes, unaddressable_prefixes) = classify_prefixes(prefix, prefixes);
         Ok(DelimitedList {
-            objects: direct,
-            common_prefixes: prefixes,
+            objects,
+            common_prefixes,
+            unaddressable,
+            unaddressable_prefixes,
         })
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        check_addressable(key)?;
         self.objects.write().remove(key);
         Ok(())
     }
@@ -576,6 +621,23 @@ impl ObjectStoreBackend for MemoryStore {
             // publishes the assembled object atomically at `complete`.
             multipart: true,
         }
+    }
+}
+
+/// The conformance suite's foreign-key writer for a `MemoryStore` subject:
+/// [`MemoryStore::insert_foreign`], and a removal that skips the key check the
+/// same way.
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait::async_trait]
+impl crate::conformance::ForeignKeySeeder for MemoryStore {
+    async fn seed(&self, key: &str, data: Bytes) -> Result<(), StoreError> {
+        self.insert_foreign(key, data);
+        Ok(())
+    }
+
+    async fn remove(&self, key: &str) -> Result<(), StoreError> {
+        self.objects.write().remove(key);
+        Ok(())
     }
 }
 
@@ -930,6 +992,160 @@ mod tests {
             store.head("poisoned").await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    fn assert_refused<T: std::fmt::Debug>(
+        op: &str,
+        result: Result<T, StoreError>,
+        key: &str,
+        addressed: &str,
+    ) {
+        match result {
+            Err(StoreError::UnaddressableKey { key: k, addresses }) => {
+                assert_eq!(k, key, "{op}");
+                assert_eq!(addresses, addressed, "{op}");
+            }
+            other => panic!("{op} of {key:?}: expected UnaddressableKey, got {other:?}"),
+        }
+    }
+
+    /// Every key operation refuses a key the adapter would rewrite, naming the
+    /// key it would reach, even when an object is stored at the raw key.
+    #[tokio::test]
+    async fn operations_refuse_unaddressable_keys() {
+        let store = MemoryStore::new();
+        for (key, addressed) in [("a/b\u{1}c", "a/b%01c"), ("a/*b", "a/%2Ab")] {
+            store.insert_foreign(key, Bytes::from_static(b"foreign"));
+            let pin = crate::Pin::etag("e");
+            assert_refused("get", store.get(key, GetRange::Full).await, key, addressed);
+            assert_refused("head", store.head(key).await, key, addressed);
+            assert_refused(
+                "put",
+                store
+                    .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                    .await,
+                key,
+                addressed,
+            );
+            assert_refused("delete", store.delete(key).await, key, addressed);
+            assert_refused("pin_of", store.pin_of(key).await, key, addressed);
+            assert_refused(
+                "get_pinned",
+                store.get_pinned(key, GetRange::Full, &pin).await,
+                key,
+                addressed,
+            );
+            assert_refused(
+                "get_with_pin",
+                store.get_with_pin(key, GetRange::Full).await,
+                key,
+                addressed,
+            );
+            assert_refused(
+                "put_multipart",
+                store.put_multipart(key).await.map(|_| ()),
+                key,
+                addressed,
+            );
+        }
+        let listing = crate::list_all_reporting(&store, "a/").await.expect("list");
+        assert_eq!(
+            listing.unaddressable.count, 2,
+            "the refused delete left both foreign objects in place"
+        );
+    }
+
+    /// Unaddressable keys seeded in the middle of a page and on each side of a
+    /// page boundary: the listing returns every addressable key once and
+    /// reports exactly the seeded keys, and raw keys still count toward the
+    /// page size and end a page.
+    #[tokio::test]
+    async fn listing_reports_exactly_the_seeded_unaddressable_keys() {
+        // Raw order: p/a p/b* p/c* p/d p/e p/f\x01 p/g. At page size 2 the
+        // boundary falls between p/b* and p/c*; at page size 3, p/b* sits in
+        // the middle of the first page.
+        let foreign = ["p/b*", "p/c*", "p/f\u{1}"];
+        let addressable = ["p/a", "p/d", "p/e", "p/g"];
+        for page_size in [2, 3] {
+            let store = MemoryStore::with_page_size(page_size);
+            for key in foreign {
+                store.insert_foreign(key, Bytes::from_static(b"f"));
+            }
+            for key in addressable {
+                store
+                    .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                    .await
+                    .expect("put");
+            }
+
+            let first = store.list("p/", None).await.expect("page 1");
+            let first_raw = first.objects.len() + first.unaddressable.len();
+            assert_eq!(first_raw, page_size, "raw keys fill the page");
+            if page_size == 2 {
+                assert_eq!(
+                    first.next,
+                    Some(PageToken("p/b*".to_string())),
+                    "the page ends on the raw unaddressable key"
+                );
+            }
+
+            let listing = crate::list_all_reporting(&store, "p/")
+                .await
+                .expect("drain");
+            let keys: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+            assert_eq!(keys, addressable, "page size {page_size}");
+            let skipped: Vec<&str> = listing
+                .unaddressable
+                .sample
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect();
+            assert_eq!(skipped, foreign, "page size {page_size}");
+            assert_eq!(listing.unaddressable.count, 3, "page size {page_size}");
+
+            let after = store
+                .list_after("p/", Some("p/b*"), None)
+                .await
+                .expect("list_after");
+            let after_raw: Vec<&str> = after
+                .unaddressable
+                .iter()
+                .map(|s| s.key.as_str())
+                .chain(after.objects.iter().map(|m| m.key.as_str()))
+                .collect();
+            assert_eq!(after_raw.len(), page_size, "list_after pages raw keys too");
+            assert!(!after_raw.contains(&"p/b*"), "start_after is exclusive");
+        }
+    }
+
+    /// A common prefix that fails the prefix rule is reported apart from the
+    /// addressable ones, and so is a direct key.
+    #[tokio::test]
+    async fn delimited_listing_classifies_prefixes_and_keys() {
+        let store = MemoryStore::new();
+        store.insert_foreign("t/abc\u{1}/x", Bytes::from_static(b"f"));
+        store.insert_foreign("t/z\u{1}", Bytes::from_static(b"f"));
+        for key in ["t/ok/1", "t/y"] {
+            store
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        let listing = store.list_delimited("t/").await.expect("list");
+        assert_eq!(listing.common_prefixes, vec!["t/ok/".to_string()]);
+        assert_eq!(
+            listing.unaddressable_prefixes,
+            vec!["t/abc\u{1}/".to_string()]
+        );
+        let objects: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(objects, vec!["t/y"]);
+        let skipped: Vec<&str> = listing
+            .unaddressable
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect();
+        assert_eq!(skipped, vec!["t/z\u{1}"]);
+        assert_eq!(listing.unaddressable[0].addresses, "t/z%01");
     }
 
     #[test]

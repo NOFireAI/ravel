@@ -12591,6 +12591,7 @@ mod alert_retention_tests {
                 return Ok(ravel_object_store::ListPage {
                     objects: Vec::new(),
                     next: Some(ravel_object_store::PageToken("more".to_string())),
+                    unaddressable: Vec::new(),
                 });
             }
             self.inner.list(prefix, page).await

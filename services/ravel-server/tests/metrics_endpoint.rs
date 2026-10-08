@@ -491,8 +491,8 @@ fn mode_only_samples<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// The unverified-read counter and the three bucket-protection control-plane
-/// counters on a live scrape, read from the `StoreMetrics` handle the server
+/// The unverified-read counter, the unaddressable-listing counter (ADR-2637)
+/// and the three bucket-protection control-plane counters on a live scrape, read from the `StoreMetrics` handle the server
 /// was started with. The control-plane counts are moved by real probes: one
 /// `S3Store` against a fake bucket (three GETs answered, 568 body bytes) and
 /// one against a closed port (three GETs sent, none answered), both recording
@@ -510,6 +510,7 @@ async fn metrics_render_get_unverified_and_control_plane_counters() {
     for _ in 0..4 {
         metrics.record_get_unverified();
     }
+    metrics.record_list_unaddressable(7);
 
     let (endpoint, served, served_bytes) = spawn_fake_bucket().await;
     s3_store_on(endpoint, &metrics)
@@ -543,6 +544,7 @@ async fn metrics_render_get_unverified_and_control_plane_counters() {
 
     for (name, value) in [
         ("ravel_store_get_unverified_total", 4),
+        ("ravel_store_list_unaddressable_total", 7),
         ("ravel_store_control_plane_requests_total", 6),
         ("ravel_store_control_plane_calls_total", 3),
         ("ravel_store_control_plane_response_bytes_total", 568),
