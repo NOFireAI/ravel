@@ -1876,6 +1876,8 @@ mod tests {
         );
 
         for (shard, part) in parts {
+            part.validate()
+                .unwrap_or_else(|e| panic!("shard {shard}'s partition must validate: {e}"));
             let want = ColumnarLogBatch::from_records(&expected[&shard]);
             assert_eq!(
                 part, want,
