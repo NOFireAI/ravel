@@ -829,53 +829,34 @@ mod tests {
         assert_eq!(deletes(&store), 2);
     }
 
-    /// A key is chosen by whoever put it, control characters included, so
-    /// every line that prints one escapes it, and so does the error naming it
-    /// left in place: the store's path encoding would send its delete
-    /// elsewhere.
+    /// A key is chosen by whoever put it, control characters included. The
+    /// path encoding changes such a key, so the listing reports it
+    /// unaddressable: no line prints it, raw or escaped, and `--delete`
+    /// never sends it a delete.
     #[tokio::test]
-    async fn repair_prints_every_key_escaped() {
+    async fn repair_never_prints_or_deletes_a_key_holding_control_characters() {
         let store = forged_table().await;
         let hash = TenantId::new("acme").hash();
         let slot = "\u{1b}[2J\u{7}xxxxxxxxxxxxxxx";
         assert_eq!(slot.chars().count(), 20);
-        let key = format!(
-            "{}{slot}.pqm",
-            ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix")
-        );
+        let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
+        let key = format!("{prefix}{slot}.pqm");
         store
             .inner()
-            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
-            .await
-            .expect("put");
+            .insert_foreign(&key, Bytes::from_static(b"x"));
         for action in [RepairAction::List, RepairAction::DeleteFlagged] {
             let mut lines = Vec::new();
-            let result = collect_repair(&store, "acme", "hits", action, &mut lines).await;
-            let mut printed = lines.join("\n");
-            if action == RepairAction::DeleteFlagged {
-                let err = result.expect_err("left in place");
-                printed.push_str(&format!("\n{err:#}"));
-                assert!(
-                    printed.contains(&format!(
-                        "\nskipped {key:?}: undeletable by Ravel; delete the exact key with the \
-                         Maintain credential through an S3 tool\ndeleted 2 manifest versions\n"
-                    )),
-                    "{printed}"
-                );
-                assert!(
-                    printed.ends_with(&format!(
-                        "\n1 flagged key(s) undeletable by Ravel left in place: {key:?}"
-                    )),
-                    "{printed}"
-                );
-            } else {
-                result.expect("repair");
-            }
+            collect_repair(&store, "acme", "hits", action, &mut lines)
+                .await
+                .expect("repair");
+            let printed = lines.join("\n");
             assert!(!printed.contains('\u{1b}'), "{printed}");
             assert!(!printed.contains('\u{7}'), "{printed}");
-            assert!(printed.contains(&format!("{key:?}")), "{printed}");
+            assert!(!printed.contains(&format!("{key:?}")), "{printed}");
+            assert!(!printed.contains("undeletable by Ravel"), "{printed}");
         }
         assert_eq!(deletes(&store), 2);
+        assert_eq!(unaddressable_under(&store, &prefix).await, [key]);
     }
 
     #[tokio::test]
@@ -971,7 +952,8 @@ mod tests {
     /// Handles keys the way the S3 adapter's `object_store` client does, and
     /// records the key every `delete` is sent to. A list page holding a key
     /// `Path::parse` refuses (a control character, an empty segment, a `.` or
-    /// `..` segment; no key here starts or ends with `/`) fails, and a delete
+    /// `..` segment; no key here starts or ends with `/`) fails, whether the
+    /// page reports it as an object or unaddressable, and a delete
     /// goes to [`store_path`] of its key. With `lose_deletes` set, a delete
     /// reports success and removes nothing.
     struct S3Keys<S> {
@@ -1040,10 +1022,15 @@ mod tests {
             page: Option<ravel_object_store::PageToken>,
         ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
             let page = self.inner.list(prefix, page).await?;
-            if let Some(meta) = page.objects.iter().find(|meta| !s3_lists(&meta.key)) {
+            if let Some(key) = page
+                .objects
+                .iter()
+                .map(|meta| &meta.key)
+                .chain(page.unaddressable.iter().map(|skipped| &skipped.key))
+                .find(|key| !s3_lists(key))
+            {
                 return Err(ravel_object_store::StoreError::Permanent(format!(
-                    "invalid path: {:?}",
-                    meta.key
+                    "invalid path: {key:?}"
                 )));
             }
             Ok(page)
@@ -1080,9 +1067,9 @@ mod tests {
         "a/b/v/00000000000000000001.pqm",
     ];
 
-    /// Stray keys the S3 adapter lists but sends a delete of to a different
-    /// key: a tilde, and a quote and a backslash in the version characters,
-    /// all three percent-encoded by its path encoding.
+    /// Stray keys no request reaches: a tilde, and a quote and a backslash in
+    /// the version characters, all three percent-encoded by the path
+    /// encoding. A listing reports them unaddressable, never as objects.
     const UNDELETABLE: [&str; 2] = [
         "Hits~/v/00000000000000000001.pqm",
         "Hits/v/\"\\xxxxxxxxxxxxxxxxxx.pqm",
@@ -1107,7 +1094,7 @@ mod tests {
         keys
     }
 
-    /// [`forged_table`] plus the stray keys `rests` of `acme`, written at
+    /// [`forged_table`] plus the stray keys `rests` of `acme`, written raw at
     /// store time 5_000, behind [`S3Keys`].
     async fn stray_table(rests: &[&str]) -> S3Keys<InstrumentedStore<MemoryStore>> {
         let store = forged_table().await;
@@ -1115,15 +1102,26 @@ mod tests {
         for rest in rests {
             store
                 .inner()
-                .put(
-                    &acme_key(rest),
-                    Bytes::from_static(b"x"),
-                    PutOptions::default(),
-                )
-                .await
-                .expect("put");
+                .insert_foreign(&acme_key(rest), Bytes::from_static(b"x"));
         }
         S3Keys::new(store)
+    }
+
+    /// The keys under `prefix` that a listing of `store` reports
+    /// unaddressable.
+    async fn unaddressable_under(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
+        ravel_object_store::list_all_reporting(store, prefix)
+            .await
+            .expect("list")
+            .unaddressable
+            .sample
+            .into_iter()
+            .map(|skipped| skipped.key)
+            .collect()
+    }
+
+    fn acme_prefix() -> String {
+        ravel_pqtable::keys::tenant_manifest_prefix(&TenantId::new("acme").hash())
     }
 
     /// Every stray key [`stray_table`] is given by the tests below.
@@ -1136,8 +1134,10 @@ mod tests {
             .collect()
     }
 
+    /// The [`UNDELETABLE`] keys are reported unaddressable by the listing, so
+    /// the command neither lists nor prints them.
     #[tokio::test]
-    async fn repair_stray_lists_exactly_the_stray_keys_escaped_and_deletes_nothing() {
+    async fn repair_stray_lists_exactly_the_addressable_stray_keys_and_deletes_nothing() {
         let store = stray_table(&every_stray()).await;
         let report = repair_stray_lines(&store, "acme", false, false)
             .await
@@ -1148,28 +1148,24 @@ mod tests {
             .iter()
             .filter_map(|l| l.strip_prefix("  key: "))
             .collect();
-        let expected: Vec<String> = sorted(&every_stray())
-            .iter()
-            .map(|k| format!("{k:?}"))
-            .collect();
+        let mut rests = STRAYS.to_vec();
+        rests.push(RESERVED);
+        let expected: Vec<String> = sorted(&rests).iter().map(|k| format!("{k:?}")).collect();
         assert_eq!(listed, expected, "{printed}");
         assert_eq!(
             printed
                 .matches("stored_unix_ms: 5000 (the store's clock)")
                 .count(),
-            6
+            4
         );
-        // Each undeletable key is marked with where a delete of it would go.
-        for key in sorted(&UNDELETABLE) {
-            let mark = format!(
-                "  key: {key:?}\n    stored_unix_ms: 5000 (the store's clock)\n    undeletable \
-                 by Ravel: the store's path encoding sends a delete of this key to {:?}; delete \
-                 the exact key with the Maintain credential through an S3 tool",
-                store_path(&key)
-            );
-            assert!(printed.contains(&mark), "{printed}");
-        }
-        assert_eq!(printed.matches("undeletable by Ravel").count(), 2);
+        assert_eq!(
+            unaddressable_under(&store, &acme_prefix()).await,
+            sorted(&UNDELETABLE)
+        );
+        assert!(!printed.contains("undeletable by Ravel"), "{printed}");
+        assert!(!printed.contains("Hits~"), "{printed}");
+        assert!(!printed.contains("v/\""), "{printed}");
+        assert!(!printed.contains("v/\\\"\\\\x"), "{printed}");
         let reserved = format!(
             "  key: {:?}\n    stored_unix_ms: 5000 (the store's clock)\n    possibly a table \
              created before the name was reserved",
@@ -1178,12 +1174,9 @@ mod tests {
         assert!(printed.contains(&reserved), "{printed}");
         assert_eq!(printed.matches("possibly a table").count(), 1);
         assert!(!printed.contains("/hits/"), "{printed}");
-        // The quote and backslash are escaped.
-        assert!(!printed.contains("v/\""), "{printed}");
-        assert!(printed.contains("v/\\\"\\\\x"), "{printed}");
         assert!(
             printed.ends_with(
-                "6 key(s) listed; rerun with --delete to remove 3 of them; it skips the other 3, \
+                "4 key(s) listed; rerun with --delete to remove 3 of them; it skips the other 1, \
                  marked above"
             ),
             "{printed}"
@@ -1204,9 +1197,10 @@ mod tests {
         );
     }
 
-    /// A key the store's path encoding changes is skipped, never sent a
-    /// delete that would land on another key, and the listing after the
-    /// deletes names it, so the command fails.
+    /// A key under a reserved name is skipped, and the listing after the
+    /// deletes names it, so the command fails. A key the store's path
+    /// encoding changes is never listed, so it is never sent a delete that
+    /// would land on another key, and it stays in place.
     #[tokio::test]
     async fn repair_stray_with_the_flag_deletes_what_it_can_and_fails_naming_the_rest() {
         let store = Arc::new(stray_table(&every_stray()).await);
@@ -1217,12 +1211,7 @@ mod tests {
         let printed = report.lines.join("\n");
         assert_eq!(store.deletes(), sorted(&STRAYS), "{printed}");
         assert!(printed.contains("deleted 3 key(s)"), "{printed}");
-        for key in sorted(&UNDELETABLE) {
-            assert!(
-                printed.contains(&format!("skipped {key:?}: undeletable by Ravel")),
-                "{printed}"
-            );
-        }
+        assert!(!printed.contains("undeletable by Ravel"), "{printed}");
         assert!(
             printed.contains(&format!(
                 "skipped {:?}: possibly a table created before the name was reserved; pass \
@@ -1231,9 +1220,7 @@ mod tests {
             )),
             "{printed}"
         );
-        let mut left = sorted(&UNDELETABLE);
-        left.push(acme_key(RESERVED));
-        left.sort();
+        let left = vec![acme_key(RESERVED)];
         assert_eq!(report.remaining, left);
         // The valid table keeps every key it had, flagged ones included.
         assert_eq!(
@@ -1250,7 +1237,7 @@ mod tests {
             .expect_err("keys remain");
         let text = err.to_string();
         assert!(
-            text.starts_with("3 key(s) under no valid table name still listed after --delete"),
+            text.starts_with("1 key(s) under no valid table name still listed after --delete"),
             "{text}"
         );
         for key in &left {
@@ -1258,14 +1245,18 @@ mod tests {
         }
         assert_eq!(store.deletes().len(), 3);
 
-        // With reserved names included, the reserved one goes; the
-        // undeletable ones still fail the run.
+        // With reserved names included, the reserved one goes and nothing
+        // listed is left; the unaddressable keys are still there.
         let report = repair_stray_lines(store.as_ref(), "acme", true, true)
             .await
             .expect("repair");
         assert_eq!(store.deletes().len(), 4);
         assert_eq!(store.deletes()[3], acme_key(RESERVED));
-        assert_eq!(report.remaining, sorted(&UNDELETABLE));
+        assert!(report.remaining.is_empty());
+        assert_eq!(
+            unaddressable_under(store.as_ref(), &acme_prefix()).await,
+            sorted(&UNDELETABLE)
+        );
     }
 
     #[tokio::test]
@@ -1334,46 +1325,35 @@ mod tests {
         assert!(text.contains("listing refused"), "{text}");
     }
 
-    /// A flagged key under the table's own `v/` prefix whose delete the
-    /// store's path encoding would send to a different key is marked in the
-    /// listing. `--delete` deletes every other flagged version, never sends
-    /// that key a delete, and fails naming it as undeletable.
+    /// A key under the table's own `v/` prefix that the store's path
+    /// encoding changes is reported unaddressable by the listing, so the
+    /// command neither lists nor flags it. `--delete` deletes every flagged
+    /// version and never sends that key a delete.
     #[tokio::test]
-    async fn repair_marks_and_skips_a_flagged_key_the_path_encoding_changes() {
+    async fn repair_neither_lists_nor_deletes_a_key_the_path_encoding_changes() {
         let hash = TenantId::new("acme").hash();
-        let tilde = format!(
-            "{}~~~~~~~~~~~~~~~~~~~~.pqm",
-            ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix")
-        );
+        let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
+        let tilde = format!("{prefix}~~~~~~~~~~~~~~~~~~~~.pqm");
         let store = S3Keys::new(forged_table().await);
         store
             .inner
             .inner()
-            .put(&tilde, Bytes::from_static(b"x"), PutOptions::default())
-            .await
-            .expect("put");
-        let mark = format!(
-            "    key: {tilde:?}\n    stored_unix_ms: 0 (the store's clock)\n    undeletable by \
-             Ravel: the store's path encoding sends a delete of this key to {:?}; delete the \
-             exact key with the Maintain credential through an S3 tool",
-            store_path(&tilde)
-        );
+            .insert_foreign(&tilde, Bytes::from_static(b"x"));
         let lines = repair_lines(&store, "acme", "hits", RepairAction::List)
             .await
             .expect("repair");
         let printed = lines.join("\n");
-        assert!(printed.contains(&mark), "{printed}");
-        assert_eq!(printed.matches("undeletable by Ravel").count(), 2);
+        assert!(!printed.contains(&format!("{tilde:?}")), "{printed}");
+        assert!(!printed.contains("undeletable by Ravel"), "{printed}");
+        assert_eq!(keys_left(&lines).len(), 4, "{printed}");
         assert!(
-            printed.ends_with(
-                "3 version(s) flagged; rerun with --delete to remove 2 of them; it skips the \
-                 other 1, undeletable by Ravel and marked above"
-            ),
+            printed.ends_with("2 version(s) flagged; rerun with --delete to remove exactly these"),
             "{printed}"
         );
+        assert_eq!(unaddressable_under(&store, &prefix).await, [tilde.clone()]);
 
         let mut lines = Vec::new();
-        let err = collect_repair(
+        collect_repair(
             &store,
             "acme",
             "hits",
@@ -1381,30 +1361,25 @@ mod tests {
             &mut lines,
         )
         .await
-        .expect_err("the undeletable key is left");
-        assert_eq!(
-            format!("{err:#}"),
-            format!("1 flagged key(s) undeletable by Ravel left in place: {tilde:?}")
-        );
+        .expect("repair");
         let printed = lines.join("\n");
-        assert!(printed.contains(&mark), "{printed}");
+        assert!(!printed.contains(&format!("{tilde:?}")), "{printed}");
         let forged = [
             manifest_key(&hash, "hits", MAX_MANIFEST_VERSION + 1).expect("key"),
             manifest_key(&hash, "hits", u64::MAX).expect("key"),
         ];
         assert!(
             printed.ends_with(&format!(
-                "skipped {tilde:?}: undeletable by Ravel; delete the exact key with the Maintain \
-                 credential through an S3 tool\ndeleted 2 manifest versions\n  {:?}\n  {:?}",
+                "\ndeleted 2 manifest versions\n  {:?}\n  {:?}",
                 forged[0], forged[1]
             )),
             "{printed}"
         );
-        // Each deletable version is sent a delete at its own key; the tilde
+        // Each flagged version is sent a delete at its own key; the tilde
         // key is never sent one.
         assert_eq!(store.deletes(), forged);
         assert_eq!(deletes(&store.inner), 2);
-        store.inner.inner().head(&tilde).await.expect("still there");
+        assert_eq!(unaddressable_under(&store, &prefix).await, [tilde]);
         assert_eq!(
             resolve::versions(&store, &hash, "hits")
                 .await
