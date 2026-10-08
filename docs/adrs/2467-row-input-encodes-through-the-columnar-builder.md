@@ -310,14 +310,16 @@ shapes where the columnar arm ran:
 | 200,000 rows, K = 1,000 | 486.1 MB | not run | |
 
 At K = 1,000 the dense allocation site measured exactly 640,000,000 bytes,
-rows times keys times the 32 bytes of one slot; the columnar batch as a whole,
-which includes the other allocations of `from_records`, measured 643.5 MB. The two largest columnar runs
-were not made. The dense vector alone comes to about 6.4 GB for each. The
-measurement's own rule was to run a shape only with twice its pre-registered
-upper bound available: 14 GB for the first (upper bound 7.0 GB) and 16 GB
-for the second (8.0 GB). The host had 13.6 GB available (`MemAvailable` 13,636,980 kB). Every shape this ADR measured before accepting decision 1, including
-the width gate of decision 4, had every attribute present on every record,
-so none of them exercised this. Ingest's default limits cap a record at 128
+rows times keys times the 32 bytes of one slot; the columnar batch as a
+whole, which includes the other allocations of `from_records`, measured
+643.5 MB. The two largest columnar runs were not made. The dense vector
+alone comes to about 6.4 GB for each. The measurement's own rule was to run
+a shape only with twice its pre-registered upper bound available: 14 GB for
+the first (upper bound 7.0 GB) and 16 GB for the second (8.0 GB). The host
+had 13.96 GB (13.0 GiB) available: `MemAvailable` 13,636,980 kB, which
+`/proc/meminfo` reports in KiB. Every shape this ADR measured before
+accepting decision 1, including the width gate of decision 4, had every
+attribute present on every record, so none of them exercised this. Ingest's default limits cap a record at 128
 attributes; the review found no cap on the distinct names across a flush or a
 compaction part.
 
@@ -376,11 +378,16 @@ What changes:
   two, and `ColumnarLogBatch::validate` running on every row-shaped encode.
   Encoded objects still do not change.
 - **Outcome.** Decisions 5 and 6 landed for both builders in pull request
-  #2601 (issue #2565). Measured with the same profiler, heap at its global
-  maximum, 20,000 records (issues #2602 and #2608): the row builder at
-  20,000 streams went from 40.76 MB to 32.67 MB, 19.85% lower, and the
-  columnar builder with its input dropped from 30.22 MB to 27.12 MB, 10.27%
-  lower; at 1 and 1,000 streams neither moved by more than 1%. The drops of
-  the columnar builder's per-row arrays after its block loop do not lower
-  that peak on this corpus, because it falls inside the block loop, while
-  those arrays are still in use.
+  #2601 (issue #2565). Measured with the same profiler and corpus, heap at
+  its global maximum, 20,000 records (issues #2602 and #2608), at 20,000
+  streams: the row builder went from 40,756,745 to 32,668,456 bytes, 19.85%
+  lower, and the columnar builder with its records dropped once the batch is
+  built went from 30,219,105 to 27,115,257 bytes, 10.27% lower. At 1 and
+  1,000 streams neither moved by more than 1%. The baselines sit 688,144
+  bytes under the Stage 0 table at 20,000 streams in both arms because the
+  `ref_of` map Stage 0 measured had been removed by ADR-2425 before this
+  measurement. At 20,000 streams the columnar builder's gathered per-row
+  arrays still hold bytes at the peak instant, so after this change the
+  peak falls before the point where they are dropped, and those drops do
+  not lower it on this corpus; where in the builder it now falls was not
+  located. At 1 and 1,000 streams none of them is live at the peak.
