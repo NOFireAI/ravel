@@ -48,8 +48,15 @@ What the table and the runs behind it establish:
 - The 1 s decay costs 10.9 % qps, which cannot be separated from noise: the
   two default-decay runs alone differ by 9.2 %.
 - The uncharged live heap (`allocated` − accounted, the gap minus the
-  retention) is 0.2 to 1.9 GB, of which up to 1.27 GB is the handoff overlap
-  counted twice. It is mostly DataFusion aggregation state.
+  retention) is mostly DataFusion aggregation state. At each run's peak-gap
+  sample in the table above it is 0.15 to 1.68 GB. Its worst case is larger
+  and falls on other samples: the per-sample maximum of `allocated` −
+  accounted − handoff overlap (the overlap is counted twice in "accounted",
+  so it is subtracted) is, per run, 1.97 GB (baseline), 1.19 GB (rerun),
+  1.95 and 1.46 GB (decay A) and 2.07 and 1.83 GB (decay B), over every
+  5 s sample in each run's `samples.tsv`. The derivation in section 2 uses
+  that per-sample maximum, 2.07 GB, since a gate must hold at the worst
+  sample, not at the peak-gap one.
 - `memory_overhead_reserve_bytes` is a fixed 2.1 GB at the 27 GB budget (it
   is `MEMORY_OVERHEAD_RESERVE_BYTES`, 2 GiB, in
   `crates/ravel-maintain/src/config.rs`).
@@ -140,11 +147,15 @@ reading in the gauge, and decides the gate state as the first diagram shows.
 The epoch is refreshed by this thread only, at most once per interval;
 nothing on a query path calls into the allocator's control interface.
 
-The state is one atomic owned by `MemoryBudget` in `ravel-memory`, which stays
-a std-only crate with no allocator dependency: `ravel-server` writes the state
-and the reading, and every check site only loads them. The atomic sits on its
-own cache line, apart from `reserved`, so a reservation's CAS and a gate check
-never contend; it is written at most once per interval.
+The state is a small padded group of atomics owned by `MemoryBudget` in
+`ravel-memory`, which stays a std-only crate with no allocator dependency:
+an open-or-closed flag, the last reading and the mark. `ravel-server` writes
+them, and a check site loads only the flag; the reading and mark are for
+refusal messages and metrics. The group sits on its own cache line, apart
+from `reserved`, so a reservation's CAS and a gate check never contend; it is
+written at most once per interval. Admission refusals do not pass through
+`MemoryBudget`: the admission call reads the same flag and returns its own
+typed refusal.
 
 The 100 ms default is set by the burst slope: at the measured 0.4 GB/s, one
 interval lets about 40 MB of growth go unseen, small against the slack in
@@ -183,7 +194,8 @@ peak the gate permits is bounded by:
 ```text
 peak VmRSS <= M + D + G + O
   D  growth before the sampler sees it: 0.4 GB/s x (0.1 s interval + 0.05 s purge) = 0.06 GB
-  G  live growth a closed gate does not stop: the uncharged heap, up to 1.9 GB measured
+  G  live growth a closed gate does not stop: the uncharged heap, at most 2.07 GB measured
+     (per-sample maximum net of handoff overlap, over six runs; see Context)
   O  VmRSS outside jemalloc resident (stacks, binary, kernel-side buffers): taken at
      NON_BUDGET_BASELINE_BYTES, 256 MiB = 0.27 GB, until task 2 measures it
 ```
@@ -195,12 +207,12 @@ the part no ledger sees. The acceptance band is B + S with S = 512 MiB
 sampling and measurement error. For the 8 GB run:
 
 ```text
-M <= B + S - D - G - O = 8.00 + 0.54 - 0.06 - 1.90 - 0.27 = 6.31 GB = 0.79 B
+M <= B + S - D - G - O = 8.00 + 0.54 - 0.06 - 2.07 - 0.27 = 6.14 GB = 0.7675 B
 ```
 
-The default is the largest whole-five-percent fraction under 0.79: 75 %, a
-mark of 6.0 GB, which leaves 0.31 GB for an O or G larger than estimated.
-80 % (6.4 GB) overshoots the band by 0.09 GB in the same bound.
+The default is the largest whole-five-percent fraction under 0.7675: 75 %,
+a mark of 6.0 GB, which leaves 0.14 GB for an O or G larger than estimated.
+80 % (6.4 GB) overshoots the band by 0.26 GB in the same bound.
 
 The mark costs little concurrency on the measured workload. Taking O at
 0.27 GB, the peak allocated figure (VmRSS − O − retention) of the current code
@@ -228,8 +240,10 @@ Three sites, all reading the same atomic:
 
 1. **Admission.** Every query admission that today calls
    `QueryAdmissionController::try_admit` (`QueryControls::admit` in
-   `crates/ravel-query/src/http/service.rs`, and the Flight SQL service in
-   `crates/ravel-sql/src/flight/service.rs`) goes through one async admission
+   `crates/ravel-query/src/http/service.rs`, and the three independent
+   `try_admit` calls in `crates/ravel-sql/src/flight/service.rs`, at about
+   lines 310, 431 and 648, each of which the implementing task replaces and
+   tests) goes through one async admission
    call that first checks the gate. When the gate is closed it waits, checking
    once per gate interval, up to `--memory-gate-wait-ms` (default 2000, 0
    refuses at once) or the statement's remaining deadline, whichever is
@@ -308,6 +322,16 @@ and PromQL HTTP surfaces, and on Flight SQL takes the same status the SQL
 pool's refusal takes today. The refusal still carries only byte figures,
 never a key or a tenant value.
 
+The catalog decode charge is the third refusal path with the same defect.
+`crates/ravel-catalog/src/charged.rs` returns `MemoryExhausted` from
+`reserve_decoded`. That surfaces as `CatalogError::MemoryExhausted`, and
+`crates/ravel-query/src/http/error.rs` redacts it to `MSG_UNAVAILABLE`, so
+`ApiError::Unavailable` answers 503. A gate closure during a burst would
+then tell a PromQL client that storage is down. It moves with the fetch
+refusal: `CatalogError::MemoryExhausted`, accounted or gate, answers 422
+with the typed memory-budget message on every surface that answers it today.
+Task 4 covers both.
+
 ### 6. ADR-1170: the sentences that change
 
 ADR-1170 is Proposed, so it is not edited by this draft. The implementing
@@ -342,6 +366,12 @@ sentences it changes, quoted from ADR-1170:
    memory the ledgers never see." Partly superseded: the gate bounds the
    retained part of that memory and stops admitting while the unseen live
    part is high. Attributing and charging the live part stays open.
+7. Available-memory amendment, decision 3: "a fetch the remainder cannot
+   admit answers 503 (the SQL fetcher amendment above)." Becomes 422.
+8. Available-memory amendment, decision 3: "A fetch that arrives while a
+   tenant sits at its ceiling and the remaining 10% is already reserved
+   still answers 503." Becomes 422. The cap's point, that 10% stays outside
+   the SQL ceiling, is unchanged.
 
 The amendment text task 5 appends, with its markers:
 
@@ -351,6 +381,8 @@ The amendment text task 5 appends, with its markers:
 <!-- amendment-applies: sections="Constraints a governor has to satisfy|Rejected alternatives|Consequences|Amendment 2026-09-26 (issue #1255): decision 2 reaches the server|Amendment (2026-09-29, issue #2086): the SQL path's fetchers reserve against the budget|Amendment (2026-10-03, issue #2367): the budget starts from available memory" pointer="resident-gate amendment" -->
 <!-- amendment-supersedes: phrase="returned as 503" pointer="resident-gate amendment" -->
 <!-- amendment-supersedes: phrase="answers 503 (`unavailable`) over HTTP" pointer="resident-gate amendment" -->
+<!-- amendment-supersedes: phrase="a fetch the remainder cannot admit answers 503" pointer="resident-gate amendment" -->
+<!-- amendment-supersedes: phrase="still answers 503" pointer="resident-gate amendment" -->
 
 ADR-2633 adds a gate that reads jemalloc's `stats.resident`, forces a purge
 at a high-water mark (75 % of the budget by default), and refuses admission
@@ -358,7 +390,8 @@ and reservation growth with the budget's 422 while the mark is still
 exceeded. Constraint 4 and the rejected "RSS as the ceiling" alternative stand
 for the ceiling itself; the acceptance test becomes peak VmRSS at or below the
 budget plus 512 MiB. The infallible `grow` path trips its breach while the
-gate is closed. Every `FetchMemoryExhausted` answers 422, not 503.
+gate is closed. Every `FetchMemoryExhausted` and every
+`CatalogError::MemoryExhausted` answers 422, not 503.
 ```
 
 ## Rejected alternatives
@@ -375,8 +408,8 @@ about 1.3 GB, but bursts of 4 to 5 GB remain, and the peak is what kills the
 process. Its 10.9 % qps cost cannot be told from noise in the runs so far.
 
 **Exact DataFusion charging.** Charging DataFusion's aggregation state and
-removing the handoff double count addresses the uncharged live heap, 0.2 to
-1.9 GB. The retention, 2.5 to 6.5 GB at peak, is freed memory no charging can
+removing the handoff double count addresses the uncharged live heap, at
+most 2.07 GB per sample. The retention, 2.5 to 6.5 GB at peak, is freed memory no charging can
 see. It is worth doing for G in section 2, and it is not this decision.
 
 **A cgroup memory limit.** `memory.max` makes the kernel enforce the bound by
@@ -433,7 +466,7 @@ connections, 32 GB host, gate at its defaults, three runs.
   `resident`) at or below 0.27 GB.
 - On a miss, check in this order: the run used the stated budget and the gate
   stamp read enabled at 75 %; O and G as measured against the 0.27 and
-  1.9 GB used to derive the mark; only then the mark itself.
+  2.07 GB used to derive the mark; only then the mark itself.
 
 M1-shaped run: 30 GB host, 27 GB budget, the workload that was OOM-killed in
 3 of 3 attempts.
@@ -507,16 +540,17 @@ ravel-server)
   infallible `grow` while closed fails the query with 422 and releases its
   reservations; each site's refusal counter moves by one.
 
-**Task 4: the fetch refusal answers 422** (crates: ravel-sql, ravel-query,
-ravel-server)
+**Task 4: the fetch and catalog-decode refusals answer 422** (crates:
+ravel-sql, ravel-query, ravel-catalog, ravel-server)
 
-- `FetchMemoryExhausted` takes the budget class and a memory-budget message on
-  SQL HTTP, PromQL HTTP and Flight SQL.
+- `FetchMemoryExhausted` and `CatalogError::MemoryExhausted` take the budget
+  class and a memory-budget message on SQL HTTP, PromQL HTTP and Flight SQL.
 - Acceptance: the existing
   `a_sql_{metrics,logs,spans}_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving`
   tests assert 422 and the new message; a PromQL fetch over the budget
-  answers 422; the server's status-mapping test pins the change; the
-  changelog records the status change.
+  answers 422; a PromQL query whose catalog decode charge is refused answers
+  422; the server's status-mapping test pins the change; the changelog
+  records the status change.
 
 **Task 5: documentation** (docs only)
 
