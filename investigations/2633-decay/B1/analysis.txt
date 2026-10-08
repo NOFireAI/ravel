@@ -1,0 +1,37 @@
+== analyze.py (rerun branch, unmodified)
+rows 106 first 1791482539.385 last 1791483064.385 server start 1791482538.8262246 conc start 1791482574.8333685 bench end 1791482934.9826808
+ok rows 105 non-ok rows [1791483064.385]
+ASSERT nonzero after 30s: violations 0 ; bg!=1 rows: 0
+conc rows 72
+PEAKGAP: ts=1791482824.386 t=+249.6s res=8.807 act=4.515 alloc=4.476 acc=3.894 gap=4.913 ret=4.331 unc=0.582 sql=0.893 fetch=0.309 fcache=2.692 ccache=0.000 overlap=0.309 vmrss=8.417
+{'allocated': 4476082432, 'active': 4514873344, 'resident': 8806928384, 'sql_reserved': 892968033, 'fetch_reserved': 309266578, 'fetch_cache_resident': 2691650939, 'catalog_cache_resident': 0, 'handoff_overlap': 309266578, 'budget_limit': 4400000000, 'accounted': 3893885550, 'gap': 4913042834, 'vmrss_bytes': 8416501760, 'rssanon_bytes': 8337154048, 'bg_thread': 1}
+ret 4330845952 0.881499734142151 res-act 4292055040 0.873604237743961 act-alloc 38790912 0.007895496398189962 unc 582196882 0.11850026585784902
+PEAKRES: ts=1791482854.387 t=+279.6s res=9.814 act=8.301 alloc=8.254 acc=5.706 gap=4.108 ret=1.560 unc=2.548 sql=2.535 fetch=0.479 fcache=2.692 ccache=0.000 overlap=0.479 vmrss=8.425
+PEAKUNC: ts=1791482854.387 t=+279.6s res=9.814 act=8.301 alloc=8.254 acc=5.706 gap=4.108 ret=1.560 unc=2.548 sql=2.535 fetch=0.479 fcache=2.692 ccache=0.000 overlap=0.479 vmrss=8.425
+PEAKRET: ts=1791482824.386 t=+249.6s res=8.807 act=4.515 alloc=4.476 acc=3.894 gap=4.913 ret=4.331 unc=0.582 sql=0.893 fetch=0.309 fcache=2.692 ccache=0.000 overlap=0.309 vmrss=8.417
+PEAKSQL: ts=1791482914.386 t=+339.6s res=8.490 act=7.127 alloc=7.085 acc=6.690 gap=1.800 ret=1.406 unc=0.394 sql=3.794 fetch=0.205 fcache=2.692 ccache=0.000 overlap=0.205 vmrss=7.504
+PEAKOVERLAP: ts=1791482589.386 t=+14.6s res=7.099 act=5.739 alloc=5.695 acc=4.588 gap=2.512 ret=1.404 unc=1.107 sql=1.394 fetch=0.572 fcache=2.621 ccache=0.000 overlap=0.572 vmrss=6.873
+Traceback (most recent call last):
+  File "/var/lib/fleet/work/c3d2ad79-81ac-4554-8d4f-28a3be9c9ff0/investigations/2633-decay/analyze.py", line 40, in <module>
+    show(idle[-1],"IDLE-LAST"); print("idle after last query s", idle[-1]['unix_ts']-bend, "n idle>=300",len(idle))
+         ~~~~^^^^
+IndexError: list index out of range
+analyze.py exit=1
+
+== decay.py
+serial statements 43, errored 0: []
+sampled rows 105, rows with bg_thread != 1: 0
+peak gap 4.913 GB at t=+249.6s: retention 4.331 GB (88.1%), uncharged live 0.582 GB (11.9%), resident-active 4.292 GB, handoff overlap 0.309 GB
+median retention over phase 1.270 GB (72 samples)
+peak resident 9.814 GB at t=+279.6s
+peak VmRSS 8.833 GB at t=+199.6s (-160.6s from bench end)
+concurrency qps 6.647, completed 2394, errors 52, unreachable 0
+server-logged query errors 52 (bench counted 52):
+    30 422 tenant memory budget exhausted
+    18 422 query pool full, spill disabled
+     3 fetch memory exhausted (client sees HTTP 503 unavailable)
+     1 422 process memory budget exhausted
+errors by statement: {6: 1, 13: 2, 14: 1, 15: 1, 17: 3, 18: 3, 19: 12, 24: 1, 29: 3, 33: 17, 34: 3, 35: 5}
+idle +60s (sample at +64.4s): retention 0.088 GB, resident 2.802 GB, allocated 2.713 GB, VmRSS 2.863 GB
+idle +120s (sample at +124.4s): retention 0.088 GB, resident 2.801 GB, allocated 2.713 GB, VmRSS 2.863 GB
+decay.py exit=0

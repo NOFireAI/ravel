@@ -1,0 +1,1 @@
+_RJEM_MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:0
