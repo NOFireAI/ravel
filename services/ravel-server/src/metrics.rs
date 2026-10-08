@@ -5733,6 +5733,7 @@ fn render_allocator_family(
             allocated,
             active,
             resident,
+            background_thread,
         } => {
             write_header(
                 out,
@@ -5756,6 +5757,19 @@ fn render_allocator_family(
                     value,
                 );
             }
+            write_header(
+                out,
+                "ravel_process_allocator_background_thread",
+                "1 when jemalloc's background purge thread is enabled, 0 when it is not, read back \
+                 from the allocator at scrape time.",
+                "gauge",
+            );
+            write_sample(
+                out,
+                "ravel_process_allocator_background_thread",
+                &[Label::Mode(mode), Label::Allocator("jemalloc")],
+                u64::from(background_thread),
+            );
         }
         crate::mem_stats::AllocatorStats::Other { name } => {
             write_header(
@@ -13789,8 +13803,12 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                 allocated: 111,
                 active: 222,
                 resident: 333,
+                background_thread: true,
             },
         );
+        assert!(out.contains(
+            "ravel_process_allocator_background_thread{mode=\"query\",allocator=\"jemalloc\"} 1"
+        ));
         assert!(out.contains(
             "ravel_process_allocator_bytes{mode=\"query\",allocator=\"jemalloc\",stat=\"allocated\"} 111"
         ));
@@ -13805,6 +13823,21 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             "a jemalloc build renders the byte figures, never the named-allocator \
              fallback series:\n{out}"
         );
+
+        let mut out = String::new();
+        render_allocator_family(
+            &mut out,
+            Mode::Query,
+            crate::mem_stats::AllocatorStats::Jemalloc {
+                allocated: 111,
+                active: 222,
+                resident: 333,
+                background_thread: false,
+            },
+        );
+        assert!(out.contains(
+            "ravel_process_allocator_background_thread{mode=\"query\",allocator=\"jemalloc\"} 0"
+        ));
     }
 
     /// On a non-jemalloc build there are no allocated/active/resident figures
@@ -13825,6 +13858,10 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             !out.contains("ravel_process_allocator_bytes"),
             "a non-jemalloc build must never report the jemalloc-only byte \
              figures:\n{out}"
+        );
+        assert!(
+            !out.contains("ravel_process_allocator_background_thread"),
+            "a non-jemalloc build has no jemalloc background thread to report:\n{out}"
         );
     }
 
