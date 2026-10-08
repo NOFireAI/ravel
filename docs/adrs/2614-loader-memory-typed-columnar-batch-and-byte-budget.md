@@ -513,16 +513,18 @@ Verdicts against the acceptance table:
   3,905 s at 1.95 GB peak loader RSS, so no shard-ack timeout ended it,
   where stock v0.22.0 failed. The budget bound hard (187 decoder waits,
   peak charge 1,198,284,910 bytes of 1,200,000,000), and its flush split
-  is size 240, age 20, final 310: the `final` count includes the
-  stall flusher's early drains, which publish through the same
-  `FlushNow` path as the end-of-input drain. Its objects are 17.1 MB
+  is size 240, age 20, final 310 over the 570 objects it wrote (563 of
+  them above 100 KB, the count the table's median and mean use; R5's 408
+  written and 407 above 100 KB differ the same way). The `final` count
+  includes the stall flusher's early drains, which publish through the
+  same `FlushNow` path as the end-of-input drain. Its objects are 17.1 MB
   median (10th percentile 2.9 MB) and 18.3 MB mean, short of 25 MB. R4,
   at the R1b flags, also completed where stock failed, with the budget
   binding (163 decoder waits, peak charge 1,199,715,423 bytes), at
   10.4 MB median objects.
-- **16 GB: the load time is met, objects are about 1% short of 25 MB.**
-  R6 ran the R5
-  flags unchanged: 1,203 s, 0.83x the stock 1,448 s against the 1.5x
+- **16 GB: the load time is met, objects are 2% short of 25 MB on the
+  median and 0.4% on the mean.** R6 ran the R5 flags unchanged: 1,203 s,
+  0.83x the stock 1,448 s against the 1.5x
   limit, at 6.04 GB peak loader RSS, with 24.5 MB median and 24.9 MB mean
   objects (10,205,895,571 bytes / 410 objects). R2, at the R1b flags,
   took 0.72x at 8.6 MB median objects.

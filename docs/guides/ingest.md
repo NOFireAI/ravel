@@ -1230,8 +1230,9 @@ Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
 - `--target-bytes 1850000000` stored 25.1 MB mean objects on this
-  corpus, 74 times below the target: the run's 408 objects split size
-  390, age 14, final 4, so the target is what closed almost all of them,
+  corpus, 74 times below the target: the run wrote 408 objects (the mean
+  is over the 407 above 100 KB), split size 390, age 14, final 4, so the
+  target is what closed almost all of them,
   not the age trigger. At 1,650,000,000 the objects were about 22 MB
   (median, 75 times below) and at 375,000,000 5.7 MB (66 times below).
   The ratio was measured at these three target values only; scaling
@@ -1317,13 +1318,16 @@ roughly the budget plus the floor, plus whatever the object store holds:
 `--store memory` keeps every written object in the process, so a
 memory-store load grows past the budget with the data it writes.
 
-Measured on ClickBench `hits.parquet` at `--batch-rows 100000` into
-S3-compatible storage, the peak loader RSS was 6.42 GB under a
-6,500,000,000-byte budget at `--pipeline-depth 32`, and 2.02 GB under a
-1,200,000,000-byte budget on a 4 GB host, where the peak charge reached
-1,199,715,423 bytes and the decoder waited 163 times. The
-[measured recipe](#measured-recipe-for-large-objects) above has the other
-runs.
+Measured on ClickBench `hits.parquet` with the
+[measured recipe](#measured-recipe-for-large-objects) above
+(`--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s`)
+into S3-compatible storage, the peak loader RSS was 7.03 GB under a
+6,500,000,000-byte budget at `--pipeline-depth 32`, and 1.95 GB under a
+1,200,000,000-byte budget at `--pipeline-depth 16` on a 4 GB host, where
+the peak charge reached 1,198,284,910 bytes and the decoder waited 187
+times. At the same budget and depth, a 1,650,000,000 target peaked at
+6.42 GB, so size a host from the run whose target you use. The recipe
+section has the other runs.
 
 A metrics or spans load ignores `--load-memory-bytes` and warns when it is
 set.

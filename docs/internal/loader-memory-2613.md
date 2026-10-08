@@ -965,8 +965,9 @@ model below: 1,850,000,000 / 7,440 is about 248,656 rows per object, times
   is a property of this corpus.
 - **The age trigger.** At the 2 s default, 798 of R1b's 916 objects closed
   on age. A 30 s delay (R1c) let them reach the target. R1e's 453 objects
-  split size 433, age 13, final 7, and R5's 408 split size 390, age 14,
-  final 4: the target is what closed almost all of them.
+  split size 433, age 13, final 7, and R5's 408 (407 over 100 KB) split
+  size 390, age 14, final 4: the target is what closed almost all of
+  them.
 - **Pipeline depth sets load time once objects are large.** Each Strict
   write waits for its batch's flush, so the depth bounds how many batches
   fill a shard buffer at once: 16, 24 and 32 took 1,990, 1,139 and 858 s.
@@ -1052,7 +1053,9 @@ multiplicity section above gives the terms.
    25000000`. That target is estimated uncompressed bytes: on this corpus
    it stored objects of 1.1 to 2.4 MB (p10 to p90), not 25 MB, so the
    recipe was withdrawn. Wave 4 (#2627, above) measured the replacement:
-   `--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay 30s
-   --pipeline-depth 32 --load-memory-bytes 6500000000` stored about 22 MB
-   objects in 858 s at a 6.42 GB peak loader RSS. The `--target-bytes` and
-   `--pipeline-depth` help and docs/guides/ingest.md carry it.
+   `--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s
+   --pipeline-depth 32 --load-memory-bytes 6500000000` (R5) stored 25.1 MB
+   mean objects in 896 s at a 7.03 GB peak loader RSS; at a 1,650,000,000
+   target (R1e) the same flags stored about 22 MB objects in 858 s at
+   6.42 GB. The `--target-bytes` help and docs/guides/ingest.md carry the
+   R5 recipe, and the `--pipeline-depth` help carries the depth sweep.
