@@ -161,7 +161,10 @@ cheaper and simpler than a hold-snapshot handoff protocol.
 
 ADR-1693 adds the ADR-0020 catalog fold to this list, per `(tenant, signal)`
 and owned by the owner of shard 0 of that pair, so the fold and the
-catalog-object sweep for a pair run in the same process.
+catalog-object sweep for a pair run in the same process. ADR-1693's
+2026-10-07 sweep ownership amendment moves `sweep_shard` (and its zoned
+variant) to the same owner, which runs it for every shard of the pair;
+retention and compaction stay owned per shard.
 
 **Why correctness survives overlap.** During a membership transition (at most
 `3 * H` plus one heartbeat), two workers may both believe they own a unit.

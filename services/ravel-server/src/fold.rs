@@ -25,7 +25,8 @@
 //! decision 1). Each tick gates a `(tenant, signal)` pair on
 //! [`WorkerSet::owns_unit`] over shard [`FOLD_UNIT_SHARD`], the same unit key
 //! the per-signal maintenance sweeps use, so the process that sweeps a pair's
-//! catalog objects is the process that folds it. The gate is pure computation
+//! catalog objects, and every shard of the pair, is the process that folds it.
+//! The gate is pure computation
 //! over the discovery result and it runs before every per-tenant read, the
 //! lifecycle config record included, so a pair this process does not own costs
 //! zero requests. The per-tick cost of a pair nobody on this process owns is
@@ -209,11 +210,13 @@ pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Sig
 /// The shard whose rendezvous owner owns a whole `(tenant, signal)` pair's
 /// fold (ADR-1693 decision 1). The fold is per pair, not per shard, so it
 /// needs one shard to key the unit on; shard 0 is the convention the
-/// per-signal maintenance sweeps already use ([`crate::maintain`]). That makes
-/// the process sweeping a pair's shard 0 and its per-pair catalog objects the
-/// process that folds it. Every other shard of the pair is swept by whichever
-/// process owns that shard, which under a live set of more than one need not
-/// be the folder.
+/// per-signal maintenance sweeps already use ([`crate::maintain`]). The owner
+/// of this shard also runs the sweep pass of every shard of the pair, owned or
+/// not, while each shard's retention and compaction stay with that shard's
+/// owner (ADR-1693, the 2026-10-07 sweep ownership amendment). So the process
+/// whose superseded-input sweep finds a named-snapshot hold on any shard of
+/// the pair is the process that folds it, and the hold reaches the fold
+/// through [`RefoldQueue`].
 pub const FOLD_UNIT_SHARD: u32 = 0;
 
 /// Default [`RefoldQueue`] capacity, in `(tenant, signal)` pairs.

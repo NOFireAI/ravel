@@ -89,7 +89,9 @@ use ravel_fleet::query_workers::{
     QUERY_WORKERS_PREFIX, ReapPass, default_liveness_window_ns, reap_dead_query_workers,
 };
 use ravel_ingest::{Clock as _, SystemClock};
-use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
+use ravel_maintain::scan::{
+    MaintainMemo, MaintainReport, Zone, classify_zone, scan_and_maintain_with_memo,
+};
 use ravel_maintain::worker_set::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, owns, run_bounded,
 };
@@ -2226,32 +2228,34 @@ fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
     report.orphans_deleted + report.orphans_withheld + report.orphans_quarantine_refused
 }
 
-/// Sends one `(tenant, signal)` pair's Named-blocked hours to `queue` when this
-/// process folds the pair, that is when it owns [`FOLD_UNIT_SHARD`] of it under
-/// `live_set` (see [`run_tick_with_refold`]). Otherwise sends nothing and
-/// counts nothing as dropped.
-fn send_refold_hours(
-    queue: &RefoldQueue,
-    worker: &WorkerSet,
-    live_set: &[Uuid],
+/// The head and tail hours (ADR-0065 decision 3) present on a shard this
+/// process sweeps but does not scan, for its zoned sweep pass: one delimited
+/// LIST of the shard's commit prefix, each hour classified as the scan would
+/// classify it at `now_ns` under `retention_window_ns`.
+async fn unscanned_head_tail_hours(
+    store: &dyn ObjectStoreBackend,
+    compactor: &CompactorConfig,
     tenant: &TenantHash,
     signal: Signal,
-    hours: BTreeSet<u32>,
-) {
-    if hours.is_empty() {
-        return;
+    shard: u32,
+    now_ns: i64,
+    retention_window_ns: Option<i64>,
+) -> Result<Vec<u32>, MaintainError> {
+    let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+    let listed = store.list_delimited(&prefix).await?;
+    let mut hours = Vec::new();
+    for common in &listed.common_prefixes {
+        let segment = common
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix('/'))
+            .unwrap_or("");
+        let hour = keys::parse_ingest_hour_string(segment)?;
+        if classify_zone(hour, now_ns, compactor, retention_window_ns) != Zone::Interior {
+            hours.push(hour);
+        }
     }
-    if !worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD) {
-        tracing::debug!(
-            tenant = %tenant.to_hex(),
-            signal = ?signal,
-            hours = hours.len(),
-            "maintenance: hours held by a named snapshot on a shard this process sweeps but \
-             whose pair it does not fold; no re-fold request sent"
-        );
-        return;
-    }
-    queue.send(*tenant, signal, hours);
+    hours.sort_unstable();
+    Ok(hours)
 }
 
 /// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
@@ -2312,14 +2316,15 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
 /// ([`ravel_maintain::SweepReport::blocked_named_hours`], ADR-0063 section 4).
 /// Both sweep paths feed it, the zoned per-tick pass and the full pass.
 ///
-/// Per `(tenant, signal)`, the hours of every owned shard's sweep are unioned
-/// and sent to `refold` once, and only when this process owns
-/// [`FOLD_UNIT_SHARD`] of the pair under `live_set`, which is when its own fold
-/// loop folds the pair and takes its hours. A process that sweeps a shard of
-/// the pair but does not fold it sends nothing, since no fold in this process
-/// takes an entry for that pair: the hours it found held reach no fold from here, and
-/// their inputs stay held as they did before re-fold requests existed (issue
-/// #2606). `None` sends nothing at all.
+/// The sweep pass of a `(tenant, signal)` pair runs only in the process that
+/// owns [`FOLD_UNIT_SHARD`] of it under `live_set`, which is the process whose
+/// fold loop folds the pair, and there it sweeps every shard of the pair,
+/// including the shards other processes own for retention and compaction
+/// (ADR-1693, the 2026-10-07 sweep ownership amendment, issue #2606). A
+/// process that owns other shards of the pair runs their retention and
+/// compaction and sweeps none of them. So every hold the pair's sweep finds is
+/// found in the folding process: the hours of every shard's sweep are unioned
+/// and sent to `refold` once per pair. `None` sends nothing at all.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     clock: &C,
@@ -2463,9 +2468,10 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 }
             };
         // Ownership gate (ADR-0065 decision 2): keep only the shards this
-        // process owns under the current live set. A unit it does not own is
-        // not evaluated at all this tick (a discovery-time skip, not a mid-work
-        // abort); whichever worker the rendezvous hash assigns it to runs it.
+        // process owns under the current live set. A unit it does not own gets
+        // no retention or compaction from it this tick (a discovery-time skip,
+        // not a mid-work abort); whichever worker the rendezvous hash assigns
+        // it to runs them. Its sweep follows the pair's sweep owner below.
         let owned_shards: Vec<u32> = (0..scan_shards)
             .filter(|shard| worker.owns_unit(live_set, tenant, signal, *shard))
             .collect();
@@ -2479,13 +2485,51 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
             ownership.note_owned_unit(*tenant, signal, shard);
         }
 
-        // Carve each owned unit's memo slice out of the shared memo so its
+        // The sweep pass of the whole pair belongs to the owner of
+        // FOLD_UNIT_SHARD, which sweeps every shard in `scan_shards`, owned or
+        // not (ADR-1693, the 2026-10-07 sweep ownership amendment). A
+        // named-snapshot hold the superseded-input sweep finds on any shard is
+        // then found by the process that folds the pair, so it reaches the
+        // fold through the in-process queue. Retention and compaction stay
+        // with each shard's own owner.
+        let sweeps_pair = worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD);
+        let unit_shards: Vec<(u32, bool)> = (0..scan_shards)
+            .filter_map(|shard| {
+                let owned = owned_shards.contains(&shard);
+                (owned || sweeps_pair).then_some((shard, owned))
+            })
+            .collect();
+        // A shard this process sweeps but does not scan has no scan report to
+        // take its zone from, so its zoned pass classifies the shard's hours
+        // itself against the tenant's retention window, read once per pair.
+        // A failed read leaves `None` and those shards take a full pass.
+        let unscanned_window = if unit_shards.len() > owned_shards.len() {
+            match ravel_maintain::retention::resolve_retention_window_ns(store, retention, tenant)
+                .await
+            {
+                Ok(window) => Some(window),
+                Err(err) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        error = %err,
+                        "maintenance: retention window read failed; shards swept for the \
+                         pair but not scanned here take a full sweep pass this tick"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Carve each unit's memo slice out of the shared memo so its
         // concurrent future can mutate it without aliasing another unit's
         // disjoint bucket space; the slices are merged back (in ascending shard
         // order) after the fan-out completes.
-        let units: Vec<(u32, MaintainMemo)> = owned_shards
+        let units: Vec<(u32, bool, MaintainMemo)> = unit_shards
             .iter()
-            .map(|&shard| (shard, memo.split_unit(*tenant, signal, shard)))
+            .map(|&(shard, owned)| (shard, owned, memo.split_unit(*tenant, signal, shard)))
             .collect();
 
         // Maintain owned units with bounded intra-process concurrency
@@ -2495,27 +2539,37 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         // shard) order in its results, so the serial accounting and logging
         // below is deterministic and, for a single-replica live set, produces
         // byte-for-byte the pre-ADR-0065 sequential behavior. Each future runs
-        // one unit's retention/compaction pass and then its sweep, over a
-        // keyspace disjoint from every other unit's.
+        // one unit's retention/compaction pass when this process owns the
+        // shard and then the shard's sweep when this process sweeps the pair,
+        // over a keyspace disjoint from every other unit's.
         let clock_ref = clock;
         let hold_ref = &hold;
         let ownership_ref = ownership;
         let unit_results = run_bounded(
             worker.unit_concurrency(),
             units,
-            move |(shard, mut unit_memo)| async move {
-                let scan = scan_and_maintain_with_memo(
-                    &mut unit_memo,
-                    store,
-                    clock_ref,
-                    compactor,
-                    retention,
-                    hold_ref,
-                    *tenant,
-                    signal,
-                    shard,
-                )
-                .await;
+            move |(shard, owned, mut unit_memo)| async move {
+                let scan = if owned {
+                    Some(
+                        scan_and_maintain_with_memo(
+                            &mut unit_memo,
+                            store,
+                            clock_ref,
+                            compactor,
+                            retention,
+                            hold_ref,
+                            *tenant,
+                            signal,
+                            shard,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                if !sweeps_pair {
+                    return (shard, owned, unit_memo, scan, None);
+                }
                 // Zone-scoped sweep on most ticks (ADR-0065 decision 3): rules
                 // 2 and 3 list only the head+tail hours this tick's scan just
                 // classified, reusing that classification instead of a second
@@ -2526,7 +2580,9 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 // interior-only invalidation gap or a bug in the zone split
                 // itself left permanently unswept, still gets a full pass. A
                 // failed scan carries no head+tail set to scope by, so it also
-                // falls back to a full pass rather than sweeping nothing.
+                // falls back to a full pass rather than sweeping nothing. A
+                // shard scanned by another process lists its own hours instead,
+                // and a failed listing falls back to a full pass the same way.
                 //
                 // Rule 1 (orphan GC) rides the same cadence memo: its `l0/`
                 // data prefix LIST cannot be hour-scoped (issue #1734), so
@@ -2536,31 +2592,56 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 // due. The gate is driven purely by `full_sweep_due`; no new
                 // interval or flag.
                 let now = clock_ref.now_ns();
-                let sweep = match &scan {
-                    Ok(report)
-                        if !unit_memo.full_sweep_due(
-                            *tenant,
-                            signal,
-                            shard,
-                            now,
-                            compactor.interior_reverify_ns,
-                        ) =>
-                    {
-                        sweep_shard_zoned_with_holds(
-                            store,
-                            clock_ref,
-                            compactor,
-                            hold_ref,
-                            tenant,
-                            signal,
-                            shard,
-                            &report.head_tail_hours,
-                            OrphanPass::Skip,
-                        )
-                        .await
-                        .map(|(zoned_report, _holds)| zoned_report)
+                let listed_hours;
+                let zone_hours: Option<&[u32]> = if unit_memo.full_sweep_due(
+                    *tenant,
+                    signal,
+                    shard,
+                    now,
+                    compactor.interior_reverify_ns,
+                ) {
+                    None
+                } else {
+                    match (&scan, unscanned_window) {
+                        (Some(Ok(report)), _) => Some(&report.head_tail_hours),
+                        (Some(Err(_)), _) | (None, None) => None,
+                        (None, Some(window)) => {
+                            listed_hours = unscanned_head_tail_hours(
+                                store, compactor, tenant, signal, shard, now, window,
+                            )
+                            .await;
+                            match &listed_hours {
+                                Ok(hours) => Some(hours),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        tenant = %tenant.to_hex(),
+                                        signal = ?signal,
+                                        shard,
+                                        error = %err,
+                                        "maintenance: hour listing for a shard scanned \
+                                         elsewhere failed; it takes a full sweep pass"
+                                    );
+                                    None
+                                }
+                            }
+                        }
                     }
-                    _ => {
+                };
+                let sweep = match zone_hours {
+                    Some(hours) => sweep_shard_zoned_with_holds(
+                        store,
+                        clock_ref,
+                        compactor,
+                        hold_ref,
+                        tenant,
+                        signal,
+                        shard,
+                        hours,
+                        OrphanPass::Skip,
+                    )
+                    .await
+                    .map(|(zoned_report, _holds)| zoned_report),
+                    None => {
                         let outcome = sweep_shard(
                             store, clock_ref, compactor, hold_ref, tenant, signal, shard,
                         )
@@ -2572,25 +2653,37 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                         outcome
                     }
                 };
-                (shard, unit_memo, scan, sweep)
+                (shard, owned, unit_memo, scan, Some(sweep))
             },
         )
         .await;
 
+        // A failed sweep of a shard this process does not own counts against
+        // its FOLD_UNIT_SHARD unit, the unit the pair's sweep is keyed on, so
+        // a sweep that keeps failing still reaches the stalled-unit gauge.
+        let unscanned_sweeps_ok = unit_results
+            .iter()
+            .filter(|(_, owned, ..)| !owned)
+            .all(|(.., sweep)| matches!(sweep, Some(Ok(_))));
         let mut blocked_named_hours: BTreeSet<u32> = BTreeSet::new();
-        for (shard, unit_memo, scan_result, sweep_result) in unit_results {
+        for (shard, owned, unit_memo, scan_result, sweep_result) in unit_results {
             memo.merge_unit(unit_memo);
-            ownership.observe_unit_tick(
-                *tenant,
-                signal,
-                shard,
-                scan_result.is_ok() && sweep_result.is_ok(),
-            );
-            if scan_result.is_err() {
+            if owned {
+                let sweeps_ok = sweep_result.as_ref().is_none_or(Result::is_ok)
+                    && (shard != FOLD_UNIT_SHARD || unscanned_sweeps_ok);
+                ownership.observe_unit_tick(
+                    *tenant,
+                    signal,
+                    shard,
+                    scan_result.as_ref().is_some_and(Result::is_ok) && sweeps_ok,
+                );
+            }
+            if matches!(scan_result, Some(Err(_))) {
                 safety.record_scan_failed(signal);
             }
             match scan_result {
-                Ok(report) => {
+                None => {}
+                Some(Ok(report)) => {
                     tracing::info!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -2630,12 +2723,12 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     total.lag_bound_gets += report.lag_bound_gets;
                     total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
                 }
-                Err(MaintainError::ConservationViolation {
+                Some(Err(MaintainError::ConservationViolation {
                     input_sample_count,
                     part_sample_count,
                     ingest_hour_bucket,
                     ..
-                }) => {
+                })) => {
                     tracing::error!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -2649,7 +2742,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     );
                     safety.record_conservation_abort(signal);
                 }
-                Err(MaintainError::ClaimRenewFailed { at, source }) => {
+                Some(Err(MaintainError::ClaimRenewFailed { at, source })) => {
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -2661,7 +2754,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     );
                     safety.record_claim_renew_failure(signal);
                 }
-                Err(err) => {
+                Some(Err(err)) => {
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -2673,7 +2766,8 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
             }
 
             match sweep_result {
-                Ok(report) => {
+                None => {}
+                Some(Ok(report)) => {
                     tracing::info!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -2695,7 +2789,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     safety.record_sweep(signal, &report);
                     blocked_named_hours.extend(&report.blocked_named_hours);
                 }
-                Err(err) => {
+                Some(Err(err)) => {
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -2706,8 +2800,10 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 }
             }
         }
+        // Only the process that sweeps the pair has any hours here, and it is
+        // the process whose fold loop folds the pair.
         if let Some(queue) = refold {
-            send_refold_hours(queue, worker, live_set, tenant, signal, blocked_named_hours);
+            queue.send(*tenant, signal, blocked_named_hours);
         }
 
         // Idempotency markers exist only for logs and spans (ADR-0051 SS5);
