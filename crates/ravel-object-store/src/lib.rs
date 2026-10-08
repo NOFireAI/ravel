@@ -366,6 +366,10 @@ pub struct PageToken(pub String);
 pub struct ListPage {
     pub objects: Vec<ObjectMeta>,
     pub next: Option<PageToken>,
+    /// Keys the listing found that fail [`is_addressable_key`]: no operation
+    /// can reach them, so they are reported here instead of in `objects`, and
+    /// never fail the page (ADR-2637 decision 2).
+    pub unaddressable: Vec<UnaddressableKey>,
 }
 
 /// One-level listing: objects directly under the prefix plus common
@@ -374,6 +378,226 @@ pub struct ListPage {
 pub struct DelimitedList {
     pub objects: Vec<ObjectMeta>,
     pub common_prefixes: Vec<String>,
+    /// Keys directly under the prefix that fail [`is_addressable_key`], as on
+    /// [`ListPage::unaddressable`].
+    pub unaddressable: Vec<UnaddressableKey>,
+    /// Raw common prefixes that fail [`is_addressable_prefix`]. They never
+    /// appear in `common_prefixes`.
+    pub unaddressable_prefixes: Vec<String>,
+}
+
+/// True when `key` reaches the store unchanged through the `object_store`
+/// adapter: `Path::from(key)` is `key` itself (ADR-2637).
+///
+/// `Path::from` drops empty segments and percent-encodes control characters,
+/// non-ASCII bytes, `.` and `..` segments, and a set of punctuation that
+/// includes `*`, `#`, `%` and `\`, so a request for a key failing this would
+/// reach a different key. A space is not encoded. The empty key is
+/// addressable.
+pub fn is_addressable_key(key: &str) -> bool {
+    object_store::path::Path::from(key).as_ref() == key
+}
+
+/// True when a common prefix can be listed through the adapter: the empty
+/// prefix, or a prefix whose stem (the prefix without its trailing `/`) is a
+/// non-empty addressable key. `/` alone is not addressable: its stem is empty,
+/// and a listing under it would reach the root instead.
+pub fn is_addressable_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let stem = prefix.strip_suffix('/').unwrap_or(prefix);
+    !stem.is_empty() && is_addressable_key(stem)
+}
+
+/// The key a request for `key` reaches through the adapter: `Path::from(key)`.
+pub(crate) fn addressed_key(key: &str) -> String {
+    object_store::path::Path::from(key).to_string()
+}
+
+/// `Ok` when `key` is addressable, else [`StoreError::UnaddressableKey`]. Every
+/// key operation of a backend in this crate calls it before doing anything
+/// else.
+pub(crate) fn check_addressable(key: &str) -> Result<(), StoreError> {
+    if is_addressable_key(key) {
+        Ok(())
+    } else {
+        Err(StoreError::UnaddressableKey {
+            key: key.to_string(),
+            addresses: addressed_key(key),
+        })
+    }
+}
+
+/// A listed key that fails [`is_addressable_key`]. Reported by a listing,
+/// never returned as an [`ObjectMeta`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnaddressableKey {
+    /// The key exactly as the store listed it.
+    pub key: String,
+    /// The key a request for `key` would reach instead: `Path::from(key)`.
+    pub addresses: String,
+    pub size: u64,
+    pub last_modified_unix_ms: i64,
+}
+
+impl UnaddressableKey {
+    pub(crate) fn of(meta: ObjectMeta) -> Self {
+        UnaddressableKey {
+            addresses: addressed_key(&meta.key),
+            key: meta.key,
+            size: meta.size,
+            last_modified_unix_ms: meta.last_modified_unix_ms,
+        }
+    }
+}
+
+/// How many [`UnaddressableKey`]s an [`Unaddressable`] keeps as a sample.
+pub const UNADDRESSABLE_SAMPLE_MAX: usize = 16;
+
+/// The unaddressable keys a whole drain skipped: the count of all of them and
+/// the first [`UNADDRESSABLE_SAMPLE_MAX`] in listing order.
+///
+/// Deliberately not `#[must_use]`: a caller that ends its drain in `.await?;`
+/// ignores it, and the adapter's metric and warning still report the keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unaddressable {
+    pub count: u64,
+    pub sample: Vec<UnaddressableKey>,
+}
+
+impl Unaddressable {
+    fn record(&mut self, key: UnaddressableKey) {
+        self.count += 1;
+        if self.sample.len() < UNADDRESSABLE_SAMPLE_MAX {
+            self.sample.push(key);
+        }
+    }
+}
+
+/// A whole listing from [`list_all_reporting`]: every addressable key, and the
+/// unaddressable keys the listing skipped.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    pub objects: Vec<ObjectMeta>,
+    pub unaddressable: Unaddressable,
+}
+
+/// Split listed objects into the addressable ones and the
+/// [`UnaddressableKey`]s, preserving listing order in both, and warn about the
+/// unaddressable ones under `prefix`. Every base backend's listing goes
+/// through this.
+pub(crate) fn classify_objects(
+    prefix: &str,
+    listed: Vec<ObjectMeta>,
+) -> (Vec<ObjectMeta>, Vec<UnaddressableKey>) {
+    let (objects, refused): (Vec<_>, Vec<_>) = listed
+        .into_iter()
+        .partition(|meta| is_addressable_key(&meta.key));
+    let unaddressable: Vec<UnaddressableKey> =
+        refused.into_iter().map(UnaddressableKey::of).collect();
+    warn_unaddressable(
+        prefix,
+        unaddressable
+            .iter()
+            .map(|skipped| (skipped.key.as_str(), skipped.addresses.as_str())),
+    );
+    (objects, unaddressable)
+}
+
+/// [`classify_objects`] for common prefixes: split by
+/// [`is_addressable_prefix`], and warn about the refused ones.
+pub(crate) fn classify_prefixes(prefix: &str, listed: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let (prefixes, refused): (Vec<_>, Vec<_>) = listed
+        .into_iter()
+        .partition(|common| is_addressable_prefix(common));
+    let addresses: Vec<String> = refused.iter().map(|p| addressed_key(p)).collect();
+    warn_unaddressable(
+        prefix,
+        refused
+            .iter()
+            .zip(&addresses)
+            .map(|(raw, addressed)| (raw.as_str(), addressed.as_str())),
+    );
+    (prefixes, refused)
+}
+
+/// Cap on the distinct unaddressable keys a process remembers having warned
+/// about. Matches `ravel-pqtable`'s `ABOVE_BOUND_TABLES_MAX`.
+const UNADDRESSABLE_WARNED_MAX: usize = 4096;
+
+/// Past [`UNADDRESSABLE_WARNED_MAX`], one listing in this many that skips a
+/// key not already warned about warns. Matches `ABOVE_BOUND_WARN_EVERY`.
+const UNADDRESSABLE_WARN_EVERY: u64 = 1024;
+
+struct UnaddressableWarnState {
+    warned: std::collections::BTreeSet<String>,
+    /// Listings that skipped a key not warned about after the set filled.
+    overflow: u64,
+}
+
+static UNADDRESSABLE_WARNED: std::sync::Mutex<UnaddressableWarnState> =
+    std::sync::Mutex::new(UnaddressableWarnState {
+        warned: std::collections::BTreeSet::new(),
+        overflow: 0,
+    });
+
+/// Which of one listing's skipped keys to warn about, recording them in
+/// `state`: every key not warned about before while the set has room, and once
+/// it is full, the first new key of one listing in `warn_every`.
+fn keys_to_warn<'k>(
+    state: &mut UnaddressableWarnState,
+    keys: impl Iterator<Item = (&'k str, &'k str)>,
+    cap: usize,
+    warn_every: u64,
+) -> Vec<(&'k str, &'k str)> {
+    let mut warn = Vec::new();
+    let mut overflowed = None;
+    for (key, addresses) in keys {
+        if state.warned.contains(key) {
+            continue;
+        }
+        if state.warned.len() < cap {
+            state.warned.insert(key.to_string());
+            warn.push((key, addresses));
+        } else if overflowed.is_none() {
+            overflowed = Some((key, addresses));
+        }
+    }
+    if let Some(first) = overflowed {
+        if state.overflow.is_multiple_of(warn_every) {
+            warn.push(first);
+        }
+        state.overflow += 1;
+    }
+    warn
+}
+
+/// Warn once per distinct unaddressable key per process (ADR-2637 decision 2),
+/// rate-limited past [`UNADDRESSABLE_WARNED_MAX`] keys.
+fn warn_unaddressable<'k>(prefix: &str, keys: impl Iterator<Item = (&'k str, &'k str)>) {
+    let mut keys = keys.peekable();
+    if keys.peek().is_none() {
+        return;
+    }
+    let warn = {
+        let mut state = UNADDRESSABLE_WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys_to_warn(
+            &mut state,
+            keys,
+            UNADDRESSABLE_WARNED_MAX,
+            UNADDRESSABLE_WARN_EVERY,
+        )
+    };
+    for (key, addresses) in warn {
+        tracing::warn!(
+            "listing under {prefix:?} skipped key {key:?}: a request for it would reach \
+             {addresses:?} instead, so no operation can read, overwrite or delete it; \
+             delete it with the Maintain credential through an S3 tool"
+        );
+    }
 }
 
 /// Capability flags mirroring the capability tables in the contract doc.
@@ -518,6 +742,11 @@ pub enum StoreError {
         previous: String,
         offending: String,
     },
+    /// The key cannot be sent through the adapter unchanged: a request for it
+    /// would reach `addresses` instead. See [`is_addressable_key`]. Never
+    /// retryable.
+    #[error("key {key:?} is not addressable: a request for it would reach {addresses:?}")]
+    UnaddressableKey { key: String, addresses: String },
 }
 
 impl StoreError {
@@ -567,7 +796,9 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     ///
     /// The default implementation refuses with [`StoreError::Unsupported`]
     /// rather than falling back to an unconditional `get`: silently dropping
-    /// the pin would serve bytes from a replaced file.
+    /// the pin would serve bytes from a replaced file. An unaddressable key is
+    /// refused with [`StoreError::UnaddressableKey`] first, as every key
+    /// operation refuses it.
     /// [`crate::external::probe::probe_preconditions`] is how a candidate store
     /// is qualified for this before any grant relies on it.
     async fn get_pinned(
@@ -577,6 +808,7 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
         pin: &Pin,
     ) -> Result<PinnedRead, StoreError> {
         let _ = (range, pin);
+        check_addressable(key)?;
         Err(StoreError::Unsupported {
             operation: format!("conditional get of {key}"),
         })
@@ -668,6 +900,11 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
                     .filter(|meta| meta.key.as_str() > after)
                     .collect(),
                 next: page.next,
+                unaddressable: page
+                    .unaddressable
+                    .into_iter()
+                    .filter(|skipped| skipped.key.as_str() > after)
+                    .collect(),
             }),
             None => Ok(page),
         }
@@ -854,13 +1091,18 @@ pub enum DrainStep {
 ///   token that keeps changing without ending trips `max_pages` as
 ///   [`StoreError::ListPageCeiling`]. Pass [`MAX_LIST_PAGES`] unless a test
 ///   needs a smaller ceiling.
+///
+/// It returns the [`ListPage::unaddressable`] keys of every page it fetched,
+/// summed into an [`Unaddressable`], also when `keys` stops it early. The order
+/// and dedup rules above see only `objects`; an unaddressable key equal to the
+/// one recorded just before it is a repeat and is not counted twice.
 pub async fn drain_pages<E, Fetch, Fut, Keys>(
     prefix: &str,
     start_after: Option<&str>,
     max_pages: usize,
     mut fetch: Fetch,
     mut keys: Keys,
-) -> Result<(), E>
+) -> Result<Unaddressable, E>
 where
     E: From<StoreError>,
     Fetch: FnMut(Option<String>, Option<PageToken>) -> Fut,
@@ -872,6 +1114,8 @@ where
     let mut page_token: Option<PageToken> = None;
     let mut prev_token: Option<PageToken> = None;
     let mut pages = 0usize;
+    let mut unaddressable = Unaddressable::default();
+    let mut last_unaddressable: Option<String> = None;
     loop {
         if pages >= max_pages {
             return Err(StoreError::ListPageCeiling {
@@ -882,6 +1126,12 @@ where
         }
         pages += 1;
         let page = fetch(start_after.clone(), page_token).await?;
+        for skipped in page.unaddressable {
+            if last_unaddressable.as_deref() != Some(skipped.key.as_str()) {
+                last_unaddressable = Some(skipped.key.clone());
+                unaddressable.record(skipped);
+            }
+        }
         for meta in page.objects {
             match last_key.as_deref() {
                 // The raw delivery sequence never decreases and a repeat
@@ -900,7 +1150,7 @@ where
                 _ => {
                     last_key = Some(meta.key.clone());
                     if keys(meta)? == DrainStep::Stop {
-                        return Ok(());
+                        return Ok(unaddressable);
                     }
                 }
             }
@@ -916,7 +1166,7 @@ where
                 prev_token = Some(next.clone());
                 page_token = Some(next);
             }
-            None => return Ok(()),
+            None => return Ok(unaddressable),
         }
     }
 }
@@ -929,29 +1179,42 @@ pub async fn list_all(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
 ) -> Result<Vec<ObjectMeta>, StoreError> {
+    Ok(drain_list(store, prefix, MAX_LIST_PAGES).await?.objects)
+}
+
+/// [`list_all`], also returning the unaddressable keys the listing skipped,
+/// for a caller that reports them.
+pub async fn list_all_reporting(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+) -> Result<Listing, StoreError> {
     drain_list(store, prefix, MAX_LIST_PAGES).await
 }
 
-/// [`list_all`] with an explicit page ceiling, so a test can exercise the
-/// [`StoreError::ListPageCeiling`] path without draining 100 000 pages.
+/// [`list_all_reporting`] with an explicit page ceiling, so a test can
+/// exercise the [`StoreError::ListPageCeiling`] path without draining 100 000
+/// pages.
 async fn drain_list(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
     max_pages: usize,
-) -> Result<Vec<ObjectMeta>, StoreError> {
-    let mut out: Vec<ObjectMeta> = Vec::new();
-    drain_pages(
+) -> Result<Listing, StoreError> {
+    let mut objects: Vec<ObjectMeta> = Vec::new();
+    let unaddressable = drain_pages(
         prefix,
         None,
         max_pages,
         |_start_after, token| async move { store.list(prefix, token).await },
         |meta| {
-            out.push(meta);
+            objects.push(meta);
             Ok(DrainStep::Continue)
         },
     )
     .await?;
-    Ok(out)
+    Ok(Listing {
+        objects,
+        unaddressable,
+    })
 }
 
 #[cfg(test)]
@@ -1020,6 +1283,7 @@ mod list_all_tests {
             Ok(ListPage {
                 objects: Vec::new(),
                 next: Some(token),
+                unaddressable: Vec::new(),
             })
         }
 
@@ -1041,6 +1305,8 @@ mod list_all_tests {
     /// or a contract-violating backward key. `MemoryStore` cannot repeat a key,
     /// so the dedup and order paths need a driver that can. Every `list` call is
     /// counted; the last scripted page ends the listing (`next == None`).
+    /// Scripted keys are classified like a real backend's, so an unaddressable
+    /// one lands in `unaddressable`.
     struct ScriptedList {
         pages: Vec<Vec<String>>,
         calls: AtomicUsize,
@@ -1093,17 +1359,22 @@ mod list_all_tests {
 
         async fn list(
             &self,
-            _prefix: &str,
+            prefix: &str,
             _page: Option<PageToken>,
         ) -> Result<ListPage, StoreError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            let objects = self.pages[n].iter().map(|k| Self::meta(k)).collect();
+            let listed = self.pages[n].iter().map(|k| Self::meta(k)).collect();
+            let (objects, unaddressable) = classify_objects(prefix, listed);
             let next = if n + 1 < self.pages.len() {
                 Some(PageToken(format!("tok-{n}")))
             } else {
                 None
             };
-            Ok(ListPage { objects, next })
+            Ok(ListPage {
+                objects,
+                next,
+                unaddressable,
+            })
         }
 
         async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -1166,6 +1437,7 @@ mod list_all_tests {
         let keys: Vec<String> = drain_list(&store, "p/", MAX_LIST_PAGES)
             .await
             .expect("a permitted repeat must not error")
+            .objects
             .into_iter()
             .map(|m| m.key)
             .collect();
@@ -1332,6 +1604,197 @@ mod list_all_tests {
             3,
             "five keys at page size 2 is exactly three pages"
         );
+    }
+
+    /// The drain sums every page's unaddressable keys into one count, and keeps
+    /// only the first `UNADDRESSABLE_SAMPLE_MAX` of them, in listing order, as
+    /// the sample. Twenty foreign keys at page size 2 span many pages.
+    #[tokio::test]
+    async fn the_drain_sums_unaddressable_keys_and_caps_the_sample() {
+        let store = MemoryStore::with_page_size(2);
+        let mut foreign: Vec<String> = (0..20).map(|i| format!("p/{i:02}*")).collect();
+        foreign.sort();
+        for key in &foreign {
+            store.insert_foreign(key, Bytes::from_static(b"x"));
+        }
+        for key in ["p/00", "p/10", "p/19"] {
+            store
+                .put(
+                    key,
+                    Bytes::from_static(b"x"),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("seed addressable key");
+        }
+
+        let listing = list_all_reporting(&store, "p/").await.expect("drain");
+        let keys: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["p/00", "p/10", "p/19"]);
+        assert_eq!(listing.unaddressable.count, 20);
+        let sample: Vec<&str> = listing
+            .unaddressable
+            .sample
+            .iter()
+            .map(|skipped| skipped.key.as_str())
+            .collect();
+        let expected: Vec<&str> = foreign
+            .iter()
+            .take(UNADDRESSABLE_SAMPLE_MAX)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(UNADDRESSABLE_SAMPLE_MAX, 16);
+        assert_eq!(sample, expected, "the first 16 in listing order");
+        assert_eq!(listing.unaddressable.sample[0].addresses, "p/00%2A");
+        assert_eq!(listing.unaddressable.sample[0].size, 1);
+    }
+
+    /// An unaddressable key re-delivered at a page boundary is the
+    /// contract-permitted repeat, and is counted once.
+    #[tokio::test]
+    async fn an_unaddressable_repeat_at_a_page_boundary_is_counted_once() {
+        let store = ScriptedList::new(&[&["p/a", "p/b*"], &["p/b*", "p/c"]]);
+        let listing = drain_list(&store, "p/", MAX_LIST_PAGES)
+            .await
+            .expect("a permitted repeat must not error");
+        let keys: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["p/a", "p/c"]);
+        assert_eq!(listing.unaddressable.count, 1);
+        assert_eq!(listing.unaddressable.sample[0].key, "p/b*");
+    }
+
+    /// A drain the key hook stops early still returns the unaddressable keys
+    /// of the pages it fetched.
+    #[tokio::test]
+    async fn an_early_stop_still_returns_the_unaddressable_count() {
+        let store = ScriptedList::new(&[&["p/a*", "p/b"], &["p/c"]]);
+        let skipped = drain_pages::<StoreError, _, _, _>(
+            "p/",
+            None,
+            MAX_LIST_PAGES,
+            |_start_after, token| store.list("p/", token),
+            |_meta| Ok(DrainStep::Stop),
+        )
+        .await
+        .expect("drain");
+        assert_eq!(skipped.count, 1);
+        assert_eq!(store.call_count(), 1, "the stop ends the drain on page one");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod addressable_tests {
+    use bytes::Bytes;
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::memory::MemoryStore;
+
+    #[test]
+    fn keys_the_adapter_rewrites_are_not_addressable() {
+        for key in ["", "a", "a/b", "a b/c+d", "t/0123/x.pqm"] {
+            assert!(is_addressable_key(key), "{key:?}");
+        }
+        for key in [
+            "a/b\u{1}c",
+            "a/*b",
+            "a//b",
+            "/a",
+            "a/",
+            "a/./b",
+            "a/../b",
+            "a#b",
+            "a%b",
+            "é",
+        ] {
+            assert!(!is_addressable_key(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_common_prefix_is_judged_by_its_stem() {
+        for prefix in ["", "t/", "t/abc/", "a b/"] {
+            assert!(is_addressable_prefix(prefix), "{prefix:?}");
+        }
+        for prefix in ["/", "t/abc\u{1}/", "t//", "t/*/", "./"] {
+            assert!(!is_addressable_prefix(prefix), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn the_error_escapes_the_key_and_is_not_retryable() {
+        let err = check_addressable("a/b\u{1}c").expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            r#"key "a/b\u{1}c" is not addressable: a request for it would reach "a/b%01c""#
+        );
+        assert!(!err.is_retryable());
+    }
+
+    /// Below the cap every new key warns once; at the cap, one listing in
+    /// `warn_every` that skips a new key warns, naming its first new key.
+    #[test]
+    fn warnings_are_once_per_key_then_rate_limited_past_the_cap() {
+        let mut state = UnaddressableWarnState {
+            warned: std::collections::BTreeSet::new(),
+            overflow: 0,
+        };
+        let warned = keys_to_warn(
+            &mut state,
+            [("a*", "a%2A"), ("b*", "b%2A")].into_iter(),
+            2,
+            3,
+        );
+        assert_eq!(warned, vec![("a*", "a%2A"), ("b*", "b%2A")]);
+        let again = keys_to_warn(&mut state, [("a*", "a%2A")].into_iter(), 2, 3);
+        assert!(again.is_empty(), "a key already warned about is silent");
+
+        let mut warned_listings = 0;
+        for _ in 0..6 {
+            let listing = [("a*", "a%2A"), ("c*", "c%2A"), ("d*", "d%2A")];
+            let warned = keys_to_warn(&mut state, listing.into_iter(), 2, 3);
+            if !warned.is_empty() {
+                assert_eq!(warned, vec![("c*", "c%2A")]);
+                warned_listings += 1;
+            }
+        }
+        assert_eq!(warned_listings, 2, "listings 1 and 4 of 6 past the cap");
+        assert_eq!(state.warned.len(), 2, "the set stays at its cap");
+        assert_eq!(state.overflow, 6);
+    }
+
+    fn key_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![any::<String>(), "[ab/. *#%+\\\\\u{1}é]{0,10}"]
+    }
+
+    proptest! {
+        /// The predicate is exactly `Path::from` round-tripping, and the
+        /// oracle refuses exactly the keys it rejects.
+        #[test]
+        fn memory_store_refuses_exactly_the_unaddressable_keys(key in key_strategy()) {
+            let addressable = object_store::path::Path::from(key.as_str()).as_ref() == key;
+            prop_assert_eq!(is_addressable_key(&key), addressable);
+
+            let store = MemoryStore::new();
+            let put = futures::executor::block_on(store.put(
+                &key,
+                Bytes::from_static(b"x"),
+                PutOptions::create_if_absent(),
+            ));
+            let head = futures::executor::block_on(store.head(&key));
+            let delete = futures::executor::block_on(store.delete(&key));
+            for refused in [
+                matches!(put, Err(StoreError::UnaddressableKey { .. })),
+                matches!(head, Err(StoreError::UnaddressableKey { .. })),
+                matches!(delete, Err(StoreError::UnaddressableKey { .. })),
+            ] {
+                prop_assert_eq!(refused, !addressable);
+            }
+            if addressable {
+                prop_assert!(put.is_ok() && head.is_ok() && delete.is_ok());
+            }
+        }
     }
 }
 

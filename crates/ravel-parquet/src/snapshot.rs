@@ -8,7 +8,8 @@
 //! each file's identity from the footer read's response, never from the
 //! listing.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -157,9 +158,11 @@ pub enum SnapshotError {
 /// directory location is listed once, recursively; every key ending in
 /// exactly [`PARQUET_SUFFIX`] becomes a file, Hive-style subdirectories
 /// included as plain files, and the other keys are counted and skipped. A
-/// file key [`key_is_addressable`] refuses or the grant does not contain,
-/// more than [`MAX_TABLE_FILES`] files, or none at all, refuses the
-/// snapshot.
+/// file key [`key_is_addressable`] refuses, a file key the store lists as
+/// unaddressable, a file key the grant does not contain, more than
+/// [`MAX_TABLE_FILES`] files, or none at all, refuses the snapshot. A listed
+/// unaddressable key that is not a file is counted and skipped like any
+/// other.
 ///
 /// Each file's footer read reserves its bytes against `memory` before the
 /// GET is issued and releases the reservation once the footer is decoded; a
@@ -291,13 +294,40 @@ async fn list_files(
         directory_markers: 0,
         other_suffixes: 0,
     };
+    // The store reports keys it cannot address outside `objects`; they are
+    // judged here by the same suffix rules, deduplicated the way the drain
+    // dedups objects, so an unaddressable `.parquet` file still refuses the
+    // snapshot instead of dropping out of it.
+    let unaddressable_markers = AtomicU64::new(0);
+    let unaddressable_other = AtomicU64::new(0);
+    let last_unaddressable = Mutex::new(None::<String>);
     drain_pages(
         &prefix,
         None,
         MAX_LIST_PAGES,
         |_start_after, page| async {
             resolve.record_s3_request(AccountedOp::List);
-            Ok(store.list(&prefix, page).await?)
+            let page = store.list(&prefix, page).await?;
+            let mut last = last_unaddressable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for skipped in &page.unaddressable {
+                if last.as_deref() == Some(skipped.key.as_str()) {
+                    continue;
+                }
+                *last = Some(skipped.key.clone());
+                if skipped.key.ends_with('/') {
+                    unaddressable_markers.fetch_add(1, Ordering::Relaxed);
+                } else if !skipped.key.ends_with(PARQUET_SUFFIX) {
+                    unaddressable_other.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    return Err(ListDrainError::Snapshot(SnapshotError::Unaddressable {
+                        location: location.url(),
+                        key: skipped.key.clone(),
+                    }));
+                }
+            }
+            Ok(page)
         },
         |object| {
             if object.key.ends_with('/') {
@@ -331,6 +361,8 @@ async fn list_files(
         },
         ListDrainError::Snapshot(err) => err,
     })?;
+    listed.directory_markers += unaddressable_markers.into_inner();
+    listed.other_suffixes += unaddressable_other.into_inner();
     Ok(listed)
 }
 
@@ -833,7 +865,7 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, Etag, GetOutcome, ListPage, ObjectMeta, PageToken, PutOptions,
-        PutOutcome, Version,
+        PutOutcome, UnaddressableKey, Version,
     };
     use ravel_pqtable::grants::resolve_location;
 
@@ -943,6 +975,13 @@ mod tests {
             .expect("put");
     }
 
+    /// Seed a key no store operation can write, as a writer outside Ravel
+    /// would: a directory marker, or a key holding a byte the client encodes.
+    fn put_foreign(store: &MemoryStore, key: &str, bytes: Bytes) {
+        assert!(!ravel_object_store::is_addressable_key(key), "{key:?}");
+        store.insert_foreign(key, bytes);
+    }
+
     fn keys(snapshot: &LocationSnapshot) -> Vec<String> {
         snapshot.files.iter().map(key_of).collect()
     }
@@ -995,6 +1034,9 @@ mod tests {
         /// delivery sequence a real backend would refuse to produce (a
         /// decrease): no listing built on a real store can reach one.
         scripted_pages: Mutex<Vec<ListPage>>,
+        /// The last unaddressable key of the previous `list` page, for
+        /// `repeat_page_boundary`.
+        last_unaddressable: Mutex<Option<UnaddressableKey>>,
         lists: Mutex<Vec<String>>,
         heads: Mutex<Vec<String>>,
         gets: Mutex<Vec<(String, GetRange, Pin)>>,
@@ -1035,7 +1077,11 @@ mod tests {
                 })
                 .collect();
             let next = (end < count).then(|| PageToken(end.to_string()));
-            ListPage { objects, next }
+            ListPage {
+                objects,
+                next,
+                unaddressable: Vec::new(),
+            }
         }
     }
 
@@ -1125,13 +1171,29 @@ mod tests {
                 };
                 return Ok(Self::synthetic_page(count, page, suffix));
             }
+            let boundary = self
+                .last_unaddressable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            // The page token is the last raw key, which the store may have
+            // reported as unaddressable rather than as an object.
             let repeated = match (&page, self.repeat_page_boundary) {
-                (Some(PageToken(after)), true) => Some(self.inner.head(after).await?),
+                (Some(PageToken(after)), true) => Some(match boundary {
+                    Some(skipped) if skipped.key == *after => Err(skipped),
+                    _ => Ok(self.inner.head(after).await?),
+                }),
                 _ => None,
             };
             let mut listed = self.inner.list(prefix, page).await?;
-            if let Some(repeated) = repeated {
-                listed.objects.insert(0, repeated);
+            *self
+                .last_unaddressable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = listed.unaddressable.last().cloned();
+            match repeated {
+                Some(Ok(object)) => listed.objects.insert(0, object),
+                Some(Err(skipped)) => listed.unaddressable.insert(0, skipped),
+                None => {}
             }
             if self.misreport_listing {
                 for object in &mut listed.objects {
@@ -1547,7 +1609,7 @@ mod tests {
         let store = MemoryStore::new();
         let valid = parquet_bytes(&[1], &["x"]);
         for key in ["data/", "data/year=2024/"] {
-            put(&store, key, Bytes::new()).await;
+            put_foreign(&store, key, Bytes::new());
         }
         for key in ["data/year=2024/a.parquet", "data/b.parquet"] {
             put(&store, key, valid.clone()).await;
@@ -1588,11 +1650,11 @@ mod tests {
             ..Scripted::default()
         };
         let valid = parquet_bytes(&[1], &["x"]);
-        put(&store, "data/", Bytes::new()).await;
+        put_foreign(&store.inner, "data/", Bytes::new());
         put(&store, "data/a.parquet", valid.clone()).await;
         put(&store, "data/b.csv", Bytes::from_static(b"csv")).await;
         put(&store, "data/c.parquet", valid.clone()).await;
-        put(&store, "data/d/", Bytes::new()).await;
+        put_foreign(&store.inner, "data/d/", Bytes::new());
         let got = snapshot(&store, "s3://lake/data/").await.expect("snapshot");
         assert_eq!(store.lists().len(), 3, "three pages were listed");
         assert_eq!(keys(&got), ["data/a.parquet", "data/c.parquet"]);
@@ -1614,7 +1676,7 @@ mod tests {
             ..Scripted::default()
         };
         let valid = parquet_bytes(&[1], &["x"]);
-        put(&store, "data/", Bytes::new()).await;
+        put_foreign(&store.inner, "data/", Bytes::new());
         put(&store, "data/a.csv", Bytes::from_static(b"csv")).await;
         put(&store, "data/b.parquet", valid.clone()).await;
         put(&store, "data/c.parquet", valid).await;
@@ -1650,6 +1712,7 @@ mod tests {
                     last_modified_unix_ms: 0,
                 }],
                 next: Some(PageToken("b".to_string())),
+                unaddressable: Vec::new(),
             },
             ListPage {
                 objects: vec![ObjectMeta {
@@ -1660,6 +1723,7 @@ mod tests {
                     last_modified_unix_ms: 0,
                 }],
                 next: None,
+                unaddressable: Vec::new(),
             },
         ];
         match snapshot(&store, "s3://lake/data/").await {
@@ -1707,14 +1771,16 @@ mod tests {
         assert_eq!(store.lists().len(), count / 1000);
     }
 
-    /// Mutation that fails it: dropping the `key_is_addressable` check
-    /// (`MemoryStore` reads the key back, so the snapshot succeeds).
+    /// The store lists the file as unaddressable, outside `objects`. Mutation
+    /// that fails it: counting an unaddressable `.parquet` key as an other
+    /// suffix in `list_files` (the snapshot then succeeds with
+    /// `data/a.parquet` alone).
     #[tokio::test]
     async fn an_unaddressable_listed_key_refuses_naming_it() {
         let store = Scripted::default();
         let valid = parquet_bytes(&[1], &["x"]);
         put(&store, "data/a.parquet", valid.clone()).await;
-        put(&store, "data/x//y.parquet", valid).await;
+        put_foreign(&store.inner, "data/x//y.parquet", valid);
         match snapshot(&store, "s3://lake/data/").await {
             Err(SnapshotError::Unaddressable { key, .. }) => assert_eq!(key, "data/x//y.parquet"),
             other => panic!("expected Unaddressable, got {other:?}"),
@@ -1764,7 +1830,7 @@ mod tests {
                 other => panic!("expected NoFiles, got {other:?}"),
             }
         }
-        put(&store, "data/", Bytes::new()).await;
+        put_foreign(&store, "data/", Bytes::new());
         put(&store, "data/c.csv", Bytes::from_static(b"csv")).await;
         assert!(matches!(
             snapshot(&store, "s3://lake/data/").await,
@@ -2342,12 +2408,16 @@ mod tests {
     /// own, narrower refusals (no `#`, `?`, `%`, or glob character) to reach
     /// `check_file_key` at all: `<` is outside that set but still a byte
     /// `key_is_addressable` refuses. Mutation that fails it: dropping the
-    /// `key_is_addressable` check for the single-object path (`MemoryStore`
-    /// reads the key back, so the snapshot would otherwise succeed).
+    /// `key_is_addressable` check for the single-object path (the HEAD then
+    /// reaches the store, which `heads()` records).
     #[tokio::test]
     async fn an_unaddressable_single_object_key_refuses_naming_it() {
         let store = Scripted::default();
-        put(&store, "data/a<b.parquet", parquet_bytes(&[1], &["x"])).await;
+        put_foreign(
+            &store.inner,
+            "data/a<b.parquet",
+            parquet_bytes(&[1], &["x"]),
+        );
         match snapshot(&store, "s3://lake/data/a<b.parquet").await {
             Err(SnapshotError::Unaddressable { key, .. }) => assert_eq!(key, "data/a<b.parquet"),
             other => panic!("expected Unaddressable, got {other:?}"),

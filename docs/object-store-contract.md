@@ -53,8 +53,13 @@ pub struct Pin { pub etag: String, pub version: Option<String> }
 pub struct PutOutcome { pub etag: Etag, pub version: Version }
 pub struct GetOutcome { pub data: Bytes, pub etag: Etag, pub version: Version, pub total_size: u64 }
 pub struct ObjectMeta { pub key: String, pub size: u64, pub etag: Etag, pub version: Version, pub last_modified_unix_ms: i64 }
-pub struct ListPage { pub objects: Vec<ObjectMeta>, pub next: Option<PageToken> }
-pub struct DelimitedList { pub objects: Vec<ObjectMeta>, pub common_prefixes: Vec<String> }
+pub struct ListPage { pub objects: Vec<ObjectMeta>, pub next: Option<PageToken>,
+    pub unaddressable: Vec<UnaddressableKey> }
+pub struct DelimitedList { pub objects: Vec<ObjectMeta>, pub common_prefixes: Vec<String>,
+    pub unaddressable: Vec<UnaddressableKey>, pub unaddressable_prefixes: Vec<String> }
+pub struct UnaddressableKey { pub key: String, pub addresses: String, pub size: u64, pub last_modified_unix_ms: i64 }
+pub struct Unaddressable { pub count: u64, pub sample: Vec<UnaddressableKey> /* first 16 */ }
+pub struct Listing { pub objects: Vec<ObjectMeta>, pub unaddressable: Unaddressable }
 
 #[async_trait]
 pub trait MultipartUpload: Send {
@@ -80,7 +85,10 @@ range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`,
 all, so no argument and no retry can make it succeed, unlike `Permanent`,
 which reports a request the backend understood and rejected), `ReadOnly {
 operation, store }` (the store was opened read-only and the call would have
-mutated it), and the three a paged listing drain raises on a backend that
+mutated it), `UnaddressableKey { key, addresses }` (the key is not
+addressable, see "Addressable keys" below: a request for `key` would reach
+the different key `addresses`, so the operation is refused before any
+request is sent), and the three a paged listing drain raises on a backend that
 breaks the listing contract: `ListRepeatedToken { prefix }`,
 `ListPageCeiling { prefix, ceiling }` and `ListOrderViolation { prefix,
 previous, offending }`.
@@ -102,9 +110,28 @@ read-only, so it has no delete to cover. A HEAD response has no body on any
 of these backends, so `head` and `pin_of` against a missing bucket or
 container still read `NotFound`: telling the two apart would cost a second
 request.
-`PreconditionFailed`, `Unsupported` and `ReadOnly` are never retryable: a
-retry of a pinned read reads the same changed object, and neither an
-unimplemented operation nor a read-only store changes between attempts.
+`PreconditionFailed`, `Unsupported`, `ReadOnly` and `UnaddressableKey` are
+never retryable: a retry of a pinned read reads the same changed object, and
+neither an unimplemented operation, a read-only store nor a key's encoding
+changes between attempts. `InstrumentedStore` counts `UnaddressableKey` in
+the `Permanent` class.
+
+### Addressable keys (ADR-2637)
+
+A key is *addressable* when `object_store::path::Path::from(key)` is `key`
+itself (`is_addressable_key`). `Path::from` drops empty segments and
+percent-encodes control characters, non-ASCII bytes, `.` and `..` segments,
+and punctuation including `*`, `#`, `%` and `\`, so a request for any other
+key reaches a different key: a write would land beside the intended one and
+a delete would report success while the key stays. The empty key (the
+bucket root) is addressable. Every key operation of every backend in this
+crate (`get`, `get_pinned`, `get_with_pin`, `pin_of`, `head`, `put`,
+`put_multipart`, `delete`, and the trait's default `get_pinned`) refuses an
+unaddressable key with `UnaddressableKey` before doing anything else;
+`S3Store` and `ExternalStore` do it in `path_of`, and `ExternalStore`'s
+writes refuse an unaddressable key that way before they report `ReadOnly`.
+`MemoryStore` refuses the same keys, and its test-support `insert_foreign`
+plants one directly, standing in for a key another S3 client wrote.
 
 ### HTTP client timeouts (S3 adapter)
 
@@ -262,6 +289,29 @@ trait honors cancellation by drop, so the query deadline (usually well under
   listed prefix excludes no key under it. Overriding the default (which
   lists from the prefix and drops `<= start_after` in the client) is a
   performance property only; the visible result set is identical.
+- A listing classifies every key it finds and never fails because of one
+  (ADR-2637 decision 2). An addressable key is an `ObjectMeta` in
+  `objects`; an unaddressable one goes to `unaddressable` as an
+  `UnaddressableKey` carrying the raw key, the key a request for it would
+  reach (`addresses`), its size and its `last_modified_unix_ms`, in listing
+  order. Both count toward the page size, so a page of unaddressable keys
+  still advances the listing. `list_delimited` judges a common prefix by
+  its stem, the prefix without its trailing `/`: `t/abc\u{1}/` is reported
+  in `unaddressable_prefixes`, never in `common_prefixes`, and so is `/`
+  alone, whose stem is empty. `drain_pages` returns the drain's
+  `Unaddressable` (the count of every skipped key and a sample of the first
+  16, deduplicated against the last skipped key the way objects are), also
+  when the caller stops early, and `list_all_reporting` returns a `Listing`
+  holding both; `list_all` keeps returning the objects alone. The adapter
+  logs one warning per distinct skipped key per process, for up to 4096
+  keys, and past that one listing in 1024 that skips a key not warned about
+  still warns. `InstrumentedStore` counts every skipped key and common
+  prefix (see "Instrumentation decorator"). `S3Store` and `ExternalStore`
+  still list through `object_store`, which classifies only what that
+  listing returns: it lists a key such as `a*b` and the adapter reports it
+  in `unaddressable`, but its listing rejects a key holding a control
+  character, so on S3 such a key still fails the whole listing until the
+  raw ListObjectsV2 listing of ADR-2637 decision 1 lands.
 - `list` and `head` report one object's `etag` identically, byte for byte,
   and report the same `size`. Quoting, casing and any weak-validator prefix
   are passed through verbatim from the backend rather than normalized, so an
@@ -1038,6 +1088,30 @@ common TLA model's `CreateIfAbsentWinnerUnique`,
 `ListingConsumersConsistent`, `ListReturn`/`ListEventuallyComplete`, and
 `DeleteIdempotent` (`formal/tla/common/traceability.md`).
 
+Two more properties cover the addressable-key rules above (ADR-2637). A key
+that is not addressable cannot be written through any store in this crate,
+so the second one needs a way to plant such keys from outside it: a
+`ForeignKeySeeder` (`seed` and `remove`), passed to
+`run_conformance_suite_with_seeder(store, scratch_prefix, page_size,
+seeder)`. `run_conformance_suite` is that call with no seeder.
+
+- `OperationsRefuseUnaddressableKeys`: `get`, `get_pinned`, `pin_of`,
+  `head`, `put` and `delete` of a key holding a control character and of a
+  key holding `*` each fail `UnaddressableKey` naming that key and the key a
+  request would reach. With a seeder both keys are seeded first, so a store
+  that rewrote the key and acted on the rewritten one cannot pass by
+  finding nothing there. It runs on every suite run.
+- `UnaddressableKeysAreCounted`: with the page size the suite was given,
+  foreign keys are seeded at half a page, the last slot of the first page
+  and the first slot of the second, among addressable keys, and
+  `list_all_reporting` must return exactly the addressable keys as objects
+  and exactly the seeded keys in its `Unaddressable`, count and sample.
+  Without a seeder it is not run: the report lists it in
+  `ConformanceReport::not_run` with the reason, and it is absent from
+  `results`, so a run that could not check it never reads as a pass.
+  `MemoryStore` is a seeder (test-support), and both properties run against
+  it in the crate's tests.
+
 Because the delete probe deletes, the credential running `ravel-cli store
 qualify` needs delete permission on the scratch prefix
 `sys/qualify/<run-id>/**`, and only there. The shipped Admin template
@@ -1054,7 +1128,7 @@ still not implemented.
 
 `CONFORMANCE_SUITE_VERSION` is `2`. Version 1 checked four properties (the two
 conditional-write modes, read-after-write, and list-after-write); version 2 is
-the eight-probe suite above, adding concurrent single-winner create,
+the eight-probe suite in the list above, adding concurrent single-winner create,
 lexicographic listing order, cross-page listing, and delete visibility. A
 record written under version 1 was never checked against those four, so
 ravel-server refuses startup on it (a stale record that reads as a current pass
@@ -1066,7 +1140,14 @@ equal-or-newer record untouched. Re-recording is the only way to clear the
 refusal, because the record is written with `CreateIfAbsent` and cannot
 otherwise be replaced.
 
-Conditional reads are deliberately not a ninth gating property, and
+The two ADR-2637 properties do not bump it either.
+`OperationsRefuseUnaddressableKeys` gates every run, but it checks the Ravel
+binary's own refusal, which holds before any request reaches the bucket, so
+a record written without it says nothing false about the bucket.
+`UnaddressableKeysAreCounted` needs a seeder, which `ravel-cli store
+qualify` does not pass, so a qualification run leaves it in `not_run`.
+
+Conditional reads are deliberately not a gating property, and
 `CONFORMANCE_SUITE_VERSION` stays at `2` for them. The suite qualifies the
 bucket Ravel writes, and nothing on Ravel's own write or read path issues a
 pinned read: every object Ravel writes is immutable. The store that needs
@@ -1587,6 +1668,17 @@ every retry behavior above stay exactly as documented: this observes the loop,
 it does not alter it. A backend that issues no HTTP (`MemoryStore`) leaves
 `attempts` at zero. `ravel-server` exports it as `ravel_store_attempts_total`
 beside `ravel_store_calls_total`.
+
+The decorator also counts, store-wide, every unaddressable key and common
+prefix a successful listing skipped: `page.unaddressable` for `list` and
+`list_after`, and `unaddressable` plus `unaddressable_prefixes` for
+`list_delimited` (`StoreMetrics::record_list_unaddressable`, read back as
+`StoreMetrics::list_unaddressable` and
+`StoreMetricsSnapshot::list_unaddressable`). It is recorded here and nowhere
+else, so a listing that passes through several layers counts once.
+`ravel-server` exports it as `ravel_store_list_unaddressable_total`, a
+counter labelled `mode` only. A key listed on every pass counts on every
+pass; the warning log is the per-key signal.
 
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
 against all three, multipart included (`assert_multipart_upload` is part of

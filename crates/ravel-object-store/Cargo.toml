@@ -63,6 +63,9 @@ tempfile = { workspace = true }
 # the retry/backoff/multipart paths are exercised over real HTTP rather than
 # only through synthetic StoreError values.
 axum = { workspace = true }
+# Property test of the addressable-key predicate against `Path::from`
+# (ADR-2637).
+proptest = { workspace = true }
 
 [lints]
 workspace = true

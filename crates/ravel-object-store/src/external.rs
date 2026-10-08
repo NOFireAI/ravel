@@ -593,6 +593,7 @@ impl GenericStore {
         range: GetRange,
         pin: Option<&Pin>,
     ) -> Result<crate::PinnedRead, StoreError> {
+        let path = crate::s3::path_of(key)?;
         let os_range = match range {
             GetRange::Full => None,
             GetRange::Range(start, end) => {
@@ -611,7 +612,7 @@ impl GenericStore {
         let result = self
             .store
             .get_opts(
-                &crate::s3::path_of(key),
+                &path,
                 OsGetOptions {
                     range: os_range,
                     if_match: pin.map(|pin| pin.etag.clone()),
@@ -644,7 +645,7 @@ impl GenericStore {
     async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
         let raw = self
             .store
-            .head(&crate::s3::path_of(key))
+            .head(&crate::s3::path_of(key)?)
             .await
             .map_err(map_external_error)?;
         let reported_version = raw.version.clone();
@@ -656,7 +657,7 @@ impl GenericStore {
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
         let meta = self
             .store
-            .head(&crate::s3::path_of(key))
+            .head(&crate::s3::path_of(key)?)
             .await
             .map_err(map_external_error)?;
         map_external_meta(meta)
@@ -693,7 +694,12 @@ impl GenericStore {
         } else {
             None
         };
-        Ok(ListPage { objects: out, next })
+        let (objects, unaddressable) = crate::classify_objects(prefix, out);
+        Ok(ListPage {
+            objects,
+            next,
+            unaddressable,
+        })
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -703,19 +709,24 @@ impl GenericStore {
             .list_with_delimiter(prefix_path.as_ref())
             .await
             .map_err(map_external_error)?;
-        let objects = result
+        let listed = result
             .objects
             .into_iter()
             .map(map_external_meta)
             .collect::<Result<Vec<_>, _>>()?;
-        let common_prefixes = result
+        let listed_prefixes = result
             .common_prefixes
             .into_iter()
             .map(|p| format!("{p}/"))
             .collect();
+        let (objects, unaddressable) = crate::classify_objects(prefix, listed);
+        let (common_prefixes, unaddressable_prefixes) =
+            crate::classify_prefixes(prefix, listed_prefixes);
         Ok(DelimitedList {
             objects,
             common_prefixes,
+            unaddressable,
+            unaddressable_prefixes,
         })
     }
 }
@@ -728,6 +739,7 @@ impl ObjectStoreBackend for ExternalStore {
         _data: Bytes,
         _opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        crate::s3::path_of(key)?;
         self.refuse(&format!("put of {key}"))
     }
 
@@ -735,10 +747,12 @@ impl ObjectStoreBackend for ExternalStore {
         &'a self,
         key: &str,
     ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        crate::s3::path_of(key)?;
         self.refuse(&format!("multipart upload of {key}"))
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        crate::s3::path_of(key)?;
         self.refuse(&format!("delete of {key}"))
     }
 

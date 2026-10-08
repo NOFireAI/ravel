@@ -157,6 +157,10 @@ fn clone_store_error(err: &StoreError) -> StoreError {
             previous: previous.clone(),
             offending: offending.clone(),
         },
+        StoreError::UnaddressableKey { key, addresses } => StoreError::UnaddressableKey {
+            key: key.clone(),
+            addresses: addresses.clone(),
+        },
     }
 }
 
@@ -9008,6 +9012,7 @@ mod tests {
                     last_modified_unix_ms: 0,
                 }],
                 next: Some(ravel_object_store::PageToken("stuck".to_string())),
+                unaddressable: Vec::new(),
             })
         }
 

@@ -67,6 +67,13 @@
 //!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
 //!   S3 adapter. A non-zero and *growing* value against an endpoint that is
 //!   supposed to store checksums is the signal that it is dropping them.
+//! - `list_unaddressable` (`ravel_store_list_unaddressable_total`) is a
+//!   store-wide total of listed keys and common prefixes a backend classified
+//!   unaddressable and left out of a page (ADR-2637): objects no operation can
+//!   reach, which an operator deletes with the Maintain credential through an
+//!   S3 tool. This decorator records it once per successful `list`,
+//!   `list_after` or `list_delimited` page it passes through, so a drain that
+//!   re-lists a page counts that page's keys again.
 //! - The bucket-protection control plane (ADR-1727 decision 1) has its own
 //!   block, [`ControlPlaneMetricsSnapshot`], read with
 //!   [`StoreMetrics::control_plane`] and never through [`StoreOp`] or
@@ -224,6 +231,9 @@ impl StoreErrorClass {
             StoreError::ListRepeatedToken { .. }
             | StoreError::ListPageCeiling { .. }
             | StoreError::ListOrderViolation { .. } => StoreErrorClass::Permanent,
+            // A key the adapter would rewrite before sending (ADR-2637): no
+            // retry and no other backend state makes it addressable.
+            StoreError::UnaddressableKey { .. } => StoreErrorClass::Permanent,
             // A capability the backend does not have, and a mutation of a
             // store opened read-only: both are client-side configuration
             // failures that no retry and no other argument can fix, so they
@@ -444,6 +454,10 @@ pub struct StoreMetrics {
     /// checksum check (ADR-1696 decision 3). Store-wide rather than per-op:
     /// only `get` can move it, so a per-op block would be five permanent zeros.
     get_unverified: AtomicU64,
+    /// `ravel_store_list_unaddressable_total`: listed keys and common prefixes
+    /// classified unaddressable and left out of a page (ADR-2637). Store-wide
+    /// for the same reason as `get_unverified`.
+    list_unaddressable: AtomicU64,
     /// The bucket-protection control plane's own block; see the
     /// [module docs](self).
     control_plane: ControlPlaneMetrics,
@@ -510,6 +524,19 @@ impl StoreMetrics {
         self.get_unverified.load(Ordering::Relaxed)
     }
 
+    /// Record `n` listed keys or common prefixes left out of a page as
+    /// unaddressable (`ravel_store_list_unaddressable_total`, ADR-2637).
+    /// [`InstrumentedStore`] records this once per page it passes through. It
+    /// touches no other counter.
+    pub fn record_list_unaddressable(&self, n: u64) {
+        self.list_unaddressable.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Current value of `ravel_store_list_unaddressable_total`.
+    pub fn list_unaddressable(&self) -> u64 {
+        self.list_unaddressable.load(Ordering::Relaxed)
+    }
+
     /// One control-plane GET about to be sent. Touches no per-op block.
     pub(crate) fn record_control_plane_request(&self) {
         self.control_plane.requests.fetch_add(1, Ordering::Relaxed);
@@ -565,6 +592,7 @@ impl StoreMetrics {
             list_delimited: self.op(StoreOp::ListDelimited).snapshot(),
             delete: self.op(StoreOp::Delete).snapshot(),
             get_unverified: self.get_unverified.load(Ordering::Relaxed),
+            list_unaddressable: self.list_unaddressable.load(Ordering::Relaxed),
         }
     }
 }
@@ -584,6 +612,10 @@ pub struct StoreMetricsSnapshot {
     /// served without checking the body against a stored checksum (ADR-1696
     /// decision 3). Store-wide, not per-op; see the [module docs](self).
     pub get_unverified: u64,
+    /// `ravel_store_list_unaddressable_total`: listed keys and common prefixes
+    /// left out of a page as unaddressable (ADR-2637). Store-wide, not per-op;
+    /// see the [module docs](self).
+    pub list_unaddressable: u64,
 }
 
 impl StoreMetricsSnapshot {
@@ -782,6 +814,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         let result = self.inner.list(prefix, page).await;
         // One call is one page, so a full drain of N pages is N calls.
         self.record(StoreOp::List, start, 0, &result);
+        if let Ok(page) = &result {
+            self.metrics
+                .record_list_unaddressable(page.unaddressable.len() as u64);
+        }
         result
     }
 
@@ -795,6 +831,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         let result = self.inner.list_after(prefix, start_after, page).await;
         // A start-after page is still one LIST, counted the same as `list`.
         self.record(StoreOp::List, start, 0, &result);
+        if let Ok(page) = &result {
+            self.metrics
+                .record_list_unaddressable(page.unaddressable.len() as u64);
+        }
         result
     }
 
@@ -802,6 +842,11 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         let start = self.clock.now_nanos();
         let result = self.inner.list_delimited(prefix).await;
         self.record(StoreOp::ListDelimited, start, 0, &result);
+        if let Ok(list) = &result {
+            self.metrics.record_list_unaddressable(
+                (list.unaddressable.len() + list.unaddressable_prefixes.len()) as u64,
+            );
+        }
         result
     }
 
@@ -913,6 +958,10 @@ mod tests {
                 operation: "put".into(),
                 store: "external".into(),
             },
+            StoreError::UnaddressableKey {
+                key: "a/*b".into(),
+                addresses: "a/%2Ab".into(),
+            },
         ] {
             assert_eq!(
                 StoreErrorClass::of(&err),
@@ -1020,6 +1069,51 @@ mod tests {
             0,
             "a store that recorded nothing reads exactly zero"
         );
+    }
+
+    /// Every page the decorator passes through adds its unaddressable keys (and,
+    /// for a delimited listing, its unaddressable common prefixes) to
+    /// `ravel_store_list_unaddressable_total`, and the listing itself is still
+    /// one ordinary successful call.
+    #[tokio::test]
+    async fn listing_unaddressable_keys_moves_the_store_wide_counter() {
+        use crate::memory::MemoryStore;
+        use crate::{ObjectStoreBackend, PutOptions};
+        use bytes::Bytes;
+
+        let inner = MemoryStore::with_page_size(2);
+        inner.insert_foreign("p/a*", Bytes::from_static(b"x"));
+        inner.insert_foreign("p/b\u{1}", Bytes::from_static(b"x"));
+        inner.insert_foreign("p/d\u{1}/x", Bytes::from_static(b"x"));
+        let store = InstrumentedStore::new(inner);
+        for key in ["p/c", "p/e"] {
+            store
+                .put(key, Bytes::from_static(b"y"), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        assert_eq!(store.metrics().list_unaddressable(), 0);
+
+        let listing = crate::list_all_reporting(&store, "p/")
+            .await
+            .expect("listing");
+        assert_eq!(listing.unaddressable.count, 3);
+        assert_eq!(
+            store.metrics().list_unaddressable(),
+            3,
+            "the paged listing skipped three keys"
+        );
+
+        let delimited = store.list_delimited("p/").await.expect("delimited");
+        assert_eq!(delimited.unaddressable.len(), 2);
+        assert_eq!(delimited.unaddressable_prefixes, ["p/d\u{1}/"]);
+        let snap = store.metrics().snapshot();
+        assert_eq!(
+            snap.list_unaddressable, 6,
+            "two keys and one common prefix more"
+        );
+        assert_eq!(snap.list_delimited.ok, 1);
+        assert_eq!(snap.list.errors_total(), 0);
     }
 
     /// A pinned read is a GET on the wire and is billed as one: it lands in the
