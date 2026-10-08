@@ -1192,8 +1192,8 @@ per-row fields), not the stored object size. Stored objects come out much
 smaller. On ClickBench `hits.parquet` the estimate counts about 7.4 KB per
 row and a stored object holds about 102 bytes per row, so stored objects
 are about 65 to 75 times below the target: a target of 375,000,000 stored
-5.7 MB objects (median, 66 times), and 1,650,000,000 about 22 MB (75
-times). The ratio is a
+5.7 MB objects (median, 66 times), 1,650,000,000 about 22 MB (75 times),
+and 1,850,000,000 25.1 MB (mean, 74 times). The ratio is a
 property of that corpus, not a rule; measure your own stored objects
 before sizing the target from it.
 
@@ -1214,11 +1214,11 @@ hold yields smaller objects rather than a stalled load.
 #### Measured recipe for large objects
 
 On ClickBench `hits.parquet`, loaded into S3-compatible storage on a
-16-vCPU host with 128 GB of memory, this stored objects of about 22 MB
-(median) in 858 s at a 6.42 GB peak loader RSS:
+16-vCPU host with 128 GB of memory, this stored objects of 24.5 MB
+(median; 25.1 MB mean) in 896 s at a 7.03 GB peak loader RSS:
 
 ```sh
-ravel-cli load ... --batch-rows 100000 --target-bytes 1650000000 \
+ravel-cli load ... --batch-rows 100000 --target-bytes 1850000000 \
   --max-flush-delay 30s --pipeline-depth 32 --load-memory-bytes 6500000000
 ```
 
@@ -1229,35 +1229,41 @@ For comparison, an earlier loader without the memory budget, at
 Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
-- `--target-bytes 1650000000` stored about 22 MB median objects on this
-  corpus, 75 times below the target: R1e's 453 objects split size 433,
-  age 13, final 7, so the target is what closed almost all of them, not
-  the age trigger. At 375,000,000 the objects were 5.7 MB, 66
-  times below. The ratio was measured at these two target values only;
-  scaling `--target-bytes` above 1,650,000,000 for still larger objects
-  was not measured.
+- `--target-bytes 1850000000` stored 25.1 MB mean objects on this
+  corpus, 74 times below the target: the run's 408 objects split size
+  390, age 14, final 4, so the target is what closed almost all of them,
+  not the age trigger. At 1,650,000,000 the objects were about 22 MB
+  (median, 75 times below) and at 375,000,000 5.7 MB (66 times below).
+  The ratio was measured at these three target values only; scaling
+  `--target-bytes` above 1,850,000,000 for still larger objects was not
+  measured.
 - `--max-flush-delay 30s` lets a buffer live long enough to fill. At the
   2s default, 798 of 916 objects closed on age and the median object was
   10.2 MB.
 - `--pipeline-depth` sets the load time once objects are large, because
-  each Strict write waits for its batch's flush. With the other flags
-  above, depth 16 took 1,990 s, depth 24 took 1,139 s and depth 32 took
-  858 s.
+  each Strict write waits for its batch's flush. At a 1,650,000,000
+  target with the other flags above, depth 16 took 1,990 s, depth 24
+  took 1,139 s and depth 32 took 858 s.
 - `--load-memory-bytes` grows with the depth, since more batches are held
-  at once: 5,000,000,000 at depth 16 (4.34 GB peak loader RSS),
-  5,500,000,000 at 24 (5.77 GB) and 6,500,000,000 at 32 (6.42 GB).
+  at once: at a 1,650,000,000 target, 5,000,000,000 at depth 16 (4.34 GB
+  peak loader RSS), 5,500,000,000 at 24 (5.77 GB) and 6,500,000,000 at 32
+  (6.42 GB). At 1,850,000,000 and depth 32 the same budget peaked at
+  7.03 GB.
 
-Smaller hosts completed the load with `--batch-rows 100000 --target-bytes
-1650000000 --pipeline-depth 16` at the 2s default `--max-flush-delay`,
-storing objects of 8.6 to 11.5 MB (median):
+Smaller hosts loaded the same corpus with `--batch-rows 100000
+--target-bytes 1850000000 --max-flush-delay 30s`. The 16 GB host kept the
+depth and budget above; the 8 and 4 GB hosts lowered both:
 
-| host memory | other flags | load | peak loader RSS |
-|---|---|---|---|
-| 16 GB | `--load-memory-bytes 5000000000` | 1,041 s | 4.35 GB |
-| 8 GB | `--load-memory-bytes 3000000000` | 1,908 s | 4.00 GB |
-| 4 GB | `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s | 2.02 GB |
+| host memory | other flags | load | peak loader RSS | median object |
+|---|---|---|---|---|
+| 16 GB | `--pipeline-depth 32 --load-memory-bytes 6500000000` | 1,203 s | 6.04 GB | 24.5 MB |
+| 8 GB | `--pipeline-depth 24 --load-memory-bytes 3500000000` | 1,965 s | 4.92 GB | 23.9 MB |
+| 4 GB | `--pipeline-depth 16 --read-cursors 2 --load-memory-bytes 1200000000` | 3,905 s | 1.95 GB | 17.1 MB |
 
-On the 4 GB host the budget bound: the decoder waited 163 times.
+On the 8 GB host the budget bound: the decoder waited 9 times. On the
+4 GB host it bound hard: the decoder waited 187 times and the loader
+flushed shard buffers early to make room, so objects there came out
+smaller (2.9 MB at the 10th percentile).
 
 ### Load memory: `--load-memory-bytes`
 
