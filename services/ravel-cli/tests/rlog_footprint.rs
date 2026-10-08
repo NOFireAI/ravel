@@ -532,15 +532,21 @@ async fn tenant_footprint_reads_only_directories() {
 }
 
 /// A key resolved from the catalog is fetched from the store even when a local
-/// file sits at the same path; only an explicit target reads local disk.
+/// file sits at the same path; only an explicit target reads local disk. The
+/// path is relative to the working directory: an absolute one starts with
+/// `/`, which no store key can.
 #[tokio::test]
 async fn catalog_keys_are_read_from_the_store_not_local_disk() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("rlog-footprint-")
+        .tempdir_in(".")
+        .expect("tempdir");
     let a = object_a();
     let b = object_b();
-    let path = dir.path().join("same.rlog");
+    let path = std::path::Path::new(dir.path().file_name().expect("name")).join("same.rlog");
     std::fs::write(&path, &b).expect("write b");
     let key = path.to_str().expect("utf-8 path").to_string();
+    assert!(ravel_object_store::is_addressable_key(&key), "{key}");
     let store = MemoryStore::new();
     store
         .put(

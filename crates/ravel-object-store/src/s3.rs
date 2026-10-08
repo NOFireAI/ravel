@@ -1437,6 +1437,36 @@ pub(crate) fn prefix_of(prefix: &str) -> Option<Path> {
     }
 }
 
+/// One page of an `object_store` listing of up to `page_size` keys, classified,
+/// with a continuation token when the page is full.
+///
+/// The token is the page's last addressable key. The next page resumes after
+/// `Path::from(token)`, which re-encodes an unaddressable key: resuming after
+/// `p/a#b` starts at `p/a%23b` and skips `p/a$`, and resuming after `p/é`
+/// starts at `p/%C3%A9` and re-delivers keys this page already returned. An
+/// unaddressable tail after the token is listed and reported again on the
+/// next page, and a drain counts a tail of two or more keys twice. A full page with no addressable key keeps its raw last key as
+/// the token, which still re-encodes until the raw listing of ADR-2637
+/// decision 1 replaces this one.
+pub(crate) fn assemble_page(prefix: &str, listed: Vec<ObjectMeta>, page_size: usize) -> ListPage {
+    let next = if listed.len() == page_size {
+        listed
+            .iter()
+            .rev()
+            .find(|m| crate::is_addressable_key(&m.key))
+            .or(listed.last())
+            .map(|m| PageToken(m.key.clone()))
+    } else {
+        None
+    };
+    let (objects, unaddressable) = crate::classify_objects(prefix, listed);
+    ListPage {
+        objects,
+        next,
+        unaddressable,
+    }
+}
+
 fn map_meta(meta: object_store::ObjectMeta) -> Result<ObjectMeta, StoreError> {
     let etag = meta.e_tag.clone().ok_or_else(|| {
         StoreError::Permanent(format!("S3 returned no ETag for {}", meta.location))
@@ -2756,17 +2786,7 @@ impl ObjectStoreBackend for S3Store {
                     None => break,
                 }
             }
-            let next = if out.len() == self.page_size {
-                out.last().map(|m| PageToken(m.key.clone()))
-            } else {
-                None
-            };
-            let (objects, unaddressable) = crate::classify_objects(prefix, out);
-            Ok(ListPage {
-                objects,
-                next,
-                unaddressable,
-            })
+            Ok(assemble_page(prefix, out, self.page_size))
         })
         .await
     }
@@ -2802,17 +2822,7 @@ impl ObjectStoreBackend for S3Store {
                     None => break,
                 }
             }
-            let next = if out.len() == self.page_size {
-                out.last().map(|m| PageToken(m.key.clone()))
-            } else {
-                None
-            };
-            let (objects, unaddressable) = crate::classify_objects(prefix, out);
-            Ok(ListPage {
-                objects,
-                next,
-                unaddressable,
-            })
+            Ok(assemble_page(prefix, out, self.page_size))
         })
         .await
     }
@@ -2917,6 +2927,95 @@ mod tests {
     use object_store::{PutResult, UploadPart};
 
     use super::*;
+
+    fn listed(keys: &[&str]) -> Vec<ObjectMeta> {
+        keys.iter()
+            .map(|key| ObjectMeta {
+                key: (*key).to_string(),
+                size: 1,
+                etag: Etag("\"e\"".to_string()),
+                version: Version("\"e\"".to_string()),
+                last_modified_unix_ms: 0,
+            })
+            .collect()
+    }
+
+    fn object_keys(page: &ListPage) -> Vec<&str> {
+        page.objects.iter().map(|m| m.key.as_str()).collect()
+    }
+
+    fn unaddressable_keys(page: &ListPage) -> Vec<&str> {
+        page.unaddressable.iter().map(|u| u.key.as_str()).collect()
+    }
+
+    /// A full page ending in an unaddressable key resumes after the last
+    /// addressable one: `Path::from("p/a#b")` is `p/a%23b`, which sorts past
+    /// `p/a$`, so resuming there would skip it.
+    #[test]
+    fn a_page_token_skips_an_encoded_tail_that_sorts_higher() {
+        let page = assemble_page("p/", listed(&["p/0", "p/a", "p/a#b"]), 3);
+        assert_eq!(page.next, Some(PageToken("p/a".to_string())));
+        assert_eq!(object_keys(&page), ["p/0", "p/a"]);
+        assert_eq!(unaddressable_keys(&page), ["p/a#b"]);
+    }
+
+    /// `p/é` encodes to `p/%C3%A9`, which sorts below `p/b`: resuming there
+    /// would deliver `p/b` again, out of order.
+    #[test]
+    fn a_page_token_skips_an_encoded_tail_that_sorts_lower() {
+        let page = assemble_page("p/", listed(&["p/a", "p/b", "p/é"]), 3);
+        assert_eq!(page.next, Some(PageToken("p/b".to_string())));
+        assert_eq!(object_keys(&page), ["p/a", "p/b"]);
+        assert_eq!(unaddressable_keys(&page), ["p/é"]);
+    }
+
+    /// With no addressable key there is no safe offset, so the raw last key
+    /// stays the token.
+    #[test]
+    fn a_page_of_only_unaddressable_keys_keeps_its_raw_last_key() {
+        let page = assemble_page("p/", listed(&["p/a#b", "p/é"]), 2);
+        assert_eq!(page.next, Some(PageToken("p/é".to_string())));
+        assert!(page.objects.is_empty());
+        assert_eq!(unaddressable_keys(&page), ["p/a#b", "p/é"]);
+    }
+
+    /// The tail after the token is listed again, and the drain drops only a
+    /// repeat of the key it recorded last, so a tail of two keys counts four.
+    #[tokio::test]
+    async fn a_drain_counts_a_relisted_unaddressable_tail_twice() {
+        let stored = ["p/a", "p/b#1", "p/b#2"];
+        let mut objects = Vec::new();
+        let unaddressable = crate::drain_pages(
+            "p/",
+            None,
+            crate::MAX_LIST_PAGES,
+            |_, token: Option<PageToken>| async move {
+                let offset = token.map(|PageToken(after)| Path::from(after).to_string());
+                let rest: Vec<&str> = stored
+                    .into_iter()
+                    .filter(|key| offset.as_deref().is_none_or(|after| *key > after))
+                    .take(3)
+                    .collect();
+                Ok::<_, StoreError>(assemble_page("p/", listed(&rest), 3))
+            },
+            |meta| {
+                objects.push(meta.key);
+                Ok(crate::DrainStep::Continue)
+            },
+        )
+        .await
+        .expect("drain");
+        assert_eq!(objects, ["p/a"]);
+        assert_eq!(unaddressable.count, 4);
+    }
+
+    #[test]
+    fn a_short_page_has_no_token() {
+        let page = assemble_page("p/", listed(&["p/a", "p/a#b"]), 3);
+        assert_eq!(page.next, None);
+        assert_eq!(object_keys(&page), ["p/a"]);
+        assert_eq!(unaddressable_keys(&page), ["p/a#b"]);
+    }
 
     /// The probe for one lifecycle document, with versioning `Enabled`.
     fn probe_for_lifecycle(

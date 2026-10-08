@@ -689,17 +689,7 @@ impl GenericStore {
                 None => break,
             }
         }
-        let next = if out.len() == EXTERNAL_PAGE_SIZE {
-            out.last().map(|m| PageToken(m.key.clone()))
-        } else {
-            None
-        };
-        let (objects, unaddressable) = crate::classify_objects(prefix, out);
-        Ok(ListPage {
-            objects,
-            next,
-            unaddressable,
-        })
+        Ok(crate::s3::assemble_page(prefix, out, EXTERNAL_PAGE_SIZE))
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {

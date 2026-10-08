@@ -115,6 +115,8 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
 [dev-dependencies]
+# `MemoryStore::insert_foreign`, to seed keys no store operation can write.
+ravel-object-store = { workspace = true, features = ["test-support"] }
 # Writing small Parquet fixtures in the loader tests uses the same parquet/arrow
 # reader deps declared above; ArrowWriter comes from the `parquet` dep.
 # Query loaded logs back through the real ravel-sql logs path in the

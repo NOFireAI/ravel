@@ -920,18 +920,17 @@ mod tests {
         }
     }
 
-    /// A zero-byte folder marker listed ahead of the data, as an S3 console
-    /// writes one for `data/` and `data/t1/`, does not refuse a location that
-    /// holds a real file: the probe runs on the file, and the grant is
-    /// written. A location holding only the marker is refused as empty.
+    /// A zero-byte folder marker, as an S3 console writes one for `data/` and
+    /// `data/t1/`, does not refuse a location that holds a real file. The
+    /// marker is unaddressable (`Path::from` drops its trailing `/`), so the
+    /// listing reports it in `unaddressable` and the probe never sees it: the
+    /// probe runs on the file, and the grant is written. A location holding
+    /// only the marker is refused as empty.
     #[tokio::test]
     async fn a_leading_folder_marker_does_not_refuse_a_valid_location() {
         let external_store = MemoryStore::new();
         for key in ["data/", "data/t1/"] {
-            external_store
-                .put(key, Bytes::new(), PutOptions::default())
-                .await
-                .expect("put marker");
+            external_store.insert_foreign(key, Bytes::new());
         }
         external_store
             .put(
@@ -941,6 +940,15 @@ mod tests {
             )
             .await
             .expect("put");
+        let listed = external_store.list("data/", None).await.expect("list");
+        let objects: Vec<&str> = listed.objects.iter().map(|m| m.key.as_str()).collect();
+        let markers: Vec<&str> = listed
+            .unaddressable
+            .iter()
+            .map(|u| u.key.as_str())
+            .collect();
+        assert_eq!(objects, ["data/t1/part-0.parquet"]);
+        assert_eq!(markers, ["data/", "data/t1/"]);
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_store);
         for url in ["s3://customer/data", "s3://customer/data/t1/"] {
             let ravel = ravel_bucket();
@@ -964,10 +972,7 @@ mod tests {
         }
 
         let markers_only = MemoryStore::new();
-        markers_only
-            .put("empty/", Bytes::new(), PutOptions::default())
-            .await
-            .expect("put marker");
+        markers_only.insert_foreign("empty/", Bytes::new());
         let markers_only: Arc<dyn ObjectStoreBackend> = Arc::new(markers_only);
         let err = add_grant(
             &ravel_bucket(),

@@ -374,7 +374,8 @@ impl ObjectStoreBackend for SegmentAlignedStore {
 /// Handles keys the way the S3 adapter's `object_store` client does. A list
 /// page holding a key `Path::parse` refuses (a control character, an empty
 /// segment, a `.` or `..` segment) fails with the error the adapter maps that
-/// to, as `object_store` fails to parse the whole ListObjectsV2 response. A
+/// to, as `object_store` fails to parse the whole ListObjectsV2 response
+/// before any key is classified, so an unaddressable key fails it too. A
 /// request for one key goes to `Path::from` of it, as the adapter's
 /// `path_of` sends it, which percent-encodes some characters and drops empty
 /// segments. Prefixes and page tokens pass through.
@@ -422,8 +423,12 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for S3KeyStore<S> {
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         let page = self.inner.list(prefix, page).await?;
-        for meta in &page.objects {
-            parse_listed(&meta.key)?;
+        for key in page.objects.iter().map(|meta| meta.key.as_str()).chain(
+            page.unaddressable
+                .iter()
+                .map(|skipped| skipped.key.as_str()),
+        ) {
+            parse_listed(key)?;
         }
         Ok(page)
     }
@@ -435,6 +440,13 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for S3KeyStore<S> {
             .iter()
             .map(|meta| meta.key.as_str())
             .chain(listed.common_prefixes.iter().map(String::as_str))
+            .chain(
+                listed
+                    .unaddressable
+                    .iter()
+                    .map(|skipped| skipped.key.as_str()),
+            )
+            .chain(listed.unaddressable_prefixes.iter().map(String::as_str))
         {
             parse_listed(key)?;
         }
