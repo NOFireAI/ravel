@@ -1693,7 +1693,7 @@ not flagged:
   bound.
 
 `parquet sweep` deletes a table's superseded versions only when it can
-attribute the newest version to Ravel's DDL writer (ADR-2430):
+attribute the newest version to Ravel's DDL writer:
 
 - On a keyed bucket, run the sweep with `--tenant-hash-key-file`. It reads
   each table's newest version and deletes the versions beneath it only when

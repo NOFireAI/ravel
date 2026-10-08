@@ -1108,7 +1108,7 @@ mod tests {
             MemoryStore::new(),
             FaultPlan::empty().with_rule(
                 Rule::new(Op::Get, ScriptedFault::Permanent("down".into()))
-                    .with_key_contains(&mkey("hits", 2)),
+                    .with_key_contains(mkey("hits", 2)),
             ),
         );
         let store = faults.inner();
