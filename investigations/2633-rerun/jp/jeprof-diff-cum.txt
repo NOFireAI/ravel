@@ -1,0 +1,300 @@
+Total: 1237894242 B
+       0   0.0%   0.0% 1237894242 100.0% ::call_once (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::call_once::{shim:vtable#0}
+       0   0.0%   0.0% 1237894242 100.0% ::launch::{closure#0} (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::new::thread_start
+       0   0.0%   0.0% 1237894242 100.0% ::poll
+       0   0.0%   0.0% 1237894242 100.0% ::poll (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::poll::{closure#0} (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::poll_inner (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::run (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::run_task
+       0   0.0%   0.0% 1237894242 100.0% ::run_task::{closure#0} (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::set:: (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::spawn_thread::{closure#0} (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::try_with:: (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::with:: (inline)
+       0   0.0%   0.0% 1237894242 100.0% ::with_mut:: (inline)
+       0   0.0%   0.0% 1237894242 100.0% __clone@@GLIBC_2.2.5
+       0   0.0%   0.0% 1237894242 100.0% _rjem_je_prof_backtrace
+       0   0.0%   0.0% 1237894242 100.0% _rjem_je_prof_tctx_create
+       0   0.0%   0.0% 1237894242 100.0% prof_alloc_prep (inline)
+1237894242 100.0% 100.0% 1237894242 100.0% prof_backtrace_impl
+       0   0.0% 100.0% 1237894242 100.0% pthread_condattr_setpshared@GLIBC_2.2.5
+       0   0.0% 100.0% 1237894242 100.0% std::panic::catch_unwind:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% std::panicking::catch_unwind:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% std::panicking::catch_unwind::do_call:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% std::sys::backtrace::__rust_begin_short_backtrace::
+       0   0.0% 100.0% 1237894242 100.0% std::thread::lifecycle::spawn_unchecked::::{closure#1} (inline)
+       0   0.0% 100.0% 1237894242 100.0% std::thread::lifecycle::spawn_unchecked::::{closure#1}::{closure#0} (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::context::runtime::enter_runtime:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::context::set_scheduler:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::context::set_scheduler::::{closure#0} (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::scheduler::multi_thread::worker::run
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0} (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0} (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::task::harness::poll_future:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::task::harness::poll_future::::{closure#0} (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::runtime::task::raw::poll::@6533950
+       0   0.0% 100.0% 1237894242 100.0% tokio::task::coop::budget:: (inline)
+       0   0.0% 100.0% 1237894242 100.0% tokio::task::coop::with_budget:: (inline)
+       0   0.0% 100.0% 739072996  59.7% ::finish_grow
+       0   0.0% 100.0% 739072996  59.7% ::grow_amortized (inline)
+       0   0.0% 100.0% 732714182  59.2% ::reserve::do_reserve_and_handle::
+       0   0.0% 100.0% 728602061  58.9% ::reserve (inline)
+       0   0.0% 100.0% 711023451  57.4% ::grow (inline)
+       0   0.0% 100.0% 711023451  57.4% ::grow_impl (inline)
+       0   0.0% 100.0% 711023451  57.4% ::grow_impl_runtime (inline)
+       0   0.0% 100.0% 711023451  57.4% ::realloc (inline)
+       0   0.0% 100.0% 711023451  57.4% __rustc::__rust_realloc (inline)
+       0   0.0% 100.0% 711023451  57.4% alloc::alloc::realloc_nonnull (inline)
+       0   0.0% 100.0% 711023451  57.4% do_rallocx
+       0   0.0% 100.0% 711023451  57.4% irallocx_prof (inline)
+       0   0.0% 100.0% 702738545  56.8% ::spec_extend (inline)
+       0   0.0% 100.0% 701609054  56.7% ::append_elements (inline)
+       0   0.0% 100.0% 701609054  56.7% ::extend_from_slice (inline)
+       0   0.0% 100.0% 674746113  54.5% ::call::{closure#0}
+       0   0.0% 100.0% 673157853  54.4% ::poll_msg (inline)
+       0   0.0% 100.0% 673157853  54.4% ::poll_write
+       0   0.0% 100.0% 673157853  54.4% axum::serve::handle_connection::::{closure#0}::{closure#3}
+       0   0.0% 100.0% 673157853  54.4% axum::serve::handle_connection::::{closure#0}::{closure#3}::{closure#0} (inline)
+       0   0.0% 100.0% 673157853  54.4% core::future::future::Future>::poll (inline)
+       0   0.0% 100.0% 673157853  54.4% ravel_server::sql::handle::{closure#0} (inline)
+       0   0.0% 100.0% 673157853  54.4% ravel_server::sql::run::{closure#0}
+       0   0.0% 100.0% 673157853  54.4% tokio::runtime::task::raw::poll::@5a980e0
+       0   0.0% 100.0% 671088640  54.2% ::finish (inline)
+       0   0.0% 100.0% 671088640  54.2% ::to_arrow_ipc
+       0   0.0% 100.0% 671088640  54.2% ::write_all (inline)
+       0   0.0% 100.0% 671088640  54.2% arrow_ipc::writer::write_continuation:: (inline)
+       0   0.0% 100.0% 671088640  54.2% ravel_server::sql::encode
+       0   0.0% 100.0% 668026183  54.0% ::poll_catch (inline)
+       0   0.0% 100.0% 668026183  54.0% ::poll_loop (inline)
+       0   0.0% 100.0% 569868058  46.0% datafusion_common_runtime::trace_utils::trace_future::::{closure#0}
+       0   0.0% 100.0% 569868058  46.0% tokio::runtime::task::raw::poll::@41321b0
+       0   0.0% 100.0% 526870791  42.6% ::alloc (inline)
+       0   0.0% 100.0% 526870791  42.6% __rustc::__rust_alloc (inline)
+       0   0.0% 100.0% 526870791  42.6% alloc::alloc::alloc (inline)
+       0   0.0% 100.0% 526870791  42.6% imalloc (inline)
+       0   0.0% 100.0% 526870791  42.6% imalloc_body (inline)
+       0   0.0% 100.0% 526304256  42.5% _rjem_je_malloc_default
+       0   0.0% 100.0% 524715997  42.4% ::alloc_impl (inline)
+       0   0.0% 100.0% 524715997  42.4% ::allocate (inline)
+       0   0.0% 100.0% 513302634  41.5% ::alloc_impl_runtime (inline)
+       0   0.0% 100.0% 485906134  39.3% ::with_capacity_in (inline)
+       0   0.0% 100.0% 481581704  38.9% ::try_allocate_in (inline)
+       0   0.0% 100.0% 478844271  38.7% ::with_capacity (inline)
+       0   0.0% 100.0% 463588757  37.4% ::poll_next
+       0   0.0% 100.0% 463588757  37.4% ::poll_next (inline)
+       0   0.0% 100.0% 463588757  37.4% ::poll_next_unpin (inline)
+       0   0.0% 100.0% 416420941  33.6% ::poll_next::{closure#0} (inline)
+       0   0.0% 100.0% 415401392  33.6% ::poll_scan (inline)
+       0   0.0% 100.0% 415401392  33.6% ::poll_upstream (inline)
+       0   0.0% 100.0% 414352720  33.5% ::into_stream::{closure#0}::{closure#0} (inline)
+       0   0.0% 100.0% 414352720  33.5% ::transition::{closure#0} (inline)
+       0   0.0% 100.0% 381968003  30.9% ::pull_from_input::{closure#0} (inline)
+       0   0.0% 100.0% 338347240  27.3% ::try_decode
+       0   0.0% 100.0% 338347240  27.3% ::try_next_batch (inline)
+       0   0.0% 100.0% 331686271  26.8% ::next
+       0   0.0% 100.0% 331686271  26.8% ::next_inner (inline)
+       0   0.0% 100.0% 324664632  26.2% ::read_one_batch (inline)
+       0   0.0% 100.0% 324664632  26.2% ::read_records
+       0   0.0% 100.0% 324664632  26.2% ::read_records (inline)
+       0   0.0% 100.0% 324664632  26.2% parquet::arrow::array_reader::read_records:: (inline)
+       0   0.0% 100.0% 304025042  24.6% ::transition (inline)
+       0   0.0% 100.0% 304025042  24.6% ::try_build (inline)
+       0   0.0% 100.0% 304025042  24.6% ::try_next_reader (inline)
+       0   0.0% 100.0% 304025042  24.6% ::try_transition (inline)
+       0   0.0% 100.0% 304025042  24.6% ::with_predicate_options
+       0   0.0% 100.0% 296771233  24.0% ::fetch_batch (inline)
+       0   0.0% 100.0% 248991398  20.1% ::has_next (inline)
+       0   0.0% 100.0% 248991398  20.1% ::read_new_page
+       0   0.0% 100.0% 243625955  19.7% ::get_next_page
+       0   0.0% 100.0% 243625955  19.7% parquet::file::serialized_reader::decode_page
+       0   0.0% 100.0% 187900055  15.2% ::run_input::{closure#0} (inline)
+       0   0.0% 100.0% 101868046   8.2% ::coalesce
+       0   0.0% 100.0% 101868046   8.2% ::copy_rows
+       0   0.0% 100.0% 101868046   8.2% ::push_and_drain (inline)
+       0   0.0% 100.0% 101868046   8.2% ::push_batch
+       0   0.0% 100.0% 78078734   6.3% ::try_poll_next (inline)
+       0   0.0% 100.0% 76133685   6.2% ::append_views_and_copy_strings
+       0   0.0% 100.0% 76133685   6.2% ::next_buffer (inline)
+       0   0.0% 100.0% 76005479   6.1% ::fetch_once::{closure#0}
+       0   0.0% 100.0% 76005479   6.1% ::get_byte_ranges::{closure#0}
+       0   0.0% 100.0% 76005479   6.1% ::get_or_fetch::::{closure#0} (inline)
+       0   0.0% 100.0% 76005479   6.1% ::get_or_fetch_outcome::::{closure#0} (inline)
+       0   0.0% 100.0% 76005479   6.1% ::get_or_fetch_outcome::::{closure#0}::{closure#0}::{closure#0} (inline)
+       0   0.0% 100.0% 76005479   6.1% ::read_reserved::{closure#0}
+       0   0.0% 100.0% 76005479   6.1% ::run::::{closure#0} (inline)
+       0   0.0% 100.0% 76005479   6.1% ::run_as_leader::::{closure#0} (inline)
+       0   0.0% 100.0% 75673233   6.1% ::get_or_insert_with:: (inline)
+       0   0.0% 100.0% 75673233   6.1% ::read_one_batch::{closure#0} (inline)
+       0   0.0% 100.0% 70924340   5.7% ::fetch_once::{closure#0}::{closure#0}::{closure#0}
+       0   0.0% 100.0% 70924340   5.7% ::get_inner::{closure#0} (inline)
+       0   0.0% 100.0% 70924340   5.7% ::get_one::{closure#0}
+       0   0.0% 100.0% 70924340   5.7% ::get_pinned::{closure#0}
+       0   0.0% 100.0% 70924340   5.7% ::scope_inner:: (inline)
+       0   0.0% 100.0% 70924340   5.7% ravel_object_store::s3::connector::scope::::{closure#0}
+       0   0.0% 100.0% 70873809   5.7% ::try_poll (inline)
+       0   0.0% 100.0% 69336080   5.6% ::bytes::{closure#0}
+       0   0.0% 100.0% 69336080   5.6% object_store::util::collect_bytes::::{closure#0} (inline)
+       0   0.0% 100.0% 46114110   3.7% ::group_aggregate_batch (inline)
+       0   0.0% 100.0% 44694325   3.6% ::insert_if_new:: (inline)
+       0   0.0% 100.0% 44694325   3.6% ::insert_if_new_inner:: (inline)
+       0   0.0% 100.0% 44694325   3.6% ::intern
+       0   0.0% 100.0% 37605393   3.0% ::append_value
+       0   0.0% 100.0% 35439350   2.9% ::next (inline)
+       0   0.0% 100.0% 25734361   2.1% ::ensure_capacity (inline)
+       0   0.0% 100.0% 11938291   1.0% ::new_uninitialized:: (inline)
+       0   0.0% 100.0% 11938291   1.0% hashbrown::alloc::inner::do_alloc:: (inline)
+       0   0.0% 100.0%  9108626   0.7% ::new (inline)
+       0   0.0% 100.0%  8667566   0.7% ::fallible_with_capacity::
+       0   0.0% 100.0%  8611996   0.7% ::collect:: (inline)
+       0   0.0% 100.0%  8611996   0.7% ::from_iter:: (inline)
+       0   0.0% 100.0%  7613860   0.6% ::prepare_resize:: (inline)
+       0   0.0% 100.0%  7613860   0.6% ::reserve:: (inline)
+       0   0.0% 100.0%  7613860   0.6% ::reserve_rehash::
+       0   0.0% 100.0%  7613860   0.6% ::reserve_rehash_inner:: (inline)
+       0   0.0% 100.0%  7613860   0.6% ::resize_inner:: (inline)
+       0   0.0% 100.0%  7558290   0.6% ::from_iter (inline)
+       0   0.0% 100.0%  7088932   0.6% ::insert_accounted:: (inline)
+       0   0.0% 100.0%  7021639   0.6% ::from_iter::::{closure#0} (inline)
+       0   0.0% 100.0%  7021639   0.6% ::try_fold:: (inline)
+       0   0.0% 100.0%  7021639   0.6% ::try_for_each:: (inline)
+       0   0.0% 100.0%  7021639   0.6% core::iter::adapters::map::map_try_fold::::{closure#0} (inline)
+       0   0.0% 100.0%  7021639   0.6% core::iter::adapters::try_process:: (inline)
+       0   0.0% 100.0%  6574692   0.5% ::to_vec:: (inline)
+       0   0.0% 100.0%  6574692   0.5% ::to_vec_in:: (inline)
+       0   0.0% 100.0%  6428799   0.5% ::consume_batch
+       0   0.0% 100.0%  6428799   0.5% ::consume_batch::{closure#0} (inline)
+       0   0.0% 100.0%  6358813   0.5% ::grow_one
+       0   0.0% 100.0%  6358813   0.5% ::grow_one (inline)
+       0   0.0% 100.0%  6358813   0.5% ::push (inline)
+       0   0.0% 100.0%  6358813   0.5% ::push_mut (inline)
+       0   0.0% 100.0%  5853665   0.5% ::extend_with (inline)
+       0   0.0% 100.0%  5853665   0.5% ::resize (inline)
+       0   0.0% 100.0%  5380776   0.4% ::execute
+       0   0.0% 100.0%  5365443   0.4% ::set_dict
+       0   0.0% 100.0%  5243118   0.4% arrow_select::concat::concat
+       0   0.0% 100.0%  5243118   0.4% arrow_select::concat::concat_byte_view::
+       0   0.0% 100.0%  5081139   0.4% ::admit (inline)
+       0   0.0% 100.0%  5081139   0.4% ::copy_from_slice (inline)
+       0   0.0% 100.0%  5081139   0.4% ::insert
+       0   0.0% 100.0%  5081139   0.4% ::to_vec (inline)
+       0   0.0% 100.0%  5081139   0.4% ravel_cache::cache::copy_counted (inline)
+       0   0.0% 100.0%  5081139   0.4% ravel_cache::cache::owned_exact (inline)
+       0   0.0% 100.0%  4856040   0.4% ::execute_typed (inline)
+       0   0.0% 100.0%  4324430   0.3% ::with_capacity:: (inline)
+       0   0.0% 100.0%  4076081   0.3% ::and_then
+       0   0.0% 100.0%  3765798   0.3% ::ensure_input_streams_initialized
+       0   0.0% 100.0%  3669196   0.3% ::execute::{closure#0} (inline)
+       0   0.0% 100.0%  3270724   0.3% ::fallible_with_capacity:: (inline)
+       0   0.0% 100.0%  3270724   0.3% datafusion_physical_plan::aggregates::group_values::new_group_values
+       0   0.0% 100.0%  3268192   0.3% ::new
+       0   0.0% 100.0%  3146456   0.3% alloc::boxed::box_new_uninit (inline)
+       0   0.0% 100.0%  2839568   0.2% ::set_dict (inline)
+       0   0.0% 100.0%  2069213   0.2% ::attempt::{closure#0} (inline)
+       0   0.0% 100.0%  2069213   0.2% ::execute_accounted::{closure#0}
+       0   0.0% 100.0%  2069213   0.2% ::run::{closure#0}
+       0   0.0% 100.0%  2069213   0.2% ::sql_execute::{closure#0} (inline)
+       0   0.0% 100.0%  1778521   0.1% arrow_select::filter::filter_array
+       0   0.0% 100.0%  1778521   0.1% arrow_select::filter::filter_byte_view::
+       0   0.0% 100.0%  1778521   0.1% arrow_select::filter::filter_native::
+       0   0.0% 100.0%  1588259   0.1% ::connect_to::{closure#0}::{closure#1}::{closure#0}
+       0   0.0% 100.0%  1588259   0.1% ::connection_for::{closure#0} (inline)
+       0   0.0% 100.0%  1588259   0.1% ::get_opts::{closure#0}
+       0   0.0% 100.0%  1588259   0.1% ::get_request::{closure#0}
+       0   0.0% 100.0%  1588259   0.1% ::get_result::{closure#0} (inline)
+       0   0.0% 100.0%  1588259   0.1% ::handshake::::{closure#0} (inline)
+       0   0.0% 100.0%  1588259   0.1% ::one_connection_for::{closure#0} (inline)
+       0   0.0% 100.0%  1588259   0.1% ::poll_unpin (inline)
+       0   0.0% 100.0%  1588259   0.1% ::send::{closure#0}
+       0   0.0% 100.0%  1588259   0.1% ::send_request::{closure#0}
+       0   0.0% 100.0%  1588259   0.1% ::try_send_request::{closure#0} (inline)
+       0   0.0% 100.0%  1588259   0.1% hyper::client::dispatch::channel::
+       0   0.0% 100.0%  1588259   0.1% ravel_object_store::s3::connector::observe_get::::{closure#0} (inline)
+       0   0.0% 100.0%  1588259   0.1% tokio::sync::mpsc::chan::channel:: (inline)
+       0   0.0% 100.0%  1588259   0.1% tokio::sync::mpsc::list::channel:: (inline)
+       0   0.0% 100.0%  1588259   0.1% tokio::sync::mpsc::unbounded::unbounded_channel:: (inline)
+       0   0.0% 100.0%  1493552   0.1% ::clone (inline)
+       0   0.0% 100.0%  1419784   0.1% ::update_batch
+       0   0.0% 100.0%  1185681   0.1% arrow_select::filter::filter
+       0   0.0% 100.0%  1129491   0.1% ::extend_desugared:: (inline)
+       0   0.0% 100.0%  1090846   0.1% ::map:: (inline)
+       0   0.0% 100.0%  1053705   0.1% ::consume_input_streams (inline)
+       0   0.0% 100.0%  1053705   0.1% ::execute::{closure#0}
+       0   0.0% 100.0%  1053705   0.1% ::with_capacity_and_hasher_in (inline)
+       0   0.0% 100.0%  1048704   0.1% ::build (inline)
+       0   0.0% 100.0%  1048704   0.1% ::dispatch
+       0   0.0% 100.0%  1048704   0.1% ::from (inline)
+       0   0.0% 100.0%  1048704   0.1% ::into (inline)
+       0   0.0% 100.0%  1048704   0.1% ::plan
+       0   0.0% 100.0%  1048704   0.1% ::prepare_filters (inline)
+       0   0.0% 100.0%  1048704   0.1% ::push:: (inline)
+       0   0.0% 100.0%  1048704   0.1% ::transition
+       0   0.0% 100.0%  1048704   0.1% ::try_new
+       0   0.0% 100.0%  1048704   0.1% ::visit_struct
+       0   0.0% 100.0%  1048704   0.1% ::with_supplied_schema (inline)
+       0   0.0% 100.0%  1048704   0.1% parquet::arrow::schema::complex::convert_schema (inline)
+       0   0.0% 100.0%  1048704   0.1% parquet::arrow::schema::parquet_to_arrow_field_levels_with_virtual
+       0   0.0% 100.0%  1019549   0.1% ::append
+       0   0.0% 100.0%  1019549   0.1% ::insert_batch
+       0   0.0% 100.0%   592840   0.0% ::filter_record_batch
+       0   0.0% 100.0%   592840   0.0% ::filter_record_batch::{closure#0} (inline)
+       0   0.0% 100.0%   592840   0.0% arrow_select::filter::filter_record_batch
+       0   0.0% 100.0%   574764   0.0% ::partition_iter
+       0   0.0% 100.0%   566534   0.0% ::build
+       0   0.0% 100.0%   566534   0.0% ::build::{closure#1} (inline)
+       0   0.0% 100.0%   566534   0.0% ::new_mask_from_selectors (inline)
+       0   0.0% 100.0%   566534   0.0% _rjem_mallocx
+       0   0.0% 100.0%   566534   0.0% parquet::arrow::arrow_reader::selection::boolean_mask_from_selectors (inline)
+       0   0.0% 100.0%   536651   0.0% ::call
+       0   0.0% 100.0%   536651   0.0% ::call_once_force:: (inline)
+       0   0.0% 100.0%   536651   0.0% ::call_once_force::::{closure#0}
+       0   0.0% 100.0%   536651   0.0% ::create_sibling_state
+       0   0.0% 100.0%   536651   0.0% ::from_config (inline)
+       0   0.0% 100.0%   536651   0.0% ::get_or_init:: (inline)
+       0   0.0% 100.0%   536651   0.0% ::get_or_init::::{closure#0} (inline)
+       0   0.0% 100.0%   536651   0.0% ::get_or_try_init:: (inline)
+       0   0.0% 100.0%   536651   0.0% ::initialize::
+       0   0.0% 100.0%   536651   0.0% ::initialize::::{closure#0} (inline)
+       0   0.0% 100.0%   524928   0.0% ::add_manifest
+       0   0.0% 100.0%   524928   0.0% ::find_or_find_insert_index:: (inline)
+       0   0.0% 100.0%   524928   0.0% ::insert (inline)
+       0   0.0% 100.0%   524928   0.0% ::plan_pinned_with::{closure#0}
+       0   0.0% 100.0%   524928   0.0% ravel_sql::parquet::session_tables
+       0   0.0% 100.0%   524800   0.0% ::evaluate
+       0   0.0% 100.0%   524800   0.0% arrow_ord::cmp::apply:: (inline)
+       0   0.0% 100.0%   524800   0.0% arrow_ord::cmp::apply_op::
+       0   0.0% 100.0%   524800   0.0% arrow_ord::cmp::collect_bool:: (inline)
+       0   0.0% 100.0%   524800   0.0% arrow_ord::cmp::compare_op
+       0   0.0% 100.0%   524800   0.0% arrow_ord::cmp::compare_op::{closure#6}
+       0   0.0% 100.0%   524800   0.0% arrow_ord::cmp::neq
+       0   0.0% 100.0%   524800   0.0% datafusion_physical_expr_common::datum::apply:: (inline)
+       0   0.0% 100.0%   524800   0.0% datafusion_physical_expr_common::datum::apply_cmp
+       0   0.0% 100.0%   524800   0.0% datafusion_physical_expr_common::datum::apply_cmp::{closure#0} (inline)
+       0   0.0% 100.0%   524736   0.0% ::boxed (inline)
+       0   0.0% 100.0%   524736   0.0% ::pin (inline)
+       0   0.0% 100.0%   524736   0.0% ::run_input
+       0   0.0% 100.0%   524736   0.0% ::spawn:: (inline)
+       0   0.0% 100.0%   524736   0.0% ::start_with_scratch
+       0   0.0% 100.0%   524736   0.0% datafusion_common_runtime::trace_utils::trace_future:: (inline)
+       0   0.0% 100.0%   524736   0.0% datafusion_physical_plan::execution_plan::execute_stream
+       0   0.0% 100.0%   524352   0.0% ::counter:: (inline)
+       0   0.0% 100.0%   524352   0.0% ::global_counter:: (inline)
+       0   0.0% 100.0%   524352   0.0% ::spilled_bytes
+       0   0.0% 100.0%   524312   0.0% ::new::
+       0   0.0% 100.0%   524312   0.0% ::new::{closure#1} (inline)
+       0   0.0% 100.0%      -32  -0.0% ::plan_file
+       0   0.0% 100.0%      -32  -0.0% ::prepare_open_file (inline)
+       0   0.0% 100.0%      -32  -0.0% ::try_new (inline)
+       0   0.0% 100.0%  -524384  -0.0% ::with_label (inline)
+       0   0.0% 100.0%  -524384  -0.0% ::with_new_label:: (inline)
+       0   0.0% 100.0% -1802516  -0.1% ::decode:: (inline)
+       0   0.0% 100.0% -1802516  -0.1% ::read_mem
+       0   0.0% 100.0% -3329153  -0.3% ::maybe_notify
+       0   0.0% 100.0% -3329153  -0.3% ::try_keep_alive (inline)
+       0   0.0% 100.0% -5131670  -0.4% ::poll_read (inline)
+       0   0.0% 100.0% -5131670  -0.4% ::poll_read_body
+       0   0.0% 100.0% -5131670  -0.4% ::poll_read_from_io
+       0   0.0% 100.0% -5131670  -0.4% ::reserve_inner
+       0   0.0% 100.0% -5131670  -0.4% tokio::runtime::task::raw::poll::@6119090
