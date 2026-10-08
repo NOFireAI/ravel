@@ -112,7 +112,7 @@ flowchart TD
     F --> B
     T -->|"yes, ListPage full"| N["next = PageToken(raw last key received,<br/>addressable or not)"]
     T -->|no| Z["next = None"]
-    G["get / get_pinned / head / put / put_multipart / delete (K)"] --> H{"is_addressable_key(K)?"}
+    G["get / get_pinned / pin_of / head / put / put_multipart / delete (K)"] --> H{"is_addressable_key(K)?"}
     H -->|no| X["StoreError::UnaddressableKey, no request sent"]
     H -->|yes| Y["object_store request for Path::from(K) == K"]
 ```
@@ -140,7 +140,8 @@ they did before.
   is at the key level: `canonical_query` still URI-escapes each value into
   the query string, and S3 decodes it back to the same key. The `PageToken`
   handed back to a caller between calls stays the raw last key of the last
-  response, which is what the contract already calls it ("opaque"), so
+  response, which `PageToken`'s own rustdoc already allows ("Opaque listing
+  continuation token", `crates/ravel-object-store/src/lib.rs:357`), so
   resuming a listing in a later call needs no state S3 holds;
 - signed with the SigV4 pieces in `crates/ravel-object-store/src/s3/bucket_config.rs`
   (`canonical_query`, `canonical_request`, `string_to_sign`, `signature`,
@@ -151,16 +152,33 @@ they did before.
   `ListVersionsResult`). The body cap is its own, `LIST_MAX_BODY_BYTES` of
   8 MiB, not the module's 1 MiB `MAX_BODY_BYTES`: a 1000-key response of
   1024-byte keys, URL-encoded to up to three times that, with its
-  per-object metadata, needs about 3.5 MB. When the response echoes `<EncodingType>url</EncodingType>`, `Key`,
-  `Prefix`, `StartAfter` and `CommonPrefixes/Prefix` are URL-decoded (`%XX`,
-  and `+` as a space). A key that does not decode to UTF-8 is unaddressable
-  (decision 2), with its key shown as the still-encoded text;
+  per-object metadata, needs about 3.5 MB. When the response echoes
+  `<EncodingType>url</EncodingType>`, `Key`, `Prefix`, `StartAfter` and
+  `CommonPrefixes/Prefix` are URL-decoded with `+` read as a space and
+  `%XX` as its byte. That rule rests on a stated backend assumption: under
+  `encoding-type=url` the backend encodes a space as `+` and a literal `+`
+  as `%2B`, which is AWS's documented form-encoding. A backend that left a
+  literal `+` unescaped would have its `a+b` read back as `a b`, an
+  addressable key that is wrong and silent. So the assumption is verified,
+  not assumed, per backend: Task 1's conformance property puts a key with a
+  literal `+` and a key with a space through a real listing and requires
+  both back verbatim. It runs on the scripted S3 server and on RustFS. A
+  backend that fails it is not supported for listing until it passes. A
+  key that does not decode to UTF-8 is unaddressable (decision 2), with
+  its key shown as the still-encoded text;
 - sent through the `HttpClient` that `S3HttpConnector` produces from the same
-  `ClientOptions` the data plane uses, inside
-  `connector::scope(StoreOp::List, ..)`. Attempts, `Date` observation,
-  connect and request timeouts and the List metrics block are therefore the
-  same as today, and nothing is recorded in the `ravel_store_control_plane_*`
-  block that ADR-1727's probes use.
+  `ClientOptions` the data plane uses. Each call keeps the connector scope it
+  uses today: `connector::scope(StoreOp::List, ..)` for `list` and
+  `list_after`, and `connector::scope(StoreOp::ListDelimited, ..)` for
+  `list_delimited` (`s3.rs:2801`), so each HTTP attempt is still billed to
+  the same per-operation block (`list` or `list_delimited`). Attempts,
+  `Date` observation, connect and request timeouts and both metrics blocks
+  are therefore the same as today, and nothing is recorded in the
+  `ravel_store_control_plane_*` block that ADR-1727's probes use. The
+  module's `parse_document` and `request_target` are private to
+  `bucket_config.rs` and return `ControlPlaneError`; Task 1 widens their
+  visibility to the crate and maps that error into the `StoreError` table
+  below.
 
 **Paging.** Within one call the adapter follows S3's own
 `NextContinuationToken`: an opaque token S3 issued, sent back unchanged, so
@@ -188,9 +206,19 @@ raw last key. In detail:
   its own continuation. `discover_tenants` (`list_delimited("t/")`, whose
   responses carry only common prefixes) therefore lists past 1000 tenants
   as it does today.
-- A truncated response with no `NextContinuationToken`, or one whose token
-  equals the token just sent, is `StoreError::Permanent` naming the prefix,
-  since following it would spin. This is the only shape refused.
+- The in-call loop has the same two non-termination guards as
+  `drain_pages` (`crates/ravel-object-store/src/lib.rs:852-856`), now that
+  the loop is Ravel's rather than `object_store`'s:
+  - a truncated response whose `NextContinuationToken` equals the token
+    just sent is the existing `StoreError::ListRepeatedToken { prefix }`,
+    which `ravel-maintain` and `ravel-catalog` already match by name;
+  - a call that has followed `MAX_LIST_PAGES` responses and is still
+    truncated is the existing `StoreError::ListPageCeiling`, so a backend
+    that keeps issuing fresh tokens without ending cannot loop one
+    `list_delimited` call forever.
+- A truncated response with no `NextContinuationToken` at all is
+  `StoreError::Permanent` naming the prefix, since there is nothing to
+  follow. These three are the only shapes refused.
 
 **Prefix.** The prefix is sent raw. This removes the known divergence in
 the `s3.rs` module doc, where `object_store` appended `/` to a non-empty
@@ -255,7 +283,9 @@ use to learn about it:
   `common_prefixes`. A common prefix has no size or modification time, so it
   gets its own field rather than an `UnaddressableKey`. Each one counts
   toward the same metric and warning as a key. `discover_tenants` therefore
-  skips and reports a forged `t/<hash>\x01/` prefix rather than failing the
+  skips a forged `t/<hash>\x01/` prefix (the adapter's metric and warning
+  report it; `discover_tenants` itself reads only `common_prefixes`)
+  rather than failing the
   whole maintenance run with `InvalidTenantPrefix`.
 - `pub struct UnaddressableKey { pub key: String, pub addresses: String,
   pub size: u64, pub last_modified_unix_ms: i64 }`, where `addresses` is
@@ -294,7 +324,7 @@ keys around an unaddressable one.
 
 ### 3. Operations refuse a key they cannot address
 
-`get`, `get_pinned`, `head`, `put`, `put_multipart` and `delete` check
+`get`, `get_pinned`, `pin_of`, `head`, `put`, `put_multipart` and `delete` check
 `is_addressable_key(key)` before building any request and return the new
 variant
 
@@ -411,9 +441,14 @@ that pins the trailing empty request changes with it.
 `.await?;` call site. `StoreError` is exhaustive, so each `match` on it that
 names every variant gains one arm.
 
-**Conformance** (`crates/ravel-object-store/src/conformance.rs`). Two new
+**Conformance** (`crates/ravel-object-store/src/conformance.rs`). Three new
 properties:
 
+- `ListedKeysRoundTripPlusAndSpace`, on every subject: keys containing a
+  literal `+` and a space, both addressable and written through the
+  ordinary `put`, come back from a listing verbatim. This is the
+  per-backend check of the `encoding-type=url` decoding assumption in
+  decision 1, and the RustFS run in Task 1 must pass it.
 - `OperationsRefuseUnaddressableKeys`, on every subject: `get`, `head`,
   `put` and `delete` of such a key return `UnaddressableKey` and issue zero
   requests (asserted on the attempt counter).
@@ -457,9 +492,16 @@ axum server already answers ListObjectsV2 (`Op::List`), extended to script a
 - a common prefix with `\x01`: it lands in `unaddressable_prefixes`, not in
   `common_prefixes`, and counts toward the metric;
 - a truncated response whose `NextContinuationToken` repeats the token just
-  sent: `StoreError::Permanent` naming the prefix;
-- a URL-encoded response (`encoding-type=url`) with `+` and `%0A` decodes,
-  and one without `EncodingType` is read literally;
+  sent: `StoreError::ListRepeatedToken` naming the prefix;
+- responses that stay truncated with a fresh token each time:
+  `StoreError::ListPageCeiling` after the ceiling, tested with a small
+  ceiling;
+- a truncated response with no `NextContinuationToken`:
+  `StoreError::Permanent` naming the prefix;
+- a URL-encoded response (`encoding-type=url`) carrying `a%2Bb`, `a+b` and
+  `%0A` decodes to `a+b`, `a b` and a newline, and one without
+  `EncodingType` is read literally. This pins the decode rule; whether a
+  given backend encodes that way is the conformance property's job;
 - 403, 301, 400, 429-then-200 and 503-until-exhausted map per the table in
   decision 1, with the attempt count the retry rules imply.
 
@@ -489,16 +531,23 @@ not, the gap is recorded in the contract doc beside the other RustFS notes.
 ## Implementation tasks
 
 **Task 1: raw listing and the addressable-key rules in `ravel-object-store`**
-(crates: `ravel-object-store`, `ravel-server` for the metric export).
+(crates: `ravel-object-store`, `ravel-server` for the metric export, and,
+as mechanical churn only, `ravel-parquet`, `ravel-maintain`,
+`ravel-catalog` and `ravel-query`: the new `ListPage` field touches the 23
+`ListPage` literals across those crates, and the new `StoreError` variant
+breaks the deliberately exhaustive `clone_store_error` matches in
+`crates/ravel-catalog/src/catalog.rs` and `crates/ravel-query/src/fetcher.rs`).
 `is_addressable_key`, `UnaddressableKey`, `Unaddressable`, `Listing`,
 `list_all_reporting`, the `drain_pages` return value, `StoreError::UnaddressableKey`,
 the metric, the fallible `path_of`, the raw ListObjectsV2 client with its
-retry loop, `MemoryStore`'s rules and `insert_foreign`, the two conformance
-properties, and the contract and `s3.rs` doc changes. Acceptance:
+retry loop, `MemoryStore`'s rules and `insert_foreign`, the three
+conformance properties, and the contract and `s3.rs` doc changes.
+Acceptance:
 
 - every `s3_http_faults.rs` case listed under Consequences passes;
-- both conformance properties pass on `MemoryStore` and on the scripted S3
-  subject;
+- all three conformance properties pass on `MemoryStore` and on the
+  scripted S3 subject, and `ListedKeysRoundTripPlusAndSpace` passes on a
+  RustFS run;
 - a proptest over arbitrary strings asserts `is_addressable_key(k) ==
   (Path::from(k).as_ref() == k)` and that `MemoryStore` refuses exactly
   those keys;
