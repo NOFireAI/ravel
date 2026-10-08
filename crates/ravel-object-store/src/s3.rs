@@ -1445,7 +1445,7 @@ pub(crate) fn prefix_of(prefix: &str) -> Option<Path> {
 /// `p/a#b` starts at `p/a%23b` and skips `p/a$`, and resuming after `p/é`
 /// starts at `p/%C3%A9` and re-delivers keys this page already returned. An
 /// unaddressable tail after the token is listed and reported again on the
-/// next page. A full page with no addressable key keeps its raw last key as
+/// next page, and a drain counts a tail of two or more keys twice. A full page with no addressable key keeps its raw last key as
 /// the token, which still re-encodes until the raw listing of ADR-2637
 /// decision 1 replaces this one.
 pub(crate) fn assemble_page(prefix: &str, listed: Vec<ObjectMeta>, page_size: usize) -> ListPage {
@@ -2977,6 +2977,36 @@ mod tests {
         assert_eq!(page.next, Some(PageToken("p/é".to_string())));
         assert!(page.objects.is_empty());
         assert_eq!(unaddressable_keys(&page), ["p/a#b", "p/é"]);
+    }
+
+    /// The tail after the token is listed again, and the drain drops only a
+    /// repeat of the key it recorded last, so a tail of two keys counts four.
+    #[tokio::test]
+    async fn a_drain_counts_a_relisted_unaddressable_tail_twice() {
+        let stored = ["p/a", "p/b#1", "p/b#2"];
+        let mut objects = Vec::new();
+        let unaddressable = crate::drain_pages(
+            "p/",
+            None,
+            crate::MAX_LIST_PAGES,
+            |_, token: Option<PageToken>| async move {
+                let offset = token.map(|PageToken(after)| Path::from(after).to_string());
+                let rest: Vec<&str> = stored
+                    .into_iter()
+                    .filter(|key| offset.as_deref().is_none_or(|after| *key > after))
+                    .take(3)
+                    .collect();
+                Ok::<_, StoreError>(assemble_page("p/", listed(&rest), 3))
+            },
+            |meta| {
+                objects.push(meta.key);
+                Ok(crate::DrainStep::Continue)
+            },
+        )
+        .await
+        .expect("drain");
+        assert_eq!(objects, ["p/a"]);
+        assert_eq!(unaddressable.count, 4);
     }
 
     #[test]

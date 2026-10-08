@@ -299,8 +299,9 @@ trait honors cancellation by drop, so the query deadline (usually well under
   key. `S3Store` and `ExternalStore` resume through `object_store`'s
   `Path::from`, which re-encodes an unaddressable key, so their page token
   is the page's last addressable key: an unaddressable tail after it is
-  listed and reported again on the next page, and a drain can count such a
-  key twice. A full page holding only unaddressable keys has no safe
+  listed and reported again on the next page. `drain_pages` drops only a
+  repeat of the key it recorded last, so a tail of two or more such keys is
+  counted twice. A full page holding only unaddressable keys has no safe
   offset. Its token is its raw last key, which still re-encodes, so the
   next page can skip keys (`p/a#b` resumes after `p/a%23b`, past `p/a$`)
   or re-deliver them and fail `ListOrderViolation` (`p/é` resumes after
