@@ -864,9 +864,9 @@ mod tests {
         "logs/v/00000000000000000001.pqm",
     ];
 
-    /// Stray keys the S3 adapter lists but sends a delete of to a different
-    /// key: `Path::from` percent-encodes a tilde, a percent sign and a
-    /// non-ASCII character.
+    /// Stray keys no request reaches, because `Path::from` percent-encodes a
+    /// tilde, a percent sign and a non-ASCII character. A listing reports
+    /// them unaddressable, never as objects.
     const UNDELETABLE: [&str; 3] = [
         "Hits~/v/00000000000000000001.pqm",
         "a%2Fb/v/00000000000000000001.pqm",
@@ -923,21 +923,35 @@ mod tests {
                 stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
             ])
         {
-            memory
-                .put(&key, Bytes::from_static(b"x"), PutOptions::default())
-                .await
-                .expect("put");
+            memory.insert_foreign(&key, Bytes::from_static(b"x"));
         }
         store
     }
 
+    /// The keys under `prefix` that a listing of `store` reports
+    /// unaddressable.
+    async fn unaddressable_under(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
+        ravel_object_store::list_all_reporting(store, prefix)
+            .await
+            .expect("list")
+            .unaddressable
+            .sample
+            .into_iter()
+            .map(|skipped| skipped.key)
+            .collect()
+    }
+
+    /// The [`UNDELETABLE`] keys are reported unaddressable and never listed.
     #[tokio::test]
-    async fn list_stray_lists_exactly_the_keys_under_no_valid_table() {
+    async fn list_stray_lists_exactly_the_addressable_keys_under_no_valid_table() {
         let store = stray_store().await;
         let got = list_stray(&store, &TENANT_A).await.expect("list");
+        assert_eq!(
+            unaddressable_under(&store, &tenant_manifest_prefix(&TENANT_A)).await,
+            sorted(&UNDELETABLE)
+        );
         let mut expected: Vec<StrayEntry> = [
             (&STRAYS[..], StrayClass::Deletable),
-            (&UNDELETABLE[..], StrayClass::Undeletable),
             (&RESERVED[..], StrayClass::ReservedName),
         ]
         .into_iter()
@@ -1008,9 +1022,6 @@ mod tests {
             .expect("delete");
         assert_eq!(deleted, sorted(&STRAYS));
         assert_eq!(store.inner.deletes(), sorted(&STRAYS));
-        let mut left = sorted(&UNDELETABLE);
-        left.extend(sorted(&RESERVED));
-        left.sort();
         assert_eq!(
             list_stray(&store, &TENANT_A)
                 .await
@@ -1018,24 +1029,25 @@ mod tests {
                 .into_iter()
                 .map(|e| e.key)
                 .collect::<Vec<_>>(),
-            left
+            sorted(&RESERVED)
         );
         // With reserved names included, those go too.
         let deleted = delete_stray(&store, &TENANT_A, &sorted(&RESERVED), true)
             .await
             .expect("delete");
         assert_eq!(deleted, sorted(&RESERVED));
-        assert_eq!(
+        assert!(
             list_stray(&store, &TENANT_A)
                 .await
                 .expect("list")
-                .into_iter()
-                .map(|e| e.key)
-                .collect::<Vec<_>>(),
+                .is_empty()
+        );
+        // Every valid table's keys, the other tenant's stray key, the
+        // foreign key and the unaddressable keys are still there.
+        assert_eq!(
+            unaddressable_under(&store, &tenant_manifest_prefix(&TENANT_A)).await,
             sorted(&UNDELETABLE)
         );
-        // Every valid table's keys, the other tenant's stray key and the
-        // foreign key are still there.
         assert_eq!(
             keys_of(list(&store, &TENANT_A, "hits").await.expect("list")),
             hits_before
@@ -1091,7 +1103,11 @@ mod tests {
         );
         assert!(store.inner.deletes().is_empty());
         assert_eq!(deletes_sent(&store), 0);
-        assert_eq!(list_stray(&store, &TENANT_A).await.expect("list").len(), 8);
+        assert_eq!(list_stray(&store, &TENANT_A).await.expect("list").len(), 5);
+        assert_eq!(
+            unaddressable_under(&store, &tenant_manifest_prefix(&TENANT_A)).await,
+            sorted(&UNDELETABLE)
+        );
     }
 
     /// `Path::from` drops the empty segment of `hits//v/<3>.pqm`, so the S3
@@ -1100,10 +1116,7 @@ mod tests {
     async fn delete_stray_refuses_a_key_whose_delete_reaches_a_valid_version() {
         let store = stray_store().await;
         let doubled = stray_key(&TENANT_A, "hits//v/00000000000000000003.pqm");
-        memory(&store)
-            .put(&doubled, Bytes::from_static(b"x"), PutOptions::default())
-            .await
-            .expect("put");
+        memory(&store).insert_foreign(&doubled, Bytes::from_static(b"x"));
         assert!(matches!(
             parse_listed_manifest_key(&doubled),
             Ok(ListedManifestKey::InvalidTable { .. })
@@ -1117,26 +1130,23 @@ mod tests {
         );
         assert_eq!(deletes_sent(&store), 0);
         memory(&store).head(&mkey(3)).await.expect("version 3 kept");
-        memory(&store).head(&doubled).await.expect("still there");
+        assert_eq!(unaddressable_under(memory(&store), &doubled).await, [doubled]);
     }
 
     /// A version slot of 20 tildes, which `Path::from` percent-encodes.
     const TILDES: &str = "~~~~~~~~~~~~~~~~~~~~";
 
-    /// A key under `hits`'s own `v/` prefix that the S3 adapter lists but
-    /// sends a delete of to a different key is flagged and marked
-    /// undeletable. `delete_flagged` never sends it a delete, reports it, and
-    /// still deletes every other flagged key, each at its own key.
+    /// A key under `hits`'s own `v/` prefix that `Path::from` encodes is
+    /// reported unaddressable, not listed. Named to `delete_flagged` beside
+    /// the listed flagged keys, it is never sent a delete and is reported,
+    /// and every other flagged key is still deleted, each at its own key.
     #[tokio::test]
-    async fn delete_flagged_skips_a_flagged_key_the_s3_adapter_encodes_and_deletes_the_rest() {
+    async fn delete_flagged_skips_an_unaddressable_key_and_deletes_the_rest() {
         let store = S3KeyStore {
             inner: segment_aligned_forged_store().await,
         };
         let tilde = invalid_key(TILDES);
-        memory(&store)
-            .put(&tilde, Bytes::from_static(b"x"), PutOptions::default())
-            .await
-            .expect("put");
+        memory(&store).insert_foreign(&tilde, Bytes::from_static(b"x"));
         assert_ne!(store_path(&tilde), tilde);
         let listed = list(&store, &TENANT_A, "hits").await.expect("list");
         let marked: Vec<(&str, bool)> = listed
@@ -1153,17 +1163,20 @@ mod tests {
                 (invalid_key(OVERFLOW).as_str(), false),
                 (invalid_key(NON_DIGIT).as_str(), false),
                 (invalid_key(NESTED).as_str(), false),
-                (tilde.as_str(), true),
             ]
         );
-        assert_eq!(listed.iter().filter(|e| e.undeletable).count(), 1);
-        let flagged: Vec<String> = listed
+        assert_eq!(
+            unaddressable_under(&store, &manifest_prefix(&TENANT_A, "hits").expect("prefix"))
+                .await,
+            [tilde.clone()]
+        );
+        let rest: Vec<String> = listed
             .into_iter()
             .filter(|e| e.flagged)
             .map(|e| e.key)
             .collect();
-        let rest: Vec<String> = flagged.iter().filter(|k| **k != tilde).cloned().collect();
-        assert_eq!(rest.len(), 6);
+        let mut flagged = rest.clone();
+        flagged.push(tilde.clone());
         let got = delete_flagged(&store, &TENANT_A, "hits", &flagged).await;
         assert_eq!(
             got.expect("skips rather than refusing"),
@@ -1174,14 +1187,12 @@ mod tests {
         );
         assert_eq!(store.inner.deletes(), rest);
         assert_eq!(deletes_sent(&store), 6);
-        memory(&store).head(&tilde).await.expect("still there");
-        assert_eq!(
+        assert!(
             keys_of(list(&store, &TENANT_A, "hits").await.expect("list"))
-                .into_iter()
-                .filter(|k| flagged.contains(k))
-                .collect::<Vec<_>>(),
-            [tilde]
+                .iter()
+                .all(|k| !flagged.contains(k))
         );
+        assert_eq!(unaddressable_under(memory(&store), &tilde).await, [tilde]);
     }
 
     /// `Path::from` drops the empty segment of `hits/v//<3>.pqm`, a key that
@@ -1193,10 +1204,7 @@ mod tests {
             inner: segment_aligned_forged_store().await,
         };
         let doubled = invalid_key("/00000000000000000003");
-        memory(&store)
-            .put(&doubled, Bytes::from_static(b"x"), PutOptions::default())
-            .await
-            .expect("put");
+        memory(&store).insert_foreign(&doubled, Bytes::from_static(b"x"));
         assert!(classify(&TENANT_A, "hits", &doubled).1);
         assert_eq!(store_path(&doubled), mkey(3));
         let got = delete_flagged(&store, &TENANT_A, "hits", std::slice::from_ref(&doubled)).await;
@@ -1210,24 +1218,21 @@ mod tests {
         assert_eq!(store.inner.deletes(), Vec::<String>::new());
         assert_eq!(deletes_sent(&store), 0);
         memory(&store).head(&mkey(3)).await.expect("version 3 kept");
-        memory(&store).head(&doubled).await.expect("still there");
-        // A store that lists any key, unlike the S3 adapter, marks it too.
+        // `MemoryStore` lists every key, and reports this one unaddressable
+        // rather than as an entry.
         let listed = list(memory(&store), &TENANT_A, "hits").await.expect("list");
-        let entry = listed.iter().find(|e| e.key == doubled).expect("listed");
-        assert!(entry.flagged && entry.undeletable, "{entry:?}");
+        assert!(listed.iter().all(|e| e.key != doubled), "{listed:?}");
+        assert_eq!(unaddressable_under(memory(&store), &doubled).await, [doubled]);
     }
 
     /// On S3 a stray key `Path::parse` refuses fails the listing that meets
-    /// it; only a store that lists any key, such as `MemoryStore`, lists it.
+    /// it; `MemoryStore` reports it unaddressable.
     #[tokio::test]
     async fn a_key_the_s3_adapter_cannot_list_fails_list_stray_with_the_store_error() {
         for rest in UNLISTABLE {
             let store = stray_store().await;
             let key = stray_key(&TENANT_A, rest);
-            memory(&store)
-                .put(&key, Bytes::from_static(b"x"), PutOptions::default())
-                .await
-                .expect("put");
+            memory(&store).insert_foreign(&key, Bytes::from_static(b"x"));
             let got = list_stray(&store, &TENANT_A).await;
             assert!(
                 matches!(&got, Err(RepairError::Store {
@@ -1237,8 +1242,12 @@ mod tests {
                     && msg.starts_with("invalid path")),
                 "{rest:?}: {got:?}"
             );
-            let listed = list_stray(memory(&store), &TENANT_A).await.expect("list");
-            assert!(listed.iter().any(|e| e.key == key), "{rest:?}");
+            assert!(
+                unaddressable_under(memory(&store), &tenant_manifest_prefix(&TENANT_A))
+                    .await
+                    .contains(&key),
+                "{rest:?}"
+            );
         }
     }
 

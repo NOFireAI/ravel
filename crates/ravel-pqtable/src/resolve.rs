@@ -686,17 +686,15 @@ pub(crate) mod tests {
         "abcdefghijklmnopqrst",
     ];
 
-    /// Put `t/<tenant>/pq/t/hits/v/<slot>.pqm` with a body that is not a
-    /// manifest, so any attempt to read it as one fails.
+    /// Write `t/<tenant>/pq/t/hits/v/<slot>.pqm` with a body that is not a
+    /// manifest, so any attempt to read it as one fails. The key is written
+    /// raw, as any S3 client could, even when no store operation could.
     pub(crate) async fn put_invalid(store: &MemoryStore, tenant: &TenantHash, slot: &str) {
         let key = format!(
             "{}{slot}.pqm",
             manifest_prefix(tenant, "hits").expect("prefix")
         );
-        store
-            .put(&key, Bytes::from_static(b"forged"), PutOptions::default())
-            .await
-            .expect("put");
+        store.insert_foreign(&key, Bytes::from_static(b"forged"));
     }
 
     /// How many times the above-bound warning names `slot` in `logs`.
@@ -823,14 +821,11 @@ pub(crate) mod tests {
         matches!(err, StoreError::Permanent(msg) if msg.starts_with("invalid path"))
     }
 
-    /// Put `t/<tenant>/pq/t/<rest>` with a body that is not a manifest, and
-    /// return the key.
+    /// Write `t/<tenant>/pq/t/<rest>` raw with a body that is not a
+    /// manifest, and return the key.
     pub(crate) async fn put_stray(store: &MemoryStore, tenant: &TenantHash, rest: &str) -> String {
         let key = format!("{}{rest}", tenant_manifest_prefix(tenant));
-        store
-            .put(&key, Bytes::from_static(b"forged"), PutOptions::default())
-            .await
-            .expect("put");
+        store.insert_foreign(&key, Bytes::from_static(b"forged"));
         key
     }
 
@@ -905,10 +900,12 @@ pub(crate) mod tests {
         assert!(text.contains("has 2 manifest-shaped key(s)"), "{text}");
     }
 
-    /// A stray key S3 lists can still hold characters a terminal would act
-    /// on or misread; the warning prints it escaped.
+    /// A stray key S3 lists can hold characters a terminal would act on or
+    /// misread. `Path::from` encodes each of them, so the listing reports the
+    /// key unaddressable rather than under an invalid table, and its warning
+    /// prints it escaped.
     #[tokio::test]
-    async fn the_invalid_table_warning_prints_the_key_escaped() {
+    async fn an_unaddressable_stray_key_is_warned_about_escaped_and_not_as_an_invalid_table() {
         const TENANT: TenantHash = TenantHash([0x66; 16]);
         let rest = "Hits/v/\"\\xxxxxxxxxxxxxxxxxx.pqm";
         let (logs, _guard) = capture_logs();
@@ -921,14 +918,26 @@ pub(crate) mod tests {
             tables(&store, &TENANT).await.expect("tables"),
             BTreeMap::from([("hits".to_string(), vec![1])])
         );
+        let listing = tenant_listing(&store, &TENANT).await.expect("listing");
+        assert!(listing.invalid_table_keys.is_empty());
+        assert_eq!(invalid_table_listings(&TENANT), 0);
         let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
         assert!(!text.contains("v/\""), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("WARN")
+                    && l.contains("skipped key")
+                    && l.contains(&format!("{stray:?}")))
+                .count(),
+            1,
+            "{text}"
+        );
         assert!(text.contains("v/\\\"\\\\x"), "{text}");
-        assert_eq!(stray_warnings_naming(&logs, &stray), 1, "{text}");
+        assert_eq!(stray_warnings_naming(&logs, &stray), 0, "{text}");
     }
 
     /// On S3 a stray key `Path::parse` refuses fails the tenant-wide listing
-    /// with the store error; it is skipped only by a store that lists it.
+    /// with the store error; `MemoryStore` reports it unaddressable.
     #[tokio::test]
     async fn a_stray_key_the_s3_adapter_cannot_list_fails_the_tenant_listing() {
         for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
@@ -961,13 +970,27 @@ pub(crate) mod tests {
             let listing = tenant_listing(&store.inner, &tenant)
                 .await
                 .expect("listing");
-            assert_eq!(listing.invalid_table_keys, vec![stray], "{rest:?}");
+            assert!(listing.invalid_table_keys.is_empty(), "{rest:?}");
+            let reported = ravel_object_store::list_all_reporting(
+                &store.inner,
+                &tenant_manifest_prefix(&tenant),
+            )
+            .await
+            .expect("list")
+            .unaddressable
+            .sample;
+            assert_eq!(
+                reported.iter().map(|k| &k.key).collect::<Vec<_>>(),
+                [&stray],
+                "{rest:?}"
+            );
         }
     }
 
     /// On S3 a key under the table's own `v/` prefix whose slot names no
     /// version and that `Path::parse` refuses fails every listing that meets
-    /// it, the table's own included; only a store that lists it skips it.
+    /// it, the table's own included; `MemoryStore` reports it unaddressable
+    /// and skips it.
     #[tokio::test]
     async fn a_key_naming_no_version_the_s3_adapter_cannot_list_fails_every_listing() {
         for (i, slot) in [

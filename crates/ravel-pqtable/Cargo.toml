@@ -23,6 +23,8 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 proptest = { workspace = true }
+# `MemoryStore::insert_foreign`, to seed keys no store operation can write.
+ravel-object-store = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
