@@ -1325,8 +1325,9 @@ into S3-compatible storage, the peak loader RSS was 7.03 GB under a
 6,500,000,000-byte budget at `--pipeline-depth 32`, and 1.95 GB under a
 1,200,000,000-byte budget at `--pipeline-depth 16` on a 4 GB host, where
 the peak charge reached 1,198,284,910 bytes and the decoder waited 187
-times. At the same budget and depth, a 1,650,000,000 target peaked at
-6.42 GB, so size a host from the run whose target you use. The recipe
+times. Under the 6,500,000,000-byte budget at depth 32, a 1,650,000,000
+target peaked at 6.42 GB, so size a host from the run whose target you
+use. The recipe
 section has the other runs.
 
 A metrics or spans load ignores `--load-memory-bytes` and warns when it is
