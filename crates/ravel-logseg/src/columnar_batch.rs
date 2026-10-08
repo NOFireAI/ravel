@@ -1599,10 +1599,7 @@ mod tests {
             distinct: vec![b"v".to_vec()],
             ids: vec![1],
         })];
-        assert_malformed(
-            batch.validate(),
-            "id[0] is 1 but distinct has 1 entries",
-        );
+        assert_malformed(batch.validate(), "id[0] is 1 but distinct has 1 entries");
     }
 
     #[test]
@@ -2071,7 +2068,9 @@ mod tests {
     #[test]
     fn fewer_dictionaries_than_columns_is_rejected() {
         let mut batch = one_cell_batch(FieldType::Str, AttrValue::Str("v".into()));
-        batch.dyn_columns.push(batch.dyn_columns[0].clone());
+        let mut second = batch.dyn_columns[0].clone();
+        second.name = "k2".into();
+        batch.dyn_columns.push(second);
         batch.dyn_col_dicts = vec![None];
         assert_malformed(
             batch.validate(),
