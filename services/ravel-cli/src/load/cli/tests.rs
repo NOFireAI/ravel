@@ -310,3 +310,83 @@ fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
         "no shard was written twice, so nothing could have accumulated"
     );
 }
+
+/// A derived budget below one batch is reported even when the load then
+/// fails. The loader admits the batches one at a time and records the
+/// warning on the report, which a failed load drops; the entry point prints
+/// it beside the error from the copy the memory options kept.
+#[tokio::test]
+async fn a_failed_load_still_prints_the_one_batch_warning() {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    let (dir, pq) = write_parquet(&batch(vec![
+        ("ts", i64_col(vec![NOW_NS; 4])),
+        ("idx", i64_col((0..4).collect())),
+    ]));
+    let mapping_path = dir.path().join("mapping.toml");
+    std::fs::write(
+        &mapping_path,
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[attribute]]\nkey = \"idx\"\ncolumn = \"idx\"\ntype = \"i64\"\n",
+    )
+    .expect("write mapping");
+
+    // The second batch's data-object PUT fails, after the first batch has
+    // already been admitted alone and the warning recorded.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+        )
+        .with_key_contains("/l0/0000/")
+        .with_occurrence(Occurrence::Nth(2)),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+    let mut sink: Vec<u8> = Vec::new();
+    run_memory_warning_to(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        1,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        DEFAULT_TARGET_BYTES,
+        None,
+        RlogZstdLevel::DEFAULT,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(1024),
+        },
+        NOW_NS,
+        &mut sink,
+    )
+    .await
+    .expect_err("the second batch's PUT fails permanently, so the load fails");
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the scripted PUT fault fired"
+    );
+
+    let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+    assert_eq!(
+        emitted
+            .matches("more than the loader's derived memory budget of 0 bytes")
+            .count(),
+        1,
+        "the one-batch warning is printed exactly once on the failure path: {emitted}"
+    );
+    assert!(
+        emitted.contains("host memory 1024 bytes"),
+        "naming the budget's source: {emitted}"
+    );
+}

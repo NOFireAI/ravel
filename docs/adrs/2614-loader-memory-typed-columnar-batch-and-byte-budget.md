@@ -229,6 +229,9 @@ depends on #2615 (the read cache serves nothing on these runs, q20 reads the
 corpus twice, q33 exceeds the per-query limit), and on spill needing
 `--cache-dir`, which the entry sets.
 
+The measured results and a verdict per row are in the acceptance amendment
+below.
+
 ## Rejected alternatives
 
 - **Tune the entry around today's loader** (tiered `--batch-rows` by machine
@@ -391,7 +394,10 @@ that setting and the stored objects came out far smaller, for two reasons:
   RLOG. On ClickBench `hits.parquet` at `--batch-rows 50000 --target-bytes
   25000000 --shards 4 --read-cursors 16 --pipeline-depth 4`, one run of
   2,651 objects stored a median of 1.67 MB (p10 1.12 MB, p90 2.41 MB,
-  largest 3.46 MB), about 15 times below the target.
+  largest 3.46 MB), about 15 times below the target (corrected in the
+  acceptance amendment below: that run's objects closed before the target,
+  under the pipeline-depth cap and the 2 s age trigger, and the
+  estimate-to-stored ratio on this corpus is about 65 times).
 - Each Strict write waits for the flush of its own batch, and the loader
   keeps at most `--pipeline-depth` writes in flight, so one object merges
   at most `--pipeline-depth` batches' slices however large the target. The
@@ -404,7 +410,9 @@ Figures from docs/internal/loader-memory-2613.md, "Wave 3 (#2626)".
 The recipe for large stored objects from small batches, and the
 ClickBench entry's sizing of `--target-bytes`, are not settled by wave 3.
 The wave 4 measurement (#2627) settles them; until then the
-`--target-bytes` help and docs/guides/ingest.md say the recipe is pending.
+`--target-bytes` help and docs/guides/ingest.md say the recipe is pending
+(settled in the acceptance amendment below, which the help and the guide
+now carry).
 
 `--batch-rows` is not a memory setting for the batches the budget charges,
 but memory outside the budget still scales with it: the read cursors'
@@ -445,3 +453,76 @@ built. As implemented:
   metric), as before the budget. Only the loader's charge uses the measured
   size, so a budget that never binds lays objects out as an unbudgeted load
   does.
+
+## Amendment (2026-10-08): acceptance measured (issue #2627)
+
+<!-- amendment-applies: sections="Acceptance (pre-registered; measured with the #2592 method)|Amendment (2026-10-07): --target-bytes counts uncompressed content and pipeline depth caps batches per object (issue #2626)" pointer="acceptance amendment" -->
+<!-- amendment-supersedes: phrase="about 15 times below the target" pointer="acceptance amendment" -->
+<!-- amendment-supersedes: phrase="say the recipe is pending" pointer="acceptance amendment" -->
+
+Wave 4 ran the pre-registered acceptance. ClickBench `hits.parquet` was
+loaded into RustFS on gp2 volumes with release binaries built from main
+4b1241534; loader RSS is the `ravel-cli` process, sampled every 5 s.
+Queries ran on the r6a.4xlarge rows, where all 43 statements were
+answered; the query column is cold total seconds, hot total seconds and the
+geometric mean.
+
+| run | box | flags | load | peak loader RSS | stored objects, median | queries |
+|---|---|---|---|---|---|---|
+| B0, main 524bff9d8 (before waves 1-3) | r6a.4xlarge | `--batch-rows 1000000` | 1,461 s | 26.3 GB | ~25 MB (413 objects) | 648.4 / 64.4 / 0.804 |
+| R1 | r6a.4xlarge | `--batch-rows 100000 --pipeline-depth 16 --target-bytes 375000000 --load-memory-bytes 5000000000` | 602 s | 4.38 GB | 5.7 MB | 1,283.7 / 66.0 / 0.983 |
+| R1b | r6a.4xlarge | as R1, `--target-bytes 1650000000` | 790 s | 5.44 GB | 10.2 MB (the 2 s age trigger closed 798 of 916) | 1,005.7 / 63.6 / 0.859 |
+| R1c | r6a.4xlarge | as R1b, `--max-flush-delay 30s` | 1,990 s | 4.34 GB | 21.5 MB | 622.0 / 61.0 / 0.782 |
+| R1d | r6a.4xlarge | as R1c, `--pipeline-depth 24 --load-memory-bytes 5500000000` | 1,139 s | 5.77 GB | 21.9 MB | 602.4 / 60.6 / 0.779 |
+| R1e | r6a.4xlarge | as R1c, `--pipeline-depth 32 --load-memory-bytes 6500000000` | 858 s | 6.42 GB | 22.1 MB | 600.7 / 59.9 / 0.772 |
+| R2 | c6a.2xlarge, 16 GB | R1b flags | 1,041 s (stock v0.22.0: 1,448 s) | 4.35 GB | 8.6 MB | 42 of 43 answered |
+| R3 | c6a.xlarge, 8 GB | R1b flags, `--load-memory-bytes 3000000000` | 1,908 s (stock: 2,905 s) | 4.00 GB | 11.5 MB | 37 of 43 answered |
+| R4 | c6a.large, 4 GB | R1b flags, `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s (stock: load failed) | 2.02 GB | 10.4 MB | 28 of 43 answered |
+
+Verdicts against the acceptance table:
+
+- **Large objects under a fixed RSS: met** by R1d and R1e. Their median
+  objects (21.9 and 22.1 MB) match the B0 layout the criterion names
+  (~25 MB at 1,000,000-row batches) to within 13%, at a peak loader RSS of
+  5.77 and 6.42 GB against the 8 GB limit.
+- **Load time no worse: met.** The baseline is B0 at 1,461 s, so the limit
+  is 1,534 s; R1d took 1,139 s (0.78x) and R1e 858 s (0.59x).
+- **Objects byte-identical: met** by the row-versus-columnar tests in
+  `ravel-logseg` (`row_and_columnar_paths_identical_under_a_key` and its
+  siblings), which pass on this tree.
+- **4 GB: met** by R4. The load completed, so no shard-ack timeout ended
+  it, where stock v0.22.0 failed. The budget bound: the decoder waited 163
+  times and the peak charge was 1,199,715,423 bytes.
+- **8 GB and 16 GB: met** by R3 (0.66x the stock load time) and R2
+  (0.72x), against the 1.5x limit.
+
+The small-host runs used the R1b flags, at depth 16 and the 2 s age
+trigger, so their objects are 8.6 to 11.5 MB, not the 25 MB the 4, 8 and
+16 GB rows name; the R1e recipe was run only on the r6a.4xlarge.
+
+The recipe for large stored objects from small batches, which the
+target-bytes amendment left open, is R1e:
+
+```sh
+--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay 30s \
+  --pipeline-depth 32 --load-memory-bytes 6500000000
+```
+
+The target-bytes amendment's "about 15 times below the target" is wrong as
+a ratio. The size trigger counts the row-path estimate, about 5.9 KB per
+row on this corpus, and a stored object holds about 89 bytes per row, so
+stored objects are about 65 times below `--target-bytes` once nothing else
+closes them first: 375,000,000 stored 5.7 MB (R1), and 1,650,000,000 about
+22 MB (R1c to R1e). The wave 3 run's objects were closed early by the
+pipeline-depth cap and the age trigger, so its 15x measured those caps.
+The 65x figure is a property of this corpus, not of the format.
+
+All three settings are needed. Without `--max-flush-delay 30s` the age
+trigger closes most objects first (R1b). With objects that large, load
+time scales with `--pipeline-depth`, because each Strict write waits for
+the flush of its own batch and the depth bounds how many batches fill a
+shard buffer at once: 16, 24 and 32 took 1,990, 1,139 and 858 s (R1c to
+R1e). The budget grows with the depth, since more batches are held at
+once. The `--target-bytes` and `--pipeline-depth` help and
+docs/guides/ingest.md now carry this recipe and its measured outcome in
+place of "pending".

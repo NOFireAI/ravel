@@ -11,7 +11,7 @@
 //! the Parquet read cursors' decode buffers, each flush's writer working set)
 //! is the floor, which the derived default leaves out of the host's memory.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use ravel_ingest::{IngestByteBudget, IngestByteBudgetLimit};
@@ -102,6 +102,10 @@ pub struct LoadMemoryOptions {
     /// the CLI); a test shortens it rather than sleep on the real one.
     pub stall_flush_period: Duration,
     pub on_budget: Option<LoadBudgetHook>,
+    /// The one-batch warning ([`LoadMemory::one_batch_warning`]) once the
+    /// load gives it. The report carries it too, but a failed load drops the
+    /// report.
+    pub one_batch_warning: Arc<OnceLock<String>>,
 }
 
 impl LoadMemoryOptions {
@@ -110,6 +114,7 @@ impl LoadMemoryOptions {
             request,
             stall_flush_period: LOAD_STALL_FLUSH_PERIOD,
             on_budget: None,
+            one_batch_warning: Arc::default(),
         }
     }
 }

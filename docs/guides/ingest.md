@@ -1188,25 +1188,70 @@ reaches the target, so objects grow without growing the batch.
 
 The target counts the buffer's estimated **uncompressed** content (body,
 severity text, stream attributes, attribute names and values, and fixed
-per-row fields), not the stored object size. Stored objects are compressed
-and come out much smaller: on ClickBench `hits.parquet` with `--shards 4`,
-`--batch-rows 50000 --target-bytes 25000000` stored objects of 1.1 to
-2.4 MB (10th to 90th percentile, median 1.67 MB), about 15 times below the
-target. Which `--batch-rows` and `--target-bytes` give large objects from
-small batches is pending measurement.
+per-row fields), not the stored object size. Stored objects come out much
+smaller. On ClickBench `hits.parquet` the estimate counts about 5.9 KB per
+row and a stored object holds about 89 bytes per row, so stored objects
+are about 65 times below the target: a target of 375,000,000 stored
+5.7 MB objects (median), and 1,650,000,000 about 22 MB. The ratio is a
+property of that corpus, not a rule; measure your own stored objects
+before sizing the target from it.
 
 A Strict write's ack waits for the flush that holds its rows, and the
 loader keeps at most `--pipeline-depth` writes in flight, so one object
 merges at most `--pipeline-depth` batches' slices. Above `1` a batch's ack
 can wait for later batches to fill the buffer. Set `--pipeline-depth` to
-at least the number of batches that accumulate into one flush; otherwise
-every flush waits out the router's age trigger (`--max-flush-delay`, 2s by
-default). A buffer that never reaches the target flushes on that trigger,
-or at the end of the input. When two checks 250 ms apart both find the
-decoder waiting for room in `--load-memory-bytes` and the bytes charged
-not lower than at the first, the loader flushes every shard buffer early,
-so a target the budget cannot hold yields smaller objects rather than a
-stalled load.
+at least the number of batches whose slices fill one object on a shard;
+otherwise every flush waits out the router's age trigger
+(`--max-flush-delay`, 2s by default). A buffer that never reaches the
+target flushes on that trigger, or at the end of the input, so
+`--max-flush-delay` must also be long enough for one object to fill. When
+two checks 250 ms apart both find the decoder waiting for room in
+`--load-memory-bytes` and the bytes charged not lower than at the first,
+the loader flushes every shard buffer early, so a target the budget cannot
+hold yields smaller objects rather than a stalled load.
+
+#### Measured recipe for large objects
+
+On ClickBench `hits.parquet`, loaded into S3-compatible storage on a
+16-vCPU host with 128 GB of memory, this stored objects of about 22 MB
+(median) in 858 s at a 6.42 GB peak loader RSS:
+
+```sh
+ravel-cli load ... --batch-rows 100000 --target-bytes 1650000000 \
+  --max-flush-delay 30s --pipeline-depth 32 --load-memory-bytes 6500000000
+```
+
+For comparison, an earlier loader without the memory budget, at
+`--batch-rows 1000000` and the default `--target-bytes`, took 1,461 s at a
+26.3 GB peak loader RSS for objects of about 25 MB.
+
+Each setting does a separate job, and dropping any one of them changes the
+outcome:
+
+- `--target-bytes 1650000000` is about 65 times the stored size wanted on
+  this corpus. At 375,000,000 the objects were 5.7 MB.
+- `--max-flush-delay 30s` lets a buffer live long enough to fill. At the
+  2s default, 798 of 916 objects closed on age and the median object was
+  10.2 MB.
+- `--pipeline-depth` sets the load time once objects are large, because
+  each Strict write waits for its batch's flush. With the other flags
+  above, depth 16 took 1,990 s, depth 24 took 1,139 s and depth 32 took
+  858 s.
+- `--load-memory-bytes` grows with the depth, since more batches are held
+  at once: 5,000,000,000 at depth 16 (4.34 GB peak loader RSS),
+  5,500,000,000 at 24 (5.77 GB) and 6,500,000,000 at 32 (6.42 GB).
+
+Smaller hosts completed the load with `--batch-rows 100000 --target-bytes
+1650000000 --pipeline-depth 16` at the 2s default `--max-flush-delay`,
+storing objects of 8.6 to 11.5 MB (median):
+
+| host memory | other flags | load | peak loader RSS |
+|---|---|---|---|
+| 16 GB | `--load-memory-bytes 5000000000` | 1,041 s | 4.35 GB |
+| 8 GB | `--load-memory-bytes 3000000000` | 1,908 s | 4.00 GB |
+| 4 GB | `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s | 2.02 GB |
+
+On the 4 GB host the budget bound: the decoder waited 163 times.
 
 ### Load memory: `--load-memory-bytes`
 
@@ -1259,6 +1304,14 @@ Process memory is
 roughly the budget plus the floor, plus whatever the object store holds:
 `--store memory` keeps every written object in the process, so a
 memory-store load grows past the budget with the data it writes.
+
+Measured on ClickBench `hits.parquet` at `--batch-rows 100000` into
+S3-compatible storage, the peak loader RSS was 6.42 GB under a
+6,500,000,000-byte budget at `--pipeline-depth 32`, and 2.02 GB under a
+1,200,000,000-byte budget on a 4 GB host, where the peak charge reached
+1,199,715,423 bytes and the decoder waited 163 times. The
+[measured recipe](#measured-recipe-for-large-objects) above has the other
+runs.
 
 A metrics or spans load ignores `--load-memory-bytes` and warns when it is
 set.

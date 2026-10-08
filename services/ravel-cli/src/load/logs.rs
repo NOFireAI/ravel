@@ -647,8 +647,9 @@ pub(super) async fn load_with_drain_reflush_period(
                     && !load_memory.is_explicit()
                 {
                     if report.load_memory_warning.is_none() {
-                        report.load_memory_warning =
-                            Some(load_memory.one_batch_warning(charge.bytes(), batch.num_rows));
+                        let warning = load_memory.one_batch_warning(charge.bytes(), batch.num_rows);
+                        let _ = memory_options.one_batch_warning.set(warning.clone());
+                        report.load_memory_warning = Some(warning);
                     }
                 } else if let Some(charge) = &charge
                     && charge.bytes() > load_memory.budget_bytes
