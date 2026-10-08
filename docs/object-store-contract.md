@@ -295,7 +295,18 @@ trait honors cancellation by drop, so the query deadline (usually well under
   `UnaddressableKey` carrying the raw key, the key a request for it would
   reach (`addresses`), its size and its `last_modified_unix_ms`, in listing
   order. Both count toward the page size, so a page of unaddressable keys
-  still advances the listing. `list_delimited` judges a common prefix by
+  still advances the listing. `MemoryStore` resumes after a page's raw last
+  key. `S3Store` and `ExternalStore` resume through `object_store`'s
+  `Path::from`, which re-encodes an unaddressable key, so their page token
+  is the page's last addressable key: an unaddressable tail after it is
+  listed and reported again on the next page. `drain_pages` drops only a
+  repeat of the key it recorded last, so a tail of two or more such keys is
+  counted twice. A full page holding only unaddressable keys has no safe
+  offset. Its token is its raw last key, which still re-encodes, so the
+  next page can skip keys (`p/a#b` resumes after `p/a%23b`, past `p/a$`)
+  or re-deliver them and fail `ListOrderViolation` (`p/é` resumes after
+  `p/%C3%A9`, before `p/b`) until the raw ListObjectsV2 listing of
+  ADR-2637 decision 1 replaces it. `list_delimited` judges a common prefix by
   its stem, the prefix without its trailing `/`: `t/abc\u{1}/` is reported
   in `unaddressable_prefixes`, never in `common_prefixes`, and so is `/`
   alone, whose stem is empty. `drain_pages` returns the drain's

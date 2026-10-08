@@ -1241,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn a_folder_marker_and_an_empty_parquet_are_skipped() {
         let store = MemoryStore::new();
-        put_sized(&store, "data/t1/", b"").await;
+        store.insert_foreign("data/t1/", Bytes::new());
         put_sized(&store, "data/t1/empty.parquet", b"").await;
         put_sized(&store, "data/t1/full.parquet", b"PAR1").await;
         for url in ["s3://b/data/t1", "s3://b/data/t1/"] {
@@ -1259,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn a_listed_object_is_offered_whatever_its_suffix() {
         let store = MemoryStore::new();
-        put_sized(&store, "exports/", b"").await;
+        store.insert_foreign("exports/", Bytes::new());
         put_sized(&store, "exports/2026-09", b"PAR1").await;
         for url in ["s3://b/exports/", "s3://b/exports"] {
             assert_eq!(
@@ -1359,7 +1359,7 @@ mod tests {
     #[tokio::test]
     async fn an_admitted_object_on_the_third_page_is_found() {
         let store = MemoryStore::with_page_size(2);
-        put_sized(&store, "data/t1/", b"").await;
+        store.insert_foreign("data/t1/", Bytes::new());
         put_sized(&store, "data/t1/a.parquet", b"").await;
         put_sized(&store, "data/t1/b.txt", b"x").await;
         put_sized(&store, "data/t1/c.parquet", b"").await;
