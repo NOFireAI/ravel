@@ -1,0 +1,13 @@
+diff --git a/crates/ravel-bench/src/clickbench_parquet/report.rs b/crates/ravel-bench/src/clickbench_parquet/report.rs
+index ece990a..7400bd5 100644
+--- a/crates/ravel-bench/src/clickbench_parquet/report.rs
++++ b/crates/ravel-bench/src/clickbench_parquet/report.rs
+@@ -35,7 +35,7 @@ impl Arm {
+     /// 100 `hits_*.parquet` parts D7 names for arm A, one file for arm B.
+     pub fn expected_files(self) -> u64 {
+         match self {
+-            Arm::A => 100,
++            Arm::A => 20,
+             Arm::B => 1,
+         }
+     }
