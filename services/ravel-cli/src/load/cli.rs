@@ -245,6 +245,56 @@ pub(crate) async fn run_warning_to(
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    run_memory_warning_to(
+        store,
+        parquet_path,
+        tenant,
+        mapping_path,
+        signal,
+        shards,
+        batch_rows,
+        skip_rows,
+        read_cursors,
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+        max_flush_delay,
+        zstd_level,
+        LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
+        now_ns,
+        warnings,
+    )
+    .await
+}
+
+/// [`run_warning_to`] with the memory request injected in place of the host
+/// read, so a test can give a logs load a derived budget below one batch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_memory_warning_to(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping_path: &Path,
+    signal: SignalArg,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    zstd_level: RlogZstdLevel,
+    load_memory: LoadMemoryRequest,
+    now_ns: i64,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    let load_memory_bytes = match load_memory {
+        LoadMemoryRequest::Flag(bytes) => Some(bytes),
+        LoadMemoryRequest::Derived { .. } | LoadMemoryRequest::Unbudgeted => None,
+    };
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
     let admission_warning = match signal {
@@ -309,10 +359,11 @@ pub(crate) async fn run_warning_to(
 
     // The loader resolves the budget once it knows the read-cursor count the
     // floor depends on.
-    let load_memory = LoadMemoryRequest::from_flag_on_host(load_memory_bytes);
     if let Some(warning) = load_memory.fallback_warning() {
         let _ = writeln!(warnings, "{warning}");
     }
+    let memory_options = LoadMemoryOptions::new(load_memory);
+    let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
 
     // The production entry point drives the columnar fast path (ADR-0109) with
     // the operator-configured decode-queue depth; `load` keeps a stable
@@ -337,7 +388,7 @@ pub(crate) async fn run_warning_to(
         None,
         None,
         zstd_level,
-        Some(LoadMemoryOptions::new(load_memory)),
+        Some(memory_options),
     )
     .await
     {
@@ -385,6 +436,11 @@ pub(crate) async fn run_warning_to(
         }
         Err(err) => {
             print_durable_tokens(&err, LOGS_RESUMABLE_SETTINGS);
+            // The failed load dropped the report that carried this warning, and
+            // it still explains the run: the load went one batch at a time.
+            if let Some(warning) = one_batch_warning.get() {
+                let _ = writeln!(warnings, "{warning}");
+            }
             // The report that held these figures is dropped with the error, and
             // they are the only thing an operator can act on to resume: print
             // them beside the error, with the settings precondition that says

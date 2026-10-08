@@ -382,6 +382,40 @@ fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> Result<ColumnarLogBatch, 
     .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
 }
 
+/// The inverse of [`to_logseg_record`], for records a refused build hands back.
+fn from_logseg_record(rec: LogRecord) -> NormalizedLogRecord {
+    NormalizedLogRecord {
+        stream_id: rec.stream_id,
+        stream_attrs: rec.stream_attrs,
+        ts_ns: rec.ts_ns,
+        observed_ts_ns: rec.observed_ts_ns,
+        severity_num: rec.severity_num,
+        severity_text: rec.severity_text,
+        body: rec.body,
+        trace_id: rec.trace_id,
+        span_id: rec.span_id,
+        flags: rec.flags,
+        attrs: rec.attrs,
+    }
+}
+
+/// [`rows_to_batch`] over a buffer's own records: they are taken rather than
+/// copied, so the buffered set is not held twice during the build, and a
+/// refusal puts them back unchanged.
+fn take_rows_as_batch(
+    records: &mut Vec<NormalizedLogRecord>,
+    build: impl FnOnce(&[LogRecord]) -> Result<ColumnarLogBatch, LogSegError>,
+) -> Result<ColumnarLogBatch, LogWriteError> {
+    let rows: Vec<LogRecord> = std::mem::take(records)
+        .into_iter()
+        .map(to_logseg_record)
+        .collect();
+    build(&rows).map_err(|e| {
+        *records = rows.into_iter().map(from_logseg_record).collect();
+        LogWriteError::SegmentBuild(e.to_string())
+    })
+}
+
 /// A tenant's buffered payload: one representation at a time (ADR-0109 decision
 /// 5). `Empty` is the pre-first-write state that accepts either shape; once a
 /// write lands, the buffer is `Rows` or `Columnar` until it flushes, and the
@@ -576,9 +610,8 @@ impl LogTenantBuf {
                 }
             }
             FlushPayload::Columnar(batches) => {
-                if let BufContent::Rows(records) = &self.content {
-                    // Copied so a refusal leaves the buffered records in place.
-                    let batch = rows_to_batch(records.clone())?;
+                if let BufContent::Rows(records) = &mut self.content {
+                    let batch = take_rows_as_batch(records, ColumnarLogBatch::try_from_records)?;
                     self.content = BufContent::Columnar(vec![batch]);
                 }
                 for batch in batches {
@@ -5500,6 +5533,53 @@ mod tests {
             registered, charged,
             "the shards register what the writes charged"
         );
+    }
+
+    /// A columnar hand-back into a buffer holding rows converts those rows
+    /// into one batch ahead of the handed-back ones, with the registered
+    /// estimate unchanged by the conversion.
+    #[test]
+    fn a_columnar_hand_back_converts_the_buffered_rows_into_the_first_batch() {
+        let rows = HandBackRig::six_records();
+        let handed = HandBackRig::six_records();
+        let mut buf = LogTenantBuf::default();
+        buf.merge_rows_unstamped(rows.clone())
+            .expect("rows into an empty buffer");
+        let before = buf.est_bytes;
+        let handed_batch = rows_to_batch(handed).expect("the records convert");
+        let handed_bytes = est_columnar_bytes(&handed_batch);
+        buf.merge_hand_back(FlushPayload::Columnar(vec![handed_batch.clone()]))
+            .expect("a hand-back has no writer left to refuse");
+
+        let BufContent::Columnar(batches) = &buf.content else {
+            panic!("the buffer now holds columnar batches");
+        };
+        assert_eq!(
+            batches,
+            &vec![
+                rows_to_batch(rows).expect("the records convert"),
+                handed_batch
+            ]
+        );
+        assert_eq!(buf.est_bytes, before + handed_bytes);
+    }
+
+    /// A refused conversion leaves the records exactly as they were, in order,
+    /// and the build sees every one of them.
+    #[test]
+    fn a_refused_row_conversion_puts_the_records_back() {
+        let original = HandBackRig::six_records();
+        let mut records = original.clone();
+        let err = take_rows_as_batch(&mut records, |rows| {
+            assert_eq!(rows.len(), original.len(), "the build sees every record");
+            Err(LogSegError::LimitExceeded("refused for the test".into()))
+        })
+        .expect_err("the build refuses");
+        assert!(
+            matches!(&err, LogWriteError::SegmentBuild(msg) if msg.contains("refused for the test")),
+            "got {err:?}"
+        );
+        assert_eq!(records, original);
     }
 }
 

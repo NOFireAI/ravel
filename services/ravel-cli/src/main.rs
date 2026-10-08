@@ -567,6 +567,18 @@ enum Command {
         /// before returning rather than abandoning it, so the report equals what
         /// landed at any depth, and a resume from it does not re-ingest rows
         /// that already committed. `0` is rejected.
+        ///
+        /// With `--target-bytes` above `1` the depth also bounds object size
+        /// and load time: each Strict write waits for the flush of its own
+        /// batch, so one object merges at most this many batches' slices, and
+        /// a depth below the batches one object needs on a shard leaves the
+        /// writes waiting for `--max-flush-delay` to close it. Set it to at
+        /// least that many batches. On ClickBench at `--batch-rows 100000
+        /// --target-bytes 1650000000 --max-flush-delay 30s` (issue #2627),
+        /// depth 16 loaded in 1,990 s, 24 in 1,139 s and 32 in 858 s, with
+        /// `--load-memory-bytes` raised alongside to 5,000,000,000,
+        /// 5,500,000,000 and 6,500,000,000 and peak loader RSS 4.34, 5.77
+        /// and 6.42 GB.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_PIPELINE_DEPTH)]
         pipeline_depth: usize,
         /// Number of flushes one shard may have in flight at once (issue #807).
@@ -610,17 +622,29 @@ enum Command {
         decode_queue_batches: usize,
         /// The object-size setting: the estimated UNCOMPRESSED content a
         /// shard's buffer accumulates before it flushes as one RLOG object
-        /// (issue #801). Stored objects are compressed and come out much
-        /// smaller than the target, about 15x on the ClickBench corpus. At
-        /// the default `1` every batch flushes as its own object the moment it
-        /// is written: one object per involved shard per batch, so
-        /// `--batch-rows` sets its size. A larger value lets a shard merge
-        /// several batches' slices into one buffer until the target is
-        /// reached, but each Strict write waits for the flush of its own
-        /// batch, so a buffer merges at most `--pipeline-depth` batches'
-        /// slices. Which `--batch-rows` and `--target-bytes` give large
-        /// objects at a fraction of a large batch's memory is pending
-        /// measurement (issue #2627).
+        /// (issue #801). Stored objects come out much smaller than the
+        /// target: on the ClickBench corpus the estimate counts about 5.9 KB
+        /// per row and a stored object holds about 89 bytes per row, so
+        /// stored objects are about 65x below the target (375,000,000 gave
+        /// 5.7 MB objects, 1,650,000,000 about 22 MB). That ratio is a
+        /// property of that corpus, not of the format. At the default `1`
+        /// every batch flushes as its own object the moment it is written:
+        /// one object per involved shard per batch, so `--batch-rows` sets
+        /// its size. A larger value lets a shard merge several batches'
+        /// slices into one buffer until the target is reached, but each
+        /// Strict write waits for the flush of its own batch, so a buffer
+        /// merges at most `--pipeline-depth` batches' slices.
+        ///
+        /// Large objects from small batches need all three settings together:
+        /// this target, a `--pipeline-depth` that covers the batches one
+        /// object needs on a shard, and a `--max-flush-delay` long enough for
+        /// one object to fill. Measured on ClickBench (issue #2627),
+        /// `--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay
+        /// 30s --pipeline-depth 32 --load-memory-bytes 6500000000` stored
+        /// objects of about 22 MB and loaded in 858 s at a 6.42 GB peak
+        /// loader RSS on a 16-vCPU 128 GB host. The same target at the 2s
+        /// default delay closed 798 of its 916 objects on age (10.2 MB
+        /// median).
         ///
         /// The estimate sums body, severity text, stream attributes,
         /// attribute names and values, and fixed per-row fields over the rows

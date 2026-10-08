@@ -315,6 +315,31 @@ fn metrics_and_spans_warn_on_a_non_default_zstd_level_and_logs_does_not() {
     );
 }
 
+/// A `--load-memory-bytes` on a metrics or spans load is named as ignored;
+/// an unset flag, or any budget on a logs load, is not.
+#[test]
+fn metrics_and_spans_warn_on_a_set_load_memory_budget_and_logs_does_not() {
+    assert_eq!(
+        unused_load_memory_warning(Some(6_000_000_000), SignalArg::Logs),
+        None
+    );
+    assert_eq!(unused_load_memory_warning(None, SignalArg::Spans), None);
+    assert_eq!(
+        unused_load_memory_warning(Some(6_000_000_000), SignalArg::Metrics).as_deref(),
+        Some(
+            "warning: a metrics load ignores --load-memory-bytes 6000000000. The budget \
+                     applies only to the batches a logs load holds."
+        )
+    );
+    assert_eq!(
+        unused_load_memory_warning(Some(6_000_000_000), SignalArg::Spans).as_deref(),
+        Some(
+            "warning: a spans load ignores --load-memory-bytes 6000000000. The budget \
+                     applies only to the batches a logs load holds."
+        )
+    );
+}
+
 /// The future-skew bound is kept and the past-lag bound is relaxed,
 /// both anchored on the span's END exactly as `checked_span_interval`
 /// anchors them.

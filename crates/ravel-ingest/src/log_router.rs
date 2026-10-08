@@ -570,6 +570,13 @@ impl LogIngestRouter {
     /// buffers in place of a fresh ADR-0069 charge, so the batch is charged
     /// once and never refused for budget here.
     ///
+    /// A charged write never reaches the router's ADR-0069 `try_charge`, so a
+    /// load under `--load-memory-bytes` (set, or derived from host memory when
+    /// unset) opts out of the server-side ingest ceiling: its bytes do not
+    /// move that budget's in-flight gauge and are never shed with
+    /// `BufferBudgetExceeded`. That is intended; the loader's own budget
+    /// bounds them instead.
+    ///
     /// The charge is held exactly as a fresh one would be: cloned into every
     /// shard message, held by each shard buffer, moved into the flush task
     /// (including one queued behind the flush permit), and dropped when the
