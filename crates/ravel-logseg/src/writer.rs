@@ -1050,12 +1050,15 @@ impl RlogWriter {
         let mut streams: BTreeMap<LogStreamId, &[u8]> = BTreeMap::new();
         for b in batches {
             // `stream_attrs` must run parallel to `stream_ids` (the struct's own
-            // doc comment); nothing upstream of here enforces it. Zipping the two
-            // unequal-length silently drops whichever ids or blobs fall past the
-            // shorter one's end -- a dropped id is one the directory below never
-            // learns about, so it would later miss the stream-ref remap built
-            // from `sorted_ids` instead of resolving to the wrong stream. Refuse
-            // here, before the directory (or anything derived from it) is built.
+            // doc comment); `push_columnar` already enforces it via
+            // `ColumnarLogBatch::validate`, so this is redundant for every batch
+            // that reached `self.batches` that way. It stays as the refusal for a
+            // batch placed in `self.batches` without going through
+            // `push_columnar`: zipping the two unequal-length would silently drop
+            // whichever ids or blobs fall past the shorter one's end, and a
+            // dropped id is one the directory below never learns about, so it
+            // would later miss the stream-ref remap built from `sorted_ids`
+            // instead of resolving to the wrong stream.
             if b.stream_ids.len() != b.stream_attrs.len() {
                 let message = if b.stream_attrs.len() < b.stream_ids.len() {
                     format!(
@@ -4613,7 +4616,7 @@ mod tests {
             .expect_err("a duplicate stream id must be refused at push");
         assert_malformed(
             err,
-            &format!("stream_ids[0x1] repeats stream {}", dup.to_hex()),
+            &format!("stream_ids[1] repeats stream {}", dup.to_hex()),
         );
     }
 

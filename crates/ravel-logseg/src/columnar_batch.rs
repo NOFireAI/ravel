@@ -836,7 +836,7 @@ impl ColumnarLogBatch {
         for (idx, sid) in self.stream_ids.iter().enumerate() {
             if !seen_streams.insert(*sid) {
                 return malformed(format!(
-                    "stream_ids[{idx:#x}] repeats stream {}: stream_ids must be distinct",
+                    "stream_ids[{idx}] repeats stream {}: stream_ids must be distinct",
                     sid.to_hex(),
                 ));
             }
@@ -848,14 +848,24 @@ impl ColumnarLogBatch {
             .find(|(_, r)| **r as usize >= ids)
         {
             return malformed(format!(
-                "stream_refs[{row}] is {r:#x} but the batch has {ids} stream ids"
+                "stream_refs[{row}] is {r} but the batch has {ids} stream ids"
             ));
         }
 
+        let mut seen_dyn_columns: std::collections::HashSet<(&str, u8)> =
+            std::collections::HashSet::with_capacity(self.dyn_columns.len());
         for (ci, c) in self.dyn_columns.iter().enumerate() {
+            if !seen_dyn_columns.insert((c.name.as_str(), c.field_type.to_u8())) {
+                return malformed(format!(
+                    "dyn column {:?} (index {ci}) repeats an earlier column of the same name and \
+                     type {:?}: two columns of one (name, type) would double-count presence and \
+                     let the last one written win",
+                    c.name, c.field_type,
+                ));
+            }
             if c.validity.len() != n {
                 return malformed(format!(
-                    "dyn column {:?} (index {ci:#x}) validity describes {} rows but num_rows is {n}",
+                    "dyn column {:?} (index {ci}) validity describes {} rows but num_rows is {n}",
                     c.name,
                     c.validity.len(),
                 ));
@@ -863,7 +873,7 @@ impl ColumnarLogBatch {
             let present = c.validity.count_present();
             if c.cells.len() != present {
                 return malformed(format!(
-                    "dyn column {:?} (index {ci:#x}) has {} cells but validity marks {present} rows present",
+                    "dyn column {:?} (index {ci}) has {} cells but validity marks {present} rows present",
                     c.name,
                     c.cells.len(),
                 ));
@@ -871,7 +881,7 @@ impl ColumnarLogBatch {
             let found = c.cells.field_type();
             if found != c.field_type {
                 return malformed(format!(
-                    "dyn column {:?} (index {ci:#x}) holds {found:?} cells but the column's field_type is {:?}",
+                    "dyn column {:?} (index {ci}) holds {found:?} cells but the column's field_type is {:?}",
                     c.name, c.field_type,
                 ));
             }
@@ -882,7 +892,7 @@ impl ColumnarLogBatch {
             };
             if let Some(why) = var_bytes.and_then(VarBytes::offsets_error) {
                 return malformed(format!(
-                    "dyn column {:?} (index {ci:#x}) offsets are malformed: {why}",
+                    "dyn column {:?} (index {ci}) offsets are malformed: {why}",
                     c.name,
                 ));
             }
@@ -892,7 +902,7 @@ impl ColumnarLogBatch {
                         (0..v.len()).find(|&i| std::str::from_utf8(v.get(i)).is_err())
                     {
                         return malformed(format!(
-                            "dyn column {:?} (index {ci:#x}) cell {cell} is not UTF-8",
+                            "dyn column {:?} (index {ci}) cell {cell} is not UTF-8",
                             c.name,
                         ));
                     }
@@ -903,21 +913,21 @@ impl ColumnarLogBatch {
                         let slot = *slot as usize;
                         if slot < floor || slot >= present {
                             return malformed(format!(
-                                "dyn column {:?} (index {ci:#x}) nested slot {slot:#x} is out of order or past its {present} cells",
+                                "dyn column {:?} (index {ci}) nested slot {slot} is out of order or past its {present} cells",
                                 c.name,
                             ));
                         }
                         floor = slot + 1;
                         if !matches!(value, AttrValue::List(_) | AttrValue::Map(_)) {
                             return malformed(format!(
-                                "dyn column {:?} (index {ci:#x}) nested slot {slot:#x} holds a {:?} value, not a List or Map",
+                                "dyn column {:?} (index {ci}) nested slot {slot} holds a {:?} value, not a List or Map",
                                 c.name,
                                 attr_field_type(value),
                             ));
                         }
                         if canonical_value_bytes(value) != b.values.get(slot) {
                             return malformed(format!(
-                                "dyn column {:?} (index {ci:#x}) cell {slot:#x} differs from its nested value's canonical bytes",
+                                "dyn column {:?} (index {ci}) cell {slot} differs from its nested value's canonical bytes",
                                 c.name,
                             ));
                         }
@@ -940,7 +950,7 @@ impl ColumnarLogBatch {
                 let c = &self.dyn_columns[ci];
                 if dict.ids.len() != c.cells.len() {
                     return malformed(format!(
-                        "dyn column {:?} (index {ci:#x}) dictionary has {} ids but {} present cells",
+                        "dyn column {:?} (index {ci}) dictionary has {} ids but {} present cells",
                         c.name,
                         dict.ids.len(),
                         c.cells.len(),
@@ -953,7 +963,7 @@ impl ColumnarLogBatch {
                     .find(|(_, id)| **id as usize >= dict.distinct.len())
                 {
                     return malformed(format!(
-                        "dyn column {:?} (index {ci:#x}) dictionary id[{slot:#x}] is {gid:#x} but distinct has {} entries",
+                        "dyn column {:?} (index {ci}) dictionary id[{slot}] is {gid} but distinct has {} entries",
                         c.name,
                         dict.distinct.len(),
                     ));
@@ -964,7 +974,7 @@ impl ColumnarLogBatch {
                     };
                     if dict.distinct[*id as usize] != cell_bytes {
                         return malformed(format!(
-                            "dyn column {:?} (index {ci:#x}) dictionary id[{slot:#x}] is {id:#x} but distinct[{id:#x}] differs from the cell's bytes",
+                            "dyn column {:?} (index {ci}) dictionary id[{slot}] is {id} but distinct[{id}] differs from the cell's bytes",
                             c.name,
                         ));
                     }
@@ -1589,10 +1599,7 @@ mod tests {
             distinct: vec![b"v".to_vec()],
             ids: vec![1],
         })];
-        assert_malformed(
-            batch.validate(),
-            "id[0x0] is 0x1 but distinct has 1 entries",
-        );
+        assert_malformed(batch.validate(), "id[0] is 1 but distinct has 1 entries");
     }
 
     #[test]
@@ -1671,7 +1678,7 @@ mod tests {
         });
         assert_malformed(
             batch.validate(),
-            "dyn column \"flag\" (index 0x0) holds I64 cells but the column's field_type is Bool",
+            "dyn column \"flag\" (index 0) holds I64 cells but the column's field_type is Bool",
         );
     }
 
@@ -1680,7 +1687,7 @@ mod tests {
         let batch = one_cell_batch(FieldType::I64, AttrValue::Str("x".into()));
         assert_malformed(
             batch.validate(),
-            "dyn column \"k\" (index 0x0) holds Str cells but the column's field_type is I64",
+            "dyn column \"k\" (index 0) holds Str cells but the column's field_type is I64",
         );
     }
 
@@ -1729,7 +1736,7 @@ mod tests {
         });
         assert_malformed(
             batch.validate(),
-            "dyn column \"k\" (index 0x0) cell 0 is not UTF-8",
+            "dyn column \"k\" (index 0) cell 0 is not UTF-8",
         );
     }
 
@@ -1870,7 +1877,7 @@ mod tests {
             });
             assert_malformed(
                 batch.validate(),
-                &format!("dyn column \"k\" (index 0x0) {want}"),
+                &format!("dyn column \"k\" (index 0) {want}"),
             );
         }
     }
@@ -1925,19 +1932,19 @@ mod tests {
             .expect("canonical bytes match");
         assert_malformed(
             nested_batch(b"x", vec![(0, list.clone())]).validate(),
-            "cell 0x0 differs from its nested value's canonical bytes",
+            "cell 0 differs from its nested value's canonical bytes",
         );
         assert_malformed(
             nested_batch(&canon, vec![(1, list.clone())]).validate(),
-            "nested slot 0x1 is out of order or past its 1 cells",
+            "nested slot 1 is out of order or past its 1 cells",
         );
         assert_malformed(
             nested_batch(&canon, vec![(0, list.clone()), (0, list)]).validate(),
-            "nested slot 0x0 is out of order",
+            "nested slot 0 is out of order",
         );
         assert_malformed(
             nested_batch(b"x", vec![(0, AttrValue::Bytes(b"x".to_vec()))]).validate(),
-            "nested slot 0x0 holds a Bytes value, not a List or Map",
+            "nested slot 0 holds a Bytes value, not a List or Map",
         );
     }
 
@@ -2009,7 +2016,7 @@ mod tests {
         );
         assert_malformed(
             batch.validate(),
-            "dyn column \"k\" (index 0x0) dictionary id[0x0] is 0x0 but distinct[0x0] differs from the cell's bytes",
+            "dyn column \"k\" (index 0) dictionary id[0] is 0 but distinct[0] differs from the cell's bytes",
         );
         let batch = with_dict(
             one_cell_batch(FieldType::Bytes, AttrValue::Bytes(vec![1, 2])),
@@ -2061,7 +2068,9 @@ mod tests {
     #[test]
     fn fewer_dictionaries_than_columns_is_rejected() {
         let mut batch = one_cell_batch(FieldType::Str, AttrValue::Str("v".into()));
-        batch.dyn_columns.push(batch.dyn_columns[0].clone());
+        let mut second = batch.dyn_columns[0].clone();
+        second.name = "k2".into();
+        batch.dyn_columns.push(second);
         batch.dyn_col_dicts = vec![None];
         assert_malformed(
             batch.validate(),
@@ -2104,7 +2113,7 @@ mod tests {
         let mut batch = minimal_batch(1);
         batch.stream_ids = vec![wide_id(0), wide_id(0)];
         batch.stream_attrs = vec![wide_attrs_blob(0), wide_attrs_blob(0)];
-        assert_malformed(batch.validate(), "stream_ids[0x1] repeats stream");
+        assert_malformed(batch.validate(), "stream_ids[1] repeats stream");
     }
 
     /// Trace ids are 16 bytes per present row: one byte too few and one too
@@ -2130,5 +2139,35 @@ mod tests {
             batch.span_id = vec![0u8; bytes];
             assert_malformed(batch.validate(), &format!("span_id holds {bytes} bytes"));
         }
+    }
+
+    /// Two dynamic columns sharing one (name, type) pair: unrefused, the
+    /// writer's last-value-wins merge would double FIELD_DIR's present count
+    /// against one stored value.
+    #[test]
+    fn two_dyn_columns_of_the_same_name_and_type_are_rejected() {
+        let mut batch = minimal_batch(2);
+        let mut first_validity = Bitmap::new();
+        first_validity.push(true);
+        first_validity.push(false);
+        batch.dyn_columns.push(DynColumn {
+            name: "k".into(),
+            field_type: FieldType::I64,
+            cells: DynCells::I64(vec![1]),
+            validity: first_validity,
+        });
+        let mut second_validity = Bitmap::new();
+        second_validity.push(false);
+        second_validity.push(true);
+        batch.dyn_columns.push(DynColumn {
+            name: "k".into(),
+            field_type: FieldType::I64,
+            cells: DynCells::I64(vec![2]),
+            validity: second_validity,
+        });
+        assert_malformed(
+            batch.validate(),
+            "dyn column \"k\" (index 1) repeats an earlier column of the same name and type I64",
+        );
     }
 }
