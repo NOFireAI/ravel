@@ -469,12 +469,12 @@ geometric mean.
 
 | run | box | flags | load | peak loader RSS | stored objects, median | queries |
 |---|---|---|---|---|---|---|
-| B0, main 524bff9d8 (before waves 1-3) | r6a.4xlarge | `--batch-rows 1000000` | 1,461 s | 26.3 GB | ~25 MB (413 objects) | 648.4 / 64.4 / 0.804 |
+| B0, main 524bff9d8 (before waves 1-3) | r6a.4xlarge | `--batch-rows 1000000` | 1,461 s | 26.3 GB | 24.8 MB mean (413 objects, 10,227,376,733 bytes; median not recorded) | 648.4 / 64.4 / 0.804 |
 | R1 | r6a.4xlarge | `--batch-rows 100000 --pipeline-depth 16 --target-bytes 375000000 --load-memory-bytes 5000000000` | 602 s | 4.38 GB | 5.7 MB | 1,283.7 / 66.0 / 0.983 |
 | R1b | r6a.4xlarge | as R1, `--target-bytes 1650000000` | 790 s | 5.44 GB | 10.2 MB (the 2 s age trigger closed 798 of 916) | 1,005.7 / 63.6 / 0.859 |
 | R1c | r6a.4xlarge | as R1b, `--max-flush-delay 30s` | 1,990 s | 4.34 GB | 21.5 MB | 622.0 / 61.0 / 0.782 |
-| R1d | r6a.4xlarge | as R1c, `--pipeline-depth 24 --load-memory-bytes 5500000000` | 1,139 s | 5.77 GB | 21.9 MB | 602.4 / 60.6 / 0.779 |
-| R1e | r6a.4xlarge | as R1c, `--pipeline-depth 32 --load-memory-bytes 6500000000` | 858 s | 6.42 GB | 22.1 MB | 600.7 / 59.9 / 0.772 |
+| R1d | r6a.4xlarge | as R1c, `--pipeline-depth 24 --load-memory-bytes 5500000000` | 1,139 s | 5.77 GB | 21.9 MB median, 22.4 MB mean (455 objects, 10,196,683,756 bytes) | 602.4 / 60.6 / 0.779 |
+| R1e | r6a.4xlarge | as R1c, `--pipeline-depth 32 --load-memory-bytes 6500000000` | 858 s | 6.42 GB | 22.1 MB median, 22.6 MB mean (451 objects, 10,197,978,095 bytes) | 600.7 / 59.9 / 0.772 |
 | R2 | c6a.2xlarge, 16 GB | R1b flags | 1,041 s (stock v0.22.0: 1,448 s) | 4.35 GB | 8.6 MB | 42 of 43 answered |
 | R3 | c6a.xlarge, 8 GB | R1b flags, `--load-memory-bytes 3000000000` | 1,908 s (stock: 2,905 s) | 4.00 GB | 11.5 MB | 37 of 43 answered |
 | R4 | c6a.large, 4 GB | R1b flags, `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s (stock: load failed) | 2.02 GB | 10.4 MB | 28 of 43 answered |
@@ -484,10 +484,16 @@ Verdicts against the acceptance table:
 - **Large objects under a fixed RSS: the RSS limit is met, the object
   size is not quite.** R1d and R1e peaked at 5.77 and 6.42 GB of loader
   RSS against the 8 GB limit. Their median objects are 21.9 and 22.1 MB
-  (90th percentile about 30 MB), against the 25 MB this table names. The
-  wave 4 pre-registration on #2627 set a 20 MB median as the pass band,
-  which they meet; against this table's own figure they fall about 12%
-  short.
+  (90th percentile about 30 MB), about 12% short of the 25 MB this table
+  names; their means are 22.4 MB (R1d, 10,196,683,756 bytes / 455
+  objects) and 22.6 MB (R1e, 10,197,978,095 bytes / 451 objects), about
+  10% short on the same basis. B0 itself, the baseline this table's 25 MB
+  figure was read off, sat at 24.8 MB mean (10,227,376,733 bytes / 413
+  objects; its median was not recorded). B0 stored about 102 bytes per
+  row (10,227,376,733 / 99,997,497), against about 89 to 102 bytes per
+  row for the later runs, so the 89 B/row figure does not estimate B0's
+  object size. The wave 4 pre-registration on #2627 set a 20 MB median as
+  the pass band, which R1d and R1e meet.
 - **Load time no worse: met.** The baseline is B0 at 1,461 s, so the limit
   is 1,534 s; R1d took 1,139 s (0.78x) and R1e 858 s (0.59x).
 - **Objects byte-identical: met** by the row-versus-columnar tests in

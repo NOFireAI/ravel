@@ -1230,9 +1230,12 @@ Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
 - `--target-bytes 1650000000` stored about 22 MB median objects on this
-  corpus, 75 times below the target. At 375,000,000 the objects were
-  5.7 MB, 66 times below. For larger stored objects, raise the target by
-  the ratio measured on your own data.
+  corpus, 75 times below the target: R1e's flush counts show the size
+  trigger closed 433 of its 453 objects, so the target is what closed
+  them, not the age trigger. At 375,000,000 the objects were 5.7 MB, 66
+  times below. The ratio was measured at these two target values only;
+  scaling `--target-bytes` above 1,650,000,000 for still larger objects
+  was not measured.
 - `--max-flush-delay 30s` lets a buffer live long enough to fill. At the
   2s default, 798 of 916 objects closed on age and the median object was
   10.2 MB.
