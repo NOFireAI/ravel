@@ -841,9 +841,7 @@ mod tests {
         assert_eq!(slot.chars().count(), 20);
         let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
         let key = format!("{prefix}{slot}.pqm");
-        store
-            .inner()
-            .insert_foreign(&key, Bytes::from_static(b"x"));
+        store.inner().insert_foreign(&key, Bytes::from_static(b"x"));
         for action in [RepairAction::List, RepairAction::DeleteFlagged] {
             let mut lines = Vec::new();
             collect_repair(&store, "acme", "hits", action, &mut lines)

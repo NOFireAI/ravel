@@ -423,12 +423,11 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for S3KeyStore<S> {
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         let page = self.inner.list(prefix, page).await?;
-        for key in page
-            .objects
-            .iter()
-            .map(|meta| meta.key.as_str())
-            .chain(page.unaddressable.iter().map(|skipped| skipped.key.as_str()))
-        {
+        for key in page.objects.iter().map(|meta| meta.key.as_str()).chain(
+            page.unaddressable
+                .iter()
+                .map(|skipped| skipped.key.as_str()),
+        ) {
             parse_listed(key)?;
         }
         Ok(page)
@@ -441,7 +440,12 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for S3KeyStore<S> {
             .iter()
             .map(|meta| meta.key.as_str())
             .chain(listed.common_prefixes.iter().map(String::as_str))
-            .chain(listed.unaddressable.iter().map(|skipped| skipped.key.as_str()))
+            .chain(
+                listed
+                    .unaddressable
+                    .iter()
+                    .map(|skipped| skipped.key.as_str()),
+            )
             .chain(listed.unaddressable_prefixes.iter().map(String::as_str))
         {
             parse_listed(key)?;

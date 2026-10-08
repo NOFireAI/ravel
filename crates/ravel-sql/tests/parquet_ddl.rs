@@ -897,7 +897,11 @@ async fn folder_marker_object_is_not_treated_as_the_probe_object() {
     lake.grant(&t).await;
     let listed = lake.lake.list("t/hits/", None).await.expect("list");
     assert!(listed.objects.is_empty(), "{:?}", listed.objects);
-    let markers: Vec<&str> = listed.unaddressable.iter().map(|u| u.key.as_str()).collect();
+    let markers: Vec<&str> = listed
+        .unaddressable
+        .iter()
+        .map(|u| u.key.as_str())
+        .collect();
     assert_eq!(markers, ["t/hits/"]);
 
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");

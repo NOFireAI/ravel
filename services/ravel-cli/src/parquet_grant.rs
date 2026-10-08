@@ -942,7 +942,11 @@ mod tests {
             .expect("put");
         let listed = external_store.list("data/", None).await.expect("list");
         let objects: Vec<&str> = listed.objects.iter().map(|m| m.key.as_str()).collect();
-        let markers: Vec<&str> = listed.unaddressable.iter().map(|u| u.key.as_str()).collect();
+        let markers: Vec<&str> = listed
+            .unaddressable
+            .iter()
+            .map(|u| u.key.as_str())
+            .collect();
         assert_eq!(objects, ["data/t1/part-0.parquet"]);
         assert_eq!(markers, ["data/", "data/t1/"]);
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_store);

@@ -1130,7 +1130,10 @@ mod tests {
         );
         assert_eq!(deletes_sent(&store), 0);
         memory(&store).head(&mkey(3)).await.expect("version 3 kept");
-        assert_eq!(unaddressable_under(memory(&store), &doubled).await, [doubled]);
+        assert_eq!(
+            unaddressable_under(memory(&store), &doubled).await,
+            [doubled]
+        );
     }
 
     /// A version slot of 20 tildes, which `Path::from` percent-encodes.
@@ -1166,8 +1169,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            unaddressable_under(&store, &manifest_prefix(&TENANT_A, "hits").expect("prefix"))
-                .await,
+            unaddressable_under(&store, &manifest_prefix(&TENANT_A, "hits").expect("prefix")).await,
             [tilde.clone()]
         );
         let rest: Vec<String> = listed
@@ -1222,7 +1224,10 @@ mod tests {
         // rather than as an entry.
         let listed = list(memory(&store), &TENANT_A, "hits").await.expect("list");
         assert!(listed.iter().all(|e| e.key != doubled), "{listed:?}");
-        assert_eq!(unaddressable_under(memory(&store), &doubled).await, [doubled]);
+        assert_eq!(
+            unaddressable_under(memory(&store), &doubled).await,
+            [doubled]
+        );
     }
 
     /// On S3 a stray key `Path::parse` refuses fails the listing that meets
