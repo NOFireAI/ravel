@@ -625,8 +625,9 @@ enum Command {
         /// (issue #801). Stored objects come out much smaller than the
         /// target: on the ClickBench corpus the estimate counts about 5.9 KB
         /// per row and a stored object holds about 89 bytes per row, so
-        /// stored objects are about 65x below the target (375,000,000 gave
-        /// 5.7 MB objects, 1,650,000,000 about 22 MB). That ratio is a
+        /// stored objects are about 65 to 75 times below the target
+        /// (375,000,000 gave 5.7 MB objects, 66x; 1,650,000,000 about 22 MB,
+        /// 75x). That ratio is a
         /// property of that corpus, not of the format. At the default `1`
         /// every batch flushes as its own object the moment it is written:
         /// one object per involved shard per batch, so `--batch-rows` sets
