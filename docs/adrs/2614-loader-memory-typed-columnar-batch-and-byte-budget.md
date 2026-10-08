@@ -478,16 +478,22 @@ geometric mean.
 | R2 | c6a.2xlarge, 16 GB | R1b flags | 1,041 s (stock v0.22.0: 1,448 s) | 4.35 GB | 8.6 MB | 42 of 43 answered |
 | R3 | c6a.xlarge, 8 GB | R1b flags, `--load-memory-bytes 3000000000` | 1,908 s (stock: 2,905 s) | 4.00 GB | 11.5 MB | 37 of 43 answered |
 | R4 | c6a.large, 4 GB | R1b flags, `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s (stock: load failed) | 2.02 GB | 10.4 MB | 28 of 43 answered |
+| R5 | r6a.4xlarge | as R1e, `--target-bytes 1850000000` | 896 s | 7.03 GB | 24.5 MB median, 25.1 MB mean (407 objects, 10,206,007,213 bytes) | 499.4 / 60.6 / 0.769 |
+| R6 | c6a.2xlarge, 16 GB | R5 flags | 1,203 s (stock: 1,448 s) | 6.04 GB | 24.5 MB median, 24.9 MB mean (410 objects, 10,205,895,571 bytes) | 42 of 43 answered |
+| R7 | c6a.xlarge, 8 GB | R5 flags, `--pipeline-depth 24 --load-memory-bytes 3500000000` | 1,965 s (stock: 2,905 s) | 4.92 GB | 23.9 MB median, 23.9 MB mean (426 objects, 10,202,084,220 bytes) | 37 of 43 answered |
+| R8 | c6a.large, 4 GB | R5 flags, `--pipeline-depth 16 --read-cursors 2 --load-memory-bytes 1200000000` | 3,905 s (stock: load failed) | 1.95 GB | 17.1 MB median, 18.3 MB mean (563 objects, 10,322,446,037 bytes) | 28 of 43 answered |
 
 Verdicts against the acceptance table:
 
-- **Large objects under a fixed RSS: the RSS limit is met, the object
-  size is not quite.** R1d and R1e peaked at 5.77 and 6.42 GB of loader
-  RSS against the 8 GB limit. Their median objects are 21.9 and 22.1 MB
-  (90th percentile about 30 MB), about 12% short of the 25 MB this table
-  names; their means are 22.4 MB (R1d, 10,196,683,756 bytes / 455
-  objects) and 22.6 MB (R1e, 10,197,978,095 bytes / 451 objects), about
-  10% short on the same basis. B0 itself, the baseline this table's 25 MB
+- **Large objects under a fixed RSS: met by R5 on the mean.** R5 peaked
+  at 7.03 GB of loader RSS against the 8 GB limit and stored 25.1 MB mean
+  objects (10,206,007,213 bytes / 407 objects), the same basis as B0's
+  24.8 MB mean; its median is 24.5 MB, 2% under 25 MB. R1d and R1e, at the 1,650,000,000 target, peaked at
+  5.77 and 6.42 GB but stored 21.9 and 22.1 MB median objects (90th
+  percentile about 30 MB), about 12% short of the 25 MB this table names;
+  their means are 22.4 MB (R1d, 10,196,683,756 bytes / 455 objects) and
+  22.6 MB (R1e, 10,197,978,095 bytes / 451 objects), about 10% short on
+  the same basis. B0 itself, the baseline this table's 25 MB
   figure was read off, sat at 24.8 MB mean (10,227,376,733 bytes / 413
   objects; its median was not recorded). Stored bytes per row, each total
   divided by the corpus's 99,997,497 rows: B0 102.3 (10,227,376,733), R1
@@ -495,33 +501,58 @@ Verdicts against the acceptance table:
   (10,197,978,095), so B0 stores about the same 100 to 102 bytes per row
   as the later runs. The wave 4
   pre-registration on #2627 set a 20 MB median as the pass band, which
-  R1d and R1e meet.
+  R1d and R1e meet; the follow-up pre-registration set a 24 MB median
+  and a 25 MB mean for R5, and R5 meets both.
 - **Load time no worse: met.** The baseline is B0 at 1,461 s, so the limit
-  is 1,534 s; R1d took 1,139 s (0.78x) and R1e 858 s (0.59x).
+  is 1,534 s; R1d took 1,139 s (0.78x), R1e 858 s (0.59x) and R5 896 s
+  (0.61x).
 - **Objects byte-identical: met** by the row-versus-columnar tests in
   `ravel-logseg` (`row_and_columnar_paths_identical_under_a_key` and its
   siblings), which pass on this tree.
-- **4 GB: the load is met, the object size is not measured.** R4's load
-  completed, so no shard-ack timeout ended it, where stock v0.22.0 failed;
-  the budget bound (163 decoder waits, peak charge 1,199,715,423 bytes).
-  But R4 ran the R1b flags and stored 10.4 MB median objects, not the
-  25 MB this row names.
-- **8 GB and 16 GB: the load time is met, the object size is not
-  measured.** R3 took 0.66x and R2 0.72x the stock load time, against the
-  1.5x limit, at 11.5 and 8.6 MB median objects, not 25 MB.
+- **4 GB: the load is met, the object size is not.** R8 completed in
+  3,905 s at 1.95 GB peak loader RSS, so no shard-ack timeout ended it,
+  where stock v0.22.0 failed. The budget bound hard (187 decoder waits,
+  peak charge 1,198,284,910 bytes of 1,200,000,000), and its flush split
+  is size 240, age 20, final 310: the `final` count includes the
+  stall flusher's early drains, which publish through the same
+  `FlushNow` path as the end-of-input drain. Its objects are 17.1 MB
+  median (10th percentile 2.9 MB) and 18.3 MB mean, short of 25 MB. R4,
+  at the R1b flags, also completed where stock failed, with the budget
+  binding (163 decoder waits, peak charge 1,199,715,423 bytes), at
+  10.4 MB median objects.
+- **16 GB: the load time is met, objects are about 1% short of 25 MB.**
+  R6 ran the R5
+  flags unchanged: 1,203 s, 0.83x the stock 1,448 s against the 1.5x
+  limit, at 6.04 GB peak loader RSS, with 24.5 MB median and 24.9 MB mean
+  objects (10,205,895,571 bytes / 410 objects). R2, at the R1b flags,
+  took 0.72x at 8.6 MB median objects.
+- **8 GB: the load time is met, objects are about 4% short of 25 MB.**
+  R7, at depth 24 and a 3,500,000,000-byte budget, took 1,965 s, 0.68x
+  the stock 2,905 s, at 4.92 GB peak loader RSS, with 23.9 MB median and
+  mean objects (10,202,084,220 bytes / 426 objects). The budget bound:
+  the charge peaked at 3,497,782,663 bytes and the decoder waited 9
+  times. R3, at the R1b flags, took 0.66x at 11.5 MB median objects.
 
-The small-host runs used the R1b flags, at depth 16 and the 2 s age
-trigger, so their objects are 8.6 to 11.5 MB; the R1e recipe was run only
-on the r6a.4xlarge. Large objects on 4, 8 and 16 GB hosts remain to be
-measured, with `--load-memory-bytes` scaled to each host.
+The R2 to R4 runs used the R1b flags, at depth 16 and the 2 s age
+trigger, so their objects are 8.6 to 11.5 MB. R6 to R8 ran the R5 recipe:
+R6 with its depth and budget unchanged, R7 and R8 with
+`--pipeline-depth` and `--load-memory-bytes` scaled down to the host.
+Query completion, reported and not gated: each of R6, R7 and R8 failed
+exactly the statements that R2, R3 and R4 failed on the same host (1, 6
+and 15 of 43), so the larger objects did not change which statements
+complete there; that remains #2615.
 
 The recipe for large stored objects from small batches, which the
-target-bytes amendment left open, is R1e:
+target-bytes amendment left open, is R5:
 
 ```sh
---batch-rows 100000 --target-bytes 1650000000 --max-flush-delay 30s \
+--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s \
   --pipeline-depth 32 --load-memory-bytes 6500000000
 ```
+
+On an 8 GB host R7 used `--pipeline-depth 24 --load-memory-bytes
+3500000000`, and on a 4 GB host R8 used `--pipeline-depth 16
+--read-cursors 2 --load-memory-bytes 1200000000`.
 
 The target-bytes amendment's "about 15 times below the target" is wrong as
 a ratio. Stored bytes per row, from the measured totals above, run 99.1
@@ -533,11 +564,13 @@ over 100 KB (the listing its median and mean are read from), so
 (1,650,000,000 / 221,724). That pair, about 7.4 KB estimated against
 about 102 B stored per row, predicts 221,724 x 102 is about 22.6 MB,
 R1e's own mean: there is no over-prediction, so the 1,650,000,000 target
-was simply too low for 25 MB objects on this corpus (about 1,850,000,000
-would be needed by the same arithmetic, unmeasured). Stored objects are
-about 65 to 75 times below `--target-bytes` once nothing else closes them
-first: 375,000,000 stored 5.7 MB (R1, 66x), and 1,650,000,000 about 22 MB
-(R1c to R1e, 75x). The wave 3 run's objects were closed early by the
+was simply too low for 25 MB objects on this corpus. The same arithmetic
+gives 1,850,000,000 / 7,440 is about 248,656 rows, times 102 B is about
+25.4 MB; R5 was pre-registered on that figure and measured 25.1 MB mean.
+Stored objects are about 65 to 75 times below `--target-bytes` once
+nothing else closes them first: 375,000,000 stored 5.7 MB (R1, 66x),
+1,650,000,000 about 22 MB (R1c to R1e, 75x), and 1,850,000,000 24.5 MB
+median and 25.1 MB mean (R5, 75x on the median, 74x on the mean). The wave 3 run's objects were closed early by the
 pipeline-depth cap and the age trigger, so its 15x measured those caps.
 The ratio is a property of this corpus, not of the format.
 
@@ -547,6 +580,8 @@ time scales with `--pipeline-depth`, because each Strict write waits for
 the flush of its own batch and the depth bounds how many batches fill a
 shard buffer at once: 16, 24 and 32 took 1,990, 1,139 and 858 s (R1c to
 R1e). The budget grows with the depth, since more batches are held at
-once. The `--target-bytes` and `--pipeline-depth` help and
-docs/guides/ingest.md now carry this recipe and its measured outcome in
-place of "pending".
+once. R5, which differs from R1e only in the larger target, peaked at
+7.03 GB of loader RSS against R1e's 6.42 GB. The `--target-bytes` help
+and docs/guides/ingest.md now carry this recipe and its measured outcome
+in place of "pending", and the `--pipeline-depth` help carries the depth
+sweep.

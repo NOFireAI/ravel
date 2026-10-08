@@ -627,7 +627,7 @@ enum Command {
         /// per row and a stored object holds about 102 bytes per row, so
         /// stored objects are about 65 to 75 times below the target
         /// (375,000,000 gave 5.7 MB objects, 66x; 1,650,000,000 about 22 MB,
-        /// 75x). That ratio is a
+        /// 75x; 1,850,000,000 25.1 MB mean, 74x). That ratio is a
         /// property of that corpus, not of the format. At the default `1`
         /// every batch flushes as its own object the moment it is written:
         /// one object per involved shard per batch, so `--batch-rows` sets
@@ -640,11 +640,11 @@ enum Command {
         /// this target, a `--pipeline-depth` that covers the batches one
         /// object needs on a shard, and a `--max-flush-delay` long enough for
         /// one object to fill. Measured on ClickBench (issue #2627),
-        /// `--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay
+        /// `--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay
         /// 30s --pipeline-depth 32 --load-memory-bytes 6500000000` stored
-        /// objects of about 22 MB and loaded in 858 s at a 6.42 GB peak
-        /// loader RSS on a 16-vCPU 128 GB host. The same target at the 2s
-        /// default delay closed 798 of its 916 objects on age (10.2 MB
+        /// objects of 25.1 MB (mean) and loaded in 896 s at a 7.03 GB peak
+        /// loader RSS on a 16-vCPU 128 GB host. A 1,650,000,000 target at the
+        /// 2s default delay closed 798 of its 916 objects on age (10.2 MB
         /// median).
         ///
         /// The estimate sums body, severity text, stream attributes,

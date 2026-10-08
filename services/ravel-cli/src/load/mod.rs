@@ -186,7 +186,8 @@ pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = DEFAULT_PIPELINE_DEPTH as u32;
 /// the router's age trigger, the third binding constraint on object layout
 /// beside `target_bytes` and a batch's per-shard slice footprint (issue #801):
 /// a shard buffer flushes when it reaches `target_bytes`, when its oldest point
-/// ages past `max_flush_delay`, or at the final drain. At the default 2s a
+/// ages past `max_flush_delay`, or on a drain (the final drain, or the
+/// loader's budget-stall and straggler flushes). At the default 2s a
 /// buffer that fills slower than one target's worth every 2s is released by age
 /// before it ever reaches a large `target_bytes`, so a bulk load that wants
 /// target-sized objects must raise this delay past the time one target takes to
@@ -416,7 +417,11 @@ pub struct FlushMixCounts {
     pub size: u64,
     /// Flushes opened because a shard buffer aged past `max_flush_delay`.
     pub age: u64,
-    /// Flushes opened by the final drain at load close.
+    /// Flushes opened by a drain: the final drain at load close, and the
+    /// loader's budget-stall and straggler flushes, which publish through the
+    /// same `FlushNow` path ([`FlushTrigger::Manual`]).
+    ///
+    /// [`FlushTrigger::Manual`]: ravel_ingest::FlushTrigger::Manual
     #[serde(rename = "final")]
     pub final_drain: u64,
 }

@@ -936,6 +936,14 @@ cold total seconds, hot total seconds and the geometric mean.
 | R2 | c6a.2xlarge, 16 GB | R1b flags | 1,041 s (stock v0.22.0: 1,448 s) | 4.35 GB | 8.6 MB | 42 of 43 answered |
 | R3 | c6a.xlarge, 8 GB | R1b flags, `--load-memory-bytes 3000000000` | 1,908 s (stock: 2,905 s) | 4.00 GB | 11.5 MB | 37 of 43 answered |
 | R4 | c6a.large, 4 GB | R1b flags, `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s (stock: load failed) | 2.02 GB | 10.4 MB | 28 of 43 answered |
+| R5 | r6a.4xlarge | as R1e, `--target-bytes 1850000000` | 896 s | 7.03 GB | 24.5 MB median, 25.1 MB mean (407 objects, 10,206,007,213 bytes) | 499.4 / 60.6 / 0.769 |
+| R6 | c6a.2xlarge, 16 GB | R5 flags | 1,203 s (stock: 1,448 s) | 6.04 GB | 24.5 MB median, 24.9 MB mean (410 objects, 10,205,895,571 bytes) | 42 of 43 answered |
+| R7 | c6a.xlarge, 8 GB | R5 flags, `--pipeline-depth 24 --load-memory-bytes 3500000000` | 1,965 s (stock: 2,905 s) | 4.92 GB | 23.9 MB median, 23.9 MB mean (426 objects, 10,202,084,220 bytes) | 37 of 43 answered |
+| R8 | c6a.large, 4 GB | R5 flags, `--pipeline-depth 16 --read-cursors 2 --load-memory-bytes 1200000000` | 3,905 s (stock: load failed) | 1.95 GB | 17.1 MB median, 18.3 MB mean (563 objects, 10,322,446,037 bytes) | 28 of 43 answered |
+
+R5 to R8 were pre-registered on #2627 before launch, from the per-row
+model below: 1,850,000,000 / 7,440 is about 248,656 rows per object, times
+102 B is about 25.4 MB.
 
 - **The target ratio.** Stored bytes per row, from the measured totals:
   B0 102.3, R1 99.1, R1d 102.0, R1e 102.0 (each total divided by the
@@ -946,17 +954,19 @@ cold total seconds, hot total seconds and the geometric mean.
   row (1,650,000,000 / 221,724). That pair, about 7.4 KB estimated
   against about 102 B stored per row, predicts 221,724 x 102 is about
   22.6 MB, R1e's own mean: the 1,650,000,000 target was simply too low
-  for 25 MB objects on this corpus (about 1,850,000,000 would be needed
-  by the same arithmetic, unmeasured), not an over-prediction. Stored
-  objects are about 65 to 75 times below `--target-bytes` when the target
-  is what closes them: 375,000,000 stored 5.7 MB (R1, 66x), 1,650,000,000
-  about 22 MB (R1c to R1e, 75x). Wave 3's 7 to 15 times was a run
+  for 25 MB objects on this corpus, not an over-prediction. R5, at
+  1,850,000,000, measured 25.1 MB mean against the 25.4 MB the same
+  arithmetic predicts. Stored objects are about 65 to 75 times below
+  `--target-bytes` when the target is what closes them: 375,000,000
+  stored 5.7 MB (R1, 66x), 1,650,000,000 about 22 MB (R1c to R1e, 75x),
+  1,850,000,000 24.5 MB median, 25.1 MB mean (R5, 75x on the median).
+  Wave 3's 7 to 15 times was a run
   whose objects closed early; it did not measure the estimate. The ratio
   is a property of this corpus.
 - **The age trigger.** At the 2 s default, 798 of R1b's 916 objects closed
   on age. A 30 s delay (R1c) let them reach the target. R1e's 453 objects
-  split size 433, age 13, final 7: the target is what closed almost all
-  of them.
+  split size 433, age 13, final 7, and R5's 408 split size 390, age 14,
+  final 4: the target is what closed almost all of them.
 - **Pipeline depth sets load time once objects are large.** Each Strict
   write waits for its batch's flush, so the depth bounds how many batches
   fill a shard buffer at once: 16, 24 and 32 took 1,990, 1,139 and 858 s.
@@ -970,11 +980,21 @@ cold total seconds, hot total seconds and the geometric mean.
   same basis. B0 itself sat at 24.8 MB mean (10,227,376,733 bytes / 413
   objects; its median was not recorded) and stored about 102 bytes per
   row (10,227,376,733 / 99,997,497), the same 100 to 102 bytes per row as
-  R1, R1d and R1e. 4 GB: the load completed where stock failed, and the
-  budget bound (163 decoder waits, peak charge 1,199,715,423 bytes). 8
-  and 16 GB: load time met by R3 (0.66x stock) and R2 (0.72x). The
-  small-host runs used the R1b flags, so their objects are 8.6 to 11.5
-  MB: large objects on 4, 8 and 16 GB hosts were not measured.
+  R1, R1d and R1e. R5 closes the object-size gap: 25.1 MB mean and
+  24.5 MB median at 7.03 GB peak loader RSS and 896 s (0.61x B0). 16 GB:
+  R6 ran the R5 flags in 1,203 s (0.83x stock) at 6.04 GB, 24.5 MB
+  median and 24.9 MB mean objects. 8 GB: R7 took 1,965 s (0.68x stock)
+  at 4.92 GB, 23.9 MB median objects; the budget bound (9 decoder waits,
+  peak charge 3,497,782,663 bytes). 4 GB: R8 completed in 3,905 s
+  (stock failed) at 1.95 GB; the budget bound hard (187 decoder waits,
+  peak charge 1,198,284,910 bytes) and its flush split is size 240, age
+  20, final 310, where `final` includes the stall flusher's early drains,
+  so its objects are 17.1 MB median and 18.3 MB mean, short of 25 MB.
+  R6, R7 and R8 failed exactly the statements R2, R3 and R4 failed (1, 6
+  and 15 of 43). R2 to R4 used the R1b
+  flags, so their objects are 8.6 to 11.5 MB; R4's 4 GB load completed
+  where stock failed, with the budget binding (163 decoder waits, peak
+  charge 1,199,715,423 bytes).
 
 ## Follow-ups, in order, with the expected saving each
 
