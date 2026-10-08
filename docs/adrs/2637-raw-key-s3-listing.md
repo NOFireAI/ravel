@@ -99,7 +99,7 @@ failures, and the amendment names this issue as the adapter defect.
 
 ```mermaid
 flowchart TD
-    A["list / list_after / list_delimited"] --> B["GET ?list-type=2&prefix=P&(start-after=RAW | continuation-token=T)&max-keys=N&encoding-type=url<br/>signed with the bucket_config SigV4 signer,<br/>sent through S3HttpConnector inside connector::scope(List)"]
+    A["list / list_after / list_delimited"] --> B["GET ?list-type=2&prefix=P&(start-after=RAW | continuation-token=T)&max-keys=N&encoding-type=url<br/>signed with the bucket_config SigV4 signer,<br/>sent through S3HttpConnector inside connector::scope(List),<br/>or scope(ListDelimited) for list_delimited"]
     B -->|"5xx, 429, 408, connect/request/timeout"| R["retry: object_store's RetryConfig values<br/>(10 retries, 180 s, backoff 100 ms to 15 s, base 2)"]
     R --> B
     B -->|"other status"| E["typed StoreError (table in decision 1)"]
@@ -134,7 +134,9 @@ they did before.
 
 - query parameters `list-type=2`, `prefix=<raw prefix>`,
   `start-after=<raw key>` when a call resumes from a `PageToken` or the
-  caller gave one, `continuation-token=<token>` when a call follows a
+  caller gave one; when `list_after` has both, the `PageToken` wins, since a
+  present page token is always past the caller's `start_after` (the rule
+  `s3.rs:2767-2777` already states). `continuation-token=<token>` when a call follows a
   truncated response it received itself (see Paging), `max-keys=<n>`,
   `encoding-type=url`, and `delimiter=/` for `list_delimited`. "Raw" here
   is at the key level: `canonical_query` still URI-escapes each value into
@@ -212,10 +214,23 @@ raw last key. In detail:
   - a truncated response whose `NextContinuationToken` equals the token
     just sent is the existing `StoreError::ListRepeatedToken { prefix }`,
     which `ravel-maintain` and `ravel-catalog` already match by name;
-  - a call that has followed `MAX_LIST_PAGES` responses and is still
-    truncated is the existing `StoreError::ListPageCeiling`, so a backend
-    that keeps issuing fresh tokens without ending cannot loop one
-    `list_delimited` call forever.
+  - a call that is still truncated after its response ceiling is the
+    existing `StoreError::ListPageCeiling`, so a backend that keeps issuing
+    fresh tokens without ending cannot loop one call forever. The ceiling
+    differs by call, because only one of them composes with `drain_pages`:
+    - `list_delimited` returns a whole listing and no drain wraps it, so
+      its ceiling is `MAX_LIST_PAGES` (100 000 responses), the same bound
+      the contract already gives a drained listing;
+    - a `ListPage` call (`list`, `list_after`) is itself one page of a
+      drain that is already capped at `MAX_LIST_PAGES` pages, so its own
+      ceiling is a new, small `MAX_RESPONSES_PER_PAGE` of
+      `ceil(page_size / 1000) + 16`: the responses a full page needs plus
+      16 that may come back empty. The composed wire-request bound of a
+      drained `S3Store` listing is therefore
+      `MAX_LIST_PAGES × MAX_RESPONSES_PER_PAGE`, 1.7 million requests at
+      the default 1000-key page size, where today the loop inside
+      `object_store` has no bound. The contract's page-ceiling sentence
+      changes to state it (see "Docs that change").
 - A truncated response with no `NextContinuationToken` at all is
   `StoreError::Permanent` naming the prefix, since there is nothing to
   follow. These three are the only shapes refused.
@@ -449,14 +464,28 @@ properties:
   ordinary `put`, come back from a listing verbatim. This is the
   per-backend check of the `encoding-type=url` decoding assumption in
   decision 1, and the RustFS run in Task 1 must pass it.
-- `OperationsRefuseUnaddressableKeys`, on every subject: `get`, `head`,
-  `put` and `delete` of such a key return `UnaddressableKey` and issue zero
-  requests (asserted on the attempt counter).
+- `OperationsRefuseUnaddressableKeys`, on every subject: `get`,
+  `get_pinned`, `pin_of`, `head`, `put` and `delete` of such a key return
+  `UnaddressableKey`.
 - `UnaddressableKeysAreCounted`: with unaddressable keys seeded among
   addressable ones, one in the middle of a page and one on each side of a
-  page boundary, the listing returns every addressable key once, reports
-  exactly the seeded keys in `unaddressable`, and the metric moves by their
-  number. Seeding needs a writer outside the trait, since every subject now
+  page boundary, the listing returns every addressable key once and reports
+  exactly the seeded keys in `unaddressable`.
+
+The suite receives only a `&dyn ObjectStoreBackend`, which exposes no
+metrics or attempt counter, and `MemoryStore` has no attempt counter at all.
+So the conformance properties assert only what the trait returns. Two
+claims are pinned elsewhere:
+
+- that a refused operation sends no request, by the `s3_http_faults.rs`
+  cases below, which see every request the scripted server receives;
+- that `ravel_store_list_unaddressable_total` moves by the skipped count,
+  by a unit test on `S3Store` wrapped in `InstrumentedStore` against the
+  scripted server, reading `InstrumentedStore::metrics()`.
+
+The seeding rule for `UnaddressableKeysAreCounted`:
+
+Seeding needs a writer outside the trait, since every subject now
   refuses such a put, so `run_conformance_suite` takes an optional
   foreign-key seeder: `MemoryStore::insert_foreign`, the scripted server's
   script, or for a RustFS or S3 run a signed PUT in test code (a fixture,
@@ -509,8 +538,14 @@ axum server already answers ListObjectsV2 (`Op::List`), extended to script a
 
 - `docs/object-store-contract.md`: listing (raw prefix, raw `start-after`,
   `unaddressable`, the metric), the `UnaddressableKey` error, the retry
-  sentence at "Retry and failure", and `S3Store`'s line under
-  "Implementations".
+  sentence at "Retry and failure", the page-ceiling sentence (now the
+  composed `MAX_LIST_PAGES × MAX_RESPONSES_PER_PAGE` request bound for
+  `S3Store`, and `MAX_LIST_PAGES` responses for `list_delimited`), and
+  `S3Store`'s line under "Implementations".
+- `crates/ravel-maintain/src/discover.rs` module doc: the adapter now
+  classifies tenant prefixes, so an unaddressable one is skipped and counted
+  before `discover_tenants` sees it, and `InvalidTenantPrefix` covers only
+  an addressable prefix that is not 32 hex characters.
 - `docs/adrs/2040-parquet-tables-queried-in-place.md`: a new amendment to
   the version bound amendment and the 2026-10-06 amendment, replacing "on S3
   ... fails the whole listing" and the page-boundary paragraph with the
@@ -573,7 +608,9 @@ Acceptance:
   them through `insert_foreign` and assert the same output.
 
 **Task 3: ADR-2040 and module docs** (docs only, after tasks 1 and 2 land).
-The ADR-2040 amendment and the `resolve.rs` module doc listed under
-Consequences. Acceptance: `scripts/guards/check-amendment-integrity.sh`
-passes with the new amendment's markers, and no sentence in ADR-2040 or
-`resolve.rs` still says S3 fails a listing on such a key.
+The ADR-2040 amendment and the `resolve.rs` and `discover.rs` module docs
+listed under Consequences. Acceptance: `scripts/guards/check-amendment-integrity.sh`
+passes with the new amendment's markers, no sentence in ADR-2040 or
+`resolve.rs` still says S3 fails a listing on such a key, and `discover.rs`
+no longer promises `InvalidTenantPrefix` for a prefix the adapter now
+skips.
