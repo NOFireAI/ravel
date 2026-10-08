@@ -506,8 +506,9 @@ impl ObjectStoreBackend for MemoryStore {
                 break;
             }
         }
-        // Unaddressable keys count toward the page and can be its last key, as
-        // on S3: classification happens after the page is cut.
+        // Unaddressable keys count toward the page and can be its last key:
+        // classification happens after the page is cut. The token resumes on
+        // the raw key, which S3Store cannot do; see `s3::assemble_page`.
         let next = if out.len() == self.page_size {
             out.last().map(|m| PageToken(m.key.clone()))
         } else {
