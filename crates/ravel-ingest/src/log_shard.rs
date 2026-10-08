@@ -1763,6 +1763,12 @@ impl LogShardActor {
     /// flush-trigger accounting (`flush_est_bytes >= target_bytes`, or
     /// `est_bytes` past the memory backstop), the charge and waiter handling,
     /// and the size-flush path are identical to the row path.
+    ///
+    /// Every sender must call [`ColumnarLogBatch::validate`] on the batch (or
+    /// on the parent it was partitioned from) first: [`est_columnar_bytes`]
+    /// runs on arrival and indexes `stream_attrs` by `stream_refs` unchecked.
+    /// [`crate::LogIngestRouter`] is the only production sender and validates
+    /// before it partitions.
     async fn handle_write_columnar(
         &mut self,
         tenant: TenantId,
