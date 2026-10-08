@@ -1414,11 +1414,17 @@ fn bucket_config_probe(
     }
 }
 
-/// `key -> Path`. `object_store::path::Path` percent-encodes a small set of
-/// reserved bytes per segment; plain ASCII keys (the only kind this crate's
-/// tests and Ravel's own key scheme produce) round-trip exactly.
-pub(crate) fn path_of(key: &str) -> Path {
-    Path::from(key)
+/// `key -> Path`, or [`StoreError::UnaddressableKey`] when the two differ.
+///
+/// `Path::from` drops empty segments and percent-encodes control characters,
+/// non-ASCII bytes, `.`/`..` segments and reserved punctuation such as `*` and
+/// `#`, so a request built from a key it rewrites would reach another key
+/// (ADR-2637 decision 3). Every key operation of [`S3Store`] and
+/// [`crate::external::ExternalStore`] builds its `Path` here, before any
+/// request, so a refused key sends nothing.
+pub(crate) fn path_of(key: &str) -> Result<Path, StoreError> {
+    crate::check_addressable(key)?;
+    Ok(Path::from(key))
 }
 
 /// `prefix -> Option<Path>`, `None` for the empty (whole-bucket) prefix so
@@ -2146,6 +2152,9 @@ impl S3Store {
             // implements the operation and never refuses a write it was not
             // asked to make. Passed through for the same reason.
             Err(e @ (StoreError::Unsupported { .. } | StoreError::ReadOnly { .. })) => Err(e),
+            // The put that got here already passed `path_of` for this key, so
+            // `head` cannot refuse it. Passed through for the same reason.
+            Err(e @ StoreError::UnaddressableKey { .. }) => Err(e),
             Err(
                 StoreError::AccessDenied(_)
                 | StoreError::PreconditionFailed
@@ -2175,7 +2184,7 @@ impl S3Store {
                 crate::MULTIPART_MAX_PARTS
             )));
         }
-        let path = path_of(key);
+        let path = path_of(key)?;
         let mut upload = self
             .store
             .put_multipart(&path)
@@ -2293,8 +2302,9 @@ impl S3Store {
         // The observation slot is scoped to this one request, so the
         // concurrently-polled ranged GETs of a split whole-object read do not
         // overwrite each other's response headers.
+        let path = path_of(key)?;
         let (result, observation) = connector::observe_get(self.store.get_opts(
-            &path_of(key),
+            &path,
             OsGetOptions {
                 range,
                 if_match: pin.map(|pin| pin.etag.clone()),
@@ -2579,6 +2589,7 @@ impl ObjectStoreBackend for S3Store {
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
         connector::scope(StoreOp::Put, async move {
+            let path = path_of(key)?;
             preflight_checksum(&data, opts.checksum)?;
             // Large payloads go out as a multipart upload, but only under
             // `Overwrite`: `object_store` 0.14 has no conditional
@@ -2620,7 +2631,6 @@ impl ObjectStoreBackend for S3Store {
                     version: Some(version.0.clone()),
                 }),
             };
-            let path = path_of(key);
             let payload = PutPayload::from(data);
             let result = match self
                 .store
@@ -2661,7 +2671,7 @@ impl ObjectStoreBackend for S3Store {
     ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
         let upload = self
             .store
-            .put_multipart(&path_of(key))
+            .put_multipart(&path_of(key)?)
             .await
             .map_err(map_error_common)?;
         Ok(Box::new(S3MultipartUpload {
@@ -2703,7 +2713,7 @@ impl ObjectStoreBackend for S3Store {
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
         connector::scope(StoreOp::Head, async move {
-            let path = path_of(key);
+            let path = path_of(key)?;
             let meta = self.store.head(&path).await.map_err(map_error_common)?;
             map_meta(meta)
         })
@@ -2721,7 +2731,7 @@ impl ObjectStoreBackend for S3Store {
     /// is ETag-only, which is the honest answer: there is nothing to select.
     async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
         connector::scope(StoreOp::Head, async move {
-            let path = path_of(key);
+            let path = path_of(key)?;
             let meta = self.store.head(&path).await.map_err(map_error_common)?;
             meta_to_pin(meta)
         })
@@ -2751,7 +2761,12 @@ impl ObjectStoreBackend for S3Store {
             } else {
                 None
             };
-            Ok(ListPage { objects: out, next })
+            let (objects, unaddressable) = crate::classify_objects(prefix, out);
+            Ok(ListPage {
+                objects,
+                next,
+                unaddressable,
+            })
         })
         .await
     }
@@ -2792,7 +2807,12 @@ impl ObjectStoreBackend for S3Store {
             } else {
                 None
             };
-            Ok(ListPage { objects: out, next })
+            let (objects, unaddressable) = crate::classify_objects(prefix, out);
+            Ok(ListPage {
+                objects,
+                next,
+                unaddressable,
+            })
         })
         .await
     }
@@ -2805,19 +2825,24 @@ impl ObjectStoreBackend for S3Store {
                 .list_with_delimiter(prefix_path.as_ref())
                 .await
                 .map_err(map_error_common)?;
-            let objects = result
+            let listed = result
                 .objects
                 .into_iter()
                 .map(map_meta)
                 .collect::<Result<Vec<_>, _>>()?;
-            let common_prefixes = result
+            let listed_prefixes = result
                 .common_prefixes
                 .into_iter()
                 .map(|p| format!("{p}/"))
                 .collect();
+            let (objects, unaddressable) = crate::classify_objects(prefix, listed);
+            let (common_prefixes, unaddressable_prefixes) =
+                crate::classify_prefixes(prefix, listed_prefixes);
             Ok(DelimitedList {
                 objects,
                 common_prefixes,
+                unaddressable,
+                unaddressable_prefixes,
             })
         })
         .await
@@ -2825,7 +2850,7 @@ impl ObjectStoreBackend for S3Store {
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         connector::scope(StoreOp::Delete, async move {
-            let path = path_of(key);
+            let path = path_of(key)?;
             match self.store.delete(&path).await.map_err(map_delete_error) {
                 Ok(()) => Ok(()),
                 // Idempotent per the contract: deleting a missing key succeeds.

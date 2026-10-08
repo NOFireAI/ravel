@@ -3349,6 +3349,10 @@ pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
             previous: previous.clone(),
             offending: offending.clone(),
         },
+        StoreError::UnaddressableKey { key, addresses } => StoreError::UnaddressableKey {
+            key: key.clone(),
+            addresses: addresses.clone(),
+        },
     }
 }
 

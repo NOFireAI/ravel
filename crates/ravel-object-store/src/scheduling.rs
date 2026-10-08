@@ -1003,6 +1003,7 @@ mod tests {
             Ok(ListPage {
                 objects: Vec::new(),
                 next: None,
+                unaddressable: Vec::new(),
             })
         }
 
@@ -1010,6 +1011,8 @@ mod tests {
             Ok(DelimitedList {
                 objects: Vec::new(),
                 common_prefixes: Vec::new(),
+                unaddressable: Vec::new(),
+                unaddressable_prefixes: Vec::new(),
             })
         }
 

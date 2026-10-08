@@ -27,7 +27,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
+use crate::{GetRange, ObjectStoreBackend, Pin, PutMode, PutOptions, StoreError};
 
 /// Version of the probe set itself, recorded alongside a pass in
 /// `sys/qualification` (ADR-0050 section 6). Bump this whenever a probe is
@@ -42,6 +42,13 @@ use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
 /// against the last four, so `ravel-server` startup refuses it as stale
 /// (`services/ravel-server/src/qualification.rs`) and `ravel-cli store qualify`
 /// re-records over it when re-run against the same bucket.
+///
+/// The ADR-2637 properties did not bump it. Every adapter refuses an
+/// unaddressable key before sending a request, so
+/// [`Property::OperationsRefuseUnaddressableKeys`] checks the binary rather
+/// than the bucket a record attests, and
+/// [`Property::UnaddressableKeysAreCounted`] runs only with a
+/// [`ForeignKeySeeder`], which `ravel-cli store qualify` does not pass.
 pub const CONFORMANCE_SUITE_VERSION: u32 = 2;
 
 /// Root-prefix key for the durable qualification record (ADR-0050 section 6,
@@ -130,6 +137,17 @@ pub enum Property {
     /// `NotFound` and a listing of its prefix omits it, and deleting it again
     /// changes nothing. Empirical counterpart of `DeleteIdempotent`.
     DeleteVisibility,
+    /// `get`, `get_pinned`, `pin_of`, `head`, `put` and `delete` of a key the
+    /// adapter would rewrite before sending return
+    /// [`StoreError::UnaddressableKey`] naming the key it would reach instead
+    /// (ADR-2637). Runs on every subject.
+    OperationsRefuseUnaddressableKeys,
+    /// With unaddressable keys seeded among addressable ones, one in the middle
+    /// of a page and one on each side of a page boundary, a listing returns
+    /// every addressable key once and reports exactly the seeded keys as
+    /// unaddressable (ADR-2637). Needs a [`ForeignKeySeeder`]; without one it
+    /// is reported in [`ConformanceReport::not_run`], never as passed.
+    UnaddressableKeysAreCounted,
 }
 
 impl Property {
@@ -148,8 +166,35 @@ impl Property {
             Property::LexicographicListingOrder => "lexicographic_listing_order",
             Property::CrossPageListing => "cross_page_listing",
             Property::DeleteVisibility => "delete_visibility",
+            Property::OperationsRefuseUnaddressableKeys => "operations_refuse_unaddressable_keys",
+            Property::UnaddressableKeysAreCounted => "unaddressable_keys_are_counted",
         }
     }
+}
+
+/// Writes and removes keys the store under test refuses, for the properties
+/// that need an unaddressable key present (ADR-2637). Every subject refuses
+/// such a put, so the writer sits outside [`ObjectStoreBackend`]:
+/// `MemoryStore::insert_foreign`, a scripted server's script, or a signed PUT
+/// in test code against a real bucket. A fixture, never a production write
+/// path.
+#[async_trait::async_trait]
+pub trait ForeignKeySeeder: Send + Sync {
+    /// Store `data` under exactly `key`, bypassing the subject's key rules.
+    async fn seed(&self, key: &str, data: Bytes) -> Result<(), StoreError>;
+
+    /// Remove a key [`seed`](Self::seed) wrote. The subject cannot delete it
+    /// itself, so a probe that seeds also cleans up through here.
+    async fn remove(&self, key: &str) -> Result<(), StoreError>;
+}
+
+/// A property [`run_conformance_suite_with_seeder`] did not probe, and why.
+/// Neither a pass nor a failure: [`ConformanceReport::passed`] ignores it, and
+/// it never lands among the record's passed properties.
+#[derive(Debug, Clone)]
+pub struct NotRun {
+    pub property: Property,
+    pub reason: String,
 }
 
 /// Outcome of probing one [`Property`].
@@ -180,10 +225,12 @@ impl ProbeResult {
     }
 }
 
-/// Result of a full conformance run: one [`ProbeResult`] per [`Property`].
+/// Result of a full conformance run: one [`ProbeResult`] per [`Property`] that
+/// ran, and one [`NotRun`] per property the subject could not be probed for.
 #[derive(Debug, Clone)]
 pub struct ConformanceReport {
     pub results: Vec<ProbeResult>,
+    pub not_run: Vec<NotRun>,
 }
 
 impl ConformanceReport {
@@ -999,17 +1046,34 @@ impl BucketControlPlane for FixtureBucketControlPlane {
 /// that matches the backend's real configuration forces at least one real
 /// continuation-token boundary; a mismatched value either proves nothing (too
 /// small) or wastes writes proving nothing new (too large).
+///
+/// Runs with no [`ForeignKeySeeder`], so
+/// [`Property::UnaddressableKeysAreCounted`] lands in
+/// [`ConformanceReport::not_run`]; see [`run_conformance_suite_with_seeder`].
 pub async fn run_conformance_suite(
     store: &dyn ObjectStoreBackend,
     scratch_prefix: &str,
     page_size: usize,
+) -> ConformanceReport {
+    run_conformance_suite_with_seeder(store, scratch_prefix, page_size, None).await
+}
+
+/// [`run_conformance_suite`] with an optional foreign-key seeder (ADR-2637).
+/// With one, [`Property::UnaddressableKeysAreCounted`] runs and
+/// [`Property::OperationsRefuseUnaddressableKeys`] also probes keys that
+/// exist; without one the former is reported as not run, never as passed.
+pub async fn run_conformance_suite_with_seeder(
+    store: &dyn ObjectStoreBackend,
+    scratch_prefix: &str,
+    page_size: usize,
+    seeder: Option<&dyn ForeignKeySeeder>,
 ) -> ConformanceReport {
     let prefix = if scratch_prefix.ends_with('/') {
         scratch_prefix.to_string()
     } else {
         format!("{scratch_prefix}/")
     };
-    let results = vec![
+    let mut results = vec![
         probe_conditional_write_create_if_absent(store, &prefix).await,
         probe_conditional_write_cas_version(store, &prefix).await,
         probe_consistent_read_after_write(store, &prefix).await,
@@ -1020,8 +1084,20 @@ pub async fn run_conformance_suite(
         probe_lexicographic_listing_order(store, &prefix, page_size).await,
         probe_cross_page_listing(store, &prefix, page_size).await,
         probe_delete_visibility(store, &prefix).await,
+        probe_operations_refuse_unaddressable_keys(store, &prefix, seeder).await,
     ];
-    ConformanceReport { results }
+    let mut not_run = Vec::new();
+    match seeder {
+        Some(seeder) => results
+            .push(probe_unaddressable_keys_are_counted(store, &prefix, page_size, seeder).await),
+        None => not_run.push(NotRun {
+            property: Property::UnaddressableKeysAreCounted,
+            reason: "no foreign-key seeder: the subject refuses to write an unaddressable key \
+                     itself, so none could be placed for the listing to report"
+                .to_string(),
+        }),
+    }
+    ConformanceReport { results, not_run }
 }
 
 async fn probe_conditional_write_create_if_absent(
@@ -2049,6 +2125,204 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
     )
 }
 
+/// Every key operation refuses a key the adapter would rewrite (ADR-2637),
+/// with the error naming the key it would have reached. One key carries a
+/// control character and one a `*`, the two shapes S3's listing path treats
+/// differently. With a seeder the keys exist first, so a backend that serves
+/// or deletes the rewritten key instead fails here rather than answering
+/// `NotFound` by luck.
+async fn probe_operations_refuse_unaddressable_keys(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    seeder: Option<&dyn ForeignKeySeeder>,
+) -> ProbeResult {
+    let property = Property::OperationsRefuseUnaddressableKeys;
+    let keys = [
+        format!("{prefix}refuse/a\u{1}b"),
+        format!("{prefix}refuse/a*b"),
+    ];
+    if let Some(seeder) = seeder {
+        for key in &keys {
+            if let Err(err) = seeder.seed(key, Bytes::from_static(b"foreign")).await {
+                return ProbeResult::fail(property, format!("seeding {key:?} failed: {err}"));
+            }
+        }
+    }
+    let failure = first_unrefused_operation(store, &keys).await;
+    if let Some(seeder) = seeder {
+        for key in &keys {
+            if let Err(err) = seeder.remove(key).await {
+                return ProbeResult::fail(
+                    property,
+                    format!("removing the seeded {key:?} failed: {err}"),
+                );
+            }
+        }
+    }
+    match failure {
+        Some(detail) => ProbeResult::fail(property, detail),
+        None => ProbeResult::pass(
+            property,
+            format!(
+                "get, get_pinned, pin_of, head, put and delete of {keys:?} ({}) each returned \
+                 UnaddressableKey naming the key a request would reach",
+                if seeder.is_some() {
+                    "seeded first"
+                } else {
+                    "absent"
+                }
+            ),
+        ),
+    }
+}
+
+async fn first_unrefused_operation(
+    store: &dyn ObjectStoreBackend,
+    keys: &[String],
+) -> Option<String> {
+    let pin = Pin::etag("\"conformance\"");
+    for key in keys {
+        let addresses = crate::addressed_key(key);
+        let outcomes = [
+            ("get", store.get(key, GetRange::Full).await.map(|_| ())),
+            (
+                "get_pinned",
+                store
+                    .get_pinned(key, GetRange::Full, &pin)
+                    .await
+                    .map(|_| ()),
+            ),
+            ("pin_of", store.pin_of(key).await.map(|_| ())),
+            ("head", store.head(key).await.map(|_| ())),
+            (
+                "put",
+                store
+                    .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                    .await
+                    .map(|_| ()),
+            ),
+            ("delete", store.delete(key).await),
+        ];
+        for (operation, outcome) in outcomes {
+            match outcome {
+                Err(StoreError::UnaddressableKey {
+                    key: refused,
+                    addresses: reached,
+                }) if refused == *key && reached == addresses => {}
+                other => {
+                    return Some(format!(
+                        "{operation} of {key:?} returned {other:?}, expected UnaddressableKey \
+                         naming {key:?} and {addresses:?}"
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Unaddressable keys seeded among addressable ones, one in the middle of the
+/// first page and one on each side of its boundary, come back in the listing's
+/// unaddressable report exactly, and every addressable key comes back once
+/// (ADR-2637). The seeded keys alternate between a `*` and a control
+/// character.
+async fn probe_unaddressable_keys_are_counted(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    page_size: usize,
+    seeder: &dyn ForeignKeySeeder,
+) -> ProbeResult {
+    let property = Property::UnaddressableKeysAreCounted;
+    let list_prefix = format!("{prefix}unaddressable/");
+    let page = page_size.max(1);
+    let foreign_at = [page / 2, page - 1, page];
+    let key_count = page_probe_key_count(page_size);
+
+    let mut expected: Vec<String> = Vec::new();
+    let mut seeded: Vec<String> = Vec::new();
+    for i in 0..key_count {
+        if foreign_at.contains(&i) {
+            let key = if seeded.len().is_multiple_of(2) {
+                format!("{list_prefix}{i:06}*")
+            } else {
+                format!("{list_prefix}{i:06}\u{1}")
+            };
+            if let Err(err) = seeder.seed(&key, Bytes::from_static(b"foreign")).await {
+                return ProbeResult::fail(property, format!("seeding {key:?} failed: {err}"));
+            }
+            seeded.push(key);
+        } else {
+            let key = format!("{list_prefix}{i:06}");
+            if let Err(err) = store
+                .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+            {
+                return ProbeResult::fail(property, format!("put {key} failed: {err}"));
+            }
+            expected.push(key);
+        }
+    }
+
+    let failure = match crate::list_all_reporting(store, &list_prefix).await {
+        Err(err) => Some(format!(
+            "listing {list_prefix} with {} unaddressable keys seeded failed: {err}",
+            seeded.len()
+        )),
+        Ok(listing) => {
+            let listed: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+            let reported: Vec<(&str, &str)> = listing
+                .unaddressable
+                .sample
+                .iter()
+                .map(|u| (u.key.as_str(), u.addresses.as_str()))
+                .collect();
+            let seeded_report: Vec<String> =
+                seeded.iter().map(|k| crate::addressed_key(k)).collect();
+            let expected_report: Vec<(&str, &str)> = seeded
+                .iter()
+                .zip(&seeded_report)
+                .map(|(k, a)| (k.as_str(), a.as_str()))
+                .collect();
+            if listed != expected {
+                Some(format!(
+                    "listing {list_prefix} returned the addressable keys {listed:?}, expected \
+                     each of {expected:?} exactly once"
+                ))
+            } else if listing.unaddressable.count != seeded.len() as u64
+                || reported != expected_report
+            {
+                Some(format!(
+                    "listing {list_prefix} reported {} unaddressable keys {reported:?}, \
+                     expected exactly the seeded {expected_report:?}",
+                    listing.unaddressable.count
+                ))
+            } else {
+                None
+            }
+        }
+    };
+    for key in &seeded {
+        if let Err(err) = seeder.remove(key).await {
+            return ProbeResult::fail(
+                property,
+                format!("removing the seeded {key:?} failed: {err}"),
+            );
+        }
+    }
+    match failure {
+        Some(detail) => ProbeResult::fail(property, detail),
+        None => ProbeResult::pass(
+            property,
+            format!(
+                "{} addressable keys listed once each and the {} seeded unaddressable keys \
+                 {seeded:?} reported exactly, at a declared page size of {page_size}",
+                expected.len(),
+                seeded.len()
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -2064,7 +2338,7 @@ mod tests {
     /// Every property [`run_conformance_suite`] gates on. Pinned here so a new
     /// probe has to be acknowledged in the tests that assert the suite's shape
     /// rather than silently widening them.
-    const GATING_PROPERTIES: usize = 8;
+    const GATING_PROPERTIES: usize = 9;
 
     /// The `sys/qualification` JSON shape is a frozen contract (ADR-0050
     /// section 6): a record written before this struct was relocated out of
@@ -2200,6 +2474,145 @@ mod tests {
             report.failures().collect::<Vec<_>>()
         );
         assert_eq!(report.results.len(), GATING_PROPERTIES);
+        let not_run: Vec<Property> = report.not_run.iter().map(|n| n.property).collect();
+        assert_eq!(
+            not_run,
+            vec![Property::UnaddressableKeysAreCounted],
+            "without a seeder the counting property is not run, and is not among the results"
+        );
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|r| r.property != Property::UnaddressableKeysAreCounted)
+        );
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|r| r.property == Property::OperationsRefuseUnaddressableKeys && r.passed)
+        );
+    }
+
+    /// Both ADR-2637 properties pass on `MemoryStore` with
+    /// `MemoryStore::insert_foreign` as the seeder, at page sizes that put the
+    /// seeded keys mid-page and on each side of a boundary, and the seeded keys
+    /// are removed afterwards.
+    #[tokio::test]
+    async fn memory_store_with_a_seeder_passes_the_unaddressable_properties() {
+        for page_size in [1, 2, 3, 4] {
+            let store = MemoryStore::with_page_size(page_size);
+            let prefix = format!("sys/qualify/seeded-{page_size}/");
+            let report =
+                run_conformance_suite_with_seeder(&store, &prefix, page_size, Some(&store)).await;
+            assert!(
+                report.passed(),
+                "page size {page_size}: {:?}",
+                report.failures().collect::<Vec<_>>()
+            );
+            assert!(report.not_run.is_empty());
+            assert_eq!(report.results.len(), GATING_PROPERTIES + 1);
+            for property in [
+                Property::OperationsRefuseUnaddressableKeys,
+                Property::UnaddressableKeysAreCounted,
+            ] {
+                assert!(
+                    report.results.iter().any(|r| r.property == property),
+                    "{} ran",
+                    property.name()
+                );
+            }
+            let left = crate::list_all_reporting(&store, &prefix)
+                .await
+                .expect("listing");
+            assert_eq!(
+                left.unaddressable.count, 0,
+                "the probes removed every key they seeded"
+            );
+        }
+    }
+
+    /// Forwards to `MemoryStore` under the key the pre-ADR-2637 adapter would
+    /// have sent, and lists without reporting what it skips: the two defects
+    /// the ADR-2637 properties exist to catch.
+    struct RewritingStore(MemoryStore);
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RewritingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.0.put(&crate::addressed_key(key), data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.0.get(&crate::addressed_key(key), range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.0.head(&crate::addressed_key(key)).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut listed = self.0.list(prefix, page).await?;
+            listed.unaddressable.clear();
+            Ok(listed)
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.0.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(&crate::addressed_key(key)).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.0.capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_rewrites_keys_and_hides_them_fails_both_properties() {
+        let store = RewritingStore(MemoryStore::with_page_size(2));
+        let report =
+            run_conformance_suite_with_seeder(&store, "sys/qualify/rewriting/", 2, Some(&store.0))
+                .await;
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![
+                Property::OperationsRefuseUnaddressableKeys,
+                Property::UnaddressableKeysAreCounted,
+            ]
+        );
+        let refuse = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::OperationsRefuseUnaddressableKeys)
+            .expect("refusal result present");
+        assert!(
+            refuse.detail.starts_with("get of "),
+            "the first operation that did not refuse is named: {}",
+            refuse.detail
+        );
+        let counted = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::UnaddressableKeysAreCounted)
+            .expect("counting result present");
+        assert!(
+            counted.detail.contains("reported 0 unaddressable keys"),
+            "{}",
+            counted.detail
+        );
     }
 
     /// Wraps `MemoryStore` and simulates eventually consistent listing: the
@@ -2778,7 +3191,10 @@ mod tests {
             self.inner.list_delimited(prefix).await
         }
 
-        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            // Lies only about deleting, so the key rules every store applies
+            // still hold and no other property fails.
+            crate::check_addressable(key)?;
             Ok(())
         }
 
@@ -4507,7 +4923,11 @@ mod tests {
             } else {
                 None
             };
-            ListPage { objects, next }
+            ListPage {
+                objects,
+                next,
+                unaddressable: Vec::new(),
+            }
         }
     }
 

@@ -101,8 +101,8 @@ async fn qualify_re_records_over_a_stale_suite_version() {
     );
     assert_eq!(
         record.passed_properties.len(),
-        8,
-        "the upgraded record lists all eight probed properties"
+        9,
+        "the upgraded record lists all nine probed properties"
     );
 }
 

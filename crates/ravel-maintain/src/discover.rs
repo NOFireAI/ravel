@@ -19,7 +19,11 @@ use crate::error::{MaintainError, Result};
 /// [`TenantHash`]. A prefix that does not parse as exactly 32 lowercase-or-any
 /// hex characters is a fail-loud [`MaintainError::InvalidTenantPrefix`], never
 /// a silent skip: the same key-shape discipline every other object key in
-/// this crate is held to (docs/catalog-and-mvcc.md key layout).
+/// this crate is held to (docs/catalog-and-mvcc.md key layout). A prefix no
+/// store operation can address (ADR-2637) never reaches it: the adapter
+/// reports it in `unaddressable_prefixes`, counts it and warns, so
+/// `InvalidTenantPrefix` covers only an addressable prefix that is not 32 hex
+/// characters.
 pub async fn discover_tenants(store: &dyn ObjectStoreBackend) -> Result<Vec<TenantHash>> {
     let listing = store.list_delimited("t/").await?;
     let mut tenants = Vec::with_capacity(listing.common_prefixes.len());

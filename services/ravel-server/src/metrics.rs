@@ -953,6 +953,21 @@ fn render_store_family(out: &mut String, mode: Mode, snapshot: &StoreMetricsSnap
         &[Label::Mode(mode)],
         snapshot.get_unverified,
     );
+
+    // Store-wide for the same reason: keys and prefixes a listing left out as
+    // unaddressable (ADR-2637), whichever listing call skipped them.
+    write_header(
+        out,
+        "ravel_store_list_unaddressable_total",
+        "Listed keys and common prefixes skipped because no operation can address them.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_store_list_unaddressable_total",
+        &[Label::Mode(mode)],
+        snapshot.list_unaddressable,
+    );
 }
 
 /// The bucket-protection control plane's read-only GETs, from
@@ -8308,6 +8323,27 @@ mod tests {
         assert_eq!(
             family_samples(&body, "ravel_store_get_unverified_total"),
             vec!["ravel_store_get_unverified_total{mode=\"all\"} 3"]
+        );
+    }
+
+    /// `ravel_store_list_unaddressable_total` renders the recorded count
+    /// exactly once, with `mode` and no `op` label, from its own field.
+    #[test]
+    fn store_family_renders_list_unaddressable_as_one_store_wide_sample() {
+        let metrics = StoreMetrics::default();
+        metrics.record_list_unaddressable(2);
+        metrics.record_list_unaddressable(3);
+        metrics.record_get_unverified();
+        let mut body = String::new();
+        render_store_family(&mut body, Mode::All, &metrics.snapshot());
+        assert_eq!(
+            body.matches("# TYPE ravel_store_list_unaddressable_total counter\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            family_samples(&body, "ravel_store_list_unaddressable_total"),
+            vec!["ravel_store_list_unaddressable_total{mode=\"all\"} 5"]
         );
     }
 

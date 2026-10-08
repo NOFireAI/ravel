@@ -836,6 +836,7 @@ mod tests {
                     last_modified_unix_ms: 0,
                 }],
                 next: Some(ravel_object_store::PageToken("stuck".to_string())),
+                unaddressable: Vec::new(),
             })
         }
 
