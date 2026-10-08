@@ -937,16 +937,26 @@ cold total seconds, hot total seconds and the geometric mean.
 | R3 | c6a.xlarge, 8 GB | R1b flags, `--load-memory-bytes 3000000000` | 1,908 s (stock: 2,905 s) | 4.00 GB | 11.5 MB | 37 of 43 answered |
 | R4 | c6a.large, 4 GB | R1b flags, `--read-cursors 2 --load-memory-bytes 1200000000` | 3,981 s (stock: load failed) | 2.02 GB | 10.4 MB | 28 of 43 answered |
 
-- **The target ratio.** The size trigger counts the row-path estimate,
-  about 5.9 KB per row here, and a stored object holds about 89 bytes per
-  row, so stored objects are about 65 to 75 times below `--target-bytes`
-  when the target is what closes them: 375,000,000 stored 5.7 MB (R1,
-  66x), 1,650,000,000 about 22 MB (R1c to R1e, 75x; the per-row model
-  predicts about 25 MB there). Wave 3's 7 to 15 times was a run
+- **The target ratio.** Stored bytes per row, from the measured totals:
+  B0 102.3, R1 99.1, R1d 102.0, R1e 102.0 (each total divided by the
+  corpus's 99,997,497 rows) -- about 100 to 102 throughout. R1e stored
+  453 objects, 451 of them over 100 KB (the listing its median and mean
+  are read from), so 99,997,497 / 451 is about 221,724 rows per object,
+  and at the 1,650,000,000 target that is about 7,440 estimated bytes per
+  row (1,650,000,000 / 221,724). That pair, about 7.4 KB estimated
+  against about 102 B stored per row, predicts 221,724 x 102 is about
+  22.6 MB, R1e's own mean: the 1,650,000,000 target was simply too low
+  for 25 MB objects on this corpus (about 1,850,000,000 would be needed
+  by the same arithmetic, unmeasured), not an over-prediction. Stored
+  objects are about 65 to 75 times below `--target-bytes` when the target
+  is what closes them: 375,000,000 stored 5.7 MB (R1, 66x), 1,650,000,000
+  about 22 MB (R1c to R1e, 75x). Wave 3's 7 to 15 times was a run
   whose objects closed early; it did not measure the estimate. The ratio
   is a property of this corpus.
 - **The age trigger.** At the 2 s default, 798 of R1b's 916 objects closed
-  on age. A 30 s delay (R1c) let them reach the target.
+  on age. A 30 s delay (R1c) let them reach the target. R1e's 453 objects
+  split size 433, age 13, final 7: the target is what closed almost all
+  of them.
 - **Pipeline depth sets load time once objects are large.** Each Strict
   write waits for its batch's flush, so the depth bounds how many batches
   fill a shard buffer at once: 16, 24 and 32 took 1,990, 1,139 and 858 s.
@@ -959,9 +969,8 @@ cold total seconds, hot total seconds and the geometric mean.
   22.6 MB (10,197,978,095 bytes / 451 objects), about 10% short on the
   same basis. B0 itself sat at 24.8 MB mean (10,227,376,733 bytes / 413
   objects; its median was not recorded) and stored about 102 bytes per
-  row (10,227,376,733 / 99,997,497) against about 89 to 102 bytes per row
-  for the later runs, so do not use the 89 B/row figure to estimate B0's
-  object size. 4 GB: the load completed where stock failed, and the
+  row (10,227,376,733 / 99,997,497), the same 100 to 102 bytes per row as
+  R1, R1d and R1e. 4 GB: the load completed where stock failed, and the
   budget bound (163 decoder waits, peak charge 1,199,715,423 bytes). 8
   and 16 GB: load time met by R3 (0.66x stock) and R2 (0.72x). The
   small-host runs used the R1b flags, so their objects are 8.6 to 11.5

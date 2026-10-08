@@ -489,11 +489,13 @@ Verdicts against the acceptance table:
   objects) and 22.6 MB (R1e, 10,197,978,095 bytes / 451 objects), about
   10% short on the same basis. B0 itself, the baseline this table's 25 MB
   figure was read off, sat at 24.8 MB mean (10,227,376,733 bytes / 413
-  objects; its median was not recorded). B0 stored about 102 bytes per
-  row (10,227,376,733 / 99,997,497), against about 89 to 102 bytes per
-  row for the later runs, so the 89 B/row figure does not estimate B0's
-  object size. The wave 4 pre-registration on #2627 set a 20 MB median as
-  the pass band, which R1d and R1e meet.
+  objects; its median was not recorded). Stored bytes per row, each total
+  divided by the corpus's 99,997,497 rows: B0 102.3 (10,227,376,733), R1
+  99.1 (9,912,541,268), R1d 102.0 (10,196,683,756) and R1e 102.0
+  (10,197,978,095), so B0 stores about the same 100 to 102 bytes per row
+  as the later runs. The wave 4
+  pre-registration on #2627 set a 20 MB median as the pass band, which
+  R1d and R1e meet.
 - **Load time no worse: met.** The baseline is B0 at 1,461 s, so the limit
   is 1,534 s; R1d took 1,139 s (0.78x) and R1e 858 s (0.59x).
 - **Objects byte-identical: met** by the row-versus-columnar tests in
@@ -522,16 +524,22 @@ target-bytes amendment left open, is R1e:
 ```
 
 The target-bytes amendment's "about 15 times below the target" is wrong as
-a ratio. The size trigger counts the row-path estimate, about 5.9 KB per
-row on this corpus, and a stored object holds about 89 bytes per row, so
-stored objects are about 65 to 75 times below `--target-bytes` once
-nothing else closes them first: 375,000,000 stored 5.7 MB (R1, 66x), and
-1,650,000,000 about 22 MB (R1c to R1e, 75x). The per-row model predicts
-about 25 MB at the larger target, so it over-predicts there by about 12%,
-which is the shortfall against the 25 MB criterion. The wave 3 run's
-objects were closed early by the pipeline-depth cap and the age trigger, so
-its 15x measured those caps. The ratio is a property of this corpus, not
-of the format.
+a ratio. Stored bytes per row, from the measured totals above, run 99.1
+to 102.3 across B0, R1, R1d and R1e; call it about 100 to 102. R1e stored
+453 objects, 451 of them
+over 100 KB (the listing its median and mean are read from), so
+99,997,497 / 451 is about 221,724 rows per object, and at the
+1,650,000,000 target that is about 7,440 estimated bytes per row
+(1,650,000,000 / 221,724). That pair, about 7.4 KB estimated against
+about 102 B stored per row, predicts 221,724 x 102 is about 22.6 MB,
+R1e's own mean: there is no over-prediction, so the 1,650,000,000 target
+was simply too low for 25 MB objects on this corpus (about 1,850,000,000
+would be needed by the same arithmetic, unmeasured). Stored objects are
+about 65 to 75 times below `--target-bytes` once nothing else closes them
+first: 375,000,000 stored 5.7 MB (R1, 66x), and 1,650,000,000 about 22 MB
+(R1c to R1e, 75x). The wave 3 run's objects were closed early by the
+pipeline-depth cap and the age trigger, so its 15x measured those caps.
+The ratio is a property of this corpus, not of the format.
 
 All three settings are needed. Without `--max-flush-delay 30s` the age
 trigger closes most objects first (R1b). With objects that large, load
