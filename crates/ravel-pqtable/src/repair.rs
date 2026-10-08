@@ -1168,9 +1168,10 @@ mod tests {
                 (invalid_key(NESTED).as_str(), false),
             ]
         );
+        let hits_prefix = manifest_prefix(&TENANT_A, "hits").expect("prefix");
         assert_eq!(
-            unaddressable_under(&store, &manifest_prefix(&TENANT_A, "hits").expect("prefix")).await,
-            [tilde.clone()]
+            unaddressable_under(&store, &hits_prefix).await,
+            std::slice::from_ref(&tilde)
         );
         let rest: Vec<String> = listed
             .into_iter()

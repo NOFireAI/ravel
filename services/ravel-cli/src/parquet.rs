@@ -1348,7 +1348,10 @@ mod tests {
             printed.ends_with("2 version(s) flagged; rerun with --delete to remove exactly these"),
             "{printed}"
         );
-        assert_eq!(unaddressable_under(&store, &prefix).await, [tilde.clone()]);
+        assert_eq!(
+            unaddressable_under(&store, &prefix).await,
+            std::slice::from_ref(&tilde)
+        );
 
         let mut lines = Vec::new();
         collect_repair(
