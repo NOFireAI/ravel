@@ -623,8 +623,8 @@ enum Command {
         /// The object-size setting: the estimated UNCOMPRESSED content a
         /// shard's buffer accumulates before it flushes as one RLOG object
         /// (issue #801). Stored objects come out much smaller than the
-        /// target: on the ClickBench corpus the estimate counts about 5.9 KB
-        /// per row and a stored object holds about 89 bytes per row, so
+        /// target: on the ClickBench corpus the estimate counts about 7.4 KB
+        /// per row and a stored object holds about 102 bytes per row, so
         /// stored objects are about 65 to 75 times below the target
         /// (375,000,000 gave 5.7 MB objects, 66x; 1,650,000,000 about 22 MB,
         /// 75x). That ratio is a

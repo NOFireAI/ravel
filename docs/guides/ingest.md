@@ -1189,8 +1189,8 @@ reaches the target, so objects grow without growing the batch.
 The target counts the buffer's estimated **uncompressed** content (body,
 severity text, stream attributes, attribute names and values, and fixed
 per-row fields), not the stored object size. Stored objects come out much
-smaller. On ClickBench `hits.parquet` the estimate counts about 5.9 KB per
-row and a stored object holds about 89 bytes per row, so stored objects
+smaller. On ClickBench `hits.parquet` the estimate counts about 7.4 KB per
+row and a stored object holds about 102 bytes per row, so stored objects
 are about 65 to 75 times below the target: a target of 375,000,000 stored
 5.7 MB objects (median, 66 times), and 1,650,000,000 about 22 MB (75
 times). The ratio is a
@@ -1230,9 +1230,9 @@ Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
 - `--target-bytes 1650000000` stored about 22 MB median objects on this
-  corpus, 75 times below the target: R1e's flush counts show the size
-  trigger closed 433 of its 453 objects, so the target is what closed
-  them, not the age trigger. At 375,000,000 the objects were 5.7 MB, 66
+  corpus, 75 times below the target: R1e's 453 objects split size 433,
+  age 13, final 7, so the target is what closed almost all of them, not
+  the age trigger. At 375,000,000 the objects were 5.7 MB, 66
   times below. The ratio was measured at these two target values only;
   scaling `--target-bytes` above 1,650,000,000 for still larger objects
   was not measured.
