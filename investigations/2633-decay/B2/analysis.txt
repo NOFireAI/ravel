@@ -22,7 +22,8 @@ analyze.py exit=1
 serial statements 43, errored 0: []
 sampled rows 103, rows with bg_thread != 1: 0
 peak gap 5.003 GB at t=+112.5s: retention 4.650 GB (92.9%), uncharged live 0.353 GB (7.1%), resident-active 4.615 GB, handoff overlap 0.013 GB
-median retention over phase 1.393 GB (72 samples)
+median retention over phase 1.393 GB (72 samples), p90 2.367 GB, samples >= 1.5 GB: 33
+mean over phase: resident 6.841 GB, VmRSS 6.512 GB
 peak resident 9.260 GB at t=+12.5s
 peak VmRSS 8.815 GB at t=+12.5s (-348.2s from bench end)
 concurrency qps 6.941, completed 2504, errors 46, unreachable 0

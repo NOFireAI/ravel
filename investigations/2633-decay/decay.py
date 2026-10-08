@@ -69,8 +69,12 @@ def main():
           f"uncharged live {unc / G:.3f} GB ({unc / pk['gap']:.1%}), "
           f"resident-active {(pk['resident'] - pk['active']) / G:.3f} GB, "
           f"handoff overlap {pk['handoff_overlap'] / G:.3f} GB")
-    print(f"median retention over phase {st.median(d['resident'] - d['allocated'] for d in phase) / G:.3f} GB "
-          f"({len(phase)} samples)")
+    rets = sorted(d["resident"] - d["allocated"] for d in phase)
+    print(f"median retention over phase {st.median(rets) / G:.3f} GB "
+          f"({len(phase)} samples), p90 {rets[int(0.9 * (len(rets) - 1))] / G:.3f} GB, "
+          f"samples >= 1.5 GB: {sum(1 for r in rets if r >= 1.5 * G)}")
+    print(f"mean over phase: resident {st.mean(d['resident'] for d in phase) / G:.3f} GB, "
+          f"VmRSS {st.mean(d['vmrss_bytes'] for d in phase) / G:.3f} GB")
     pr = max(phase, key=lambda d: d["resident"])
     print(f"peak resident {pr['resident'] / G:.3f} GB at t=+{pr['unix_ts'] - cs:.1f}s")
     pv = max(rows, key=lambda d: d["vmrss_bytes"] or 0)
