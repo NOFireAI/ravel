@@ -18,9 +18,10 @@
 //! reserved bytes return to zero without any explicit cleanup path. A pool that
 //! did not forward `shrink` would leak tenant budget on every cancellation.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
@@ -317,6 +318,71 @@ pub struct TenantDelegatingPool {
     /// `peak_intermediate_bytes` reflects this pool's own reservations
     /// rather than staying zero, as it does on the PromQL path today.
     accounting: QueryAccounting,
+    /// Issue #2633 instrumentation (task branch only, never merged): per
+    /// consumer name, and per name with partition indices stripped, the
+    /// current and peak reserved bytes. Logged when the pool drops.
+    consumers: Mutex<HashMap<String, (usize, usize)>>,
+    query_peak: AtomicUsize,
+}
+
+/// `GroupedHashAggregateStream[3] (count(x))` -> `GroupedHashAggregateStream[*] (count(x))`.
+fn consumer_base_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '[' {
+            let mut digits = String::new();
+            while let Some(d) = chars.peek().copied().filter(char::is_ascii_digit) {
+                digits.push(d);
+                chars.next();
+            }
+            if digits.is_empty() || chars.peek() != Some(&']') {
+                out.push_str(&digits);
+            } else {
+                out.push('*');
+            }
+        }
+    }
+    out
+}
+
+impl TenantDelegatingPool {
+    fn track(&self, reservation: &MemoryReservation, delta: isize) {
+        let name = reservation.consumer().name();
+        let Ok(mut table) = self.consumers.lock() else {
+            return;
+        };
+        for key in [
+            format!("P {name}"),
+            format!("B {}", consumer_base_name(name)),
+        ] {
+            let entry = table.entry(key).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add_signed(delta);
+            entry.1 = entry.1.max(entry.0);
+        }
+    }
+}
+
+impl Drop for TenantDelegatingPool {
+    fn drop(&mut self) {
+        let Ok(table) = self.consumers.lock() else {
+            return;
+        };
+        let mut rows: Vec<_> = table.iter().collect();
+        rows.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        let dump = rows
+            .iter()
+            .map(|(k, (cur, peak))| format!("{k}\t{peak}\t{cur}"))
+            .collect::<Vec<_>>()
+            .join("\u{1e}");
+        tracing::warn!(
+            target: "ravel_sql_pool_consumers",
+            query_peak = self.query_peak.load(Ordering::Relaxed),
+            table = %dump,
+            "pool consumer peaks"
+        );
+    }
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -360,6 +426,8 @@ impl TenantDelegatingPool {
             tenant,
             breach,
             accounting,
+            consumers: Mutex::new(HashMap::new()),
+            query_peak: AtomicUsize::new(0),
         }
     }
 
@@ -413,7 +481,8 @@ impl MemoryPool for TenantDelegatingPool {
         "TenantDelegatingPool"
     }
 
-    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.track(reservation, additional as isize);
         // The trait requires this to be infallible, and both budgets grow
         // unconditionally -- this is not only reachable after a validated
         // try_grow. datafusion 54.1.0's MemoryReservation::resize() and at
@@ -446,6 +515,7 @@ impl MemoryPool for TenantDelegatingPool {
             .query_used
             .fetch_add(additional, Ordering::AcqRel)
             .saturating_add(additional);
+        self.query_peak.fetch_max(query_total, Ordering::Relaxed);
         self.accounting
             .observe_intermediate_bytes(query_total as u64);
         let totals = self.tenant.grow(additional);
@@ -472,7 +542,8 @@ impl MemoryPool for TenantDelegatingPool {
         }
     }
 
-    fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.track(reservation, -(shrink as isize));
         // Forwarded to the tenant accountant, including the shrink DataFusion
         // issues when a MemoryReservation is dropped: this is what
         // makes a cancelled or dropped stream return its tenant reservation to
@@ -481,7 +552,7 @@ impl MemoryPool for TenantDelegatingPool {
         self.tenant.shrink(shrink);
     }
 
-    fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
         // Query budget first: a query must trip its own pool before it can
         // threaten the tenant budget.
         let query_total = self.query_try_grow(additional).map_err(|used| {
@@ -528,6 +599,8 @@ impl MemoryPool for TenantDelegatingPool {
         // back on a tenant refusal: the peak would outlive the allocation.
         self.accounting
             .observe_intermediate_bytes(query_total as u64);
+        self.query_peak.fetch_max(query_total, Ordering::Relaxed);
+        self.track(reservation, additional as isize);
         Ok(())
     }
 
