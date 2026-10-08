@@ -752,6 +752,97 @@ async fn a_hold_on_a_shard_the_folder_does_not_own_reaches_its_fold() {
     );
 }
 
+/// The tenant's durable retention window in the zoned test below: 48 hours,
+/// so at [`past_horizon_ns`] [`OLD_HOUR`] has expired (its end is 1001 h, the
+/// tick about 1068 h) and is still inside one protection horizon of its
+/// expiry, which `classify_zone` calls its tail.
+const ZONED_RETENTION_NS: i64 = 48 * NS_PER_HOUR;
+
+/// Issue #2606, zoned cadence: on a tick where the full-sweep pass is not due,
+/// the folder's sweep of a shard it does not own, and so does not scan, takes
+/// its hours from the shard's own listing classified against the tenant's
+/// retention window, and still finds a hold in a tail hour and queues it. B's
+/// memo is primed with a full sweep of that shard at the tick's own instant
+/// (`record_full_sweep`, as a previous tick's full pass would leave it), so
+/// that shard takes the zoned pass while every other shard B sweeps, cold,
+/// takes a full one; the full-sweep counter is one short of the cold count,
+/// which is the proof the hold was found by the zoned pass.
+///
+/// The tail hour is also inside the fold's retirement-frontier band, so the
+/// fold lists it in that pass and not in the targeted re-fold pass;
+/// `refold_hours_reconciled` is 0, and the fold still takes the entry and
+/// the snapshot stops naming the inputs.
+///
+/// Flip to watch it fail: in `unscanned_head_tail_hours`, change
+/// `!= Zone::Interior` to `== Zone::Interior`, or pass `None` for the
+/// retention window to `classify_zone`. The zoned pass then lists no hour of
+/// the shard and B holds 0 inputs, not 4.
+#[tokio::test]
+async fn a_zoned_sweep_of_a_shard_the_folder_does_not_scan_finds_its_hold() {
+    const SHARDS: u32 = 8;
+    let live_ab = vec![PROCESS_A, PROCESS_B];
+    let store = Arc::new(MemoryStore::new());
+    let (tenant, shard) = split_tenant(&live_ab, SHARDS);
+    let a = Process::new(&store, &tenant, PROCESS_A, SHARDS);
+    let mut b = Process::new(&store, &tenant, PROCESS_B, SHARDS);
+    let pair = tenant.hash();
+    let solo_a = a.worker.solo_live_set();
+    let parts = seed_late_compaction(&a, shard, &solo_a).await;
+    let config = ravel_catalog::TenantConfig {
+        retention_ns: Some(ZONED_RETENTION_NS),
+        ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+    };
+    ravel_catalog::set_tenant_config(store.as_ref(), &pair, &config, 1)
+        .await
+        .expect("write the tenant's retention window");
+    let now = past_horizon_ns();
+    assert_eq!(
+        ravel_maintain::scan::classify_zone(
+            OLD_HOUR,
+            now,
+            &compactor_config(),
+            Some(ZONED_RETENTION_NS)
+        ),
+        ravel_maintain::scan::Zone::Tail,
+        "the held hour is in the tail at the tick"
+    );
+
+    b.memo.record_full_sweep(pair, Signal::Metrics, shard, now);
+    let b_queue = RefoldQueue::default();
+    let metrics = b.maintain_tick(now, &live_ab, &b_queue).await;
+    assert_eq!(
+        metrics.ownership.full_sweep_passes_total(),
+        cold_full_sweep_passes(&b, &live_ab) - 1,
+        "every shard B sweeps took a full pass but the primed one"
+    );
+    assert_eq!(
+        metrics
+            .safety
+            .superseded_inputs_held(Signal::Metrics, SupersededHeldReason::Named),
+        4,
+        "the zoned pass of the shard B does not scan held the hour's inputs"
+    );
+    assert_eq!(
+        pending_hours(&b_queue, &tenant),
+        vec![OLD_HOUR],
+        "the hold reached the folder's queue"
+    );
+
+    let report = b.fold_tick(now, &live_ab, &b_queue).await;
+    assert_eq!(report.owned, vec![pair]);
+    assert_eq!(report.folded, vec![pair], "{report:?}");
+    assert_eq!(
+        report.refold_hours_reconciled, 0,
+        "the frontier pass listed the tail hour first: {report:?}"
+    );
+    assert_eq!(b_queue.pending_len(), 0, "the fold took the entry");
+    assert_eq!(
+        head_levels(&store, &tenant, OLD_HOUR).await,
+        (0, parts),
+        "the snapshot names the compaction's parts and none of its inputs"
+    );
+}
+
 /// A sweep of a shard the folder does not own that keeps failing reaches the
 /// stalled-unit gauge on the folder, through the pair's FOLD_UNIT_SHARD unit,
 /// although no unit of that shard is the folder's. The fault refuses every
