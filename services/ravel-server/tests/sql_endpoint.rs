@@ -858,6 +858,7 @@ async fn create_clicks_table(store: &dyn ObjectStoreBackend, lake: &dyn ObjectSt
         },
         &clock,
         60_000,
+        None,
     )
     .await
     .expect("create the table");

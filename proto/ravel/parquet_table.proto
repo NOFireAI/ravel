@@ -62,6 +62,12 @@ message ParquetTableManifest {
   // the `<tenant_hash>` segment of the key it is stored at, so a version
   // copied under another tenant's key is refused rather than read as theirs.
   bytes tenant_hash = 13;
+  // From format_version 2 (ADR-2430): a 32-byte keyed BLAKE3 MAC over this
+  // message encoded with `mac` empty, under a key derived from the deployment
+  // key. Empty when the writer held no deployment key. A format_version 1
+  // manifest carries none. The sweep deletes a table's predecessors only when
+  // its newest version carries a valid one.
+  bytes mac = 14;
 }
 
 // One external Parquet file a manifest pins.

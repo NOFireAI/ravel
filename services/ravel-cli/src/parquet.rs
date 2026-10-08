@@ -11,11 +11,16 @@
 //! [`ravel_pqtable::repair`]. Nothing about the key layout, the grace
 //! arithmetic or the version bound is restated here.
 //!
-//! `repair` runs under the Maintain credential, which may list and delete
-//! manifest versions but not read them. Which versions it deletes is decided
-//! from the listing alone; the writer and statement of each version are
-//! printed when the credential can read them and reported unreadable
-//! otherwise.
+//! `repair` runs under the Maintain credential, which may list, read and
+//! delete manifest versions. Which versions it deletes is decided from the
+//! listing alone; the writer and statement of each version are printed when
+//! the credential can read them and reported unreadable otherwise.
+//!
+//! `sweep` deletes a table's superseded versions only once its newest version
+//! is attributed to the DDL writer (ADR-2430): on a keyed bucket a valid MAC
+//! under the key given with `--tenant-hash-key-file`, on an unkeyed one an
+//! age of [`sweep::UNKEYED_NEWEST_GRACE_MULTIPLE`] times the grace. It prints
+//! every table it held and why.
 //!
 //! # Where the sweep's minimum grace comes from
 //!
@@ -196,17 +201,25 @@ pub async fn ls(
 
 /// `parquet sweep`: delete every manifest version superseded for longer than
 /// `grace`, refusing a grace below the deployment's stored minimum.
+///
+/// `deployment_key` is the `--tenant-hash-key-file` key of a keyed bucket.
+/// With it a table's superseded versions go only when its newest version
+/// carries a valid MAC; without it, only once the newest is older than
+/// [`sweep::UNKEYED_NEWEST_GRACE_MULTIPLE`] times the grace (ADR-2430). Each
+/// table the gate held is printed with the reason.
 pub async fn sweep(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     grace: &str,
     now_ns: i64,
+    deployment_key: Option<&[u8; 32]>,
 ) -> anyhow::Result<()> {
     let grace_ms = parse_grace_ms(grace)?;
     let min_grace_ms = deployment_min_grace_ms(store.as_ref()).await?;
     let hash = TenantId::new(tenant).hash();
     let now_ms = now_ns / 1_000_000;
-    let plan = sweep::plan(store.as_ref(), &hash, now_ms, grace_ms, min_grace_ms).await?;
+    let gate = sweep::NewestGate::for_deployment(deployment_key);
+    let plan = sweep::plan(store.as_ref(), &hash, now_ms, grace_ms, min_grace_ms, &gate).await?;
     let report = sweep::execute(store.as_ref(), &plan).await?;
     println!(
         "deleted {} manifest versions",
@@ -215,7 +228,45 @@ pub async fn sweep(
     for key in &report.manifests_deleted {
         println!("  {key}");
     }
+    if !plan.held.is_empty() {
+        println!(
+            "held the superseded versions of {} table(s) whose newest version is not \
+             authenticated",
+            plan.held.len()
+        );
+    }
+    for held in &plan.held {
+        println!(
+            "  {}: {} version(s) kept under newest version {}: {}",
+            held.table,
+            held.held,
+            held.newest,
+            hold_reason_text(&held.reason)
+        );
+    }
     Ok(())
+}
+
+fn hold_reason_text(reason: &sweep::HoldReason) -> String {
+    match reason {
+        sweep::HoldReason::Unversioned => {
+            "format version 1 carries no MAC; the next DDL on the table writes one that does"
+                .to_string()
+        }
+        sweep::HoldReason::MacAbsent => {
+            "no MAC, so not written by a keyed DDL writer; check the DDL audit log".to_string()
+        }
+        sweep::HoldReason::MacInvalid => {
+            "MAC does not verify under this deployment's key; check the DDL audit log, and \
+             remove a forged version with `parquet repair --delete-version`"
+                .to_string()
+        }
+        sweep::HoldReason::Unreadable(why) => format!("unreadable ({why})"),
+        sweep::HoldReason::UnkeyedGrace => format!(
+            "unkeyed bucket: kept until the newest version is {}x the grace old",
+            sweep::UNKEYED_NEWEST_GRACE_MULTIPLE
+        ),
+    }
 }
 
 /// What `parquet repair` does after it is told the table.
@@ -646,16 +697,102 @@ mod tests {
     async fn sweep_refuses_a_grace_below_the_stored_minimum() {
         let store: Arc<dyn ObjectStoreBackend> =
             Arc::new(store_with_two_hour_query_duration().await);
-        let err = sweep(Arc::clone(&store), "acme", "1h", NOW_NS)
+        let err = sweep(Arc::clone(&store), "acme", "1h", NOW_NS, None)
             .await
             .expect_err("must refuse");
         assert!(
             format!("{err:#}").contains("grace 3600000 ms is below the minimum 7200000 ms"),
             "{err:#}"
         );
-        sweep(store, "acme", "2h", NOW_NS)
+        sweep(store, "acme", "2h", NOW_NS, None)
             .await
             .expect("a grace at the minimum is accepted");
+    }
+
+    /// `acme`'s `hits` at versions 1 and 2, written at store time 0 as a
+    /// version 2 manifest MACed under `key`, or carrying no MAC with `None`.
+    async fn two_versions(key: Option<&[u8; 32]>) -> Arc<dyn ObjectStoreBackend> {
+        let store = store_with_two_hour_query_duration().await;
+        store.set_clock_ms(0);
+        let hash = TenantId::new("acme").hash();
+        let mac_key = key.map(ravel_pqtable::manifest::ManifestMacKey::from_deployment_key);
+        for version in [1, 2] {
+            let manifest = Manifest {
+                table: "hits".into(),
+                version,
+                dropped: true,
+                location: String::new(),
+                grant: String::new(),
+                files: Vec::new(),
+                options: Default::default(),
+                created_by: "ddl".into(),
+                created_unix_ns: 0,
+                statement: "DROP TABLE hits".into(),
+                apply_nonce: vec![version as u8; ravel_pqtable::manifest::APPLY_NONCE_LEN],
+            };
+            let bytes = ravel_pqtable::manifest::encode_manifest_with(
+                &hash,
+                &manifest,
+                ravel_pqtable::manifest::MAC_FORMAT_VERSION,
+                mac_key.as_ref(),
+            )
+            .expect("encode");
+            store
+                .put(
+                    &manifest_key(&hash, "hits", version).expect("key"),
+                    Bytes::from(bytes),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put");
+        }
+        Arc::new(store)
+    }
+
+    async fn versions_left(store: &dyn ObjectStoreBackend) -> Vec<u64> {
+        resolve::versions(store, &TenantId::new("acme").hash(), "hits")
+            .await
+            .expect("versions")
+    }
+
+    /// The deployment key `sweep` is given is the one the MAC gate verifies
+    /// with (ADR-2430): the same manifests are deleted under their own key and
+    /// held under another one or with no MAC at all.
+    #[tokio::test]
+    async fn sweep_verifies_the_newest_manifest_under_the_deployment_key() {
+        const KEY: [u8; 32] = [0x21; 32];
+        for (written_with, swept_with, left) in [
+            (Some(&KEY), Some(&KEY), vec![2]),
+            (Some(&KEY), Some(&[0x22; 32]), vec![1, 2]),
+            (None, Some(&KEY), vec![1, 2]),
+        ] {
+            let store = two_versions(written_with).await;
+            sweep(Arc::clone(&store), "acme", "2h", NOW_NS, swept_with)
+                .await
+                .expect("sweep");
+            assert_eq!(
+                versions_left(store.as_ref()).await,
+                left,
+                "{written_with:?} {swept_with:?}"
+            );
+        }
+    }
+
+    /// Without a deployment key the sweep falls back to the longer grace:
+    /// `NOW_NS` is far past 168 times two hours, so v1 goes, MAC or not.
+    #[tokio::test]
+    async fn an_unkeyed_sweep_deletes_once_the_newest_is_past_the_longer_grace() {
+        let store = two_versions(None).await;
+        sweep(Arc::clone(&store), "acme", "2h", NOW_NS, None)
+            .await
+            .expect("sweep");
+        assert_eq!(versions_left(store.as_ref()).await, vec![2]);
+        let young = two_versions(None).await;
+        let just_past_grace = (2 * 3_600_000 + sweep::SKEW_MS as i64 + 1) * 1_000_000;
+        sweep(Arc::clone(&young), "acme", "2h", just_past_grace, None)
+            .await
+            .expect("sweep");
+        assert_eq!(versions_left(young.as_ref()).await, vec![1, 2]);
     }
 
     /// Every field of the manifest and of the file it names reaches the

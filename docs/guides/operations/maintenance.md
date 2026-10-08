@@ -1677,9 +1677,10 @@ To remove the flagged keys:
    ```
 
    It deletes only the flagged keys and refuses to delete any version at or
-   below the bound. The Maintain role cannot read manifests, so this run
-   reports `created_by` and `statement` as unreadable. That does not change
-   which keys it deletes.
+   below the bound. The Maintain role can read manifests, which the sweep
+   needs to check a manifest's MAC, so this run also prints `created_by` and
+   `statement`. A credential that cannot read them gets them reported as
+   unreadable. That does not change which keys it deletes.
 
 ### Forged version within the bound
 
@@ -1691,10 +1692,23 @@ not flagged:
   REPLACE` or `DROP` on the table is refused with a 422 that names the version
   bound.
 
-**Act before the next `parquet sweep` runs.** That sweep also deletes the
-legitimate versions beneath the forged one once it is past the grace. If the
-sweep has run, restore the noncurrent object versions, if the bucket keeps
-them.
+`parquet sweep` deletes a table's superseded versions only when it can
+attribute the newest version to Ravel's DDL writer:
+
+- On a keyed bucket, run the sweep with `--tenant-hash-key-file`. It reads
+  each table's newest version and deletes the versions beneath it only when
+  that version carries a valid MAC under a key derived from the deployment
+  key. A forged version has no valid MAC, so the sweep keeps every version
+  beneath it and prints the table as held. A manifest written at format
+  version 1 carries no MAC either, so a table is held this way until its next
+  DDL statement writes a version that does. This build still writes format
+  version 1: the release that writes version 2 follows once every reader
+  reads it, so until then a keyed sweep holds every table.
+- On an unkeyed bucket nothing can be authenticated. The sweep instead keeps
+  the versions beneath the newest until the newest is 168 times the grace old
+  (a week at `--grace 1h`). Remove a forged version within that window. If
+  the sweep has run, restore the noncurrent object versions, if the bucket
+  keeps them.
 
 The audit log decides whether a version is forged:
 

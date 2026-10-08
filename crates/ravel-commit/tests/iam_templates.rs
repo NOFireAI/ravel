@@ -2530,7 +2530,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     //
     // t/*/pq/t/* appears on the list and delete axes for `ravel-cli parquet
     // sweep`, which runs under this credential: it lists a tenant's Parquet
-    // table manifests and deletes the superseded ones, and reads none of them.
+    // table manifests and deletes the superseded ones. t/*/pq/t/*/v/*.pqm on
+    // the get axis is the read of each table's newest manifest, whose MAC the
+    // sweep verifies before deleting any predecessor (ADR-2430 decision 4).
     // Asserted by maintain_template_covers_every_parquet_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
@@ -2585,6 +2587,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/enc",
             "t/*/a/state/latest",
+            "t/*/pq/t/*/v/*.pqm",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -7115,8 +7118,10 @@ fn maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them() {
 /// `ravel-cli parquet sweep` (`services/ravel-cli/src/parquet.rs`) runs under
 /// the Maintain credential. `sweep::plan` (`crates/ravel-pqtable/src/sweep.rs`)
 /// LISTs `t/<hash>/pq/t/` once, reads `sys/gc` for the deployment's grace floor,
-/// and `sweep::execute` DELETEs each superseded manifest past the grace. The
-/// sweep reads no manifest and never touches the grants record.
+/// GETs the newest manifest of each table with a version past the grace to
+/// verify its MAC before deleting any predecessor (ADR-2430 decision 4), and
+/// `sweep::execute` DELETEs each superseded manifest past the grace. The sweep
+/// never touches the grants record.
 #[test]
 fn maintain_template_covers_every_parquet_sweep_call() {
     let maintain = load_policy("maintain");
@@ -7139,9 +7144,24 @@ fn maintain_template_covers_every_parquet_sweep_call() {
          sweep::execute deletes once superseded. Grants: {deletes:?}"
     );
     assert!(
-        !gets.iter().any(|p| glob_matches(p, &manifest)),
-        "maintain: a GetObject Allow reaches the manifest {manifest:?}, but the \
-         sweep lists and deletes manifests and never reads one. Grants: {gets:?}"
+        gets.iter().any(|p| glob_matches(p, &manifest)),
+        "maintain: no GetObject Allow reaches the manifest {manifest:?}, which \
+         sweep::plan reads to verify the newest version's MAC (ADR-2430). \
+         Without it every table's predecessors are held. Grants: {gets:?}"
+    );
+    assert!(
+        !gets.iter().any(|p| glob_matches(p, &grants)),
+        "maintain: a GetObject Allow reaches the grants record {grants:?}; the \
+         sweep reads manifests only. Grants: {gets:?}"
+    );
+    // The read reaches manifest keys and nothing else under `pq/t/`: not a
+    // stray key without the `.pqm` suffix, and nothing outside the manifest
+    // keyspace.
+    let stray = format!("{}hits/v/{:020}", parquet_tenant_manifest_prefix(), 1);
+    assert!(
+        !gets.iter().any(|p| glob_matches(p, &stray)),
+        "maintain: a GetObject Allow reaches {stray:?}, which is no manifest. \
+         Grants: {gets:?}"
     );
     assert!(
         gets.iter().any(|p| glob_matches(p, "sys/gc")),
@@ -7151,6 +7171,7 @@ fn maintain_template_covers_every_parquet_sweep_call() {
     for (axis, patterns) in [
         ("s3:prefix Allow", &list_prefixes),
         ("delete Allow", &deletes),
+        ("GetObject Allow", &gets),
     ] {
         let witness = if axis == "s3:prefix Allow" {
             &prefix

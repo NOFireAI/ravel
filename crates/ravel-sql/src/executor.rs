@@ -106,6 +106,7 @@ use ravel_catalog::{Catalog, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
+use ravel_pqtable::manifest::ManifestMacKey;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
@@ -1040,6 +1041,11 @@ pub struct SqlExecutor {
     /// [`SqlExecutor::new`] default) keeps that constant; the server installs
     /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
     ddl_min_grace_ms: Option<u64>,
+    /// The manifest MAC key `execute_ddl` passes to
+    /// `ravel_pqtable::writer::apply` (ADR-2430), derived from the deployment
+    /// key. `None`, the [`SqlExecutor::new`] default, is an unkeyed
+    /// deployment, whose manifests carry no MAC.
+    manifest_mac_key: Option<ManifestMacKey>,
     /// The process spill ceiling every query granted spill reserves its
     /// scratch cap from (ADR-0954 requirement 2, issue #2416): the configured
     /// `spill.max_bytes`, shared by every query this executor serves. `None`
@@ -1089,6 +1095,7 @@ impl SqlExecutor {
             parquet: None,
             clock: Arc::new(SystemClock),
             ddl_min_grace_ms: None,
+            manifest_mac_key: None,
             #[cfg(test)]
             executed_plan_tamper: None,
         }
@@ -1163,6 +1170,19 @@ impl SqlExecutor {
     pub fn ddl_min_grace_ms(&self) -> u64 {
         self.ddl_min_grace_ms
             .unwrap_or(crate::ddl::DEFAULT_MIN_GRACE_MS)
+    }
+
+    /// Install the deployment key (`--tenant-hash-key-file`) the manifest MAC
+    /// key is derived from (ADR-2430). The server installs it on a keyed
+    /// deployment; without it the writer MACs no manifest.
+    pub fn with_deployment_key(mut self, deployment_key: &[u8; 32]) -> Self {
+        self.manifest_mac_key = Some(ManifestMacKey::from_deployment_key(deployment_key));
+        self
+    }
+
+    /// The manifest MAC key [`Self::with_deployment_key`] derived, if any.
+    pub fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
+        self.manifest_mac_key.as_ref()
     }
 
     /// Install the source of per-tenant declared typed attribute columns for the

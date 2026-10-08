@@ -850,6 +850,7 @@ impl SqlExecutor {
                     write_intent,
                     clock,
                     self.ddl_min_grace_ms(),
+                    self.manifest_mac_key(),
                 )
                 .await?;
 
@@ -877,6 +878,7 @@ impl SqlExecutor {
                     write_intent,
                     clock,
                     self.ddl_min_grace_ms(),
+                    self.manifest_mac_key(),
                 )
                 .await?;
                 Ok(match outcome {

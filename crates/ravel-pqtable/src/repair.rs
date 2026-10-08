@@ -1328,7 +1328,7 @@ mod tests {
         put_version(&store, &TENANT_A, 1).await;
         put_version(&store, &TENANT_A, MAX_MANIFEST_VERSION).await;
         let clock = FixedClock::new(0);
-        let got = apply(&store, &TENANT_A, "hits", replace(), &clock, 660_000).await;
+        let got = apply(&store, &TENANT_A, "hits", replace(), &clock, 660_000, None).await;
         assert!(
             matches!(got, Err(WriteError::VersionAboveBound { .. })),
             "{got:?}"
@@ -1340,7 +1340,7 @@ mod tests {
             mkey(MAX_MANIFEST_VERSION)
         );
         assert_eq!(
-            apply(&store, &TENANT_A, "hits", replace(), &clock, 660_000)
+            apply(&store, &TENANT_A, "hits", replace(), &clock, 660_000, None)
                 .await
                 .expect("apply"),
             Outcome::Committed { version: 2 }

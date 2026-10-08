@@ -3246,6 +3246,8 @@ pub async fn start_with_heartbeat(
                 // `None`, which leaves every Parquet table unqueryable.
                 config.parquet_profiles.clone(),
                 ddl_min_grace_ms,
+                // ADR-2430: the DDL writer's manifest MAC key derives from it.
+                config.deployment_key.as_deref(),
                 &sql_spill.inputs,
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
