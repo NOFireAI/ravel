@@ -220,7 +220,7 @@ flowchart TD
         C1["push_columnar(batch)"] --> B2["build_object_columnar"]
         B2 --> O1
     end
-    subgraph after["After"]
+    subgraph after["After decisions 1 to 4, parked by the amendment of 2026-10-05"]
         P2["push(record) x N"] --> R2["records"]
         R2 -->|"fold, consuming<br/>each record"| BA["ColumnarLogBatch"]
         C2["push_columnar(batch)"] --> BC["build_object_columnar"]
@@ -309,12 +309,13 @@ shapes where the columnar arm ran:
 | 20,000 rows, K = 10,000 | 56.2 MB | not run | |
 | 200,000 rows, K = 1,000 | 486.1 MB | not run | |
 
-The dense allocation measured 643.5 MB at K = 1,000 against 640.0 MB for
-rows times keys times the 32 bytes of one slot. The two largest columnar runs
+At K = 1,000 the dense allocation site measured exactly 640,000,000 bytes,
+rows times keys times the 32 bytes of one slot; the columnar batch as a whole,
+which includes the other allocations of `from_records`, measured 643.5 MB. The two largest columnar runs
 were not made. The dense vector alone comes to about 6.4 GB for each. The
 measurement's own rule was to run a shape only with twice its pre-registered
 upper bound available: 14 GB for the first (upper bound 7.0 GB) and 16 GB
-for the second (8.0 GB). The host had 13.6 GiB available. Every shape this ADR measured before accepting decision 1, including
+for the second (8.0 GB). The host had 13.6 GB available (`MemAvailable` 13,636,980 kB). Every shape this ADR measured before accepting decision 1, including
 the width gate of decision 4, had every attribute present on every record,
 so none of them exercised this. Ingest's default limits cap a record at 128
 attributes; the review found no cap on the distinct names across a flush or a
@@ -344,7 +345,7 @@ What changes:
   the row builder's. That is a new decision and needs its own ADR or a
   further amendment here. The implementation branch of #2564 is kept as
   reference for it.
-- **Decision 5 applies to both builders.** Each builder encodes the stream
+- **Decision 5 applies to both builders.** Each builder is to encode the stream
   directory through an encode-side entry point over borrowed entries, into a
   buffer sized for its content.
 - **Decision 6 applies to both builders, and names the row builder's
@@ -374,3 +375,12 @@ What changes:
   the lower encode time on wide records, one production builder instead of
   two, and `ColumnarLogBatch::validate` running on every row-shaped encode.
   Encoded objects still do not change.
+- **Outcome.** Decisions 5 and 6 landed for both builders in pull request
+  #2601 (issue #2565). Measured with the same profiler, heap at its global
+  maximum, 20,000 records (issues #2602 and #2608): the row builder at
+  20,000 streams went from 40.76 MB to 32.67 MB, 19.85% lower, and the
+  columnar builder with its input dropped from 30.22 MB to 27.12 MB, 10.27%
+  lower; at 1 and 1,000 streams neither moved by more than 1%. The drops of
+  the columnar builder's per-row arrays after its block loop do not lower
+  that peak, because it falls inside the block loop, while those arrays are
+  still in use.
