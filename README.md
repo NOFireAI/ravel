@@ -118,8 +118,8 @@ matrix says which.
 The matrix describes `main`. Its "In published image" column means that the
 image built from `main` compiles the surface in. A surface that lands after
 the tag that the quickstart pins is not yet in the quickstart image. Every
-entry below is in the pinned `0.22.0` image. After the next feature lands,
-`git log v0.22.0..main` tells you whether that is still true. `CHANGELOG.md`
+entry below is in the pinned `0.23.0` image. After the next feature lands,
+`git log v0.23.0..main` tells you whether that is still true. `CHANGELOG.md`
 records the release that each surface first shipped in.
 
 <!-- BEGIN SUPPORT MATRIX -->
@@ -336,7 +336,7 @@ catalogued and refuse calls until their bodies land.
 GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
 `Dockerfile`. Both `linux/amd64` and `linux/arm64` are published. Each published
 object is an OCI image index that carries an SBOM and full build provenance. The
-quickstart pins `ghcr.io/nofireai/ravel-server:0.22.0`. Override it with
+quickstart pins `ghcr.io/nofireai/ravel-server:0.23.0`. Override it with
 `RAVEL_IMAGE`.
 
 ```sh
@@ -360,12 +360,12 @@ so that is the identity in the certificate:
 
 ```sh
 cosign verify \
-  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.22.0' \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.23.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/nofireai/ravel-server:0.22.0
+  ghcr.io/nofireai/ravel-server:0.23.0
 ```
 
-Replace `v0.22.0` and `0.22.0` with the release you are verifying. The tag ref in
+Replace `v0.23.0` and `0.23.0` with the release you are verifying. The tag ref in
 `--certificate-identity` must be the exact tag that produced the image.
 
 ## How Ravel is verified

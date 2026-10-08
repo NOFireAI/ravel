@@ -147,7 +147,7 @@ Two routes Grafana's built-in Prometheus datasource probes on every datasource
 save. They take no parameters.
 
 ```json
-{"status": "success", "data": {"version": "0.22.0", "revision": "", "branch": "", "buildUser": "", "buildDate": "", "goVersion": ""}}
+{"status": "success", "data": {"version": "0.23.0", "revision": "", "branch": "", "buildUser": "", "buildDate": "", "goVersion": ""}}
 ```
 
 `version` is the version of Ravel, not of Prometheus. `revision` is the git
