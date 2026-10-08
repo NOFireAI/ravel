@@ -936,6 +936,13 @@ enum ParquetCommand {
     /// resolve, so while it is in flight no sweep can free the version key
     /// its create-if-absent put targets. A query needs no protection here,
     /// since it reads a table's manifest once, when it resolves.
+    ///
+    /// A table's superseded versions go only once its newest version is
+    /// attributed to Ravel's DDL writer (ADR-2430). On a keyed bucket, given
+    /// `--tenant-hash-key-file`, the newest version must carry a valid MAC;
+    /// format version 1 manifests carry none, so their tables are held until
+    /// their next DDL statement. On an unkeyed bucket the newest version must
+    /// instead be 168 times the grace old. Every held table is printed.
     Sweep {
         /// The tenant whose superseded manifest versions to delete.
         #[arg(long)]
@@ -972,7 +979,8 @@ enum ParquetCommand {
     /// with `--delete-version` once the DDL audit log shows no statement wrote
     /// it. Prints each key, when the store wrote it, and its `created_by` and
     /// `statement` (reported unreadable when the credential may not read
-    /// manifests), and marks the flagged ones. Without `--delete` or
+    /// manifests; the shipped Maintain template may), and marks the flagged
+    /// ones. Without `--delete` or
     /// `--delete-version` nothing is deleted. Run it under the Maintain
     /// credential, the only role that may delete manifest versions.
     ///

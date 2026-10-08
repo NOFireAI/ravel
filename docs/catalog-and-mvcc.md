@@ -29,7 +29,7 @@ t/<tenant_hash>/catalog/<signal>/HEAD                                    head po
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
 t/<tenant_hash>/pq/grants                                               Parquet table location grants record (CAS whole-record replace, format_version 1; ADR-2040 D1)
-t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm                        Parquet table manifest version (CreateIfAbsent, immutable, newest version is the table; ADR-2040 D1)
+t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm                        Parquet table manifest version (CreateIfAbsent, immutable, newest version is the table; written at format_version 1, read at 1 and 2, version 2 adds a MAC the sweep verifies; ADR-2040 D1, ADR-2430)
 sys/qualification                                                       store qualification record (once per suite version, re-recorded on a version bump; ADR-1302)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/pq-probe/<random>                                                   Ravel-bucket probe object, written and deleted by the probe (transient; ADR-2040 D1)

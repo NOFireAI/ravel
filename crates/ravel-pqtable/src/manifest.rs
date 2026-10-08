@@ -671,10 +671,22 @@ mod tests {
     }
 
     #[test]
-    fn the_read_window_is_exactly_version_one() {
+    fn release_a_reads_versions_one_and_two_and_writes_one() {
+        // ADR-2430 decision 1: readers learn version 2 one release before any
+        // writer stamps it.
         assert_eq!(PARQUET_TABLE_FORMAT_VERSION, 1);
         assert_eq!(PARQUET_TABLE_MIN_READ_VERSION, 1);
-        assert_eq!(PARQUET_TABLE_MAX_READ_VERSION, 1);
+        assert_eq!(PARQUET_TABLE_MAX_READ_VERSION, 2);
+        assert_eq!(MAC_FORMAT_VERSION, 2);
+        let key = manifest_key(&TENANT, "hits", 3).expect("key");
+        for format_version in [1, 2] {
+            let bytes = raw_with_version(format_version, &live(3));
+            assert_eq!(
+                decode_manifest(&key, &bytes),
+                Ok(live(3)),
+                "{format_version}"
+            );
+        }
     }
 
     #[test]
@@ -686,8 +698,8 @@ mod tests {
             decode_manifest(&key, &bytes),
             Err(ManifestError::UnsupportedVersion {
                 key: key.clone(),
-                got: 2,
-                ceiling: 1,
+                got: 3,
+                ceiling: 2,
             })
         );
         let bytes = raw_with_version(u32::MAX, &m);
@@ -953,6 +965,179 @@ mod tests {
         ));
     }
 
+    fn mac_key() -> ManifestMacKey {
+        ManifestMacKey::from_deployment_key(&[0x42; 32])
+    }
+
+    fn status(bytes: &[u8], key: &ManifestMacKey) -> MacStatus {
+        let at = manifest_key(&TENANT, "hits", 3).expect("key");
+        decode_authenticated(&at, bytes, key).expect("decode").1
+    }
+
+    #[test]
+    fn the_mac_key_is_derived_under_its_own_context() {
+        let deployment = [0x42; 32];
+        let derived = blake3::derive_key("ravel pqm manifest mac v1", &deployment);
+        let tag = blake3::keyed_hash(&derived, b"body");
+        assert!(mac_key().verify(b"body", tag.as_bytes()));
+        // Neither the deployment key itself nor another context's key.
+        let raw = blake3::keyed_hash(&deployment, b"body");
+        assert!(!mac_key().verify(b"body", raw.as_bytes()));
+        let other = blake3::keyed_hash(
+            &blake3::derive_key("ravel audit query-text token key v1", &deployment),
+            b"body",
+        );
+        assert!(!mac_key().verify(b"body", other.as_bytes()));
+        assert_eq!(format!("{:?}", mac_key()), "ManifestMacKey(<redacted>)");
+    }
+
+    #[test]
+    fn a_version_two_manifest_macs_under_the_key_and_verifies() {
+        let m = live(3);
+        let bytes = encode_manifest_with(&TENANT, &m, MAC_FORMAT_VERSION, Some(&mac_key()))
+            .expect("encode");
+        let at = manifest_key(&TENANT, "hits", 3).expect("key");
+        assert_eq!(
+            decode_authenticated(&at, &bytes, &mac_key()),
+            Ok((m.clone(), MacStatus::Valid))
+        );
+        assert_eq!(decode_manifest(&at, &bytes), Ok(m.clone()));
+        let body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
+        assert_eq!(body.format_version, 2);
+        assert_eq!(body.mac.len(), MANIFEST_MAC_LEN);
+        assert_eq!(
+            manifest_mac(&mac_key(), &TENANT, &m, MAC_FORMAT_VERSION)
+                .expect("mac")
+                .map(|t| t.to_vec()),
+            Some(body.mac)
+        );
+        assert_eq!(manifest_mac(&mac_key(), &TENANT, &m, 1).expect("mac"), None);
+    }
+
+    #[test]
+    fn a_manifest_built_without_the_key_does_not_verify() {
+        let m = live(3);
+        let unkeyed = encode_manifest_with(&TENANT, &m, MAC_FORMAT_VERSION, None).expect("encode");
+        assert_eq!(status(&unkeyed, &mac_key()), MacStatus::Absent);
+        let forger = ManifestMacKey::from_deployment_key(&[0x66; 32]);
+        let forged =
+            encode_manifest_with(&TENANT, &m, MAC_FORMAT_VERSION, Some(&forger)).expect("encode");
+        assert_eq!(status(&forged, &mac_key()), MacStatus::Invalid);
+        assert_eq!(status(&forged, &forger), MacStatus::Valid);
+        // Version 1 never authenticates, even holding a MAC that would verify
+        // under version 2.
+        let mut body = pb::ParquetTableManifest::decode(
+            encode_manifest_with(&TENANT, &m, MAC_FORMAT_VERSION, Some(&mac_key()))
+                .expect("encode")
+                .as_slice(),
+        )
+        .expect("decode");
+        body.format_version = 1;
+        assert_eq!(
+            status(&body.encode_to_vec(), &mac_key()),
+            MacStatus::Unversioned
+        );
+        assert_eq!(
+            status(&encode_manifest(&TENANT, &m).expect("encode"), &mac_key()),
+            MacStatus::Unversioned
+        );
+    }
+
+    #[test]
+    fn every_one_bit_change_to_the_tag_fails_verification() {
+        let bytes = encode_manifest_with(&TENANT, &live(3), MAC_FORMAT_VERSION, Some(&mac_key()))
+            .expect("encode");
+        let body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
+        assert_eq!(status(&bytes, &mac_key()), MacStatus::Valid);
+        for bit in 0..MANIFEST_MAC_LEN * 8 {
+            let mut flipped = body.clone();
+            flipped.mac[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                status(&flipped.encode_to_vec(), &mac_key()),
+                MacStatus::Invalid,
+                "bit {bit}"
+            );
+        }
+        // A truncated or extended tag is refused before any byte compares.
+        for len in [0, 1, MANIFEST_MAC_LEN - 1, MANIFEST_MAC_LEN + 1] {
+            let mut tag = body.mac.clone();
+            tag.resize(len, 0);
+            assert!(!ct_eq(&body.mac, &tag), "{len}");
+        }
+    }
+
+    #[test]
+    fn the_mac_binds_every_field_of_the_body() {
+        let bytes = encode_manifest_with(&TENANT, &live(3), MAC_FORMAT_VERSION, Some(&mac_key()))
+            .expect("encode");
+        let body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
+        type Edit = fn(&mut pb::ParquetTableManifest);
+        let edits: [(&str, Edit); 10] = [
+            ("location", |b| {
+                b.location = "s3://customer-bucket/other/".into()
+            }),
+            ("grant", |b| b.grant = "s3://customer-bucket".into()),
+            ("files", |b| {
+                b.files.pop();
+            }),
+            ("file etag", |b| b.files[0].etag = "\"etag-x\"".into()),
+            ("options", |b| {
+                b.options.clear();
+            }),
+            ("created_by", |b| b.created_by = "intruder".into()),
+            ("created_unix_ns", |b| b.created_unix_ns += 1),
+            ("statement", |b| b.statement = "DROP TABLE hits".into()),
+            ("apply_nonce", |b| b.apply_nonce[0] ^= 1),
+            ("dropped", |b| {
+                b.dropped = true;
+                b.location.clear();
+                b.grant.clear();
+                b.files.clear();
+                b.options.clear();
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut edited = body.clone();
+            edit(&mut edited);
+            assert_eq!(
+                status(&edited.encode_to_vec(), &mac_key()),
+                MacStatus::Invalid,
+                "{field}"
+            );
+        }
+        // The tenant, table and version are bound too: a MACed body copied
+        // under another version's key is refused as misfiled, and with the key
+        // fields edited to match, its MAC no longer verifies.
+        let mut moved = body.clone();
+        moved.version = 4;
+        let at = manifest_key(&TENANT, "hits", 4).expect("key");
+        assert_eq!(
+            decode_authenticated(&at, &moved.encode_to_vec(), &mac_key()).map(|(_, s)| s),
+            Ok(MacStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn the_encoder_refuses_a_stamp_outside_the_read_window() {
+        let key = manifest_key(&TENANT, "hits", 3).expect("key");
+        assert_eq!(
+            encode_manifest_with(&TENANT, &live(3), 3, Some(&mac_key())),
+            Err(ManifestError::UnsupportedVersion {
+                key: key.clone(),
+                got: 3,
+                ceiling: 2,
+            })
+        );
+        assert_eq!(
+            encode_manifest_with(&TENANT, &live(3), 0, None),
+            Err(ManifestError::VersionBelowFloor {
+                key,
+                got: 0,
+                floor: 1,
+            })
+        );
+    }
+
     #[test]
     fn a_dropped_manifest_round_trips() {
         let m = Manifest {
@@ -1103,6 +1288,26 @@ mod tests {
             let key = manifest_key(&TENANT, &m.table, m.version).expect("key");
             let bytes = encode_manifest(&TENANT, &m).expect("encode");
             prop_assert_eq!(decode_manifest(&key, &bytes), Ok(m));
+        }
+
+        #[test]
+        fn a_version_two_manifest_verifies_under_its_key_only(
+            m in arb_manifest(),
+            other in any::<[u8; 32]>(),
+        ) {
+            prop_assume!(other != [0x42; 32]);
+            let key = manifest_key(&TENANT, &m.table, m.version).expect("key");
+            let bytes = encode_manifest_with(&TENANT, &m, MAC_FORMAT_VERSION, Some(&mac_key()))
+                .expect("encode");
+            prop_assert_eq!(
+                decode_authenticated(&key, &bytes, &mac_key()),
+                Ok((m.clone(), MacStatus::Valid))
+            );
+            let wrong = ManifestMacKey::from_deployment_key(&other);
+            prop_assert_eq!(
+                decode_authenticated(&key, &bytes, &wrong),
+                Ok((m, MacStatus::Invalid))
+            );
         }
 
         #[test]

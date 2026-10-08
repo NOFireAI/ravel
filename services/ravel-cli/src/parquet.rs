@@ -11,11 +11,16 @@
 //! [`ravel_pqtable::repair`]. Nothing about the key layout, the grace
 //! arithmetic or the version bound is restated here.
 //!
-//! `repair` runs under the Maintain credential, which may list and delete
-//! manifest versions but not read them. Which versions it deletes is decided
-//! from the listing alone; the writer and statement of each version are
-//! printed when the credential can read them and reported unreadable
-//! otherwise.
+//! `repair` runs under the Maintain credential, which may list, read and
+//! delete manifest versions. Which versions it deletes is decided from the
+//! listing alone; the writer and statement of each version are printed when
+//! the credential can read them and reported unreadable otherwise.
+//!
+//! `sweep` deletes a table's superseded versions only once its newest version
+//! is attributed to the DDL writer (ADR-2430): on a keyed bucket a valid MAC
+//! under the key given with `--tenant-hash-key-file`, on an unkeyed one an
+//! age of [`sweep::UNKEYED_NEWEST_GRACE_MULTIPLE`] times the grace. It prints
+//! every table it held and why.
 //!
 //! # Where the sweep's minimum grace comes from
 //!
