@@ -196,17 +196,25 @@ pub async fn ls(
 
 /// `parquet sweep`: delete every manifest version superseded for longer than
 /// `grace`, refusing a grace below the deployment's stored minimum.
+///
+/// `deployment_key` is the `--tenant-hash-key-file` key of a keyed bucket.
+/// With it a table's superseded versions go only when its newest version
+/// carries a valid MAC; without it, only once the newest is older than
+/// [`sweep::UNKEYED_NEWEST_GRACE_MULTIPLE`] times the grace (ADR-2430). Each
+/// table the gate held is printed with the reason.
 pub async fn sweep(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     grace: &str,
     now_ns: i64,
+    deployment_key: Option<&[u8; 32]>,
 ) -> anyhow::Result<()> {
     let grace_ms = parse_grace_ms(grace)?;
     let min_grace_ms = deployment_min_grace_ms(store.as_ref()).await?;
     let hash = TenantId::new(tenant).hash();
     let now_ms = now_ns / 1_000_000;
-    let plan = sweep::plan(store.as_ref(), &hash, now_ms, grace_ms, min_grace_ms).await?;
+    let gate = sweep::NewestGate::for_deployment(deployment_key);
+    let plan = sweep::plan(store.as_ref(), &hash, now_ms, grace_ms, min_grace_ms, &gate).await?;
     let report = sweep::execute(store.as_ref(), &plan).await?;
     println!(
         "deleted {} manifest versions",
@@ -215,7 +223,45 @@ pub async fn sweep(
     for key in &report.manifests_deleted {
         println!("  {key}");
     }
+    if !plan.held.is_empty() {
+        println!(
+            "held the superseded versions of {} table(s) whose newest version is not \
+             authenticated",
+            plan.held.len()
+        );
+    }
+    for held in &plan.held {
+        println!(
+            "  {}: {} version(s) kept under newest version {}: {}",
+            held.table,
+            held.held,
+            held.newest,
+            hold_reason_text(&held.reason)
+        );
+    }
     Ok(())
+}
+
+fn hold_reason_text(reason: &sweep::HoldReason) -> String {
+    match reason {
+        sweep::HoldReason::Unversioned => {
+            "format version 1 carries no MAC; the next DDL on the table writes one that does"
+                .to_string()
+        }
+        sweep::HoldReason::MacAbsent => {
+            "no MAC, so not written by a keyed DDL writer; check the DDL audit log".to_string()
+        }
+        sweep::HoldReason::MacInvalid => {
+            "MAC does not verify under this deployment's key; check the DDL audit log, and \
+             remove a forged version with `parquet repair --delete-version`"
+                .to_string()
+        }
+        sweep::HoldReason::Unreadable(why) => format!("unreadable ({why})"),
+        sweep::HoldReason::UnkeyedGrace => format!(
+            "unkeyed bucket: kept until the newest version is {}x the grace old",
+            sweep::UNKEYED_NEWEST_GRACE_MULTIPLE
+        ),
+    }
 }
 
 /// What `parquet repair` does after it is told the table.
@@ -646,14 +692,14 @@ mod tests {
     async fn sweep_refuses_a_grace_below_the_stored_minimum() {
         let store: Arc<dyn ObjectStoreBackend> =
             Arc::new(store_with_two_hour_query_duration().await);
-        let err = sweep(Arc::clone(&store), "acme", "1h", NOW_NS)
+        let err = sweep(Arc::clone(&store), "acme", "1h", NOW_NS, None)
             .await
             .expect_err("must refuse");
         assert!(
             format!("{err:#}").contains("grace 3600000 ms is below the minimum 7200000 ms"),
             "{err:#}"
         );
-        sweep(store, "acme", "2h", NOW_NS)
+        sweep(store, "acme", "2h", NOW_NS, None)
             .await
             .expect("a grace at the minimum is accepted");
     }

@@ -13,6 +13,8 @@ ravel-object-store = { workspace = true }
 object_store = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
+# Keys the manifest MAC (ADR-2430). Already in the server binary.
+blake3 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
@@ -21,7 +23,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-blake3 = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

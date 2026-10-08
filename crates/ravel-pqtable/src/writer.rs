@@ -52,7 +52,10 @@ use ravel_types::TenantHash;
 
 use crate::clock::Clock;
 use crate::keys::{KeyError, MAX_MANIFEST_VERSION, manifest_key};
-use crate::manifest::{APPLY_NONCE_LEN, Manifest, ManifestError, ParquetFile, encode_manifest};
+use crate::manifest::{
+    APPLY_NONCE_LEN, Manifest, ManifestError, ManifestMacKey, PARQUET_TABLE_FORMAT_VERSION,
+    ParquetFile, encode_manifest_with,
+};
 use crate::names::{NameError, validate_table};
 use crate::resolve::{self, ResolveError};
 
@@ -304,6 +307,12 @@ async fn own_commit(
 /// `min_grace_ms` is the deployment's sweep floor ([`crate::sweep`]). Half of
 /// it is the budget from this call's resolve to the end of its put; see the
 /// module docs for what happens past it.
+///
+/// `mac_key` is the deployment's manifest MAC key, `None` in an unkeyed
+/// deployment. The manifest is stamped [`PARQUET_TABLE_FORMAT_VERSION`] and
+/// carries a MAC under `mac_key` once that stamp is
+/// [`MAC_FORMAT_VERSION`](crate::manifest::MAC_FORMAT_VERSION) or
+/// later (ADR-2430); at stamp 1 the key is unused.
 pub async fn apply(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -311,6 +320,34 @@ pub async fn apply(
     intent: Intent,
     clock: &dyn Clock,
     min_grace_ms: u64,
+    mac_key: Option<&ManifestMacKey>,
+) -> Result<Outcome, WriteError> {
+    apply_stamped(
+        store,
+        tenant,
+        table,
+        intent,
+        clock,
+        min_grace_ms,
+        mac_key,
+        PARQUET_TABLE_FORMAT_VERSION,
+    )
+    .await
+}
+
+/// [`apply`], stamping `format_version` instead of
+/// [`PARQUET_TABLE_FORMAT_VERSION`], so the version 2 write path runs in tests
+/// before the writer stamp moves.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_stamped(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    table: &str,
+    intent: Intent,
+    clock: &dyn Clock,
+    min_grace_ms: u64,
+    mac_key: Option<&ManifestMacKey>,
+    format_version: u32,
 ) -> Result<Outcome, WriteError> {
     validate_table(table)?;
     if let Intent::Create { files, .. } | Intent::CreateOrReplace { files, .. } = &intent
@@ -347,7 +384,7 @@ pub async fn apply(
             });
         }
         let key = manifest_key(tenant, table, manifest.version)?;
-        let bytes = encode_manifest(tenant, &manifest)?;
+        let bytes = encode_manifest_with(tenant, &manifest, format_version, mac_key)?;
         let remaining_ns = budget_ns.saturating_sub(clock.now_ns().saturating_sub(resolved_at));
         let Ok(remaining_ns) = u64::try_from(remaining_ns) else {
             continue;
@@ -418,8 +455,17 @@ mod tests {
 
     use super::*;
     use crate::clock::FixedClock;
+    use prost::Message;
+    use ravel_proto::parquet_table::v1 as pb;
+
+    use crate::keys::manifest_key;
+    use crate::manifest::{
+        MAC_FORMAT_VERSION, MacStatus, decode_authenticated, encode_manifest, manifest_mac,
+    };
     use crate::resolve::read_version;
-    use crate::test_util::{CountingStore, TENANT_A, file_for, live_manifest};
+    use crate::test_util::{
+        CountingStore, TENANT_A, TEST_DEPLOYMENT_KEY, file_for, live_manifest, test_mac_key,
+    };
 
     type Store = CountingStore<FaultStore<MemoryStore>>;
 
@@ -500,6 +546,7 @@ mod tests {
             intent,
             &FixedClock::new(now_ns),
             GRACE_MS,
+            None,
         )
         .await
     }
@@ -937,6 +984,7 @@ mod tests {
                 create(false, &[1], "a"),
                 &clock,
                 GRACE_MS,
+                None,
             )
             .await
             .expect("create"),
@@ -964,6 +1012,7 @@ mod tests {
                     create(false, &[1], "a"),
                     &clock,
                     GRACE_MS,
+                    None,
                 )
                 .await
                 .expect("create"),
@@ -1089,6 +1138,7 @@ mod tests {
                 create(false, &[1], "a"),
                 &FixedClock::new(0),
                 grace,
+                None,
             )
             .await;
             assert!(
@@ -1104,6 +1154,7 @@ mod tests {
                 create(false, &[1], "a"),
                 &FixedClock::new(0),
                 2,
+                None,
             )
             .await
             .expect("one ms of budget"),
@@ -1126,6 +1177,7 @@ mod tests {
                 create(false, &[1], "a"),
                 &FixedClock::new(0),
                 45_000,
+                None,
             )
             .await
             .expect("45 s grace leaves a budget"),
@@ -1203,5 +1255,129 @@ mod tests {
                 .dropped
         );
         assert_each_version_written_once(&store);
+    }
+
+    /// The bytes stored at `table`'s version `version`.
+    async fn stored(store: &MemoryStore, table: &str, version: u64) -> (String, Bytes) {
+        let key = manifest_key(&TENANT_A, table, version).expect("key");
+        let data = store.get(&key, GetRange::Full).await.expect("get").data;
+        (key, data)
+    }
+
+    #[tokio::test]
+    async fn the_version_two_write_path_macs_every_manifest_it_writes() {
+        let store = MemoryStore::new();
+        let key = test_mac_key();
+        for (intent, version) in [
+            (create(false, &[1], "a"), 1),
+            (replace(&[2], "a"), 2),
+            (drop_table(false, "a"), 3),
+        ] {
+            assert_eq!(
+                apply_stamped(
+                    &store,
+                    &TENANT_A,
+                    "hits",
+                    intent,
+                    &FixedClock::new(0),
+                    GRACE_MS,
+                    Some(&key),
+                    MAC_FORMAT_VERSION,
+                )
+                .await
+                .expect("apply"),
+                Outcome::Committed { version }
+            );
+            let (object_key, bytes) = stored(&store, "hits", version).await;
+            let (manifest, status) =
+                decode_authenticated(&object_key, &bytes, &key).expect("decode");
+            assert_eq!(status, MacStatus::Valid, "v{version}");
+            // The stored MAC is the one `manifest_mac` computes for the same
+            // manifest, so the sweep and the writer agree on the bytes.
+            let body = pb::ParquetTableManifest::decode(bytes.as_ref()).expect("decode");
+            assert_eq!(body.format_version, MAC_FORMAT_VERSION);
+            assert_eq!(
+                manifest_mac(&key, &TENANT_A, &manifest, MAC_FORMAT_VERSION)
+                    .expect("mac")
+                    .map(|m| m.to_vec()),
+                Some(body.mac)
+            );
+            // A key derived from any other deployment key does not verify it.
+            let other = ManifestMacKey::from_deployment_key(&[0x43; 32]);
+            assert_eq!(
+                decode_authenticated(&object_key, &bytes, &other)
+                    .expect("decode")
+                    .1,
+                MacStatus::Invalid,
+                "v{version}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_two_manifest_written_without_the_key_does_not_verify() {
+        let store = MemoryStore::new();
+        apply_stamped(
+            &store,
+            &TENANT_A,
+            "hits",
+            create(false, &[1], "a"),
+            &FixedClock::new(0),
+            GRACE_MS,
+            None,
+            MAC_FORMAT_VERSION,
+        )
+        .await
+        .expect("apply");
+        let (object_key, bytes) = stored(&store, "hits", 1).await;
+        assert_eq!(
+            decode_authenticated(&object_key, &bytes, &test_mac_key())
+                .expect("decode")
+                .1,
+            MacStatus::Absent
+        );
+    }
+
+    /// Release A (ADR-2430 decision 1): the writer still stamps version 1 and
+    /// MACs nothing, even holding the key, so a reader that predates version 2
+    /// reads every manifest this build writes.
+    #[tokio::test]
+    async fn the_shipped_writer_stamps_version_one_without_a_mac() {
+        assert_eq!(PARQUET_TABLE_FORMAT_VERSION, 1);
+        let store = MemoryStore::new();
+        let key = ManifestMacKey::from_deployment_key(&TEST_DEPLOYMENT_KEY);
+        apply(
+            &store,
+            &TENANT_A,
+            "hits",
+            create(false, &[1], "a"),
+            &FixedClock::new(0),
+            GRACE_MS,
+            Some(&key),
+        )
+        .await
+        .expect("apply");
+        let (object_key, bytes) = stored(&store, "hits", 1).await;
+        let body = pb::ParquetTableManifest::decode(bytes.as_ref()).expect("decode");
+        assert_eq!(body.format_version, 1);
+        assert!(body.mac.is_empty());
+        assert_eq!(
+            decode_authenticated(&object_key, &bytes, &key)
+                .expect("decode")
+                .1,
+            MacStatus::Unversioned
+        );
+        assert_eq!(
+            bytes.as_ref(),
+            encode_manifest(
+                &TENANT_A,
+                &read_version(&store, &TENANT_A, "hits", 1)
+                    .await
+                    .expect("read")
+                    .expect("present")
+            )
+            .expect("encode")
+            .as_slice()
+        );
     }
 }

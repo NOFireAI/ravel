@@ -564,6 +564,7 @@ pub fn build_sql_state(
         process_memory_budget,
         None,
         ravel_sql::DEFAULT_MIN_GRACE_MS,
+        None,
         &SqlSpillInputs::default(),
     )
 }
@@ -1043,6 +1044,10 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// parquet sweep` does. The caller derives it from the already-bootstrapped
 /// `GcConfigValues` rather than this function re-reading `sys/gc`.
 ///
+/// `deployment_key` is the `--tenant-hash-key-file` key of a keyed
+/// deployment, `None` on an unkeyed one. The executor derives the Parquet
+/// manifest MAC key from it (ADR-2430) and hands that to the writer.
+///
 /// `spill` is what [`prepare_sql_spill`] settled: the executor's
 /// `SqlConfig::spill` comes from `SqlConfig::with_spill_resolved(spill.off,
 /// spill.cache_dir)`.
@@ -1064,6 +1069,7 @@ pub fn build_sql_state_with_parquet(
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet_profiles: Option<crate::config::ParquetProfiles>,
     ddl_min_grace_ms: u64,
+    deployment_key: Option<&[u8; 32]>,
     spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
@@ -1101,6 +1107,7 @@ pub fn build_sql_state_with_parquet(
         process_memory_budget,
         Some(sources),
         ddl_min_grace_ms,
+        deployment_key,
         spill,
     )
 }
@@ -1123,6 +1130,7 @@ fn build_sql_state_inner(
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet: Option<ravel_sql::ParquetSources>,
     ddl_min_grace_ms: u64,
+    deployment_key: Option<&[u8; 32]>,
     spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
@@ -1256,6 +1264,12 @@ fn build_sql_state_inner(
     // writer spends as its resolve-to-put budget; see
     // `WRITER_MIN_USABLE_GRACE_MS` for why it is not query protection.
     let executor = executor.with_ddl_min_grace_ms(ddl_min_grace_ms);
+    // ADR-2430: the manifest MAC key is derived from the deployment key, so a
+    // keyed deployment's DDL writer can authenticate the manifests it writes.
+    let executor = match deployment_key {
+        Some(key) => executor.with_deployment_key(key),
+        None => executor,
+    };
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -2399,10 +2413,22 @@ mod tests {
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             None,
             7_000,
+            Some(&[7u8; 32]),
             &SqlSpillInputs::default(),
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
+        // ADR-2430: a keyed deployment's executor holds the manifest MAC key
+        // derived from its deployment key, the one the sweep verifies with.
+        let installed = state.executor.manifest_mac_key().expect("a mac key");
+        let tag = blake3::keyed_hash(
+            &blake3::derive_key(
+                ravel_pqtable::manifest::MANIFEST_MAC_KEY_CONTEXT,
+                &[7u8; 32],
+            ),
+            b"probe",
+        );
+        assert!(installed.verify(b"probe", tag.as_bytes()));
         assert_ne!(7_000, ravel_sql::DEFAULT_MIN_GRACE_MS);
     }
 
@@ -2452,9 +2478,11 @@ mod tests {
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             None,
             expected_ms,
+            None,
             &SqlSpillInputs::default(),
         )
         .expect("sql state builds");
+        assert!(state.executor.manifest_mac_key().is_none());
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
     }
 
@@ -2580,6 +2608,7 @@ mod tests {
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
                 profiles,
                 ravel_sql::DEFAULT_MIN_GRACE_MS,
+                None,
                 &SqlSpillInputs::default(),
             )
             .expect("sql state builds")
@@ -3297,6 +3326,7 @@ mod tests {
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             None,
             ravel_sql::DEFAULT_MIN_GRACE_MS,
+            None,
             inputs,
         )
         .expect("sql state builds");

@@ -16,10 +16,18 @@ use ravel_object_store::{
 use ravel_types::TenantHash;
 
 use crate::clock::FixedClock;
-use crate::manifest::{APPLY_NONCE_LEN, Manifest, ParquetFile};
+use crate::manifest::{APPLY_NONCE_LEN, Manifest, ManifestMacKey, ParquetFile};
 
 pub const TENANT_A: TenantHash = TenantHash([0xa1; 16]);
 pub const TENANT_B: TenantHash = TenantHash([0xb2; 16]);
+
+/// The deployment key behind [`test_mac_key`].
+pub const TEST_DEPLOYMENT_KEY: [u8; 32] = [0x42; 32];
+
+/// The manifest MAC key of a deployment keyed with [`TEST_DEPLOYMENT_KEY`].
+pub fn test_mac_key() -> ManifestMacKey {
+    ManifestMacKey::from_deployment_key(&TEST_DEPLOYMENT_KEY)
+}
 
 /// An external Parquet file in the tenant's own bucket, distinct per `seed`.
 pub fn file_for(seed: u8) -> ParquetFile {

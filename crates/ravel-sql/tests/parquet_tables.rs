@@ -294,6 +294,7 @@ impl Lake {
             },
             &FixedClock::new(NOW),
             MIN_GRACE_MS,
+            None,
         )
         .await
         .expect("create");
@@ -316,6 +317,7 @@ impl Lake {
             },
             &FixedClock::new(NOW),
             MIN_GRACE_MS,
+            None,
         )
         .await
         .expect("replace");
@@ -1258,6 +1260,7 @@ async fn drop_table(lake: &Lake, tenant: &TenantHash, table: &str) {
         },
         &FixedClock::new(NOW),
         MIN_GRACE_MS,
+        None,
     )
     .await
     .expect("drop");

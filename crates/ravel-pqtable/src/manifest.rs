@@ -26,6 +26,15 @@
 //! `dropped`, and files that are individually addressable and distinct.
 //! A decoded manifest whose file key fails [`key_is_addressable`] is refused
 //! as [`ManifestDefect::UnaddressableKey`] rather than read.
+//!
+//! From `format_version` 2 a manifest carries a MAC (ADR-2430): a keyed
+//! BLAKE3-256 over the body encoded with `mac` empty, under a
+//! [`ManifestMacKey`] derived from the deployment key. A create-only object
+//! credential can write a manifest version but cannot compute its MAC, so
+//! [`decode_authenticated`] tells a version the DDL writer wrote from one put
+//! directly in the bucket. This build reads version 2 and still writes
+//! version 1 ([`PARQUET_TABLE_FORMAT_VERSION`]), so no reader meets a version
+//! it refuses while the readers roll out.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,19 +42,32 @@ use prost::Message;
 use ravel_proto::parquet_table::v1 as pb;
 use ravel_types::TenantHash;
 
-use crate::keys::{KeyError, parse_manifest_key};
+use crate::keys::{KeyError, manifest_key, parse_manifest_key};
 use crate::names::{NameError, validate_table};
 
-/// Format floor written into every manifest this build emits.
+/// Format floor written into every manifest this build emits. Still 1 while
+/// readers of version 2 roll out (ADR-2430 decision 1, release A); raising it
+/// to [`MAC_FORMAT_VERSION`] is what makes the writer MAC its manifests.
 pub const PARQUET_TABLE_FORMAT_VERSION: u32 = 1;
 
 /// Lowest `format_version` this build reads. Version 0 is an unstamped
 /// record, which no supported writer produces.
 pub const PARQUET_TABLE_MIN_READ_VERSION: u32 = 1;
 
-/// Highest `format_version` this build reads. Equal to the writer stamp: the
-/// record has had no additive change.
-pub const PARQUET_TABLE_MAX_READ_VERSION: u32 = PARQUET_TABLE_FORMAT_VERSION;
+/// Highest `format_version` this build reads. Version 2 adds the `mac` field
+/// (ADR-2430), and is read before any writer stamps it.
+pub const PARQUET_TABLE_MAX_READ_VERSION: u32 = 2;
+
+/// The first `format_version` whose manifest carries a MAC. A version 1
+/// manifest is never authenticated, whatever its `mac` field holds.
+pub const MAC_FORMAT_VERSION: u32 = 2;
+
+/// Bytes in a manifest MAC: a BLAKE3-256 keyed hash.
+pub const MANIFEST_MAC_LEN: usize = 32;
+
+/// `blake3::derive_key` context the manifest MAC key is derived from the
+/// deployment key under (ADR-2430 decision 2).
+pub const MANIFEST_MAC_KEY_CONTEXT: &str = "ravel pqm manifest mac v1";
 
 /// Bytes in a manifest's per-apply nonce.
 pub const APPLY_NONCE_LEN: usize = 16;
@@ -92,9 +114,10 @@ pub struct ParquetFile {
     pub footer_len: u32,
 }
 
-/// One decoded manifest version. `format_version` is not carried: an encoded
-/// manifest is always stamped [`PARQUET_TABLE_FORMAT_VERSION`], and a decoded
-/// one has already passed the read window.
+/// One decoded manifest version. `format_version` and `mac` are not carried:
+/// the encoder takes the stamp and key as arguments, a decoded manifest has
+/// already passed the read window, and [`decode_authenticated`] reports what
+/// its MAC proves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub table: String,
@@ -286,13 +309,163 @@ impl Manifest {
     }
 }
 
-/// Encode `manifest` as a version of `tenant`'s table, stamped with
-/// [`PARQUET_TABLE_FORMAT_VERSION`]. Refuses a manifest that fails
-/// [`Manifest::validate`].
-pub fn encode_manifest(tenant: &TenantHash, manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
+/// The key a manifest MAC is taken under, derived from the deployment key
+/// (`--tenant-hash-key-file`). It never reaches object storage, so a principal
+/// holding only object access cannot compute a MAC.
+#[derive(Clone)]
+pub struct ManifestMacKey([u8; 32]);
+
+impl ManifestMacKey {
+    /// Derive the MAC key from the 32-byte deployment key under
+    /// [`MANIFEST_MAC_KEY_CONTEXT`], so it is never the deployment key itself.
+    pub fn from_deployment_key(deployment_key: &[u8; 32]) -> Self {
+        ManifestMacKey(blake3::derive_key(MANIFEST_MAC_KEY_CONTEXT, deployment_key))
+    }
+
+    /// Keyed BLAKE3-256 of `bytes`.
+    fn tag(&self, bytes: &[u8]) -> [u8; MANIFEST_MAC_LEN] {
+        *blake3::keyed_hash(&self.0, bytes).as_bytes()
+    }
+
+    /// True when `tag` is this key's MAC of `bytes`, compared in constant
+    /// time.
+    pub fn verify(&self, bytes: &[u8], tag: &[u8]) -> bool {
+        ct_eq(&self.tag(bytes), tag)
+    }
+}
+
+impl std::fmt::Debug for ManifestMacKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManifestMacKey(<redacted>)")
+    }
+}
+
+/// Constant-time byte-slice comparison, so verifying a MAC does not leak how
+/// many leading bytes matched. A length mismatch is refused up front; the
+/// length of a tag is not secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Whether a stored manifest is authenticated by a key ([`decode_authenticated`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacStatus {
+    /// `format_version` below [`MAC_FORMAT_VERSION`]: the record predates the
+    /// MAC and authenticates nothing.
+    Unversioned,
+    /// A version 2 manifest with an empty `mac`.
+    Absent,
+    /// A `mac` that is not the key's MAC of the body.
+    Invalid,
+    Valid,
+}
+
+impl MacStatus {
+    pub fn is_valid(self) -> bool {
+        self == MacStatus::Valid
+    }
+}
+
+/// The MAC of `body` under `key`: the keyed hash of `body` encoded with `mac`
+/// empty. prost encodes fields in field-number order and the `options` map as
+/// a `BTreeMap`, so one message has one encoding, and a decoded body
+/// re-encodes to the bytes its MAC was taken over.
+fn body_mac(key: &ManifestMacKey, body: &pb::ParquetTableManifest) -> [u8; MANIFEST_MAC_LEN] {
+    let mut unsigned = body.clone();
+    unsigned.mac.clear();
+    key.tag(&unsigned.encode_to_vec())
+}
+
+fn mac_status(key: &ManifestMacKey, body: &pb::ParquetTableManifest) -> MacStatus {
+    if body.format_version < MAC_FORMAT_VERSION {
+        MacStatus::Unversioned
+    } else if body.mac.is_empty() {
+        MacStatus::Absent
+    } else if ct_eq(&body_mac(key, body), &body.mac) {
+        MacStatus::Valid
+    } else {
+        MacStatus::Invalid
+    }
+}
+
+/// The MAC [`encode_manifest_with`] stores for `manifest` as a version of
+/// `tenant`'s table stamped `format_version`, or `None` when that version
+/// carries no MAC. Refuses a manifest that fails [`Manifest::validate`].
+pub fn manifest_mac(
+    key: &ManifestMacKey,
+    tenant: &TenantHash,
+    manifest: &Manifest,
+    format_version: u32,
+) -> Result<Option<[u8; MANIFEST_MAC_LEN]>, ManifestError> {
     manifest.validate()?;
-    let body = pb::ParquetTableManifest {
-        format_version: PARQUET_TABLE_FORMAT_VERSION,
+    if format_version < MAC_FORMAT_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(body_mac(
+        key,
+        &to_body(tenant, manifest, format_version),
+    )))
+}
+
+/// Encode `manifest` as a version of `tenant`'s table, stamped with
+/// [`PARQUET_TABLE_FORMAT_VERSION`] and carrying no MAC. Refuses a manifest
+/// that fails [`Manifest::validate`].
+pub fn encode_manifest(tenant: &TenantHash, manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
+    encode_manifest_with(tenant, manifest, PARQUET_TABLE_FORMAT_VERSION, None)
+}
+
+/// Encode `manifest` stamped `format_version`. From [`MAC_FORMAT_VERSION`] on,
+/// a `key` makes the body carry its MAC; with no key the `mac` field stays
+/// empty, which no reader authenticates. Below it the body never carries one.
+/// Refuses a manifest that fails [`Manifest::validate`], and a
+/// `format_version` outside this build's read window, which it could not read
+/// back.
+pub fn encode_manifest_with(
+    tenant: &TenantHash,
+    manifest: &Manifest,
+    format_version: u32,
+    key: Option<&ManifestMacKey>,
+) -> Result<Vec<u8>, ManifestError> {
+    manifest.validate()?;
+    let mut body = to_body(tenant, manifest, format_version);
+    let stamp_key =
+        || manifest_key(tenant, &manifest.table, manifest.version).map_err(ManifestError::from);
+    if format_version < PARQUET_TABLE_MIN_READ_VERSION {
+        return Err(ManifestError::VersionBelowFloor {
+            key: stamp_key()?,
+            got: format_version,
+            floor: PARQUET_TABLE_MIN_READ_VERSION,
+        });
+    }
+    if format_version > PARQUET_TABLE_MAX_READ_VERSION {
+        return Err(ManifestError::UnsupportedVersion {
+            key: stamp_key()?,
+            got: format_version,
+            ceiling: PARQUET_TABLE_MAX_READ_VERSION,
+        });
+    }
+    if format_version >= MAC_FORMAT_VERSION
+        && let Some(key) = key
+    {
+        body.mac = body_mac(key, &body).to_vec();
+    }
+    Ok(body.encode_to_vec())
+}
+
+fn to_body(
+    tenant: &TenantHash,
+    manifest: &Manifest,
+    format_version: u32,
+) -> pb::ParquetTableManifest {
+    pb::ParquetTableManifest {
+        format_version,
         tenant_hash: tenant.0.to_vec(),
         table: manifest.table.clone(),
         version: manifest.version,
@@ -318,16 +491,34 @@ pub fn encode_manifest(tenant: &TenantHash, manifest: &Manifest) -> Result<Vec<u
         created_unix_ns: manifest.created_unix_ns,
         statement: manifest.statement.clone(),
         apply_nonce: manifest.apply_nonce.clone(),
-    };
-    Ok(body.encode_to_vec())
+        mac: Vec::new(),
+    }
 }
 
 /// Decode the manifest stored at `key`. Refuses, with a typed error: a key
 /// that is not a manifest key, bytes that are not a protobuf message, a
 /// `format_version` outside the read window, a body whose tenant, table or
 /// version differs from the key's, and a body that fails
-/// [`Manifest::validate`].
+/// [`Manifest::validate`]. A version 2 body's MAC is not checked here: a
+/// query reads an unauthenticated manifest as it reads a version 1 one
+/// (ADR-2430 decision 6). [`decode_authenticated`] checks it.
 pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestError> {
+    into_manifest(decode_body(key, bytes)?)
+}
+
+/// [`decode_manifest`], plus whether `mac_key` authenticates the body.
+pub fn decode_authenticated(
+    key: &str,
+    bytes: &[u8],
+    mac_key: &ManifestMacKey,
+) -> Result<(Manifest, MacStatus), ManifestError> {
+    let body = decode_body(key, bytes)?;
+    let status = mac_status(mac_key, &body);
+    Ok((into_manifest(body)?, status))
+}
+
+/// The body stored at `key`, checked against the read window and the key.
+fn decode_body(key: &str, bytes: &[u8]) -> Result<pb::ParquetTableManifest, ManifestError> {
     let parsed = parse_manifest_key(key)?;
     let body = pb::ParquetTableManifest::decode(bytes).map_err(|source| ManifestError::Decode {
         key: key.to_string(),
@@ -371,6 +562,12 @@ pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestErro
             actual: body.version.to_string(),
         });
     }
+    Ok(body)
+}
+
+/// The [`Manifest`] a checked body holds, refused if it fails
+/// [`Manifest::validate`].
+fn into_manifest(body: pb::ParquetTableManifest) -> Result<Manifest, ManifestError> {
     let manifest = Manifest {
         table: body.table,
         version: body.version,

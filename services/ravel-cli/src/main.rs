@@ -2750,8 +2750,24 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
         Command::Parquet {
             command: ParquetCommand::Sweep { tenant, grace },
         } => {
-            ravel_cli::parquet::sweep(store::build_store(&cli.store)?, &tenant, &grace, now_ns()?)
-                .await
+            // The deployment key, when given, already passed the sys/tenancy
+            // check above; it keys the sweep's manifest MAC gate (ADR-2430).
+            let deployment_key = match tenancy::configured_scheme_from_flags(
+                cli.tenancy.tenant_hash_key_file.as_deref(),
+                cli.tenancy.tenant_hash_unkeyed,
+            )? {
+                ravel_types::ConfiguredScheme::Keyed(key) => Some(*key),
+                ravel_types::ConfiguredScheme::Unkeyed
+                | ravel_types::ConfiguredScheme::Unspecified => None,
+            };
+            ravel_cli::parquet::sweep(
+                store::build_store(&cli.store)?,
+                &tenant,
+                &grace,
+                now_ns()?,
+                deployment_key.as_ref(),
+            )
+            .await
         }
         Command::Parquet {
             command:
