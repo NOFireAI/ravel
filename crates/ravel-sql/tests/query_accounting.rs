@@ -418,9 +418,15 @@ async fn scan_timing_counts_logs_scans_in_the_plan() {
     let tenant = tenant_id("logs-scan-count");
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_logs_with_region_postings(store.as_ref(), &tenant).await;
-    let fixture = Fixture::build(Arc::clone(&store), &[], SqlConfig::default(), 1 << 30).await;
+    // This fixture is narrower than the rule's default width floor; the count
+    // does not depend on the floor, only on the rule having fired.
+    let config = SqlConfig {
+        late_materialization_extra_columns: Some(1),
+        ..SqlConfig::default()
+    };
+    let fixture = Fixture::build(Arc::clone(&store), &[], config, 1 << 30).await;
 
-    let topk = request("SELECT * FROM logs WHERE attrs['region'] = 'region-0' ORDER BY ts LIMIT 2");
+    let topk = request("SELECT * FROM logs WHERE body LIKE '%record 1%' ORDER BY ts LIMIT 2");
     let explain = fixture
         .executor
         .explain(tenant.hash(), &topk)
