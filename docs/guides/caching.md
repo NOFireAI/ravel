@@ -153,11 +153,24 @@ reclaiming a pre-namespacing cache directory.
 | `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars` and the measured request timings `request_latency_micros` and `per_connection_throughput_bytes_per_s` (both or neither), with `timings_measured` naming where they were measured. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, one timing without the other, or a blank `name` fails startup rather than falling back to the reference prices. |
 | `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
 
-Both `--cache-max-bytes` and `--catalog-cache-max-bytes` are **LRU caps, not
+Both `--cache-max-bytes` and `--catalog-cache-max-bytes` are **caps, not
 reservations**. Neither cache pre-allocates its ceiling. Each holds only the
-bytes that it admitted and evicts least-recently-used entries once it reaches
-its cap. The ceiling is an upper bound on resident cache bytes, not memory
-claimed at startup.
+bytes that it admitted and, once it reaches its cap, evicts with S3-FIFO, not
+LRU: a new entry waits in a small probation queue, and only an entry that is
+read again, or one that leaves probation while the main queue still has
+room, joins the main queue. A one-pass scan, such as a compaction or a fold,
+therefore passes through probation without evicting a working set that
+queries keep reading. The ceiling is an upper bound on resident cache bytes,
+not memory claimed at startup.
+
+A repeated scan larger than the cache, such as the same query run again over
+more data than the cache holds, is served in part rather than not at all. The
+first run fills the cache, and the entries it admitted stay resident: later
+runs of the same scan read those from the cache and the rest from storage.
+For equal-sized objects twice the cache's size, at least 40% of the second
+and third runs' reads come from the cache, from the same entries in both. A
+working set that queries read again sooner than the scan comes back around
+still takes residency from entries that are read less often.
 
 The **sum of every ceiling can exceed physical RAM**. The two caches are
 independent, and the SQL memory pools (`--sql-max-query-bytes`,
