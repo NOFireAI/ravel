@@ -201,9 +201,15 @@ async fn writers_stopped_combines_with_max_flush_lifetime_and_reports_in_json() 
 }
 
 fn help_text(args: &[&str]) -> String {
+    help_output(args, "--help")
+}
+
+/// The help clap prints for `flag`: `-h` prints only each argument's first
+/// paragraph, `--help` all of it.
+fn help_output(args: &[&str], flag: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
         .args(args)
-        .arg("--help")
+        .arg(flag)
         .output()
         .expect("ravel-cli runs");
     assert!(output.status.success(), "--help exits 0");
@@ -211,7 +217,9 @@ fn help_text(args: &[&str]) -> String {
 }
 
 /// Both flags carry the UNSAFE wording and the assertion the operator (or the
-/// loader) makes by passing them.
+/// loader) makes by passing them. For `--fold-after-load` the UNSAFE sentence
+/// is in the first paragraph, the one `-h` and the generated flag reference
+/// show.
 #[test]
 fn the_seal_flags_help_states_the_assertion_and_the_unsafe_case() {
     let fold = help_text(&["catalog", "fold"]);
@@ -225,10 +233,28 @@ fn the_seal_flags_help_states_the_assertion_and_the_unsafe_case() {
     let load = help_text(&["load"]);
     assert!(load.contains("--fold-after-load"), "{load}");
     assert!(
-        load.contains("no other writer will publish into any hour up to and including"),
+        load.contains("the loader asserts that it is the tenant's only writer"),
         "{load}"
     );
     assert!(load.contains("UNSAFE under a live writer"), "{load}");
+    assert!(
+        load.contains("HEAD has already sealed the current ingest hour"),
+        "{load}"
+    );
+
+    let short = help_output(&["load"], "-h");
+    let fold_after_load = short
+        .split_once("--fold-after-load")
+        .unwrap_or_else(|| panic!("no --fold-after-load in {short}"))
+        .1;
+    assert!(
+        fold_after_load.contains("UNSAFE under a live writer"),
+        "{fold_after_load}"
+    );
+    assert!(
+        !fold_after_load.contains("HEAD has already sealed the current ingest hour"),
+        "-h shows only the first paragraph: {fold_after_load}"
+    );
 }
 
 /// `--fold-after-load` folds only logs; a metrics or spans load is refused

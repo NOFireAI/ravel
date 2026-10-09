@@ -481,6 +481,23 @@ query sees. Guarantees:
   `--mode maintain`, on the replica that owns shard 0 of a signal, and covers
   the maintained signals (metrics, logs, spans). A single-process `--mode all`
   deployment runs no scrub task, so nothing detects this case there.
+- The operator-asserted seal sits beside that exception. `ravel-cli catalog
+  fold --writers-stopped` and `ravel-cli load --fold-after-load` seal through
+  the current hour (the fold's hour, or the latest ingest hour the load
+  wrote) instead of waiting for the seal margin, on the operator's assertion
+  that no writer for the tenant and signal will publish into that hour or
+  any earlier one (docs/catalog-and-mvcc.md "Operator-asserted seal"). The
+  loader does not write into an hour it finds sealed: with
+  `--fold-after-load`, a load whose current ingest hour the logs HEAD has
+  already sealed is refused before any row is read or any object written,
+  and a load whose own fold leaves a loaded hour outside the snapshot,
+  because another fold sealed that hour while the load was writing, exits
+  non-zero naming the hours. Any other writer that publishes into the
+  asserted hours, whether a live server or a load run without the flag, is
+  not refused: its commit succeeds and is invisible to non-token queries the
+  same way as the folder-fast case above, until a HEAD rebuild (see
+  docs/guides/operations/troubleshooting.md "Rebuild the snapshot"). A
+  `min_commit_token` read still sees it.
 
 The fold protocol (the CAS'd HEAD pointer, watermark computation, and how
 each degraded path resolves) is in docs/catalog-and-mvcc.md.

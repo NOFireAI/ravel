@@ -359,8 +359,11 @@ fold then seals through the hour it runs in, without waiting out the margin.
 
 Do not use `load --fold-after-load` in this sequence. It seals at the end of the
 load, before compaction, and a later fold in the same hour has nothing left to
-seal, so it never picks up the compaction records and the pass measures the
-uncompacted layout until a fold in a later hour advances the watermark.
+seal, so it does not pick up the compaction records and the pass measures the
+uncompacted layout. The watermark advances only once the natural seal margin
+passes the next hour, or on another `--writers-stopped` fold (or
+`--fold-after-load` load) run in a later hour. A second `--fold-after-load` into the tenant in the same hour is refused
+before it writes anything.
 `--fold-after-load` fits a sequence with no compaction after the load, such as
 the `--compaction pre` flow in `docs/internal/clickbench.md`.
 

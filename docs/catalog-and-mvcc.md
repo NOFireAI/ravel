@@ -936,9 +936,14 @@ time; the clock is not moved forward. Two callers pass S, and the assertion is
 theirs, not the catalog's: `ravel-cli catalog fold --writers-stopped` passes the
 hour the fold itself runs in, and `ravel-cli load --fold-after-load` (logs only)
 passes the latest ingest hour among the commits the load published, after its
-own writers have shut down. Each asserts that no writer will publish into S or
-any earlier hour, so only an operator or loader that knows every writer of the
-tenant and signal has stopped may pass it. The seal lemma then rests on that
+own writers have shut down. An S later than the hour bucket of the fold's own
+clock is refused with `CatalogError::InvalidConfig` before anything is read:
+no caller can assert anything about an hour that has not begun. Each caller
+asserts that no writer will publish into S or any earlier hour, so only an
+operator or loader that knows every writer of the tenant and signal has
+stopped may pass it. The loader also refuses to write into a sealed hour: with
+`--fold-after-load` it reads the logs HEAD before reading any row, and stops
+when the watermark is at or above the current hour. The seal lemma then rests on that
 assertion rather than on `max_flush_lifetime`, and it is unsafe under a live
 writer: a commit published into a bucket at or below the sealed watermark is
 never folded incrementally (the next fold's watermark is already at or past

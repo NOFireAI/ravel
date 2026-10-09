@@ -216,10 +216,14 @@ one, without moving the fold's clock, and the report's `seal_through_hour` line
 names that hour. The same warning applies, to the current hour too. A logs
 load can do this itself: `ravel-cli load --fold-after-load` folds once the load
 succeeds, sealing through the latest ingest hour it wrote, and prints the
-result in its summary. Seal after compacting, not before: a later fold in the
-same hour has nothing left to seal, so it does not pick up compaction records
-published into the sealed hours until a fold in a later hour advances the
-watermark. See [Sealed hours](../../catalog-and-mvcc.md#sealed-hours).
+result in its summary. It refuses to start when the logs HEAD has already
+sealed the current hour, since every object it wrote would then be invisible to
+queries without a commit token. Seal after compacting, not before: a later fold
+in the same hour has nothing left to seal, so it does not pick up compaction
+records published into the sealed hours. The watermark advances only once the
+natural seal margin passes the next hour, or on another `--writers-stopped`
+fold (or `--fold-after-load` load) run in a later hour. See
+[Sealed hours](../../catalog-and-mvcc.md#sealed-hours).
 
 ### Routine verification
 

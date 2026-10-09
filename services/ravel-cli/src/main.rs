@@ -763,27 +763,28 @@ enum Command {
         /// when it is set. `0` is rejected.
         #[arg(long, value_name = "BYTES")]
         load_memory_bytes: Option<u64>,
-        /// Fold the loaded tenant's catalog once the load succeeds (ADR-2677
-        /// decision 1), so the next query resolves the loaded hours from the
-        /// snapshot instead of listing them. The loader asserts that it was
-        /// the only writer for this tenant: no other writer will publish into
-        /// any hour up to and including the latest ingest hour the load
-        /// wrote. The fold seals through that hour without moving the clock,
-        /// and its time is part of the summary's elapsed. A fold with nothing
-        /// left to seal is a success; a failed fold fails the load, though
-        /// every loaded object is already durable and `catalog fold --signal
-        /// logs --writers-stopped` seals them once the cause is fixed. Logs
-        /// only: a metrics or spans load with this flag is refused before any
-        /// row is read or written.
+        /// Fold the loaded tenant's logs catalog once the load succeeds
+        /// (ADR-2677 decision 1), so the next query resolves the loaded hours
+        /// from the snapshot instead of listing them. UNSAFE under a live
+        /// writer: the loader asserts that it is the tenant's only writer and
+        /// seals through the latest ingest hour it wrote, so a commit another
+        /// writer publishes into a sealed hour is not picked up by a later
+        /// incremental fold and stays invisible to queries without a commit
+        /// token until the HEAD is rebuilt. Logs only: a metrics or spans load
+        /// with this flag is refused before any row is read or written.
         ///
-        /// UNSAFE under a live writer: a commit another writer publishes into
-        /// a sealed hour is never picked up by a later incremental fold and
-        /// stays invisible to queries without a commit token until HEAD is
-        /// rebuilt. Use it only when this load is the tenant's sole writer.
-        /// That includes a later load: one into the same tenant before the
-        /// sealed hour has ended writes into it, its own fold has nothing
-        /// left to seal, and the summary warns that its objects are
-        /// invisible until HEAD is rebuilt.
+        /// Before it reads any row, the load is refused when the logs catalog
+        /// HEAD has already sealed the current ingest hour (for example by an
+        /// earlier `--fold-after-load` in the same hour): wait for the next
+        /// hour, or rebuild the HEAD as the troubleshooting guide's "Rebuild
+        /// the snapshot" describes. The fold seals without moving the clock,
+        /// and its time is part of the summary's elapsed. A failed fold fails
+        /// the load, though every loaded object is already durable and
+        /// `catalog fold --signal logs --writers-stopped` seals them once the
+        /// cause is fixed. A fold that leaves a loaded hour out of the
+        /// snapshot, because another fold sealed it while the load was
+        /// writing, also fails the load and names the hours. A load that
+        /// wrote nothing runs no fold.
         #[arg(long)]
         fold_after_load: bool,
     },
@@ -1949,8 +1950,9 @@ enum CatalogCommand {
         /// writer is still flushing, not that this host's clock is exact: the
         /// clock-skew allowance and the fold safety margin keep their defaults.
         /// UNSAFE under a live writer: a commit record published into a bucket
-        /// this fold already sealed is never picked up by a later incremental
-        /// fold, which re-lists only hours after the watermark. The default is
+        /// this fold already sealed is not picked up by a later incremental
+        /// fold, whose reconcile window re-lists hours below the watermark but
+        /// skips a bucket holding only level-0 commit records. The default is
         /// the safe 1h; use this only for a tenant known quiescent, such as one
         /// whose bulk load has finished and whose writer process has exited.
         #[arg(long, value_name = "DURATION",
@@ -1963,10 +1965,11 @@ enum CatalogCommand {
         /// last hour. The fold's clock is not moved; the report's
         /// `seal_through_hour` names the hour applied. Combines with
         /// `--max-flush-lifetime`. UNSAFE under a live writer: a commit record
-        /// published into a bucket this fold already sealed is never picked up
-        /// by a later incremental fold, which re-lists only hours after the
-        /// watermark, and stays invisible to queries that carry no commit
-        /// token until the HEAD is rebuilt. Use this only for a tenant known
+        /// published into a bucket this fold already sealed is not picked up
+        /// by a later incremental fold, whose reconcile window re-lists hours
+        /// below the watermark but skips a bucket holding only level-0 commit
+        /// records, and stays invisible to queries that carry no commit token
+        /// until the HEAD is rebuilt. Use this only for a tenant known
         /// quiescent, such as one whose bulk load has finished and whose
         /// writer process has exited.
         #[arg(long)]
