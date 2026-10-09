@@ -276,10 +276,14 @@ trait honors cancellation by drop, so the query deadline (usually well under
   the client fails rather than looping forever, and a token that keeps
   changing without ending is bounded by a page ceiling (`MAX_LIST_PAGES`,
   100 000 pages, 100 million keys at the 1000-key page size). One
-  `S3Store` page can take several ListObjectsV2 responses (below), at most
-  `ceil(page_size / 1000) + 16` of them, so the request bound of one
-  `S3Store` drain is the composed `MAX_LIST_PAGES` times that figure: 1.7
-  million responses at the default page size of 1000. `list_delimited` is
+  `S3Store` page can take several ListObjectsV2 responses (below). Only a
+  truncated response carrying no key is charged to that page's ceiling of
+  16; every other response adds at least one key, and ListObjectsV2 may
+  return fewer than `max-keys`, so a page takes at most `page_size + 16`
+  responses. The request bound of one `S3Store` drain is the composed
+  `MAX_LIST_PAGES` times that figure: 101.6 million responses at the
+  default page size of 1000, a bound a backend reaches only by returning
+  one key per response. `list_delimited` is
   one call that follows tokens to the end, bounded at `MAX_LIST_PAGES`
   responses.
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
@@ -315,10 +319,12 @@ trait honors cancellation by drop, so the query deadline (usually well under
   1000 keys per response and follows `NextContinuationToken` within the
   call until the page holds `page_size` keys or the listing ends, so a
   truncated response with no keys continues the page instead of ending it.
-  A truncated response with no `NextContinuationToken` is `Permanent`
-  naming the prefix, a token equal to the one just sent is
-  `ListRepeatedToken`, and more responses for one page than the ceiling
-  above is `ListPageCeiling`. Its `list_delimited` follows tokens only and
+  A truncated response with no `NextContinuationToken` that leaves the page
+  short is `Permanent` naming the prefix, a token equal to the one just
+  sent is `ListRepeatedToken` (a response that fills the page is complete,
+  and its token is never checked or sent), and a page's 16th empty
+  truncated response ends it with `ListPageCeiling` instead of another
+  request. Its `list_delimited` follows tokens only and
   never resumes from a key, since a common prefix can sort after a
   response's last key. An S3 grant read through `ExternalStore` lists
   through `S3Store`.
