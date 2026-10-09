@@ -390,5 +390,61 @@ check "scenario 2's cleanup keeps the logs when the scenario exits 3" "yes" \
 check "scenario 1 gives the restarted server its own log file" "yes" \
   "$([[ "$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")" == *'start_server_bg "$SERVER_LOG"'* && "$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")" == *'start_server_bg "$SERVER_RESTART_LOG"'* ]] && echo yes || echo no)"
 
+# ---------------------------------------------------------------------------
+# Tenant-hash declaration: a fresh bucket refuses a server that names neither
+# scheme, and the lane empties its bucket before every scenario.
+# ---------------------------------------------------------------------------
+
+# One argv element per line, from a fresh shell that sources lib.sh with the
+# tenancy variables taken from the arguments (VAR=value ...) and nothing else.
+server_argv() {
+  env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE "$@" \
+    bash -c 'source "$1" && ravel_server_cmd --store s3 | tr "\0" "\n"' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null
+}
+server_cmd_rc() {
+  env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE "$@" \
+    bash -c 'source "$1"; rc=0; ravel_server_cmd --store s3 >/dev/null || rc=$?; echo "${rc}"' \
+    _ "${CHAOS_DIR}/lib.sh" 2>/dev/null
+}
+tenant_hash_flags() {
+  grep -- '^--tenant-hash-' || true
+}
+
+check "server argv: exactly one tenant-hash flag, --tenant-hash-unkeyed by default" \
+  "--tenant-hash-unkeyed" "$(server_argv | tenant_hash_flags)"
+check "server argv: the caller's own flags are kept" "--store"$'\n'"s3" \
+  "$(server_argv | grep -x -A1 -- '--store')"
+KEY_FILE="${SCRATCH}/deployment.key"
+printf '%064d' 0 > "${KEY_FILE}"
+check "server argv: keyed mode emits --tenant-hash-key-file and no other tenant-hash flag" \
+  "--tenant-hash-key-file" \
+  "$(server_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}" | tenant_hash_flags)"
+check "server argv: keyed mode passes the key file path after the flag" "${KEY_FILE}" \
+  "$(server_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}" \
+      | grep -x -A1 -- '--tenant-hash-key-file' | tail -n 1)"
+check "server argv: an unknown mode is refused with 64" "64" \
+  "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=bogus)"
+check "server argv: keyed mode with no key file is refused with 64" "64" \
+  "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=keyed)"
+check "server argv: a key file under unkeyed mode is refused with 64" "64" \
+  "$(server_cmd_rc CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+for s in kill-ingest-flush.sh kill-maintain-worker.sh; do
+  check "${s}: an unknown tenant-hash mode is refused with 64 before anything starts" "64" \
+    "$(CHAOS_TENANT_HASH_MODE=bogus rc_of bash "${CHAOS_DIR}/${s}" --check)"
+done
+
+# `--audit-text redacted` refuses an `all`-mode server with no tokenization
+# key, and an unkeyed bucket has no deployment key to derive one from.
+audit_key() {
+  env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE -u RAVEL_AUDIT_TOKEN_KEY "$@" \
+    bash -c 'source "$1" && printf "%s" "${RAVEL_AUDIT_TOKEN_KEY:-unset}"' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null
+}
+check "audit key: unkeyed mode exports a 64-hex RAVEL_AUDIT_TOKEN_KEY" "yes" \
+  "$([[ "$(audit_key)" =~ ^[0-9a-f]{64}$ ]] && echo yes || echo no)"
+check "audit key: a caller's own RAVEL_AUDIT_TOKEN_KEY is kept" "caller-key" \
+  "$(audit_key RAVEL_AUDIT_TOKEN_KEY=caller-key)"
+check "audit key: keyed mode leaves it to the deployment key" "unset" \
+  "$(audit_key CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]

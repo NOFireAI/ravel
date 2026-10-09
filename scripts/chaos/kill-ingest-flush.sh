@@ -80,6 +80,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Refuse a bad tenant-hash mode before anything starts: the start sites read
+# ravel_server_cmd through a process substitution, which drops its status.
+chaos_tenant_hash_args || exit 64
+
 if [[ "$MODE" == "check" ]]; then
   echo "== kill-ingest-flush.sh --check (scenario 1: kill ingest mid-flush) =="
   echo "mid-flush trigger marker: ${CHAOS_FLUSH_METRIC} (attempt-time increment)"

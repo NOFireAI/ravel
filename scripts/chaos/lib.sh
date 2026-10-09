@@ -75,6 +75,51 @@ export RAVEL_S3_SECRET_KEY="${RAVEL_S3_SECRET_KEY:-ravel-dev-secret}"
 CHAOS_TENANT_TOKEN="${CHAOS_TENANT_TOKEN:-chaos-token}"
 CHAOS_TENANT_NAME="${CHAOS_TENANT_NAME:-chaos-tenant}"
 
+# Tenant-hash scheme (ADR-0050 section 3). The tenant hash is keyed by default,
+# and a fresh bucket refuses a server that names neither scheme; `rustfs_up`
+# empties the bucket before every scenario, so every start here meets a fresh
+# bucket. The chaos bucket is dev-only and emptied per scenario, and the
+# scenarios' oracles read tenant prefixes under `t/`, so it is unkeyed by
+# default. A keyed run sets CHAOS_TENANT_HASH_MODE=keyed together with
+# CHAOS_TENANT_HASH_KEY_FILE, which selects --tenant-hash-key-file instead.
+CHAOS_TENANT_HASH_MODE="${CHAOS_TENANT_HASH_MODE:-unkeyed}"
+CHAOS_TENANT_HASH_KEY_FILE="${CHAOS_TENANT_HASH_KEY_FILE:-}"
+
+# `--audit-text redacted`, the default, refuses to start an `all`-mode server
+# with no tokenization key, and an unkeyed bucket has no deployment key to
+# derive one from. This is the dev-only key deploy/docker-compose/ravel.yml
+# also defaults to; a keyed run derives its key from the key file instead.
+if [[ "${CHAOS_TENANT_HASH_MODE}" == "unkeyed" ]]; then
+  export RAVEL_AUDIT_TOKEN_KEY="${RAVEL_AUDIT_TOKEN_KEY:-998626405d16aeca71f4fac7673b55213a774ba40401709022e81a27f050ffd8}"
+fi
+
+# Set CHAOS_TENANT_HASH_ARGS to the tenant-hash flags for the configured mode.
+# Returns 64, naming the problem, for a mode that is neither `unkeyed` nor
+# `keyed`, for `keyed` with no key file, and for a key file under `unkeyed`.
+chaos_tenant_hash_args() {
+  CHAOS_TENANT_HASH_ARGS=()
+  case "${CHAOS_TENANT_HASH_MODE}" in
+    unkeyed)
+      if [[ -n "${CHAOS_TENANT_HASH_KEY_FILE}" ]]; then
+        log "CHAOS_TENANT_HASH_KEY_FILE is set but CHAOS_TENANT_HASH_MODE=unkeyed; set CHAOS_TENANT_HASH_MODE=keyed to use the key"
+        return 64
+      fi
+      CHAOS_TENANT_HASH_ARGS=(--tenant-hash-unkeyed)
+      ;;
+    keyed)
+      if [[ -z "${CHAOS_TENANT_HASH_KEY_FILE}" ]]; then
+        log "CHAOS_TENANT_HASH_MODE=keyed needs CHAOS_TENANT_HASH_KEY_FILE"
+        return 64
+      fi
+      CHAOS_TENANT_HASH_ARGS=(--tenant-hash-key-file "${CHAOS_TENANT_HASH_KEY_FILE}")
+      ;;
+    *)
+      log "CHAOS_TENANT_HASH_MODE must be 'unkeyed' or 'keyed', got '${CHAOS_TENANT_HASH_MODE}'"
+      return 64
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Logging and oracle bookkeeping.
 # ---------------------------------------------------------------------------
@@ -449,11 +494,15 @@ rustfs_down() {
 # harness works on an orchestrator with installed binaries and on a dev tree.
 # ---------------------------------------------------------------------------
 
+# The tenant-hash flags go to every invocation. On a keyed bucket the
+# tenant-hashing verify commands refuse without the key file; on an unkeyed one
+# the flag only makes the expectation explicit.
 ravel_cli() {
+  chaos_tenant_hash_args || return 64
   if chaos_have_command ravel-cli; then
-    ravel-cli "$@"
+    ravel-cli "${CHAOS_TENANT_HASH_ARGS[@]}" "$@"
   else
-    cargo run --quiet -p ravel-cli -- "$@"
+    cargo run --quiet -p ravel-cli -- "${CHAOS_TENANT_HASH_ARGS[@]}" "$@"
   fi
 }
 
@@ -470,11 +519,14 @@ chaos_gen_fixture() {
 
 ravel_server_cmd() {
   # Emit the argv for launching the server, so callers can background it and
-  # capture the PID directly (needed to SIGKILL a specific process).
+  # capture the PID directly (needed to SIGKILL a specific process). Callers
+  # read it through a process substitution, which drops this function's exit
+  # status, so each scenario also runs chaos_tenant_hash_args up front.
+  chaos_tenant_hash_args || return 64
   if chaos_have_command ravel-server; then
-    printf '%s\0' ravel-server "$@"
+    printf '%s\0' ravel-server "${CHAOS_TENANT_HASH_ARGS[@]}" "$@"
   else
-    printf '%s\0' cargo run --quiet -p ravel-server -- "$@"
+    printf '%s\0' cargo run --quiet -p ravel-server -- "${CHAOS_TENANT_HASH_ARGS[@]}" "$@"
   fi
 }
 

@@ -274,15 +274,10 @@ jobs:
             *) echo "::error::chaos scenario 2 setup or usage error (exit ${code}); no oracle verdict" ;;
           esac
           exit "$code"
-      # The scenarios keep their process logs under CHAOS_LOG_DIR (set on the
-      # job) on a non-zero exit and print each one's tail into the step log.
-      # The whole files go up as an artifact: a server that never accepted a
-      # connection says why only in its own log, and before this step existed
-      # the scripts deleted that log in their exit trap, so twenty nightly
-      # failures in a row left no cause to read.
-      # `cancelled()` too: a scenario that hangs past the job's timeout-minutes
-      # is cancelled, not failed, and its kept logs would otherwise stay on
-      # the runner.
+      # The artifact carries the whole process logs; the step log has only
+      # their tails. `cancelled()` too, because a scenario that hangs past the
+      # job's timeout-minutes is cancelled, not failed. Which logs are kept is
+      # `chaos_release_logs` in scripts/chaos/lib.sh.
       - name: Upload the chaos process logs on failure
         if: failure() || cancelled()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
