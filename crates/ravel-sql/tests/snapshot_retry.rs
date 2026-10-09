@@ -125,6 +125,8 @@ async fn not_found_before_the_first_batch_retries_exactly_once_and_succeeds() {
     assert_eq!(outcome.stats.attempts, 2);
     assert_eq!(count_of(&outcome.output), 3, "all three samples come back");
 
+    // hygiene-allow: wall-clock -- a lower bound the gate's own sleep
+    // guarantees, proving the hold sat inside the statement; it cannot flake.
     assert!(
         elapsed >= FIRST_ATTEMPT_HOLD,
         "the hold fired inside the statement: {elapsed:?}"
