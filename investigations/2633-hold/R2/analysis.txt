@@ -1,0 +1,50 @@
+== analyze.py (unmodified from the decay branch)
+rows 105 first 1791584634.475 last 1791585154.475 server start 1791584633.423107 conc start 1791584661.9635713 bench end 1791585022.7147546
+ok rows 104 non-ok rows [1791585154.475]
+ASSERT nonzero after 30s: violations 0 ; bg!=1 rows: 0
+conc rows 72
+PEAKGAP: ts=1791584809.476 t=+147.5s res=9.654 act=3.691 alloc=3.656 acc=3.432 gap=6.222 ret=5.998 unc=0.224 sql=0.635 fetch=0.106 fcache=2.692 ccache=0.000 overlap=0.106 vmrss=9.469
+{'allocated': 3656119760, 'active': 3690737664, 'resident': 9653891072, 'sql_reserved': 634593200, 'fetch_reserved': 105882184, 'fetch_cache_resident': 2691650939, 'catalog_cache_resident': 0, 'handoff_overlap': 105882184, 'budget_limit': 4400000000, 'accounted': 3432126323, 'gap': 6221764749, 'vmrss_bytes': 9469489152, 'rssanon_bytes': 9392594944, 'bg_thread': 1}
+ret 5997771312 0.9639984078414405 res-act 5963153408 0.9584344070480059 act-alloc 34617904 0.0055640007934346924 unc 223993437 0.03600159215855945
+PEAKRES: ts=1791585019.476 t=+357.5s res=10.136 act=6.203 alloc=6.165 acc=5.986 gap=4.150 ret=3.971 unc=0.179 sql=3.025 fetch=0.270 fcache=2.692 ccache=0.000 overlap=0.270 vmrss=9.709
+PEAKUNC: ts=1791584904.477 t=+242.5s res=7.288 act=4.763 alloc=4.708 acc=3.458 gap=3.829 ret=2.580 unc=1.250 sql=0.138 fetch=0.629 fcache=2.692 ccache=0.000 overlap=0.566 vmrss=6.984
+PEAKRET: ts=1791584809.476 t=+147.5s res=9.654 act=3.691 alloc=3.656 acc=3.432 gap=6.222 ret=5.998 unc=0.224 sql=0.635 fetch=0.106 fcache=2.692 ccache=0.000 overlap=0.106 vmrss=9.469
+PEAKSQL: ts=1791584879.476 t=+217.5s res=9.023 act=6.140 alloc=6.100 acc=6.430 gap=2.592 ret=2.923 unc=-0.331 sql=3.661 fetch=0.078 fcache=2.692 ccache=0.000 overlap=0.078 vmrss=8.648
+PEAKOVERLAP: ts=1791584784.476 t=+122.5s res=7.982 act=4.561 alloc=4.522 acc=4.019 gap=3.963 ret=3.460 unc=0.503 sql=0.745 fetch=0.605 fcache=2.669 ccache=0.000 overlap=0.605 vmrss=8.047
+Traceback (most recent call last):
+  File "/var/lib/fleet/work/4f2f129b-2a5f-4560-8e5b-70a9034a53f8/.gate-logs/m/analyze.py", line 40, in <module>
+    show(idle[-1],"IDLE-LAST"); print("idle after last query s", idle[-1]['unix_ts']-bend, "n idle>=300",len(idle))
+         ~~~~^^^^
+IndexError: list index out of range
+exit 1
+
+== decay.py
+serial statements 43, errored 0: []
+sampled rows 104, rows with bg_thread != 1: 0
+peak gap 6.222 GB at t=+147.5s: retention 5.998 GB (96.4%), uncharged live 0.224 GB (3.6%), resident-active 5.963 GB, handoff overlap 0.106 GB
+median retention over phase 3.728 GB (72 samples), p90 4.817 GB, samples >= 1.5 GB: 71
+mean over phase: resident 8.484 GB, VmRSS 8.143 GB
+peak resident 10.136 GB at t=+357.5s
+peak VmRSS 9.769 GB at t=+287.5s (-73.2s from bench end)
+concurrency qps 8.008, completed 2889, errors 90, unreachable 0
+server-logged query errors 90 (bench counted 90):
+    42 422 tenant memory budget exhausted
+    42 422 query pool full, spill disabled
+     3 422 process memory budget exhausted
+     3 fetch memory exhausted (client sees HTTP 503 unavailable)
+errors by statement: {6: 1, 13: 2, 14: 1, 15: 2, 16: 1, 17: 7, 18: 4, 19: 18, 24: 4, 29: 6, 32: 3, 33: 22, 34: 9, 35: 7, 36: 2, 37: 1}
+idle +60s (sample at +61.8s): retention 0.085 GB, resident 2.800 GB, allocated 2.715 GB, VmRSS 2.872 GB
+idle +120s (sample at +121.8s): retention 0.085 GB, resident 2.799 GB, allocated 2.714 GB, VmRSS 2.871 GB
+exit 0
+
+== hold.py
+samples 105, live 104, not live 1 [1791585154.475]; phase samples 72; concurrency start 1791584661.964, bench end 1791585022.715
+ROW1 max(allocated - accounted + handoff_overlap) 1.816 GB at unix 1791584904.477 (t=+242.5s, phase)
+  components: allocated 4.708, accounted 3.458, handoff_overlap 0.566, sql_reserved 0.138, fetch_reserved 0.629, fetch_cache_resident 2.692, catalog_cache_resident 0.000, resident 7.288, vmrss_bytes 6.984 GB
+  top 5: t=+242.5s 1.816; t=+272.5s 1.364; t=+182.5s 1.301; t=+257.5s 1.222; t=+222.5s 1.202
+ROW2 median over phase 0.538 GB (72 samples), p90 0.971 GB, samples >= 2.0 GB: 0, >= 3.0 GB: 0
+ROW3 concurrency qps 8.008, completed 2889, errors 90, unreachable 0
+ROW4 typed 422 refusals 87; other server-logged query errors 3; bench-counted errors 90
+ROW5 peak retention (resident - allocated) 5.998 GB at t=+147.5s (phase peak 5.998 GB at t=+147.5s); peak VmRSS 9.769 GB at t=+287.5s; mean VmRSS over phase 8.143 GB
+VALIDITY serial statements 43, errored 0: []
+exit 0
