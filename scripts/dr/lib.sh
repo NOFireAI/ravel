@@ -267,8 +267,12 @@ dr_init() {
       "DR_TENANT_HASH_MODE=keyed needs DR_TENANT_HASH_KEY_FILE"
   fi
   # A keyed deployment that set RAVEL_AUDIT_TOKEN_KEY itself keeps it: an
-  # explicit key wins over the one derived from the deployment key.
+  # explicit key wins over the one derived from the deployment key. It gets
+  # the same check as a key read from a file.
   DR_SERVER_AUDIT_KEY="${RAVEL_AUDIT_TOKEN_KEY:-}"
+  if [[ -n "${DR_SERVER_AUDIT_KEY}" ]]; then
+    dr_check_audit_key "${DR_SERVER_AUDIT_KEY}" "RAVEL_AUDIT_TOKEN_KEY"
+  fi
   if [[ "${DR_TENANT_HASH_MODE}" == "unkeyed" ]]; then
     dr_load_audit_token_key
   fi
@@ -293,16 +297,23 @@ dr_load_audit_token_key() {
     dr_die "${DR_EX_USAGE}" \
       "DR_TENANT_HASH_MODE=unkeyed needs DR_AUDIT_TOKEN_KEY_FILE: an unkeyed server refuses to start under --audit-text redacted without an audit token key"
   fi
-  if [[ ! -r "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
+  if [[ ! -f "${DR_AUDIT_TOKEN_KEY_FILE}" || ! -r "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
     dr_die "${DR_EX_USAGE}" \
       "DR_AUDIT_TOKEN_KEY_FILE is not a readable file: ${DR_AUDIT_TOKEN_KEY_FILE}"
   fi
   key="$(tr -d '[:space:]' <"${DR_AUDIT_TOKEN_KEY_FILE}")"
-  if [[ ! "${key}" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    dr_die "${DR_EX_USAGE}" \
-      "DR_AUDIT_TOKEN_KEY_FILE must hold 64 hex characters (a 32-byte key): ${DR_AUDIT_TOKEN_KEY_FILE}"
-  fi
+  dr_check_audit_key "${key}" "DR_AUDIT_TOKEN_KEY_FILE (${DR_AUDIT_TOKEN_KEY_FILE})"
   DR_SERVER_AUDIT_KEY="${key}"
+}
+
+# The server's own rule for an audit token key (parse_audit_token_key in
+# services/ravel-server/src/config.rs): exactly 64 hex characters. $1 is the
+# value, $2 names where it came from for the refusal.
+dr_check_audit_key() {
+  if [[ ! "$1" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "$2 must hold 64 hex characters (a 32-byte key), got ${#1} characters"
+  fi
 }
 
 # The shared tail of every usage message: the variables a real S3 run needs,
@@ -331,7 +342,9 @@ refuses when one of them is unset.
   DR_TENANT_KMS_CONFIG      REQUIRED  per-tenant KMS config file, or `none`
   DR_ADMIN_CREDENTIAL_FILE  REQUIRED  admin credential file, or `none`
   DR_AUDIT_TOKEN_KEY_FILE   file holding the 64-hex audit token key, required
-                     when unkeyed (passed to the server in its environment)
+                     when unkeyed (passed to the server in its environment).
+                     A keyed run that sets its own key supplies it as
+                     RAVEL_AUDIT_TOKEN_KEY instead, checked the same way
   DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0; 1 only when the run waited the
                      catalog seal margin out
   DR_LOG_DIR         logs and pre-registered figures, default
