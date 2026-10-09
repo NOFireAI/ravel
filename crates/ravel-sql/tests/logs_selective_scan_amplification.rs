@@ -29,7 +29,8 @@
 //! (byte cost proportional to the surviving fraction; the >= 75% coverage
 //! crossover preserved). `text_predicate_falls_back_to_full_object_read` pins the
 //! deliberately-kept fallback. `selective_third_no_partition_multiplication_\
-//! under_cache_pressure` pins that eviction no longer re-reads whole objects.
+//! under_cache_pressure` pins that eviction no longer re-reads whole objects,
+//! comparing caches that admit the same entries and differ only in size.
 //!
 //! # Version 4 (ADR-0699 decision 5)
 //!
@@ -1159,78 +1160,121 @@ async fn text_predicate_falls_back_to_full_object_read() {
     );
 }
 
-/// The q20 shape under a cache too small to hold the working set: eviction can
-/// only add reads, but with #761 no read is a whole object, so the bytes do NOT
+/// The q20 shape under caches too small to hold the fixture: eviction can only
+/// add reads, but with #761 no read is a whole object, so the bytes do NOT
 /// multiply by the partition count the way the pre-fix whole-object re-reads
-/// did. A surviving block's chunk runs can still be fetched once per partition
-/// that owns one of the blocks they span; the exact bytes below count that.
+/// did.
+///
+/// The three caches differ only in `max_bytes`. All three take the same 128 KiB
+/// `max_entry_bytes` and reject no entry, so they admit the same entries and
+/// any difference in bytes is eviction, not admission. At 128 KiB the cache
+/// evicts, but nothing the scan reads again; at 32 KiB it evicts plan-phase
+/// probe windows the scan then reads from storage a second time.
 #[tokio::test]
 async fn selective_third_no_partition_multiplication_under_cache_pressure() {
-    let big = measure("q20_big_cache", &[code_le(1)], 64 << 20).await;
-    // A cache five times smaller than the fixture's 650 KB of object bytes, so
-    // the probe and directory extents really are evicted between the plan pass
-    // and the per-partition scans.
-    let small = measure("q20_small_cache", &[code_le(1)], 128 << 10).await;
+    const MAX_ENTRY: u64 = 128 << 10;
+    let sized = |max_bytes| CacheSize {
+        max_bytes,
+        max_entry_bytes: MAX_ENTRY,
+    };
+    let big = measure_sized("q20_big_cache", &[code_le(1)], sized(64 << 20)).await;
+    // A cache five times smaller than the fixture's 650 KB of object bytes.
+    let small = measure_sized("q20_small_cache", &[code_le(1)], sized(128 << 10)).await;
+    // Small enough that the plan phase's probe windows do not all survive to
+    // the per-partition scans.
+    let pressured = measure_sized("q20_pressured_cache", &[code_le(1)], sized(32 << 10)).await;
     report(&big);
     report(&small);
+    report(&pressured);
 
-    // No whole-object GET under either cache: the numeric arm keeps coverage
+    let counters = |s: &Shape| s.cache.expect("every measurement here wires a cache");
+    let (big_cache, small_cache, pressured_cache) =
+        (counters(&big), counters(&small), counters(&pressured));
+
+    // The premise: identical admission, and eviction only below the fixture.
+    for (label, c) in [
+        ("big", big_cache),
+        ("small", small_cache),
+        ("pressured", pressured_cache),
+    ] {
+        assert_eq!(
+            c.admissions_rejected_size, 0,
+            "q20 {label} cache: no entry exceeds max_entry_bytes, so every cache \
+             admits the same entries"
+        );
+    }
+    assert_eq!(big_cache.evictions, 0, "q20 big cache: nothing is evicted");
+    assert_eq!(small_cache.evictions, 6, "q20 small cache: evicts");
+    assert_eq!(
+        pressured_cache.evictions, 27,
+        "q20 pressured cache: evicts"
+    );
+
+    // No whole-object GET under any cache: the numeric arm keeps coverage
     // below the crossover regardless of eviction.
-    assert_eq!(big.full_gets, 0, "q20 big cache: no whole-object GET");
-    assert_eq!(small.full_gets, 0, "q20 small cache: no whole-object GET");
+    for s in [&big, &small, &pressured] {
+        assert_eq!(s.full_gets, 0, "{}: no whole-object GET", s.label);
+    }
 
     // The plan phase's footer is carried in memory, not through the read cache,
     // so eviction cannot make a subset open re-probe: one probe per segment
-    // under either cache size.
-    assert_eq!(
-        small.suffix_gets, SEGMENTS as u64,
-        "q20 small cache: still one probe per segment, the carried footer is \
-         not cache-resident state"
-    );
-
-    // Eviction can only add reads, never remove them.
-    assert!(
-        small.gets >= big.gets,
-        "small cache issues at least as many GETs ({} vs {})",
-        small.gets,
-        big.gets
-    );
+    // under every cache size.
+    for s in [&small, &pressured] {
+        assert_eq!(
+            s.suffix_gets, SEGMENTS as u64,
+            "{}: still one probe per segment, the carried footer is not \
+             cache-resident state",
+            s.label
+        );
+    }
 
     // The decisive #761 bound: the bytes never reach even a single full scan of
     // the objects. The plan phase decodes no block and no GET is a
     // whole-object read (asserted above), so what eviction re-fetches is
-    // directory extents and the surviving blocks' chunk runs, not whole
-    // objects. So the 17.9 GB > 11.1 GB whole-object re-read amplification the
-    // reproduction showed (bytes ~ 3x the object bytes) is gone: bytes stay
-    // below one full pass.
+    // probe windows, not whole objects. So the 17.9 GB > 11.1 GB whole-object
+    // re-read amplification the reproduction showed (bytes ~ 3x the object
+    // bytes) is gone: bytes stay below one full pass.
     let full = measure("full_scan", &[], 64 << 20).await;
     assert!(
-        small.bytes < full.bytes,
+        pressured.bytes < full.bytes,
         "q20 under pressure moves fewer bytes than a full scan ({} vs {}): \
-         no whole-object read, only directory and chunk-run re-fetches",
-        small.bytes,
+         no whole-object read, only probe-window re-fetches",
+        pressured.bytes,
         full.bytes
     );
-    // 264,375 with no eviction: the figure
+
+    // 264,375 with no eviction, 48 GETs: the figure
     // `selective_numeric_reads_only_surviving_blocks` decomposes for q20.
-    //
-    // 305,335 under pressure =
-    //   65,536 (8 plan probes, 8 KiB each)
+    //   65,536 (8 plan probes, 8 KiB each; the scan reads each window again,
+    //           8 cache hits serving 65,536 bytes)
     // +    672 (8 plan STREAM_DIR+FIELD_DIR front GETs, 84 each)
-    // + 40,960 (5 probe-window range re-reads of an evicted tail, 8 KiB each)
-    // + 198,167 (32 chunk-run GETs: 8 sets of 4 runs, one set per segment,
-    //           the same chunk-run bytes as with no eviction -- the striped
-    //           route deals a row group whole to one partition, so a segment's
-    //           surviving blocks no longer have their runs fetched by two
-    //           partitions, and nothing is read twice to be evicted in
-    //           between).
-    // Only the tail re-reads are repeated under pressure, so the bound is one
-    // full pass, not the no-eviction figure: both stay under the 630,401 a
-    // full pass moves.
+    // + 198,167 (32 chunk-run GETs: 8 sets of 4 runs, one set per segment).
+    // The small cache evicts 6 entries and still serves all 8 probe windows,
+    // so it moves the same bytes.
     assert_eq!(big.bytes, 264_375, "q20 with no eviction");
+    assert_eq!(big.gets, 48, "q20 with no eviction: GETs");
+    assert_eq!(big_cache.hits, 8, "q20 with no eviction: probe windows reused");
     assert_eq!(
-        small.bytes, 305_335,
-        "q20 under eviction: tail re-reads only, still under one full pass"
+        small.bytes, 264_375,
+        "q20 at 128 KiB: evictions, but none the scan reads again"
+    );
+    assert_eq!(small.gets, 48, "q20 at 128 KiB: GETs");
+
+    // 305,335 under pressure, 53 GETs = 264,375 + 40,960: 5 of the 8 probe
+    // windows were evicted before the scan read them, so 5 range GETs of
+    // 8 KiB each go to storage again, and the cache serves 3 windows instead
+    // of 8. Nothing else is read twice.
+    assert_eq!(pressured_cache.hits, 3, "q20 under pressure: probe windows reused");
+    assert_eq!(pressured.gets, 53, "q20 under pressure: GETs");
+    assert_eq!(
+        pressured.bytes, 305_335,
+        "q20 under pressure: probe-window re-reads only, still under one full pass"
+    );
+    assert_eq!(
+        pressured.bytes - big.bytes,
+        big_cache.bytes_served - pressured_cache.bytes_served,
+        "the extra bytes under pressure are exactly the probe windows the cache \
+         no longer served"
     );
 }
 
