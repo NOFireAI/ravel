@@ -854,8 +854,12 @@ mod tests {
             assert!(!printed.contains('\u{1b}'), "{printed}");
             assert!(!printed.contains('\u{7}'), "{printed}");
             assert!(printed.contains(&named), "{printed}");
-            assert_eq!(printed.matches("undeletable by Ravel").count(), 1 +
-                usize::from(action == RepairAction::DeleteFlagged), "{printed}");
+            // The key's own line, then the summary or the skipped line.
+            assert_eq!(
+                printed.matches("undeletable by Ravel").count(),
+                2,
+                "{printed}"
+            );
             if action == RepairAction::List {
                 result.expect("repair");
                 assert!(
