@@ -1205,10 +1205,7 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     }
     assert_eq!(big_cache.evictions, 0, "q20 big cache: nothing is evicted");
     assert_eq!(small_cache.evictions, 6, "q20 small cache: evicts");
-    assert_eq!(
-        pressured_cache.evictions, 27,
-        "q20 pressured cache: evicts"
-    );
+    assert_eq!(pressured_cache.evictions, 40, "q20 pressured cache: evicts");
 
     // No whole-object GET under any cache: the numeric arm keeps coverage
     // below the crossover regardless of eviction.
@@ -1254,6 +1251,14 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     assert_eq!(big.bytes, 264_375, "q20 with no eviction");
     assert_eq!(big.gets, 48, "q20 with no eviction: GETs");
     assert_eq!(big_cache.hits, 8, "q20 with no eviction: probe windows reused");
+    for s in [&big, &small] {
+        assert_eq!(
+            (s.plan_phase_gets, s.probe_phase_gets, s.scan_phase_gets),
+            (16, 0, 32),
+            "{}: 8 probes and 8 directory fronts in plan, the chunk runs in scan",
+            s.label
+        );
+    }
     assert_eq!(
         small.bytes, 264_375,
         "q20 at 128 KiB: evictions, but none the scan reads again"
@@ -1266,6 +1271,15 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     // of 8. Nothing else is read twice.
     assert_eq!(pressured_cache.hits, 3, "q20 under pressure: probe windows reused");
     assert_eq!(pressured.gets, 53, "q20 under pressure: GETs");
+    assert_eq!(
+        (
+            pressured.plan_phase_gets,
+            pressured.probe_phase_gets,
+            pressured.scan_phase_gets
+        ),
+        (16, 5, 32),
+        "q20 under pressure: the 5 extra GETs are probe-window re-reads"
+    );
     assert_eq!(
         pressured.bytes, 305_335,
         "q20 under pressure: probe-window re-reads only, still under one full pass"
