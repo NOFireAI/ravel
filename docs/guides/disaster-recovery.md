@@ -537,13 +537,15 @@ compaction reasoning, and the sweeper's re-verify LIST.
      assume it.
    - The admin credential used to mint the fresh per-mode storage credentials
      that step 6 scopes to the restore bucket.
-   - For an unkeyed deployment (`--tenant-hash-unkeyed`), the audit token key
-     (`RAVEL_AUDIT_TOKEN_KEY`, 64 hex characters). A keyed deployment derives
-     it from the deployment key. An unkeyed one has nothing to derive it from,
-     and a server that serves queries refuses to start under the default
-     `--audit-text redacted` without it. Restoring with a different key
-     starts the server but tokenizes new audit text differently from the
-     audit records already in the bucket.
+   - The audit token key (`RAVEL_AUDIT_TOKEN_KEY`, 64 hex characters), for
+     every unkeyed deployment (`--tenant-hash-unkeyed`) and for any
+     deployment that sets it explicitly. A keyed deployment that does not set
+     it derives it from the deployment key, but an explicitly set key takes
+     precedence over that derivation. An unkeyed deployment has nothing to
+     derive it from, and a server that serves queries refuses to start under
+     the default `--audit-text redacted` without it. Restoring with a
+     different key starts the server but tokenizes new audit text differently
+     from the audit records already in the bucket.
 
    All of it must be held somewhere that survives the loss of the primary
    cluster: a separate secrets manager, a cross-region vault, or an offline
@@ -865,7 +867,7 @@ produce the `--check` result, which is not a rehearsal record.
 |---|---|---|---|
 | **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock, versioning and the lifecycle rules), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound + E_v, R)` where `R` is the locked version's retain-until: the sweep's delete succeeds as a delete marker, and the locked version is removed once `R` and noncurrent-version expiry have both passed. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound + E_v, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, and the sweep deletes it only once it is also older than `protection_horizon`, so it is `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the stale object's `last_modified`, `S` is one sweep interval (default 5 min), and `R` is the locked version's retain-until. The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
-| **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
+| **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured**. A harness rehearsal record publishes a restore-completeness RPO, not this replication-lag RPO, so the field stays unmeasured until a rehearsal with bucket replication and a live writer measures it. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound + E_v, D)`; query-time exclusion still immediate | As level 1 |
 
 ## Background

@@ -244,7 +244,7 @@ mapfile -d '' -t SERVER_ARGV < <(dr_ravel_server_argv \
   --listen-http "${DR_HTTP_ADDR}" \
   --listen-grpc "${DR_GRPC_ADDR}" \
   --tenant-token-file "${TOKEN_FILE}")
-"${SERVER_ARGV[@]}" >"${SEED_LOG}" 2>&1 &
+RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" "${SERVER_ARGV[@]}" >"${SEED_LOG}" 2>&1 &
 SERVER_PID=$!
 
 server_ready() {

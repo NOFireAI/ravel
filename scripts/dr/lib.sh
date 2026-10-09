@@ -67,8 +67,10 @@
 #                        unkeyed deployment has no deployment key to derive it
 #                        from, and ravel-server refuses to start under its
 #                        default `--audit-text redacted` without one. The key
-#                        reaches the server as RAVEL_AUDIT_TOKEN_KEY in its
-#                        environment, never in argv.
+#                        reaches the server, and only the server, as
+#                        RAVEL_AUDIT_TOKEN_KEY on its launch line; it is never
+#                        in argv and never exported to the harness's other
+#                        children.
 #   DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0. Set it to 1 only when the run
 #                        really did wait `max_flush_lifetime +
 #                        clock_skew_allowance + fold_safety_margin` out after
@@ -117,6 +119,7 @@ DR_TENANT_HASH_KEY_FILE="${DR_TENANT_HASH_KEY_FILE:-}"
 DR_TENANT_KMS_CONFIG="${DR_TENANT_KMS_CONFIG:-}"
 DR_ADMIN_CREDENTIAL_FILE="${DR_ADMIN_CREDENTIAL_FILE:-}"
 DR_AUDIT_TOKEN_KEY_FILE="${DR_AUDIT_TOKEN_KEY_FILE:-}"
+DR_SERVER_AUDIT_KEY=""
 DR_FOLD_SEAL_MARGIN_WAITED="${DR_FOLD_SEAL_MARGIN_WAITED:-0}"
 DR_LOG_DIR="${DR_LOG_DIR:-${DR_ROOT_DIR}/.gate-logs/dr}"
 DR_AWS="${DR_AWS:-}"
@@ -263,6 +266,9 @@ dr_init() {
     dr_die "${DR_EX_USAGE}" \
       "DR_TENANT_HASH_MODE=keyed needs DR_TENANT_HASH_KEY_FILE"
   fi
+  # A keyed deployment that set RAVEL_AUDIT_TOKEN_KEY itself keeps it: an
+  # explicit key wins over the one derived from the deployment key.
+  DR_SERVER_AUDIT_KEY="${RAVEL_AUDIT_TOKEN_KEY:-}"
   if [[ "${DR_TENANT_HASH_MODE}" == "unkeyed" ]]; then
     dr_load_audit_token_key
   fi
@@ -275,10 +281,12 @@ dr_init() {
   esac
 }
 
-# Read the audit token key an unkeyed deployment needs and export it as
-# RAVEL_AUDIT_TOKEN_KEY for the server this harness starts. The server's own
-# check (64 hex characters) is repeated here so a bad file fails at dr_init
-# with its name, not later as a server that never became ready.
+# Read the audit token key an unkeyed deployment needs into DR_SERVER_AUDIT_KEY.
+# It is not exported: every server launch passes it as a prefix assignment,
+# RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}", so the server sees it and
+# curl, docker and a `cargo run` fallback's build scripts do not. The server's
+# own check (64 hex characters) is repeated here so a bad file fails at
+# dr_init with its name, not later as a server that never became ready.
 dr_load_audit_token_key() {
   local key
   if [[ -z "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
@@ -294,7 +302,7 @@ dr_load_audit_token_key() {
     dr_die "${DR_EX_USAGE}" \
       "DR_AUDIT_TOKEN_KEY_FILE must hold 64 hex characters (a 32-byte key): ${DR_AUDIT_TOKEN_KEY_FILE}"
   fi
-  export RAVEL_AUDIT_TOKEN_KEY="${key}"
+  DR_SERVER_AUDIT_KEY="${key}"
 }
 
 # The shared tail of every usage message: the variables a real S3 run needs,
