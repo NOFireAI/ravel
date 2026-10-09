@@ -445,6 +445,26 @@ check "audit key: a caller's own RAVEL_AUDIT_TOKEN_KEY is kept" "caller-key" \
   "$(audit_key RAVEL_AUDIT_TOKEN_KEY=caller-key)"
 check "audit key: keyed mode leaves it to the deployment key" "unset" \
   "$(audit_key CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+compose_audit_key="$(sed -n 's/.*RAVEL_AUDIT_TOKEN_KEY: \${RAVEL_AUDIT_TOKEN_KEY:-\([0-9a-f]\{64\}\)}.*/\1/p' \
+  "${REPO_ROOT}/deploy/docker-compose/ravel.yml")"
+check "audit key: unkeyed mode uses the compose file's dev-only key" "${compose_audit_key:-<no key in ravel.yml>}" \
+  "$(audit_key)"
+
+# ravel_cli takes the same tenant-hash flags as the server, ahead of the
+# subcommand (they are top-level flags of ravel-cli). A stub ravel-cli on PATH
+# records its argv.
+CLI_STUB_DIR="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@"\n' >"${CLI_STUB_DIR}/ravel-cli"
+chmod +x "${CLI_STUB_DIR}/ravel-cli"
+cli_argv() {
+  env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE PATH="${CLI_STUB_DIR}:${PATH}" "$@" \
+    bash -c 'source "$1" && ravel_cli store qualify' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null | paste -sd' ' -
+}
+check "ravel_cli: unkeyed puts --tenant-hash-unkeyed before the subcommand" \
+  "--tenant-hash-unkeyed store qualify" "$(cli_argv)"
+check "ravel_cli: keyed puts --tenant-hash-key-file before the subcommand" \
+  "--tenant-hash-key-file ${KEY_FILE} store qualify" \
+  "$(cli_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
 
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]
