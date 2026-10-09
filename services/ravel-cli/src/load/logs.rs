@@ -1012,9 +1012,11 @@ pub(super) async fn refuse_a_sealed_current_hour(
 }
 
 /// `word` as one shell word: unchanged when it holds only characters no
-/// shell treats specially, single-quoted otherwise.
+/// shell treats specially, single-quoted otherwise. A leading `=` is quoted
+/// because zsh expands `=name` to the path of the command `name`.
 fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
+        && !word.starts_with('=')
         && word
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.:/@+=,".contains(c));

@@ -3817,3 +3817,13 @@ fn uncovered_commits_names_the_missing_commits() {
          not found"
     );
 }
+
+/// A tenant `shell_word` would leave bare only when no shell rewrites it.
+#[test]
+fn shell_word_quotes_what_a_shell_would_rewrite() {
+    assert_eq!(shell_word("acme"), "acme");
+    assert_eq!(shell_word("a=b,c:d"), "a=b,c:d");
+    assert_eq!(shell_word("=acme"), "'=acme'");
+    assert_eq!(shell_word("it's"), "'it'\\''s'");
+    assert_eq!(shell_word(""), "''");
+}

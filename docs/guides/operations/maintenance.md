@@ -217,8 +217,8 @@ names that hour. The same warning applies, to the current hour too. A logs
 load can do this itself: `ravel-cli load --fold-after-load` folds once the load
 succeeds, sealing through the latest ingest hour it wrote, and prints the
 result in its summary. It refuses to start when the logs HEAD has already
-sealed the current hour, since every object it wrote would then be invisible to
-queries without a commit token. Seal after compacting, not before: a later fold
+sealed the current hour, since every object written into the sealed hour would
+then be invisible to queries without a commit token. Seal after compacting, not before: a later fold
 in the same hour has nothing left to seal, so it does not pick up compaction
 records published into the sealed hours. The watermark advances only once the
 natural seal margin passes the next hour, or on another `--writers-stopped`
