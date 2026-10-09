@@ -149,7 +149,9 @@ counter, because its two consumers account differently:
   already keeps grow and shrink as separate counter operations
   (`memory.rs:105-130`) and `TenantDelegatingPool` already forwards every
   DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
-  refusal (`memory.rs:264-348`); the adapter forwards each of those to the
+  refusal (`memory.rs:264-348`; a held aggregate's shrink is the one
+  exception, see the aggregate hold amendment below); the adapter forwards
+  each of those to the
   process counter with the same delta, in the same order, so process-level
   bytes track SQL bytes exactly: tenant then process on the way up, process
   then tenant on the way down, and a refusal at either level rolls the other
@@ -1120,3 +1122,18 @@ is more measured than it is. Decision 3's calibration run replaces all three;
 until then, a small host's reserve is a proportion chosen so the budget is
 positive, held at or above the memory it must cover outside the budget, not a figure
 shown to cover the allocator and stacks on that host.
+
+## Amendment (2026-10-09, #2633): an aggregate's shrink can be held
+
+<!-- amendment-applies: sections="1. `MemoryBudget`, a process-wide accountant" pointer="aggregate hold amendment" -->
+
+The decision says `TenantDelegatingPool` forwards every DataFusion `grow`,
+`try_grow` and `shrink` to the counters 1:1. One shrink is no longer
+forwarded at once: a `GroupedHashAggregateStream[..]` consumer that cannot
+spill keeps its shrunk bytes charged until it unregisters, and its next
+grow draws on them before charging anything new. The bytes stay counted in
+every query, tenant and process figure the whole time, so the budgets never
+read lower than what is live; they can read higher, by at most the
+aggregate's own peak reservation, from its first shrink until its stream is
+dropped. ADR-0102's aggregate hold amendment records why `can_spill`
+selects it.
