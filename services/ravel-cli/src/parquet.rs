@@ -308,12 +308,14 @@ async fn collect_repair(
             "    stored_unix_ms: {} (the store's clock)",
             entry.last_modified_unix_ms
         ));
-        if entry.flagged && entry.undeletable {
+        if entry.undeletable {
+            // No request reaches the key, so there is no body to describe.
             out.push(format!(
                 "    undeletable by Ravel: the store's path encoding sends a delete of this key \
                  to {:?}; delete the exact key with the Maintain credential through an S3 tool",
                 store_path(&entry.key)
             ));
+            continue;
         }
         match repair::describe(store, entry).await {
             Description::Manifest(manifest) => {
@@ -327,32 +329,29 @@ async fn collect_repair(
             }
         }
     }
-    let flagged: Vec<String> = entries
+    let flagged = entries.iter().filter(|e| e.flagged).count();
+    let deletable: Vec<String> = entries
         .iter()
-        .filter(|e| e.flagged)
+        .filter(|e| e.flagged && !e.undeletable)
         .map(|e| e.key.clone())
         .collect();
-    if flagged.is_empty() {
+    let undeletable: Vec<&String> = entries
+        .iter()
+        .filter(|e| e.undeletable)
+        .map(|e| &e.key)
+        .collect();
+    if flagged == 0 && undeletable.is_empty() {
         out.push("no versions above the version bound and no keys naming no version".to_string());
         return Ok(());
     }
-    let undeletable: Vec<&String> = entries
-        .iter()
-        .filter(|e| e.flagged && e.undeletable)
-        .map(|e| &e.key)
-        .collect();
     if action != RepairAction::DeleteFlagged {
         out.push(if undeletable.is_empty() {
-            format!(
-                "{} version(s) flagged; rerun with --delete to remove exactly these",
-                flagged.len()
-            )
+            format!("{flagged} version(s) flagged; rerun with --delete to remove exactly these")
         } else {
             format!(
-                "{} version(s) flagged; rerun with --delete to remove {} of them; it skips the \
-                 other {}, undeletable by Ravel and marked above",
-                flagged.len(),
-                flagged.len() - undeletable.len(),
+                "{flagged} version(s) flagged; rerun with --delete to remove {} of them; it \
+                 skips the {} key(s) undeletable by Ravel, marked above",
+                deletable.len(),
                 undeletable.len()
             )
         });
@@ -364,20 +363,20 @@ async fn collect_repair(
              credential through an S3 tool"
         ));
     }
-    let deletion = repair::delete_flagged(store, &hash, table, &flagged)
+    let deletion = repair::delete_flagged(store, &hash, table, &deletable)
         .await
         .map_err(|err| delete_failed(out, "manifest versions", err))?;
     push_deleted(out, "manifest versions", &deletion.deleted);
-    if !deletion.undeletable.is_empty() {
-        let keys: Vec<String> = deletion
-            .undeletable
-            .iter()
-            .map(|k| format!("{k:?}"))
-            .collect();
+    let left: Vec<String> = undeletable
+        .into_iter()
+        .chain(&deletion.undeletable)
+        .map(|k| format!("{k:?}"))
+        .collect();
+    if !left.is_empty() {
         anyhow::bail!(
-            "{} flagged key(s) undeletable by Ravel left in place: {}",
-            keys.len(),
-            keys.join(", ")
+            "{} key(s) undeletable by Ravel left in place: {}",
+            left.len(),
+            left.join(", ")
         );
     }
     Ok(())
@@ -831,10 +830,10 @@ mod tests {
 
     /// A key is chosen by whoever put it, control characters included. The
     /// path encoding changes such a key, so the listing reports it
-    /// unaddressable: no line prints it, raw or escaped, and `--delete`
-    /// never sends it a delete.
+    /// unaddressable: the command names it escaped, never raw, marks it
+    /// undeletable by Ravel, and `--delete` never sends it a delete.
     #[tokio::test]
-    async fn repair_never_prints_or_deletes_a_key_holding_control_characters() {
+    async fn repair_names_a_key_holding_control_characters_escaped_and_never_deletes_it() {
         let store = forged_table().await;
         let hash = TenantId::new("acme").hash();
         let slot = "\u{1b}[2J\u{7}xxxxxxxxxxxxxxx";
@@ -842,16 +841,38 @@ mod tests {
         let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
         let key = format!("{prefix}{slot}.pqm");
         store.inner().insert_foreign(&key, Bytes::from_static(b"x"));
+        let named = format!(
+            "    key: {key:?}\n    stored_unix_ms: 0 (the store's clock)\n    undeletable by \
+             Ravel: the store's path encoding sends a delete of this key to {:?}; delete the \
+             exact key with the Maintain credential through an S3 tool",
+            store_path(&key)
+        );
         for action in [RepairAction::List, RepairAction::DeleteFlagged] {
             let mut lines = Vec::new();
-            collect_repair(&store, "acme", "hits", action, &mut lines)
-                .await
-                .expect("repair");
+            let result = collect_repair(&store, "acme", "hits", action, &mut lines).await;
             let printed = lines.join("\n");
             assert!(!printed.contains('\u{1b}'), "{printed}");
             assert!(!printed.contains('\u{7}'), "{printed}");
-            assert!(!printed.contains(&format!("{key:?}")), "{printed}");
-            assert!(!printed.contains("undeletable by Ravel"), "{printed}");
+            assert!(printed.contains(&named), "{printed}");
+            assert_eq!(printed.matches("undeletable by Ravel").count(), 1 +
+                usize::from(action == RepairAction::DeleteFlagged), "{printed}");
+            if action == RepairAction::List {
+                result.expect("repair");
+                assert!(
+                    printed.ends_with(
+                        "3 version(s) flagged; rerun with --delete to remove 2 of them; it skips \
+                         the 1 key(s) undeletable by Ravel, marked above"
+                    ),
+                    "{printed}"
+                );
+            } else {
+                let err = result.expect_err("an undeletable key is left");
+                assert_eq!(
+                    format!("{err:#}"),
+                    format!("1 key(s) undeletable by Ravel left in place: {key:?}")
+                );
+                assert!(printed.contains("deleted 2 manifest versions"), "{printed}");
+            }
         }
         assert_eq!(deletes(&store), 2);
         assert_eq!(unaddressable_under(&store, &prefix).await, [key]);
@@ -1349,10 +1370,10 @@ mod tests {
 
     /// A key under the table's own `v/` prefix that the store's path
     /// encoding changes is reported unaddressable by the listing, so the
-    /// command neither lists nor flags it. `--delete` deletes every flagged
-    /// version and never sends that key a delete.
+    /// command names it undeletable by Ravel. `--delete` deletes every
+    /// flagged version, never sends that key a delete, and fails naming it.
     #[tokio::test]
-    async fn repair_neither_lists_nor_deletes_a_key_the_path_encoding_changes() {
+    async fn repair_names_and_never_deletes_a_key_the_path_encoding_changes() {
         let hash = TenantId::new("acme").hash();
         let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
         let tilde = format!("{prefix}~~~~~~~~~~~~~~~~~~~~.pqm");
@@ -1365,11 +1386,21 @@ mod tests {
             .await
             .expect("repair");
         let printed = lines.join("\n");
-        assert!(!printed.contains(&format!("{tilde:?}")), "{printed}");
-        assert!(!printed.contains("undeletable by Ravel"), "{printed}");
-        assert_eq!(keys_left(&lines).len(), 4, "{printed}");
         assert!(
-            printed.ends_with("2 version(s) flagged; rerun with --delete to remove exactly these"),
+            printed.contains(&format!(
+                "    key: {tilde:?}\n    stored_unix_ms: 0 (the store's clock)\n    undeletable \
+                 by Ravel: the store's path encoding sends a delete of this key to {:?}; delete \
+                 the exact key with the Maintain credential through an S3 tool",
+                store_path(&tilde)
+            )),
+            "{printed}"
+        );
+        assert_eq!(keys_left(&lines).len(), 5, "{printed}");
+        assert!(
+            printed.ends_with(
+                "3 version(s) flagged; rerun with --delete to remove 2 of them; it skips the 1 \
+                 key(s) undeletable by Ravel, marked above"
+            ),
             "{printed}"
         );
         assert_eq!(
@@ -1378,7 +1409,7 @@ mod tests {
         );
 
         let mut lines = Vec::new();
-        collect_repair(
+        let err = collect_repair(
             &store,
             "acme",
             "hits",
@@ -1386,16 +1417,21 @@ mod tests {
             &mut lines,
         )
         .await
-        .expect("repair");
+        .expect_err("the tilde key is left");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("1 key(s) undeletable by Ravel left in place: {tilde:?}")
+        );
         let printed = lines.join("\n");
-        assert!(!printed.contains(&format!("{tilde:?}")), "{printed}");
         let forged = [
             manifest_key(&hash, "hits", MAX_MANIFEST_VERSION + 1).expect("key"),
             manifest_key(&hash, "hits", u64::MAX).expect("key"),
         ];
         assert!(
             printed.ends_with(&format!(
-                "\ndeleted 2 manifest versions\n  {:?}\n  {:?}",
+                "\nskipped {tilde:?}: undeletable by Ravel; delete the exact key with the \
+                 Maintain credential through an S3 tool\ndeleted 2 manifest versions\n  {:?}\n  \
+                 {:?}",
                 forged[0], forged[1]
             )),
             "{printed}"
