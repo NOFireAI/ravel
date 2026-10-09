@@ -882,14 +882,18 @@ mod tests {
     fn an_aggregate_is_held_only_when_its_consumer_cannot_spill() {
         for (can_spill, charged, held) in [(true, 200, 0), (false, 1000, 800)] {
             let ledgers = Ledgers::holding();
-            let res = ledgers
-                .register_consumer(MemoryConsumer::new(AGGREGATE).with_can_spill(can_spill));
+            let res =
+                ledgers.register_consumer(MemoryConsumer::new(AGGREGATE).with_can_spill(can_spill));
 
             res.try_grow(1000).expect("within every ceiling");
             res.shrink(800);
 
             let case = format!("can_spill={can_spill}");
-            assert_eq!(ledgers.charged(), (charged, charged, charged as u64), "{case}");
+            assert_eq!(
+                ledgers.charged(),
+                (charged, charged, charged as u64),
+                "{case}"
+            );
             assert_eq!(ledgers.pool.held_bytes(), held, "{case}");
             drop(res);
             assert_eq!(ledgers.charged(), (0, 0, 0), "{case}");
