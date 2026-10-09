@@ -537,8 +537,15 @@ compaction reasoning, and the sweeper's re-verify LIST.
      assume it.
    - The admin credential used to mint the fresh per-mode storage credentials
      that step 6 scopes to the restore bucket.
+   - For an unkeyed deployment (`--tenant-hash-unkeyed`), the audit token key
+     (`RAVEL_AUDIT_TOKEN_KEY`, 64 hex characters). A keyed deployment derives
+     it from the deployment key. An unkeyed one has nothing to derive it from,
+     and a server that serves queries refuses to start under the default
+     `--audit-text redacted` without it. Restoring with a different key
+     starts the server but tokenizes new audit text differently from the
+     audit records already in the bucket.
 
-   All three must be held somewhere that survives the loss of the primary
+   All of it must be held somewhere that survives the loss of the primary
    cluster: a separate secrets manager, a cross-region vault, or an offline
    copy. If they are stored only on the primary cluster, they are a single
    point of failure that the rest of this runbook cannot work around.
@@ -786,12 +793,15 @@ real rehearsal, not from estimation. The definitions are:
   re-run when the restore-relevant machinery changes materially, and the
   record keeps its history.
 - **What a harness rehearsal's RPO is (owner decision, 2026-10-08):** the RPO
-  a rehearsal with `scripts/dr/rehearse.sh` publishes is a
+  recorded for a rehearsal run with `scripts/dr/rehearse.sh` is a
   restore-completeness figure, not the replication lag the definition above
-  describes. It counts acknowledged samples (rows) missing from the target
-  bucket after the restore: the samples `seed.sh` had acknowledged under
-  strict ack, minus the samples the canary check reads back from bucket B.
-  The canary check fails unless that difference is 0. For a
+  describes. The harness does not compute it; the operator fills the record
+  from the canary check's result. It counts acknowledged samples (rows)
+  missing from the target bucket after the restore: the samples `seed.sh` had
+  acknowledged under strict ack, minus the samples the canary check reads back
+  from bucket B. The seeded corpus carries one sample per export, so the
+  acknowledged count is the number of exports that returned a commit token.
+  The canary check fails on any difference, more samples as well as fewer. For a
   quiesced client-side mirror the expected value is exactly 0: `seed.sh`
   stops its writer before `replicate.sh` copies bucket A with
   `aws s3 cp --recursive`, so every acknowledged sample is already in A when

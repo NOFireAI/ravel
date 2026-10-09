@@ -62,6 +62,13 @@
 #   DR_ADMIN_CREDENTIAL_FILE  REQUIRED. File holding the admin credential the
 #                        restore operator will use, or the literal `none` under
 #                        the same rule and for the same reason.
+#   DR_AUDIT_TOKEN_KEY_FILE   Required when DR_TENANT_HASH_MODE=unkeyed. File
+#                        holding the 64-hex-character audit token key. An
+#                        unkeyed deployment has no deployment key to derive it
+#                        from, and ravel-server refuses to start under its
+#                        default `--audit-text redacted` without one. The key
+#                        reaches the server as RAVEL_AUDIT_TOKEN_KEY in its
+#                        environment, never in argv.
 #   DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0. Set it to 1 only when the run
 #                        really did wait `max_flush_lifetime +
 #                        clock_skew_allowance + fold_safety_margin` out after
@@ -80,7 +87,8 @@
 # DR_BUCKET_PRIMARY, DR_BUCKET_REPLICA, DR_ACCESS_KEY, DR_SECRET_KEY,
 # DR_SESSION_TOKEN (under STS, which an instance role always is), DR_TENANT,
 # DR_TENANT_TOKEN, DR_TENANT_HASH_MODE (with DR_TENANT_HASH_KEY_FILE when
-# keyed), DR_TENANT_KMS_CONFIG and DR_ADMIN_CREDENTIAL_FILE.
+# keyed, or DR_AUDIT_TOKEN_KEY_FILE when unkeyed), DR_TENANT_KMS_CONFIG and
+# DR_ADMIN_CREDENTIAL_FILE.
 #
 # Credentials are never placed in a command line. The AWS CLI receives them
 # through AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN in the
@@ -108,6 +116,7 @@ DR_TENANT_HASH_MODE="${DR_TENANT_HASH_MODE:-}"
 DR_TENANT_HASH_KEY_FILE="${DR_TENANT_HASH_KEY_FILE:-}"
 DR_TENANT_KMS_CONFIG="${DR_TENANT_KMS_CONFIG:-}"
 DR_ADMIN_CREDENTIAL_FILE="${DR_ADMIN_CREDENTIAL_FILE:-}"
+DR_AUDIT_TOKEN_KEY_FILE="${DR_AUDIT_TOKEN_KEY_FILE:-}"
 DR_FOLD_SEAL_MARGIN_WAITED="${DR_FOLD_SEAL_MARGIN_WAITED:-0}"
 DR_LOG_DIR="${DR_LOG_DIR:-${DR_ROOT_DIR}/.gate-logs/dr}"
 DR_AWS="${DR_AWS:-}"
@@ -254,6 +263,9 @@ dr_init() {
     dr_die "${DR_EX_USAGE}" \
       "DR_TENANT_HASH_MODE=keyed needs DR_TENANT_HASH_KEY_FILE"
   fi
+  if [[ "${DR_TENANT_HASH_MODE}" == "unkeyed" ]]; then
+    dr_load_audit_token_key
+  fi
   case "${DR_FOLD_SEAL_MARGIN_WAITED}" in
     0 | 1) ;;
     *)
@@ -263,12 +275,34 @@ dr_init() {
   esac
 }
 
+# Read the audit token key an unkeyed deployment needs and export it as
+# RAVEL_AUDIT_TOKEN_KEY for the server this harness starts. The server's own
+# check (64 hex characters) is repeated here so a bad file fails at dr_init
+# with its name, not later as a server that never became ready.
+dr_load_audit_token_key() {
+  local key
+  if [[ -z "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "DR_TENANT_HASH_MODE=unkeyed needs DR_AUDIT_TOKEN_KEY_FILE: an unkeyed server refuses to start under --audit-text redacted without an audit token key"
+  fi
+  if [[ ! -r "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "DR_AUDIT_TOKEN_KEY_FILE is not a readable file: ${DR_AUDIT_TOKEN_KEY_FILE}"
+  fi
+  key="$(tr -d '[:space:]' <"${DR_AUDIT_TOKEN_KEY_FILE}")"
+  if [[ ! "${key}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "DR_AUDIT_TOKEN_KEY_FILE must hold 64 hex characters (a 32-byte key): ${DR_AUDIT_TOKEN_KEY_FILE}"
+  fi
+  export RAVEL_AUDIT_TOKEN_KEY="${key}"
+}
+
 # The shared tail of every usage message: the variables a real S3 run needs,
 # in one place so the six scripts cannot drift apart on it.
 dr_usage_environment() {
   cat <<'USAGE'
-Environment. The four marked REQUIRED have no default; every script refuses
-when one of them is unset.
+Environment. Every variable marked REQUIRED has no default; every script
+refuses when one of them is unset.
   DR_ENDPOINT        endpoint override, default http://127.0.0.1:9000.
                      Set it to the EMPTY STRING for real S3: no endpoint
                      override is exported and the store uses AWS's regional
@@ -288,6 +322,8 @@ when one of them is unset.
   DR_TENANT_HASH_KEY_FILE   deployment key file, required when keyed
   DR_TENANT_KMS_CONFIG      REQUIRED  per-tenant KMS config file, or `none`
   DR_ADMIN_CREDENTIAL_FILE  REQUIRED  admin credential file, or `none`
+  DR_AUDIT_TOKEN_KEY_FILE   file holding the 64-hex audit token key, required
+                     when unkeyed (passed to the server in its environment)
   DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0; 1 only when the run waited the
                      catalog seal margin out
   DR_LOG_DIR         logs and pre-registered figures, default
@@ -298,9 +334,10 @@ when one of them is unset.
 A real S3 run needs: DR_ENDPOINT="" plus DR_REGION, DR_BUCKET_PRIMARY,
 DR_BUCKET_REPLICA, DR_ACCESS_KEY, DR_SECRET_KEY, DR_SESSION_TOKEN (under STS,
 which an instance role always is), DR_TENANT, DR_TENANT_TOKEN,
-DR_TENANT_HASH_MODE (with DR_TENANT_HASH_KEY_FILE when keyed),
-DR_TENANT_KMS_CONFIG and DR_ADMIN_CREDENTIAL_FILE. Credentials are read from
-the environment and are never passed on a command line.
+DR_TENANT_HASH_MODE (with DR_TENANT_HASH_KEY_FILE when keyed, or
+DR_AUDIT_TOKEN_KEY_FILE when unkeyed), DR_TENANT_KMS_CONFIG and
+DR_ADMIN_CREDENTIAL_FILE. Credentials are read from the environment and are
+never passed on a command line.
 USAGE
 }
 
@@ -1180,6 +1217,9 @@ dr_dry_run_common() {
   printf '  bucket B (restore target): %s\n' "${DR_BUCKET_REPLICA}"
   printf '  tenant: %s (shards %s)\n' "${DR_TENANT}" "${DR_SHARDS}"
   printf '  tenant hash mode: %s\n' "${DR_TENANT_HASH_MODE}"
+  if [[ "${DR_TENANT_HASH_MODE}" == "unkeyed" ]]; then
+    printf '  audit token key: from DR_AUDIT_TOKEN_KEY_FILE (not shown)\n'
+  fi
   printf '  credentials: from DR_ACCESS_KEY / DR_SECRET_KEY (not shown)\n'
   if [[ -n "${DR_SESSION_TOKEN}" ]]; then
     printf '  session token: set (the client receives it in AWS_SESSION_TOKEN)\n'

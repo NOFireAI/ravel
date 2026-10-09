@@ -94,6 +94,11 @@ jobs:
       # has no per-tenant KMS and no separate admin credential file.
       DR_TENANT_KMS_CONFIG: none
       DR_ADMIN_CREDENTIAL_FILE: none
+      # An unkeyed server needs an audit token key to start under the default
+      # --audit-text redacted. The step "Write a throwaway audit token key"
+      # puts a fresh random one here, under private/, which the log upload
+      # below does not include.
+      DR_AUDIT_TOKEN_KEY_FILE: ${{ github.workspace }}/.gate-logs/dr/private/audit-token.key
       # This lane does not wait the catalog seal margin out, so the fold
       # verification phase reports itself a no-op rather than asserting a
       # snapshot HEAD it cannot have.
@@ -153,6 +158,12 @@ jobs:
           echo "RustFS did not become healthy in time"
           docker logs rustfs || true
           exit 1
+
+      - name: Write a throwaway audit token key
+        run: |
+          mkdir -p "$(dirname "${DR_AUDIT_TOKEN_KEY_FILE}")"
+          (umask 077 && openssl rand -hex 32 > "${DR_AUDIT_TOKEN_KEY_FILE}")
+          test "$(tr -d '[:space:]' < "${DR_AUDIT_TOKEN_KEY_FILE}" | wc -c)" -eq 64
 
       - name: Run the rehearsal
         env:
