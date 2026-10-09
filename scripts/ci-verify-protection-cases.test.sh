@@ -91,6 +91,9 @@ missing=0
 [ "${missing}" = 1 ] && failed+=(rule-scope)
 [[ "${lifecycle}" == *'"Days":'* ]] && failed+=(no-foreign-rule)
 unknown=()
+# The summary's failed list normally equals the condition lines'; the
+# summary-drift mode makes them disagree.
+summary_extra=()
 case "${FAKE_CLI_MODE:-correct}" in
   correct) ;;
   exit0) failed=() ;;
@@ -103,6 +106,8 @@ case "${FAKE_CLI_MODE:-correct}" in
     fi
     ;;
   unknown) unknown=("${failed[@]}"); failed=() ;;
+  summary-drift) [ "${#failed[@]}" -gt 0 ] && summary_extra=(object-lock) ;;
+  also-unknown) [ "${#failed[@]}" -gt 0 ] && unknown=(object-lock) ;;
 esac
 verdict() {
   local id=$1 f
@@ -119,7 +124,11 @@ printf '%-26s %s\n' object-lock "$(verdict object-lock)"
 printf '%-26s %s\n' object-retention "unknown not checked by this command, does not affect the exit code"
 join() { local IFS=,; echo "$*" | sed 's/,/, /g'; }
 if [ "${#failed[@]}" -gt 0 ]; then
-  echo "verify-protection: FAIL: failed: $(join "${failed[@]}")"
+  # The real rendering (render_verify_protection in services/ravel-cli/src/store.rs)
+  # appends the could-not-verify list after a FAIL.
+  summary="verify-protection: FAIL: failed: $(join "${failed[@]}" "${summary_extra[@]}")"
+  [ "${#unknown[@]}" -gt 0 ] && summary="${summary}; could not verify: $(join "${unknown[@]}")"
+  echo "${summary}"
   exit 1
 elif [ "${#unknown[@]}" -gt 0 ]; then
   echo "verify-protection: UNKNOWN: could not verify: $(join "${unknown[@]}")"
@@ -213,6 +222,14 @@ check names-extra 1 \
 run_helper names-none FAKE_CLI_MODE=silent
 check names-none 1 \
   "FAIL versioning-suspended: condition lines read fail for [], want [versioning]"
+
+run_helper summary-drift FAKE_CLI_MODE=summary-drift
+check summary-drift 1 \
+  "FAIL versioning-suspended: summary names [object-lock,versioning] as failed, want [versioning]"
+
+run_helper also-unknown FAKE_CLI_MODE=also-unknown
+check also-unknown 1 \
+  "FAIL versioning-suspended: summary could not verify [object-lock], want none"
 
 # Put 1 breaks versioning, put 2 restores it.
 run_helper restore-fails FAKE_AWS_FAIL_PUT=2

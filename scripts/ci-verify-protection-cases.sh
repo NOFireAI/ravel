@@ -21,6 +21,9 @@
 # and expects exit 0 again before the next case.
 #
 #   versioning-suspended     versioning Suspended          versioning
+#                            (SKIPPED on the CI bucket: it carries Object Lock,
+#                            and RustFS, like AWS S3, refuses to suspend
+#                            versioning on such a bucket)
 #   no-noncurrent-expiration rule without NoncurrentVersionExpiration
 #                                                          noncurrent-expiration, rule-scope
 #   no-expired-delete-marker rule without ExpiredObjectDeleteMarker
