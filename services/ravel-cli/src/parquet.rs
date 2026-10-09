@@ -335,22 +335,42 @@ async fn collect_repair(
         .filter(|e| e.flagged && !e.undeletable)
         .map(|e| e.key.clone())
         .collect();
+    // The flagged keys Ravel cannot delete are skipped and fail `--delete`.
+    // An unflagged key is never a deletion candidate, so one Ravel cannot
+    // delete is only reported.
     let undeletable: Vec<&String> = entries
         .iter()
-        .filter(|e| e.undeletable)
+        .filter(|e| e.flagged && e.undeletable)
         .map(|e| &e.key)
         .collect();
-    if flagged == 0 && undeletable.is_empty() {
-        out.push("no versions above the version bound and no keys naming no version".to_string());
+    let unflagged_undeletable = entries
+        .iter()
+        .filter(|e| !e.flagged && e.undeletable)
+        .count();
+    let left_unflagged = if unflagged_undeletable == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {unflagged_undeletable} key(s) not flagged and undeletable by Ravel, marked \
+             above, are left in place"
+        )
+    };
+    if flagged == 0 {
+        out.push(format!(
+            "no versions above the version bound and no keys naming no version{left_unflagged}"
+        ));
         return Ok(());
     }
     if action != RepairAction::DeleteFlagged {
         out.push(if undeletable.is_empty() {
-            format!("{flagged} version(s) flagged; rerun with --delete to remove exactly these")
+            format!(
+                "{flagged} version(s) flagged; rerun with --delete to remove exactly \
+                 these{left_unflagged}"
+            )
         } else {
             format!(
                 "{flagged} version(s) flagged; rerun with --delete to remove {} of them; it \
-                 skips the {} key(s) undeletable by Ravel, marked above",
+                 skips the {} key(s) undeletable by Ravel, marked above{left_unflagged}",
                 deletable.len(),
                 undeletable.len()
             )
