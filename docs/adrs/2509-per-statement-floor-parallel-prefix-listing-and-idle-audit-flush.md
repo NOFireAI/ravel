@@ -291,6 +291,9 @@ The implementing tasks' acceptance stamps are measured the same way as Stage 0:
 The steady-traffic row's "about 77" is 73 by the batching model, so its miss
 band is above 74: see the steady-traffic and reachability correction below.
 
+The commit-listing row is now read from the SQL response rather than
+subtracted: see the resolveMs amendment below.
+
 **How the end-to-end bands are derived.**
 - Real S3: the band is the measured components with the listing overlapped
   to about one round and the 25 ms and one 18 ms GET removed. The 19 ms not
@@ -523,3 +526,18 @@ Take two queries submitted 1 ms apart to a quiet pipeline, with `max_age`
 traffic, the measured case, gains the 25 ms. The ADR-0062 idle-flush
 amendment carries the full statement, and issue #2561 tracks reducing the
 second event's wait.
+
+## Amendment (2026-10-08): the listing wall time is read from `stats.timings.resolveMs`
+
+<!-- amendment-applies: sections="What this moves, pre-registered" pointer="resolveMs amendment" -->
+
+ADR-2677 decision 4 adds `stats.timings` to the JSON response of
+`POST /api/v1/sql` (issue #2680). The "wall time spent in the commit
+listing" row above was derived by subtracting the other components from the
+statement's total. It is now read from `stats.timings.resolveMs`, the wall
+time of the successful attempt's snapshot resolve.
+
+`resolveMs` covers the whole resolve: the commit listing and the catalog
+HEAD read, plus any Parquet table resolution. It bounds the listing's wall
+time from above rather than isolating it. The row's expected band and miss
+band are unchanged.

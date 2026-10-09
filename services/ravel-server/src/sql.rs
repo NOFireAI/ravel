@@ -254,7 +254,13 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
-    let outcome = state.service().sql_execute(tenant_hash, &request).await?;
+    let crate::service::SqlExecution {
+        outcome,
+        audit_elapsed,
+    } = state
+        .service()
+        .sql_execute_timed(tenant_hash, &request)
+        .await?;
 
     // Fold this query's LogsScanExec block counters into the process-global
     // prune-selectivity totals. These are the scan's own
@@ -279,6 +285,14 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
         map.insert(
             "io".to_string(),
             ravel_sql::stats_json::io_shape_json(&outcome.io_shape),
+        );
+        map.insert(
+            "timings".to_string(),
+            ravel_sql::stats_json::timings_json(&outcome.stats, audit_elapsed),
+        );
+        map.insert(
+            "pruning".to_string(),
+            ravel_sql::stats_json::pruning_json(&outcome.stats),
         );
     }
     encode(&headers, &outcome, tenant_hash, stats)

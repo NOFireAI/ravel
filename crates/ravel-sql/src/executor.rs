@@ -415,6 +415,10 @@ pub struct SqlStats {
     /// same DataFusion metric set as the block counters. All zero for a plan
     /// with no logs scan.
     pub scan_timing: ScanTiming,
+    /// The successful attempt's wall time per executor stage (ADR-2677
+    /// decision 4). A retried statement reports only the attempt that
+    /// returned rows; [`Self::attempts`] says whether there was another.
+    pub wall: PhaseWallTiming,
     /// Histogram-kind series the successful attempt's `RsegScanExec` matched
     /// and did not return, read off its DataFusion counters the same way the
     /// block counters above are (issue #1738). Nonzero means this result is
@@ -425,6 +429,30 @@ pub struct SqlStats {
     /// a distinct-series count. Zero for every non-metrics statement, and for a
     /// metrics statement over a tenant with no histogram data.
     pub histogram_series_skipped: u64,
+}
+
+/// Wall time of one attempt's executor stages, in nanoseconds on a monotonic
+/// clock. The stages run one after another, and `drain_ns` covers the scan,
+/// decode and every operator above it. They do not sum to what the client
+/// waited: admission, audit and encoding sit outside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhaseWallTiming {
+    /// Around the attempt's snapshot resolve.
+    pub resolve_ns: u64,
+    /// Around logical planning against the pinned snapshot.
+    pub plan_ns: u64,
+    /// Physical plan creation plus starting the stream.
+    pub start_ns: u64,
+    /// From the stream starting to its first `Ok` batch; zero when the stream
+    /// emitted none.
+    pub first_batch_ns: u64,
+    /// From the first batch (or the stream starting, when there was none) to
+    /// the stream's end.
+    pub drain_ns: u64,
+}
+
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Wall-clock timing of a query's `LogsScanExec` partitions (see
@@ -1495,6 +1523,7 @@ impl SqlExecutor {
             // whose snapshot resolves to zero segments cannot slip past this
             // ceiling on the strength that it never reaches the
             // segment-fetch loop in scan.rs.
+            let resolve_started = Instant::now();
             let Resolved {
                 snapshot,
                 estimate,
@@ -1503,6 +1532,7 @@ impl SqlExecutor {
                 parquet,
                 ..
             } = self.resolve(tenant_hash, req, &phase_accounting).await?;
+            let resolve_ns = elapsed_ns(resolve_started);
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
@@ -1550,6 +1580,10 @@ impl SqlExecutor {
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
                     stats.scan_timing = blocks.timing;
+                    stats.wall = PhaseWallTiming {
+                        resolve_ns,
+                        ..caps.wall
+                    };
                     stats.histogram_series_skipped = blocks.histogram_series_skipped;
                     let phase_snapshot = phase_accounting.snapshot();
                     return Ok(SqlOutcome {
@@ -3114,6 +3148,8 @@ impl SqlExecutor {
         Vec<OperatorSpill>,
         AttemptCaps,
     ) {
+        let mut wall = PhaseWallTiming::default();
+        let plan_started = Instant::now();
         let planned = match self
             .plan_pinned_with(
                 tenant_hash,
@@ -3145,12 +3181,14 @@ impl SqlExecutor {
                 );
             }
         };
+        wall.plan_ns = elapsed_ns(plan_started);
         let schema = planned.schema();
         // Read before `execute` consumes the planned query. Reported even on
         // the paths below that fail: the filter was applied to the plan that
         // failed, and saying otherwise would misreport what ran.
         let window_predicate = planned.window_predicate().map(str::to_string);
 
+        let start_started = Instant::now();
         let mut stream = match planned.with_row_cap(req.max_rows).execute().await {
             Ok(stream) => stream,
             Err(e) => {
@@ -3163,16 +3201,23 @@ impl SqlExecutor {
                     AttemptCaps {
                         window_predicate,
                         row_cap_hit: false,
+                        wall,
                     },
                 );
             }
         };
+        wall.start_ns = elapsed_ns(start_started);
 
         let mut batches = Vec::new();
         let mut emitted = 0usize;
+        let mut drain_started = Instant::now();
         while let Some(next) = stream.next().await {
             match next {
                 Ok(batch) => {
+                    if emitted == 0 {
+                        wall.first_batch_ns = elapsed_ns(drain_started);
+                        drain_started = Instant::now();
+                    }
                     emitted += 1;
                     batches.push(batch);
                 }
@@ -3192,11 +3237,13 @@ impl SqlExecutor {
                         AttemptCaps {
                             window_predicate,
                             row_cap_hit: stream.row_cap_hit(),
+                            wall,
                         },
                     );
                 }
             }
         }
+        wall.drain_ns = elapsed_ns(drain_started);
 
         // The stream drained cleanly: the plan's LogsScanExec counters are now
         // final, so read them off the plan we kept.
@@ -3211,19 +3258,22 @@ impl SqlExecutor {
             AttemptCaps {
                 window_predicate,
                 row_cap_hit: stream.row_cap_hit(),
+                wall,
             },
         )
     }
 }
 
 /// What one [`SqlExecutor::attempt`] applied on top of the statement itself:
-/// the row-window predicate and whether the row cap cut the result. Carried
+/// the row-window predicate and whether the row cap cut the result, plus the
+/// wall time of the stages it ran. Carried
 /// out separately from [`SqlStats`] because an attempt that is later discarded
 /// by the retry must not leave its values behind.
 #[derive(Debug, Clone, Default)]
 struct AttemptCaps {
     window_predicate: Option<String>,
     row_cap_hit: bool,
+    wall: PhaseWallTiming,
 }
 
 /// A query planned against one pinned snapshot, not yet executing.
