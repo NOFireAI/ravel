@@ -2392,7 +2392,10 @@ async fn sql_response_carries_timings_and_pruning_stats() {
     let value: Value = serde_json::from_slice(&raw).expect("JSON body");
     let timings = stats_object(&raw, &value, "timings", TIMINGS_KEYS);
     assert_eq!(timings["attempts"], 1, "{value}");
-    assert_eq!(timings["scans"], 0, "a metrics plan has no logs scan: {value}");
+    assert_eq!(
+        timings["scans"], 0,
+        "a metrics plan has no logs scan: {value}"
+    );
     let resolve_ms = timings["resolveMs"].as_f64().expect("resolveMs");
     assert!(resolve_ms > 0.0, "resolve took measurable time: {value}");
     for key in TIMINGS_KEYS {
