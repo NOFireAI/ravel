@@ -315,19 +315,24 @@ check "custody: keyed mode needs no audit key file and hands the server none" \
   "0||unset" "$(audit_init keyed "" "")"
 check "custody: keyed mode passes a caller's explicit audit key to the server" \
   "0|${CALLER_KEY}|${CALLER_KEY}" "$(audit_init keyed "" "${CALLER_KEY}")"
+check "custody: a caller's explicit audit key that is not 64 hex characters is refused" \
+  "64" "$(audit_init keyed "" "${CALLER_KEY%?}" | cut -d'|' -f1)"
+check "custody: a directory as the audit key file is refused as not a readable file" \
+  "64" "$(audit_init unkeyed "${AUDIT_KEY_DIR}" "" | cut -d'|' -f1)"
 
 # Every server launch carries the key as a prefix assignment, so the server,
 # and only the server, receives it. Counted per script: a launch added without
 # it fails here.
-for launcher in seed.sh start.sh; do
+# Both counts are pinned to the number of launches each script has, so a
+# launch line that stops matching the pattern fails instead of reading 0 = 0.
+for pair in seed.sh:1 start.sh:2; do
+  launcher="${pair%%:*}"
+  expected="${pair#*:}"
   launches="$(grep -c '"${SERVER_ARGV\[@\]}"' "${DR_DIR}/${launcher}")"
   keyed_launches="$(grep -c 'RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" \(exec \)\{0,1\}"${SERVER_ARGV\[@\]}"' "${DR_DIR}/${launcher}")"
-  check "custody: every ravel-server launch in ${launcher} passes the audit key (${launches} found)" \
-    "${launches}" "${keyed_launches}"
+  check "custody: ${launcher} has ${expected} ravel-server launch(es), each passing the audit key" \
+    "${expected}:${expected}" "${launches}:${keyed_launches}"
 done
-[[ "$(grep -c '"${SERVER_ARGV\[@\]}"' "${DR_DIR}/start.sh")" -eq 2 ]] ||
-  check "custody: start.sh has the two launches this suite counts" "2" \
-    "$(grep -c '"${SERVER_ARGV\[@\]}"' "${DR_DIR}/start.sh")"
 
 # --- finding 1: the buckets are named, never guessed -----------------------
 
