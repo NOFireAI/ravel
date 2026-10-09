@@ -23,7 +23,7 @@
 //!   folded (reconciliation), so it is
 //!   reported but never treated as a failure by any caller.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[cfg(test)]
 use prost::Message;
@@ -32,10 +32,13 @@ use ravel_commit::erasure::{
 };
 use ravel_commit::keys::{self, KeyError};
 use ravel_commit::record::{self, RecordError};
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
+use ravel_proto::catalog::v1::SnapshotHead;
+use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
+use crate::error::CatalogError;
 use crate::snapshot_format::{PartLimits, SnapshotFormatError, decode_head, decode_part};
 
 /// Entry identity, the dedup key:
@@ -169,6 +172,12 @@ pub enum SealDivergenceError {
         #[source]
         source: ravel_commit::erasure::ErasureError,
     },
+    #[error("could not resolve the rewrite supersession in {bucket}: {source}")]
+    Supersession {
+        bucket: String,
+        #[source]
+        source: Box<CatalogError>,
+    },
 }
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
@@ -232,42 +241,11 @@ pub async fn verify_seal_divergence(
     // silently truncate and collide. `decode_part` has already checked the
     // per-level width, so a level-0 writer_id is guaranteed 16 bytes; the
     // fallible convert stays as defense against an entry that bypassed decode.
-    let limits = PartLimits::default();
-    let mut snapshot_entries: BTreeMap<EntryIdentity, Vec<u8>> = BTreeMap::new();
-    let mut snapshot_entry_count = 0usize;
-    for part_ref in &head.parts {
-        let got = store
-            .get(&part_ref.key, GetRange::Full)
-            .await
-            .map_err(|source| SealDivergenceError::PartFetch {
-                key: part_ref.key.clone(),
-                source,
-            })?;
-        let decoded =
-            decode_part(&got.data, &limits).map_err(|source| SealDivergenceError::PartCorrupt {
-                key: part_ref.key.clone(),
-                source,
-            })?;
-        for entry in decoded.entries {
-            snapshot_entry_count += 1;
-            if entry.level != 0 {
-                continue;
-            }
-            let writer_id: [u8; 16] = entry.writer_id.as_slice().try_into().map_err(|_| {
-                SealDivergenceError::PartWriterId {
-                    key: part_ref.key.clone(),
-                }
-            })?;
-            let identity = (
-                entry.shard,
-                entry.ingest_hour_bucket,
-                writer_id,
-                entry.writer_epoch,
-                entry.writer_seq,
-            );
-            snapshot_entries.insert(identity, entry.content_hash);
-        }
-    }
+    let SnapshotEntries {
+        level0: snapshot_entries,
+        entry_count: snapshot_entry_count,
+        ..
+    } = read_snapshot_entries(store, &head).await?;
 
     // Re-list every sealed commit record directly from the store (the ground
     // truth), decoded into the same identity shape.
@@ -299,68 +277,12 @@ pub async fn verify_seal_divergence(
         // Pass one: the L0 identities superseded by a compaction or rewrite
         // record in this shard, keyed exactly as the fold keys `excluded`:
         // the raw `(writer_id string, epoch, seq)` triple.
+        let records = load_superseding_records(store, &objects).await?;
         let mut superseded: HashSet<(String, u64, u64)> = HashSet::new();
-        for object in &objects {
-            if keys::parse_compaction_record_key(&object.key).is_ok() {
-                let got = store
-                    .get(&object.key, GetRange::Full)
-                    .await
-                    .map_err(|source| SealDivergenceError::RecordFetch {
-                        key: object.key.clone(),
-                        source,
-                    })?;
-                let rec = record::decode_compaction(got.data.as_ref()).map_err(|source| {
-                    SealDivergenceError::CompactionRecordCorrupt {
-                        key: object.key.clone(),
-                        source,
-                    }
-                })?;
-                // Recompute the record's hash for its own format_version
-                // before trusting a single input to suppress an L0 entry from
-                // the ground truth: the version 1 hash over `inputs` for a
-                // version 1 record, the version 2 hash over `inputs` and
-                // `superseded_record_key` for a version 2 record. A mismatch
-                // under that per-version rule means the record is corrupt or
-                // forged, and failing loud here is what makes `catalog
-                // verify` notice instead of silently under-checking real L0
-                // entries.
-                let computed =
-                    if rec.format_version == record::COMPACTION_SUPERSEDING_FORMAT_VERSION {
-                        compute_superseding_compaction_input_set_hash(
-                            &rec.inputs,
-                            &rec.superseded_record_key,
-                        )
-                    } else {
-                        compute_compaction_input_set_hash(&rec.inputs)
-                    };
-                if rec.input_set_hash.as_slice() != computed.as_slice() {
-                    return Err(SealDivergenceError::CompactionInputSetHashMismatch {
-                        key: object.key.clone(),
-                        declared: hex::encode(&rec.input_set_hash),
-                        computed: hex::encode(computed),
-                    });
-                }
-                for input in rec.inputs {
-                    superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
-                }
-            } else if keys::parse_rewrite_record_key(&object.key).is_ok() {
-                let got = store
-                    .get(&object.key, GetRange::Full)
-                    .await
-                    .map_err(|source| SealDivergenceError::RecordFetch {
-                        key: object.key.clone(),
-                        source,
-                    })?;
-                let rec = ravel_commit::erasure::decode_rewrite(&got.data).map_err(|source| {
-                    SealDivergenceError::RewriteRecordCorrupt {
-                        key: object.key.clone(),
-                        source,
-                    }
-                })?;
-                for input in rec.inputs {
-                    superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
-                }
-            }
+        let compaction_inputs = records.compaction.into_iter().map(|(_, rec)| rec.inputs);
+        let rewrite_inputs = records.rewrite.into_iter().map(|(_, rec)| rec.inputs);
+        for input in compaction_inputs.chain(rewrite_inputs).flatten() {
+            superseded.insert((input.writer_id, input.writer_epoch, input.writer_seq));
         }
 
         // Pass two: every non-superseded sealed L0 commit record.
@@ -425,6 +347,290 @@ pub async fn verify_seal_divergence(
         mismatched,
         orphaned,
     }))
+}
+
+/// The entries of the snapshot a decoded HEAD names, read part by part.
+struct SnapshotEntries {
+    /// Level-0 entries by identity, with their `content_hash`.
+    level0: BTreeMap<EntryIdentity, Vec<u8>>,
+    /// Level-1 entries as `(shard, ingest_hour_bucket, input_set_hash)`: the
+    /// compaction and rewrite records whose parts the snapshot holds.
+    level1_records: HashSet<(u32, u32, Vec<u8>)>,
+    /// Entries across every part, all levels.
+    entry_count: usize,
+}
+
+/// GET and decode every part `head` references. A part that cannot be fetched
+/// or decoded is an error, never an empty part.
+async fn read_snapshot_entries(
+    store: &dyn ObjectStoreBackend,
+    head: &SnapshotHead,
+) -> Result<SnapshotEntries, SealDivergenceError> {
+    let limits = PartLimits::default();
+    let mut entries = SnapshotEntries {
+        level0: BTreeMap::new(),
+        level1_records: HashSet::new(),
+        entry_count: 0,
+    };
+    for part_ref in &head.parts {
+        let got = store
+            .get(&part_ref.key, GetRange::Full)
+            .await
+            .map_err(|source| SealDivergenceError::PartFetch {
+                key: part_ref.key.clone(),
+                source,
+            })?;
+        let decoded =
+            decode_part(&got.data, &limits).map_err(|source| SealDivergenceError::PartCorrupt {
+                key: part_ref.key.clone(),
+                source,
+            })?;
+        for entry in decoded.entries {
+            entries.entry_count += 1;
+            if entry.level != 0 {
+                entries.level1_records.insert((
+                    entry.shard,
+                    entry.ingest_hour_bucket,
+                    entry.writer_id,
+                ));
+                continue;
+            }
+            let writer_id: [u8; 16] = entry.writer_id.as_slice().try_into().map_err(|_| {
+                SealDivergenceError::PartWriterId {
+                    key: part_ref.key.clone(),
+                }
+            })?;
+            let identity = (
+                entry.shard,
+                entry.ingest_hour_bucket,
+                writer_id,
+                entry.writer_epoch,
+                entry.writer_seq,
+            );
+            entries.level0.insert(identity, entry.content_hash);
+        }
+    }
+    Ok(entries)
+}
+
+/// The compaction and rewrite records among a listing, decoded and keyed by
+/// their object key.
+struct SupersedingRecords {
+    compaction: Vec<(String, CompactionRecord)>,
+    rewrite: Vec<(String, RewriteRecord)>,
+}
+
+/// GET and decode every compaction and rewrite record in `objects`, skipping
+/// every other key.
+///
+/// Each compaction record's hash is recomputed for its own format_version
+/// before a single input is trusted to supersede an L0 commit record: the
+/// version 1 hash over `inputs` for a version 1 record, the version 2 hash
+/// over `inputs` and `superseded_record_key` for a version 2 record. A
+/// mismatch under that per-version rule means the record is corrupt or
+/// forged, and failing loud here is what makes `catalog verify` notice instead
+/// of silently under-checking real L0 entries.
+async fn load_superseding_records(
+    store: &dyn ObjectStoreBackend,
+    objects: &[ObjectMeta],
+) -> Result<SupersedingRecords, SealDivergenceError> {
+    let mut records = SupersedingRecords {
+        compaction: Vec::new(),
+        rewrite: Vec::new(),
+    };
+    for object in objects {
+        let is_compaction = keys::parse_compaction_record_key(&object.key).is_ok();
+        if !is_compaction && keys::parse_rewrite_record_key(&object.key).is_err() {
+            continue;
+        }
+        let got = store
+            .get(&object.key, GetRange::Full)
+            .await
+            .map_err(|source| SealDivergenceError::RecordFetch {
+                key: object.key.clone(),
+                source,
+            })?;
+        if !is_compaction {
+            let rec = ravel_commit::erasure::decode_rewrite(&got.data).map_err(|source| {
+                SealDivergenceError::RewriteRecordCorrupt {
+                    key: object.key.clone(),
+                    source,
+                }
+            })?;
+            records.rewrite.push((object.key.clone(), rec));
+            continue;
+        }
+        let rec = record::decode_compaction(got.data.as_ref()).map_err(|source| {
+            SealDivergenceError::CompactionRecordCorrupt {
+                key: object.key.clone(),
+                source,
+            }
+        })?;
+        let computed = if rec.format_version == record::COMPACTION_SUPERSEDING_FORMAT_VERSION {
+            compute_superseding_compaction_input_set_hash(&rec.inputs, &rec.superseded_record_key)
+        } else {
+            compute_compaction_input_set_hash(&rec.inputs)
+        };
+        if rec.input_set_hash.as_slice() != computed.as_slice() {
+            return Err(SealDivergenceError::CompactionInputSetHashMismatch {
+                key: object.key.clone(),
+                declared: hex::encode(&rec.input_set_hash),
+                computed: hex::encode(computed),
+            });
+        }
+        records.compaction.push((object.key.clone(), rec));
+    }
+    Ok(records)
+}
+
+/// The result of [`snapshot_coverage`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnapshotCoverage {
+    /// The HEAD's watermark hour. `None` when there is no HEAD, in which case
+    /// every identity asked about is missing.
+    pub watermark_hour: Option<u32>,
+    /// The identities asked about that the snapshot does not cover, in the
+    /// order given, each listed once.
+    pub missing: Vec<EntryIdentity>,
+    /// Snapshot parts fetched: every part the HEAD references.
+    pub parts_read: usize,
+    /// `(shard, hour)` buckets listed: only those holding an identity that is
+    /// not a level-0 entry of the snapshot.
+    pub buckets_listed: usize,
+    /// Compaction and rewrite records fetched from those buckets.
+    pub records_read: usize,
+}
+
+/// Whether the snapshot the `(tenant, signal)` HEAD names covers each of
+/// `identities`, the L0 commits one writer knows it published.
+///
+/// An identity is covered when it is a level-0 entry of a part the HEAD
+/// references, or when a compaction or rewrite record whose parts the
+/// snapshot holds as level-1 entries supersedes it: a compaction record by
+/// naming it among its `inputs`, a rewrite record by its own `inputs` or
+/// through the predecessor chain [`crate::resolve_rewrite_supersession`]
+/// chases, the same rule the fold applies. A superseding record on the store
+/// whose parts the snapshot does not hold covers nothing.
+///
+/// Cost: one HEAD GET and one GET per part the HEAD references. Only for an
+/// identity found in no level-0 entry is its `(shard, hour)` bucket listed and
+/// its compaction and rewrite records fetched, never the tenant's whole commit
+/// history. A HEAD or part that cannot be fetched or decoded is an `Err`; an
+/// absent HEAD covers nothing.
+pub async fn snapshot_coverage(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    identities: &[EntryIdentity],
+) -> Result<SnapshotCoverage, SealDivergenceError> {
+    let key = head_key(tenant_hash, signal);
+    let head_bytes = match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => outcome.data,
+        Err(StoreError::NotFound) => {
+            let mut missing = identities.to_vec();
+            dedup_in_order(&mut missing);
+            return Ok(SnapshotCoverage {
+                missing,
+                ..SnapshotCoverage::default()
+            });
+        }
+        Err(source) => return Err(SealDivergenceError::HeadFetch { key, source }),
+    };
+    let head = decode_head(&head_bytes)
+        .map_err(|source| SealDivergenceError::HeadCorrupt { key, source })?;
+    let snapshot = read_snapshot_entries(store, &head).await?;
+    let mut coverage = SnapshotCoverage {
+        watermark_hour: Some(head.watermark_hour),
+        parts_read: head.parts.len(),
+        ..SnapshotCoverage::default()
+    };
+
+    let mut candidates: Vec<EntryIdentity> = identities
+        .iter()
+        .filter(|id| !snapshot.level0.contains_key(*id))
+        .copied()
+        .collect();
+    dedup_in_order(&mut candidates);
+    let buckets: BTreeSet<(u32, u32)> = candidates.iter().map(|id| (id.0, id.1)).collect();
+
+    let mut superseded: HashSet<EntryIdentity> = HashSet::new();
+    for (shard, hour) in buckets {
+        let prefix = keys::commit_shard_hour_prefix(tenant_hash, signal, shard, hour)
+            .map_err(|source| SealDivergenceError::ShardPrefix { source })?;
+        let objects = ravel_object_store::list_all(store, &prefix)
+            .await
+            .map_err(|source| SealDivergenceError::ListShard {
+                prefix: prefix.clone(),
+                source,
+            })?;
+        coverage.buckets_listed += 1;
+        let records = load_superseding_records(store, &objects).await?;
+        coverage.records_read += records.compaction.len() + records.rewrite.len();
+        let held = |rec_hash: &[u8]| {
+            snapshot
+                .level1_records
+                .contains(&(shard, hour, rec_hash.to_vec()))
+        };
+
+        let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+        for (_, rec) in &records.compaction {
+            if held(&rec.input_set_hash) {
+                for input in &rec.inputs {
+                    excluded.insert((
+                        input.writer_id.clone(),
+                        input.writer_epoch,
+                        input.writer_seq,
+                    ));
+                }
+            }
+        }
+        let compaction_by_key: HashMap<&str, &CompactionRecord> = records
+            .compaction
+            .iter()
+            .map(|(k, r)| (k.as_str(), r))
+            .collect();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> = records
+            .rewrite
+            .iter()
+            .map(|(k, r)| (k.as_str(), r))
+            .collect();
+        let mut superseded_records: HashSet<String> = HashSet::new();
+        for (rkey, rec) in &records.rewrite {
+            if held(&rec.input_set_hash) {
+                crate::catalog::resolve_rewrite_supersession(
+                    rkey,
+                    rec,
+                    &prefix,
+                    &compaction_by_key,
+                    &rewrite_by_key,
+                    &mut excluded,
+                    &mut superseded_records,
+                )
+                .map_err(|source| SealDivergenceError::Supersession {
+                    bucket: prefix.clone(),
+                    source: Box::new(source),
+                })?;
+            }
+        }
+        for (writer_id, epoch, seq) in excluded {
+            // An input whose writer_id is not a uuid names no L0 commit.
+            if let Ok(writer) = Uuid::parse_str(&writer_id) {
+                superseded.insert((shard, hour, *writer.as_bytes(), epoch, seq));
+            }
+        }
+    }
+
+    coverage.missing = candidates
+        .into_iter()
+        .filter(|id| !superseded.contains(id))
+        .collect();
+    Ok(coverage)
+}
+
+/// Drop every repeat of an earlier element, keeping first-seen order.
+fn dedup_in_order(ids: &mut Vec<EntryIdentity>) {
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(*id));
 }
 
 #[cfg(test)]
@@ -1077,5 +1283,296 @@ mod tests {
             .await
             .expect_err("a corrupt HEAD must be a typed read error");
         assert!(matches!(err, SealDivergenceError::HeadCorrupt { .. }));
+    }
+
+    fn identity(rec: &ravel_proto::commit::v1::CommitRecord) -> EntryIdentity {
+        (
+            rec.shard,
+            rec.ingest_hour_bucket,
+            *Uuid::parse_str(&rec.writer_id).expect("uuid").as_bytes(),
+            rec.writer_epoch,
+            rec.writer_seq,
+        )
+    }
+
+    async fn coverage(
+        store: &dyn ObjectStoreBackend,
+        tenant: &str,
+        ids: &[EntryIdentity],
+    ) -> Result<SnapshotCoverage, SealDivergenceError> {
+        snapshot_coverage(store, &TenantId::new(tenant).hash(), Signal::Metrics, ids).await
+    }
+
+    /// The first part key the tenant's HEAD references.
+    async fn first_part_key(store: &MemoryStore, tenant: &str) -> String {
+        let key = head_key(&TenantId::new(tenant).hash(), Signal::Metrics);
+        let got = store.get(&key, GetRange::Full).await.expect("HEAD");
+        let head = decode_head(&got.data).expect("decodes");
+        head.parts.first().expect("one part").key.clone()
+    }
+
+    /// A level-0 entry covers its commit, and a commit published after the
+    /// fold is missing. Only the missing commit's bucket is listed; a set the
+    /// level-0 entries cover lists nothing.
+    #[tokio::test]
+    async fn coverage_finds_level0_entries_and_names_the_unfolded_commit() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "coverage-l0";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let folded = publish_segment(store.as_ref(), tenant, 1, created).await;
+        fold(store.clone(), tenant, now).await;
+        let late = publish_segment(store.as_ref(), tenant, 2, created).await;
+
+        let ids = [identity(&folded), identity(&late), identity(&folded)];
+        let found = coverage(store.as_ref(), tenant, &ids)
+            .await
+            .expect("readable");
+        assert_eq!(found.missing, vec![identity(&late)]);
+        assert_eq!(found.watermark_hour, Some(folded.ingest_hour_bucket));
+        assert_eq!(found.parts_read, 1);
+        assert_eq!(found.buckets_listed, 1);
+        assert_eq!(found.records_read, 0);
+
+        let covered = coverage(store.as_ref(), tenant, &[identity(&folded)])
+            .await
+            .expect("readable");
+        assert!(covered.missing.is_empty(), "{covered:?}");
+        assert_eq!(covered.buckets_listed, 0, "nothing to look up past level 0");
+    }
+
+    /// A commit a compaction record superseded is not a level-0 entry of the
+    /// snapshot, and is covered by the level-1 part the snapshot holds.
+    #[tokio::test]
+    async fn coverage_counts_a_commit_a_held_compaction_supersedes() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "coverage-l1";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+        let compacted = publish_segment(store.as_ref(), tenant, 1, created).await;
+        let raw = publish_segment(store.as_ref(), tenant, 2, created).await;
+        publish_compaction(store.as_ref(), tenant, hour, &[&compacted], created).await;
+        fold(store.clone(), tenant, now).await;
+
+        let found = coverage(
+            store.as_ref(),
+            tenant,
+            &[identity(&compacted), identity(&raw)],
+        )
+        .await
+        .expect("readable");
+        assert!(
+            found.missing.is_empty(),
+            "the compacted commit is covered by the level-1 part: {found:?}"
+        );
+        assert_eq!(found.buckets_listed, 1);
+        assert_eq!(found.records_read, 1);
+    }
+
+    /// A rewrite record over `inputs` in `(shard 0, ingest_hour_bucket)` with
+    /// one output part, in the input order and hash `validate_rewrite` checks.
+    async fn publish_rewrite(
+        store: &MemoryStore,
+        tenant: &str,
+        ingest_hour_bucket: u32,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+    ) {
+        use ravel_commit::{erasure, signal};
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, RewriteDrop};
+
+        let mut input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        input_ids.sort_by(|a, b| {
+            (a.writer_id.as_str(), a.writer_epoch, a.writer_seq).cmp(&(
+                b.writer_id.as_str(),
+                b.writer_epoch,
+                b.writer_seq,
+            ))
+        });
+        let request_ids = vec![Uuid::new_v4().to_string()];
+        let input_set_hash =
+            erasure::compute_rewrite_input_set_hash(&input_ids, None, &request_ids).to_vec();
+        let part_payload = format!("rw-{ingest_hour_bucket}").into_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: blake3::hash(&part_payload).as_bytes().to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: TenantId::new(tenant).hash().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard: 0,
+            ingest_hour_bucket,
+            inputs: input_ids,
+            input_set_hash,
+            parts: vec![part],
+            drops: request_ids
+                .iter()
+                .map(|request_id| RewriteDrop {
+                    request_id: request_id.clone(),
+                    dropped_count: 1,
+                })
+                .collect(),
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+        store
+            .put(
+                &key,
+                erasure::encode_rewrite(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put rewrite record");
+    }
+
+    /// A commit a rewrite record superseded is covered by the rewrite's part
+    /// the snapshot holds, and not by a rewrite published after the fold.
+    #[tokio::test]
+    async fn coverage_counts_a_commit_a_held_rewrite_supersedes() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "coverage-rewrite";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+        let rewritten = publish_segment(store.as_ref(), tenant, 1, created).await;
+        publish_rewrite(store.as_ref(), tenant, hour, &[&rewritten], created).await;
+        fold(store.clone(), tenant, now).await;
+        let late = publish_segment(store.as_ref(), tenant, 2, created).await;
+        publish_rewrite(store.as_ref(), tenant, hour, &[&late], created).await;
+
+        let found = coverage(
+            store.as_ref(),
+            tenant,
+            &[identity(&rewritten), identity(&late)],
+        )
+        .await
+        .expect("readable");
+        assert_eq!(
+            found.missing,
+            vec![identity(&late)],
+            "only the rewrite the snapshot holds covers its input: {found:?}"
+        );
+        assert_eq!(found.buckets_listed, 1);
+        assert_eq!(found.records_read, 2);
+    }
+
+    /// A compaction record on the store whose parts the snapshot does not
+    /// hold covers nothing: the snapshot is what queries read.
+    #[tokio::test]
+    async fn coverage_ignores_a_compaction_the_snapshot_does_not_hold() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "coverage-unheld";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
+        publish_segment(store.as_ref(), tenant, 1, created).await;
+        fold(store.clone(), tenant, now).await;
+        let late = publish_segment(store.as_ref(), tenant, 2, created).await;
+        publish_compaction(store.as_ref(), tenant, hour, &[&late], created).await;
+
+        let found = coverage(store.as_ref(), tenant, &[identity(&late)])
+            .await
+            .expect("readable");
+        assert_eq!(found.missing, vec![identity(&late)]);
+        assert_eq!(found.records_read, 1, "the compaction record was read");
+    }
+
+    /// No HEAD: nothing is covered.
+    #[tokio::test]
+    async fn coverage_without_a_head_covers_nothing() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "coverage-no-head";
+        let created = 600_000 * NS_PER_HOUR - SEALED_AGE_NS;
+        let rec = publish_segment(store.as_ref(), tenant, 1, created).await;
+        let found = coverage(store.as_ref(), tenant, &[identity(&rec)])
+            .await
+            .expect("an absent HEAD is not a read error");
+        assert_eq!(found.missing, vec![identity(&rec)]);
+        assert_eq!(found.watermark_hour, None);
+    }
+
+    /// A part that cannot be fetched, or does not decode, is an error: the
+    /// coverage of the commits it may hold was not checked.
+    #[tokio::test]
+    async fn coverage_with_an_unreadable_part_is_an_error() {
+        let inner = Arc::new(MemoryStore::new());
+        let tenant = "coverage-bad-part";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        let rec = publish_segment(inner.as_ref(), tenant, 1, created).await;
+        fold(inner.clone(), tenant, now).await;
+        let part_key = first_part_key(inner.as_ref(), tenant).await;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
+                .with_key_contains(part_key.clone()),
+        );
+        let faulty = FaultStore::new(inner.clone(), plan);
+        let err = coverage(&faulty, tenant, &[identity(&rec)])
+            .await
+            .expect_err("an unreadable part is not coverage");
+        assert!(
+            matches!(&err, SealDivergenceError::PartFetch { key, .. } if *key == part_key),
+            "{err:?}"
+        );
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Permanent), 1);
+
+        inner
+            .put(
+                &part_key,
+                Bytes::from_static(b"not a part"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite part");
+        let err = coverage(inner.as_ref(), tenant, &[identity(&rec)])
+            .await
+            .expect_err("a corrupt part is not coverage");
+        assert!(
+            matches!(err, SealDivergenceError::PartCorrupt { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_with_a_corrupt_head_is_an_error() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "coverage-bad-head";
+        let tenant_hash = TenantId::new(tenant).hash();
+        store
+            .put(
+                &head_key(&tenant_hash, Signal::Metrics),
+                Bytes::from_static(b"not a valid HEAD"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt HEAD");
+        let err = coverage(store.as_ref(), tenant, &[(0, 1, [0; 16], 1, 1)])
+            .await
+            .expect_err("a corrupt HEAD is not coverage");
+        assert!(
+            matches!(err, SealDivergenceError::HeadCorrupt { .. }),
+            "{err:?}"
+        );
     }
 }
