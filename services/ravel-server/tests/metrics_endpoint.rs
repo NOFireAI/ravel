@@ -492,13 +492,14 @@ fn mode_only_samples<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// The unverified-read counter, the unaddressable-listing counter (ADR-2637)
-/// and the three bucket-protection control-plane counters on a live scrape, read from the `StoreMetrics` handle the server
-/// was started with. The control-plane counts are moved by real probes: one
-/// `S3Store` against a fake bucket (three GETs answered, 568 body bytes) and
-/// one against a closed port (three GETs sent, none answered), both recording
-/// into that handle, so `requests`, `calls` and `response_bytes` all differ and
-/// a family rendering the wrong field fails. None of it reaches the per-op
-/// `ravel_store_*` families.
+/// and the three bucket-protection control-plane counters on a live scrape,
+/// read from the `StoreMetrics` handle the server was started with. The
+/// control-plane counts are moved by real probes: one `S3Store` against a
+/// fake bucket (three GETs answered, 568 body bytes) and one against a closed
+/// port (three GETs sent, none answered), both recording into that handle, so
+/// `requests`, `calls` and `response_bytes` all differ and a family rendering
+/// the wrong field fails. None of it reaches the per-op `ravel_store_*`
+/// families.
 #[tokio::test]
 async fn metrics_render_get_unverified_and_control_plane_counters() {
     use std::sync::atomic::Ordering;
