@@ -330,5 +330,35 @@ check "scenario 2 --check runs with no store" "0" \
 check "unknown argument is usage error 64" "64" \
   "$(rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --bogus)"
 
+# ---------------------------------------------------------------------------
+# Process logs: kept on failure when CHAOS_LOG_DIR is set, else deleted.
+# ---------------------------------------------------------------------------
+
+# Each case runs in a subshell so the CHAOS_LOG_DIR it sets does not leak.
+check "logfile: without CHAOS_LOG_DIR it is a temp file that exists" "yes" \
+  "$(CHAOS_LOG_DIR="" f="$(chaos_logfile s1 server)"; [[ -f "${f}" ]] && echo yes || echo no; rm -f "${f}")"
+check "logfile: with CHAOS_LOG_DIR it is the named file under it" \
+  "${SCRATCH}/logs/s1-server.log" \
+  "$(CHAOS_LOG_DIR="${SCRATCH}/logs" chaos_logfile s1 server)"
+check "logfile: with CHAOS_LOG_DIR the directory is created" "yes" \
+  "$([[ -d "${SCRATCH}/logs" ]] && echo yes || echo no)"
+
+printf 'server refused: the reason\n' > "${SCRATCH}/logs/kept.log"
+printf 'deleted on success\n' > "${SCRATCH}/logs/gone.log"
+check "release: exit 0 deletes the log even with CHAOS_LOG_DIR set" "no" \
+  "$(CHAOS_LOG_DIR="${SCRATCH}/logs" chaos_release_logs 0 "${SCRATCH}/logs/gone.log" 2>/dev/null; [[ -f "${SCRATCH}/logs/gone.log" ]] && echo yes || echo no)"
+kept_tail="$(CHAOS_LOG_DIR="${SCRATCH}/logs" chaos_release_logs 3 "${SCRATCH}/logs/kept.log" 2>&1 >/dev/null)"
+check "release: exit 3 with CHAOS_LOG_DIR keeps the log" "yes" \
+  "$([[ -f "${SCRATCH}/logs/kept.log" ]] && echo yes || echo no)"
+check "release: exit 3 with CHAOS_LOG_DIR prints the kept path and the log's tail" "yes" \
+  "$([[ "${kept_tail}" == *"kept ${SCRATCH}/logs/kept.log"* && "${kept_tail}" == *'server refused: the reason'* ]] && echo yes || echo no)"
+printf 'no dir, no keep\n' > "${SCRATCH}/logs/nodir.log"
+check "release: exit 3 without CHAOS_LOG_DIR deletes the log" "no" \
+  "$(CHAOS_LOG_DIR="" chaos_release_logs 3 "${SCRATCH}/logs/nodir.log" 2>/dev/null; [[ -f "${SCRATCH}/logs/nodir.log" ]] && echo yes || echo no)"
+check "scenario 1 reads its exit code before the trap can replace it" "yes" \
+  "$([[ "$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")" == *$'cleanup() {\n'*$'  local code=$?\n  trap - ERR'* ]] && echo yes || echo no)"
+check "scenario 2 reads its exit code before the trap can replace it" "yes" \
+  "$([[ "$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")" == *$'cleanup() {\n'*$'  local code=$?\n  trap - ERR'* ]] && echo yes || echo no)"
+
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]

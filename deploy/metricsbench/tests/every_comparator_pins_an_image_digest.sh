@@ -146,8 +146,10 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # `all-features` job (issue #1925): a checkout and a rust-cache. Raised 110->111
 # when ci.yml's `features` job became the `features-lane` matrix (issue #1793):
 # the matrix job adds a nextest install (taiki-e/install-action), and the
-# `features` job that reports on it uses no action at all.
-WORKFLOW_EXPECTED_ACTION_COUNT=111
+# `features` job that reports on it uses no action at all. Raised 111->112
+# when k8s-nightly.yml's `chaos` job gained an upload-artifact step for the
+# scenarios' process logs on failure (issue #2666).
+WORKFLOW_EXPECTED_ACTION_COUNT=112
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
