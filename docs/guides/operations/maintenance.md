@@ -1681,6 +1681,12 @@ To remove the flagged keys:
    reports `created_by` and `statement` as unreadable. That does not change
    which keys it deletes.
 
+   A key whose characters the store's path encoding changes, such as `~`,
+   is listed escaped and marked `undeletable by Ravel`, with the key a delete
+   of it would reach instead. `--delete` never sends it a delete, prints it
+   as skipped and exits non-zero naming it. Delete that exact key with the
+   Maintain credential through an S3 tool.
+
 ### Forged version within the bound
 
 A forged version at or below the bound looks like any other version and is
