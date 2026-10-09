@@ -204,6 +204,23 @@ the fold safety margin still apply, a 20 minute margin, so the hour that is
 being written is still not sealed. The report's `seal_margin` line shows the
 sum that the run used.
 
+To seal that hour as well, assert that every writer has stopped:
+
+```sh
+ravel-cli catalog fold --tenant <name> --shards <n> --signal <signal> \
+  --writers-stopped
+```
+
+`--writers-stopped` seals through the hour the fold runs in and every earlier
+one, without moving the fold's clock, and the report's `seal_through_hour` line
+names that hour. The same warning applies, to the current hour too. A logs
+load can do this itself: `ravel-cli load --fold-after-load` folds once the load
+succeeds, sealing through the latest ingest hour it wrote, and prints the
+result in its summary. Seal after compacting, not before: a later fold in the
+same hour has nothing left to seal, so it does not pick up compaction records
+published into the sealed hours until a fold in a later hour advances the
+watermark. See [Sealed hours](../../catalog-and-mvcc.md#sealed-hours).
+
 ### Routine verification
 
 ```sh

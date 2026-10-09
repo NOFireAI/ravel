@@ -310,8 +310,8 @@ them.
 **Cause.** A folder whose clock ran fast beyond its seal margin sealed an hour
 before every writer's flush for it had landed. A commit published into the
 already-sealed bucket is invisible to snapshot-reading queries. A hand fold
-with `--max-flush-lifetime 0s`, run while a writer was live, has the same
-effect.
+with `--max-flush-lifetime 0s` or `--writers-stopped`, or a `ravel-cli load
+--fold-after-load`, run while another writer was live, has the same effect.
 
 **Confirm.** `ravel-cli catalog verify --tenant <name> --signal <signal>`
 exits nonzero with a nonempty "missing from snapshot" count.
