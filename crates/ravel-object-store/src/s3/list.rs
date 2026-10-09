@@ -42,26 +42,18 @@ pub(crate) const LIST_MAX_BODY_BYTES: usize = 8 << 20;
 /// for.
 const WIRE_PAGE_KEYS: usize = 1000;
 
-/// Truncated responses carrying no key after which a `ListPage` call fails
-/// with [`StoreError::ListPageCeiling`].
+/// The response ceiling of one [`crate::ObjectStoreBackend::list`] or
+/// `list_after` call on `S3Store`. Only a truncated response carrying no key
+/// is charged to it: after 16 of them the call fails with
+/// [`StoreError::ListPageCeiling`] instead of sending another request. Every
+/// other response adds at least one key, and ListObjectsV2 may return fewer
+/// than `max-keys`, so the page size alone bounds those, and one call receives
+/// at most `page_size + 16` responses. A drain is capped at
+/// [`crate::MAX_LIST_PAGES`] pages of that many.
 const EMPTY_RESPONSE_ALLOWANCE: usize = 16;
 
 /// Largest error body read for its `<Error><Code>`.
 const ERROR_BODY_BYTES: usize = 64 << 10;
-
-/// Most ListObjectsV2 responses one [`crate::ObjectStoreBackend::list`] or
-/// `list_after` call on `S3Store` receives. Only a truncated response carrying
-/// no key is charged to the ceiling: after 16 of them the call fails with
-/// [`StoreError::ListPageCeiling`] instead of sending another request. Every
-/// other response adds at least one key, and ListObjectsV2 may return fewer
-/// than `max-keys`, so the page size alone bounds those: at most `page_size` of
-/// them plus the 16 empty ones. A drain is capped at [`crate::MAX_LIST_PAGES`] pages, so a drained
-/// listing sends at most `MAX_LIST_PAGES × max_responses_per_page(page_size)`
-/// requests.
-pub const fn max_responses_per_page(page_size: usize) -> usize {
-    let page_size = if page_size == 0 { 1 } else { page_size };
-    page_size + EMPTY_RESPONSE_ALLOWANCE
-}
 
 /// One ListObjectsV2 request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1125,9 +1117,6 @@ mod tests {
             ));
             assert_eq!(script.seen.lock().len(), 16);
         }
-        assert_eq!(max_responses_per_page(0), 17);
-        assert_eq!(max_responses_per_page(1000), 1016);
-        assert_eq!(max_responses_per_page(1001), 1017);
     }
 
     /// Only the empty responses are charged: 15 of them, then keys, fit.
