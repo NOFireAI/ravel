@@ -72,7 +72,7 @@ use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ravel_cache::{Cache, CacheLimits};
+use ravel_cache::{Cache, CacheLimits, CacheMetricsSnapshot};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
@@ -614,27 +614,52 @@ impl ObjectStoreBackend for CountingStore {
     }
 }
 
-fn read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
-    let max_entries = (cache_bytes / 4096).max(64) as usize;
+/// The read cache's two byte limits, kept apart so a test can shrink the
+/// cache without also changing which entries it admits.
+#[derive(Clone, Copy)]
+struct CacheSize {
+    max_bytes: u64,
+    max_entry_bytes: u64,
+}
+
+impl CacheSize {
+    /// Both limits at `bytes`: the cache admits any entry that fits it.
+    const fn whole(bytes: u64) -> Self {
+        CacheSize {
+            max_bytes: bytes,
+            max_entry_bytes: bytes,
+        }
+    }
+}
+
+fn read_cache(size: CacheSize) -> Arc<Cache<CacheFetchError>> {
+    let max_entries = (size.max_bytes / 4096).max(64) as usize;
     Arc::new(Cache::new(CacheLimits::new(
-        cache_bytes,
+        size.max_bytes,
         max_entries,
-        cache_bytes,
+        size.max_entry_bytes,
     )))
 }
 
 /// A fetcher that treats every object as above the block-range threshold (ranged
 /// path), with a tail-sized suffix probe, no coalescing slack, and ADR-0046's
-/// read cache sized to `cache_bytes`. See this file's header for why those two
+/// read cache sized to `size`. See this file's header for why those two
 /// settings are pinned rather than left at their defaults.
-fn fetcher(store: Arc<dyn ObjectStoreBackend>, cache_bytes: u64) -> LogSegmentFetcher {
+fn fetcher(store: Arc<dyn ObjectStoreBackend>, size: CacheSize) -> LogSegmentFetcher {
+    fetcher_with_cache(store, read_cache(size))
+}
+
+fn fetcher_with_cache(
+    store: Arc<dyn ObjectStoreBackend>,
+    cache: Arc<Cache<CacheFetchError>>,
+) -> LogSegmentFetcher {
     let block_range = BlockRangeFetcher::new(Arc::clone(&store))
         .with_suffix_len(SUFFIX_LEN)
         .with_coalesce_gap(0)
         .with_whole_object_threshold(0);
     LogSegmentFetcher::new(store)
         .with_block_range(block_range)
-        .with_cache(read_cache(cache_bytes))
+        .with_cache(cache)
         .with_block_range_threshold(0)
 }
 
@@ -742,13 +767,20 @@ struct Shape {
     /// for part of its blocks and fell back to the row path partway through.
     columnar_batches: usize,
     rowpath_batches: usize,
+    /// The read cache's counters at the end of the query; `None` with no
+    /// cache wired.
+    cache: Option<CacheMetricsSnapshot>,
 }
 
 async fn measure(label: &'static str, filters: &[Expr], cache_bytes: u64) -> Shape {
-    measure_opt(label, filters, Some(cache_bytes), PARTS).await
+    measure_sized(label, filters, CacheSize::whole(cache_bytes)).await
 }
 
-/// `cache_bytes: None` wires no read cache at all (see [`fetcher_uncached`]).
+async fn measure_sized(label: &'static str, filters: &[Expr], size: CacheSize) -> Shape {
+    measure_opt(label, filters, Some(size), PARTS).await
+}
+
+/// `cache: None` wires no read cache at all (see [`fetcher_uncached`]).
 /// `plan_concurrency` is the provider's `target_partitions`, which this
 /// codebase also uses as the plan phase's fetch fan-out (`LogsScanExec`
 /// threads one value into both roles); most callers pass [`PARTS`] to keep
@@ -757,7 +789,7 @@ async fn measure(label: &'static str, filters: &[Expr], cache_bytes: u64) -> Sha
 async fn measure_opt(
     label: &'static str,
     filters: &[Expr],
-    cache_bytes: Option<u64>,
+    cache: Option<CacheSize>,
     plan_concurrency: usize,
 ) -> Shape {
     let base = Arc::new(MemoryStore::new());
@@ -765,7 +797,7 @@ async fn measure_opt(
     measure_with_snapshot(
         label,
         filters,
-        cache_bytes,
+        cache,
         plan_concurrency,
         base,
         snapshot,
@@ -781,7 +813,7 @@ async fn measure_opt(
 async fn measure_with_snapshot(
     label: &'static str,
     filters: &[Expr],
-    cache_bytes: Option<u64>,
+    cache: Option<CacheSize>,
     plan_concurrency: usize,
     base: Arc<MemoryStore>,
     snapshot: Snapshot,
@@ -789,8 +821,9 @@ async fn measure_with_snapshot(
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let acc = QueryAccounting::new();
-    let fetch = match cache_bytes {
-        Some(bytes) => fetcher(store, bytes),
+    let cache = cache.map(read_cache);
+    let fetch = match &cache {
+        Some(cache) => fetcher_with_cache(store, Arc::clone(cache)),
         None => fetcher_uncached(store),
     };
     let wire_bytes = fetch.phase_wire_byte_counter();
@@ -823,6 +856,7 @@ async fn measure_with_snapshot(
         probe_phase_gets: phases.phase_requests(QueryPhase::Probe),
         columnar_batches: sum_metric(&plan, "columnar_batches"),
         rowpath_batches: sum_metric(&plan, "rowpath_batches"),
+        cache: cache.map(|cache| cache.metrics().snapshot()),
     }
 }
 
@@ -1231,7 +1265,7 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
     let small = measure_opt(
         "text_fallback (small cache)",
         &[has_word(MARKER_FEW)],
-        Some(128 << 10),
+        Some(CacheSize::whole(128 << 10)),
         PARTS,
     )
     .await;
@@ -1877,7 +1911,7 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
     );
 
     // Ranged path: a ts-pruned statement decoding only block 0.
-    let ranged = fetcher(Arc::clone(&store), 1 << 20);
+    let ranged = fetcher(Arc::clone(&store), CacheSize::whole(1 << 20));
     let phase_r = PhaseAccounting::new();
     let mut rscan = ranged
         .scan_accounted_with_tenant(
@@ -1896,7 +1930,7 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
 
     // Whole-object path: a full-window statement reading the whole object in one
     // GET and decoding every block.
-    let whole = fetcher(Arc::clone(&store), 1 << 20);
+    let whole = fetcher(Arc::clone(&store), CacheSize::whole(1 << 20));
     let phase_w = PhaseAccounting::new();
     let mut wscan = whole
         .scan_whole_accounted_with_tenant(
