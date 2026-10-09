@@ -885,8 +885,8 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     ///
     /// The default implementation lists from `prefix` and drops keys
     /// `<= start_after`; a backend whose store supports a native start-after
-    /// (S3 `list_with_offset`, the in-memory ordered map) overrides it so the
-    /// dropped keys are never transferred. Overriding is a performance
+    /// (S3 ListObjectsV2 `start-after`, the in-memory ordered map) overrides
+    /// it so the dropped keys are never transferred. Overriding is a performance
     /// property only: the visible result is identical either way.
     async fn list_after(
         &self,

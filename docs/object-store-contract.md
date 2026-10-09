@@ -274,8 +274,14 @@ trait honors cancellation by drop, so the query deadline (usually well under
   rejects rather than reordering. The client also bounds the drain: a
   continuation token equal to the previous one is a spinning backend and
   the client fails rather than looping forever, and a token that keeps
-  changing without ending is bounded by a page ceiling (100 000 pages,
-  100 million keys at the 1000-key page size).
+  changing without ending is bounded by a page ceiling (`MAX_LIST_PAGES`,
+  100 000 pages, 100 million keys at the 1000-key page size). One
+  `S3Store` page can take several ListObjectsV2 responses (below), at most
+  `ceil(page_size / 1000) + 16` of them, so the request bound of one
+  `S3Store` drain is the composed `MAX_LIST_PAGES` times that figure: 1.7
+  million responses at the default page size of 1000. `list_delimited` is
+  one call that follows tokens to the end, bounded at `MAX_LIST_PAGES`
+  responses.
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
   would, minus every key `<= start_after`: each returned key compares
   strictly greater than `start_after`, in the same lexicographic order and
@@ -290,28 +296,46 @@ trait honors cancellation by drop, so the query deadline (usually well under
   lists from the prefix and drops `<= start_after` in the client) is a
   performance property only; the visible result set is identical.
 - A listing classifies every key it finds and does not fail because of one
-  (ADR-2637 decision 2), except on `S3Store` and `ExternalStore` when a
-  whole full page holds only unaddressable keys, and on a key holding a
-  control character, which `object_store`'s own listing rejects (both
-  below). An addressable key is an
+  (ADR-2637 decision 2), except on `ExternalStore`'s GCS and Azure arms
+  (below). An addressable key is an
   `ObjectMeta` in `objects`; an unaddressable one goes to `unaddressable`
   as an `UnaddressableKey` carrying the raw key, the key a request for it
   would reach (`addresses`), its size and its `last_modified_unix_ms`, in
   listing order. Both count toward the page size, so a page of
-  unaddressable keys still advances the listing. `MemoryStore` resumes
-  after a page's raw last key and has no exception. `S3Store` and
-  `ExternalStore` resume through `object_store`'s `Path::from`, which
-  re-encodes an unaddressable key, so their page token is the page's last
-  addressable key: an unaddressable tail after it is listed and reported
-  again on the next page. `drain_pages` drops only a repeat of the key it
-  recorded last, so a tail of two or more such keys is counted twice. On
-  S3 today, a full page holding only unaddressable keys has no safe offset:
-  its token is its raw last key, which still re-encodes, so the next page
-  can skip keys (`p/a#b` resumes after `p/a%23b`, past `p/a$`), re-deliver
-  them and fail `ListOrderViolation` (`p/é` resumes after `p/%C3%A9`,
-  before `p/b`), or re-deliver the same page and fail `ListRepeatedToken`
-  (`p/é1` and `p/é2` at a page size of 2). The raw ListObjectsV2 listing of
-  ADR-2637 decision 1 resumes after the raw key and removes this exception.
+  unaddressable keys still advances the listing. `MemoryStore` and
+  `S3Store` resume after a page's raw last key, so neither lists a key
+  twice and neither has an exception.
+  `S3Store` lists with its own signed ListObjectsV2 GET, not through
+  `object_store` (ADR-2637 decision 1). It sends the caller's prefix and
+  `start-after` raw, asks for `encoding-type=url`, and decodes a response
+  that echoes `EncodingType=url` (`+` is a space, `%XX` a byte); a
+  response without `EncodingType` is read literally. A key that is not
+  UTF-8 once decoded is reported in `unaddressable` under its still-encoded
+  text. One `list` or `list_after` call is one page: it asks for at most
+  1000 keys per response and follows `NextContinuationToken` within the
+  call until the page holds `page_size` keys or the listing ends, so a
+  truncated response with no keys continues the page instead of ending it.
+  A truncated response with no `NextContinuationToken` is `Permanent`
+  naming the prefix, a token equal to the one just sent is
+  `ListRepeatedToken`, and more responses for one page than the ceiling
+  above is `ListPageCeiling`. Its `list_delimited` follows tokens only and
+  never resumes from a key, since a common prefix can sort after a
+  response's last key. An S3 grant read through `ExternalStore` lists
+  through `S3Store`.
+  `ExternalStore`'s GCS and Azure arms still list through `object_store`
+  and resume through its `Path::from`, which re-encodes an unaddressable
+  key, so their page token is the page's last addressable key: an
+  unaddressable tail after it is listed and reported again on the next
+  page. `drain_pages` drops only a repeat of the key it recorded last, so a
+  tail of two or more such keys is counted twice there. On those arms a
+  full page holding only unaddressable keys has no safe offset: its token
+  is its raw last key, which still re-encodes, so the next page can skip
+  keys (`p/a#b` resumes after `p/a%23b`, past `p/a$`), re-deliver them and
+  fail `ListOrderViolation` (`p/é` resumes after `p/%C3%A9`, before
+  `p/b`), or re-deliver the same page and fail `ListRepeatedToken` (`p/é1`
+  and `p/é2` at a page size of 2). `object_store`'s listing also rejects a
+  key holding a control character, so on those arms such a key fails the
+  whole listing.
   `list_delimited` judges a common prefix by
   its stem, the prefix without its trailing `/`: `t/abc\u{1}/` is reported
   in `unaddressable_prefixes`, never in `common_prefixes`, and so is `/`
@@ -323,12 +347,7 @@ trait honors cancellation by drop, so the query deadline (usually well under
   logs one warning per distinct skipped key per process, for up to 4096
   keys, and past that one listing in 1024 that skips a key not warned about
   still warns. `InstrumentedStore` counts every skipped key and common
-  prefix (see "Instrumentation decorator"). `S3Store` and `ExternalStore`
-  still list through `object_store`, which classifies only what that
-  listing returns: it lists a key such as `a*b` and the adapter reports it
-  in `unaddressable`, but its listing rejects a key holding a control
-  character, so on S3 such a key still fails the whole listing until the
-  raw ListObjectsV2 listing of ADR-2637 decision 1 lands.
+  prefix (see "Instrumentation decorator").
 - `list` and `head` report one object's `etag` identically, byte for byte,
   and report the same `size`. Quoting, casing and any weak-validator prefix
   are passed through verbatim from the backend rather than normalized, so an
@@ -623,7 +642,13 @@ process-local `AtomicU64` on the `S3Store`; a hard process crash increments
 neither, so that case stays inferable only from S3's own list of open uploads.
 
 **Retry and failure.** Nothing retries internally beyond what `object_store`'s
-client already does per request. A `put_part` that still fails *poisons the
+client already does per request. `S3Store`'s listing sends its own
+ListObjectsV2 requests (ADR-2637 decision 1) and retries each one with the
+figures of `object_store`'s default `RetryConfig`: at most 10 retries within
+180 seconds, with decorrelated-jitter backoff starting at 100 ms and capped at
+15 s. It retries a 5xx, 429 or 408 status and a connect, request, timeout or
+interrupted transport failure, and never a 403, a 3xx or another 4xx. A
+`put_part` that still fails *poisons the
 handle*: the first failure surfaces the classified `StoreError` a `put` would
 (so the original cause stays visible), but the handle is now dead, and every
 later `put_part` and `complete` fails with a non-retryable `Permanent` error.
@@ -1067,18 +1092,14 @@ size the two listing probes size their key counts against; see
   page size the backend under test was built with -- `ravel-cli store
   qualify --list-page-size`, defaulting to the production S3 page size of
   1000); the probe writes `page_size + 2` keys, floored at 5, before the
-  first page request. `S3Store::with_page_size` cuts one wire response
-  client-side rather than asking for a smaller one: `S3Store::list` sets no
-  `MaxKeys`, so S3 answers with its default of up to 1000 keys, and the
-  method opens a fresh `object_store` listing stream per page, pulls at most
-  `page_size` entries off it, and drops it -- leaving that response's own
-  `NextContinuationToken` unfollowed unless `page_size` exceeds what one
-  response carries. Writing more keys than the backend's actual page size is
-  therefore the only way to force a real continuation-token boundary; a
-  shrunken declared page size against a large real one exercises only Ravel's
-  own client-side drain loop, not the backend. At the default the run does
-  prove the backend's side: 1002 keys means S3 serves a full 1000-key
-  response and then honours an exclusive `start-after` resume past it. All
+  first page request. `S3Store::with_page_size` sets the wire-level page
+  size: each request asks for `max-keys` of at most `page_size` (and at most
+  1000), the method follows `NextContinuationToken` within the page, and the
+  next page resumes with `start-after` at the page's raw last key. Writing
+  more keys than the page size therefore makes the backend honour an
+  exclusive `start-after` resume, at a shrunken declared page size as well
+  as at the default, where 1002 keys means S3 serves a full 1000-key
+  response and then resumes past it. All
   `page_size + 2` keys written must come back as that many distinct keys,
   none lost between pages, AND delivered across at least two
   pages that actually carry objects: a backend may emit a trailing empty page
@@ -1105,9 +1126,9 @@ common TLA model's `CreateIfAbsentWinnerUnique`,
 `ListingConsumersConsistent`, `ListReturn`/`ListEventuallyComplete`, and
 `DeleteIdempotent` (`formal/tla/common/traceability.md`).
 
-Two more properties cover the addressable-key rules above (ADR-2637). A key
-that is not addressable cannot be written through any store in this crate,
-so the second one needs a way to plant such keys from outside it: a
+Three more properties cover the addressable-key rules above (ADR-2637). A
+key that is not addressable cannot be written through any store in this
+crate, so the second one needs a way to plant such keys from outside it: a
 `ForeignKeySeeder` (`seed` and `remove`), passed to
 `run_conformance_suite_with_seeder(store, scratch_prefix, page_size,
 seeder)`. `run_conformance_suite` is that call with no seeder.
@@ -1128,6 +1149,14 @@ seeder)`. `run_conformance_suite` is that call with no seeder.
   `results`, so a run that could not check it never reads as a pass.
   `MemoryStore` is a seeder (test-support), and both properties run against
   it in the crate's tests.
+- `ListedKeysRoundTripPlusAndSpace`: keys holding a literal `+`, a space,
+  and both (`a b`, `a+b`, `a+b c`), written with an ordinary `put`, come
+  back from a listing of their prefix verbatim, and none is reported
+  unaddressable; the probe then deletes them. `S3Store` lists with
+  `encoding-type=url` and reads `+` as a space and `%2B` as `+`, so this
+  checks that the backend encodes the two that way. It runs on every suite
+  run. `tests/s3_http_faults.rs` runs all three properties against a
+  scripted S3 endpoint through `S3Store`, with a seeder.
 
 Because the delete probe deletes, the credential running `ravel-cli store
 qualify` needs delete permission on the scratch prefix
@@ -1157,12 +1186,17 @@ equal-or-newer record untouched. Re-recording is the only way to clear the
 refusal, because the record is written with `CreateIfAbsent` and cannot
 otherwise be replaced.
 
-The two ADR-2637 properties do not bump it either.
+The three ADR-2637 properties do not bump it either.
 `OperationsRefuseUnaddressableKeys` gates every run, but it checks the Ravel
 binary's own refusal, which holds before any request reaches the bucket, so
 a record written without it says nothing false about the bucket.
 `UnaddressableKeysAreCounted` needs a seeder, which `ravel-cli store
 qualify` does not pass, so a qualification run leaves it in `not_run`.
+`ListedKeysRoundTripPlusAndSpace` does check the bucket and was added
+without a bump, so a version 2 record taken before it existed does not
+attest it, and a re-run of `ravel-cli store qualify` leaves that record in
+place (the once-per-bucket no-op below); the re-run's printed probe results
+are the evidence for it.
 
 Conditional reads are deliberately not a gating property, and
 `CONFORMANCE_SUITE_VERSION` stays at `2` for them. The suite qualifies the
@@ -1237,9 +1271,9 @@ small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
 14 the other probes leave (two conditional-write keys, five read-after-write,
 five list-after-write, one concurrent-create, and the delete probe's
 surviving key): 2018 objects at the default page size of 1000, against 24
-before the page size became a parameter. The delete probe's second key and
-the stored-checksum echo probe's object are the only scratch objects a run
-deletes; the echo object stays too when its delete is refused, and the run
+before the page size became a parameter. The delete probe's second key, the
+three `ListedKeysRoundTripPlusAndSpace` keys and the stored-checksum echo
+probe's object are the only scratch objects a run deletes; the echo object stays too when its delete is refused, and the run
 prints a note naming it. Nothing else is deleted afterward and each run's
 prefix is unique, so this is unbounded untracked
 storage a runbook should sweep periodically (delete `sys/qualify/` between
@@ -1641,7 +1675,9 @@ ADR-0042 decision 3.
    completion order (it does not, per ADR-0059).
 3. `S3Store`: `object_store` crate adapter (AWS S3, plus an S3-compatible
    endpoint such as RustFS via the endpoint override), honoring every MUST
-   above.
+   above. `list`, `list_after` and `list_delimited` do not go through
+   `object_store`: they send their own SigV4-signed ListObjectsV2 GET
+   (ADR-2637 decision 1) through the same HTTP connector and credentials.
 
 ### Instrumentation decorator
 
@@ -1663,7 +1699,8 @@ billed count is carried in a separate per-operation `attempts`
 counter on the same `StoreMetrics` block, filled in by the S3 adapter's counting
 HTTP connector (`S3Store::with_metrics`, installed via
 `AmazonS3Builder::with_http_connector`), which records one attempt per HTTP
-request `object_store` issues, retries included. `attempts >= calls` holds
+request `object_store` issues, retries included, and per ListObjectsV2
+request the listing's own retry loop issues, which shares the connector. `attempts >= calls` holds
 exactly when every store the decorator counts a `calls` on records its attempts
 into the same `StoreMetrics` handle: a store built with `S3Store::new` (no
 handle) wrapped in `InstrumentedStore::with_metrics` would count `calls` while

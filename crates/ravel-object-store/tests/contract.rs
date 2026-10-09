@@ -1592,8 +1592,8 @@ async fn rustfs_contract() {
     };
     let checksum_config = config.clone();
     // A small page size, like `memory_store_paged_contract`, so the
-    // pagination assertion exercises `list_with_offset` continuation
-    // against the real bucket instead of fitting in a single page.
+    // pagination assertion exercises `start-after` continuation against the
+    // real bucket instead of fitting in a single page.
     let store = S3Store::with_page_size(config, 2)
         .expect("S3Store::with_page_size must succeed with a valid config");
 
@@ -1728,7 +1728,7 @@ async fn floci_contract() {
         instance_metadata_endpoint: None,
     };
     // A small page size, as in `rustfs_contract`, so the pagination assertion
-    // exercises `list_with_offset` continuation against the real bucket.
+    // exercises `start-after` continuation against the real bucket.
     let store = S3Store::with_page_size(config, 2)
         .expect("S3Store::with_page_size must succeed with a valid config");
 
