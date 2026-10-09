@@ -552,9 +552,9 @@ impl SqlConfig {
     /// mark into it on every grow, feeding `peak_intermediate_bytes`.
     ///
     /// The pool holds a grouped hash aggregate's released bytes until its
-    /// stream ends unless that stream can spill to disk, which is decided per
-    /// statement: [`crate::build_session`] tells the pool whether its
-    /// statement has a disk ([`TenantDelegatingPool::set_disk_spill`]).
+    /// stream ends when that stream's memory consumer cannot spill, which
+    /// DataFusion decides per stream from the aggregate mode and whether the
+    /// session's runtime has a disk.
     pub fn query_pool(
         &self,
         tenant: Arc<TenantMemoryAccountant>,

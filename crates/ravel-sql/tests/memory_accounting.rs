@@ -193,6 +193,38 @@ async fn a_multi_batch_aggregate_query_returns_every_reserved_byte() {
 /// not produce and the hold reads 0 after every batch.
 #[tokio::test]
 async fn a_real_group_by_is_held_by_the_production_pool() {
+    let (groups, least_held, _) = held_during_group_by(SpillDecision::Disabled).await;
+    assert_eq!(groups, SAMPLES as usize, "one group per sample timestamp");
+    assert!(
+        least_held > 0,
+        "no bytes were held after some output batch of a live GROUP BY stream \
+         (least {least_held}): the pool did not recognise DataFusion's \
+         aggregate consumer name"
+    );
+}
+
+/// The same `GROUP BY` on a session with a spill directory: DataFusion marks
+/// every aggregate stream's consumer `can_spill`, so the pool holds nothing.
+///
+/// FLIP: drop the `!consumer.can_spill()` conjunct from the pool's `holds`
+/// and bytes are held after some batch here too.
+#[tokio::test]
+async fn a_group_by_that_can_spill_is_not_held() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let (groups, _, most_held) = held_during_group_by(SpillDecision::Enabled {
+        dir: dir.path(),
+        max_bytes: 1 << 30,
+    })
+    .await;
+    assert_eq!(groups, SAMPLES as usize, "one group per sample timestamp");
+    assert_eq!(most_held, 0, "a stream that can spill was held");
+}
+
+/// Run `SELECT ts, count(value) ... GROUP BY ts` over [`big_segment`] through
+/// the production pool under `spill`, returning the group count and the
+/// least and most bytes the pool held after any output batch. Asserts that
+/// dropping the stream releases every held and reserved byte.
+async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize) {
     let tenant = tenant_id("acme");
     let specs = big_segment();
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
@@ -219,7 +251,7 @@ async fn a_real_group_by_is_held_by_the_production_pool() {
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
         false,
-        SpillDecision::Disabled,
+        spill,
     )
     .expect("session");
     let mut stream = ctx
@@ -232,21 +264,17 @@ async fn a_real_group_by_is_held_by_the_production_pool() {
 
     let mut groups = 0usize;
     let mut least_held = usize::MAX;
+    let mut most_held = 0usize;
     while let Some(next) = stream.next().await {
         groups += next.expect("batch").num_rows();
         least_held = least_held.min(held());
+        most_held = most_held.max(held());
     }
-    assert_eq!(groups, SAMPLES as usize, "one group per sample timestamp");
-    assert!(
-        least_held > 0,
-        "no bytes were held after some output batch of a live GROUP BY stream \
-         (least {least_held}): the pool did not recognise DataFusion's \
-         aggregate consumer name"
-    );
 
     drop(stream);
     assert_eq!(held(), 0, "the hold is released when the stream drops");
     assert_eq!(accountant.reserved(), 0);
+    (groups, least_held, most_held)
 }
 
 /// Three consecutive queries against one tenant accountant. A leak of even

@@ -18,17 +18,17 @@
 //! reserved bytes return to zero without any explicit cleanup path. A pool that
 //! did not forward `shrink` would leak tenant budget on every cancellation.
 //!
-//! One exception: a grouped hash aggregate stream that cannot spill to disk
+//! One exception: a grouped hash aggregate stream whose consumer cannot spill
 //! has its shrinks held on all three budgets rather than released, because
 //! DataFusion 54.1's `GroupedHashAggregateStream::emit` shrinks its reservation
 //! while the emitted batch still holds the bytes. The choice is made per
-//! stream (see [`TenantDelegatingPool::set_disk_spill`]). The hold is released
-//! when that consumer unregisters, which DataFusion does when the stream's last
-//! reservation drops, so cancellation still returns every byte.
+//! stream, from the consumer itself. The hold is released when that consumer
+//! unregisters, which DataFusion does when the stream's last reservation
+//! drops, so cancellation still returns every byte.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -345,9 +345,6 @@ pub struct TenantDelegatingPool {
     /// `peak_intermediate_bytes` reflects this pool's own reservations
     /// rather than staying zero, as it does on the PromQL path today.
     accounting: QueryAccounting,
-    /// Whether the runtime this pool backs has a disk to spill to. See
-    /// [`Self::set_disk_spill`].
-    disk_spill: AtomicBool,
     /// Bytes each hash aggregate consumer, keyed by `MemoryConsumer::id`, has
     /// shrunk by and the pool still keeps charged on all three budgets. Only
     /// consumers [`Self::holds`] selects ever add to it.
@@ -362,7 +359,6 @@ impl fmt::Debug for TenantDelegatingPool {
         f.debug_struct("TenantDelegatingPool")
             .field("query_limit", &self.query_limit)
             .field("query_used", &self.query_used.load(Ordering::Relaxed))
-            .field("disk_spill", &self.disk_spill.load(Ordering::Relaxed))
             .field("held", &self.held_bytes())
             .field("tenant_reserved", &self.tenant.reserved())
             .field("tenant_limit", &self.tenant.limit())
@@ -388,9 +384,6 @@ impl TenantDelegatingPool {
     /// trips `breach` if `grow`'s unconditional path overshoots either ceiling.
     /// `accounting` receives this query's reserved-bytes high-water mark on
     /// every successful grow.
-    ///
-    /// Until [`Self::set_disk_spill`] says otherwise, the pool assumes its
-    /// runtime may spill to disk.
     pub fn new(
         query_limit: usize,
         tenant: Arc<TenantMemoryAccountant>,
@@ -403,33 +396,9 @@ impl TenantDelegatingPool {
             tenant,
             breach,
             accounting,
-            disk_spill: AtomicBool::new(true),
             held: Mutex::new(HashMap::new()),
             registered: AtomicUsize::new(0),
         }
-    }
-
-    /// Record whether the runtime this pool backs has a disk to spill to.
-    /// [`crate::build_session`] calls it with the statement's spill decision.
-    ///
-    /// DataFusion marks a grouped hash aggregate's consumer `can_spill` both
-    /// when the stream spills its state to disk under pressure, which frees the
-    /// memory, and when it is a partial aggregate that emits early instead,
-    /// which does not. Without a disk only the second is possible, so every
-    /// grouped hash aggregate stream is held; with one, only the streams whose
-    /// consumer cannot spill are.
-    pub fn set_disk_spill(&self, enabled: bool) {
-        self.disk_spill.store(enabled, Ordering::Release);
-        tracing::debug!(
-            disk_spill = enabled,
-            query_limit = self.query_limit,
-            "SQL query memory pool holds released bytes for {}",
-            if enabled {
-                "grouped hash aggregate streams that cannot spill"
-            } else {
-                "every grouped hash aggregate stream"
-            }
-        );
     }
 
     /// The tenant accountant this pool delegates to (for tests and the
@@ -448,10 +417,16 @@ impl TenantDelegatingPool {
     }
 
     /// Whether `consumer`'s shrinks are held rather than released: a grouped
-    /// hash aggregate stream that cannot spill to disk.
+    /// hash aggregate stream whose consumer cannot spill.
+    ///
+    /// DataFusion marks the consumer `can_spill` when the stream answers memory
+    /// pressure itself: a partial aggregate by emitting early into the exchange
+    /// that feeds the final aggregate, which reserves the batches it buffers,
+    /// and a final aggregate on a runtime with a disk by spilling its state.
+    /// Holding either would charge those bytes twice and would make a peak
+    /// depend on when each partial stream ends.
     fn holds(&self, consumer: &MemoryConsumer) -> bool {
-        consumer.name().starts_with(HASH_AGGREGATE_CONSUMER_PREFIX)
-            && !(consumer.can_spill() && self.disk_spill.load(Ordering::Acquire))
+        consumer.name().starts_with(HASH_AGGREGATE_CONSUMER_PREFIX) && !consumer.can_spill()
     }
 
     fn held_map(&self) -> MutexGuard<'_, HashMap<usize, usize>> {
@@ -646,15 +621,21 @@ impl MemoryPool for TenantDelegatingPool {
         "TenantDelegatingPool"
     }
 
-    fn register(&self, _consumer: &MemoryConsumer) {
+    fn register(&self, consumer: &MemoryConsumer) {
         self.registered.fetch_add(1, Ordering::AcqRel);
+        if self.holds(consumer) {
+            tracing::debug!(
+                consumer = consumer.name(),
+                query_limit = self.query_limit,
+                "SQL query memory pool holds this consumer's released bytes until it unregisters"
+            );
+        }
     }
 
     fn unregister(&self, consumer: &MemoryConsumer) {
         // DataFusion calls this when the consumer's last reservation drops,
         // after that reservation's final shrink, so whatever the consumer
-        // still holds is no longer live anywhere. Not gated on `holds`, which
-        // reads a flag a later `set_disk_spill` may have changed.
+        // still holds is no longer live anywhere.
         let released = {
             let mut held = self.held_map();
             let released = held.remove(&consumer.id()).unwrap_or(0);
@@ -763,7 +744,7 @@ mod tests {
     }
 
     impl Ledgers {
-        fn new(query_limit: usize, disk_spill: bool) -> Self {
+        fn new(query_limit: usize) -> Self {
             let budget = Arc::new(MemoryBudget::new(1 << 30));
             let tenant = TenantMemoryAccountant::with_process_budget(1 << 30, Arc::clone(&budget));
             let breach = CeilingBreach::new();
@@ -773,7 +754,6 @@ mod tests {
                 Arc::clone(&breach),
                 QueryAccounting::new(),
             ));
-            pool.set_disk_spill(disk_spill);
             Ledgers {
                 budget,
                 tenant,
@@ -782,10 +762,8 @@ mod tests {
             }
         }
 
-        /// A pool whose runtime has no disk, so every grouped hash aggregate
-        /// stream is held.
         fn holding() -> Self {
-            Ledgers::new(1 << 30, false)
+            Ledgers::new(1 << 30)
         }
 
         fn register(&self, name: &str) -> MemoryReservation {
@@ -894,76 +872,28 @@ mod tests {
         assert_eq!(ledgers.charged(), (200, 200, 200));
     }
 
-    /// The hold is chosen per stream. Only an aggregate whose consumer can
-    /// spill, on a runtime with a disk to spill to, releases at once; that is
-    /// the one stream whose shrink can follow a spill. Without a disk, a
-    /// consumer marked `can_spill` is a partial aggregate that emits early,
-    /// and its emitted batch is as live as a final aggregate's.
+    /// The hold is chosen per stream, from the consumer: an aggregate whose
+    /// consumer can spill (a partial aggregate, or a final one on a runtime
+    /// with a disk) releases at once, one that cannot is held.
     ///
-    /// FLIP: drop the `self.disk_spill` conjunct from `holds` and the
-    /// no-disk, `can_spill` row reads 200; drop the `can_spill` conjunct and
-    /// the disk, cannot-spill row reads 200.
+    /// FLIP: drop the `!consumer.can_spill()` conjunct from `holds` and the
+    /// `can_spill` row reads 1000 charged, 800 held.
     #[test]
-    fn an_aggregate_is_held_unless_it_can_spill_to_a_disk() {
-        for (disk_spill, can_spill, charged, held) in [
-            (true, true, 200, 0),
-            (true, false, 1000, 800),
-            (false, true, 1000, 800),
-            (false, false, 1000, 800),
-        ] {
-            let ledgers = Ledgers::new(1 << 30, disk_spill);
+    fn an_aggregate_is_held_only_when_its_consumer_cannot_spill() {
+        for (can_spill, charged, held) in [(true, 200, 0), (false, 1000, 800)] {
+            let ledgers = Ledgers::holding();
             let res = ledgers
                 .register_consumer(MemoryConsumer::new(AGGREGATE).with_can_spill(can_spill));
 
             res.try_grow(1000).expect("within every ceiling");
             res.shrink(800);
 
-            let case = format!("disk_spill={disk_spill} can_spill={can_spill}");
+            let case = format!("can_spill={can_spill}");
             assert_eq!(ledgers.charged(), (charged, charged, charged as u64), "{case}");
             assert_eq!(ledgers.pool.held_bytes(), held, "{case}");
             drop(res);
             assert_eq!(ledgers.charged(), (0, 0, 0), "{case}");
         }
-    }
-
-    /// A pool no session has told about its runtime assumes the runtime may
-    /// spill, so it never holds what a spill freed.
-    #[test]
-    fn a_new_pool_assumes_its_runtime_may_spill() {
-        let tenant = TenantMemoryAccountant::new(1 << 30);
-        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
-            1 << 30,
-            Arc::clone(&tenant),
-            CeilingBreach::new(),
-            QueryAccounting::new(),
-        ));
-        let spilling = MemoryConsumer::new(AGGREGATE)
-            .with_can_spill(true)
-            .register(&pool);
-        spilling.try_grow(1000).expect("within every ceiling");
-        spilling.shrink(800);
-        assert_eq!(tenant.reserved(), 200);
-
-        let final_only = MemoryConsumer::new(AGGREGATE).register(&pool);
-        final_only.try_grow(1000).expect("within every ceiling");
-        final_only.shrink(800);
-        assert_eq!(tenant.reserved(), 1200);
-    }
-
-    /// A consumer that was held keeps its hold to its unregister even after
-    /// `set_disk_spill` stops selecting it, so nothing is left charged.
-    #[test]
-    fn a_hold_is_released_at_unregister_whatever_the_flag_says_by_then() {
-        let ledgers = Ledgers::holding();
-        let res = ledgers.register_consumer(MemoryConsumer::new(AGGREGATE).with_can_spill(true));
-        res.try_grow(1000).expect("within every ceiling");
-        res.shrink(800);
-        assert_eq!(ledgers.pool.held_bytes(), 800);
-
-        ledgers.pool.set_disk_spill(true);
-        drop(res);
-        assert_eq!(ledgers.charged(), (0, 0, 0));
-        assert_eq!(ledgers.pool.held_bytes(), 0);
     }
 
     #[test]
@@ -993,7 +923,7 @@ mod tests {
     /// only 800 of the 1500 ceiling, so no breach trips and the try_grow fits.
     #[test]
     fn held_bytes_count_toward_the_query_ceiling() {
-        let ledgers = Ledgers::new(1500, false);
+        let ledgers = Ledgers::new(1500);
         let aggregate = ledgers.register(AGGREGATE);
         aggregate.try_grow(1000).expect("within every ceiling");
         aggregate.shrink(800);
@@ -1017,7 +947,7 @@ mod tests {
 
     #[test]
     fn a_refused_try_grow_returns_what_it_took_from_the_hold() {
-        let ledgers = Ledgers::new(1500, false);
+        let ledgers = Ledgers::new(1500);
         let res = ledgers.register(AGGREGATE);
         res.try_grow(1000).expect("within every ceiling");
         res.shrink(800);
