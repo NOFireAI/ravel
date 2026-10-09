@@ -378,17 +378,21 @@ pub struct SqlStats {
     /// Blocks the successful attempt's `LogsScanExec` saw, read straight off
     /// its DataFusion counters after the stream drained (reused rather
     /// than recounted). Zero for a metrics query, and for a logs query whose
-    /// plan carries no scan node. `blocks_scanned` over `blocks_total` is the
-    /// prune selectivity ADR-0049 measures.
+    /// plan carries no scan node. Summed over every logs scan in the plan
+    /// ([`ScanTiming::scans`]), so a block two scans both read counts twice.
+    /// `blocks_scanned` over `blocks_total` is the prune selectivity ADR-0049
+    /// measures.
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     pub blocks_pruned_by_postings: u64,
     /// Segments the successful attempt's logs scan skipped before any fetch
     /// because their declared-column statistics excluded a pushed-down
     /// predicate (ADR-2121 D1), read off the scan's
-    /// `segments_pruned_by_stats` counter. Counted within [`Self::segments`],
-    /// which is the resolved snapshot. Zero for a metrics query and for a
-    /// logs plan with no scan node.
+    /// `segments_pruned_by_stats` counter, summed over every logs scan in the
+    /// plan ([`ScanTiming::scans`]). With one scan it is counted within
+    /// [`Self::segments`], which is the resolved snapshot; each further scan
+    /// prunes the same snapshot again, so the sum can exceed it. Zero for a
+    /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
@@ -484,7 +488,7 @@ pub struct ScanTiming {
     pub emit_elapsed_ns: u64,
     /// Longest single partition's wait on the shared plan barrier.
     pub planning_wait_elapsed_max_ns: u64,
-    /// The barrier's own cost, counted once per query.
+    /// The barrier's own cost, counted once per scan and summed over scans.
     pub plan_init_elapsed_ns: u64,
     /// Offset from exec creation to the earliest batch any partition emitted;
     /// zero when no partition emitted one.
@@ -496,6 +500,10 @@ pub struct ScanTiming {
     pub polls_pending: u64,
     /// Partitions that ran to `Done`.
     pub partitions: u64,
+    /// `LogsScanExec` nodes in the plan, counted by type during the same walk
+    /// that folds their metrics. The offset figures and
+    /// `plan_init_elapsed_ns` have one origin only when this is 1.
+    pub scans: u64,
     /// Per-segment timeline points, one row per `(partition, segment)`.
     pub segments: Vec<SegmentTiming>,
 }
@@ -628,6 +636,12 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
     // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
     // the set holds three labelled metrics per segment per partition. Folding
     // the timing here rather than in a second traversal halves both.
+    if plan
+        .downcast_ref::<crate::logs_scan::LogsScanExec>()
+        .is_some()
+    {
+        counts.timing.scans += 1;
+    }
     if let Some(metrics) = plan.metrics() {
         let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
         counts.total += sum("blocks_total");

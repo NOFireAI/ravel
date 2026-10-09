@@ -2868,26 +2868,46 @@ buckets `stats.phases` names, and they live in their own object so the
   executor returns and before the response is released. Always present: a
   query-serving server always installs its audit pipeline, and a SQL router
   built over the no-op sink reports that sink's immediate accept.
-- `planInitMs`: the logs scan's shared plan barrier, counted once per query.
+- `scans`: the number of logs scans (`LogsScanExec` nodes) in the executed
+  plan. Always present: 0 for a statement that reads no `logs`, 1 for a
+  single-table logs statement (a late-materialized `ORDER BY ... LIMIT`
+  included, whose second phase re-reads rows without a second scan), and 2
+  or more for a `UNION ALL` of two logs branches, a self-join, an
+  `IN (SELECT ... FROM logs)`, or a CTE read twice.
+- `planInitMs`: the logs scan's shared plan barrier. Present only when
+  `scans` is 1.
 - `planningWaitMaxMs`: the longest single scan partition's wait on that
   barrier.
 - `openMaxMs`: the longest single scan partition's segment-open stall.
 - `decodeBuildMaxMs`: the longest single scan partition's synchronous decode
   and Arrow build.
 - `firstBatchMinMs`: from scan creation to the earliest batch any partition
-  emitted; 0 when none emitted one.
-- `streamMaxMs`: from scan creation to the last partition finishing.
+  emitted; 0 when none emitted one. Present only when `scans` is 1.
+- `streamMaxMs`: from scan creation to the last partition finishing. Present
+  only when `scans` is 1.
 
-The last six are the logs scan's own timers (`SqlStats::scan_timing`) and
-read 0 for a statement with no logs scan. Only the figures that hold across
-partitions are rendered: the scan's per-partition sums add overlapping
-intervals and are not rendered, nor are its per-segment timeline rows.
+The last six are the logs scan's own timers (`SqlStats::scan_timing`). Each
+scan pays its own plan barrier and times its offsets from its own creation,
+so with more than one scan `planInitMs` would be a sum of barriers and
+`firstBatchMinMs`/`streamMaxMs` would mix origins; with none there is
+nothing to time. Those three are therefore omitted unless `scans` is 1.
+`planningWaitMaxMs`, `openMaxMs` and `decodeBuildMaxMs` are always present:
+they are maxima over every partition of every scan, and read 0 when `scans`
+is 0. Only the figures that hold across partitions are rendered: the scan's
+per-partition sums add overlapping intervals and are not rendered, nor are
+its per-segment timeline rows.
 
-The stages overlap and do not sum to the latency a client sees.
+The five executor stages (`resolveMs`, `planMs`, `startMs`, `firstBatchMs`,
+`drainMs`) run one after another; the scan timers overlap them. None of
+them sums to the latency a client sees.
 `drainMs` covers the scan, decode and every operator above it. The six
 scan figures are measured inside the scan, which is created during `startMs`
 and runs on through `firstBatchMs` and `drainMs`, so they overlap those
-three. Admission, request parsing and response encoding are in no field. A retried statement reports the stages of its
+three. Admission, request parsing and response encoding are in no field,
+and neither is the executor's work before its first stamp: resolving the
+tenant's declared typed attribute columns
+(`SqlExecutor::resolve_declared_columns`) and checking which tables the
+statement names (`SqlExecutor::statement_tables`). A retried statement reports the stages of its
 successful attempt only, with `attempts` saying a retry happened, so the
 discarded attempt's time is in no field either.
 
@@ -2895,14 +2915,19 @@ discarded attempt's time is in no field either.
 and block-level reported independently:
 
 - `segments`: segments in the resolved snapshot.
-- `segmentsPrunedByStats`: of those, segments the logs scan skipped before
-  any fetch because a typed attribute column's stamped statistics excluded a
+- `segmentsPrunedByStats`: segments a logs scan skipped before any fetch
+  because a typed attribute column's stamped statistics excluded a
   pushed-down predicate (ADR-2121 D1).
-- `blocksTotal`: blocks the logs scan saw in the segments it read.
+- `blocksTotal`: blocks a logs scan saw in the segments it read.
 - `blocksScanned`: of those, blocks it read.
 - `blocksPrunedByPostings`: blocks POSTINGS ruled out.
 
 All four counts after `segments` are 0 for a statement with no logs scan.
+They are sums over every logs scan in the plan (`stats.timings.scans`),
+while `segments` counts the one snapshot all of them read. With one scan,
+`segmentsPrunedByStats` is a subset of `segments`; with two, each scan
+prunes the same snapshot on its own, so the sum can exceed `segments`, and a
+block both scans read counts in `blocksTotal` twice.
 `services/ravel-server/tests/sql_declared_prune_reachability_e2e.rs` drives
 both pruning levels through `POST /api/v1/sql`.
 

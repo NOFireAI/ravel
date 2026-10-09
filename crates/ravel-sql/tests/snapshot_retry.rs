@@ -22,6 +22,7 @@
 use crate::util;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
@@ -65,9 +66,17 @@ async fn faulted_fixture(plan: FaultPlan) -> (Arc<FaultStore<MemoryStore>>, Fixt
     (store, fixture)
 }
 
+/// How long the first attempt's data-object GETs are held.
+const FIRST_ATTEMPT_HOLD: Duration = Duration::from_secs(1);
+
 /// A `NotFound` on the very first data-object GET, before any batch was
 /// emitted: exactly one re-resolve, one retry, and the query then succeeds
 /// with the full result.
+///
+/// The first attempt is also held for [`FIRST_ATTEMPT_HOLD`] before its GETs
+/// reach the fault plan, so the statement as a whole takes at least that long
+/// while every stage stamp the outcome reports, which describe the successful
+/// attempt only, stays below it: the discarded attempt's time is in no field.
 #[tokio::test]
 async fn not_found_before_the_first_batch_retries_exactly_once_and_succeeds() {
     let plan = FaultPlan::empty().with_rule(
@@ -78,6 +87,21 @@ async fn not_found_before_the_first_batch_retries_exactly_once_and_succeeds() {
     let (store, fixture) = faulted_fixture(plan).await;
     let tenant = tenant_id("acme");
 
+    // Every data-object GET is held; the first ones (the first attempt's) are
+    // released together after the hold, every later one as soon as it lands.
+    let gate = store.hold(Op::Get, Some(".rseg".to_string()), Occurrence::Always);
+    let releaser = tokio::spawn(async move {
+        gate.wait_until_held(1).await;
+        tokio::time::sleep(FIRST_ATTEMPT_HOLD).await;
+        loop {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            gate.wait_until_held(1).await;
+        }
+    });
+
+    let started = Instant::now();
     let outcome = fixture
         .executor
         .execute(
@@ -86,6 +110,8 @@ async fn not_found_before_the_first_batch_retries_exactly_once_and_succeeds() {
         )
         .await
         .expect("the retry must recover the query");
+    let elapsed = started.elapsed();
+    releaser.abort();
 
     assert_eq!(
         store.fault_count(Op::Get, FaultKind::NotFoundBlip),
@@ -98,6 +124,33 @@ async fn not_found_before_the_first_batch_retries_exactly_once_and_succeeds() {
     );
     assert_eq!(outcome.stats.attempts, 2);
     assert_eq!(count_of(&outcome.output), 3, "all three samples come back");
+
+    // hygiene-allow: wall-clock -- a lower bound the gate's own sleep
+    // guarantees, proving the hold sat inside the statement; it cannot flake.
+    assert!(
+        elapsed >= FIRST_ATTEMPT_HOLD,
+        "the hold fired inside the statement: {elapsed:?}"
+    );
+    let wall = &outcome.stats.wall;
+    let stages = [
+        ("resolve", wall.resolve_ns),
+        ("plan", wall.plan_ns),
+        ("start", wall.start_ns),
+        ("first_batch", wall.first_batch_ns),
+        ("drain", wall.drain_ns),
+    ];
+    let hold_ns = FIRST_ATTEMPT_HOLD.as_nanos() as u64;
+    for (stage, ns) in stages {
+        assert!(
+            ns < hold_ns,
+            "{stage} is the successful attempt's alone, below the discarded \
+             attempt's {FIRST_ATTEMPT_HOLD:?} hold: {wall:?}"
+        );
+    }
+    assert!(
+        stages.iter().map(|(_, ns)| ns).sum::<u64>() < hold_ns,
+        "no stage carries the discarded attempt: {wall:?}"
+    );
 }
 
 /// A `NotFound` on every data-object GET: the retry runs once, fails again,
