@@ -921,7 +921,9 @@ mod tests {
         let junk_key = junk.as_str();
         let seeded = move || async move {
             let store = table_with(&[(1, "ddl"), (MAX_MANIFEST_VERSION + 1, "forger")]).await;
-            store.inner().insert_foreign(junk_key, Bytes::from_static(b"x"));
+            store
+                .inner()
+                .insert_foreign(junk_key, Bytes::from_static(b"x"));
             store
         };
         let named = format!(
