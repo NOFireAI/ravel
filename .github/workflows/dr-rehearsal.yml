@@ -356,8 +356,8 @@ jobs:
           # Logs and the small text records the assertions read, only. No
           # object bodies and no fixture data leave the runner. Every entry is
           # a file directly under .gate-logs/dr, so the credential-bearing
-          # files the harness writes into .gate-logs/dr/private (the tenant
-          # token file and the curl auth config) are not uploaded.
+          # files under .gate-logs/dr/private (the tenant token file, the curl
+          # auth config and the audit token key) are not uploaded.
           path: |
             .gate-logs/dr/*.log
             .gate-logs/dr/dr-expect.env

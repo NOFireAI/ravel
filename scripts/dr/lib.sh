@@ -62,8 +62,11 @@
 #   DR_ADMIN_CREDENTIAL_FILE  REQUIRED. File holding the admin credential the
 #                        restore operator will use, or the literal `none` under
 #                        the same rule and for the same reason.
-#   DR_AUDIT_TOKEN_KEY_FILE   Required when DR_TENANT_HASH_MODE=unkeyed. File
-#                        holding the 64-hex-character audit token key. An
+#   DR_AUDIT_TOKEN_KEY_FILE   Required when DR_TENANT_HASH_MODE=unkeyed, unless
+#                        RAVEL_AUDIT_TOKEN_KEY is set (an explicit key wins, as
+#                        it does in the server; a file that disagrees with it is
+#                        refused). File holding the 64-hex-character audit
+#                        token key. An
 #                        unkeyed deployment has no deployment key to derive it
 #                        from, and ravel-server refuses to start under its
 #                        default `--audit-text redacted` without one. The key
@@ -288,14 +291,21 @@ dr_init() {
 # Read the audit token key an unkeyed deployment needs into DR_SERVER_AUDIT_KEY.
 # It is not exported: every server launch passes it as a prefix assignment,
 # RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}", so the server sees it and
-# curl, docker and a `cargo run` fallback's build scripts do not. The server's
-# own check (64 hex characters) is repeated here so a bad file fails at
-# dr_init with its name, not later as a server that never became ready.
+# curl and docker do not. A prefix assignment on `cargo run` would still reach
+# every dependency build script cargo runs, so dr_require_server_binary
+# refuses that fallback whenever a key is set. The server's own check (64 hex
+# characters) is repeated here so a bad file fails at dr_init with its name,
+# not later as a server that never became ready. A caller's explicit
+# RAVEL_AUDIT_TOKEN_KEY (already in DR_SERVER_AUDIT_KEY, already checked)
+# satisfies the requirement on its own, as it wins in the server.
 dr_load_audit_token_key() {
   local key
   if [[ -z "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
+    if [[ -n "${DR_SERVER_AUDIT_KEY}" ]]; then
+      return 0
+    fi
     dr_die "${DR_EX_USAGE}" \
-      "DR_TENANT_HASH_MODE=unkeyed needs DR_AUDIT_TOKEN_KEY_FILE: an unkeyed server refuses to start under --audit-text redacted without an audit token key"
+      "DR_TENANT_HASH_MODE=unkeyed needs DR_AUDIT_TOKEN_KEY_FILE or RAVEL_AUDIT_TOKEN_KEY: an unkeyed server refuses to start under --audit-text redacted without an audit token key"
   fi
   if [[ ! -f "${DR_AUDIT_TOKEN_KEY_FILE}" || ! -r "${DR_AUDIT_TOKEN_KEY_FILE}" ]]; then
     dr_die "${DR_EX_USAGE}" \
@@ -303,16 +313,36 @@ dr_load_audit_token_key() {
   fi
   key="$(tr -d '[:space:]' <"${DR_AUDIT_TOKEN_KEY_FILE}")"
   dr_check_audit_key "${key}" "DR_AUDIT_TOKEN_KEY_FILE (${DR_AUDIT_TOKEN_KEY_FILE})"
+  if [[ -n "${DR_SERVER_AUDIT_KEY}" ]] &&
+    [[ "$(printf '%s' "${key}" | tr 'A-F' 'a-f')" != "$(printf '%s' "${DR_SERVER_AUDIT_KEY}" | tr 'A-F' 'a-f')" ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "RAVEL_AUDIT_TOKEN_KEY and DR_AUDIT_TOKEN_KEY_FILE (${DR_AUDIT_TOKEN_KEY_FILE}) hold different keys; the server would use RAVEL_AUDIT_TOKEN_KEY, so unset one or make them agree"
+  fi
   DR_SERVER_AUDIT_KEY="${key}"
+}
+
+# Refuse to launch ravel-server through the `cargo run` fallback while an audit
+# token key is set: cargo hands its environment to every dependency build
+# script it runs. Called by seed.sh and start.sh before they build the server
+# argv, since a refusal inside dr_ravel_server_argv's process substitution
+# would lose its exit status.
+dr_require_server_binary() {
+  if [[ -n "${DR_SERVER_AUDIT_KEY}" ]] && ! dr_have_command ravel-server; then
+    dr_die "${DR_EX_USAGE}" \
+      "ravel-server is not on PATH, and the cargo run fallback would hand the audit token key to every dependency build script; build ravel-server and put it on PATH first"
+  fi
 }
 
 # The server's own rule for an audit token key (parse_audit_token_key in
 # services/ravel-server/src/config.rs): exactly 64 hex characters. $1 is the
 # value, $2 names where it came from for the refusal.
 dr_check_audit_key() {
-  if [[ ! "$1" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  if [[ "${#1}" -ne 64 ]]; then
     dr_die "${DR_EX_USAGE}" \
       "$2 must hold 64 hex characters (a 32-byte key), got ${#1} characters"
+  fi
+  if [[ ! "$1" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    dr_die "${DR_EX_USAGE}" "$2 is not valid hex"
   fi
 }
 
@@ -342,9 +372,11 @@ refuses when one of them is unset.
   DR_TENANT_KMS_CONFIG      REQUIRED  per-tenant KMS config file, or `none`
   DR_ADMIN_CREDENTIAL_FILE  REQUIRED  admin credential file, or `none`
   DR_AUDIT_TOKEN_KEY_FILE   file holding the 64-hex audit token key, required
-                     when unkeyed (passed to the server in its environment).
-                     A keyed run that sets its own key supplies it as
-                     RAVEL_AUDIT_TOKEN_KEY instead, checked the same way
+                     when unkeyed unless RAVEL_AUDIT_TOKEN_KEY is set (passed
+                     to the server on its launch line only). A run that sets
+                     RAVEL_AUDIT_TOKEN_KEY has it checked the same way, and a
+                     file that disagrees with it is refused. With a key set,
+                     ravel-server must be on PATH (no cargo run fallback)
   DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0; 1 only when the run waited the
                      catalog seal margin out
   DR_LOG_DIR         logs and pre-registered figures, default

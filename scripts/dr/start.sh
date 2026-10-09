@@ -201,6 +201,7 @@ dr_export_s3_env "${DR_BUCKET_REPLICA}"
 TOKEN_FILE="$(dr_tenant_token_file)"
 CURL_AUTH="$(dr_curl_auth_config)"
 
+dr_require_server_binary
 declare -a SERVER_ARGV=()
 mapfile -d '' -t SERVER_ARGV < <(dr_ravel_server_argv \
   --store s3 \

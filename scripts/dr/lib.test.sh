@@ -319,6 +319,44 @@ check "custody: a caller's explicit audit key that is not 64 hex characters is r
   "64" "$(audit_init keyed "" "${CALLER_KEY%?}" | cut -d'|' -f1)"
 check "custody: a directory as the audit key file is refused as not a readable file" \
   "64" "$(audit_init unkeyed "${AUDIT_KEY_DIR}" "" | cut -d'|' -f1)"
+check "custody: unkeyed accepts a caller's explicit audit key with no key file" \
+  "0|${CALLER_KEY}|${CALLER_KEY}" "$(audit_init unkeyed "" "${CALLER_KEY}")"
+check "custody: unkeyed refuses a key file that disagrees with the caller's key" \
+  "64" "$(audit_init unkeyed "${AUDIT_KEY_OK}" "${CALLER_KEY}" | cut -d'|' -f1)"
+check "custody: unkeyed accepts a key file holding the caller's key in another case" \
+  "0" "$(audit_init unkeyed "${AUDIT_KEY_OK}" "$(printf '%s' "${OK_KEY}" | tr 'a-f' 'A-F')" | cut -d'|' -f1)"
+
+# The refusal names the property that failed: the length, or the hex.
+key_refusal() {
+  bash -c 'source "$1"; dr_check_audit_key "$2" "the key" 2>&1' _ "${DR_LIB_PATH}" "$1"
+}
+check "custody: a short audit key is refused for its length" "yes" \
+  "$([[ "$(key_refusal "${OK_KEY%????}")" == *"got 60 characters"* ]] && echo yes || echo no)"
+check "custody: a 64-character key with a non-hex character is refused as not hex" "yes" \
+  "$([[ "$(key_refusal "zz${OK_KEY#??}")" == *"is not valid hex"* ]] && echo yes || echo no)"
+
+# With a key set, ravel-server must come from PATH: the cargo run fallback
+# would hand the key to every dependency build script. $1 is the key, $2 is
+# whether a ravel-server is on PATH (1) or not (0).
+binary_rc() {
+  bash -c '
+    source "$1"
+    DR_SERVER_AUDIT_KEY="$2"
+    if [[ "$3" -eq 1 ]]; then dr_have_command() { return 0; }; else dr_have_command() { return 1; }; fi
+    rc=0
+    (dr_require_server_binary >/dev/null 2>&1) || rc=$?
+    printf "%s\n" "${rc}"' _ "${DR_LIB_PATH}" "$1" "$2"
+}
+check "custody: with a key set and no ravel-server on PATH, the cargo fallback is refused" \
+  "64" "$(binary_rc "${OK_KEY}" 0)"
+check "custody: with a key set and ravel-server on PATH, the launch proceeds" \
+  "0" "$(binary_rc "${OK_KEY}" 1)"
+check "custody: with no key set, the cargo fallback is allowed" \
+  "0" "$(binary_rc "" 0)"
+for launcher in seed.sh start.sh; do
+  check "custody: ${launcher} requires the server binary before it builds the server argv" "yes" \
+    "$(awk '/^dr_require_server_binary$/ {seen=1} /dr_ravel_server_argv/ && !/^#/ {print (seen ? "yes" : "no"); exit}' "${DR_DIR}/${launcher}")"
+done
 
 # Every server launch carries the key as a prefix assignment, so the server,
 # and only the server, receives it. Counted per script: a launch added without
