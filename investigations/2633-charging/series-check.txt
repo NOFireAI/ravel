@@ -1,0 +1,78 @@
+q 33 rep 1 secs 0.55 max_simul 1.205
+   0.017 alloc_d= 0.346 sql= 0.221 fetch= 0.117 uncharged= 0.008
+   0.046 alloc_d= 1.260 sql= 1.029 fetch= 0.149 uncharged= 0.081
+   0.208 alloc_d= 1.291 sql= 1.089 fetch= 0.149 uncharged= 0.052
+   0.229 alloc_d= 1.305 sql= 1.130 fetch= 0.145 uncharged= 0.029
+   0.249 alloc_d= 1.295 sql= 1.125 fetch= 0.138 uncharged= 0.033
+   0.271 alloc_d= 1.577 sql= 1.309 fetch= 0.110 uncharged= 0.158
+   0.322 alloc_d= 1.552 sql= 1.354 fetch= 0.105 uncharged= 0.093
+   0.342 alloc_d= 2.372 sql= 2.175 fetch= 0.032 uncharged= 0.166
+   0.427 alloc_d= 2.375 sql= 2.199 fetch= 0.025 uncharged= 0.151
+   0.447 alloc_d= 2.352 sql= 2.220 fetch= 0.005 uncharged= 0.127
+   0.468 alloc_d= 1.877 sql= 0.911 fetch= 0.000 uncharged= 0.966
+   0.488 alloc_d= 1.679 sql= 0.474 fetch= 0.000 uncharged= 1.205
+   0.508 alloc_d= 1.679 sql= 0.474 fetch= 0.000 uncharged= 1.205
+   0.528 alloc_d= 1.574 sql= 0.445 fetch= 0.000 uncharged= 1.129
+   0.548 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.568 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.588 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.608 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.629 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.649 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+q 33 rep 2 secs 0.554 max_simul 1.206
+   0.006 alloc_d= 0.128 sql= 0.060 fetch= 0.074 uncharged=-0.006
+   0.027 alloc_d= 1.178 sql= 0.916 fetch= 0.143 uncharged= 0.119
+   0.194 alloc_d= 1.306 sql= 1.132 fetch= 0.145 uncharged= 0.029
+   0.223 alloc_d= 1.336 sql= 1.172 fetch= 0.129 uncharged= 0.036
+   0.243 alloc_d= 1.274 sql= 1.122 fetch= 0.121 uncharged= 0.030
+   0.277 alloc_d= 1.574 sql= 1.327 fetch= 0.103 uncharged= 0.144
+   0.332 alloc_d= 1.546 sql= 1.359 fetch= 0.100 uncharged= 0.086
+   0.354 alloc_d= 2.296 sql= 2.040 fetch= 0.058 uncharged= 0.198
+   0.406 alloc_d= 2.377 sql= 2.226 fetch= 0.039 uncharged= 0.112
+   0.430 alloc_d= 2.366 sql= 2.226 fetch= 0.023 uncharged= 0.117
+   0.450 alloc_d= 2.350 sql= 2.220 fetch= 0.000 uncharged= 0.130
+   0.471 alloc_d= 1.902 sql= 0.965 fetch= 0.000 uncharged= 0.937
+   0.491 alloc_d= 1.680 sql= 0.474 fetch= 0.000 uncharged= 1.206
+   0.511 alloc_d= 1.680 sql= 0.474 fetch= 0.000 uncharged= 1.205
+   0.531 alloc_d= 1.661 sql= 0.460 fetch= 0.000 uncharged= 1.202
+   0.551 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.571 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.591 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.612 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.632 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+   0.652 alloc_d= 0.001 sql= 0.000 fetch= 0.000 uncharged= 0.001
+q 19 rep 1 secs 0.417 max_simul 0.782
+   0.014 alloc_d= 1.034 sql= 0.732 fetch= 0.126 uncharged= 0.175
+   0.188 alloc_d= 0.975 sql= 0.715 fetch= 0.113 uncharged= 0.147
+   0.209 alloc_d= 0.984 sql= 0.750 fetch= 0.080 uncharged= 0.154
+   0.233 alloc_d= 1.119 sql= 0.791 fetch= 0.066 uncharged= 0.262
+   0.267 alloc_d= 1.106 sql= 0.798 fetch= 0.062 uncharged= 0.247
+   0.287 alloc_d= 1.283 sql= 1.055 fetch= 0.060 uncharged= 0.168
+   0.314 alloc_d= 1.231 sql= 1.049 fetch= 0.034 uncharged= 0.148
+   0.334 alloc_d= 1.191 sql= 1.041 fetch= 0.015 uncharged= 0.135
+   0.354 alloc_d= 1.138 sql= 0.981 fetch= 0.000 uncharged= 0.157
+   0.374 alloc_d= 1.147 sql= 0.981 fetch= 0.000 uncharged= 0.166
+   0.395 alloc_d= 1.014 sql= 0.232 fetch= 0.000 uncharged= 0.782
+   0.415 alloc_d=-0.001 sql= 0.000 fetch= 0.000 uncharged=-0.001
+   0.435 alloc_d=-0.001 sql= 0.000 fetch= 0.000 uncharged=-0.001
+   0.455 alloc_d=-0.001 sql= 0.000 fetch= 0.000 uncharged=-0.001
+   0.475 alloc_d=-0.001 sql= 0.000 fetch= 0.000 uncharged=-0.001
+   0.495 alloc_d=-0.001 sql= 0.000 fetch= 0.000 uncharged=-0.001
+   0.515 alloc_d=-0.001 sql= 0.000 fetch= 0.000 uncharged=-0.001
+q 19 rep 2 secs 0.387 max_simul 0.791
+   0.004 alloc_d= 0.211 sql= 0.092 fetch= 0.061 uncharged= 0.058
+   0.029 alloc_d= 1.022 sql= 0.724 fetch= 0.127 uncharged= 0.171
+   0.182 alloc_d= 1.083 sql= 0.772 fetch= 0.123 uncharged= 0.188
+   0.204 alloc_d= 1.101 sql= 0.759 fetch= 0.105 uncharged= 0.237
+   0.234 alloc_d= 1.082 sql= 0.759 fetch= 0.099 uncharged= 0.224
+   0.255 alloc_d= 1.206 sql= 0.858 fetch= 0.079 uncharged= 0.269
+   0.279 alloc_d= 1.279 sql= 1.018 fetch= 0.062 uncharged= 0.199
+   0.313 alloc_d= 1.215 sql= 1.004 fetch= 0.037 uncharged= 0.174
+   0.334 alloc_d= 1.111 sql= 0.972 fetch= 0.016 uncharged= 0.123
+   0.354 alloc_d= 1.031 sql= 0.239 fetch= 0.000 uncharged= 0.791
+   0.374 alloc_d= 0.989 sql= 0.225 fetch= 0.000 uncharged= 0.765
+   0.394 alloc_d= 0.002 sql= 0.000 fetch= 0.000 uncharged= 0.002
+   0.414 alloc_d= 0.002 sql= 0.000 fetch= 0.000 uncharged= 0.002
+   0.434 alloc_d= 0.002 sql= 0.000 fetch= 0.000 uncharged= 0.002
+   0.454 alloc_d= 0.002 sql= 0.000 fetch= 0.000 uncharged= 0.002
+   0.475 alloc_d= 0.002 sql= 0.000 fetch= 0.000 uncharged= 0.002

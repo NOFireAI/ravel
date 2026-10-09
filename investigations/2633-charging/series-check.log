@@ -1,0 +1,9 @@
+q33 rep0 http=200 1.409s n=64 delta=2.597GB sql=2.222GB gap=0.375GB pool_peak=2.231GB dumps=1 cache_d=0.215GB
+q33 rep1 http=200 0.55s n=20 delta=2.375GB sql=2.220GB gap=0.155GB pool_peak=2.237GB dumps=1 cache_d=0.000GB
+q33 rep2 http=200 0.554s n=21 delta=2.377GB sql=2.226GB gap=0.151GB pool_peak=2.243GB dumps=1 cache_d=0.000GB
+q19 rep0 http=200 0.536s n=23 delta=1.489GB sql=1.002GB gap=0.487GB pool_peak=1.093GB dumps=1 cache_d=0.190GB
+q19 rep1 http=200 0.417s n=17 delta=1.283GB sql=1.055GB gap=0.228GB pool_peak=1.098GB dumps=1 cache_d=0.000GB
+q19 rep2 http=200 0.387s n=16 delta=1.279GB sql=1.018GB gap=0.261GB pool_peak=1.040GB dumps=1 cache_d=0.000GB
+sampler errors=0 bad_runs=0
+
+EXIT=0
