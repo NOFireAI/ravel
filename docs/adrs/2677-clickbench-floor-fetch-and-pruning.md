@@ -215,8 +215,10 @@ Arrow-IPC and Flight responses carry no `stats` today and that does not
 change; MCP's budget block does not pick these up.
 
 Beside it, `stats.pruning` renders the counts `SqlStats` already carries
-and nothing exposes per statement: `segments`, `segmentsPrunedByStats`,
-`blocksTotal`, `blocksScanned`, `blocksPrunedByPostings`. Object-level and
+and nothing exposes per statement: `segments` (the same count as
+`stats.estimate.segments`, repeated here so the prune ratios read from one
+object), `segmentsPrunedByStats`, `blocksTotal`, `blocksScanned`,
+`blocksPrunedByPostings`. Object-level and
 block-level pruning are then reported independently, which the acceptance
 bands in decision 8 and the test in decision 5 read directly.
 
@@ -326,6 +328,14 @@ better of runs 2 and 3, and the per-statement probe (`stats.phases`,
 bands below are pre-registered on #2677 before each arm launches; a figure
 outside its band is a miss and stays open with its bottleneck named.
 
+Every arm loads with the v0.23.0 entry's own recipe (ClickHouse/ClickBench
+#2471: the MemTotal-tiered load, `--target-bytes 1850000000`, about 25 MB
+objects, 410 of them on the reference box), which is the geometry every
+c6a figure below was measured on. "Stock" in this section means that
+load with no server flags. The one exception is the q20 row, which runs
+the loader's default `--target-bytes` (the 2,617-object, 3.8 MB corpus)
+because decision 2 acts only on objects under the bound; its row says so.
+
 | check | target | miss |
 |---|---|---|
 | c6a.4xlarge cold total, 43 statements, this epic's build at derived defaults | at most 425 s (W1 tuned basis on this box 386.0 s; stock 486.6 s) | over 486.6 s |
@@ -334,7 +344,7 @@ outside its band is a miss and stays open with its bottleneck named.
 | resolve LISTs per statement, folded against unfolded large-object arm | at least 80% fewer | fewer than 60% fewer |
 | `unfoldedSegmentsResolved` after the fold | 0 | any |
 | load time with `--fold-after-load` | at most 1.05x the same load without it | over 1.1x |
-| q20 GETs per object / wire bytes over corpus bytes, stock corpus arm (3.8 MB objects) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
+| q20 GETs per object / wire bytes over corpus bytes, loader-default corpus (3.8 MB objects, not the entry recipe) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
 | q2 hot on 16 GB with the cache at about half the corpus | cache-served bytes at least 40% of wire bytes | under 25% |
 | hot geomean ratio to VictoriaLogs, 42 statements, +0.01 s | reported; the plan's eight-week figure (1.1) is not this epic's target | |
 | statements answered on the reference box | 43 of 43 | fewer |
@@ -432,10 +442,10 @@ stock concurrent error ratio under 0.058; its shape is decided by the
 refusal-class measurement, and T5 does not dispatch before T6 lands and
 its arm meets the bar.
 
-Wave 1: T1, T2, T3. Wave 2: T4, then T6, then T5. Then the arms of decision 8 and the
-measurements of decision 6. The high-risk-solo wave rule is relaxed on the
-owner's days-not-weeks instruction; T1 compensates with its own reviewer
-and `effort: high`. T4 and T5 share the ravel-query crate in wave 2 by one
-stated exception: T5's footprint there is doc comments in `config.rs`,
-which T4 does not touch, so no signature or module declaration can
-collide.
+Wave 1: T1, T2, T3, concurrently. After it, each later task is its own
+wave, in this order: T4; then T6; then T5. T7 (#2694, the ordered block
+skip that decision 6's measurement cleared) follows T4, which it shares
+`logs_scan.rs` and `log_fetcher.rs` with. Then the arms of decision 8. The
+high-risk-solo wave rule is relaxed for wave 1 on the owner's
+days-not-weeks instruction; T1 compensates with its own reviewer and
+`effort: high`.
