@@ -4366,7 +4366,7 @@ async fn a_repeated_continuation_token_is_refused() {
 }
 
 /// Responses that stay truncated and empty with a fresh token each time stop
-/// at the per-page response ceiling: `ceil(1 / 1000) + 16` at page size 1.
+/// after the 16 empty responses a page allows.
 #[tokio::test]
 async fn a_listing_that_never_ends_stops_at_the_response_ceiling() {
     let fake = FakeS3::start().await;
@@ -4381,17 +4381,37 @@ async fn a_listing_that_never_ends_stops_at_the_response_ceiling() {
         .expect_err("a token that never ends must fail the listing");
 
     assert!(
-        matches!(&error, StoreError::ListPageCeiling { prefix, ceiling: 17 } if prefix == "c/"),
+        matches!(&error, StoreError::ListPageCeiling { prefix, ceiling: 16 } if prefix == "c/"),
         "got {error:?}"
     );
-    assert_eq!(fake.count(Op::List), 17);
+    assert_eq!(fake.count(Op::List), 16);
 }
 
+/// A page that fills on a truncated response without a token is complete:
+/// the token would only be needed for a request the page never sends.
+#[tokio::test]
+async fn a_full_page_without_a_token_is_complete() {
+    let fake = FakeS3::start().await;
+    fake.script_list([list_body(Some("url"), &["f/a"], &[], true, None)]);
+    let store = page_size_store(&fake, 1);
+
+    let page = store
+        .list("f/", None)
+        .await
+        .expect("a full page does not need a token");
+
+    assert_eq!(object_keys(&page), ["f/a"]);
+    assert_eq!(page.next.map(|token| token.0), Some("f/a".to_string()));
+    assert_eq!(fake.count(Op::List), 1);
+}
+
+/// One key of a two-key page, truncated without a token: the page needs a
+/// next request and has nothing to send it with.
 #[tokio::test]
 async fn a_truncated_response_without_a_token_is_permanent() {
     let fake = FakeS3::start().await;
     fake.script_list([list_body(Some("url"), &["n/a"], &[], true, None)]);
-    let store = fake.store();
+    let store = page_size_store(&fake, 2);
 
     let error = store
         .list("n/", None)
