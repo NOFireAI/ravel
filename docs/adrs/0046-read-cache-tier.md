@@ -366,48 +366,106 @@ passes once. It did not consider a hot scan that repeats: a query run again
 over the same N objects in the same order, over a cache that holds C < N
 of them. Plain S3-FIFO serves that loop nothing. Each entry leaves
 probation untouched, because its next touch is a whole pass away, and the
-ghost window is sized from `max_bytes / max_entry_bytes`: 25 to 74 keys
-for a 1.7 to 5.0 GB cache under the server's 64 MiB `max_entry_bytes`,
-against a 2,617-object loop of 3.8 MB objects. So no entry reached main, and a 1.7 to 5.0 GB cache served
+ghost window was sized from `max_bytes / max_entry_bytes`: 25 to 74 keys
+for a 1.7 to 5.0 GB cache under the server's 64 MiB `max_entry_bytes`
+(1.7e9 / 2^26 = 25.3, 5.0e9 / 2^26 = 74.5), against a 2,617-object loop of
+3.8 MB objects. So no entry reached main, and a 1.7 to 5.0 GB cache served
 0.01 GB per hot pass (#2615); on a 32 GB host whose derived cache fell
 0.8 GB under the corpus, it served nothing (#2639 W2).
 
-Two rules in `crates/ravel-cache/src/s3fifo.rs` close this. The ghost sizing
-is unchanged.
+The rules in `crates/ravel-cache/src/s3fifo.rs` that close this count
+distances in touches: a logical clock advances by one on every hit and
+every admission. Every entry records its reuse distance, the longer of its
+last two gaps between touches.
 
 - **Fill main while it has room.** An entry leaving probation untouched
   moves into main, rather than out of the cache, while main has room inside
   its share of the bounds: `max_bytes` less the probation quota of one
-  tenth, and `max_entries` less one tenth of it (at least one entry). This evicts nothing to make that room, so it cannot
-  displace a working set. A cold scan can occupy main only while main has
-  space nothing else is using, and a later hot entry promoted out of
-  probation evicts it through the main CLOCK as before.
-- **No displacement of a more recent main entry by a ghost hit.** Once main
-  is full, a key returning from the ghost queue takes the slot of the main
-  entry at the front only if that entry has gone untouched for longer than
-  the returning key's own reuse distance, both counted in touches (hits
-  plus admissions). Otherwise the returning key starts over in probation.
-  Under a loop every main entry is touched once per pass, so it has always
-  been idle for less than a pass, and no returning loop key displaces it.
-  A hot key with a short reuse distance still displaces a cold main entry.
+  tenth, and `max_entries` less one tenth of it (at least one entry). This
+  evicts nothing. Such an entry has no reuse distance yet and is never
+  overdue (next rule).
+- **A loop entry that misses its turn gives up its slot.** A main entry
+  whose reuse distance is at least the resident capacity in entries is a
+  loop entry: only a scan larger than the cache re-reads an entry that far
+  apart. It is overdue once it has gone untouched for more than 9/8 of its
+  reuse distance. When main is full, an entry leaving probation untouched
+  takes the slot of the most overdue loop entry, if there is one, and is
+  otherwise evicted to the ghost queue. Under a steady loop no entry is
+  overdue, so main's set does not change. When the loop stops and another
+  starts, the old loop's entries become overdue one by one and the new
+  loop's entries take their slots during its first pass.
+- **A ghost hit displaces only something stale.** A key returning from the
+  ghost queue enters main if main has room, or by taking the slot of the
+  most overdue loop entry, or of the main entry at the front if that entry
+  has gone untouched for longer than the returning key's own reuse
+  distance. Otherwise the front entry moves to the back and the returning
+  key starts over in probation. Under a steady loop every main entry has
+  been idle for less than a pass, so no returning key of the same loop
+  displaces it, while a hot key with a short reuse distance still displaces
+  a cold main entry.
+- **The ghost remembers twice the resident capacity.** Resident capacity
+  is estimated as `max_bytes` over the average resident entry size, capped
+  at `max_entries` and never below `max_bytes / max_entry_bytes`. For the
+  #2615 geometry that is 447 to 1,315 entries (1.7e9 / 3.8e6 = 447.4,
+  5.0e9 / 3.8e6 = 1,315.8), so the ghost remembers 894 to 2,630 keys, and
+  50 to 148 before the first entry is resident. The ghost is memory outside
+  `max_bytes`: at the server's 1,000,000-entry cap it holds at most
+  2,000,000 keys of under 500 bytes each, which it reaches only when the
+  average resident entry is under a millionth of `max_bytes`.
 
-The result for a loop: the first pass fills main with its first entries,
-and the passes after it serve those same entries. The crate test
-`repeated_scan_larger_than_the_cache_serves_a_stable_subset` pins at least
-0.8 x C/N of the touches served on passes 2 and 3, and an identical served
-set on both, at the #2615 geometry (C about N/2) and the #2639 W2 geometry
-(C about 0.9 N), plus a W2 case whose ghost covers the whole cache so that
-returning loop keys do hit it. `background_cold_scan_does_not_evict_the_hot_working_set`
-pins decision 6 with the cache already full of cold entries: a hot working
-set that arrives later, under a continuing cold scan, takes residency and
-keeps it.
+Main's share is where untouched entries stop filling it, not a cap. A
+promotion out of probation, or a displacement that admits a larger entry
+than it evicts, can take main past its share; `max_bytes` and
+`max_entries` hold for the whole cache.
+
+What the crate tests pin, each at the #2615 geometry (C about N/2), the
+#2639 W2 geometry (C about 0.9 N), and a mixed-size loop of 0.5 to 1.5
+times 3.8 MB objects at half its bytes:
+
+- `repeated_scan_larger_than_the_cache_serves_a_stable_subset`: a loop over
+  an empty cache serves at least 0.8 x C/N of its bytes on passes 2 and 3,
+  the same set on both (measured 0.45, 0.81, 0.45).
+- `a_second_loop_after_the_cache_is_full_converges`: loops B and C, each
+  starting after the loop before it filled the cache, meet the same bounds
+  from their second pass.
+- `a_loop_after_a_cold_scan_converges_from_its_third_pass`: after a one-pass
+  cold scan of 3N, the loop serves nothing on pass 2, then at least the
+  floor on passes 3 and 4, the same set on both.
+- `a_loop_five_times_the_cache_after_a_cold_scan_is_not_served`: the same
+  floor and stable set for a loop five times the cache over an empty cache
+  (0.18), and the limit of the previous guarantee: that loop outruns the
+  ghost, so after the cold scan it serves nothing in six passes.
+- `background_cold_scan_does_not_evict_the_hot_working_set` and
+  `hot_working_set_resident_first_survives_a_continuing_cold_scan`: decision
+  6 in both orders. A hot working set that arrives while a cold scan has
+  filled the cache takes residency and keeps it, and one resident before
+  the scan loses no touch to it.
+
+ADR-2677 decision 3 also asks that a loop after a cold scan meet the floor
+from its second pass. No policy found meets that. On its first pass such a
+loop cannot be told apart from the cold scan continuing, so pass 2 can be
+served only if the scan's unproven main entries expire, and a loop's own
+entries are unproven during its first pass too. An expiry after 1.2 to 4.0
+times the resident capacity idle was tried. Every horizon in that range
+stops a loop five times the cache from being served over an empty cache
+(the first assertion of
+`a_loop_five_times_the_cache_after_a_cold_scan_is_not_served`, 0.18 without
+expiry), because its first-pass entries expire before pass 2 reads them.
+Below 2.0 the horizon also breaks
+`repeated_scan_larger_than_the_cache_serves_a_stable_subset` and
+`a_second_loop_after_the_cache_is_full_converges`, and at no horizon does
+the loop after a cold scan reach the floor on pass 2 at C about 0.9 N
+(0.49 at 2.0, at most 0.42 above it). So
+`a_loop_after_a_cold_scan_converges` conflicts with the first-loop
+guarantee for any loop longer than the horizon; it keeps the decision's
+bound and is ignored, and the policy here has no expiry.
 
 Both tiers keep one policy. The disk tier and the catalog byte cache build
-the same `S3Fifo`, so they get the loop behaviour too, and the disk tier
-keeps decision 6's protection: its
-`disk_tier_survives_repeated_scans_via_s3_fifo_eviction` test passes
-unchanged. No `CacheLimits` option was needed, and `max_entry_bytes` is
-unchanged.
+the same `S3Fifo`, so they get the loop behaviour too, and the decision 6
+tests `s3_fifo_scan_resistance_keeps_working_set_resident`,
+`s3_fifo_scan_resistance_survives_repeated_scans` and
+`disk_tier_survives_repeated_scans_via_s3_fifo_eviction` pass unchanged. No
+`CacheLimits` option was needed, and `max_entry_bytes` is unchanged.
 
 ADR-2677's rejected alternatives cover the other two fixes: bypassing the
 cache for one-pass scans refuses the hot run, and plain LRU serves nothing
