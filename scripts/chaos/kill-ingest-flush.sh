@@ -93,19 +93,22 @@ fi
 # ---------------------------------------------------------------------------
 
 SERVER_PID=""
-SERVER_LOG="$(mktemp)"
+SERVER_LOG="$(chaos_logfile ingest-flush server)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
-  # A failure in here must not replace the pending exit status, with 3
-  # through the ERR trap or with its own status through set -e.
+  # The pending exit status, read before anything else can replace it. A
+  # failure in here must not replace it either, with 3 through the ERR trap
+  # or with its own status through set -e.
+  local code=$?
   trap - ERR
   set +e
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  rm -f "$SERVER_LOG" "$FIXTURE_PATH"
+  chaos_release_logs "$code" "$SERVER_LOG"
+  rm -f "$FIXTURE_PATH"
   rustfs_down
 }
 trap cleanup EXIT

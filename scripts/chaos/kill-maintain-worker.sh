@@ -114,14 +114,16 @@ fi
 WORKER_A_PID=""
 WORKER_B_PID=""
 INGEST_PID=""
-WORKER_A_LOG="$(mktemp)"
-WORKER_B_LOG="$(mktemp)"
-INGEST_LOG="$(mktemp)"
+WORKER_A_LOG="$(chaos_logfile maintain-worker worker-a)"
+WORKER_B_LOG="$(chaos_logfile maintain-worker worker-b)"
+INGEST_LOG="$(chaos_logfile maintain-worker ingest)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
-  # A failure in here must not replace a pending exit 2, with 3 through the
-  # ERR trap or with its own status through set -e.
+  # The pending exit status, read before anything else can replace it. A
+  # failure in here must not replace a pending exit 2 either, with 3 through
+  # the ERR trap or with its own status through set -e.
+  local code=$?
   trap - ERR
   set +e
   local pid
@@ -131,7 +133,8 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
-  rm -f "$WORKER_A_LOG" "$WORKER_B_LOG" "$INGEST_LOG" "$FIXTURE_PATH"
+  chaos_release_logs "$code" "$WORKER_A_LOG" "$WORKER_B_LOG" "$INGEST_LOG"
+  rm -f "$FIXTURE_PATH"
   rustfs_down
 }
 trap cleanup EXIT

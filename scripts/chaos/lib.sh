@@ -89,6 +89,42 @@ log() {
   echo "[chaos] $*" >&2
 }
 
+# Where a scenario keeps the logs of the processes it drives. Empty, the
+# default, means one mktemp file per process, deleted at exit. When set, each
+# scenario writes `<CHAOS_LOG_DIR>/<scenario>-<process>.log` and, on a
+# non-zero exit, keeps the files and prints the tail of each: a server that
+# never accepts a connection leaves its reason only in its own log, and a CI
+# job can upload the directory.
+CHAOS_LOG_DIR="${CHAOS_LOG_DIR:-}"
+
+# Path for one process log: $1=scenario $2=process. A mktemp file when
+# CHAOS_LOG_DIR is unset, else a named file under it (the directory is created).
+chaos_logfile() {
+  if [[ -n "${CHAOS_LOG_DIR}" ]]; then
+    mkdir -p "${CHAOS_LOG_DIR}"
+    printf '%s/%s-%s.log\n' "${CHAOS_LOG_DIR}" "$1" "$2"
+  else
+    mktemp
+  fi
+}
+
+# Release the process logs at exit: $1=the scenario's exit code, the rest are
+# log paths. Deleted unless the exit is non-zero and CHAOS_LOG_DIR is set, in
+# which case each is kept and its last 40 lines go to stderr.
+chaos_release_logs() {
+  local code="$1" f
+  shift
+  if [[ "${code}" -ne 0 && -n "${CHAOS_LOG_DIR}" ]]; then
+    for f in "$@"; do
+      [[ -f "${f}" ]] || continue
+      log "exit ${code}: kept ${f}; its last 40 lines:"
+      tail -n 40 "${f}" >&2
+    done
+    return 0
+  fi
+  rm -f "$@"
+}
+
 # Record a passing oracle assertion by pinned name.
 oracle_ok() {
   ORACLE_PASS+=("$1")
