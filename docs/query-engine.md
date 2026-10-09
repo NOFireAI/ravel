@@ -1354,8 +1354,12 @@ without spill, or one whose input is fully sorted on the group key. A partial
 aggregate is never held, because it emits early into the exchange that feeds
 the final aggregate and that exchange reserves what it buffers. A final
 aggregate that can spill is not held either, because its shrink can follow a
-spill to disk, which frees the memory.
-`ravel_sql::sql_memory_held_bytes()` reports the bytes held across the process.
+spill to disk, which frees the memory. So on a deployment that runs with
+`--sql-spill-dir`, a final aggregate over an unordered group key is built
+spillable and still hands its live bytes back to the pool at emit: the hold
+does not cover it, and the over-release remains for those statements.
+`ravel_sql::sql_memory_held_bytes()` returns the bytes held across the
+process; no metric renders it yet.
 
 The hold over-charges. From the aggregate's first shrink until its stream is
 dropped, its bytes stay charged while a downstream operator, for example a

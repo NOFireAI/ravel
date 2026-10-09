@@ -284,7 +284,8 @@ manager disabled, `GroupedHashAggregateStream` is constructed in
 propagates the pool's own `try_grow` error directly (Ravel's
 `TenantDelegatingPool::try_grow` already ignores `can_spill`, so this is
 not a new code path, just closing off the one DataFusion mode that used to
-route around it).
+route around it; the pool now reads `can_spill` for one purpose, see the
+aggregate hold amendment below).
 
 This also changes `ORDER BY`: `SortExec`'s external sorter would today
 silently spill the same way; with the disk manager disabled it instead
@@ -676,3 +677,24 @@ are recorded and the compensation factor is derived and pinned so a future
 admission check has a bound to use, but nothing exercises it on a real query
 path yet; that wiring is unclaimed follow-up work, not part of this
 amendment's fix.
+
+## Amendment (2026-10-09, #2633): the SQL pool holds a non-spillable aggregate's released bytes
+
+<!-- amendment-applies: sections="3. Disable the disk manager explicitly; spill is a typed error, not silent degradation" pointer="aggregate hold amendment" -->
+
+`TenantDelegatingPool` now reads `MemoryConsumer::can_spill` for one
+purpose. A consumer named `GroupedHashAggregateStream[..]` whose
+`can_spill` is false keeps the bytes it shrinks charged to the query,
+tenant and process budgets until it unregisters, and a later grow by the
+same consumer draws on those held bytes first. DataFusion 54.1 shrinks a
+grouped aggregate's reservation when it emits while the emitted batch still
+holds the bytes, so releasing them let the pool grant live memory to other
+queries. `try_grow` itself still refuses the same way for every consumer;
+what changed is that a held aggregate's shrink no longer reaches the
+budgets. `can_spill` is the selector because the pool cannot tell a shrink
+after a spill, which frees memory, from a shrink after an emit, which does
+not. With the disk manager disabled, as decision 3 sets it, a final
+aggregate is built in `ReportError` mode and so is held; a partial
+aggregate emits early under pressure, is spillable in DataFusion's sense,
+and is not held. docs/query-engine.md states the operator-visible
+consequence.
