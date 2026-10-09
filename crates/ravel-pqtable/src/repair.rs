@@ -1423,7 +1423,12 @@ mod tests {
     #[tokio::test]
     async fn the_wrapper_lists_by_whole_segment() {
         let store = segment_aligned_forged_store().await;
-        assert!(list_all(&store, &mkey(2)).await.expect("list").is_empty());
+        assert!(
+            ravel_object_store::list_all(&store, &mkey(2))
+                .await
+                .expect("list")
+                .is_empty()
+        );
         assert_eq!(
             list(&store, &TENANT_A, "hits").await.expect("list").len(),
             11
