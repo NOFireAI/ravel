@@ -177,8 +177,10 @@ runs' bytes come from the cache, and 81% when the cache holds 90% of the scan;
 both runs read the same entries from it. The same holds for a new repeated
 scan that starts after another one filled the cache. A repeated scan that
 starts right after a one-pass scan three times its size filled the cache
-serves nothing on its second run and converges from its third: on its first
-run it cannot be told apart from the one-pass scan continuing.
+serves nothing on its second run and converges from its third, if it is at
+most about twice the cache's size: on its first run it cannot be told apart
+from the one-pass scan continuing. A repeated scan five times the cache's size
+that starts there serves nothing in the six runs measured.
 
 The **sum of every ceiling can exceed physical RAM**. The two caches are
 independent, and the SQL memory pools (`--sql-max-query-bytes`,
