@@ -717,13 +717,12 @@ mod tests {
             g.label,
             g.floor()
         );
-        for pass in first_pass - 1..served.len() {
+        for (pass, &fraction) in fractions.iter().enumerate().skip(first_pass - 1) {
             assert!(
-                fractions[pass] >= g.floor(),
-                "{}, {what}: pass {} served {:.3} of the loop, floor {:.3}",
+                fraction >= g.floor(),
+                "{}, {what}: pass {} served {fraction:.3} of the loop, floor {:.3}",
                 g.label,
                 pass + 1,
-                fractions[pass],
                 g.floor()
             );
         }
