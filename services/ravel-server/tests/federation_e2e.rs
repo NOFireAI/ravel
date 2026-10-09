@@ -55,7 +55,9 @@ use ravel_segment::{
     SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
 };
 use ravel_server::config::RemoteClusterConfig;
-use ravel_server::distrib::{AdmissionClasses, FragmentMetrics, FragmentService};
+use ravel_server::distrib::{
+    AdmissionClasses, FragmentListenerRole, FragmentMetrics, FragmentService,
+};
 use ravel_server::query::build_catalog;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId, TimeRange};
 use tokio::sync::oneshot;
@@ -325,7 +327,8 @@ async fn spawn_remote(
         clock,
         metrics,
         Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
-    );
+    )
+    .with_role(FragmentListenerRole::PublicFederation);
 
     let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
     let recorder = Arc::clone(&seen_auth);

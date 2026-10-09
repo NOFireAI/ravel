@@ -214,6 +214,8 @@ fn harness(
         distrib: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_rejects: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_tls_dials: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
@@ -435,6 +437,8 @@ fn promql_harness(
         distrib: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_rejects: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_tls_dials: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
@@ -1238,6 +1242,8 @@ fn sql_budget_harness(
         distrib: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_rejects: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_tls_dials: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),

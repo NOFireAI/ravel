@@ -22,6 +22,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/fragment_tls.rs"]
+mod fragment_tls;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +47,7 @@ const TOKEN: &str = "acme-token";
 const TENANT: &str = "acme";
 const METRIC: &str = "big_gauge";
 const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
+const SQL_TICKET_KEY: [u8; 32] = [0x5c; 32];
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
@@ -154,7 +158,7 @@ async fn publish_large_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId
 fn distrib_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
-        sql_ticket_keys: None,
+        sql_ticket_keys: Some(vec![SQL_TICKET_KEY]),
         max_inflight_fragments: 8,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
@@ -162,7 +166,7 @@ fn distrib_settings() -> DistribSettings {
             min_segments: 0,
             max_parallel_slices: 8,
         },
-        fragment_listener: None,
+        fragment_listener: fragment_tls::listener_settings(),
         advertise_endpoint: None,
     }
 }

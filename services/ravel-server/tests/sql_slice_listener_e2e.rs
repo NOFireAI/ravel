@@ -5,9 +5,7 @@
 //! `sys/query/workers/`.
 //!
 //! Both processes run `--fragment-listener` with the test CA and a
-//! `ravel-fragment` leaf certificate, and share one `--sql-ticket-key-file`
-//! (or, in one variant, derive the SQL ticket keys from the shared
-//! `--fragment-key-file`).
+//! `ravel-fragment` leaf certificate, and share one `--sql-ticket-key-file`.
 //! The coordinator's store refuses every GET of a published data object, so it
 //! cannot answer any part of the query itself: the query succeeds only when the
 //! worker, in the other process, served the slices. With `--fragment-listener`
@@ -145,19 +143,8 @@ impl Material {
     /// `--listen-grpc` name fixed ports only so validation sees distinct
     /// listeners; the server binds the ephemeral ones in [`ServerConfig`].
     fn distrib_settings(&self) -> DistribSettings {
-        self.distrib_settings_with(true)
-    }
-
-    /// [`Self::distrib_settings`], passing `--sql-ticket-key-file` only when
-    /// `sql_key_file` is set. Without it every SQL ticket key derives from the
-    /// fragment key file.
-    fn distrib_settings_with(&self, sql_key_file: bool) -> DistribSettings {
         let path = |file: &tempfile::NamedTempFile| file.path().to_str().expect("utf8").to_owned();
-        let sql_key_flags = if sql_key_file {
-            vec!["--sql-ticket-key-file".to_owned(), path(&self.sql_keys)]
-        } else {
-            Vec::new()
-        };
+        let sql_key_flags = vec!["--sql-ticket-key-file".to_owned(), path(&self.sql_keys)];
         let flags = [
             "ravel-server".to_owned(),
             "--mode".to_owned(),
@@ -184,12 +171,9 @@ impl Material {
         ];
         let cli = Cli::try_parse_from(flags.into_iter().chain(sql_key_flags)).expect("flags parse");
         cli.validate().expect("flags validate");
-        let settings = cli
-            .parse_distrib_settings()
+        cli.parse_distrib_settings()
             .expect("distributed settings parse")
-            .expect("--distributed-query is on");
-        assert!(settings.fragment_listener.is_some());
-        settings
+            .expect("--distributed-query is on")
     }
 }
 
@@ -646,25 +630,11 @@ fn slice_do_get(handle: Vec<u8>) -> Request<Ticket> {
 /// single-process result bit for bit; the worker read the segments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_slice_fetch_rides_the_dedicated_tls_listener() {
-    cross_process_query_over_the_dedicated_listener(true).await;
-}
-
-/// The same acceptance without `--sql-ticket-key-file`: the dedicated
-/// listener verifies slices under the key both processes derive from the
-/// fragment key file. A dedicated listener holding any other key refuses
-/// every slice as `bad_mac`, and the coordinator, which may not read the
-/// segments, then fails the query.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sql_slice_fetch_without_a_sql_ticket_key_file_uses_the_derived_key() {
-    cross_process_query_over_the_dedicated_listener(false).await;
-}
-
-async fn cross_process_query_over_the_dedicated_listener(sql_key_file: bool) {
     let material = Material::new();
     let shared = Arc::new(MemoryStore::new());
     let (data_keys, start_ns, end_ns) = publish_fixture(&shared).await;
 
-    let settings = || material.distrib_settings_with(sql_key_file);
+    let settings = || material.distrib_settings();
     let worker_store = DataStore::new(shared.clone(), data_keys.clone(), false);
     let worker = start_server(worker_store.clone(), Some(settings())).await;
     let worker_fragment = worker.fragment_addr.expect("the dedicated listener binds");

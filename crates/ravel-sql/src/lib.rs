@@ -135,9 +135,9 @@ pub use ddl_cost::{
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
-    DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, StaticWorkerEndpoints,
-    WorkerEndpoints, WorkerSlice, WorkerSliceClient, distributed_samples_plan,
-    plan_distributed_slices,
+    DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, SliceTlsDialCounter,
+    StaticWorkerEndpoints, WorkerEndpoints, WorkerSlice, WorkerSliceClient,
+    distributed_samples_plan, plan_distributed_slices,
 };
 #[cfg(feature = "flight-sql")]
 pub use distributed_rlog::{

@@ -87,59 +87,54 @@ impl FlightClock for IngestClock {
 /// ceiling becomes the single durable authority the flight_ticket.rs docs
 /// anticipate. The default event-time window still takes ravel-sql's default.
 ///
-/// `distributed`, when `Some`, is the ADR-0071 coordinator-side scan config:
-/// the fleet worker roster plus the cost gate the process
-/// installs under `--distributed-query`. It engages the SQL-lane distributed
-/// scan for a whole-set statement whose pinned snapshot clears the gate; the
-/// external Flight SQL contract (one endpoint, byte-identical result) is
-/// unchanged. `None` leaves the service running every statement whole-set on
-/// this coordinator, exactly as before this seam existed.
+/// The service runs every statement whole-set on this process and serves the
+/// client surface only (`ClientOnly`): it holds no distributed scan config, so
+/// it never dials a worker. The server's own listeners are assembled with
+/// [`service_on_listener`].
 pub fn service(
     state: &SqlState,
     gc_ticket_ceiling: std::time::Duration,
-    distributed: Option<DistributedFlightConfig>,
-) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
-    service_with_ticket_keys(state, gc_ticket_ceiling, distributed, None)
-}
-
-/// [`service`], with the ticket keys read from `--sql-ticket-key-file`
-/// (ADR-1689 decision 2) installed when `ticket_keys` is `Some`. They take
-/// precedence over any `shared_ticket_key` in `distributed`. `None` keeps the
-/// service's own per-process random keys, or the key `distributed` carries.
-pub fn service_with_ticket_keys(
-    state: &SqlState,
-    gc_ticket_ceiling: std::time::Duration,
-    distributed: Option<DistributedFlightConfig>,
-    ticket_keys: Option<SqlTicketKeys>,
 ) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
     service_on_listener(
         state,
         gc_ticket_ceiling,
-        distributed,
-        ticket_keys,
-        FlightMount::default(),
+        None,
+        None,
+        FlightMount {
+            role: FlightListenerRole::ClientOnly,
+            slice_client_tls: None,
+            slice_rejects: None,
+            slice_tls_dials: None,
+        },
     )
 }
 
 /// Which listener a Flight SQL service is mounted on and how its coordinator
-/// dials worker slices (ADR-1689 decision 1). The default is the `Combined`
-/// public listener of a process without `--fragment-listener`, dialing
-/// plaintext.
-#[derive(Clone, Default)]
+/// dials worker slices (ADR-1689 decision 1).
+#[derive(Clone)]
 pub struct FlightMount {
-    /// `Combined` without `--fragment-listener`; with it, `ClientOnly` on the
-    /// public gRPC listener and `SliceOnly` on the dedicated one.
+    /// `ClientOnly` on the public gRPC listener and `SliceOnly` on the
+    /// dedicated fragment listener.
     pub role: FlightListenerRole,
-    /// The pinned-CA client configuration slices are dialed with, or `None`
-    /// to dial plaintext.
+    /// The pinned-CA client configuration the coordinator dials worker slices
+    /// with ([`crate::distrib::fragment_client_tls`]). `None` only for a
+    /// service that dials no worker: one without a distributed scan config, or
+    /// the `SliceOnly` service.
     pub slice_client_tls: Option<tonic::transport::ClientTlsConfig>,
     /// Counters shared by every service of one process, so its refusals are
     /// counted once whichever listener refused them. `None` keeps the
     /// service's own.
     pub slice_rejects: Option<SliceRejectCounters>,
+    /// The counter slice fetches dialed over `slice_client_tls` are recorded
+    /// in. `None` keeps the service's own.
+    pub slice_tls_dials: Option<ravel_sql::SliceTlsDialCounter>,
 }
 
-/// [`service_with_ticket_keys`], mounted as `mount` describes.
+/// The Flight SQL service, mounted as `mount` describes. `distributed`, when
+/// `Some`, is the ADR-0071 coordinator-side scan config: the fleet worker
+/// roster plus the cost gate the process installs under `--distributed-query`.
+/// `ticket_keys` are the keys read from `--sql-ticket-key-file` (ADR-1689
+/// decision 2); `None` keeps the service's own per-process random keys.
 pub fn service_on_listener(
     state: &SqlState,
     gc_ticket_ceiling: std::time::Duration,
@@ -193,6 +188,9 @@ pub fn service_on_listener(
     }
     if let Some(counters) = mount.slice_rejects {
         service = service.with_slice_reject_counters(counters);
+    }
+    if let Some(counter) = mount.slice_tls_dials {
+        service = service.with_slice_tls_dial_counter(counter);
     }
     // Bound every DoGet stream by the server ceiling so a client that opens the
     // stream and then reads nothing cannot pin its query-concurrency permit

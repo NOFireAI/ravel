@@ -86,15 +86,27 @@ both thresholds against your own store.
 
 Enable distribution on each query node. `--distributed-query` and
 `--fragment-key-file` are a pair: either one without the other fails startup.
+`--distributed-query` also requires two more flags, and startup fails without
+either one:
+
+- `--fragment-listener`, with `--fragment-tls-cert`, `--fragment-tls-key` and
+  `--fragment-tls-ca` (see
+  [The dedicated fragment listener](#the-dedicated-fragment-listener)).
+- `--sql-ticket-key-file`, in a build that serves Flight SQL. The published
+  image is one.
 
 ```sh
-# On every query-serving node in the cluster (same key file everywhere).
+# On every query-serving node in the cluster (same key files everywhere).
 ravel-server --mode all \
   --listen-http 0.0.0.0:4318 \
   --listen-grpc 10.0.0.11:4317 \
   --distributed-query \
   --fragment-key-file /etc/ravel/fragment.keys \
-  --sql-ticket-key-file /etc/ravel/sql-ticket.keys
+  --sql-ticket-key-file /etc/ravel/sql-ticket.keys \
+  --fragment-listener 10.0.0.11:4319 \
+  --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
+  --fragment-tls-key /etc/ravel/fragment-tls/tls.key \
+  --fragment-tls-ca /etc/ravel/fragment-ca/ca.crt
 ```
 
 ### `--distributed-query`
@@ -142,41 +154,27 @@ Two nodes that disagree cost more than parallelism:
 - SQL slice tickets between two such nodes fail the MAC of the worker, and
   those slices fall back to the coordinator.
 
-The flag without `--distributed-query` fails startup. In this release the flag
-is optional:
+The flag without `--distributed-query` fails startup, and so does
+`--distributed-query` without the flag in a build that serves Flight SQL. No
+SQL ticket key is derived from the fragment key file.
 
-- Without it, the SQL ticket key is derived from the first fragment key.
-- Startup then logs one warning. The warning names the flags that release B
-  requires with `--distributed-query`: `--fragment-listener` and
-  `--sql-ticket-key-file`. Release B is the release after the operator renders
-  the dedicated listener.
-- The same warning fires when only `--fragment-listener` is missing.
-
-To move a running fleet onto the file without a mixed window, follow the
-switch in the
+To upgrade a fleet whose nodes ran without the file, without a mixed window,
+follow the switch in the
 [deployment guide](operations/deployment.md#the-dedicated-fragment-listener).
 
 ### Where SQL slice tickets travel
 
-The path depends on `--fragment-listener`:
-
-- With the flag, the SQL lane dials the dedicated fragment listener of each
-  worker over mutual TLS. The public gRPC listener refuses a slice ticket (see
-  [The dedicated fragment listener](#the-dedicated-fragment-listener)).
-- Without the flag, the SQL lane dials the `--listen-grpc` address of each
-  worker, and slice tickets travel there in plaintext. A slice ticket read off
-  that network is a replayable read capability for its tenant and segment set
-  until its deadline. Keep the public gRPC port on a network that you trust.
-  Every `--distributed-query` process in `--mode all` or `--mode query` that
-  serves Flight SQL without `--fragment-listener` logs this once at startup.
+The SQL lane dials the dedicated fragment listener of each worker over mutual
+TLS. The public gRPC listener refuses a slice ticket (see
+[The dedicated fragment listener](#the-dedicated-fragment-listener)).
 
 ### `--listen-grpc`
 
-The flag is required in practice. By default the fragment surface is bound
-only on the cluster-internal gRPC listener, never on the client HTTP listener
-and never on the mTLS listener. A node with no gRPC listener never registers
-itself as a worker, so every slice of every query runs coordinator-local. The
-results are correct, but the query is not distributed.
+A `--distributed-query` node in `--mode all` or `--mode query` always binds
+the public gRPC listener. Under `--distributed-query` it serves `Resolve`-scope
+federation and, in a build that serves Flight SQL, the client Flight SQL
+surface. Neither distributed lane of this cluster dials it: both dial the
+dedicated fragment listener.
 
 ### Admission caps for inbound slices
 
@@ -267,11 +265,10 @@ A stale key set on one node is visible in two places:
 
 ### The dedicated fragment listener
 
-By default the fragment service shares the cluster-internal gRPC listener with
-`Resolve`-scope federation traffic and with Flight SQL, and SQL slice `DoGet`
-is served there too. `--fragment-listener <addr>` moves the `Pinned` fragment
-scope and SQL slice `DoGet` onto a fourth listener. That listener terminates
-TLS in-process and serves nothing else.
+`--fragment-listener <addr>`, which `--distributed-query` requires, carries
+the `Pinned` fragment scope and SQL slice `DoGet` on a fourth listener. That
+listener terminates TLS in-process and serves nothing else. `Resolve`-scope
+federation and the client Flight SQL surface stay on the public gRPC listener.
 
 Required flags and certificate:
 
@@ -316,7 +313,7 @@ TLS on this listener is mutual:
 - The same certificate serves SQL slice `DoGet`. The SQL lane needs no
   separate certificate.
 
-When the flag is set, each listener serves the following:
+Each listener serves the following:
 
 - The public gRPC listener stops serving the `Pinned` scope. `Resolve`
   (federation, under ordinary tenant credentials) stays there. The dedicated
@@ -345,13 +342,6 @@ When the flag is set, each listener serves the following:
   fetch. No client credential travels with the slice, because the slice ticket
   is the capability.
 
-Without the flag the fragment surface and SQL slice `DoGet` stay on the public
-gRPC listener, so distribution keeps working through a rolling deploy that
-adds the flag. During that deploy, a slice between a node with the flag and a
-node without it fails its first dial. It is re-dispatched once to another
-worker, and it runs coordinator-local only if that attempt fails too. Results
-do not change.
-
 ### Adding capacity
 
 To add capacity, add processes. A new node with the same flags and the same
@@ -369,27 +359,24 @@ sys/query/workers/<process_id>
 ```
 
 The record is a small JSON control-plane payload. It carries the process id,
-two endpoints, the `queryfrag` protocol version that the node speaks, and a
+one endpoint, the `queryfrag` protocol version that the node speaks, and a
 liveness timestamp that every beat stamps again. The write is an unconditional
 overwrite: one writer per key, no compare-and-swap, no contention. `maintain`
 mode processes use the same pattern for their own heartbeats.
 
-### The two endpoints
+### The endpoint
 
-The two distributed lanes dial two surfaces:
+`fragment_endpoint` is the TLS address of the dedicated fragment listener.
+Both distributed lanes dial it: the PromQL lane for `SeriesFetch` and the SQL
+lane for slice `DoGet`. The SQL lane does not dial a worker whose record
+carries an empty `fragment_endpoint`. The slices of that worker run elsewhere
+or coordinator-local.
 
-- `fragment_endpoint`: the `queryfrag` `SeriesFetch` surface that the PromQL
-  lane dials. With a dedicated fragment listener, it is the TLS address of
-  that listener, and the SQL lane dials it for slice `DoGet` too. Without one,
-  it is the public gRPC listener.
-- `flight_sql_endpoint`: always the public gRPC listener, which mounts Flight
-  SQL. Only a coordinator without `--fragment-listener` dials it for SQL
-  slices, in plaintext. A coordinator with `--fragment-listener` never dials
-  it for a slice. Such a coordinator also does not dial a worker whose record
-  carries no `fragment_endpoint` at all. The slices of that worker run
-  elsewhere or coordinator-local.
+A record written by an earlier release can also carry `flight_sql_endpoint`,
+the public gRPC address that the removed plaintext SQL lane dialed. It still
+decodes, and the field is ignored.
 
-Both endpoints default to the address that the listener bound, and a sibling
+The endpoint defaults to the address that the listener bound, and a sibling
 coordinator dials that string verbatim. A listener bound to a wildcard
 (`0.0.0.0` or `::`) therefore publishes an address that no peer can dial, so
 startup refuses that combination. `--advertise-fragment-endpoint
@@ -400,23 +387,19 @@ ravel-server --mode all \
   --listen-grpc 0.0.0.0:4317 \
   --distributed-query \
   --fragment-key-file /etc/ravel/fragment.keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket.keys \
+  --fragment-listener 0.0.0.0:4319 \
+  --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
+  --fragment-tls-key /etc/ravel/fragment-tls/tls.key \
+  --fragment-tls-ca /etc/ravel/fragment-ca/ca.crt \
   --advertise-fragment-endpoint node-11.internal
 ```
 
-- The host applies to **both** advertised endpoints.
-- A port, if given, applies to the fragment endpoint only. The Flight SQL
-  endpoint always carries the bound port of the public gRPC listener, because
-  the two endpoints name different services and one port cannot stand for
-  both.
-- Startup accepts a port only alongside a dedicated `--fragment-listener`. In
-  the combined layout both endpoints are the one public gRPC socket. A port
-  override reaches the fragment endpoint and leaves the Flight SQL endpoint on
-  the bound port, so one of the two published endpoints is wrong. Startup
-  refuses `host:port` there and names the listener that both lanes share.
-  Advertise a host only, or give the fragment lane its own listener.
+- A wildcard `--listen-grpc` needs no advertised host, because the public
+  gRPC listener is not published.
 - Omit the port unless a NAT or port mapping makes the fragment listener
   reachable on a port other than the one it bound. A host-only value keeps the
-  bound port of each listener.
+  bound port.
 - You can write an IPv6 literal bare (`fd00::1`) or bracketed
   (`[fd00::1]:4319`). It is always advertised bracketed.
 - The flag has meaning only with `--distributed-query`. The flag without
@@ -868,16 +851,18 @@ per-tenant label. There are two exceptions:
   `class` label (`pinned`|`resolve`).
 - The fragment capability reject counter also carries a `reason` label.
 
-`ravel_sql_slice_rejects_total` is listed here because it counts the slice
-fetches of the SQL lane, but it is not part of that family. It carries a
-`reason` label beside `mode`. It renders on every process that serves Flight
-SQL, with or without distribution.
+`ravel_sql_slice_rejects_total` and `ravel_sql_slice_tls_dials_total` are
+listed here because they count the slice fetches of the SQL lane, but they are
+not part of that family. They render on every process that serves Flight SQL,
+with or without distribution. The rejects counter carries a `reason` label
+beside `mode`.
 
 | Metric | Type | What it tells you |
 |---|---|---|
 | `ravel_distrib_fragment_requests_total` | counter | Inbound slice fetches this process served for other coordinators. |
 | `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are `ravel_distrib_fragment_capability_rejects_total`, and reach the coordinator as re-dispatch and fallback. |
-| `ravel_distrib_fragment_capability_rejects_total{reason}` | counter | Inbound `Pinned` fragment requests this worker refused at fragment capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `tenant_mismatch`, `query_mismatch`. What each reason counts is defined in [the observability guide](observability.md#distributed-read-fan-out-ravel_distrib_). A rising `bad_mac` during a key rotation means some coordinator is minting under a key this worker does not hold. A `Pinned` fetch refused on the public listener because `--fragment-listener` is set is refused before verification and counted under no reason. |
+| `ravel_distrib_fragment_capability_rejects_total{reason}` | counter | Inbound `Pinned` fragment requests this worker refused at fragment capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `tenant_mismatch`, `query_mismatch`. What each reason counts is defined in [the observability guide](observability.md#distributed-read-fan-out-ravel_distrib_). A rising `bad_mac` during a key rotation means some coordinator is minting under a key this worker does not hold. A `Pinned` fetch refused on the public listener is refused before verification and counted under no reason. |
+| `ravel_sql_slice_tls_dials_total` | counter | Outbound SQL slice `DoGet` fetches this coordinator dialed over TLS to the dedicated fragment listener of a worker, one per slice fetch sent, a re-dispatch included. Defined in [the observability guide](observability.md#sql-slice-tls-dials-ravel_sql_slice_tls_dials_total). Absent on a process that serves no Flight SQL. |
 | `ravel_sql_slice_rejects_total{reason}` | counter | Inbound SQL slice `DoGet` requests refused at slice capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `wrong_surface`. What each reason counts, and which refusals are counted under none, is defined in [the observability guide](observability.md#sql-slice-capability-rejects-ravel_sql_slice_rejects_total). Absent on a process that serves no Flight SQL. |
 | `ravel_distrib_fragment_inflight{class}` | gauge | Fragments in flight now, split by admission class. `class="pinned"` riding at `--max-inflight-fragments` or `class="resolve"` riding at `--max-inflight-federated-resolves` means that class's inbound slices are queueing; the two never contend for the same permits. |
 | `ravel_distrib_fragment_admission_waits_total{class}` | counter | Inbound fragment requests, by admission class, that found their class's semaphore saturated and had to queue rather than being admitted immediately. |
@@ -891,9 +876,9 @@ SQL, with or without distribution.
 | `ravel_distrib_quarantine_current` | gauge | Endpoints quarantined right now. Rides above zero for the ~2 heartbeat intervals a dead worker takes to readmit or age out. |
 
 On a multi-node cluster, `slices_local_total` that stays high while
-`slices_remote_total` stays at zero indicates a membership problem: no gRPC
-listener, a clock skew wider than `3 * H`, or a protocol-version mismatch
-during a partial upgrade. See [observability.md](observability.md) for how to
+`slices_remote_total` stays at zero indicates a membership problem: a clock
+skew wider than `3 * H`, or a protocol-version mismatch during a partial
+upgrade. See [observability.md](observability.md) for how to
 read the other query cost families alongside these.
 
 ## Failure behavior

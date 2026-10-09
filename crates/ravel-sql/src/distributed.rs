@@ -459,6 +459,23 @@ pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
 ///
 /// [`SqlTicketKeys::mint_key`]: crate::flight_ticket::SqlTicketKeys::mint_key
 /// [`TicketSurface::Slice`]: crate::flight_ticket::TicketSurface::Slice
+/// Slice `DoGet` channels a coordinator built over TLS (ADR-1689 decision 1),
+/// one per slice fetch. Cheap to clone; clones share one count, so a server
+/// reads the count its Flight service records into.
+#[derive(Debug, Clone, Default)]
+pub struct SliceTlsDialCounter(Arc<AtomicU64>);
+
+impl SliceTlsDialCounter {
+    /// The slice fetches dialed over TLS so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn record(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct FlightWorkerSliceClient {
     /// The coordinator's slice mint key, used to sign each slice ticket the
@@ -471,6 +488,8 @@ pub struct FlightWorkerSliceClient {
     /// built lazily; this caps how long the first `DoGet` waits for the TCP and
     /// HTTP/2 handshake before failing with a typed error.
     connect_timeout: Duration,
+    /// Counts each slice fetch whose channel is configured with `tls`.
+    tls_dials: SliceTlsDialCounter,
 }
 
 impl fmt::Debug for FlightWorkerSliceClient {
@@ -495,7 +514,14 @@ impl FlightWorkerSliceClient {
             slice_key,
             tls,
             connect_timeout,
+            tls_dials: SliceTlsDialCounter::default(),
         }
+    }
+
+    /// Count TLS slice dials into `counter` instead of this client's own.
+    pub fn with_tls_dial_counter(mut self, counter: SliceTlsDialCounter) -> Self {
+        self.tls_dials = counter;
+        self
     }
 }
 
@@ -530,6 +556,7 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
                     "invalid TLS configuration for worker location {location:?}: {err}"
                 ))
             })?;
+            self.tls_dials.record();
         }
         let channel = endpoint.connect_lazy();
         let setup = async move {

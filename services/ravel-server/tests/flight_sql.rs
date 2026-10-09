@@ -25,7 +25,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -48,11 +47,9 @@ use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::alerting::ALERT_SHARD;
 use ravel_server::sql::SqlState;
-use ravel_server::sql_distrib::{SliceTransport, distributed_flight_config};
+use ravel_server::sql_distrib::distributed_flight_config;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
-use ravel_sql::{
-    DistributedFlightConfig, SqlConfig, SqlExecutor, StaticWorkerEndpoints, WorkerEndpoints,
-};
+use ravel_sql::{SqlConfig, SqlExecutor};
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use tokio::sync::oneshot;
@@ -382,50 +379,6 @@ fn sql_state_with_shards(
     }
 }
 
-/// Like [`sql_state_with_shards`], but the catalog resolves over
-/// `catalog_store` while every segment fetcher reads `data_store`. The
-/// distributed-listener proof ([`distributed_flight_sql_plaintext_transport_fetches_from_flight_sql_endpoint`])
-/// uses this to give a coordinator a catalog that sees the two shards (so it
-/// engages distribution) but a local fetcher that holds no segment data: the
-/// coordinator's own fallback read of a slice then cannot mask a failed remote
-/// hop, so a slice served only by the remote worker is the only way rows come
-/// back.
-fn sql_state_split(
-    catalog_store: Arc<dyn ObjectStoreBackend>,
-    data_store: Arc<dyn ObjectStoreBackend>,
-    tokens: HashMap<String, TenantId>,
-    shard_count: u32,
-) -> SqlState {
-    let catalog_config = CatalogConfig {
-        shard_count,
-        ..CatalogConfig::default()
-    };
-    let catalog =
-        Arc::new(Catalog::new(Arc::clone(&catalog_store), catalog_config).expect("catalog"));
-    let executor = SqlExecutor::new(
-        catalog,
-        SegmentFetcher::new(data_store.clone()),
-        LogSegmentFetcher::new(data_store.clone()),
-        ravel_sql::SpanSegmentFetcher::new(data_store.clone()),
-        SqlConfig::default(),
-        1 << 30,
-    );
-    SqlState {
-        executor: Arc::new(executor),
-        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
-        store: data_store,
-        clock: Arc::new(FixedClock),
-        max_deadline: Duration::from_secs(30),
-        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
-            std::collections::HashSet::new(),
-        )),
-        query_admission: ravel_query::QueryAdmissionController::shared(
-            ravel_query::QueryConcurrencyLimit::Unlimited,
-        ),
-        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
-    }
-}
-
 /// A running tonic server carrying only the Flight SQL service.
 struct FlightServer {
     addr: SocketAddr,
@@ -435,17 +388,6 @@ struct FlightServer {
 
 impl FlightServer {
     async fn start(state: &SqlState) -> Self {
-        Self::start_with(state, None).await
-    }
-
-    /// Start a Flight server with an ADR-0071 distributed scan config installed,
-    /// so a whole-set statement's `DoGet` fans the samples scan
-    /// out to the roster the config carries.
-    async fn start_distributed(state: &SqlState, distributed: DistributedFlightConfig) -> Self {
-        Self::start_with(state, Some(distributed)).await
-    }
-
-    async fn start_with(state: &SqlState, distributed: Option<DistributedFlightConfig>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -458,7 +400,7 @@ impl FlightServer {
         let ceiling = ravel_server::gc_config::flight_ceiling(
             &ravel_maintain::GcConfigValues::maintain_defaults(),
         );
-        let service = ravel_server::flight::service(state, ceiling, distributed);
+        let service = ravel_server::flight::service(state, ceiling);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -1111,16 +1053,14 @@ async fn a_garbage_ticket_is_refused() {
 /// 2. The SQL lane's worker roster surface -- this crate's
 ///    [`ravel_sql::WorkerEndpoints`] impl over the ravel-fleet query-worker
 ///    registry ([`ravel_server::sql_distrib::FleetWorkerEndpoints`]) -- resolves
-///    a live worker to its Flight location (the fragment gRPC listener, which
-///    also hosts Flight SQL), and [`distributed_flight_config`] carries that
-///    roster plus the cost thresholds a coordinator would install.
+///    a live worker to its slice location (the worker's dedicated TLS fragment
+///    listener), and [`distributed_flight_config`] carries that roster plus the
+///    cost thresholds a coordinator would install.
 ///
-/// It does NOT assert "distributed scan engages"; that is
-/// [`distributed_flight_sql_scan_engages`] below, which installs the config
-/// through `RavelFlightSqlService::with_distributed_scan` and proves the fan-out
-/// runs. Here the config is only built (not installed), so "byte-identical to
-/// distribution off" holds over the single local path, which is what the two-run
-/// assertion records.
+/// It does NOT assert "distributed scan engages"; the cross-process fan-out
+/// over the dedicated listener is `sql_slice_listener_e2e`. Here the config is
+/// only built (not installed), so "byte-identical to distribution off" holds
+/// over the single local path, which is what the two-run assertion records.
 #[tokio::test]
 async fn distributed_flight_sql_reachable_end_to_end() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1175,16 +1115,13 @@ async fn distributed_flight_sql_reachable_end_to_end() {
         "the result is byte-identical run to run (distribution off is the only path)"
     );
 
-    // The SQL-lane worker roster surface: a live worker resolves to its Flight
-    // SQL location (the public gRPC listener, `flight_sql_endpoint`). Here no
-    // dedicated fragment listener is configured, so the fragment endpoint is the
-    // same public gRPC address.
-    let worker_endpoint = server.addr.to_string();
+    // The SQL-lane worker roster surface: a live worker resolves to its slice
+    // location, the dedicated TLS fragment listener (ADR-1689 decision 1).
+    let worker_endpoint = "10.0.0.7:4319".to_string();
     let live_workers = Arc::new(parking_lot::RwLock::new(Arc::new(vec![
         QueryWorkerRecord {
             process_id: "worker-a".to_string(),
             fragment_endpoint: worker_endpoint.clone(),
-            flight_sql_endpoint: worker_endpoint.clone(),
             protocol_version: ravel_query::distrib::codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
@@ -1198,342 +1135,12 @@ async fn distributed_flight_sql_reachable_end_to_end() {
     // own, so nothing is excluded from the roster. The coordinator's
     // self-exclusion has its own cases in `sql_distrib`.
     let self_id = Arc::new(std::sync::OnceLock::new());
-    let config = distributed_flight_config(
-        live_workers,
-        self_id,
-        SliceTransport::PublicPlaintext,
-        thresholds,
-        Some("cluster-secret"),
-    );
+    let config = distributed_flight_config(live_workers, self_id, thresholds);
     assert_eq!(
         config.workers.endpoints(),
-        vec![format!("http://{worker_endpoint}")],
+        vec![format!("https://{worker_endpoint}")],
         "the fleet-backed WorkerEndpoints resolves the live worker to its Flight location"
     );
 
     server.stop().await;
-}
-
-/// A [`WorkerEndpoints`] that counts how many times its roster is resolved and
-/// serves a late-bound location list. `endpoints()` is called by
-/// `plan_distributed_slices` only after the cost gate passes on the engage path,
-/// so a nonzero count is proof the coordinator engaged distribution for a query
-/// -- and stays zero when no config is installed (the flip proof below). The
-/// location list is filled after the server binds (its own address is not known
-/// until then), the same late-binding shape the real fleet roster has.
-struct CountingEndpoints {
-    locations: Arc<parking_lot::RwLock<Vec<String>>>,
-    calls: Arc<AtomicUsize>,
-}
-
-impl WorkerEndpoints for CountingEndpoints {
-    fn endpoints(&self) -> Vec<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.locations.read().clone()
-    }
-}
-
-/// Deliverable 5: the ADR-0071 SQL-lane distributed scan ENGAGES in
-/// the shipping service, and its result is identical to the whole-set local
-/// path.
-///
-/// The fixture publishes the same series to two shards with a `(series_id,
-/// ts=100)` sample duplicated across them. Partitioning is shard-major, so the
-/// pinned snapshot cuts into two slices, and the duplicated sample lands in both
-/// -- which makes the coordinator's cross-slice dedup observable: an undeduped
-/// fan-out would return four rows (100, 100, 200, 300), the deduped result is
-/// three (100, 200, 300). The local run over the same data (no config installed)
-/// also dedups, so the two results matching is the byte-identical guarantee.
-///
-/// Two independent facts are asserted:
-///
-/// 1. Identical result. The query run against a service with the distributed
-///    config installed returns exactly the rows the same query returns against a
-///    service with no config -- same row count, same columns.
-/// 2. Fan-out happened. A [`CountingEndpoints`] wraps the worker roster; its
-///    counter is nonzero only if the coordinator reached
-///    `plan_distributed_slices` (past the cost gate) for the installed-config
-///    run. With the two-shard snapshot the gate returns two slices, so the
-///    coordinator self-dials its own Flight listener twice over a real channel
-///    (each slice ticket carries `slice_count == 2`, served by the fragment
-///    path), and the merged, deduped rows come back.
-///
-/// Non-vacuity (prove-the-test): replacing `start_distributed` with `start`
-/// (installing no config) skips the engage branch in `do_get_statement` -- the
-/// `self.distributed` option is `None`, so `endpoints()` is never called, the
-/// counter stays zero, and the `calls > 0` assertion below fails. Verified by
-/// making that one-line change and observing the failure, then restored; see the
-/// task report.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn distributed_flight_sql_scan_engages() {
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let tenant = TenantId::new("acme".to_string());
-    // The same series on two shards, sharing (ts=100). Deduped distinct ts:
-    // 100, 200, 300 -> three rows; an undeduped cross-slice union would be four.
-    publish_segment_on_shard(store.as_ref(), &tenant, "cpu", 0, &[(100, 1.5), (200, 2.5)]).await;
-    publish_segment_on_shard(store.as_ref(), &tenant, "cpu", 1, &[(100, 1.5), (300, 3.5)]).await;
-    const DEDUPED_ROWS: usize = 3;
-
-    let mut tokens = HashMap::new();
-    tokens.insert("acme-token".to_string(), tenant);
-    // Two shards, so the pinned snapshot resolves both segments and partitions
-    // shard-major into two slices.
-    let state = sql_state_with_shards(store, tokens, 2);
-
-    // Run the query and return (row count, column names).
-    async fn run_query(server: &FlightServer) -> (usize, Vec<String>) {
-        let mut client = server.client().await;
-        let command = CommandStatementQuery {
-            query: QUERY.to_string(),
-            transaction_id: None,
-        };
-        let info = client
-            .get_flight_info(authed(descriptor(&command), "acme-token"))
-            .await
-            .expect("flight info")
-            .into_inner();
-        assert_eq!(
-            info.endpoint.len(),
-            1,
-            "the external client always sees exactly one endpoint, distribution installed or not"
-        );
-        let ticket = info.endpoint[0]
-            .ticket
-            .clone()
-            .expect("the single endpoint carries a ticket");
-        let stream = client
-            .do_get(authed(ticket, "acme-token"))
-            .await
-            .expect("do get")
-            .into_inner();
-        decode(stream).await.expect("decode")
-    }
-
-    // Baseline: no distributed config installed. This is the whole-set local
-    // path (it still dedups across shards locally).
-    let local_server = FlightServer::start(&state).await;
-    let local = run_query(&local_server).await;
-    assert_eq!(
-        local.0, DEDUPED_ROWS,
-        "the local path dedups the cross-shard duplicate"
-    );
-    local_server.stop().await;
-
-    // Engage: install a distributed config whose roster is the coordinator's own
-    // Flight listener (single process => the worker shares this coordinator's
-    // ticket key and tenant resolver, so a self-dialed slice fetch authenticates
-    // and its ticket MAC verifies). The location is filled after the server binds.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let locations: Arc<parking_lot::RwLock<Vec<String>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let config = DistributedFlightConfig {
-        workers: Arc::new(CountingEndpoints {
-            locations: locations.clone(),
-            calls: calls.clone(),
-        }),
-        // Zeroed byte/segment thresholds so the cost gate always trips; the
-        // two-shard snapshot then cuts two slices to fan out.
-        thresholds: ravel_query::distrib::partition::DistribThresholds {
-            min_store_bytes: 0,
-            min_segments: 0,
-            max_parallel_slices: 8,
-        },
-        // Single process: keep the service's own key; the self-dialed worker is
-        // this same instance, so its ticket MAC verifies without a derived key.
-        shared_ticket_key: None,
-    };
-    let dist_server = FlightServer::start_distributed(&state, config).await;
-    *locations.write() = vec![format!("http://{}", dist_server.addr)];
-
-    let distributed = run_query(&dist_server).await;
-
-    // Fact 1: identical result.
-    assert_eq!(
-        distributed, local,
-        "the distributed scan returns exactly the whole-set local result (cross-slice dedup ran)"
-    );
-    assert_eq!(
-        distributed.0, DEDUPED_ROWS,
-        "the coordinator deduped the sample duplicated across the two slices"
-    );
-
-    // Fact 2: distribution actually engaged. `endpoints()` is reached only past
-    // the cost gate on the engage path, so a nonzero count proves the fan-out
-    // ran; it stays zero with no config installed (see the non-vacuity note).
-    assert!(
-        calls.load(Ordering::SeqCst) > 0,
-        "the coordinator engaged distribution and resolved the worker roster"
-    );
-
-    dist_server.stop().await;
-}
-
-/// Regression proof for #1296, for the plaintext transport: a coordinator
-/// without `--fragment-listener` (release A, ADR-1689 decision 4) fans a slice
-/// out to a worker whose record names two different endpoints, and the fetch
-/// reaches the worker's Flight SQL listener (its public gRPC address), never
-/// `fragment_endpoint`.
-///
-/// Here `fragment_endpoint` is a port that holds no Flight service, and
-/// `flight_sql_endpoint` names the public gRPC listener where Flight SQL
-/// `DoGet` lives in the `Combined` layout. The real server roster surface
-/// ([`FleetWorkerEndpoints`], via [`distributed_flight_config`]) must resolve the
-/// worker to the latter. With `--fragment-listener` the lane dials
-/// `fragment_endpoint` over TLS instead (ADR-1689 decision 1); that transport
-/// is driven end to end by `sql_slice_listener_e2e`.
-///
-/// This exercises the production `FlightWorkerSliceClient` (built inside the
-/// coordinator's `do_get`) against a REAL worker listener, over a real Flight
-/// channel. It is discriminating because the coordinator's catalog sees the two
-/// shards (so distribution engages) while its LOCAL fetcher holds no segment
-/// data: the coordinator-local fallback read of a slice therefore cannot mask a
-/// failed remote hop, which is exactly what hides this defect on a shared-store
-/// cluster. Pre-fix the roster resolves the worker to `fragment_endpoint`, the
-/// slice fetch dials a port with no Flight service, the local fallback finds no
-/// data, and `DoGet` fails. Fixed, the roster resolves `flight_sql_endpoint`,
-/// the worker serves both slices, and the deduped rows come back.
-///
-/// The fixture is the two-shard series of [`distributed_flight_sql_scan_engages`]
-/// (the `(cpu, ts=100)` duplicate makes cross-slice dedup observable: an
-/// undeduped union would be four rows, the deduped result is three).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn distributed_flight_sql_plaintext_transport_fetches_from_flight_sql_endpoint() {
-    let data_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let tenant = TenantId::new("acme".to_string());
-    publish_segment_on_shard(
-        data_store.as_ref(),
-        &tenant,
-        "cpu",
-        0,
-        &[(100, 1.5), (200, 2.5)],
-    )
-    .await;
-    publish_segment_on_shard(
-        data_store.as_ref(),
-        &tenant,
-        "cpu",
-        1,
-        &[(100, 1.5), (300, 3.5)],
-    )
-    .await;
-    const DEDUPED_ROWS: usize = 3;
-
-    let mut tokens = HashMap::new();
-    tokens.insert("acme-token".to_string(), tenant);
-
-    // The cluster-shared Flight ticket key: the coordinator signs each slice
-    // ticket, the worker verifies it (ADR-0071 amendment, decision 2).
-    let secret = "cluster-secret";
-    let shared_key = ravel_sql::derive_ticket_key(secret.as_bytes());
-    let thresholds = ravel_query::distrib::partition::DistribThresholds {
-        min_store_bytes: 0,
-        min_segments: 0,
-        max_parallel_slices: 8,
-    };
-
-    // Worker: a real Flight SQL listener over the full data. Installing a
-    // distributed config with the shared key (empty roster) makes it verify the
-    // coordinator's slice tickets with that key; it never coordinates itself.
-    let worker_state = sql_state_with_shards(data_store.clone(), tokens.clone(), 2);
-    let worker = FlightServer::start_distributed(
-        &worker_state,
-        DistributedFlightConfig {
-            workers: Arc::new(StaticWorkerEndpoints::new(std::iter::empty::<String>())),
-            thresholds,
-            shared_ticket_key: Some(shared_key),
-        },
-    )
-    .await;
-    let flight_addr = worker.addr;
-
-    // A `fragment_endpoint` the plaintext transport must never dial: a port
-    // that accepts a connection and immediately closes it, so it hosts no
-    // Flight `DoGet`.
-    let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind dead fragment listener");
-    let dead_addr = dead.local_addr().expect("dead fragment addr");
-    let (dead_tx, mut dead_rx) = oneshot::channel::<()>();
-    let dead_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut dead_rx => break,
-                accepted = dead.accept() => match accepted {
-                    Ok((stream, _)) => drop(stream),
-                    Err(_) => break,
-                },
-            }
-        }
-    });
-
-    // A record whose two endpoints differ, so the one dialed is observable.
-    let record = QueryWorkerRecord {
-        process_id: "worker-b".to_string(),
-        fragment_endpoint: dead_addr.to_string(),
-        flight_sql_endpoint: flight_addr.to_string(),
-        protocol_version: ravel_query::distrib::codec::PROTOCOL_VERSION,
-        started_unix_ns: 0,
-    };
-    let live = Arc::new(parking_lot::RwLock::new(Arc::new(vec![record])));
-    let self_id = Arc::new(std::sync::OnceLock::new());
-    let config = distributed_flight_config(
-        live,
-        self_id,
-        SliceTransport::PublicPlaintext,
-        thresholds,
-        Some(secret),
-    );
-    // The real roster surface must resolve the worker to its Flight SQL endpoint,
-    // never the fragment listener. This is the crux of the #1296 fix.
-    assert_eq!(
-        config.workers.endpoints(),
-        vec![format!("http://{flight_addr}")],
-        "the SQL lane must dial the Flight SQL endpoint, not the fragment listener"
-    );
-
-    // Coordinator: its catalog sees both shards over the full data (so
-    // distribution engages), but its local fetcher reads an empty store, so a
-    // failed remote hop cannot be masked by a coordinator-local read.
-    let empty_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let coord_state = sql_state_split(data_store.clone(), empty_store, tokens, 2);
-    let coordinator = FlightServer::start_distributed(&coord_state, config).await;
-
-    // Drive a metrics statement over the cost gate against the coordinator.
-    let mut client = coordinator.client().await;
-    let command = CommandStatementQuery {
-        query: QUERY.to_string(),
-        transaction_id: None,
-    };
-    let info = client
-        .get_flight_info(authed(descriptor(&command), "acme-token"))
-        .await
-        .expect("flight info")
-        .into_inner();
-    assert_eq!(
-        info.endpoint.len(),
-        1,
-        "the external client always sees exactly one endpoint"
-    );
-    let ticket = info.endpoint[0]
-        .ticket
-        .clone()
-        .expect("the single endpoint carries a ticket");
-    let stream = client
-        .do_get(authed(ticket, "acme-token"))
-        .await
-        .expect("do get")
-        .into_inner();
-    let (rows, columns) = decode(stream)
-        .await
-        .expect("the slice fetch reaches the worker's Flight endpoint and streams the rows back");
-    assert_eq!(
-        rows, DEDUPED_ROWS,
-        "the two shard-major slices dedup to three rows, served by the remote worker"
-    );
-    assert_eq!(columns, vec!["ts".to_string(), "value".to_string()]);
-
-    let _ = dead_tx.send(());
-    let _ = dead_task.await;
-    coordinator.stop().await;
-    worker.stop().await;
 }

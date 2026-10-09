@@ -50,7 +50,9 @@ use rand::Rng as _;
 use arrow_flight::sql::Any;
 use tonic::transport::ClientTlsConfig;
 
-use crate::distributed::{DistributedFlightConfig, FlightWorkerSliceClient, WorkerSliceClient};
+use crate::distributed::{
+    DistributedFlightConfig, FlightWorkerSliceClient, SliceTlsDialCounter, WorkerSliceClient,
+};
 use crate::executor::{ParquetPlan, PinnedPlanInputs, PinnedResolve, SqlExecutor};
 use crate::flight::request::{sql_request, status_from_sql};
 use crate::flight::slice::{
@@ -99,6 +101,8 @@ pub struct RavelFlightSqlService {
     slice_client_tls: Option<ClientTlsConfig>,
     /// Refused slice capabilities, by closed reason.
     slice_rejects: SliceRejectCounters,
+    /// Slice fetches this coordinator dialed over `slice_client_tls`.
+    slice_tls_dials: SliceTlsDialCounter,
     /// The evidential audit sink one event per executed statement is submitted
     /// through (ADR-0042 decision 4, ADR-0062 §2a).
     /// Migrated from the raw object-store handle this service previously wrote
@@ -180,6 +184,7 @@ impl RavelFlightSqlService {
             listener_role: FlightListenerRole::default(),
             slice_client_tls: None,
             slice_rejects: SliceRejectCounters::default(),
+            slice_tls_dials: SliceTlsDialCounter::default(),
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             recorder,
             query_admission,
@@ -255,6 +260,13 @@ impl RavelFlightSqlService {
     /// reports one set of counts.
     pub fn with_slice_reject_counters(mut self, counters: SliceRejectCounters) -> Self {
         self.slice_rejects = counters;
+        self
+    }
+
+    /// Count slice fetches dialed over TLS into `counter` instead of this
+    /// service's own, so the server can report them.
+    pub fn with_slice_tls_dial_counter(mut self, counter: SliceTlsDialCounter) -> Self {
+        self.slice_tls_dials = counter;
         self
     }
 
@@ -697,12 +709,14 @@ impl FlightSqlService for RavelFlightSqlService {
                     &decoded,
                 )
                 .map(|slices| {
-                    let client: Arc<dyn WorkerSliceClient> =
-                        Arc::new(FlightWorkerSliceClient::new(
+                    let client: Arc<dyn WorkerSliceClient> = Arc::new(
+                        FlightWorkerSliceClient::new(
                             *self.slice_ticket_key(),
                             self.slice_client_tls.clone(),
                             DISTRIB_SLICE_CONNECT_TIMEOUT,
-                        ));
+                        )
+                        .with_tls_dial_counter(self.slice_tls_dials.clone()),
+                    );
                     (slices, client)
                 })
         });

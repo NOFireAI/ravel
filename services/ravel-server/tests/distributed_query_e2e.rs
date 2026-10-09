@@ -35,6 +35,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/fragment_tls.rs"]
+mod fragment_tls;
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,6 +66,7 @@ const METRIC: &str = "m";
 /// The cluster fragment key every distributed test mints and verifies
 /// capabilities under (ADR-0071 amendment, decision 2).
 const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
+const SQL_TICKET_KEY: [u8; 32] = [0x5c; 32];
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
@@ -183,7 +187,7 @@ async fn publish_segment_seq(
 fn always_distribute_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
-        sql_ticket_keys: None,
+        sql_ticket_keys: Some(vec![SQL_TICKET_KEY]),
         max_inflight_fragments: 32,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
@@ -191,11 +195,9 @@ fn always_distribute_settings() -> DistribSettings {
             min_segments: 0,
             max_parallel_slices: 8,
         },
-        // No dedicated fragment listener (ADR-0071 amendment decision 1): these
-        // tests exercise the pre-amendment combined surface on the public gRPC
-        // listener. Naming the new field is forced by Rust's exhaustive struct
-        // literal; the value is the legacy default and changes no behavior here.
-        fragment_listener: None,
+        // The dedicated TLS fragment listener `--distributed-query` requires
+        // (ADR-1689 decision 4), on an ephemeral loopback port.
+        fragment_listener: fragment_tls::listener_settings(),
         // Loopback, ephemeral-port binds: the advertised endpoints are the
         // bound addresses, so no `--advertise-fragment-endpoint` override.
         advertise_endpoint: None,
@@ -263,6 +265,15 @@ async fn start_server_with_query_cap(
     distrib: Option<DistribSettings>,
     query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
 ) -> ravel_server::Running {
+    start_server_with(store, distrib, query_concurrency_limit, 1).await
+}
+
+async fn start_server_with(
+    store: Arc<dyn ObjectStoreBackend>,
+    distrib: Option<DistribSettings>,
+    query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
+    shard_count: u32,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -280,7 +291,7 @@ async fn start_server_with_query_cap(
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
-        shard_count: 1,
+        shard_count,
         tenant_resolver,
         mtls_listener: None,
         fold_tenants: Vec::new(),
@@ -524,21 +535,15 @@ async fn fragment_surface_requires_capability_and_flag() {
 
     // Server A: --distributed-query on, guarded by capabilities under FRAGMENT_KEY.
     let distributed = start_server(Arc::clone(&store), Some(always_distribute_settings())).await;
-    let grpc_addr = distributed
-        .grpc_addr
-        .expect("gRPC listener binds in All mode");
-    let endpoint = format!("http://{grpc_addr}");
+    let fragment_addr = distributed
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
 
-    let fetch = |capability: Vec<u8>| {
-        let endpoint = endpoint.clone();
-        async move {
-            let mut client = SeriesFetchClient::connect(endpoint)
-                .await
-                .expect("connect to fragment surface");
-            let claims = capability_claims();
-            let request = request_for(&claims, capability);
-            client.fetch(tonic::Request::new(request)).await
-        }
+    let fetch = |capability: Vec<u8>| async move {
+        let mut client = SeriesFetchClient::new(fragment_tls::dial(fragment_addr).await);
+        let claims = capability_claims();
+        let request = request_for(&claims, capability);
+        client.fetch(tonic::Request::new(request)).await
     };
 
     // No capability: rejected.
@@ -651,7 +656,9 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     // Server A: a real --distributed-query process exposing the SeriesFetch
     // fragment gRPC surface over the shared store.
     let server_a = start_server(Arc::clone(&store), Some(always_distribute_settings())).await;
-    let a_grpc = server_a.grpc_addr.expect("gRPC listener binds in All mode");
+    let a_fragment = server_a
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
 
     // The coordinator's slice fetcher: A is the only live worker, and self is a
     // uuid absent from the worker set, so rendezvous ownership of every unit
@@ -689,8 +696,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
         .expect("set self id");
     let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
-        fragment_endpoint: a_grpc.to_string(),
-        flight_sql_endpoint: a_grpc.to_string(),
+        fragment_endpoint: a_fragment.to_string(),
         protocol_version: codec::PROTOCOL_VERSION,
         started_unix_ns: 0,
     }])));
@@ -700,6 +706,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -914,7 +921,9 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock() {
     )
     .await;
     let base = format!("http://{}", server.http_addr);
-    let grpc = server.grpc_addr.expect("gRPC listener binds in All mode");
+    let fragment = server
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
 
     // Q1: a real client query. It admits (taking the only permit) and then
     // parks on the gated store read, holding the permit for the rest of the
@@ -960,9 +969,7 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock() {
     // served while the client cap is fully held. A shared bound would leave
     // this waiting on the permit Q1 holds.
     let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let mut client = SeriesFetchClient::connect(format!("http://{grpc}"))
-            .await
-            .expect("connect to fragment gRPC");
+        let mut client = SeriesFetchClient::new(fragment_tls::dial(fragment).await);
         let request = valid_capability_request();
         client.fetch(tonic::Request::new(request)).await
     })
@@ -1021,7 +1028,9 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock_single_fragment_
     )
     .await;
     let base = format!("http://{}", server.http_addr);
-    let grpc = server.grpc_addr.expect("gRPC listener binds in All mode");
+    let fragment = server
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
 
     // Q1 holds the single client permit, parked on the gated store read.
     gated.arm();
@@ -1062,9 +1071,7 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock_single_fragment_
     // The fragment probe admits against the single-permit fragment class and is
     // served while the client cap is fully held.
     let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let mut client = SeriesFetchClient::connect(format!("http://{grpc}"))
-            .await
-            .expect("connect to fragment gRPC");
+        let mut client = SeriesFetchClient::new(fragment_tls::dial(fragment).await);
         let request = valid_capability_request();
         client.fetch(tonic::Request::new(request)).await
     })
@@ -1219,7 +1226,7 @@ async fn spawn_mock_worker(
     let addr = listener.local_addr().expect("mock worker local addr");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        fragment_tls::tls_server()
             .add_service(SeriesFetchServer::new(worker))
             .serve_with_incoming_shutdown(
                 tonic::transport::server::TcpIncoming::from(listener),
@@ -1316,21 +1323,18 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         QueryWorkerRecord {
             process_id: a_id.to_string(),
             fragment_endpoint: a_endpoint.clone(),
-            flight_sql_endpoint: a_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: b_id.to_string(),
             fragment_endpoint: b_endpoint.clone(),
-            flight_sql_endpoint: b_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: c_id.to_string(),
             fragment_endpoint: c_endpoint.clone(),
-            flight_sql_endpoint: c_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
@@ -1374,6 +1378,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -1519,7 +1524,6 @@ async fn version_mismatch_falls_back_to_local() {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
         // Reserved TEST-NET address that never accepts a connection.
         fragment_endpoint: "192.0.2.1:9".to_string(),
-        flight_sql_endpoint: "192.0.2.1:9".to_string(),
         protocol_version: codec::PROTOCOL_VERSION + 1,
         started_unix_ns: 0,
     }])));
@@ -1529,6 +1533,7 @@ async fn version_mismatch_falls_back_to_local() {
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -1656,14 +1661,12 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     let live = Arc::new(RwLock::new(Arc::new(vec![
         QueryWorkerRecord {
             process_id: a_id.to_string(),
-            flight_sql_endpoint: a_endpoint.clone(),
             fragment_endpoint: a_endpoint,
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: b_id.to_string(),
-            flight_sql_endpoint: b_endpoint.clone(),
             fragment_endpoint: b_endpoint,
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
@@ -1709,6 +1712,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     );
 
     let request = pb::FetchRequest {
@@ -1796,7 +1800,9 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let y_store: Arc<dyn ObjectStoreBackend> = gated.clone();
     publish_segment(y_store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
     let server_y = start_server(Arc::clone(&y_store), Some(always_distribute_settings())).await;
-    let y_grpc = server_y.grpc_addr.expect("gRPC listener binds in All mode");
+    let y_fragment = server_y
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
     let y_http = format!("http://{}", server_y.http_addr);
 
     // Coordinator over its own ungated store (same published data), so its own
@@ -1838,8 +1844,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
         .expect("set self id");
     let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
-        fragment_endpoint: y_grpc.to_string(),
-        flight_sql_endpoint: y_grpc.to_string(),
+        fragment_endpoint: y_fragment.to_string(),
         protocol_version: codec::PROTOCOL_VERSION,
         started_unix_ns: 0,
     }])));
@@ -1849,6 +1854,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -1994,14 +2000,12 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         QueryWorkerRecord {
             process_id: a_id.to_string(),
             fragment_endpoint: a_endpoint.clone(),
-            flight_sql_endpoint: a_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: b_id.to_string(),
             fragment_endpoint: b_endpoint.clone(),
-            flight_sql_endpoint: b_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
@@ -2044,6 +2048,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -2327,7 +2332,9 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
         Some(always_distribute_settings()),
     )
     .await;
-    let a_grpc = server_a.grpc_addr.expect("gRPC listener binds in All mode");
+    let a_fragment = server_a
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
 
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = AdmissionClasses::new(8, 8, metrics.clone());
@@ -2362,8 +2369,7 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
         .expect("set self id");
     let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
-        fragment_endpoint: a_grpc.to_string(),
-        flight_sql_endpoint: a_grpc.to_string(),
+        fragment_endpoint: a_fragment.to_string(),
         protocol_version: codec::PROTOCOL_VERSION,
         started_unix_ns: 0,
     }])));
@@ -2373,6 +2379,7 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
         Arc::new(vec![FRAGMENT_KEY]),
         fallback_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -2673,7 +2680,6 @@ async fn a_retryable_record_get_on_a_self_mapped_slice_still_answers_the_query()
         process_id: self_id.to_string(),
         // Never dialed: a self-mapped slice makes no network hop.
         fragment_endpoint: "127.0.0.1:1".to_string(),
-        flight_sql_endpoint: "127.0.0.1:1".to_string(),
         protocol_version: codec::PROTOCOL_VERSION,
         started_unix_ns: 0,
     }])));
@@ -2683,6 +2689,7 @@ async fn a_retryable_record_get_on_a_self_mapped_slice_still_answers_the_query()
         Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(ravel_query::distrib::Distributed::new(
         fetcher,
@@ -2761,4 +2768,522 @@ async fn a_retryable_record_get_on_a_self_mapped_slice_still_answers_the_query()
         0,
         "a self-mapped slice never enters the remote-then-fallback ladder"
     );
+}
+
+/// ADR-1689 decision 4 (release B) grep gate: no source under `crates/` or
+/// `services/` names the deleted `Combined` fragment role or the removed
+/// heartbeat field, except the one ravel-fleet test that decodes a heartbeat
+/// object written before the removal. The needles are assembled at run time so
+/// this file does not match itself.
+#[test]
+fn release_b_leaves_no_combined_role_or_removed_heartbeat_field() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let needles = [
+        concat!("FragmentListener", "Role::Combined"),
+        concat!("flight_sql", "_endpoint"),
+    ];
+    let allowed_file = std::path::Path::new("crates/ravel-fleet/src/query_workers.rs");
+    let allowed_test = concat!(
+        "fn pre_release_b_record_with_",
+        "flight_sql",
+        "_endpoint_decodes_and_ignores_it()"
+    );
+
+    let mut stack = vec![root.join("crates"), root.join("services")];
+    let mut scanned = 0;
+    let mut hits = Vec::new();
+    let mut allowed_hits = 0;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                if !matches!(name, "target" | "node_modules") && !name.starts_with('.') {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            scanned += 1;
+            let relative = path
+                .strip_prefix(&root)
+                .expect("under the root")
+                .to_path_buf();
+            // The allowed span: the decode-compatibility test, from its doc
+            // comment to the first line closing a test-module item after it.
+            let allowed_lines = if relative == allowed_file {
+                let lines: Vec<&str> = text.lines().collect();
+                let fn_line = lines
+                    .iter()
+                    .position(|l| l.contains(allowed_test))
+                    .expect("the decode-compatibility test exists");
+                let start = (0..fn_line)
+                    .rev()
+                    .take_while(|&i| {
+                        lines[i].trim_start().starts_with("///") || lines[i].trim() == "#[test]"
+                    })
+                    .last()
+                    .unwrap_or(fn_line);
+                let end = (fn_line..lines.len())
+                    .find(|&i| lines[i] == "    }")
+                    .expect("the test closes");
+                Some(start..=end)
+            } else {
+                None
+            };
+            for (index, line) in text.lines().enumerate() {
+                for needle in needles {
+                    if line.contains(needle) {
+                        if allowed_lines.as_ref().is_some_and(|r| r.contains(&index)) {
+                            allowed_hits += 1;
+                        } else {
+                            hits.push(format!("{}:{}: {line}", relative.display(), index + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the scan read the checkout ({scanned} files)"
+    );
+    assert!(
+        allowed_hits > 0,
+        "the decode-compatibility test still names the field it decodes"
+    );
+    assert!(hits.is_empty(), "release B leftovers:\n{}", hits.join("\n"));
+}
+
+/// ADR-1689 decision 4 (release B): SQL slices travel only to the dedicated
+/// TLS fragment listener.
+#[cfg(feature = "flight-sql")]
+mod sql_slices {
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    use arrow_flight::Ticket;
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, TicketStatementQuery};
+    use futures::TryStreamExt;
+    use prost::Message;
+    use ravel_sql::{FlightTicket, SliceReject, SqlTicketKeys, TicketSurface};
+    use tonic::Request;
+
+    use super::*;
+
+    const QUERY: &str = "SELECT ts, value FROM samples ORDER BY ts";
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    /// A store over one shared [`MemoryStore`] that counts GETs of the
+    /// published data objects and, when `refuse` is set, fails them.
+    struct DataStore {
+        inner: Arc<MemoryStore>,
+        data_keys: HashSet<String>,
+        refuse: bool,
+        data_gets: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for DataStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            if self.data_keys.contains(key) {
+                self.data_gets.fetch_add(1, Ordering::SeqCst);
+                if self.refuse {
+                    return Err(StoreError::AccessDenied(format!(
+                        "the coordinator may not read {key}"
+                    )));
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Publish one segment of `cpu` on `shard` with `samples` and return its
+    /// data key.
+    async fn publish_on_shard(store: &MemoryStore, shard: u32, samples: &[(i64, f64)]) -> String {
+        let tenant = TenantId::new(TENANT);
+        let tenant_hash = tenant.hash();
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(&tenant, "cpu", &label_set).expect("series id"),
+            labels: label_set,
+            samples: samples
+                .iter()
+                .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                .collect(),
+        }];
+        let writer_id = uuid::Uuid::from_u128(7_000 + u128::from(shard));
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let base_ns = samples[0].0;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: base_ns + 4 * NS_PER_MIN,
+            ingest_hour_bucket: u32::try_from(base_ns / NS_PER_HOUR).expect("hour bucket fits u32"),
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        data_key
+    }
+
+    /// `message` with the tenant bearer token and the query window attached.
+    fn authed<T>(message: T, start_ns: i64, end_ns: i64) -> Request<T> {
+        let mut request = Request::new(message);
+        let metadata = request.metadata_mut();
+        metadata.insert(
+            "authorization",
+            format!("Bearer {TOKEN}").parse().expect("ascii"),
+        );
+        metadata.insert(
+            "x-ravel-start",
+            (start_ns / NS_PER_SEC).to_string().parse().expect("ascii"),
+        );
+        metadata.insert(
+            "x-ravel-end",
+            (end_ns / NS_PER_SEC).to_string().parse().expect("ascii"),
+        );
+        request
+    }
+
+    /// A client of the public gRPC listener at `grpc`, which is plaintext.
+    async fn public_client(
+        grpc: std::net::SocketAddr,
+    ) -> FlightServiceClient<tonic::transport::Channel> {
+        let channel = tonic::transport::Channel::from_shared(format!("http://{grpc}"))
+            .expect("valid endpoint uri")
+            .connect()
+            .await
+            .expect("connect to the public gRPC listener");
+        FlightServiceClient::new(channel)
+    }
+
+    /// One Flight SQL statement against `grpc`, returning how many rows came
+    /// back, or the status that refused it.
+    async fn run_query(
+        grpc: std::net::SocketAddr,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<usize, String> {
+        let mut client = public_client(grpc).await;
+        let command = CommandStatementQuery {
+            query: QUERY.to_string(),
+            transaction_id: None,
+        };
+        let descriptor = arrow_flight::FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+        let info = client
+            .get_flight_info(authed(descriptor, start_ns, end_ns))
+            .await
+            .map_err(|s| format!("get_flight_info: {s}"))?
+            .into_inner();
+        let ticket = info.endpoint[0].ticket.clone().expect("endpoint ticket");
+        let stream = client
+            .do_get(authed(ticket, start_ns, end_ns))
+            .await
+            .map_err(|s| format!("do_get: {s}"))?
+            .into_inner();
+        let batches: Vec<_> = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|s| arrow_flight::error::FlightError::Tonic(Box::new(s))),
+        )
+        .try_collect()
+        .await
+        .map_err(|e| format!("do_get stream: {e}"))?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+
+    /// Every query-worker heartbeat object in `store`, as raw JSON.
+    async fn heartbeat_objects(store: &MemoryStore) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for meta in store
+            .list(ravel_fleet::query_workers::QUERY_WORKERS_PREFIX, None)
+            .await
+            .expect("list query workers")
+            .objects
+        {
+            let got = store
+                .get(&meta.key, GetRange::Full)
+                .await
+                .expect("get worker record");
+            out.push(serde_json::from_slice(got.data.as_ref()).expect("record is JSON"));
+        }
+        out
+    }
+
+    /// A slice capability for `TENANT` over no segments, minted under the
+    /// cluster's SQL ticket key exactly as a coordinator mints one.
+    fn slice_capability() -> Vec<u8> {
+        let now = now_ns();
+        let ticket = FlightTicket {
+            tenant: TenantId::new(TENANT).hash(),
+            statement: String::new(),
+            segments: Vec::new(),
+            min_commit_tokens: Vec::new(),
+            now_ns: now,
+            deadline_ns: now + 60 * NS_PER_SEC,
+            slice_index: 0,
+            slice_count: 2,
+            pending_erasure: Vec::new(),
+            declared_columns: Vec::new(),
+            parquet_tables: Vec::new(),
+            budgets: None,
+        };
+        SqlTicketKeys::from_file_key(&SQL_TICKET_KEY)
+            .encode(&ticket, TicketSurface::Slice)
+            .expect("encode")
+    }
+
+    /// A coordinator and a worker, both with the dedicated listener: the
+    /// coordinator's SQL roster names the worker at
+    /// `https://{fragment_endpoint}` and never at its public gRPC address;
+    /// every slice fetch is dialed over TLS (the coordinator's
+    /// `ravel_sql_slice_tls_dials_total` counts one per slice, and the
+    /// coordinator, which may not read the segments, still answers, so the
+    /// worker served them); the worker's heartbeat record carries the fragment
+    /// endpoint and no other address; and a slice ticket presented on the
+    /// worker's public listener is refused as `wrong_surface`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sql_slices_dial_only_the_tls_fragment_listener() {
+        const SLICES: u64 = 2;
+        let shared = Arc::new(MemoryStore::new());
+        let base = now_ns() - 10 * NS_PER_MIN;
+        let data_keys: HashSet<String> = [
+            publish_on_shard(&shared, 0, &[(base, 1.5), (base + NS_PER_MIN, 2.5)]).await,
+            publish_on_shard(&shared, 1, &[(base, 1.5), (base + 2 * NS_PER_MIN, 3.5)]).await,
+        ]
+        .into_iter()
+        .collect();
+        let (start_ns, end_ns) = (base - 5 * NS_PER_MIN, now_ns());
+
+        let worker_store = Arc::new(DataStore {
+            inner: shared.clone(),
+            data_keys: data_keys.clone(),
+            refuse: false,
+            data_gets: AtomicUsize::new(0),
+        });
+        let worker = start_server_with(
+            worker_store.clone(),
+            Some(always_distribute_settings()),
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+            2,
+        )
+        .await;
+        let worker_fragment = worker
+            .fragment_addr
+            .expect("the dedicated fragment listener binds");
+        let worker_grpc = worker.grpc_addr.expect("gRPC binds in All mode");
+        let coordinator_store = Arc::new(DataStore {
+            inner: shared.clone(),
+            data_keys,
+            refuse: true,
+            data_gets: AtomicUsize::new(0),
+        });
+        let coordinator = start_server_with(
+            coordinator_store,
+            Some(always_distribute_settings()),
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+            2,
+        )
+        .await;
+        let coordinator_grpc = coordinator.grpc_addr.expect("gRPC binds in All mode");
+
+        // The dial target: the roster resolves exactly as the coordinator's
+        // `DoGet` resolves it, once its heartbeat read lists the worker.
+        let roster = coordinator
+            .sql_slice_workers
+            .clone()
+            .expect("--distributed-query builds the SQL roster");
+        let deadline = Instant::now() + DEADLINE;
+        let locations = loop {
+            let locations = roster.endpoints();
+            if !locations.is_empty() {
+                break locations;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the coordinator never listed the worker"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            locations,
+            vec![format!("https://{worker_fragment}")],
+            "the only slice location is the worker's dedicated listener, over https"
+        );
+
+        // The heartbeat record names the dedicated listener and nothing else:
+        // its fields are exactly these four, and the public gRPC address
+        // appears in no record.
+        let records = heartbeat_objects(&shared).await;
+        assert_eq!(records.len(), 2, "one record per process: {records:?}");
+        for record in &records {
+            let fields: HashSet<&str> = record
+                .as_object()
+                .expect("a record is a JSON object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                fields,
+                HashSet::from([
+                    "process_id",
+                    "fragment_endpoint",
+                    "protocol_version",
+                    "started_unix_ns"
+                ]),
+                "{record}"
+            );
+            assert!(
+                !record.to_string().contains(&worker_grpc.to_string())
+                    && !record.to_string().contains(&coordinator_grpc.to_string()),
+                "no public gRPC address is advertised: {record}"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| r["fragment_endpoint"] == worker_fragment.to_string()),
+            "the worker advertises its dedicated listener: {records:?}"
+        );
+
+        let dials = coordinator
+            .sql_slice_tls_dials
+            .clone()
+            .expect("Flight SQL is served");
+        assert_eq!(dials.get(), 0, "nothing dialed before the query");
+        let deadline = Instant::now() + DEADLINE;
+        let mut attempts = 0;
+        let rows = loop {
+            attempts += 1;
+            match run_query(coordinator_grpc, start_ns, end_ns).await {
+                Ok(rows) => break rows,
+                Err(last) if Instant::now() >= deadline => {
+                    panic!("the distributed query never succeeded; last error: {last}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        };
+        assert_eq!(rows, 3, "the cross-shard duplicate dedups");
+        assert_eq!(
+            dials.get(),
+            SLICES * attempts,
+            "every slice of every attempt was dialed over TLS"
+        );
+        assert!(
+            worker_store.data_gets.load(Ordering::SeqCst) > 0,
+            "the worker read the segments, so it served the slices"
+        );
+        let body = scrape_metrics(&format!("http://{}", coordinator.http_addr)).await;
+        let line = format!(
+            "ravel_sql_slice_tls_dials_total{{mode=\"all\"}} {}",
+            dials.get()
+        );
+        assert_eq!(
+            body.lines().filter(|l| *l == line).count(),
+            1,
+            "exactly one `{line}` sample on /metrics:\n{body}"
+        );
+
+        // A slice ticket on the worker's public listener is refused.
+        let worker_rejects = worker.sql_slice_rejects.clone().expect("Flight SQL served");
+        assert_eq!(worker_rejects.get(SliceReject::WrongSurface), 0);
+        let query = TicketStatementQuery {
+            statement_handle: slice_capability().into(),
+        };
+        let status = public_client(worker_grpc)
+            .await
+            .do_get(Request::new(Ticket::new(query.as_any().encode_to_vec())))
+            .await
+            .expect_err("the public listener refuses a slice ticket");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+        assert_eq!(status.message(), "slice fetch rejected: wrong_surface");
+        assert_eq!(worker_rejects.get(SliceReject::WrongSurface), 1);
+
+        coordinator
+            .shutdown()
+            .await
+            .expect("coordinator shuts down");
+        worker.shutdown().await.expect("worker shuts down");
+    }
 }

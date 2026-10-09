@@ -1960,8 +1960,9 @@ final aggregate out) exist only after physical planning.
 Within one cluster, a read can be spread across peer query nodes so more than
 one process's NIC, CPU, and memory serve it. This is off by default: a
 `QueryEngine` built without a distributed context runs the byte-identical
-local path, and `--distributed-query` (plus a fragment-credential file) is
-what attaches one. The fan-out changes only *where* bytes are fetched and
+local path, and `--distributed-query` (with the fragment key file and the
+dedicated fragment listener it requires, and in a Flight SQL build the SQL
+ticket key file) is what attaches one. The fan-out changes only *where* bytes are fetched and
 decoded; aggregation and evaluation do not move, so the coordinator-merged
 result is bit-for-bit identical to local execution, enforced by the
 `distributed_merge_equals_local_bitwise` differential test over arbitrary

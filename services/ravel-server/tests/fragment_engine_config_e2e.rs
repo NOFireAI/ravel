@@ -25,6 +25,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/fragment_tls.rs"]
+mod fragment_tls;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,6 +52,7 @@ const METRIC: &str = "m";
 /// resolve-scope request this test drives (federation authenticates with an
 /// ordinary tenant credential), but `DistribSettings` requires one.
 const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
+const SQL_TICKET_KEY: [u8; 32] = [0x5c; 32];
 
 /// The budget the coordinator puts on the wire: far larger than anything the
 /// segment costs, so a worker that honours the wire value serves the request.
@@ -147,13 +151,13 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
         .expect("publish");
 }
 
-/// `--distributed-query` settings with no dedicated fragment listener, so the
+/// `--distributed-query` settings with the dedicated fragment listener, so the
 /// `SeriesFetch` service is mounted on the public gRPC listener in the
-/// pre-amendment `Combined` role and serves the resolve scope this test drives.
+/// `PublicFederation` role and serves the resolve scope this test drives.
 fn distrib_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
-        sql_ticket_keys: None,
+        sql_ticket_keys: Some(vec![SQL_TICKET_KEY]),
         max_inflight_fragments: 8,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
@@ -161,7 +165,7 @@ fn distrib_settings() -> DistribSettings {
             min_segments: 0,
             max_parallel_slices: 8,
         },
-        fragment_listener: None,
+        fragment_listener: fragment_tls::listener_settings(),
         advertise_endpoint: None,
     }
 }

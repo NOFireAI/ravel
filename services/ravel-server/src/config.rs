@@ -2244,7 +2244,11 @@ pub struct Cli {
     /// query workers. Requires `--fragment-key-file`: a `Pinned` fetch is only
     /// ever authorized by a per-tenant, per-query capability minted from a
     /// cluster fragment key, so `--distributed-query` without a key file fails
-    /// startup rather than exposing an unauthenticated fetch surface.
+    /// startup rather than exposing an unauthenticated fetch surface. Also
+    /// requires `--fragment-listener` (with its three `--fragment-tls-*`
+    /// files) and, in a build that serves Flight SQL, `--sql-ticket-key-file`
+    /// (ADR-1689 decision 4): both distributed lanes dial only the dedicated
+    /// TLS listener.
     #[arg(long = "distributed-query")]
     pub distributed_query: bool,
 
@@ -2274,27 +2278,23 @@ pub struct Cli {
     /// comments and blank lines ignored, the FIRST key mints and ALL keys verify.
     /// Every coordinator and worker in one cluster reads the same file. Keep it
     /// separate from the fragment key file: one key file no longer covers both
-    /// lanes. Meaningful only with `--distributed-query`. Optional in this
-    /// release, where a process without it derives the SQL ticket key from the
-    /// first fragment key and logs a startup warning; release B (ADR-1689
-    /// decision 4) requires it with `--distributed-query`.
+    /// lanes. Required with `--distributed-query` in a build that serves Flight
+    /// SQL (ADR-1689 decision 4), and refused without `--distributed-query`.
     #[arg(long = "sql-ticket-key-file", value_name = "PATH")]
     pub sql_ticket_key_file: Option<PathBuf>,
 
     /// The dedicated TLS fragment listener address (ADR-0071 amendment decision
     /// 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and
     /// `--mtls-listener`, that terminates TLS in-process and serves `Pinned`
-    /// fragment fetches and SQL slice `DoGet` ONLY (ADR-1689 decision 1). When
-    /// set, the public gRPC listener stops serving `Pinned` scope entirely
-    /// (`Resolve`/federation stays there with ordinary tenant credentials) and
-    /// refuses SQL slice tickets, and this listener rejects `Resolve` and every
-    /// client Flight SQL method outright. Coordinators dial both lanes' slices
-    /// here over mutual TLS. Requires `--distributed-query` and all three of
+    /// fragment fetches and SQL slice `DoGet` ONLY (ADR-1689 decision 1). The
+    /// public gRPC listener serves no `Pinned` scope (`Resolve`/federation
+    /// stays there with ordinary tenant credentials) and refuses SQL slice
+    /// tickets, and this listener rejects `Resolve` and every client Flight SQL
+    /// method outright. Coordinators dial both lanes' slices here over mutual
+    /// TLS. Requires `--distributed-query` and all three of
     /// `--fragment-tls-cert`, `--fragment-tls-key`, and `--fragment-tls-ca`.
-    /// Must not equal any other listener address. Without this flag the
-    /// fragment surface and SQL slices stay on the public gRPC listener, in
-    /// plaintext (the pre-amendment layout), so distribution keeps working
-    /// during a rolling deploy.
+    /// Must not equal any other listener address. Required with
+    /// `--distributed-query` (ADR-1689 decision 4).
     #[arg(long = "fragment-listener", value_name = "ADDR")]
     pub fragment_listener: Option<SocketAddr>,
 
@@ -2328,26 +2328,18 @@ pub struct Cli {
     pub fragment_tls_ca: Option<PathBuf>,
 
     /// The host (or `host:port`) sibling coordinators reach this process at
-    /// (issue #1724). Under `--distributed-query` this process publishes two
-    /// endpoints in its `sys/query/workers` heartbeat record: the fragment
-    /// endpoint (the dedicated `--fragment-listener` when one is configured,
-    /// otherwise the public gRPC listener) and the Flight SQL endpoint (always
-    /// the public gRPC listener). Both default to the address that listener
-    /// actually bound, which is unusable to a peer when the listener binds a
-    /// wildcard: no process can dial `0.0.0.0` or `::`. Startup refuses that
-    /// combination unless this flag supplies a routable host.
+    /// (issue #1724). Under `--distributed-query` this process publishes one
+    /// endpoint in its `sys/query/workers` heartbeat record: the fragment
+    /// endpoint, the dedicated `--fragment-listener` both distributed lanes
+    /// dial. It defaults to the address that listener actually bound, which is
+    /// unusable to a peer when the listener binds a wildcard: no process can
+    /// dial `0.0.0.0` or `::`. Startup refuses that combination unless this
+    /// flag supplies a routable host.
     ///
-    /// The host applies to BOTH advertised endpoints. A port, if given, applies
-    /// to the fragment endpoint only; the Flight SQL endpoint always carries the
-    /// public gRPC listener's own bound port, because the two endpoints name
-    /// different services and a single port cannot stand for both. Omit the port
-    /// unless a NAT or port mapping makes the fragment listener reachable on a
-    /// different one than it bound; a host-only value keeps the bound port,
-    /// which is what makes an ephemeral (`:0`) bind still advertise correctly.
-    /// A port is accepted only alongside `--fragment-listener`: without one
-    /// both endpoints are the same socket, so a port here would be applied to
-    /// the fragment endpoint and not to the Flight SQL endpoint, publishing one
-    /// correct endpoint and one wrong one. Startup refuses that combination.
+    /// Omit the port unless a NAT or port mapping makes the fragment listener
+    /// reachable on a different one than it bound; a host-only value keeps the
+    /// bound port, which is what makes an ephemeral (`:0`) bind still
+    /// advertise correctly.
     ///
     /// An IPv6 literal may be written bare (`fd00::1`) or bracketed
     /// (`[fd00::1]:4319`); it is always advertised bracketed, so the value is a
@@ -4808,10 +4800,10 @@ pub struct DistribSettings {
     /// rejects an empty key file).
     pub fragment_keys: Vec<[u8; 32]>,
     /// The Flight SQL ticket keys (ADR-1689 decision 2), read from
-    /// `--sql-ticket-key-file`. The first mints; all verify. `None` when the
-    /// flag is unset, in which case the SQL lane falls back to
-    /// [`DistribSettings::sql_ticket_secret`]; never `Some` of an empty list
-    /// (startup rejects an empty key file).
+    /// `--sql-ticket-key-file`. The first mints; all verify. From the command
+    /// line, `None` only in a build without Flight SQL, which has no SQL lane:
+    /// `Cli::validate` requires the flag with `--distributed-query` otherwise.
+    /// Never `Some` of an empty list (startup rejects an empty key file).
     pub sql_ticket_keys: Option<Vec<[u8; 32]>>,
     /// The `Pinned` (intra-cluster) fragment (`SeriesFetch`) admission cap, a
     /// distinct workload class from client-query admission
@@ -4824,11 +4816,10 @@ pub struct DistribSettings {
     pub max_inflight_federated_resolves: usize,
     /// The cost gate and fan-out width (`DistribThresholds`).
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
-    /// The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
-    /// `Some` only when `--fragment-listener` was set; carries the bound address
-    /// and the PEM material read once at startup. When `None`, the fragment
-    /// surface stays on the public gRPC listener (the pre-amendment layout).
-    pub fragment_listener: Option<FragmentListenerSettings>,
+    /// The dedicated TLS fragment listener (ADR-0071 amendment decision 1),
+    /// which `--distributed-query` requires (ADR-1689 decision 4): the bound
+    /// address and the PEM material read once at startup.
+    pub fragment_listener: FragmentListenerSettings,
     /// The routable endpoint this process advertises to sibling coordinators
     /// (`--advertise-fragment-endpoint`, issue #1724). `None` means advertise
     /// the bound addresses verbatim, which `Cli::validate` has proven are not
@@ -4861,12 +4852,9 @@ impl std::fmt::Debug for DistribSettings {
 /// A parsed `--advertise-fragment-endpoint` (issue #1724): the host sibling
 /// coordinators dial this process at, and an optional fragment port override.
 ///
-/// The heartbeat record publishes two endpoints and they differ in one respect,
-/// which is why this is a host plus an optional port rather than a
-/// [`SocketAddr`]: the fragment lane may be port-mapped independently, while the
-/// Flight SQL lane always lives on the public gRPC listener's own bound port.
-/// Keeping the port optional is also what lets an ephemeral (`:0`) bind
-/// advertise correctly, since the real port is only known after the bind.
+/// This is a host plus an optional port rather than a [`SocketAddr`] so that
+/// an ephemeral (`:0`) bind advertises correctly: the real port is only known
+/// after the bind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvertisedEndpoint {
     /// The host as the operator wrote it, unbracketed even for an IPv6 literal.
@@ -4962,14 +4950,6 @@ impl AdvertisedEndpoint {
             self.port.unwrap_or(bound.port())
         )
     }
-
-    /// The Flight SQL endpoint to advertise for a public gRPC listener bound at
-    /// `bound`: the advertised host with that listener's own bound port. The
-    /// flag's optional port is deliberately not applied here; it names the
-    /// fragment lane, and the two lanes are different services.
-    pub fn flight_sql_endpoint(&self, bound: SocketAddr) -> String {
-        format!("{}:{}", self.authority_host(), bound.port())
-    }
 }
 
 /// Parse the port half of an `--advertise-fragment-endpoint` value. Port `0` is
@@ -5010,22 +4990,6 @@ impl std::fmt::Debug for FragmentListenerSettings {
             .field("tls_key_pem", &"<redacted>")
             .field("tls_ca_pem", &"<redacted>")
             .finish()
-    }
-}
-
-impl DistribSettings {
-    /// The stable shared secret the Flight SQL distributed lane derives its
-    /// ticket-signing key from (`ravel_sql::derive_ticket_key`) when
-    /// `--sql-ticket-key-file` is unset. Derived from the first fragment key so
-    /// the whole cluster, reading the same key file, agrees on one ticket key.
-    /// This is the release A fallback only (ADR-1689 decision 4): with
-    /// [`DistribSettings::sql_ticket_keys`] set it is never read. Empty only if
-    /// `fragment_keys` is empty, which startup forbids.
-    pub fn sql_ticket_secret(&self) -> String {
-        self.fragment_keys
-            .first()
-            .map(hex::encode)
-            .unwrap_or_default()
     }
 }
 
@@ -6155,50 +6119,42 @@ impl Cli {
             }
             None => None,
         };
-        // The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
-        // `validate()` already guaranteed that whenever `--fragment-listener` is
-        // set all three PEM paths are present and `--distributed-query` is on, so
-        // this reads them unconditionally when the address is configured. The PEM
-        // blobs are read once here; rotation is a rolling restart.
-        let fragment_listener = match self.fragment_listener {
-            Some(addr) => {
-                // `validate()` already rejected `--fragment-listener` without all
-                // three PEM paths, so a missing one here is a bug, not an
-                // operator error; surface it as a typed error rather than panic
-                // (no `expect` on a production path).
-                fn require_path<'a>(
-                    flag: &str,
-                    path: Option<&'a Path>,
-                ) -> anyhow::Result<&'a Path> {
-                    path.ok_or_else(|| {
-                        anyhow::anyhow!("{flag} is required with --fragment-listener")
-                    })
-                }
-                let read_pem = |flag: &str, path: &Path| -> anyhow::Result<Vec<u8>> {
-                    std::fs::read(path).map_err(|e| {
-                        anyhow::anyhow!("failed to read {flag} {}: {e}", path.display())
-                    })
-                };
-                let cert_path =
-                    require_path("--fragment-tls-cert", self.fragment_tls_cert.as_deref())?;
-                let tls_cert_pem = read_pem("--fragment-tls-cert", cert_path)?;
-                // One certificate serves both halves of the mutual handshake
-                // (issue #1690): without clientAuth it serves fetches while
-                // failing every outbound dial, without serverAuth it dials
-                // while failing every inbound one. Refuse here rather than
-                // degrade silently in one direction.
-                crate::fragment_cert::ensure_mutual_auth_ekus(cert_path, &tls_cert_pem)?;
-                let key_path =
-                    require_path("--fragment-tls-key", self.fragment_tls_key.as_deref())?;
-                let ca_path = require_path("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?;
-                Some(FragmentListenerSettings {
-                    addr,
-                    tls_cert_pem,
-                    tls_key_pem: read_pem("--fragment-tls-key", key_path)?,
-                    tls_ca_pem: read_pem("--fragment-tls-ca", ca_path)?,
-                })
+        // The dedicated TLS fragment listener (ADR-0071 amendment decision 1),
+        // which `--distributed-query` requires (ADR-1689 decision 4).
+        // `validate()` already guaranteed the address and all three PEM paths
+        // are present. The PEM blobs are read once here; rotation is a rolling
+        // restart.
+        let fragment_listener = {
+            // `validate()` already rejected `--distributed-query` without
+            // these, so a missing one here is a bug, not an operator error;
+            // surface it as a typed error rather than panic (no `expect` on
+            // a production path).
+            let addr = self.fragment_listener.ok_or_else(|| {
+                anyhow::anyhow!("--distributed-query requires --fragment-listener")
+            })?;
+            fn require_path<'a>(flag: &str, path: Option<&'a Path>) -> anyhow::Result<&'a Path> {
+                path.ok_or_else(|| anyhow::anyhow!("{flag} is required with --fragment-listener"))
             }
-            None => None,
+            let read_pem = |flag: &str, path: &Path| -> anyhow::Result<Vec<u8>> {
+                std::fs::read(path)
+                    .map_err(|e| anyhow::anyhow!("failed to read {flag} {}: {e}", path.display()))
+            };
+            let cert_path = require_path("--fragment-tls-cert", self.fragment_tls_cert.as_deref())?;
+            let tls_cert_pem = read_pem("--fragment-tls-cert", cert_path)?;
+            // One certificate serves both halves of the mutual handshake
+            // (issue #1690): without clientAuth it serves fetches while
+            // failing every outbound dial, without serverAuth it dials
+            // while failing every inbound one. Refuse here rather than
+            // degrade silently in one direction.
+            crate::fragment_cert::ensure_mutual_auth_ekus(cert_path, &tls_cert_pem)?;
+            let key_path = require_path("--fragment-tls-key", self.fragment_tls_key.as_deref())?;
+            let ca_path = require_path("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?;
+            FragmentListenerSettings {
+                addr,
+                tls_cert_pem,
+                tls_key_pem: read_pem("--fragment-tls-key", key_path)?,
+                tls_ca_pem: read_pem("--fragment-tls-ca", ca_path)?,
+            }
         };
         Ok(Some(DistribSettings {
             fragment_keys,
@@ -6228,20 +6184,17 @@ impl Cli {
 
     /// The listeners whose bound address this process would publish in its
     /// `sys/query/workers` heartbeat record under `--distributed-query`, paired
-    /// with the flag that binds each: the fragment lane (the dedicated
-    /// `--fragment-listener` when configured, otherwise the public gRPC
-    /// listener, which is where the pre-amendment combined surface lives) and
-    /// the Flight SQL lane (always the public gRPC listener).
+    /// with the flag that binds each: the dedicated `--fragment-listener`, the
+    /// one endpoint both distributed lanes dial.
     ///
     /// Derived from `lib.rs`'s advertisement site, not guessed: a lane added
     /// there has to be added here too, or its wildcard bind stops being
     /// refused.
     fn advertised_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
-        let mut listeners = vec![("--listen-grpc", self.listen_grpc)];
-        if let Some(fragment_listener) = self.fragment_listener {
-            listeners.push(("--fragment-listener", fragment_listener));
-        }
-        listeners
+        self.fragment_listener
+            .map(|fragment_listener| ("--fragment-listener", fragment_listener))
+            .into_iter()
+            .collect()
     }
 
     /// The default per-remote soft timeout for federated fetches
@@ -6787,6 +6740,13 @@ impl Cli {
     /// dev-header loopback rule this consolidates from `main`). Every case
     /// here refuses startup outright; none of them warn and continue.
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_for_build(cfg!(feature = "flight-sql"))
+    }
+
+    /// [`Cli::validate`] for a build that does (`flight_sql`) or does not serve
+    /// Flight SQL. Only the `--sql-ticket-key-file` requirement depends on it:
+    /// a build without Flight SQL has no SQL lane, so no SQL ticket to key.
+    fn validate_for_build(&self, flight_sql: bool) -> anyhow::Result<()> {
         // Two sources for the same static bearer map: refuse both at once
         // rather than silently picking one, mirroring the
         // --distributed-query/--fragment-key-file pairing checks below.
@@ -7124,6 +7084,26 @@ impl Cli {
                  --distributed-query."
             );
         }
+        // ADR-1689 decision 4: both distributed lanes dial only the dedicated
+        // TLS fragment listener, and SQL slice tickets are keyed only from the
+        // SQL ticket key file. There is no plaintext layout to fall back to.
+        if self.distributed_query && self.fragment_listener.is_none() {
+            anyhow::bail!(
+                "--distributed-query requires --fragment-listener (ADR-1689 decision 4): both \
+                 distributed lanes dial each worker's dedicated TLS fragment listener, and there \
+                 is no plaintext fragment or SQL slice path. Set --fragment-listener with \
+                 --fragment-tls-cert, --fragment-tls-key, and --fragment-tls-ca, or drop \
+                 --distributed-query."
+            );
+        }
+        if self.distributed_query && flight_sql && self.sql_ticket_key_file.is_none() {
+            anyhow::bail!(
+                "--distributed-query requires --sql-ticket-key-file (ADR-1689 decision 4): \
+                 every node signs and verifies Flight SQL slice tickets with the keys in that \
+                 file, and no ticket key is derived from --fragment-key-file. Provide the key \
+                 file, or drop --distributed-query."
+            );
+        }
         if self.fragment_key_file.is_some() && !self.distributed_query {
             anyhow::bail!(
                 "--fragment-key-file was set but --distributed-query was not: the fragment \
@@ -7220,35 +7200,11 @@ impl Cli {
                  inert. Set --distributed-query, or drop --advertise-fragment-endpoint."
             );
         }
-        // Issue #1724: the port half names the fragment lane only, because the
-        // Flight SQL lane always carries the public gRPC listener's own bound
-        // port. In the combined layout there is no separate fragment lane to
-        // name: both are the one public gRPC socket, so a port override
-        // advertises a mapped port for one endpoint and the bound port for the
-        // other, and exactly one of the two published values is wrong. Refuse
-        // rather than advertise something wrong.
-        if let (Some(advertise), Some(raw)) = (
-            advertise.as_ref(),
-            self.advertise_fragment_endpoint.as_deref(),
-        ) && advertise.port.is_some()
-            && self.fragment_listener.is_none()
-        {
-            anyhow::bail!(
-                "--advertise-fragment-endpoint '{raw}' carries a port, but no --fragment-listener \
-                 is configured: in the combined layout both published lanes are served by the \
-                 public gRPC listener '{}', and the port half of this flag reaches the fragment \
-                 lane only. The Flight SQL endpoint would keep the bound port while the fragment \
-                 endpoint took the override, so one of the two endpoints published for the same \
-                 socket would be wrong. Advertise a host only, or configure --fragment-listener \
-                 so the fragment lane has its own port to map.",
-                self.listen_grpc
-            );
-        }
         if self.distributed_query {
             // Issue #1724: under `--distributed-query` this process publishes
-            // its fragment and Flight SQL endpoints for sibling coordinators to
-            // dial, and the published value defaults to the address the
-            // listener bound. A wildcard bind therefore advertises an address
+            // its fragment endpoint for sibling coordinators to dial, and the
+            // published value defaults to the address the listener bound. A
+            // wildcard bind therefore advertises an address
             // no peer can dial, and the failure is silent and remote: every
             // sibling's dispatch to this worker fails at connect and falls back
             // to coordinator-local execution, so distribution degrades to
@@ -14365,17 +14321,17 @@ mod tests {
         use ravel_query::distrib::partition::should_distribute;
         use ravel_types::accounting::CostEstimate;
 
-        // A valid fragment key file so --distributed-query resolves settings.
-        let key = tempfile::NamedTempFile::new().expect("temp key file");
-        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
+        // A valid fragment key file and listener so --distributed-query
+        // resolves settings.
+        let key = fragment_key_tmp();
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
 
         // No --distribute-*-threshold flags: the defaults come straight from
         // the ravel-query constants via `default_value_t`.
-        let thresholds = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
+        let thresholds = cli(&fragment_tls_args(
             key.path().to_str().expect("utf8 path"),
-        ])
+            &material,
+        ))
         .parse_distrib_settings()
         .expect("distrib settings resolve")
         .expect("Some when --distributed-query is set")
@@ -15062,17 +15018,16 @@ mod tests {
     fn distributed_query_under_query_mode_validates() {
         // Positive control: under a fragment-serving mode the flag validates,
         // so the #94 guard is not vacuously rejecting the flag everywhere.
-        let key = tempfile::NamedTempFile::new().expect("temp key file");
-        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
-        cli(&[
-            "--mode",
-            "query",
-            "--distributed-query",
-            "--fragment-key-file",
+        let key = fragment_key_tmp();
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let mut args = vec!["--mode", "query"];
+        args.extend(fragment_tls_args(
             key.path().to_str().expect("utf8 path"),
-        ])
-        .validate()
-        .expect("--distributed-query under query mode is fine");
+            &material,
+        ));
+        cli(&args)
+            .validate()
+            .expect("--distributed-query under query mode is fine");
     }
 
     #[test]
@@ -15401,6 +15356,89 @@ mod tests {
         key
     }
 
+    /// ADR-1689 decision 4 (release B): `--distributed-query` without
+    /// `--fragment-listener` is refused, and so is `--distributed-query`
+    /// without `--sql-ticket-key-file` in a build that serves Flight SQL, each
+    /// naming the missing flag and the ADR. Either flag missing on its own is
+    /// refused, and so is a configuration with neither. A build without
+    /// Flight SQL has no SQL lane, so it is refused only for the missing
+    /// `--fragment-listener`.
+    #[test]
+    fn validate_refuses_distributed_query_without_fragment_listener_or_sql_ticket_key() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let base = ["--distributed-query", "--fragment-key-file", key_path];
+        let listener = [
+            "--fragment-listener",
+            "127.0.0.1:4319",
+            "--fragment-tls-cert",
+            material.cert.path().to_str().expect("utf8"),
+            "--fragment-tls-key",
+            material.key.path().to_str().expect("utf8"),
+            "--fragment-tls-ca",
+            material.ca.path().to_str().expect("utf8"),
+        ];
+        let sql_key = ["--sql-ticket-key-file", key_path];
+        let args = |with_listener: bool, with_sql_key: bool| -> Vec<&str> {
+            let mut args = base.to_vec();
+            if with_listener {
+                args.extend_from_slice(&listener);
+            }
+            if with_sql_key {
+                args.extend_from_slice(&sql_key);
+            }
+            args
+        };
+        let refusal = |with_listener: bool, with_sql_key: bool, flight_sql: bool| {
+            cli(&args(with_listener, with_sql_key))
+                .validate_for_build(flight_sql)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let names = |message: &Option<String>, flag: &str| {
+            message.as_deref().is_some_and(|m| {
+                m.starts_with(&format!(
+                    "--distributed-query requires {flag} (ADR-1689 decision 4)"
+                ))
+            })
+        };
+
+        for flight_sql in [true, false] {
+            for with_sql_key in [false, true] {
+                let missing_listener = refusal(false, with_sql_key, flight_sql);
+                assert!(
+                    names(&missing_listener, "--fragment-listener"),
+                    "flight_sql={flight_sql} sql_key={with_sql_key}: refused for the missing \
+                     --fragment-listener: {missing_listener:?}"
+                );
+            }
+            assert_eq!(
+                refusal(true, true, flight_sql),
+                None,
+                "flight_sql={flight_sql}: both flags set validates"
+            );
+        }
+
+        let missing_sql_key = refusal(true, false, true);
+        assert!(
+            names(&missing_sql_key, "--sql-ticket-key-file"),
+            "a Flight SQL build is refused for the missing --sql-ticket-key-file: \
+             {missing_sql_key:?}"
+        );
+        assert_eq!(
+            refusal(true, false, false),
+            None,
+            "a build without Flight SQL needs no --sql-ticket-key-file"
+        );
+
+        // `validate` is this build's own answer.
+        assert_eq!(
+            cli(&args(true, false)).validate().is_err(),
+            cfg!(feature = "flight-sql"),
+        );
+    }
+
     #[test]
     fn sql_ticket_key_file_without_distributed_query_fails_validate() {
         let key = fragment_key_tmp();
@@ -15428,51 +15466,39 @@ mod tests {
         )
         .expect("write key");
         let sql_path = sql.path().to_str().expect("utf8");
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let with_sql_key = || {
+            let mut args = fragment_listener_args(fragment_path, &material);
+            args.extend_from_slice(&["--sql-ticket-key-file", sql_path]);
+            cli(&args)
+        };
 
-        let settings = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            fragment_path,
-            "--sql-ticket-key-file",
-            sql_path,
-        ])
-        .parse_distrib_settings()
-        .expect("settings parse")
-        .expect("--distributed-query yields settings");
+        let settings = with_sql_key()
+            .parse_distrib_settings()
+            .expect("settings parse")
+            .expect("--distributed-query yields settings");
         assert_eq!(settings.sql_ticket_keys, Some(vec![[0xcd; 32], [0xef; 32]]));
         assert_eq!(settings.fragment_keys, vec![[0xab; 32]]);
 
-        let without = cli(&["--distributed-query", "--fragment-key-file", fragment_path])
+        let without = cli(&fragment_listener_args(fragment_path, &material))
             .parse_distrib_settings()
             .expect("settings parse")
             .expect("--distributed-query yields settings");
         assert_eq!(without.sql_ticket_keys, None);
 
         std::fs::write(sql.path(), "not a key\n").expect("write key");
-        let err = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            fragment_path,
-            "--sql-ticket-key-file",
-            sql_path,
-        ])
-        .parse_distrib_settings()
-        .expect_err("a malformed SQL ticket key file fails startup");
+        let err = with_sql_key()
+            .parse_distrib_settings()
+            .expect_err("a malformed SQL ticket key file fails startup");
         assert!(
             err.to_string().starts_with("invalid --sql-ticket-key-file"),
             "names the flag: {err}"
         );
 
         std::fs::write(sql.path(), "# comments only\n\n").expect("write key");
-        let err = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            fragment_path,
-            "--sql-ticket-key-file",
-            sql_path,
-        ])
-        .parse_distrib_settings()
-        .expect_err("an SQL ticket key file with no key line fails startup");
+        let err = with_sql_key()
+            .parse_distrib_settings()
+            .expect_err("an SQL ticket key file with no key line fails startup");
         let msg = err.to_string();
         assert!(
             msg.starts_with("invalid --sql-ticket-key-file")
@@ -15496,16 +15522,13 @@ mod tests {
             format!("{}\n{}\n", "cd".repeat(32), "ef".repeat(32)),
         )
         .expect("write key");
-        let settings = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            fragment.path().to_str().expect("utf8"),
-            "--sql-ticket-key-file",
-            sql.path().to_str().expect("utf8"),
-        ])
-        .parse_distrib_settings()
-        .expect("settings parse")
-        .expect("--distributed-query yields settings");
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let mut args = fragment_listener_args(fragment.path().to_str().expect("utf8"), &material);
+        args.extend_from_slice(&["--sql-ticket-key-file", sql.path().to_str().expect("utf8")]);
+        let settings = cli(&args)
+            .parse_distrib_settings()
+            .expect("settings parse")
+            .expect("--distributed-query yields settings");
         let debug = format!("{settings:?}");
         let pretty = format!("{settings:#?}");
         for key in [[0xab_u8; 32], [0xcd; 32], [0xef; 32]] {
@@ -15535,6 +15558,8 @@ mod tests {
         vec![
             "--distributed-query",
             "--fragment-key-file",
+            key_path,
+            "--sql-ticket-key-file",
             key_path,
             "--fragment-listener",
             listener,
@@ -15629,6 +15654,8 @@ mod tests {
         let err = cli(&[
             "--distributed-query",
             "--fragment-key-file",
+            key.path().to_str().expect("utf8"),
+            "--sql-ticket-key-file",
             key.path().to_str().expect("utf8"),
             "--fragment-listener",
             "127.0.0.1:4319",
@@ -15833,7 +15860,18 @@ mod tests {
 
     /// A complete, otherwise-valid dedicated-fragment-listener configuration
     /// pointing at `material`, so `validate()` reaches the certificate check.
+    /// `key_path` serves as both the fragment and the SQL ticket key file.
     fn fragment_tls_args<'a>(key_path: &'a str, material: &'a FragmentTlsMaterial) -> Vec<&'a str> {
+        let mut args = fragment_listener_args(key_path, material);
+        args.extend_from_slice(&["--sql-ticket-key-file", key_path]);
+        args
+    }
+
+    /// [`fragment_tls_args`] without `--sql-ticket-key-file`.
+    fn fragment_listener_args<'a>(
+        key_path: &'a str,
+        material: &'a FragmentTlsMaterial,
+    ) -> Vec<&'a str> {
         vec![
             "--distributed-query",
             "--fragment-key-file",
@@ -15849,73 +15887,52 @@ mod tests {
         ]
     }
 
-    /// Issue #1724 acceptance: a wildcard-bound published listener under
-    /// `--distributed-query` refuses startup unless
-    /// `--advertise-fragment-endpoint` supplies a routable host, and with the
-    /// flag the advertised host reaches BOTH published endpoints.
-    ///
-    /// Without the refusal the failure is remote and silent: every sibling
-    /// coordinator dials `0.0.0.0`, fails at connect, and falls back to
-    /// coordinator-local execution, so distribution quietly stops while this
-    /// process reports nothing.
+    /// Issue #1724 acceptance, for the one published listener: a wildcard
+    /// `--fragment-listener` with `--advertise-fragment-endpoint` validates,
+    /// and the advertised host reaches the fragment endpoint with the bound
+    /// port, or with the flag's port when it carries one. The public gRPC
+    /// listener is not published (ADR-1689 decision 4), so a wildcard
+    /// `--listen-grpc` needs no advertise endpoint.
     #[test]
-    fn distributed_query_refuses_unspecified_listener_without_advertise_endpoint() {
+    fn advertised_host_reaches_the_one_published_endpoint() {
         let key = fragment_key_tmp();
         let key_path = key.path().to_str().expect("utf8");
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
 
-        let err = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            key_path,
-            "--listen-grpc",
-            "0.0.0.0:4317",
-        ])
-        .validate()
-        .expect_err("a wildcard --listen-grpc with no advertise endpoint must refuse startup");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("0.0.0.0:4317"),
-            "the error names the offending address: {msg}"
-        );
-        assert!(
-            msg.contains("--advertise-fragment-endpoint"),
-            "the error names the flag that fixes it: {msg}"
-        );
-
-        // With the flag the same configuration validates, and the advertised
-        // host reaches both lanes. The bound ports are what a `:0` bind
-        // resolved to, which is why a host-only value must keep them.
-        let parsed = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            key_path,
-            "--listen-grpc",
-            "0.0.0.0:4317",
-            "--advertise-fragment-endpoint",
-            "worker-3.ravel.svc",
-        ]);
-        parsed
+        let mut public_wildcard = fragment_tls_args(key_path, &material);
+        public_wildcard.extend_from_slice(&["--listen-grpc", "0.0.0.0:4317"]);
+        cli(&public_wildcard)
             .validate()
-            .expect("a wildcard bind with an advertised host validates");
-        let settings = parsed
-            .parse_distrib_settings()
-            .expect("settings parse")
-            .expect("--distributed-query yields settings");
-        let advertise = settings
-            .advertise_endpoint
-            .expect("the advertised endpoint reaches the distrib settings");
+            .expect("a wildcard --listen-grpc is not published, so it needs no advertise endpoint");
+
         let fragment_bound: SocketAddr = "0.0.0.0:35001".parse().expect("addr");
-        let grpc_bound: SocketAddr = "0.0.0.0:35002".parse().expect("addr");
-        assert_eq!(
-            advertise.fragment_endpoint(fragment_bound),
-            "worker-3.ravel.svc:35001",
-            "the fragment endpoint takes the advertised host and the bound port"
-        );
-        assert_eq!(
-            advertise.flight_sql_endpoint(grpc_bound),
-            "worker-3.ravel.svc:35002",
-            "the Flight SQL endpoint takes the same host and its own bound port"
-        );
+        for (advertised, want) in [
+            ("worker-3.ravel.svc", "worker-3.ravel.svc:35001"),
+            ("worker-3.ravel.svc:31319", "worker-3.ravel.svc:31319"),
+        ] {
+            let args: Vec<&str> = fragment_tls_args(key_path, &material)
+                .into_iter()
+                .map(|arg| {
+                    if arg == "127.0.0.1:4319" {
+                        "0.0.0.0:4319"
+                    } else {
+                        arg
+                    }
+                })
+                .chain(["--advertise-fragment-endpoint", advertised])
+                .collect();
+            let parsed = cli(&args);
+            parsed
+                .validate()
+                .expect("a wildcard fragment listener with an advertised host validates");
+            let advertise = parsed
+                .parse_distrib_settings()
+                .expect("settings parse")
+                .expect("--distributed-query yields settings")
+                .advertise_endpoint
+                .expect("the advertised endpoint reaches the distrib settings");
+            assert_eq!(advertise.fragment_endpoint(fragment_bound), want);
+        }
     }
 
     /// The dedicated fragment listener is the other published lane, and it is
@@ -15945,87 +15962,12 @@ mod tests {
     #[test]
     fn loopback_listeners_need_no_advertise_endpoint() {
         let key = fragment_key_tmp();
-        cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            key.path().to_str().expect("utf8"),
-            "--listen-grpc",
-            "127.0.0.1:0",
-        ])
-        .validate()
-        .expect("a loopback bind advertises a dialable address on its own");
-    }
-
-    /// Issue #1724: in the combined layout both published lanes are the one
-    /// public gRPC socket, and the port half of the flag reaches only the
-    /// fragment lane. Accepting it would publish the override for the fragment
-    /// endpoint and the bound port for the Flight SQL endpoint, so a port
-    /// mapping advertises one correct endpoint and one wrong one. Startup
-    /// refuses the combination.
-    #[test]
-    fn advertised_port_without_a_fragment_listener_fails_validate() {
-        let key = fragment_key_tmp();
-        let err = cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            key.path().to_str().expect("utf8"),
-            "--listen-grpc",
-            "0.0.0.0:4317",
-            "--advertise-fragment-endpoint",
-            "worker-3.ravel.svc:31319",
-        ])
-        .validate()
-        .expect_err("an advertised port with no dedicated fragment listener must refuse startup");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("worker-3.ravel.svc:31319"),
-            "the error names the value as written: {msg}"
-        );
-        assert!(
-            msg.contains("--fragment-listener"),
-            "the error names the flag whose absence makes the port meaningless: {msg}"
-        );
-        assert!(
-            msg.contains("0.0.0.0:4317"),
-            "the error names the one socket both lanes share: {msg}"
-        );
-        assert!(
-            msg.contains("Advertise a host only"),
-            "the error names the fix: {msg}"
-        );
-    }
-
-    /// The two controls for the refusal above: a host-only value in the
-    /// combined layout is the normal case and must still validate, and the
-    /// same `host:port` value is legitimate once a dedicated fragment listener
-    /// gives the fragment lane its own port to map.
-    #[test]
-    fn advertised_port_is_accepted_only_with_a_dedicated_fragment_listener() {
-        let key = fragment_key_tmp();
-        let key_path = key.path().to_str().expect("utf8");
-        cli(&[
-            "--distributed-query",
-            "--fragment-key-file",
-            key_path,
-            "--listen-grpc",
-            "0.0.0.0:4317",
-            "--advertise-fragment-endpoint",
-            "worker-3.ravel.svc",
-        ])
-        .validate()
-        .expect("a host-only value in the combined layout advertises both bound ports");
-
         let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
-        let mut args = fragment_tls_args(key_path, &material);
-        args.extend_from_slice(&[
-            "--listen-grpc",
-            "0.0.0.0:4317",
-            "--advertise-fragment-endpoint",
-            "worker-3.ravel.svc:31319",
-        ]);
+        let mut args = fragment_tls_args(key.path().to_str().expect("utf8"), &material);
+        args.extend_from_slice(&["--listen-grpc", "127.0.0.1:0"]);
         cli(&args)
             .validate()
-            .expect("a dedicated fragment listener gives the advertised port a lane of its own");
+            .expect("a loopback bind advertises a dialable address on its own");
     }
 
     #[test]
@@ -16039,22 +15981,15 @@ mod tests {
         );
     }
 
-    /// The accepted spellings and what each renders, plus the refusals. The
-    /// port half names the fragment lane only, so it never displaces the Flight
-    /// SQL listener's own bound port.
+    /// The accepted spellings and what each renders, plus the refusals.
     #[test]
     fn advertised_endpoint_parses_host_and_optional_port() {
         let bound: SocketAddr = "0.0.0.0:4319".parse().expect("addr");
-        let grpc: SocketAddr = "0.0.0.0:4317".parse().expect("addr");
 
         let host_only = AdvertisedEndpoint::parse("worker-3.ravel.svc").expect("host only");
         assert_eq!(
             host_only.fragment_endpoint(bound),
             "worker-3.ravel.svc:4319"
-        );
-        assert_eq!(
-            host_only.flight_sql_endpoint(grpc),
-            "worker-3.ravel.svc:4317"
         );
 
         let with_port = AdvertisedEndpoint::parse("10.1.2.3:31319").expect("host:port");
@@ -16062,11 +15997,6 @@ mod tests {
             with_port.fragment_endpoint(bound),
             "10.1.2.3:31319",
             "an explicit port overrides the fragment listener's bound port"
-        );
-        assert_eq!(
-            with_port.flight_sql_endpoint(grpc),
-            "10.1.2.3:4317",
-            "the Flight SQL lane keeps its own bound port"
         );
 
         let bare_v6 = AdvertisedEndpoint::parse("fd00::1").expect("bare IPv6");

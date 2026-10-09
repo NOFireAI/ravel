@@ -12844,7 +12844,7 @@ mod query_worker_reap_tests {
     /// Write one query worker's record so the store reports `mtime_ms` as its
     /// modification time, then put the store clock back at `restore_ms`.
     async fn seed(memory: &MemoryStore, mtime_ms: u64, restore_ms: u64, stamp_ns: i64) -> String {
-        let worker = QueryWorkers::with_defaults("10.0.0.1:9443", "10.0.0.1:9000", 1);
+        let worker = QueryWorkers::with_defaults("10.0.0.1:9443", 1);
         memory.set_clock_ms(mtime_ms);
         worker
             .write_heartbeat(memory, stamp_ns)
