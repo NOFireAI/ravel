@@ -776,12 +776,12 @@ mod tests {
     /// ADR-2677 decision 3's bounds for a loop after a cold scan, which this
     /// policy does not meet: on its first pass the loop is indistinguishable
     /// from the scan continuing, so it misses every turn and its entries are
-    /// still unproven when pass 2 starts. Admitting them on pass 2 would mean
-    /// letting unproven main entries expire, and every expiry horizon that
-    /// does so breaks `repeated_scan_larger_than_the_cache_serves_a_stable_subset`
-    /// or `a_second_loop_after_the_cache_is_full_converges`.
+    /// still unproven when pass 2 starts. Serving pass 2 would mean letting
+    /// unproven main entries expire, and every expiry horizon tried stops a
+    /// fresh loop longer than the horizon from being served at all (the first
+    /// assertion of `a_loop_five_times_the_cache_after_a_cold_scan_is_not_served`).
     #[test]
-    #[ignore = "conflicts with repeated_scan_larger_than_the_cache_serves_a_stable_subset (#2681)"]
+    #[ignore = "conflicts with the fresh-loop guarantee for loops longer than any expiry horizon (#2681)"]
     fn a_loop_after_a_cold_scan_converges() {
         for g in &geometries() {
             let served = loop_after_a_cold_scan(g, 3);
