@@ -453,7 +453,13 @@ helper's own behaviour is pinned without a store by
 `scripts/ci-verify-protection-cases.test.sh`, which runs in the `doc-scripts`
 job.
 
-Three conditions stay out of the job. `object-lock` is not broken: the
+Four conditions stay out of the job. `versioning` is not broken in practice:
+the case is attempted, but RustFS refuses to suspend versioning on a bucket
+that carries an Object Lock configuration (`InvalidBucketState`), as AWS S3
+does, and the CI bucket carries one, so the case reports `SKIPPED` on every
+run. Its `Fail` path stays covered by a fixture
+(`versioning_passes_only_when_enabled` in `ravel-object-store`).
+`object-lock` is not broken: the
 bucket is created with Object Lock and S3 has no call that disables it, so
 its `Fail` path stays covered by fixtures
 (`store::tests::verify_protection_names_each_failed_condition` in
