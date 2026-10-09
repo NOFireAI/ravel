@@ -37,13 +37,12 @@
 //! tier, behavior unchanged), plaintext (decision 7 -- **with SSE-KMS
 //! configured, cached bytes on local disk are not protected by that
 //! key**), evicted with the same [`s3fifo`] policy as [`Cache`] rather than
-//! a second implementation (decision 6, amended 2026-08-02 -- scan
+//! a second implementation (decision 6 -- scan
 //! resistance matters more on disk than in RAM, since a disk miss costs an
 //! S3 fetch and disk is the tier that holds the working set), and built so
 //! every failure degrades to a miss rather than an error (see the
 //! [`disk`] module docs for the crash-safety mechanism and what crc32c and
-//! the header actually prove on a hit, per decision 4 as amended
-//! 2026-08-02). A disk entry also carries a stamped write time and a
+//! the header actually prove on a hit, per decision 4). A disk entry also carries a stamped write time and a
 //! configured per-entry max-age (default 23 h,
 //! [`DEFAULT_MAX_ENTRY_AGE_NS`]): an entry older than the max-age is treated
 //! as a miss and dropped, so raw bytes of a subject erased by ADR-0064's
