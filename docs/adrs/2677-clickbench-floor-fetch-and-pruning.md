@@ -95,12 +95,21 @@ no later commit landing in a sealed hour: a record that does lands in a
 bucket reconcile skips without a GET and stays invisible to non-token
 queries until a HEAD rebuild, detected only by the maintain-mode scrub or
 `catalog verify`. The loader is the one writer that can assert this about
-its own hours. When the HEAD watermark is already at or above the effective
-target, the fold returns today's no-op report (`fold.rs:1182-1186`), and
-`--fold-after-load` reports that as a successful load with nothing left to
-seal; a seal-through hour below the natural watermark changes nothing. The
-scheduled fold no-ops on the sealed hours until the natural seal time
-passes, as it does today.
+its own hours. A seal-through hour below the natural watermark changes
+nothing, and the scheduled fold no-ops on the sealed hours until the
+natural seal time passes, as it does today (`fold.rs:1182-1186`).
+
+The loader must not write into an hour that is already sealed: those rows
+would be acknowledged, durable, and absent from every non-token query until
+a HEAD rebuild, which `docs/consistency-model.md` does not allow a tool to
+report as success. So `--fold-after-load` reads the signal's HEAD before it
+reads a row and refuses when the watermark is at or above the current hour
+(a natural-margin watermark is never that high, so only an earlier
+operator-asserted seal trips it). After the load, a fold that seals nothing
+while the load holds commit tokens is an error, not a success: the load
+exits non-zero, says the objects are durable and which hours are not in
+the snapshot, and names `catalog verify` and the HEAD rebuild. A load that
+wrote nothing runs no fold and says so.
 
 Erasure, compaction and retention are unaffected: they seal on their own
 clock-based margin, the pending-erasure LIST still runs on every resolve, and
@@ -262,14 +271,23 @@ the permits by memory, it does not change what each permit reserves.
 
 What it moves: the stock entry gets W1's cold gain on every host where it
 is safe and nothing on a host where it is not. The acceptance arm reports
-the concurrent phase (QPS and error ratio) against the same release's
-stock arm on the same box, because that phase is what sent the loopback
-default back to `cost-based` once (ADR-2023 decision 4). Its absolute bar
-is already missed by stock v0.23.0 (error ratio 0.084 against 0.058), so
-the comparison is relative: W1 on the reference box measured QPS 0.727
-and error ratio 0.103 against stock's 0.653 and 0.084, and the derived
-defaults may not widen that error gap. A miss there is reported before any
-release, not hidden.
+the concurrent phase (QPS and error ratio) against ADR-2023 decision 4's
+absolute bar, an error ratio of at most 0.058, because that phase is what
+sent the loopback default back to `cost-based` once.
+
+Stock v0.23.0 already misses that bar on the reference box: error ratio
+0.084 on RustFS against exactly 0.058 on real S3 (#2592), one pass each.
+The two runs differ in store, request latency and derived budgets (fetch
+cache 11.44 against 7.46 GB, per-query pool 14.16 against 16.45 GB), so
+which of those sets the error ratio is not established; the refusal
+classes were not captured. W1 on the same box measured 0.103. The bar is not
+relaxed to fit the baseline. Bringing stock under it is this epic's work
+and precedes this decision's default change: #2044 owns it, starting from
+the refusal classes of the stock concurrent phase (at v0.19.0 they were
+all memory-budget refusals: the per-tenant limit, the per-query limit, and
+a full pool with spill off), one lever at a time. The permits derivation
+and the loopback policy default land only on a baseline that meets the
+bar, and must meet it themselves.
 
 ### 8. Measurement protocol and targets
 
@@ -296,7 +314,7 @@ outside its band is a miss and stays open with its bottleneck named.
 | statements answered on the reference box | 43 of 43 | fewer |
 | c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal |
 | c6a.2xlarge (16 GB), no server flags | no statement refused that stock answers (42 of 43, #2627 R6); cold reported against the tuned 377.1 s and the stock arm | any such refusal |
-| concurrent phase, derived defaults against same-release stock on c6a.4xlarge | QPS not below stock's and error ratio not above stock's by more than 0.02 (v0.23.0 stock: QPS 0.653, error 0.084; W1 tuned on the same box: 0.727, 0.103) | error ratio over stock's by more than 0.02, or QPS below stock's |
+| concurrent phase on c6a.4xlarge, RustFS, no server flags: first the #2044 fix alone, then with the derived defaults | error ratio at most 0.058 (ADR-2023 decision 4) and QPS not below stock v0.23.0's 0.653 (stock today: 0.084; W1 tuned: 0.727 at 0.103) | error ratio over 0.058, or QPS below 0.653 |
 | unaffected statements | no confirmed regression over 5% | |
 
 The v0.23 nine-machine pass already in flight (pre-registration #2592
@@ -372,7 +390,7 @@ and its result stays separate from stock.
 
 ## Plan
 
-Five fleet tasks in two waves, crate-disjoint within a wave; the
+Six fleet tasks, crate-disjoint within a wave; the
 measurements are orchestrator work on bot-style boxes.
 
 | task | decision | crates | risk |
@@ -383,7 +401,12 @@ measurements are orchestrator work on bot-style boxes.
 | T4 no plan phase for segments at or under `plan_whole_object_bound()` | 2 | ravel-query (`log_fetcher.rs`), ravel-sql | medium |
 | T5 permits and loopback policy from host memory, ADR-2023 amendment, the three stale doc comments in `crates/ravel-query/src/config.rs` (the "not bounded" note, LatencyFirst's "operator opt-in", `LATENCY_FIRST_MEASURED_CONCURRENCY`) | 7 | ravel-server, docs, ravel-query (doc comments in `config.rs` only) | medium |
 
-Wave 1: T1, T2, T3. Wave 2: T4, T5. Then the arms of decision 8 and the
+T6 (#2044, ravel-server and ravel-sql memory limits, medium) brings the
+stock concurrent error ratio under 0.058; its shape is decided by the
+refusal-class measurement, and T5 does not dispatch before T6 lands and
+its arm meets the bar.
+
+Wave 1: T1, T2, T3. Wave 2: T4, then T6, then T5. Then the arms of decision 8 and the
 measurements of decision 6. The high-risk-solo wave rule is relaxed on the
 owner's days-not-weeks instruction; T1 compensates with its own reviewer
 and `effort: high`. T4 and T5 share the ravel-query crate in wave 2 by one
