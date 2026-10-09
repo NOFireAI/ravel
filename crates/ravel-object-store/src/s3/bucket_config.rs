@@ -320,18 +320,78 @@ pub(crate) fn parse_iso8601(value: &str) -> Option<(i64, u32)> {
     Some((secs, nanos))
 }
 
+/// The headers that sign one bodyless `GET` of `target` with SigV4, as
+/// `(name, value)` pairs to put on the request. `host` is signed but not among
+/// them: the HTTP client sends it from the URL, and [`RequestTarget::host`] is
+/// those exact bytes.
+pub(crate) fn signed_get_headers(
+    target: &RequestTarget,
+    query_pairs: &[(String, String)],
+    credential: &AwsCredential,
+    region: &str,
+    now_unix_secs: i64,
+) -> Vec<(&'static str, String)> {
+    let (amz_date, date_stamp) = format_amz_time(now_unix_secs);
+    let mut headers = vec![
+        SignedHeader {
+            name: "host".to_string(),
+            value: target.host.clone(),
+        },
+        SignedHeader {
+            name: "x-amz-content-sha256".to_string(),
+            value: EMPTY_SHA256_HEX.to_string(),
+        },
+        SignedHeader {
+            name: "x-amz-date".to_string(),
+            value: amz_date.clone(),
+        },
+    ];
+    if let Some(token) = credential.token.as_ref() {
+        headers.push(SignedHeader {
+            name: "x-amz-security-token".to_string(),
+            value: token.clone(),
+        });
+    }
+
+    let query = canonical_query(query_pairs);
+    let (request, signed_headers) = canonical_request(
+        "GET",
+        &target.canonical_uri,
+        &query,
+        &headers,
+        EMPTY_SHA256_HEX,
+    );
+    let scope = format!("{date_stamp}/{region}/{SERVICE}/aws4_request");
+    let sts = string_to_sign(&amz_date, &scope, &request);
+    let sig = signature(&credential.secret_key, &date_stamp, region, SERVICE, &sts);
+    let authorization = format!(
+        "{ALGORITHM} Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={sig}",
+        credential.key_id
+    );
+
+    let mut wire = vec![
+        ("x-amz-content-sha256", EMPTY_SHA256_HEX.to_string()),
+        ("x-amz-date", amz_date),
+        ("authorization", authorization),
+    ];
+    if let Some(token) = credential.token.as_ref() {
+        wire.push(("x-amz-security-token", token.clone()));
+    }
+    wire
+}
+
 // --- Request target (URL, host, canonical path) ---
 
 #[derive(Debug)]
-struct RequestTarget {
+pub(crate) struct RequestTarget {
     /// Full URL for reqwest; every character is URL-safe (unreserved or `%XX`),
     /// so `reqwest`/`url` parse it without re-encoding the query we signed.
-    url: String,
+    pub(crate) url: String,
     /// Authority (host, and port when non-default) for the `Host` header and for
     /// the signed `host` value.
-    host: String,
+    pub(crate) host: String,
     /// Canonical URI (single-encoded path) for the canonical request.
-    canonical_uri: String,
+    pub(crate) canonical_uri: String,
 }
 
 /// Compute the request target for a bucket-subresource or object-subresource
@@ -340,7 +400,7 @@ struct RequestTarget {
 /// custom endpoint uses the endpoint as given, since `object_store` expects the
 /// bucket to be in it already; with no endpoint, AWS's regional host.
 /// `object_key` `None` targets the bucket; `Some(key)` targets an object.
-fn request_target(
+pub(crate) fn request_target(
     bucket: &str,
     region: &str,
     endpoint: Option<&str>,
@@ -529,16 +589,16 @@ impl ControlPlaneError {
 /// Every body read here is capped at [`MAX_BODY_BYTES`], so building a tree and
 /// walking it is simpler and no more costly than streaming.
 #[derive(Debug, Default)]
-struct XmlElement {
-    name: String,
-    text: String,
-    children: Vec<XmlElement>,
+pub(crate) struct XmlElement {
+    pub(crate) name: String,
+    pub(crate) text: String,
+    pub(crate) children: Vec<XmlElement>,
 }
 
 /// A child element that appeared more than once where one value is expected.
 /// It is never resolved to either copy: the value it carries is unparseable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Repeated(String);
+pub(crate) struct Repeated(String);
 
 impl fmt::Display for Repeated {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -555,7 +615,7 @@ impl From<Repeated> for ControlPlaneError {
 impl XmlElement {
     /// The single child named `name`: `Ok(None)` when absent, `Err` when it
     /// appears more than once.
-    fn single(&self, name: &str) -> Result<Option<&XmlElement>, Repeated> {
+    pub(crate) fn single(&self, name: &str) -> Result<Option<&XmlElement>, Repeated> {
         let mut named = self.children.iter().filter(|child| child.name == name);
         match (named.next(), named.next()) {
             (None, _) => Ok(None),
@@ -564,12 +624,15 @@ impl XmlElement {
         }
     }
 
-    fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a XmlElement> {
+    pub(crate) fn children_named<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a XmlElement> {
         self.children.iter().filter(move |child| child.name == name)
     }
 
     /// The element's text with surrounding whitespace removed.
-    fn value(&self) -> &str {
+    pub(crate) fn value(&self) -> &str {
         self.text.trim()
     }
 }
@@ -603,7 +666,10 @@ fn attach(stack: &mut [XmlElement], root: &mut Option<XmlElement>, element: XmlE
 /// errors, so the derived condition is `Unknown` rather than a misleading
 /// partial read. quick-xml's `check_end_names` rejects a mismatched end tag but
 /// reports plain EOF for a truncated body, so the open stack is checked at EOF.
-fn parse_document(body: &[u8], expected_root: &str) -> Result<XmlElement, ControlPlaneError> {
+pub(crate) fn parse_document(
+    body: &[u8],
+    expected_root: &str,
+) -> Result<XmlElement, ControlPlaneError> {
     let parse_err = |e: &dyn fmt::Display| ControlPlaneError::Parse(e.to_string());
     let mut reader = Reader::from_reader(body);
     let mut buf = Vec::new();
@@ -1272,7 +1338,7 @@ pub(crate) fn parse_retention(body: &[u8]) -> Result<RetentionConfig, ControlPla
     })
 }
 
-fn parse_bool(element: &XmlElement) -> Result<bool, ControlPlaneError> {
+pub(crate) fn parse_bool(element: &XmlElement) -> Result<bool, ControlPlaneError> {
     match Flag::parse(element) {
         Flag::Value(value) => Ok(value),
         Flag::Invalid(raw) => Err(ControlPlaneError::Parse(format!(
@@ -1411,59 +1477,15 @@ impl BucketControlPlaneClient {
             object_key,
             query_pairs,
         )?;
-        let (amz_date, date_stamp) = format_amz_time(self.clock.now_unix_secs());
-
-        let mut headers = vec![
-            SignedHeader {
-                name: "host".to_string(),
-                value: target.host.clone(),
-            },
-            SignedHeader {
-                name: "x-amz-content-sha256".to_string(),
-                value: EMPTY_SHA256_HEX.to_string(),
-            },
-            SignedHeader {
-                name: "x-amz-date".to_string(),
-                value: amz_date.clone(),
-            },
-        ];
-        if let Some(token) = credential.token.as_ref() {
-            headers.push(SignedHeader {
-                name: "x-amz-security-token".to_string(),
-                value: token.clone(),
-            });
-        }
-
-        let query = canonical_query(query_pairs);
-        let (request, signed_headers) = canonical_request(
-            "GET",
-            &target.canonical_uri,
-            &query,
-            &headers,
-            EMPTY_SHA256_HEX,
-        );
-        let scope = format!("{date_stamp}/{}/{SERVICE}/aws4_request", self.region);
-        let sts = string_to_sign(&amz_date, &scope, &request);
-        let sig = signature(
-            &credential.secret_key,
-            &date_stamp,
+        let mut builder = self.client.get(&target.url);
+        for (name, value) in signed_get_headers(
+            &target,
+            query_pairs,
+            &credential,
             &self.region,
-            SERVICE,
-            &sts,
-        );
-        let authorization = format!(
-            "{ALGORITHM} Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={sig}",
-            credential.key_id
-        );
-
-        let mut builder = self
-            .client
-            .get(&target.url)
-            .header("x-amz-content-sha256", EMPTY_SHA256_HEX)
-            .header("x-amz-date", &amz_date)
-            .header(reqwest::header::AUTHORIZATION, &authorization);
-        if let Some(token) = credential.token.as_ref() {
-            builder = builder.header("x-amz-security-token", token);
+            self.clock.now_unix_secs(),
+        ) {
+            builder = builder.header(name, value);
         }
 
         // Counted before dispatch: the request is billed whether or not a
