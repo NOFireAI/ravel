@@ -59,10 +59,9 @@
 //! namespace under the same root.
 //!
 //! **Read-time verification is crc32c, and that is the whole of it**
-//! (decision 4). `CacheKey` is `(tenant_hash,
-//! content_hash, offset, len)`, where `content_hash` is the blake3 of the
-//! *whole object* an entry is a byte sub-range of, and the key carries no
-//! object size -- so this crate has no way to identify the full-object case
+//! (decision 4). `CacheKey` is `(tenant_hash, content_hash, offset, len)`,
+//! where `content_hash` is the blake3 of the *whole object* an entry is a
+//! byte sub-range of, and the key carries no object size -- so this crate has no way to identify the full-object case
 //! where `blake3(payload) == content_hash` would even be checkable, and the
 //! original "verify blake3 once, on admission" design this crate shipped
 //! with turned out to be unimplementable: the hash it computed and stored
@@ -107,8 +106,8 @@
 //! the startup scan, so an in-place upgrade closes the same exposure on a
 //! cache tree that already exists.
 //!
-//! **Eviction is S3-FIFO** (decision 6), the same
-//! policy and the same implementation the RAM tier uses (see [`crate::s3fifo`]):
+//! **Eviction is S3-FIFO** (decision 6), the same policy and the same
+//! implementation the RAM tier uses (see [`crate::s3fifo`]):
 //! this tier instantiates `S3Fifo<()>`, since the payload itself lives on
 //! disk rather than in the eviction structure, and passes the entry size in
 //! explicitly. Scan resistance matters *more* here than in RAM: a disk miss
