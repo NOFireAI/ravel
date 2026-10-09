@@ -7,8 +7,9 @@
 //! [`crate::classify_objects`] and [`crate::classify_prefixes`] then split
 //! into addressable and unaddressable ones.
 //!
-//! Requests go through the `HttpClient` that [`super::S3HttpConnector`] builds
-//! from the data plane's `ClientOptions`, inside the caller's
+//! Requests go through [`super::S3HttpConnector`]'s recording around a
+//! reqwest client with the data plane's settings and redirects off
+//! ([`super::list_http_client`]), inside the caller's
 //! [`super::connector::scope`], so every attempt is billed to the `list` or
 //! `list_delimited` block exactly as before. Signing reuses
 //! [`super::bucket_config`]'s SigV4 pieces with the credential provider the
@@ -555,7 +556,10 @@ impl ListClient {
         }
     }
 
-    /// Sign and send one attempt. The outer error is one no retry can change.
+    /// Sign and send one attempt. The outer error ends the request without a
+    /// retry here: a URL or header that cannot be built, which is `Permanent`,
+    /// or a credential fetch that failed, which is `Transient` and left to the
+    /// caller to retry.
     async fn attempt(
         &self,
         prefix: &str,

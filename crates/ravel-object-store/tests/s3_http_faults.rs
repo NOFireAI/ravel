@@ -148,6 +148,9 @@ enum Fault {
     /// 301 with no `Location`, the redirect S3 answers a request sent to the
     /// wrong region with: permanent, never retried.
     MovedPermanently,
+    /// 301 with a `Location` naming this URL, the form of the redirect a
+    /// client that follows redirects acts on.
+    MovedPermanentlyTo(&'static str),
     /// 400 `InvalidArgument`: permanent, never retried.
     BadRequest,
     /// `DeleteObjects` only: a 200 whose `DeleteResult` carries an `<Error>`
@@ -949,6 +952,11 @@ async fn handle(
         Some(Fault::MovedPermanently) => {
             build(StatusCode::MOVED_PERMANENTLY, vec![], Body::empty())
         }
+        Some(Fault::MovedPermanentlyTo(location)) => build(
+            StatusCode::MOVED_PERMANENTLY,
+            vec![(header::LOCATION, location.to_string())],
+            Body::empty(),
+        ),
         Some(Fault::BadRequest) => error_response(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
@@ -4479,6 +4487,39 @@ async fn list_statuses_map_per_the_decision_one_table() {
         "got {error:?}"
     );
     assert_eq!(fake.count(Op::List), 11, "one attempt plus ten retries");
+}
+
+/// A 301 whose `Location` names another endpoint is not followed: the listing
+/// fails with the region and endpoint hint, and the other endpoint never sees
+/// a request. A followed redirect would carry the signed request elsewhere and
+/// surface as that endpoint's answer instead.
+#[tokio::test]
+async fn a_list_redirect_with_a_location_is_not_followed() {
+    let fake = FakeS3::start().await;
+    let elsewhere = FakeS3::start().await;
+    let location: &'static str = Box::leak(
+        format!("http://{}/{BUCKET}?list-type=2&prefix=s%2F", elsewhere.addr).into_boxed_str(),
+    );
+    fake.script(Op::List, [Fault::MovedPermanentlyTo(location)]);
+
+    let error = fake
+        .store()
+        .list("s/", None)
+        .await
+        .expect_err("a redirect fails the listing");
+
+    assert!(
+        matches!(&error, StoreError::Permanent(message)
+            if message.contains("HTTP 301 redirect, not followed")
+                && message.contains("check the configured region and endpoint")),
+        "got {error:?}"
+    );
+    assert_eq!(fake.count(Op::List), 1, "a redirect is never retried");
+    assert_eq!(
+        elsewhere.total_requests(),
+        0,
+        "the redirect target must see no request"
+    );
 }
 
 /// The three ADR-2637 properties pass on `S3Store` against this endpoint, with
