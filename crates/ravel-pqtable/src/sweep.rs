@@ -29,7 +29,9 @@
 //! skips and counts it as [`crate::resolve::tenant_listing`] does, and the
 //! sweep never deletes it. On S3 one such key holding a control character, an
 //! empty segment or a `.` or `..` segment fails the listing, and so the sweep,
-//! with [`SweepError::Store`].
+//! with [`SweepError::Store`]. A key the store lists but reports
+//! unaddressable is in no table's versions and is never deleted; the listing
+//! is counted as [`crate::resolve::unaddressable_listings`] describes.
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's
@@ -40,7 +42,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ravel_object_store::{ObjectMeta, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{ObjectMeta, ObjectStoreBackend, StoreError, list_all_reporting};
 use ravel_types::TenantHash;
 
 use crate::keys::{
@@ -108,12 +110,14 @@ async fn manifests_by_table(
     tenant: &TenantHash,
 ) -> Result<BTreeMap<String, Versions>, SweepError> {
     let prefix = tenant_manifest_prefix(tenant);
-    let listed = list_all(store, &prefix)
+    let listing = list_all_reporting(store, &prefix)
         .await
         .map_err(|source| SweepError::Store {
             key: prefix.clone(),
             source,
         })?;
+    resolve::note_unaddressable(tenant, &listing.unaddressable);
+    let listed = listing.objects;
     // Per table: its versions, and the version characters of its keys that
     // name no version.
     let mut tables: BTreeMap<String, (Versions, Vec<String>)> = BTreeMap::new();
@@ -352,7 +356,7 @@ mod tests {
                 manifests_deleted: manifest_deletes
             }
         );
-        let mut remaining: Vec<String> = list_all(&store, "t/")
+        let mut remaining: Vec<String> = ravel_object_store::list_all(&store, "t/")
             .await
             .expect("list")
             .into_iter()
@@ -583,27 +587,54 @@ mod tests {
         store
     }
 
-    /// On S3 a stray key `Path::parse` refuses fails the sweep's listing with
-    /// the store error, and nothing is deleted.
+    /// A stray key the S3 adapter cannot address is skipped by the sweep's
+    /// listing and counted in [`resolve::unaddressable_listings`]; the sweep
+    /// deletes the superseded version and leaves the stray key in the store.
     #[tokio::test]
-    async fn a_stray_key_the_s3_adapter_cannot_list_fails_the_sweep() {
-        use crate::resolve::tests::{UNLISTABLE_SHAPES, is_unparsed_listing, put_stray};
+    async fn a_stray_key_the_s3_adapter_cannot_address_is_skipped_and_counted_by_the_sweep() {
+        use crate::resolve::tests::{UNLISTABLE_SHAPES, put_stray};
 
         for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x7a + i as u8; 16]);
             let store = two_versions_behind_s3_keys(&tenant).await;
-            put_stray(store.inner.inner(), &tenant, rest).await;
+            let stray = put_stray(store.inner.inner(), &tenant, rest).await;
             let now = (1 + GRACE + SKEW_MS) as i64;
-            let got = plan(&store, &tenant, now, GRACE, GRACE).await;
-            assert!(
-                matches!(&got, Err(SweepError::Store { key, source })
-                    if *key == tenant_manifest_prefix(&tenant) && is_unparsed_listing(source)),
-                "{rest:?}: {got:?}"
+            let planned = plan(&store, &tenant, now, GRACE, GRACE)
+                .await
+                .expect("plan");
+            assert_eq!(
+                planned,
+                SweepPlan {
+                    manifest_deletes: vec![manifest_key(&tenant, "hits", 1).expect("key")]
+                },
+                "{rest:?}"
             );
             assert_eq!(resolve::invalid_table_listings(&tenant), 0, "{rest:?}");
+            assert_eq!(resolve::unaddressable_listings(&tenant), 1, "{rest:?}");
+            execute(&store, &planned).await.expect("execute");
             assert_eq!(
                 store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
-                0
+                1,
+                "{rest:?}"
+            );
+            store
+                .inner
+                .inner()
+                .head(&stray)
+                .await
+                .expect_err("unaddressable, so the memory store refuses it too");
+            assert!(
+                ravel_object_store::list_all_reporting(
+                    store.inner.inner(),
+                    &tenant_manifest_prefix(&tenant)
+                )
+                .await
+                .expect("list")
+                .unaddressable
+                .sample
+                .iter()
+                .any(|k| k.key == stray),
+                "{rest:?}: the stray key is still in the store"
             );
         }
     }

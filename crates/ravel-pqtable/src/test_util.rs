@@ -12,6 +12,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, Pin, PinnedRead, PutMode, PutOptions, PutOutcome, StoreError,
+    UnaddressableKey,
 };
 use ravel_types::TenantHash;
 
@@ -371,28 +372,45 @@ impl ObjectStoreBackend for SegmentAlignedStore {
     }
 }
 
-/// Handles keys the way the S3 adapter's `object_store` client does. A list
-/// page holding a key `Path::parse` refuses (a control character, an empty
-/// segment, a `.` or `..` segment) fails with the error the adapter maps that
-/// to, as `object_store` fails to parse the whole ListObjectsV2 response
-/// before any key is classified, so an unaddressable key fails it too. A
-/// request for one key goes to `Path::from` of it, as the adapter's
-/// `path_of` sends it, which percent-encodes some characters and drops empty
-/// segments. Prefixes and page tokens pass through.
+/// Handles keys the way the S3 adapter does under ADR-2637. A request for a
+/// key [`ravel_object_store::is_addressable_key`] refuses is answered with
+/// [`StoreError::UnaddressableKey`] and never reaches `inner`, as the
+/// adapter's `path_of` refuses it. A listing reads raw keys, so it never fails
+/// on one: every listed key or common prefix that is not addressable moves to
+/// the page's `unaddressable` or `unaddressable_prefixes`, whatever `inner`
+/// reported it as. Prefixes and page tokens pass through.
 pub struct S3KeyStore<S> {
     pub inner: S,
 }
 
-/// What the S3 adapter's `map_error_common` makes of a listed key
-/// `object_store` cannot parse.
-fn parse_listed(key: &str) -> Result<(), StoreError> {
-    object_store::path::Path::parse(key)
-        .map(drop)
-        .map_err(|source| StoreError::Permanent(format!("invalid path: {source}")))
+/// `key` when it is addressable, else the error the S3 adapter refuses it
+/// with.
+fn addressable(key: &str) -> Result<&str, StoreError> {
+    if ravel_object_store::is_addressable_key(key) {
+        Ok(key)
+    } else {
+        Err(StoreError::UnaddressableKey {
+            key: key.to_string(),
+            addresses: object_store::path::Path::from(key).to_string(),
+        })
+    }
 }
 
-fn s3_path(key: &str) -> String {
-    object_store::path::Path::from(key).to_string()
+/// Move every object in `objects` that is not addressable to `unaddressable`,
+/// keeping listing order in both, and keep `unaddressable` sorted by key as a
+/// listing delivers it.
+fn classify(objects: &mut Vec<ObjectMeta>, unaddressable: &mut Vec<UnaddressableKey>) {
+    let (kept, refused): (Vec<_>, Vec<_>) = std::mem::take(objects)
+        .into_iter()
+        .partition(|meta| ravel_object_store::is_addressable_key(&meta.key));
+    *objects = kept;
+    unaddressable.extend(refused.into_iter().map(|meta| UnaddressableKey {
+        addresses: object_store::path::Path::from(meta.key.as_str()).to_string(),
+        key: meta.key,
+        size: meta.size,
+        last_modified_unix_ms: meta.last_modified_unix_ms,
+    }));
+    unaddressable.sort_by(|a, b| a.key.cmp(&b.key));
 }
 
 #[async_trait::async_trait]
@@ -403,58 +421,44 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for S3KeyStore<S> {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
-        self.inner.put(&s3_path(key), data, opts).await
+        self.inner.put(addressable(key)?, data, opts).await
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.inner.get(&s3_path(key), range).await
+        self.inner.get(addressable(key)?, range).await
     }
 
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
     ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
-        self.inner.put_multipart(&s3_path(key)).await
+        self.inner.put_multipart(addressable(key)?).await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        self.inner.head(&s3_path(key)).await
+        self.inner.head(addressable(key)?).await
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        let page = self.inner.list(prefix, page).await?;
-        for key in page.objects.iter().map(|meta| meta.key.as_str()).chain(
-            page.unaddressable
-                .iter()
-                .map(|skipped| skipped.key.as_str()),
-        ) {
-            parse_listed(key)?;
-        }
+        let mut page = self.inner.list(prefix, page).await?;
+        classify(&mut page.objects, &mut page.unaddressable);
         Ok(page)
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        let listed = self.inner.list_delimited(prefix).await?;
-        for key in listed
-            .objects
-            .iter()
-            .map(|meta| meta.key.as_str())
-            .chain(listed.common_prefixes.iter().map(String::as_str))
-            .chain(
-                listed
-                    .unaddressable
-                    .iter()
-                    .map(|skipped| skipped.key.as_str()),
-            )
-            .chain(listed.unaddressable_prefixes.iter().map(String::as_str))
-        {
-            parse_listed(key)?;
-        }
+        let mut listed = self.inner.list_delimited(prefix).await?;
+        classify(&mut listed.objects, &mut listed.unaddressable);
+        let (kept, refused): (Vec<_>, Vec<_>) = std::mem::take(&mut listed.common_prefixes)
+            .into_iter()
+            .partition(|p| ravel_object_store::is_addressable_prefix(p));
+        listed.common_prefixes = kept;
+        listed.unaddressable_prefixes.extend(refused);
+        listed.unaddressable_prefixes.sort();
         Ok(listed)
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.inner.delete(&s3_path(key)).await
+        self.inner.delete(addressable(key)?).await
     }
 
     fn capabilities(&self) -> Capabilities {
