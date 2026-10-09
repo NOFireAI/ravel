@@ -1686,6 +1686,10 @@ jobs:
           AWS_ACCESS_KEY_ID: rustfsadmin
           AWS_SECRET_ACCESS_KEY: rustfsadmin
           AWS_DEFAULT_REGION: us-east-1
+          # The bucket carries Object Lock, and RustFS refuses to suspend
+          # versioning on such a bucket, so that case skips; any other set of
+          # skipped cases fails the step.
+          CI_VERIFY_PROTECTION_EXPECTED_SKIPS: versioning-suspended
         run: |
           PATH="$PWD/target/debug:$PATH" \
             scripts/ci-verify-protection-cases.sh http://localhost:9000 ravel-object-store-test

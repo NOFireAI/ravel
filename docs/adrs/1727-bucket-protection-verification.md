@@ -446,8 +446,12 @@ broken only together with an action condition.
 
 A change the store rejects with a non-transient error, or a broken state the
 subcommand reports as could-not-verify for the case's own condition, makes
-that case `SKIPPED` with the reason, and the helper fails when every breaking
-case is skipped. A restore that fails, or a bucket that does not read
+that case `SKIPPED` with the reason. The job states which cases it expects to
+skip (`CI_VERIFY_PROTECTION_EXPECTED_SKIPS`, today `versioning-suspended`),
+and the helper fails when the skipped set is any other, so a store that
+starts refusing a lifecycle change fails the job rather than proving less.
+Condition lines for conditions the run does not expect are left out of the
+comparison, as the subcommand leaves them out of its summary and exit code. A restore that fails, or a bucket that does not read
 compliant after one, fails the job and says the bucket was left broken. The
 helper's own behaviour is pinned without a store by
 `scripts/ci-verify-protection-cases.test.sh`, which runs in the `doc-scripts`

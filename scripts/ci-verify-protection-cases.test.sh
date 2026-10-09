@@ -119,7 +119,14 @@ for id in versioning noncurrent-expiration expired-delete-marker abort-multipart
   rule-scope no-foreign-rule; do
   printf '%-26s %s\n' "${id}" "$(verdict "${id}")"
 done
-printf '%-26s %s\n' delete-marker-replication "unknown not expected, does not affect the exit code"
+if [ -n "${FAKE_DMR_FAIL:-}" ]; then
+  # What the real renderer prints when the store answers ?replication with
+  # ReplicationConfigurationNotFoundError and --expect-replication is not set.
+  printf '%-26s %-7s %s\n' delete-marker-replication fail \
+    "not expected, does not affect the exit code: ReplicationConfigurationNotFoundError"
+else
+  printf '%-26s %s\n' delete-marker-replication "unknown not expected, does not affect the exit code"
+fi
 printf '%-26s %s\n' object-lock "$(verdict object-lock)"
 printf '%-26s %s\n' object-retention "unknown not checked by this command, does not affect the exit code"
 join() { local IFS=,; echo "$*" | sed 's/,/, /g'; }
@@ -156,6 +163,7 @@ run_helper() {
   echo "${COMPLIANT}" >"${FAKE_STATE}/compliant"
   rc=0
   env PATH="${STUB_BIN}:${PATH}" CI_VERIFY_PROTECTION_BACKOFF_SECONDS=0 \
+    CI_VERIFY_PROTECTION_EXPECTED_SKIPS= \
     AWS_ACCESS_KEY_ID=ak AWS_SECRET_ACCESS_KEY=sk AWS_DEFAULT_REGION=us-east-1 \
     "$@" bash "${SCRIPT}" http://localhost:9000 test-bucket \
     >"${TMP}/${name}.out" 2>&1 || rc=$?
@@ -259,11 +267,29 @@ check all-unknown nonzero \
   "FAIL: every breaking case was SKIPPED (5); this run proved nothing"
 
 # The first put (suspending versioning) rejected, the rest behave.
-run_helper one-rejected FAKE_AWS_FAIL_PUT=1
+run_helper one-rejected FAKE_AWS_FAIL_PUT=1 CI_VERIFY_PROTECTION_EXPECTED_SKIPS=versioning-suspended
 check one-rejected 0 \
   "SKIPPED versioning-suspended: the store rejected versioning-suspended (exit 254" \
   "PASS foreign-rule:" \
   "verify-protection cases: 4 passed, 1 skipped"
+
+# The skipped set is pinned, not bounded: a case skipping that was expected to
+# run fails the run, and so does an expected skip that ran.
+run_helper unexpected-skip FAKE_AWS_FAIL_PUT=1
+check unexpected-skip 1 \
+  "SKIPPED versioning-suspended:" \
+  "FAIL: skipped [versioning-suspended], expected []"
+run_helper expected-skip-ran CI_VERIFY_PROTECTION_EXPECTED_SKIPS=versioning-suspended
+check expected-skip-ran 1 \
+  "PASS versioning-suspended:" \
+  "FAIL: skipped [], expected [versioning-suspended]"
+
+# A condition the run does not expect reads fail beside it; the subcommand
+# leaves it out of the summary and the exit code, and so does the helper.
+run_helper not-expected-fail FAKE_DMR_FAIL=1
+check not-expected-fail 0 \
+  "PASS versioning-suspended: exit 1 naming exactly [versioning]" \
+  "verify-protection cases: 5 passed, 0 skipped"
 
 run_helper transient-retried FAKE_AWS_TRANSIENT_PUTS=2
 check transient-retried 0 \
@@ -289,6 +315,8 @@ usage_case usage-secret-key AWS_SECRET_ACCESS_KEY RAVEL_S3_ENDPOINT=e RAVEL_S3_B
   AWS_ACCESS_KEY_ID=ak
 usage_case usage-region AWS_DEFAULT_REGION RAVEL_S3_ENDPOINT=e RAVEL_S3_BUCKET=b \
   AWS_ACCESS_KEY_ID=ak AWS_SECRET_ACCESS_KEY=sk
+usage_case usage-expected-skips CI_VERIFY_PROTECTION_EXPECTED_SKIPS RAVEL_S3_ENDPOINT=e \
+  RAVEL_S3_BUCKET=b AWS_ACCESS_KEY_ID=ak AWS_SECRET_ACCESS_KEY=sk AWS_DEFAULT_REGION=r
 rc=0
 bash "${SCRIPT}" a b c >"${TMP}/usage-extra.out" 2>&1 || rc=$?
 check usage-extra 64 "usage:"

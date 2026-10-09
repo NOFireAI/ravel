@@ -43,11 +43,23 @@
 # subcommand run exits 2 reporting the case's first condition as could not
 # verify, is SKIPPED with the reason: the store cannot express that broken
 # state, which proves nothing either way. A SKIPPED case still runs the
-# subcommand afterwards and expects exit 0.
+# subcommand afterwards and expects exit 0. Which cases skip is known in
+# advance for a given store and bucket, so the caller states it:
+# CI_VERIFY_PROTECTION_EXPECTED_SKIPS is required, a space-separated list of
+# case names (empty for none), and the run fails when the cases that actually
+# skipped are any other set. A store that starts refusing a lifecycle change,
+# or a condition that starts reading unknown, then fails the job instead of
+# quietly proving less.
 #
-# Prints one line per case. Exits 0 when every case behaved and at least one
-# breaking case was not skipped; 1 naming the first case that did not behave,
-# or when every breaking case was skipped; 64 on usage. A case that leaves the
+# Condition lines for conditions the run does not expect (the subcommand prints
+# them with the detail "not expected, does not affect the exit code") are left
+# out of the comparison, as the subcommand leaves them out of its summary and
+# its exit code.
+#
+# Prints one line per case. Exits 0 when every case behaved and the skipped
+# cases are exactly the expected ones; 1 naming the first case that did not
+# behave, or naming the difference between the skipped and expected sets; 64
+# on usage. A case that leaves the
 # bucket broken (the restore put failed, or the subcommand does not exit 0
 # after it) says so and exits 1.
 #
@@ -78,6 +90,15 @@ for pair in "endpoint:$endpoint" "bucket:$bucket" \
     exit 64
   fi
 done
+if [ -z "${CI_VERIFY_PROTECTION_EXPECTED_SKIPS+set}" ]; then
+  echo "missing: CI_VERIFY_PROTECTION_EXPECTED_SKIPS (the cases expected to skip; set it empty for none)" >&2
+  usage
+  exit 64
+fi
+# Sorted, comma-joined, so it compares against the skipped set below.
+# shellcheck disable=SC2086 # word splitting on the space-separated list is the intent
+expected_skips=$(printf '%s\n' $CI_VERIFY_PROTECTION_EXPECTED_SKIPS | sed '/^$/d' |
+  LC_ALL=C sort | paste -sd, -)
 
 for tool in aws ravel-cli; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -160,7 +181,8 @@ verify() {
 
 # The conditions the per-condition lines read as fail, sorted, comma-joined.
 failed_lines() {
-  awk '$1 !~ /^verify-protection:/ && $2 == "fail" { print $1 }' "$out" |
+  awk '$1 !~ /^verify-protection:/ && $2 == "fail" &&
+    $0 !~ /not expected, does not affect the exit code/ { print $1 }' "$out" |
     LC_ALL=C sort | paste -sd, -
 }
 # The summary's failed list and could-not-verify list, sorted, comma-joined.
@@ -208,6 +230,7 @@ echo "PASS control: exit 0 on the compliant bucket"
 
 ran=0
 skipped=0
+skipped_names=
 # run_case <name> <break-setting> <restore-setting> <want>: <want> is the
 # expected failed conditions, sorted and comma-joined; its first entry is the
 # condition the case targets.
@@ -223,6 +246,7 @@ run_case() {
   if [ "$rc" -ne 0 ]; then
     echo "SKIPPED $name: the store rejected $breaking (exit $rc: $(tail -n 1 "$err"))"
     skipped=$((skipped + 1))
+    skipped_names="$skipped_names $name"
     if ! expect_compliant; then
       fail_case "$name" "verify-protection exited $verify_rc after the rejected change, not 0; the bucket was left broken"
       exit 1
@@ -237,6 +261,7 @@ run_case() {
     [ "$(condition_line "$primary" | awk '{ print $2 }')" = unknown ]; then
     echo "SKIPPED $name: the store's broken state reads unknown, not fail: $(condition_line "$primary")"
     skipped=$((skipped + 1))
+    skipped_names="$skipped_names $name"
     restore "$name" "$restoring"
     return 0
   fi
@@ -274,6 +299,13 @@ run_case foreign-rule LIFECYCLE_FOREIGN LIFECYCLE_COMPLIANT \
 if [ "$ran" -eq 0 ]; then
   echo "FAIL: every breaking case was SKIPPED ($skipped); this run proved nothing"
   echo "::error::verify-protection: every breaking case was skipped" >&2
+  exit 1
+fi
+# shellcheck disable=SC2086 # word splitting on the space-separated list is the intent
+got_skips=$(printf '%s\n' $skipped_names | sed '/^$/d' | LC_ALL=C sort | paste -sd, -)
+if [ "$got_skips" != "$expected_skips" ]; then
+  echo "FAIL: skipped [$got_skips], expected [$expected_skips] (CI_VERIFY_PROTECTION_EXPECTED_SKIPS)"
+  echo "::error::verify-protection: skipped [$got_skips], expected [$expected_skips]" >&2
   exit 1
 fi
 echo "verify-protection cases: $ran passed, $skipped skipped"
