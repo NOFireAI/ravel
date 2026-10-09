@@ -42,20 +42,25 @@ pub(crate) const LIST_MAX_BODY_BYTES: usize = 8 << 20;
 /// for.
 const WIRE_PAGE_KEYS: usize = 1000;
 
-/// Responses a `ListPage` call may receive beyond the ones a full page needs.
+/// Truncated responses carrying no key after which a `ListPage` call fails
+/// with [`StoreError::ListPageCeiling`].
 const EMPTY_RESPONSE_ALLOWANCE: usize = 16;
 
 /// Largest error body read for its `<Error><Code>`.
 const ERROR_BODY_BYTES: usize = 64 << 10;
 
 /// Most ListObjectsV2 responses one [`crate::ObjectStoreBackend::list`] or
-/// `list_after` call on `S3Store` receives before it fails with
-/// [`StoreError::ListPageCeiling`]: the responses a full page of `page_size`
-/// keys needs, plus 16 that may come back empty. A drain is capped at
-/// [`crate::MAX_LIST_PAGES`] pages, so a drained listing sends at most
-/// `MAX_LIST_PAGES × max_responses_per_page(page_size)` requests.
+/// `list_after` call on `S3Store` receives. Only a truncated response carrying
+/// no key is charged to the ceiling: after 16 of them the call fails with
+/// [`StoreError::ListPageCeiling`] instead of sending another request. Every
+/// other response adds at least one key, and ListObjectsV2 may return fewer
+/// than `max-keys`, so the page size alone bounds those: at most `page_size` of
+/// them plus the 16 empty ones. A drain is capped at [`crate::MAX_LIST_PAGES`] pages, so a drained
+/// listing sends at most `MAX_LIST_PAGES × max_responses_per_page(page_size)`
+/// requests.
 pub const fn max_responses_per_page(page_size: usize) -> usize {
-    page_size.div_ceil(WIRE_PAGE_KEYS) + EMPTY_RESPONSE_ALLOWANCE
+    let page_size = if page_size == 0 { 1 } else { page_size };
+    page_size + EMPTY_RESPONSE_ALLOWANCE
 }
 
 /// One ListObjectsV2 request.
@@ -116,15 +121,14 @@ pub(crate) async fn list_page<F: ListFetch>(
     page_size: usize,
 ) -> Result<ListPage, StoreError> {
     let page_size = page_size.max(1);
-    let ceiling = max_responses_per_page(page_size);
     let mut listed: Vec<ObjectMeta> = Vec::new();
     let mut token: Option<String> = None;
-    let mut responses = 0usize;
+    let mut empty_responses = 0usize;
     let truncated = loop {
-        if responses == ceiling {
+        if empty_responses == EMPTY_RESPONSE_ALLOWANCE {
             return Err(StoreError::ListPageCeiling {
                 prefix: prefix.to_string(),
-                ceiling,
+                ceiling: EMPTY_RESPONSE_ALLOWANCE,
             });
         }
         let remaining = page_size.saturating_sub(listed.len());
@@ -136,15 +140,17 @@ pub(crate) async fn list_page<F: ListFetch>(
             delimited: false,
         };
         let response = fetch.fetch(&request).await?;
-        responses += 1;
+        if response.contents.is_empty() {
+            empty_responses += 1;
+        }
         listed.extend(response.contents);
         if !response.is_truncated {
             break false;
         }
-        token = Some(next_token(prefix, token.as_deref(), response.next_token)?);
         if listed.len() >= page_size {
             break true;
         }
+        token = Some(next_token(prefix, token.as_deref(), response.next_token)?);
     };
     let next = if truncated {
         listed.last().map(|meta| PageToken(meta.key.clone()))
@@ -540,12 +546,13 @@ impl ListClient {
                 retries >= self.retry.max_retries || started.elapsed() > self.retry.retry_timeout;
             let outcome = match self.attempt(prefix, &target, query_pairs).await? {
                 Ok(response) => self.read_response(prefix, response).await,
-                Err(error) => Err(Failure::Transport(error)),
+                Err(failure) => Err(failure),
             };
             let retry = match &outcome {
                 Ok(_) => false,
                 Err(Failure::Status { status, .. }) => status_retryable(*status),
                 Err(Failure::Transport(error)) => transport_retryable(error.kind()),
+                Err(Failure::Credential(_)) => true,
                 Err(Failure::Refused(_)) => false,
             };
             if !retry || exhausted {
@@ -556,19 +563,23 @@ impl ListClient {
         }
     }
 
-    /// Sign and send one attempt. The outer error ends the request without a
-    /// retry here: a URL or header that cannot be built, which is `Permanent`,
-    /// or a credential fetch that failed, which is `Transient` and left to the
-    /// caller to retry.
+    /// Sign and send one attempt. The outer error is a URL or header that
+    /// cannot be built, which is `Permanent` and no retry can change; a failed
+    /// credential fetch or send is the inner failure, for the retry loop.
     async fn attempt(
         &self,
         prefix: &str,
         target: &RequestTarget,
         query_pairs: &[(String, String)],
-    ) -> Result<Result<HttpResponse, HttpError>, StoreError> {
-        let credential = self.credentials.get_credential().await.map_err(|e| {
-            StoreError::Transient(format!("listing {prefix:?}: credential fetch failed: {e}"))
-        })?;
+    ) -> Result<Result<HttpResponse, Failure>, StoreError> {
+        let credential = match self.credentials.get_credential().await {
+            Ok(credential) => credential,
+            Err(e) => {
+                return Ok(Err(Failure::Credential(format!(
+                    "listing {prefix:?}: credential fetch failed: {e}"
+                ))));
+            }
+        };
         let mut request = HttpRequest::new(HttpRequestBody::empty());
         *request.uri_mut() = target.url.parse().map_err(|e| {
             StoreError::Permanent(format!("listing {prefix:?}: invalid request URL: {e}"))
@@ -589,7 +600,7 @@ impl ListClient {
                 .headers_mut()
                 .insert(HeaderName::from_static(name), value);
         }
-        Ok(self.http.execute(request).await)
+        Ok(self.http.execute(request).await.map_err(Failure::Transport))
     }
 
     /// The success body, or the failure a response stands for.
@@ -642,6 +653,8 @@ enum Failure {
     Status { status: u16, code: Option<String> },
     /// The request or the body read failed in transport.
     Transport(HttpError),
+    /// The credential provider failed; retried, then `Transient`.
+    Credential(String),
     /// Already classified, and never retried.
     Refused(StoreError),
 }
@@ -650,6 +663,7 @@ impl Failure {
     fn into_store_error(self, prefix: &str) -> StoreError {
         match self {
             Failure::Refused(error) => error,
+            Failure::Credential(message) => StoreError::Transient(message),
             Failure::Transport(error) => match error.kind() {
                 HttpErrorKind::Timeout => StoreError::Timeout,
                 _ => StoreError::Transient(format!("listing {prefix:?}: {error}")),
@@ -716,6 +730,7 @@ fn control_plane_error(prefix: &str, error: ControlPlaneError) -> StoreError {
 #[allow(clippy::expect_used)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use parking_lot::Mutex;
 
@@ -1008,6 +1023,57 @@ mod tests {
         );
     }
 
+    /// A credential provider that always fails, counting its calls.
+    #[derive(Debug, Default)]
+    struct FailingCredentials(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl object_store::CredentialProvider for FailingCredentials {
+        type Credential = object_store::aws::AwsCredential;
+
+        async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(object_store::Error::Generic {
+                store: "test",
+                source: "no credential".into(),
+            })
+        }
+    }
+
+    /// A failed credential fetch takes the retry loop's decision like any
+    /// other transient failure, and is `Transient` once retries run out.
+    #[tokio::test]
+    async fn a_failed_credential_fetch_is_retried_then_transient() {
+        let credentials = Arc::new(FailingCredentials::default());
+        let mut client = ListClient::new(
+            HttpClient::new(reqwest::Client::new()),
+            Arc::clone(&credentials) as AwsCredentialProvider,
+            "bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://127.0.0.1:1".to_string()),
+            true,
+        );
+        client.retry = RetryConfig {
+            backoff: BackoffConfig {
+                init_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                base: 2.0,
+            },
+            max_retries: 3,
+            ..RetryConfig::default()
+        };
+        let error = client
+            .list_page("p/", None, 10)
+            .await
+            .expect_err("no credential, no listing");
+        assert!(
+            matches!(&error, StoreError::Transient(m)
+                if m.contains("\"p/\"") && m.contains("credential fetch failed")),
+            "got {error:?}"
+        );
+        assert_eq!(credentials.0.load(Ordering::Relaxed), 4);
+    }
+
     /// ListObjectsV2 may return fewer keys than `max-keys`: a backend paging at
     /// 50 fills a 1000-key page in 20 responses.
     #[tokio::test]
@@ -1049,15 +1115,51 @@ mod tests {
             Err(StoreError::Permanent(m)) if m.contains("\"p/\"") && m.contains("NextContinuationToken")
         ));
 
-        let fresh: Vec<ListResponse> = (0..100).map(|i| truncated(&[], &format!("t{i}"))).collect();
-        let script = Script::new(fresh);
-        assert!(matches!(
-            list_page(&script, "p/", None, 1).await,
-            Err(StoreError::ListPageCeiling { ceiling: 17, .. })
-        ));
-        assert_eq!(script.seen.lock().len(), 17);
-        assert_eq!(max_responses_per_page(1000), 17);
-        assert_eq!(max_responses_per_page(1001), 18);
+        for page_size in [1, 1000] {
+            let fresh: Vec<ListResponse> =
+                (0..100).map(|i| truncated(&[], &format!("t{i}"))).collect();
+            let script = Script::new(fresh);
+            assert!(matches!(
+                list_page(&script, "p/", None, page_size).await,
+                Err(StoreError::ListPageCeiling { ceiling: 16, .. })
+            ));
+            assert_eq!(script.seen.lock().len(), 16);
+        }
+        assert_eq!(max_responses_per_page(0), 17);
+        assert_eq!(max_responses_per_page(1000), 1016);
+        assert_eq!(max_responses_per_page(1001), 1017);
+    }
+
+    /// Only the empty responses are charged: 15 of them, then keys, fit.
+    #[tokio::test]
+    async fn responses_carrying_keys_are_not_charged_to_the_ceiling() {
+        let mut responses: Vec<ListResponse> =
+            (0..15).map(|i| truncated(&[], &format!("e{i}"))).collect();
+        responses.extend((0..30).map(|i| truncated(&[&format!("p/{i:02}")], &format!("k{i}"))));
+        responses.push(last(&["p/z"]));
+        let script = Script::new(responses);
+        let page = list_page(&script, "p/", None, 1000).await.expect("page");
+        assert_eq!(page.next, None);
+        assert_eq!(page.objects.len(), 31);
+        assert_eq!(script.seen.lock().len(), 46);
+    }
+
+    /// A page that fills on a truncated response is complete: the token it
+    /// would resume with is never sent, so it is not checked.
+    #[tokio::test]
+    async fn a_full_page_does_not_check_the_token_it_never_uses() {
+        let script = Script::new([ListResponse {
+            contents: vec![meta("p/a"), meta("p/b")],
+            is_truncated: true,
+            ..ListResponse::default()
+        }]);
+        let page = list_page(&script, "p/", None, 2).await.expect("page");
+        assert_eq!(page.next, Some(PageToken("p/b".to_string())));
+
+        let script = Script::new([truncated(&["p/a"], "t1"), truncated(&["p/b"], "t1")]);
+        let page = list_page(&script, "p/", None, 2).await.expect("page");
+        assert_eq!(page.next, Some(PageToken("p/b".to_string())));
+        assert_eq!(script.seen.lock().len(), 2);
     }
 
     #[tokio::test]
