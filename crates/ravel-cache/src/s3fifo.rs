@@ -797,6 +797,31 @@ mod tests {
         }
     }
 
+    /// The limit of the narrowed guarantee above: a loop five times the
+    /// cache outruns the ghost, which remembers twice the resident capacity,
+    /// so after a cold scan none of its keys returns as a ghost hit and the
+    /// scan's unproven entries keep main. The same loop over an empty cache
+    /// serves 0.18 of itself. If this starts failing, the policy got better:
+    /// update the ADR-0046 loop amendment and the caching guide with it.
+    #[test]
+    fn a_loop_five_times_the_cache_after_a_cold_scan_is_not_served() {
+        let g = Geometry {
+            label: "C=N/5",
+            max_bytes: N / 5 * ENTRY,
+            max_entry_bytes: SERVER_MAX_ENTRY,
+            size: equal_size,
+        };
+        let metrics = CacheMetrics::default();
+        let mut fifo = g.fifo();
+        let fresh: Vec<_> = (0..3).map(|_| pass(&mut fifo, &g, 0, &metrics)).collect();
+        assert_converged(&g, "first loop", &fresh);
+
+        let served = loop_after_a_cold_scan(&g, 6);
+        let fractions: Vec<f64> = served.iter().map(|s| served_fraction(&g, s)).collect();
+        eprintln!("{}, loop after a 3N cold scan: served per pass {fractions:.3?}", g.label);
+        assert!(served.iter().all(BTreeSet::is_empty), "served per pass {fractions:.3?}");
+    }
+
     const HOT: u64 = 10;
     const SCAN_PER_ROUND: u64 = 20;
     const ROUNDS: u64 = 50;
