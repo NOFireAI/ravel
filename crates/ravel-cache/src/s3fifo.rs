@@ -18,9 +18,9 @@
 //! LRU that walk is itself the most-recently-used list, so it evicts the
 //! query working set on its way through. S3-FIFO's small probation queue
 //! absorbs exactly that pattern: a key admitted and never touched again
-//! leaves through probation, and once main is full the only main entry it
-//! can take a slot from is a loop entry that has already missed its turn
-//! (below). An entry re-read at a shorter distance is never displaced by it.
+//! leaves through probation, and when it leaves with main full, the only
+//! main entry it can take a slot from is a loop entry that has already
+//! missed its turn (below).
 //!
 //! Promotion rule: a freshly admitted entry starts in the small queue with
 //! `freq = 0`, unless it is a ghost hit that main takes (below). Every
@@ -63,14 +63,21 @@
 //!   at the front if that entry has been idle for longer than the returning
 //!   key's own reuse distance. Otherwise the front entry moves to the back
 //!   and the returning key starts over in probation. A hot key with a short
-//!   reuse distance therefore still displaces cold main entries, and a loop
-//!   key never displaces an entry of its own loop.
+//!   reuse distance therefore still displaces cold main entries, and under a
+//!   steady loop a loop key never displaces an entry of its own loop.
 //! - **The ghost remembers twice the resident capacity.** Resident
 //!   capacity is estimated as `max_bytes` over the average resident entry
 //!   size, capped at `max_entries`, and never below `max_bytes /
 //!   max_entry_bytes`. A key evicted untouched is remembered while up to
 //!   twice that many other keys are evicted after it, so a loop of up to
 //!   about twice the cache returns as ghost hits on its second pass.
+//!
+//! A loop that starts right after a cold scan that filled main converges
+//! one pass later than a loop over an empty or looping cache. On its first
+//! pass it reads as the scan continuing: the scan's entries are unproven,
+//! so none is overdue, and the loop's entries leave probation into the
+//! ghost. They return as ghost hits on the second pass and take the scan's
+//! idle slots, and from the third pass on the loop serves a stable subset.
 //!
 //! Main's share is where untouched entries stop filling it, not a cap:
 //! promoting an entry read again in probation, or a displacement that
