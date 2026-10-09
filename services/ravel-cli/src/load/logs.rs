@@ -74,6 +74,52 @@ pub async fn load(
     .await
 }
 
+/// [`load`] followed by `--fold-after-load` (ADR-2677 decision 1): once every
+/// write is acked the router is shut down, so no flush can follow, and the
+/// logs snapshot is folded through the highest ingest hour the load wrote,
+/// with a fresh reading of `clock` as the fold's time. The fold's figures are
+/// in [`LoadReport::fold`] and its time is inside [`LoadReport::elapsed`].
+/// A fold that fails fails the load with [`LoadError::Fold`]; the loaded
+/// objects are durable either way.
+#[allow(clippy::too_many_arguments)]
+pub async fn load_with_fold_after_load(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<LoadReport, LoadError> {
+    load_instrumented_at(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        0,
+        read_cursors,
+        pipeline_depth,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        DEFAULT_TARGET_BYTES,
+        None,
+        now_ns,
+        clock,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        None,
+        true,
+    )
+    .await
+}
+
 /// [`load`] with the object-size levers and the memory budget given: the
 /// flush target (`--target-bytes`), the age trigger (`--max-flush-delay`,
 /// `None` = the default) and the memory budget's inputs (see
@@ -115,6 +161,7 @@ pub async fn load_with_memory(
         None,
         RlogZstdLevel::DEFAULT,
         Some(load_memory),
+        false,
     )
     .await
 }
@@ -198,6 +245,7 @@ pub(super) async fn load_instrumented(
         on_batch_queued,
         RlogZstdLevel::DEFAULT,
         None,
+        false,
     )
     .await
 }
@@ -206,7 +254,8 @@ pub(super) async fn load_instrumented(
 /// the router's [`IngestConfig::rlog_zstd_level`], the level every page and
 /// section of each object the load writes compresses at. `load_memory` is the
 /// memory budget's inputs, resolved once the read-cursor count is known;
-/// `None` derives the budget from this host's memory.
+/// `None` derives the budget from this host's memory. `fold_after_load` is
+/// the `--fold-after-load` flag ([`load_with_fold_after_load`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_instrumented_at(
     store: Arc<dyn ObjectStoreBackend>,
@@ -229,6 +278,7 @@ pub(super) async fn load_instrumented_at(
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
     load_memory: Option<LoadMemoryOptions>,
+    fold_after_load: bool,
 ) -> Result<LoadReport, LoadError> {
     load_with_drain_reflush_period(
         store,
@@ -252,6 +302,7 @@ pub(super) async fn load_instrumented_at(
         zstd_level,
         DRAIN_REFLUSH_PERIOD,
         load_memory,
+        fold_after_load,
     )
     .await
 }
@@ -286,6 +337,7 @@ pub(super) async fn load_with_drain_reflush_period(
     zstd_level: RlogZstdLevel,
     drain_reflush_period: Duration,
     load_memory: Option<LoadMemoryOptions>,
+    fold_after_load: bool,
 ) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
@@ -423,7 +475,7 @@ pub(super) async fn load_with_drain_reflush_period(
             ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
         },
         Arc::clone(&store),
-        clock,
+        Arc::clone(&clock),
     ));
 
     // Every Strict write below waits this long for its ack, and the wait is
@@ -548,7 +600,7 @@ pub(super) async fn load_with_drain_reflush_period(
     // load parked on the age trigger, or forever on a raised one. At the
     // default target every write flushes itself and this never runs, so the
     // default layout is unchanged.
-    let _stall_flusher = match &budget {
+    let stall_flusher = match &budget {
         Some(budget) if target_bytes > DEFAULT_TARGET_BYTES => Some(spawn_stall_flusher(
             Arc::clone(&router),
             Arc::clone(budget),
@@ -836,12 +888,104 @@ pub(super) async fn load_with_drain_reflush_period(
     }
     report.load_memory_peak_bytes = budget.as_ref().map_or(0, |b| b.peak_bytes());
     report.load_memory_waits = budget.as_ref().map_or(0, |b| b.waits_total());
+    if fold_after_load {
+        let fold_started = Instant::now();
+        if let Some(stall_flusher) = stall_flusher {
+            stall_flusher.stop().await;
+        }
+        report.fold = Some(
+            fold_after_load_through(
+                store,
+                router,
+                clock.as_ref(),
+                &tenant_id,
+                shards,
+                &report.tokens,
+                fold_started,
+            )
+            .await?,
+        );
+    }
     report.elapsed = started.elapsed();
     Ok(report)
 }
 
+/// The `--fold-after-load` step (ADR-2677 decision 1), run once every write
+/// has acked. Shutting the router down waits for every shard actor to finish
+/// its last flush and closes its mailbox, which is what makes the loader's
+/// assertion true: nothing it started can publish into an hour after the
+/// fold seals it. The fold then seals the logs snapshot through the highest
+/// ingest hour among `tokens`, at a fresh reading of `clock`.
+async fn fold_after_load_through(
+    store: Arc<dyn ObjectStoreBackend>,
+    router: Arc<LogIngestRouter>,
+    clock: &dyn Clock,
+    tenant_id: &TenantId,
+    shards: u32,
+    tokens: &[CommitToken],
+    started: Instant,
+) -> Result<LoadFold, LoadError> {
+    let fold_failed = |cause: String| LoadError::Fold {
+        durable: tokens.to_vec(),
+        cause,
+    };
+    // Every write task, the drain ticker and the stall flusher have been
+    // joined by now, so this is the last handle.
+    let router = Arc::try_unwrap(router).map_err(|_| {
+        fold_failed("the ingest router is still shared, so it cannot be shut down".to_string())
+    })?;
+    router.shutdown().await;
+
+    let Some(seal_through_hour) = tokens.iter().map(|t| t.ingest_hour_bucket).max() else {
+        // Nothing was written, so no hour of this load needs sealing.
+        return Ok(LoadFold {
+            elapsed: started.elapsed(),
+            no_op: true,
+            ..LoadFold::default()
+        });
+    };
+    let now_ns = clock.now_ns();
+    let catalog = crate::catalog::enforcing_catalog(
+        store,
+        ravel_catalog::CatalogConfig {
+            shard_count: shards,
+            ..ravel_catalog::CatalogConfig::default()
+        },
+    )
+    .map_err(|err| fold_failed(format!("failed to build catalog: {err}")))?;
+    let fold = catalog
+        .fold_with_seal_through(
+            &tenant_id.hash(),
+            Signal::Logs,
+            uuid::Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+            &ravel_catalog::RefoldRequest::new(),
+            Some(seal_through_hour),
+        )
+        .await
+        .map_err(|err| fold_failed(err.to_string()))?;
+    Ok(LoadFold {
+        elapsed: started.elapsed(),
+        entry_count: fold.entry_count,
+        watermark_hour: fold.watermark_hour,
+        seal_through_hour: Some(seal_through_hour),
+        no_op: fold.no_op,
+    })
+}
+
 /// Aborts its task when dropped, so every return path of the loader stops it.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// Aborts the task and waits for it to end, so whatever it held is
+    /// released before this returns.
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

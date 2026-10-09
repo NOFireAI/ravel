@@ -358,6 +358,9 @@ pub struct LoadReport {
     /// is admitted on its own (issue #2626 decision A). `None` under an
     /// explicit `--load-memory-bytes`, which refuses such a batch instead.
     pub load_memory_warning: Option<String>,
+    /// The `--fold-after-load` fold's figures (ADR-2677 decision 1). `None`
+    /// when the flag was not given. Its time is inside [`LoadReport::elapsed`].
+    pub fold: Option<LoadFold>,
     /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
     /// snapshotted once the load finished. Present only under the
     /// `stage-timing` feature; with it off this field does not exist, so a
@@ -404,6 +407,26 @@ impl LoadReport {
         }
         FlushMixReport { shards, totals }
     }
+}
+
+/// What `--fold-after-load` did (ADR-2677 decision 1): one fold of the loaded
+/// signal, sealing through the highest ingest hour the load wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadFold {
+    /// Wall time of the router shutdown and the fold, already counted in
+    /// [`LoadReport::elapsed`].
+    pub elapsed: Duration,
+    /// Entries across every part of the HEAD the fold left.
+    pub entry_count: u64,
+    /// HEAD's watermark hour after the fold.
+    pub watermark_hour: Option<u32>,
+    /// The seal-through hour asserted: the highest `ingest_hour_bucket` over
+    /// the load's commit tokens. `None` when the load wrote nothing, so there
+    /// was no hour to seal and no fold ran.
+    pub seal_through_hour: Option<u32>,
+    /// `true` when HEAD already covered that hour, so there was nothing left
+    /// to seal. Still a successful load.
+    pub no_op: bool,
 }
 
 /// Flush counts split by trigger cause: how many flushes each of the three
@@ -548,6 +571,17 @@ pub enum LoadError {
         cause: String,
         resume: ResumeFigures,
     },
+    /// The `--fold-after-load` fold failed after every row was written. The
+    /// load's objects are all durable; only the snapshot is missing them, so
+    /// the fix is a fold, not a resumed load.
+    #[error(
+        "fold after load failed: {cause}. Every loaded object is already durable; seal them \
+         with `ravel-cli catalog fold --signal logs --writers-stopped` once the cause is fixed"
+    )]
+    Fold {
+        durable: Vec<CommitToken>,
+        cause: String,
+    },
 }
 
 impl LoadError {
@@ -559,16 +593,19 @@ impl LoadError {
             LoadError::Setup(_) => &[],
             LoadError::BatchFailed { durable, .. }
             | LoadError::RowRejected { durable, .. }
-            | LoadError::Flush { durable, .. } => durable,
+            | LoadError::Flush { durable, .. }
+            | LoadError::Fold { durable, .. } => durable,
         }
     }
 
     /// The rows skipped and the rows acked durable when this error occurred.
     /// `None` for [`LoadError::Setup`], which occurs before the load applies an
-    /// offset or writes anything, so it has no figures to resume from.
+    /// offset or writes anything, so it has no figures to resume from, and for
+    /// [`LoadError::Fold`], which occurs once every row is durable, so there is
+    /// nothing left to resume.
     pub fn resume_figures(&self) -> Option<ResumeFigures> {
         match self {
-            LoadError::Setup(_) => None,
+            LoadError::Setup(_) | LoadError::Fold { .. } => None,
             LoadError::BatchFailed { resume, .. }
             | LoadError::RowRejected { resume, .. }
             | LoadError::Flush { resume, .. } => Some(*resume),
@@ -584,7 +621,8 @@ impl LoadError {
             LoadError::Setup(_) => None,
             LoadError::BatchFailed { durable, .. }
             | LoadError::RowRejected { durable, .. }
-            | LoadError::Flush { durable, .. } => Some(durable),
+            | LoadError::Flush { durable, .. }
+            | LoadError::Fold { durable, .. } => Some(durable),
         }
     }
 }
