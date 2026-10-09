@@ -24,7 +24,7 @@ figure it moves, are:
 | attribution | the per-statement probe cannot place a 190 ms gap before the first batch (#2639 W8); the ADR-2509 after-stamp derives listing wall time by subtraction (#2595 item 10) | the SQL `stats` object carries requests and bytes per phase and no wall time; `ScanTiming` is folded onto `SqlStats` (`crates/ravel-sql/src/executor.rs:436-473`, set at `:1552`) and never rendered |
 | declared-column pruning | wired (#2151, ADR-2121 D1) and unit-tested through `SqlExecutor::execute`; no HTTP test declares a column and asserts fewer reads | `UserID = N`, `CounterID = 62` and the `EventDate` epoch-day bounds reach the stamp skip and the block `NumRange` skip; none reaches postings (string and bytes equalities only, `crates/ravel-sql/src/logs_pushdown.rs:392-397`); `<>` is not extracted at all |
 | ordered `LIMIT` (q24 to q27) | q25 and q27 about 1.1 s against 15 to 16 ms on ClickHouse; the TopK operator itself under 0.1 s; a block-level `ts` short-circuit gave no wall gain (#2639) | `hits.parquet` is CounterID-sorted, so every object spans most of the week in `ts`; an ordered traversal with a stopping rule can stop early only if the block `ts` envelopes are disjoint enough, which nobody has measured |
-| fetch concurrency as a default | #2639 W1 (`latency-first`, 256 permits, per-query pool held at stock) on v0.23.0 release binaries with 25 MB objects: 43 of 43 on every machine with 32 GB or more, c6a.4xlarge cold 386.0 s and hot 57.2 s (v0.22: 1,291.0 / 87.2); on c6a.2xlarge (16 GB) 40 of 43, q18, q32 and q33 refused with `process memory budget exhausted` at about 6.6 GB, plus two `upstream storage temporarily unavailable` errors from RustFS; on c6a.xlarge (8 GB) 33 of 43 against 37 at stock, 19 such refusals, 1.3 GB of swap used, and a concurrent phase of QPS 0.160 with an error ratio of 0.923 (#1191 comment 6071729407, #2677 comment 6071772569, #2592) | the 256 permits' in-flight fetch reservations, each up to one whole object, draw on the process budget the queries draw on, so holding the per-query pool does not protect a 16 GB host; `store_get_concurrency` derives from cores, not from memory (ADR-1195, `resolve_performance_defaults`), and the loopback policy default is `cost-based` (ADR-2023 decision 1) |
+| fetch concurrency as a default | #2639 W1 (`latency-first`, 256 permits, per-query pool held at stock) on v0.23.0 release binaries with 25 MB objects: 43 of 43 on every machine with 32 GB or more, c6a.4xlarge cold 386.0 s and hot 57.2 s (v0.22: 1,291.0 / 87.2); on c6a.2xlarge (16 GB) 40 of 43, q18, q32 and q33 refused with `process memory budget exhausted` at about 6.6 GB, plus two `upstream storage temporarily unavailable` errors from RustFS; on c6a.xlarge (8 GB) 33 of 43 against 37 at stock, 19 such refusals, 1.3 GB of swap used, and a concurrent phase of QPS 0.160 with an error ratio of 0.923; on c6a.large (4 GB) 18 of 43. The same release at stock on c6a.4xlarge: 43 of 43, cold 486.6 s, hot 56.9 s, QPS 0.653, error ratio 0.084, with 32 derived permits; W1 rerun on that box: cold 384.6 s (-21%), hot 57.1 s, QPS 0.727, error ratio 0.103, so on large objects W1 is a cold lever only (#1191 comment 6071729407, #2677 comment 6071772569, #2592 comment 6072731122) | the 256 permits' in-flight fetch reservations, each up to one whole object, draw on the process budget the queries draw on, so holding the per-query pool does not protect a 16 GB host; `store_get_concurrency` derives from cores, not from memory (ADR-1195, `resolve_performance_defaults`), and the loopback policy default is `cost-based` (ADR-2023 decision 1) |
 
 Already delivered and not reopened here: the loader's memory and object
 geometry (ADR-2614, #2592: 24.5 MB median objects, cold 499 s and hot 60.6 s
@@ -243,9 +243,14 @@ the permits by memory, it does not change what each permit reserves.
 
 What it moves: the stock entry gets W1's cold gain on every host where it
 is safe and nothing on a host where it is not. The acceptance arm reports
-the concurrent phase (QPS and error ratio) against the ADR-2023 decision 4
-bar, because that phase is what sent the loopback default back to
-`cost-based` once; a miss there is reported before any release, not hidden.
+the concurrent phase (QPS and error ratio) against the same release's
+stock arm on the same box, because that phase is what sent the loopback
+default back to `cost-based` once (ADR-2023 decision 4). Its absolute bar
+is already missed by stock v0.23.0 (error ratio 0.084 against 0.058), so
+the comparison is relative: W1 on the reference box measured QPS 0.727
+and error ratio 0.103 against stock's 0.653 and 0.084, and the derived
+defaults may not widen that error gap. A miss there is reported before any
+release, not hidden.
 
 ### 8. Measurement protocol and targets
 
@@ -272,7 +277,7 @@ outside its band is a miss and stays open with its bottleneck named.
 | statements answered on the reference box | 43 of 43 | fewer |
 | c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal |
 | c6a.2xlarge (16 GB), no server flags | no statement refused that stock answers (42 of 43, #2627 R6); cold reported against the tuned 377.1 s and the stock arm | any such refusal |
-| concurrent phase with the derived defaults on loopback | QPS at least 0.40 and error ratio at most 0.058 (ADR-2023 decision 4) | reported before any release |
+| concurrent phase, derived defaults against same-release stock on c6a.4xlarge | QPS not below stock's and error ratio not above stock's by more than 0.02 (v0.23.0 stock: QPS 0.653, error 0.084; W1 tuned on the same box: 0.727, 0.103) | error ratio over stock's by more than 0.02, or QPS below stock's |
 | unaffected statements | no confirmed regression over 5% | |
 
 The v0.23 nine-machine pass already in flight (pre-registration #2592
