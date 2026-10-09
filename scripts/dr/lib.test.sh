@@ -276,8 +276,10 @@ check "custody: dr_init accepts a declared tenant hash mode" \
 
 # --- finding 1: the buckets are named, never guessed -----------------------
 
-(
-  unset DR_BUCKET_PRIMARY DR_BUCKET_REPLICA
+# All four are unset before sourcing, so the case reads lib.sh rather than the
+# caller: the rehearsal workflow exports both credentials for the whole job.
+no_bucket_or_credential_default() (
+  unset DR_BUCKET_PRIMARY DR_BUCKET_REPLICA DR_ACCESS_KEY DR_SECRET_KEY
   # shellcheck source=scripts/dr/lib.sh
   source "${DR_LIB_PATH}"
   [[ -z "${DR_BUCKET_PRIMARY}" ]] || exit 1
@@ -286,7 +288,15 @@ check "custody: dr_init accepts a declared tenant hash mode" \
   [[ -z "${DR_SECRET_KEY}" ]] || exit 1
   exit 0
 )
+no_bucket_or_credential_default
 check "buckets: neither bucket and neither credential carries a default" "0" "$?"
+(
+  export DR_BUCKET_PRIMARY=env-primary DR_BUCKET_REPLICA=env-replica
+  export DR_ACCESS_KEY=env-access-key DR_SECRET_KEY=env-secret-key
+  no_bucket_or_credential_default
+)
+check "buckets: the no-default case ignores all four set in the caller's environment" \
+  "0" "$?"
 
 check "buckets: an unset primary is refused" \
   "64" "$(rc_sub bash -c '

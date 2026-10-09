@@ -785,6 +785,18 @@ real rehearsal, not from estimation. The definitions are:
   reconciliation step that fails) blocks publication until fixed. Rehearsals
   re-run when the restore-relevant machinery changes materially, and the
   record keeps its history.
+- **What a harness rehearsal's RPO is (owner decision, 2026-10-08):** the RPO
+  a rehearsal with `scripts/dr/rehearse.sh` publishes is a
+  restore-completeness figure, not the replication lag the definition above
+  describes. It counts acknowledged samples (rows) missing from the target
+  bucket after the restore: the samples `seed.sh` had acknowledged under
+  strict ack, minus the samples the canary check reads back from bucket B.
+  The canary check fails unless that difference is 0. For a
+  quiesced client-side mirror the expected value is exactly 0: `seed.sh`
+  stops its writer before `replicate.sh` copies bucket A with
+  `aws s3 cp --recursive`, so every acknowledged sample is already in A when
+  the copy starts. Measuring replication lag needs bucket replication and a
+  live writer during the disaster, and the harness uses neither.
 
 ## Rehearsal record
 
@@ -796,7 +808,7 @@ records the measured outcome here.
 | Date | _unrehearsed_ |
 | Environment (tier, store, region/account layout) | _unrehearsed_ |
 | Object count restored | _unrehearsed_ |
-| **Measured RPO** | **unmeasured** |
+| **Measured RPO (restore completeness: acknowledged samples missing after restore, not replication lag)** | **unmeasured** |
 | **Measured RTO** | **unmeasured** |
 | Anomalies found (blocking / non-blocking) | _unrehearsed_ |
 
