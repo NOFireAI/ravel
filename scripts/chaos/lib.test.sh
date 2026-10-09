@@ -343,6 +343,7 @@ check "logfile: with CHAOS_LOG_DIR it is the named file under it" \
 check "logfile: with CHAOS_LOG_DIR the directory is created" "yes" \
   "$([[ -d "${SCRATCH}/logs" ]] && echo yes || echo no)"
 
+mkdir -p "${SCRATCH}/logs"
 printf 'server refused: the reason\n' > "${SCRATCH}/logs/kept.log"
 printf 'deleted on success\n' > "${SCRATCH}/logs/gone.log"
 check "release: exit 0 deletes the log even with CHAOS_LOG_DIR set" "no" \
@@ -355,10 +356,39 @@ check "release: exit 3 with CHAOS_LOG_DIR prints the kept path and the log's tai
 printf 'no dir, no keep\n' > "${SCRATCH}/logs/nodir.log"
 check "release: exit 3 without CHAOS_LOG_DIR deletes the log" "no" \
   "$(CHAOS_LOG_DIR="" chaos_release_logs 3 "${SCRATCH}/logs/nodir.log" 2>/dev/null; [[ -f "${SCRATCH}/logs/nodir.log" ]] && echo yes || echo no)"
-check "scenario 1 reads its exit code before the trap can replace it" "yes" \
-  "$([[ "$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")" == *$'cleanup() {\n'*$'  local code=$?\n  trap - ERR'* ]] && echo yes || echo no)"
-check "scenario 2 reads its exit code before the trap can replace it" "yes" \
-  "$([[ "$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")" == *$'cleanup() {\n'*$'  local code=$?\n  trap - ERR'* ]] && echo yes || echo no)"
+# The scenarios' real cleanup functions, extracted from each script and run
+# as the EXIT trap of a shell exiting 3 with CHAOS_LOG_DIR set, must keep the
+# log. A command inserted before `local code=$?` (or the read moved below the
+# process reaping) makes the trap see 0 and delete it; the log that this lane
+# fails without is then gone with a green run. The processes are stubbed:
+# no PID is set, so nothing is signalled, and rustfs_down is a no-op.
+cleanup_keeps_log_on_exit_3() {
+  local script="$1"
+  local kept="${SCRATCH}/logs/cleanup-$(basename "${script}" .sh).log"
+  local body
+  printf 'the reason the start was refused\n' > "${kept}"
+  body="$(sed -n '/^cleanup() {/,/^}/p' "${script}")"
+  [[ -n "${body}" ]] || { echo "no cleanup function in ${script}"; return; }
+  CHAOS_LOG_DIR="${SCRATCH}/logs" bash -c '
+    set -euo pipefail
+    source "$1"
+    rustfs_down() { :; }
+    SERVER_PID=""; WORKER_A_PID=""; WORKER_B_PID=""; INGEST_PID=""
+    SERVER_LOG="$3"; SERVER_RESTART_LOG="$3"
+    WORKER_A_LOG="$3"; WORKER_B_LOG="$3"; INGEST_LOG="$3"
+    FIXTURE_PATH="$4"
+    eval "$2"
+    trap cleanup EXIT
+    exit 3' _ "${CHAOS_DIR}/lib.sh" "${body}" "${kept}" "${SCRATCH}/logs/fixture.pb" \
+    >/dev/null 2>&1 || true
+  [[ -f "${kept}" ]] && echo yes || echo no
+}
+check "scenario 1's cleanup keeps the log when the scenario exits 3" "yes" \
+  "$(cleanup_keeps_log_on_exit_3 "${CHAOS_DIR}/kill-ingest-flush.sh")"
+check "scenario 2's cleanup keeps the logs when the scenario exits 3" "yes" \
+  "$(cleanup_keeps_log_on_exit_3 "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "scenario 1 gives the restarted server its own log file" "yes" \
+  "$([[ "$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")" == *'start_server_bg "$SERVER_LOG"'* && "$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")" == *'start_server_bg "$SERVER_RESTART_LOG"'* ]] && echo yes || echo no)"
 
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]

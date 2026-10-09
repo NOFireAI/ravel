@@ -280,8 +280,11 @@ jobs:
       # connection says why only in its own log, and before this step existed
       # the scripts deleted that log in their exit trap, so twenty nightly
       # failures in a row left no cause to read.
+      # `cancelled()` too: a scenario that hangs past the job's timeout-minutes
+      # is cancelled, not failed, and its kept logs would otherwise stay on
+      # the runner.
       - name: Upload the chaos process logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: chaos-process-logs
