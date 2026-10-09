@@ -35,7 +35,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     LogsTableProvider, RavelTableProvider, SessionTable, SpillDecision, SqlConfig,
-    TenantMemoryAccountant, build_session,
+    TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantId;
 use ravel_types::accounting::QueryAccounting;
@@ -179,6 +179,102 @@ async fn a_multi_batch_aggregate_query_returns_every_reserved_byte() {
 
     assert_eq!(pool.reserved(), 0);
     assert_eq!(accountant.reserved(), 0);
+}
+
+/// Issue #2633: `HASH_AGGREGATE_CONSUMER_PREFIX` against the consumer name
+/// DataFusion itself gives a grouped hash aggregate, not a hand-written one.
+/// A real `GROUP BY` through the production pool (`SqlConfig::query_pool`,
+/// then `build_session` with spill disabled) must leave bytes held while its
+/// stream is alive: an aggregate's emit shrinks its reservation before it
+/// returns the batch, so by the time any output batch arrives one has
+/// shrunk, and nothing releases the hold until the stream drops.
+///
+/// FLIP: set `HASH_AGGREGATE_CONSUMER_PREFIX` to a string DataFusion does
+/// not produce and the hold reads 0 after every batch.
+#[tokio::test]
+async fn a_real_group_by_is_held_by_the_production_pool() {
+    let (groups, least_held, _) = held_during_group_by(SpillDecision::Disabled).await;
+    assert_eq!(groups, SAMPLES as usize, "one group per sample timestamp");
+    assert!(
+        least_held > 0,
+        "no bytes were held after some output batch of a live GROUP BY stream \
+         (least {least_held}): the pool did not recognise DataFusion's \
+         aggregate consumer name"
+    );
+}
+
+/// The same `GROUP BY` on a session with a spill directory: DataFusion marks
+/// every aggregate stream's consumer `can_spill`, so the pool holds nothing.
+///
+/// FLIP: drop the `!consumer.can_spill()` conjunct from the pool's `holds`
+/// and bytes are held after some batch here too.
+#[tokio::test]
+async fn a_group_by_that_can_spill_is_not_held() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let (groups, _, most_held) = held_during_group_by(SpillDecision::Enabled {
+        dir: dir.path(),
+        max_bytes: 1 << 30,
+    })
+    .await;
+    assert_eq!(groups, SAMPLES as usize, "one group per sample timestamp");
+    assert_eq!(most_held, 0, "a stream that can spill was held");
+}
+
+/// Run `SELECT ts, count(value) ... GROUP BY ts` over [`big_segment`] through
+/// the production pool under `spill`, returning the group count and the
+/// least and most bytes the pool held after any output batch. Asserts that
+/// dropping the stream releases every held and reserved byte.
+async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize) {
+    let tenant = tenant_id("acme");
+    let specs = big_segment();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    let accountant = TenantMemoryAccountant::new(1 << 30);
+    let (pool, _breach) =
+        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
+    let held = || {
+        pool.downcast_ref::<TenantDelegatingPool>()
+            .expect("query_pool builds a TenantDelegatingPool")
+            .held_bytes()
+    };
+
+    let snapshot = fixture.snapshot(&tenant).await;
+    let provider = Arc::new(RavelTableProvider::new(
+        snapshot,
+        tenant.hash(),
+        SegmentFetcher::new(Arc::clone(&fixture.store)),
+        SqlConfig::default(),
+        PhaseAccounting::new(),
+    ));
+    let ctx = build_session(
+        &SqlConfig::default(),
+        Arc::clone(&pool),
+        SessionTable::Metrics(provider),
+        false,
+        spill,
+    )
+    .expect("session");
+    let mut stream = ctx
+        .sql("SELECT ts, count(value) FROM samples GROUP BY ts")
+        .await
+        .expect("plan")
+        .execute_stream()
+        .await
+        .expect("execute");
+
+    let mut groups = 0usize;
+    let mut least_held = usize::MAX;
+    let mut most_held = 0usize;
+    while let Some(next) = stream.next().await {
+        groups += next.expect("batch").num_rows();
+        least_held = least_held.min(held());
+        most_held = most_held.max(held());
+    }
+
+    drop(stream);
+    assert_eq!(held(), 0, "the hold is released when the stream drops");
+    assert_eq!(accountant.reserved(), 0);
+    (groups, least_held, most_held)
 }
 
 /// Three consecutive queries against one tenant accountant. A leak of even
