@@ -7389,8 +7389,9 @@ fn render_sql_slice_tls_dial_family(out: &mut String, mode: Mode, dials: Option<
     write_header(
         out,
         "ravel_sql_slice_tls_dials_total",
-        "Outbound SQL slice DoGet fetches this coordinator dialed over TLS to a worker's \
-         dedicated fragment listener (ADR-1689 decision 1).",
+        "Outbound SQL slice DoGet fetches this coordinator dialed with its client TLS \
+         configuration to a worker's dedicated fragment listener (ADR-1689 decision 1). \
+         The server dials https only, so each is a TLS dial.",
         "counter",
     );
     write_sample(

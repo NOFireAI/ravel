@@ -135,8 +135,10 @@ renders it instead). This ADR builds on both.
    `--sql-ticket-key-file`, beside the existing pairing checks
    (`services/ravel-server/src/config.rs:4556-4570`); the public gRPC
    listener's fragment role is always `PublicFederation`; and the plaintext
-   dial (`client_tls: None`) is deleted, so every fragment and slice dial is
-   TLS with a client certificate (shipped; see the release B amendment below).
+   dial (`client_tls: None`) is deleted, so every intra-cluster fragment and
+   slice dial is TLS with a client certificate; `--remote-cluster` federation
+   keeps its own per-remote TLS setting (shipped; see the release B amendment
+   below).
 
 ```mermaid
 flowchart LR

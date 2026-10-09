@@ -15935,7 +15935,7 @@ mod tests {
         }
     }
 
-    /// The dedicated fragment listener is the other published lane, and it is
+    /// The dedicated fragment listener is the only published lane, and it is
     /// refused on the same rule. The check runs before the TLS PEM paths are
     /// read (they do not exist here), so the wildcard is reported as itself.
     #[test]
