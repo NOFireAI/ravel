@@ -264,15 +264,58 @@ check "custody: dr_init refuses an undeclared tenant hash mode" \
     DR_SECRET_KEY=s
     DR_TENANT_HASH_MODE=""
     dr_init' _ "${DR_LIB_PATH}")"
-check "custody: dr_init accepts a declared tenant hash mode" \
-  "0" "$(rc_sub bash -c '
+AUDIT_KEY_DIR="$(mktemp -d)"
+AUDIT_KEY_OK="${AUDIT_KEY_DIR}/ok.key"
+AUDIT_KEY_SHORT="${AUDIT_KEY_DIR}/short.key"
+AUDIT_KEY_NOT_HEX="${AUDIT_KEY_DIR}/not-hex.key"
+printf '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n' >"${AUDIT_KEY_OK}"
+printf '000102030405060708090a0b0c0d0e0f\n' >"${AUDIT_KEY_SHORT}"
+printf 'zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n' >"${AUDIT_KEY_NOT_HEX}"
+
+# dr_init under an unkeyed mode, with the audit key file given as $2; prints
+# the exported RAVEL_AUDIT_TOKEN_KEY on success.
+unkeyed_init() {
+  bash -c '
+    unset RAVEL_AUDIT_TOKEN_KEY
     source "$1"
     DR_BUCKET_PRIMARY=a-primary
     DR_BUCKET_REPLICA=a-replica
     DR_ACCESS_KEY=k
     DR_SECRET_KEY=s
     DR_TENANT_HASH_MODE=unkeyed
-    dr_init' _ "${DR_LIB_PATH}")"
+    DR_AUDIT_TOKEN_KEY_FILE="$2"
+    DR_LOG_DIR="$3"
+    dr_init
+    printf "%s\n" "${RAVEL_AUDIT_TOKEN_KEY:-}"' _ "${DR_LIB_PATH}" "$1" "${AUDIT_KEY_DIR}/log"
+}
+
+check "custody: dr_init accepts a declared tenant hash mode" \
+  "0" "$(rc_sub unkeyed_init "${AUDIT_KEY_OK}")"
+check "custody: unkeyed exports the audit token key the file holds" \
+  "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" \
+  "$(unkeyed_init "${AUDIT_KEY_OK}" 2>/dev/null)"
+check "custody: unkeyed without DR_AUDIT_TOKEN_KEY_FILE is refused" \
+  "64" "$(rc_sub unkeyed_init "")"
+check "custody: unkeyed with an unreadable audit key file is refused" \
+  "64" "$(rc_sub unkeyed_init "${AUDIT_KEY_DIR}/absent.key")"
+check "custody: an audit key shorter than 64 hex characters is refused" \
+  "64" "$(rc_sub unkeyed_init "${AUDIT_KEY_SHORT}")"
+check "custody: an audit key with a non-hex character is refused" \
+  "64" "$(rc_sub unkeyed_init "${AUDIT_KEY_NOT_HEX}")"
+check "custody: keyed mode neither needs nor exports an audit token key" \
+  "0:" "$(bash -c '
+    unset RAVEL_AUDIT_TOKEN_KEY
+    source "$1"
+    DR_BUCKET_PRIMARY=a-primary
+    DR_BUCKET_REPLICA=a-replica
+    DR_ACCESS_KEY=k
+    DR_SECRET_KEY=s
+    DR_TENANT_HASH_MODE=keyed
+    DR_TENANT_HASH_KEY_FILE=/nonexistent/deployment.key
+    DR_AUDIT_TOKEN_KEY_FILE=""
+    DR_LOG_DIR="$2"
+    dr_init >/dev/null 2>&1
+    printf "%s:%s\n" "$?" "${RAVEL_AUDIT_TOKEN_KEY:-}"' _ "${DR_LIB_PATH}" "${AUDIT_KEY_DIR}/log")"
 
 # --- finding 1: the buckets are named, never guessed -----------------------
 
