@@ -177,7 +177,10 @@ pub use logs_schema::{
     logs_schema, logs_schema_with_declared,
 };
 pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
-pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+pub use memory::{
+    AggregateRelease, CeilingBreach, HASH_AGGREGATE_CONSUMER_PREFIX, TenantDelegatingPool,
+    TenantMemoryAccountant, sql_memory_held_bytes,
+};
 pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, MetadataOnlyExec};
 pub use output::QueryOutput;
 pub use page_plan::{
