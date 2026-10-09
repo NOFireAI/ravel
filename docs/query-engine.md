@@ -1340,6 +1340,19 @@ memory pool's own refusal, `ResourcesExhausted`, is the one the SQL path
 answers 422); the refused query holds no reservation afterwards, so the next
 query is admitted against the same remainder as before.
 
+The SQL query memory pool (`TenantDelegatingPool`) holds the bytes a grouped
+hash aggregate releases instead of returning them to the query, tenant and
+process budgets. DataFusion 54.1's `GroupedHashAggregateStream`
+shrinks its reservation when it emits, while the emitted batch still holds
+those bytes, so releasing them would let other queries be granted memory that
+is still live. The held bytes stay charged and count toward every ceiling, a
+later grow by the same aggregate is served from them first, and they are
+released when the aggregate's stream is dropped, so the pool over-charges an
+aggregate from its first shrink until its stream is dropped. The hold is off
+whenever SQL spill is configured, because the pool cannot tell a shrink after
+a spill, which frees memory, from a shrink after an emit.
+`ravel_sql::sql_memory_held_bytes()` reports the bytes held across the process.
+
 `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
 the summed sizes of live fetch reservations that a fetcher marked handed off
 because the bytes they cover go through the read cache. Whenever a cache is
