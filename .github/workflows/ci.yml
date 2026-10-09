@@ -169,7 +169,7 @@ jobs:
           if echo "$changed" | grep -qE '^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-query/'; then
             promql_area=true
           fi
-          if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^scripts/ci-create-bucket\.sh$'; then
+          if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^scripts/ci-create-bucket\.sh$|^scripts/ci-verify-protection-cases\.sh$'; then
             object_store_area=true
           fi
           # Catch-all: the four lists above are conservative allowlists, not a
@@ -306,6 +306,10 @@ jobs:
       # classification is covered by these cases or not at all (issue #2036).
       - name: CI bucket-create cases (issue #2036)
         run: bash scripts/ci-create-bucket.test.sh
+      # The green contract job takes only the behaved path against RustFS, so
+      # the helper's refusals are covered by these cases (issue #2672).
+      - name: verify-protection negative-path helper cases (issue #2672)
+        run: bash scripts/ci-verify-protection-cases.test.sh
       # A filter that stopped matching the service container would surface in
       # the demo as a timeout three minutes later instead of the real exit code
       # (issue #2308).
@@ -1571,7 +1575,9 @@ jobs:
     # catalog, ingest, or workspace-level paths changed.
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not 15: the job also builds ravel-cli for the verify-protection
+    # cases after the contract suite.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1668,6 +1674,21 @@ jobs:
             echo "::error::rustfs_contract did not run (expected 1 passed)"
             exit 1
           fi
+      # ADR-1727 decision 6: the negative path of `store verify-protection`
+      # on the bucket above. The helper breaks one setting at a time with the
+      # aws CLI, asserts the subcommand names exactly the conditions that
+      # breaks, and restores the bucket before the next case; its own cases
+      # run in doc-scripts (scripts/ci-verify-protection-cases.test.sh).
+      - name: Build ravel-cli
+        run: cargo build --locked -p ravel-cli
+      - name: Prove verify-protection fails on a broken bucket (RustFS)
+        env:
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          PATH="$PWD/target/debug:$PATH" \
+            scripts/ci-verify-protection-cases.sh http://localhost:9000 ravel-object-store-test
       # floci: the fake-S3 backend ADR-0034 decision 8 gates here before the
       # kind environment and the k8s lane are allowed to depend on it. Single
       # native-binary container, S3 on port 4566, configured entirely by env

@@ -174,7 +174,8 @@ data; verification is reads of configuration.
    exercised through the fixture source only: the job's MinIO has no
    replication target, and its bucket is created without lock. (See the
    launcher substitution amendment below: the job runs RustFS, not MinIO,
-   and these cases are not in any workflow yet.)
+   and these cases are not in any workflow yet; they are now, see the
+   verify-protection cases amendment below.)
 
 ```mermaid
 flowchart LR
@@ -408,7 +409,57 @@ Decision 6 has the same substitution. The `object-store-contract` job runs
 RustFS and creates its bucket with `scripts/ci-create-bucket.sh`, so its
 bucket is now versioned and Object Lock enabled. The negative cases the
 decision describes (one per breakable condition, plus the compliant
-control) are not in any workflow yet. When they are added, they break a
+control) are not in any workflow yet (they are now: see the
+verify-protection cases amendment below). When they are added, they break a
 condition with the AWS CLI (`put-bucket-versioning` with
 `Status=Suspended`, `delete-bucket-lifecycle` or a narrowed rule) instead
 of `mc`.
+
+## Amendment (2026-10-09): the verify-protection cases run in the object-store-contract job
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-09-30): the launcher substitution, floci and RustFS in place of MinIO" pointer="verify-protection cases amendment" -->
+<!-- amendment-supersedes: phrase="not in any workflow yet" pointer="verify-protection cases amendment" -->
+
+Decision 6's cases now run in the `object-store-contract` job of
+`.github/workflows/ci.yml` (issue #2672). After the contract suite, the job
+builds `ravel-cli` and runs `scripts/ci-verify-protection-cases.sh` against
+its RustFS bucket, the one `scripts/ci-create-bucket.sh` provisioned. The
+helper runs `store verify-protection --expected-noncurrent-days 1` on the
+compliant bucket and expects exit `0` (the control case). Each breaking case
+then changes one setting with the AWS CLI, expects exit `1` with exactly the
+listed conditions failed on the condition lines and in the summary and none
+left could-not-verify, puts the setting back, and expects exit `0` again:
+
+| Case | Change | Failed conditions |
+|---|---|---|
+| `versioning-suspended` | `put-bucket-versioning` with `Status=Suspended` | `versioning` |
+| `no-noncurrent-expiration` | lifecycle re-put without `NoncurrentVersionExpiration` | `noncurrent-expiration`, `rule-scope` |
+| `no-expired-delete-marker` | lifecycle re-put without `ExpiredObjectDeleteMarker` | `expired-delete-marker`, `rule-scope` |
+| `no-abort-multipart` | lifecycle re-put without `AbortIncompleteMultipartUpload` | `abort-multipart`, `rule-scope` |
+| `foreign-rule` | lifecycle re-put with a second rule expiring `sys/` after 30 days | `no-foreign-rule` |
+
+Decision 6 says each case breaks exactly one condition. The three removal
+cases cannot: when no enabled rule covering `t/` carries a sanctioned action,
+the control plane fails `rule-scope` as well as the action's own condition,
+so each of those cases asserts that exact pair. `rule-scope` is therefore
+broken only together with an action condition.
+
+A change the store rejects with a non-transient error, or a broken state the
+subcommand reports as could-not-verify for the case's own condition, makes
+that case `SKIPPED` with the reason, and the helper fails when every breaking
+case is skipped. A restore that fails, or a bucket that does not read
+compliant after one, fails the job and says the bucket was left broken. The
+helper's own behaviour is pinned without a store by
+`scripts/ci-verify-protection-cases.test.sh`, which runs in the `doc-scripts`
+job.
+
+Three conditions stay out of the job. `object-lock` is not broken: the
+bucket is created with Object Lock and S3 has no call that disables it, so
+its `Fail` path stays covered by fixtures
+(`store::tests::verify_protection_names_each_failed_condition` in
+`ravel-cli`, `replication_and_object_lock_not_configured_codes_fail` in
+`ravel-object-store`). `delete-marker-replication` is fixture-only, as
+decision 6 states: the job's store has no replication target, and the
+helper does not pass `--expect-replication`. `object-retention` is not
+checked by the subcommand at all (see the verify-protection retention
+amendment above).
