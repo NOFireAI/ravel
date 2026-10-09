@@ -951,7 +951,10 @@ mod tests {
                 .expect("versions"),
             vec![1]
         );
-        assert_eq!(unaddressable_under(&store, &prefix).await, [junk.clone()]);
+        assert_eq!(
+            unaddressable_under(&store, &prefix).await,
+            std::slice::from_ref(&junk)
+        );
 
         // Nothing is flagged now; the key is still reported, and still kept.
         let lines = repair_lines(&store, "acme", "hits", RepairAction::DeleteFlagged)
@@ -968,7 +971,10 @@ mod tests {
             "{printed}"
         );
         assert_eq!(deletes(&store), 1);
-        assert_eq!(unaddressable_under(&store, &prefix).await, [junk.clone()]);
+        assert_eq!(
+            unaddressable_under(&store, &prefix).await,
+            std::slice::from_ref(&junk)
+        );
 
         // On the same tree, the list-only run flags the one version.
         let listed = seeded().await;
