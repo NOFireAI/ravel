@@ -1,0 +1,29 @@
+== hold.py on decay A1 (origin/decay-2633:investigations/2633-decay/A1)
+samples 105, live 104, not live 1 [1791482491.818]; phase samples 72; concurrency start 1791482003.527, bench end 1791482364.544
+ROW1 max(allocated - accounted + handoff_overlap) 3.428 GB at unix 1791482176.819 (t=+173.3s, phase)
+  components: allocated 7.916, accounted 5.274, handoff_overlap 0.786, sql_reserved 1.796, fetch_reserved 0.786, fetch_cache_resident 2.692, catalog_cache_resident 0.000, resident 9.563, vmrss_bytes 9.028 GB
+  top 5: t=+173.3s 3.428; t=+163.3s 2.373; t=+353.3s 2.274; t=+323.3s 2.256; t=+143.3s 2.178
+ROW2 median over phase 0.820 GB (72 samples), p90 1.741 GB, samples >= 2.0 GB: 5, >= 3.0 GB: 1
+ROW3 concurrency qps 7.997, completed 2887, errors 38, unreachable 0
+ROW4 typed 422 refusals 37; other server-logged query errors 1; bench-counted errors 38
+ROW5 peak retention (resident - allocated) 6.537 GB at t=+328.3s (phase peak 6.537 GB at t=+328.3s); peak VmRSS 9.885 GB at t=+253.3s; mean VmRSS over phase 8.458 GB
+VALIDITY serial statements 43, errored 0: []
+exit 0
+
+== hold.py on decay A2 (origin/decay-2633:investigations/2633-decay/A2)
+samples 104, live 103, not live 1 [1791483586.463]; phase samples 72; concurrency start 1791483096.947, bench end 1791483457.860
+ROW1 max(allocated - accounted + handoff_overlap) 1.914 GB at unix 1791483321.464 (t=+224.5s, phase)
+  components: allocated 7.054, accounted 5.517, handoff_overlap 0.377, sql_reserved 2.448, fetch_reserved 0.377, fetch_cache_resident 2.692, catalog_cache_resident 0.000, resident 8.894, vmrss_bytes 8.314 GB
+  top 5: t=+224.5s 1.914; t=+79.5s 1.816; t=+84.5s 1.644; t=+319.5s 1.630; t=+334.5s 1.498
+ROW2 median over phase 0.729 GB (72 samples), p90 1.243 GB, samples >= 2.0 GB: 0, >= 3.0 GB: 0
+ROW3 concurrency qps 7.262, completed 2621, errors 45, unreachable 0
+ROW4 typed 422 refusals 42; other server-logged query errors 3; bench-counted errors 45
+ROW5 peak retention (resident - allocated) 6.107 GB at t=+269.5s (phase peak 6.107 GB at t=+269.5s); peak VmRSS 10.190 GB at t=+269.5s; mean VmRSS over phase 8.319 GB
+VALIDITY serial statements 43, errored 0: []
+exit 0
+
+== phases.py over R1 R2 and decay A1 A2
+R1 serial n 6 max 2.478 at t=-12.4 sql 0.000 fetch 1.099 | idle max 0.025 | overlap==fetch_reserved 105/105
+R2 serial n 6 max 0.251 at t=-22.5 sql 0.009 fetch 0.028 | idle max 0.024 | overlap==fetch_reserved 100/104
+cmp/A1 serial n 7 max 1.197 at t=-6.7 sql 0.460 fetch 0.000 | idle max 0.021 | overlap==fetch_reserved 103/104
+cmp/A2 serial n 6 max 0.748 at t=-15.5 sql 0.000 fetch 0.200 | idle max 0.024 | overlap==fetch_reserved 103/103
