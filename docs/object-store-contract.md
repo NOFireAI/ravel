@@ -289,24 +289,30 @@ trait honors cancellation by drop, so the query deadline (usually well under
   listed prefix excludes no key under it. Overriding the default (which
   lists from the prefix and drops `<= start_after` in the client) is a
   performance property only; the visible result set is identical.
-- A listing classifies every key it finds and never fails because of one
-  (ADR-2637 decision 2). An addressable key is an `ObjectMeta` in
-  `objects`; an unaddressable one goes to `unaddressable` as an
-  `UnaddressableKey` carrying the raw key, the key a request for it would
-  reach (`addresses`), its size and its `last_modified_unix_ms`, in listing
-  order. Both count toward the page size, so a page of unaddressable keys
-  still advances the listing. `MemoryStore` resumes after a page's raw last
-  key. `S3Store` and `ExternalStore` resume through `object_store`'s
-  `Path::from`, which re-encodes an unaddressable key, so their page token
-  is the page's last addressable key: an unaddressable tail after it is
-  listed and reported again on the next page. `drain_pages` drops only a
-  repeat of the key it recorded last, so a tail of two or more such keys is
-  counted twice. A full page holding only unaddressable keys has no safe
-  offset. Its token is its raw last key, which still re-encodes, so the
-  next page can skip keys (`p/a#b` resumes after `p/a%23b`, past `p/a$`)
-  or re-deliver them and fail `ListOrderViolation` (`p/é` resumes after
-  `p/%C3%A9`, before `p/b`) until the raw ListObjectsV2 listing of
-  ADR-2637 decision 1 replaces it. `list_delimited` judges a common prefix by
+- A listing classifies every key it finds and does not fail because of one
+  (ADR-2637 decision 2), except on `S3Store` and `ExternalStore` when a
+  whole full page holds only unaddressable keys, and on a key holding a
+  control character, which `object_store`'s own listing rejects (both
+  below). An addressable key is an
+  `ObjectMeta` in `objects`; an unaddressable one goes to `unaddressable`
+  as an `UnaddressableKey` carrying the raw key, the key a request for it
+  would reach (`addresses`), its size and its `last_modified_unix_ms`, in
+  listing order. Both count toward the page size, so a page of
+  unaddressable keys still advances the listing. `MemoryStore` resumes
+  after a page's raw last key and has no exception. `S3Store` and
+  `ExternalStore` resume through `object_store`'s `Path::from`, which
+  re-encodes an unaddressable key, so their page token is the page's last
+  addressable key: an unaddressable tail after it is listed and reported
+  again on the next page. `drain_pages` drops only a repeat of the key it
+  recorded last, so a tail of two or more such keys is counted twice. On
+  S3 today, a full page holding only unaddressable keys has no safe offset:
+  its token is its raw last key, which still re-encodes, so the next page
+  can skip keys (`p/a#b` resumes after `p/a%23b`, past `p/a$`), re-deliver
+  them and fail `ListOrderViolation` (`p/é` resumes after `p/%C3%A9`,
+  before `p/b`), or re-deliver the same page and fail `ListRepeatedToken`
+  (`p/é1` and `p/é2` at a page size of 2). The raw ListObjectsV2 listing of
+  ADR-2637 decision 1 resumes after the raw key and removes this exception.
+  `list_delimited` judges a common prefix by
   its stem, the prefix without its trailing `/`: `t/abc\u{1}/` is reported
   in `unaddressable_prefixes`, never in `common_prefixes`, and so is `/`
   alone, whose stem is empty. `drain_pages` returns the drain's

@@ -50,25 +50,15 @@ pub const PARQUET_TABLE_MAX_READ_VERSION: u32 = PARQUET_TABLE_FORMAT_VERSION;
 /// Bytes in a manifest's per-apply nonce.
 pub const APPLY_NONCE_LEN: usize = 16;
 
-/// ASCII bytes object_store's `Path` percent-encodes inside a segment, on top
-/// of the control characters and every non-ASCII byte.
-const PATH_ENCODED: &[u8] = b"\\{^}%`]\">[~<#|*?";
-
-/// True when object_store's `Path` built from `key` addresses exactly `key`:
-/// valid UTF-8, printable ASCII with none of the bytes `Path` percent-encodes,
-/// no leading or trailing `/`, and no empty, `.` or `..` segment (`Path` drops
-/// an empty segment and encodes a dot segment).
+/// True when object_store's `Path` built from `key` addresses exactly `key`
+/// ([`ravel_object_store::is_addressable_key`]: printable ASCII with none of
+/// the bytes `Path` percent-encodes, no leading or trailing `/`, and no empty,
+/// `.` or `..` segment), and `key` is valid UTF-8 and not empty. The store
+/// counts the empty key addressable, since `Path` leaves it unchanged, but it
+/// names no file, so a manifest refuses it.
 pub fn key_is_addressable(key: &[u8]) -> bool {
-    let Ok(key) = std::str::from_utf8(key) else {
-        return false;
-    };
-    !key.is_empty()
-        && key
-            .bytes()
-            .all(|b| (0x20..0x7f).contains(&b) && !PATH_ENCODED.contains(&b))
-        && key
-            .split('/')
-            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+    std::str::from_utf8(key)
+        .is_ok_and(|key| !key.is_empty() && ravel_object_store::is_addressable_key(key))
 }
 
 /// One external Parquet file a manifest pins.
@@ -782,19 +772,6 @@ mod tests {
             .prop_filter("dot segment", |key| key_is_addressable(key))
     }
 
-    /// Characters around every rule of [`key_is_addressable`], so a random
-    /// string hits the edges far more often than an unbiased one would.
-    fn arb_edge_string() -> impl Strategy<Value = String> {
-        let chars = prop::sample::select(vec![
-            'a', 'Z', '0', '-', '_', '=', ' ', '.', '/', '%', '*', '?', '#', '~', '\\', '"', '\t',
-            '\r', '\u{7f}', '\u{e9}', '\u{4e2d}',
-        ]);
-        prop_oneof![
-            prop::collection::vec(chars, 0..10).prop_map(|c| c.into_iter().collect()),
-            any::<String>(),
-        ]
-    }
-
     #[test]
     fn key_is_addressable_follows_each_rule() {
         for (key, want) in [
@@ -819,32 +796,9 @@ mod tests {
     }
 
     #[test]
-    fn every_ascii_byte_inside_a_segment_agrees_with_the_object_store_path() {
-        for b in 0u8..0x80 {
-            let key = [b'a', b, b'b'];
-            let s = std::str::from_utf8(&key).expect("ascii");
-            let path = object_store::path::Path::from(s);
-            assert_eq!(
-                key_is_addressable(&key),
-                path.as_ref() == s,
-                "byte {b:#04x}: {s:?} became {:?}",
-                path.as_ref()
-            );
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn key_is_addressable_matches_the_object_store_path(s in arb_edge_string()) {
-            let path = object_store::path::Path::from(s.as_str());
-            prop_assert_eq!(
-                key_is_addressable(s.as_bytes()),
-                !s.is_empty() && path.as_ref() == s,
-                "{:?} became {:?}",
-                s,
-                path.as_ref()
-            );
-        }
+    fn the_empty_key_is_addressable_to_the_store_but_not_as_a_file_key() {
+        assert!(ravel_object_store::is_addressable_key(""));
+        assert!(!key_is_addressable(b""));
     }
 
     prop_compose! {

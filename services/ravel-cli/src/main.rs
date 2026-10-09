@@ -957,11 +957,12 @@ enum ParquetCommand {
     /// one there was put directly in the bucket, for example with a stolen
     /// Query credential. Readers and
     /// the sweep already skip it when the store lists it; `--delete` removes
-    /// it. A flagged key the S3 adapter would send a delete of to a different
-    /// key (one holding a character its path encoding escapes, such as `~`)
-    /// is marked undeletable. `--delete` deletes every other flagged key,
-    /// sends no delete for an undeletable one, prints it as skipped, and then
-    /// fails naming the keys left in place. A delete that fails part way
+    /// it. A key the S3 adapter would send a delete of to a different key
+    /// (one holding a character its path encoding escapes, such as `~`) is
+    /// listed escaped with the key a request reaches and marked undeletable.
+    /// `--delete` deletes every other flagged key, sends no delete for an
+    /// undeletable one, prints it as skipped, and then fails naming the keys
+    /// left in place. A delete that fails part way
     /// prints the keys deleted before it, then the store error, and fails.
     /// On S3 a key holding a control character, an empty
     /// segment or a `.` or `..` segment fails this listing and every read of
@@ -983,11 +984,12 @@ enum ParquetCommand {
     /// `--delete`, delete those, print them, then list again and fail naming
     /// any still there. A key the S3 adapter would send a delete of to a
     /// different key (one holding a character its path encoding escapes, such
-    /// as `~` or `%`) is marked undeletable and skipped. It is listed, and the
-    /// listing after `--delete` names every key still there, only when no
-    /// such key sits at a list page boundary: the adapter encodes the page's
-    /// continuation too, so the next page repeats keys, failing the listing,
-    /// or skips the keys after it. A key under a name reserved
+    /// as `~` or `%`) is listed escaped with the key a request reaches, marked
+    /// undeletable, and skipped. Both listings name every such key unless a
+    /// whole list page holds nothing else: the adapter then resumes after the
+    /// encoded form of that page's last key, so the next page repeats keys,
+    /// failing the listing, or skips the keys after it. A key under a name
+    /// reserved
     /// after tables could be created (such as `l0`) is marked as possibly a
     /// table created before the reservation and skipped unless
     /// `--include-reserved-names` is passed. On S3 a key holding a control

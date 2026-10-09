@@ -276,7 +276,7 @@ pub fn store_path(key: &str) -> String {
 /// ([`store_path`] leaves it unchanged). A delete of any other key goes to a
 /// different key, so it reports success and leaves `key` in place.
 pub fn is_store_path(key: &str) -> bool {
-    object_store::path::Path::from(key).as_ref() == key
+    ravel_object_store::is_addressable_key(key)
 }
 
 #[cfg(test)]
