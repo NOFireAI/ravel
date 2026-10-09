@@ -33,6 +33,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 DR_LIB_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+DR_DIR="$(dirname "${DR_LIB_PATH}")"
 # shellcheck source=scripts/dr/lib.sh
 source "${DR_LIB_PATH}"
 
@@ -272,50 +273,61 @@ printf '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n' >"${
 printf '000102030405060708090a0b0c0d0e0f\n' >"${AUDIT_KEY_SHORT}"
 printf 'zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n' >"${AUDIT_KEY_NOT_HEX}"
 
-# dr_init under an unkeyed mode, with the audit key file given as $2; prints
-# the exported RAVEL_AUDIT_TOKEN_KEY on success.
-unkeyed_init() {
+# dr_init under a declared mode, in a fresh shell. $1 is the mode, $2 the
+# audit key file, $3 the caller's own RAVEL_AUDIT_TOKEN_KEY (empty for none).
+# Prints three fields: dr_init's exit code, the key the server launch will
+# receive (DR_SERVER_AUDIT_KEY), and what a child process the harness starts
+# afterwards sees in RAVEL_AUDIT_TOKEN_KEY ("unset" when nothing).
+audit_init() {
   bash -c '
     unset RAVEL_AUDIT_TOKEN_KEY
+    [[ -n "$4" ]] && export RAVEL_AUDIT_TOKEN_KEY="$4"
     source "$1"
     DR_BUCKET_PRIMARY=a-primary
     DR_BUCKET_REPLICA=a-replica
     DR_ACCESS_KEY=k
     DR_SECRET_KEY=s
-    DR_TENANT_HASH_MODE=unkeyed
-    DR_AUDIT_TOKEN_KEY_FILE="$2"
-    DR_LOG_DIR="$3"
-    dr_init
-    printf "%s\n" "${RAVEL_AUDIT_TOKEN_KEY:-}"' _ "${DR_LIB_PATH}" "$1" "${AUDIT_KEY_DIR}/log"
+    DR_TENANT_HASH_MODE="$2"
+    DR_TENANT_HASH_KEY_FILE="$5"
+    DR_AUDIT_TOKEN_KEY_FILE="$3"
+    DR_LOG_DIR="$6"
+    rc=0
+    (dr_init >/dev/null 2>&1) || rc=$?
+    [[ "${rc}" -eq 0 ]] && dr_init >/dev/null 2>&1
+    child="$(bash -c "printf %s \"\${RAVEL_AUDIT_TOKEN_KEY:-unset}\"")"
+    printf "%s|%s|%s\n" "${rc}" "${DR_SERVER_AUDIT_KEY:-}" "${child}"' \
+    _ "${DR_LIB_PATH}" "$1" "$2" "$3" "${AUDIT_KEY_OK}" "${AUDIT_KEY_DIR}/log"
 }
+OK_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+CALLER_KEY=ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100
 
-check "custody: dr_init accepts a declared tenant hash mode" \
-  "0" "$(rc_sub unkeyed_init "${AUDIT_KEY_OK}")"
-check "custody: unkeyed exports the audit token key the file holds" \
-  "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" \
-  "$(unkeyed_init "${AUDIT_KEY_OK}" 2>/dev/null)"
+check "custody: unkeyed hands the file's key to the server launch and to no other child" \
+  "0|${OK_KEY}|unset" "$(audit_init unkeyed "${AUDIT_KEY_OK}" "")"
 check "custody: unkeyed without DR_AUDIT_TOKEN_KEY_FILE is refused" \
-  "64" "$(rc_sub unkeyed_init "")"
+  "64" "$(audit_init unkeyed "" "" | cut -d'|' -f1)"
 check "custody: unkeyed with an unreadable audit key file is refused" \
-  "64" "$(rc_sub unkeyed_init "${AUDIT_KEY_DIR}/absent.key")"
+  "64" "$(audit_init unkeyed "${AUDIT_KEY_DIR}/absent.key" "" | cut -d'|' -f1)"
 check "custody: an audit key shorter than 64 hex characters is refused" \
-  "64" "$(rc_sub unkeyed_init "${AUDIT_KEY_SHORT}")"
+  "64" "$(audit_init unkeyed "${AUDIT_KEY_SHORT}" "" | cut -d'|' -f1)"
 check "custody: an audit key with a non-hex character is refused" \
-  "64" "$(rc_sub unkeyed_init "${AUDIT_KEY_NOT_HEX}")"
-check "custody: keyed mode neither needs nor exports an audit token key" \
-  "0:" "$(bash -c '
-    unset RAVEL_AUDIT_TOKEN_KEY
-    source "$1"
-    DR_BUCKET_PRIMARY=a-primary
-    DR_BUCKET_REPLICA=a-replica
-    DR_ACCESS_KEY=k
-    DR_SECRET_KEY=s
-    DR_TENANT_HASH_MODE=keyed
-    DR_TENANT_HASH_KEY_FILE=/nonexistent/deployment.key
-    DR_AUDIT_TOKEN_KEY_FILE=""
-    DR_LOG_DIR="$2"
-    dr_init >/dev/null 2>&1
-    printf "%s:%s\n" "$?" "${RAVEL_AUDIT_TOKEN_KEY:-}"' _ "${DR_LIB_PATH}" "${AUDIT_KEY_DIR}/log")"
+  "64" "$(audit_init unkeyed "${AUDIT_KEY_NOT_HEX}" "" | cut -d'|' -f1)"
+check "custody: keyed mode needs no audit key file and hands the server none" \
+  "0||unset" "$(audit_init keyed "" "")"
+check "custody: keyed mode passes a caller's explicit audit key to the server" \
+  "0|${CALLER_KEY}|${CALLER_KEY}" "$(audit_init keyed "" "${CALLER_KEY}")"
+
+# Every server launch carries the key as a prefix assignment, so the server,
+# and only the server, receives it. Counted per script: a launch added without
+# it fails here.
+for launcher in seed.sh start.sh; do
+  launches="$(grep -c '"${SERVER_ARGV\[@\]}"' "${DR_DIR}/${launcher}")"
+  keyed_launches="$(grep -c 'RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" \(exec \)\{0,1\}"${SERVER_ARGV\[@\]}"' "${DR_DIR}/${launcher}")"
+  check "custody: every ravel-server launch in ${launcher} passes the audit key (${launches} found)" \
+    "${launches}" "${keyed_launches}"
+done
+[[ "$(grep -c '"${SERVER_ARGV\[@\]}"' "${DR_DIR}/start.sh")" -eq 2 ]] ||
+  check "custody: start.sh has the two launches this suite counts" "2" \
+    "$(grep -c '"${SERVER_ARGV\[@\]}"' "${DR_DIR}/start.sh")"
 
 # --- finding 1: the buckets are named, never guessed -----------------------
 
