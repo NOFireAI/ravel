@@ -66,6 +66,7 @@
 //! [`S3Store`]: crate::s3::S3Store
 
 use std::future::Future;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -75,7 +76,12 @@ use object_store::client::{
     HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector,
 };
 use parking_lot::Mutex;
+use rand::seq::SliceRandom;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::HeaderMap;
+use tokio::task::JoinSet;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::instrument::{StoreMetrics, StoreOp};
 use crate::s3::checksum::{self, ObservedChecksum};
@@ -193,6 +199,43 @@ impl S3HttpConnector {
             store_time,
             inner: ReqwestConnector::default(),
         }
+    }
+
+    /// An [`HttpClient`] that sends through `client` rather than through one
+    /// built from `ClientOptions`, with the same per-attempt recording as the
+    /// one [`HttpConnector::connect`] builds.
+    pub(crate) fn wrap(&self, client: reqwest::Client) -> HttpClient {
+        HttpClient::new(S3HttpService {
+            metrics: Arc::clone(&self.metrics),
+            store_time: Arc::clone(&self.store_time),
+            inner: HttpClient::new(client),
+        })
+    }
+}
+
+/// Resolves a host to all of its addresses in random order, as the client
+/// `object_store` builds does by default (`randomize_addresses`), so requests
+/// spread over the addresses an S3 endpoint publishes instead of all trying
+/// the first.
+#[derive(Debug)]
+pub(crate) struct ShuffleResolver;
+
+impl Resolve for ShuffleResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            // A `JoinSet` drops the lookup if this future is dropped before it
+            // starts.
+            let mut tasks = JoinSet::new();
+            tasks.spawn_blocking(move || -> Result<Addrs, BoxError> {
+                let mut addrs: Vec<SocketAddr> = (name.as_str(), 0).to_socket_addrs()?.collect();
+                addrs.shuffle(&mut rand::rng());
+                Ok(Box::new(addrs.into_iter()))
+            });
+            match tasks.join_next().await {
+                Some(joined) => joined.map_err(|e| Box::new(e) as BoxError)?,
+                None => Err("the address lookup task was not spawned".into()),
+            }
+        })
     }
 }
 
@@ -380,6 +423,27 @@ mod tests {
         assert_eq!(observed.latest(), Some(1_000));
         observed.observe(3_000);
         assert_eq!(observed.latest(), Some(3_000));
+    }
+
+    #[tokio::test]
+    async fn the_shuffle_resolver_returns_every_address_of_a_host() {
+        let Ok(name) = "localhost".parse::<Name>() else {
+            panic!("localhost is a valid host name");
+        };
+        let addrs: Vec<SocketAddr> = ShuffleResolver
+            .resolve(name)
+            .await
+            .expect("localhost resolves")
+            .collect();
+        let mut expected: Vec<SocketAddr> = ("localhost", 0)
+            .to_socket_addrs()
+            .expect("localhost resolves")
+            .collect();
+        let mut sorted = addrs.clone();
+        sorted.sort();
+        expected.sort();
+        assert!(!sorted.is_empty());
+        assert_eq!(sorted, expected);
     }
 
     /// The epoch is a real reading, not the "no observation yet" sentinel.

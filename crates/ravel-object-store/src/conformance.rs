@@ -42,17 +42,16 @@ use crate::{GetRange, ObjectStoreBackend, Pin, PutMode, PutOptions, StoreError};
 /// (`services/ravel-server/src/qualification.rs`) and `ravel-cli store qualify`
 /// re-records over it when re-run against the same bucket.
 ///
-/// The ADR-2637 properties did not bump it. Every adapter refuses an
-/// unaddressable key before sending a request, so
-/// [`Property::OperationsRefuseUnaddressableKeys`] checks the binary rather
-/// than the bucket a record attests, and
+/// Version 3 adds [`Property::ListedKeysRoundTripPlusAndSpace`]: keys holding
+/// `+` and a space must list back verbatim. It checks the bucket, so a
+/// version 2 record does not attest it, and startup refuses a version 2
+/// record as stale the same way. The other two ADR-2637 properties did not
+/// need a bump. Every adapter refuses an unaddressable key before sending a
+/// request, so [`Property::OperationsRefuseUnaddressableKeys`] checks the
+/// binary rather than the bucket a record attests, and
 /// [`Property::UnaddressableKeysAreCounted`] runs only with a
 /// [`ForeignKeySeeder`], which `ravel-cli store qualify` does not pass.
-/// [`Property::ListedKeysRoundTripPlusAndSpace`] does check the bucket and was
-/// added without a bump, so a version 2 record taken before it existed does
-/// not attest it, and a re-run of `ravel-cli store qualify` leaves that record
-/// in place.
-pub const CONFORMANCE_SUITE_VERSION: u32 = 2;
+pub const CONFORMANCE_SUITE_VERSION: u32 = 3;
 
 /// Root-prefix key for the durable qualification record (ADR-0050 section 6,
 /// "New durable objects and key-layout entries": root prefix `sys/`).
@@ -2060,7 +2059,8 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
             return ProbeResult::fail(
                 property,
                 format!(
-                    "a get of {gone} after a successful delete failed with {other} instead of NotFound"
+                    "a get of {gone} after a successful delete failed with {other} instead of \
+                     NotFound"
                 ),
             );
         }
@@ -2102,7 +2102,8 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
         return ProbeResult::fail(
             property,
             format!(
-                "a second delete of the already-deleted {gone} failed with {err}; delete of an absent key must succeed"
+                "a second delete of the already-deleted {gone} failed with {err}; delete of an \
+                 absent key must succeed"
             ),
         );
     }
@@ -2348,34 +2349,48 @@ async fn probe_listed_keys_round_trip_plus_and_space(
         .map(|suffix| format!("{list_prefix}{suffix}"))
         .collect();
     expected.sort();
+    // Every key a put was sent for, including a failed one, which may have
+    // been applied anyway; deleting an absent key succeeds.
+    let mut attempted = 0;
+    let mut failure = None;
     for key in &expected {
+        attempted += 1;
         if let Err(err) = store
             .put(key, Bytes::from_static(b"x"), PutOptions::default())
             .await
         {
-            return ProbeResult::fail(property, format!("put {key:?} failed: {err}"));
+            failure = Some(format!("put {key:?} failed: {err}"));
+            break;
         }
     }
-    let failure = match drain_membership(store, &list_prefix, expected.len()).await {
-        Err(detail) => Some(detail),
-        Ok((listed, reported)) => {
-            let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
-            if listed != expected || !reported.is_empty() {
-                Some(format!(
-                    "listing {list_prefix:?} returned {listed:?} and {} unaddressable keys \
-                     {reported:?}, expected exactly {expected:?}",
-                    reported.len()
-                ))
-            } else {
-                None
+    if failure.is_none() {
+        failure = match drain_membership(store, &list_prefix, expected.len()).await {
+            Err(detail) => Some(detail),
+            Ok((listed, reported)) => {
+                let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+                if listed != expected || !reported.is_empty() {
+                    Some(format!(
+                        "listing {list_prefix:?} returned {listed:?} and {} unaddressable keys \
+                         {reported:?}, expected exactly {expected:?}",
+                        reported.len()
+                    ))
+                } else {
+                    None
+                }
             }
-        }
-    };
-    for key in &expected {
+        };
+    }
+    let mut undeleted = Vec::new();
+    for key in &expected[..attempted] {
         if let Err(err) = store.delete(key).await {
-            return ProbeResult::fail(property, format!("delete {key:?} failed: {err}"));
+            undeleted.push(format!("delete {key:?} failed: {err}"));
         }
     }
+    let failure = match (failure, undeleted.is_empty()) {
+        (failure, true) => failure,
+        (None, false) => Some(undeleted.join("; ")),
+        (Some(detail), false) => Some(format!("{detail}; then {}", undeleted.join("; "))),
+    };
     match failure {
         Some(detail) => ProbeResult::fail(property, detail),
         None => ProbeResult::pass(
@@ -2781,6 +2796,60 @@ mod tests {
         assert_eq!(
             Property::ListedKeysRoundTripPlusAndSpace.name(),
             "listed_keys_round_trip_plus_and_space"
+        );
+    }
+
+    async fn keys_under(store: &MemoryStore, prefix: &str) -> Vec<String> {
+        let page = store.list(prefix, None).await.expect("memory list");
+        assert!(page.next.is_none(), "one page holds the probe's keys");
+        page.objects.into_iter().map(|meta| meta.key).collect()
+    }
+
+    #[tokio::test]
+    async fn the_plus_and_space_probe_deletes_what_it_wrote_after_a_put_fails() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains("plus-space/a+b c")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        let result = probe_listed_keys_round_trip_plus_and_space(&store, "sys/qualify/ps/").await;
+        assert!(!result.passed);
+        assert!(
+            result
+                .detail
+                .starts_with("put \"sys/qualify/ps/plus-space/a+b c\" failed: "),
+            "{}",
+            result.detail
+        );
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Timeout), 1);
+        assert_eq!(
+            keys_under(store.inner(), "sys/qualify/ps/").await,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plus_and_space_probe_keeps_deleting_after_a_delete_fails() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Timeout)
+                .with_key_contains("plus-space/a b")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        let result = probe_listed_keys_round_trip_plus_and_space(&store, "sys/qualify/ps/").await;
+        assert!(!result.passed);
+        assert!(
+            result
+                .detail
+                .starts_with("delete \"sys/qualify/ps/plus-space/a b\" failed: "),
+            "{}",
+            result.detail
+        );
+        assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+        assert_eq!(
+            keys_under(store.inner(), "sys/qualify/ps/").await,
+            vec!["sys/qualify/ps/plus-space/a b".to_owned()]
         );
     }
 
