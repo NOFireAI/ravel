@@ -156,21 +156,29 @@ reclaiming a pre-namespacing cache directory.
 Both `--cache-max-bytes` and `--catalog-cache-max-bytes` are **caps, not
 reservations**. Neither cache pre-allocates its ceiling. Each holds only the
 bytes that it admitted and, once it reaches its cap, evicts with S3-FIFO, not
-LRU: a new entry waits in a small probation queue, and only an entry that is
-read again, or one that leaves probation while the main queue still has
-room, joins the main queue. A one-pass scan, such as a compaction or a fold,
-therefore passes through probation without evicting a working set that
-queries keep reading. The ceiling is an upper bound on resident cache bytes,
-not memory claimed at startup.
+LRU: a new entry waits in a small probation queue. It joins the main queue if
+it is read again while in probation, or if it leaves probation while the main
+queue still has room or holds an entry of a repeated scan that has gone unread
+past its turn. A key evicted from probation that is read again soon after (a
+ghost hit) joins the main queue directly, if the main queue has room, holds
+such an overdue entry, or holds at its front an entry that has gone unread for
+longer than the returning key's own gap between reads. A one-pass scan, such
+as a compaction or a fold, therefore passes through probation without evicting
+a small working set that queries keep reading, whether that working set was
+resident before the scan began or arrived while it ran. The ceiling is an
+upper bound on resident cache bytes, not memory claimed at startup.
 
 A repeated scan larger than the cache, such as the same query run again over
 more data than the cache holds, is served in part rather than not at all. The
-first run fills the cache, and the entries it admitted stay resident: later
-runs of the same scan read those from the cache and the rest from storage.
-For equal-sized objects twice the cache's size, at least 40% of the second
-and third runs' reads come from the cache, from the same entries in both. A
-working set that queries read again sooner than the scan comes back around
-still takes residency from entries that are read less often.
+first run fills the cache and the entries it admitted stay resident: later
+runs of the same scan read those from the cache and the rest from storage. For
+equal-sized objects at twice the cache's size, 45% of the second and third
+runs' bytes come from the cache, and 81% when the cache holds 90% of the scan;
+both runs read the same entries from it. The same holds for a new repeated
+scan that starts after another one filled the cache. A repeated scan that
+starts right after a one-pass scan three times its size filled the cache
+serves nothing on its second run and converges from its third: on its first
+run it cannot be told apart from the one-pass scan continuing.
 
 The **sum of every ceiling can exceed physical RAM**. The two caches are
 independent, and the SQL memory pools (`--sql-max-query-bytes`,
