@@ -365,8 +365,8 @@ impl<V: Clone> S3Fifo<V> {
             return self.capacity_floor;
         }
         let by_bytes = u128::from(self.limits.max_bytes) * resident / bytes;
-        let capacity = u64::try_from(by_bytes.min(self.limits.max_entries as u128))
-            .unwrap_or(u64::MAX);
+        let capacity =
+            u64::try_from(by_bytes.min(self.limits.max_entries as u128)).unwrap_or(u64::MAX);
         capacity.max(self.capacity_floor)
     }
 
@@ -545,9 +545,8 @@ impl<V: Clone> S3Fifo<V> {
         let id = self.next_id();
         self.ghost_keys.insert(key, Ghost { last_touch, id });
         self.ghost.push_back((key, id));
-        let capacity =
-            usize::try_from(self.resident_capacity().saturating_mul(GHOST_PER_RESIDENT))
-                .unwrap_or(usize::MAX);
+        let capacity = usize::try_from(self.resident_capacity().saturating_mul(GHOST_PER_RESIDENT))
+            .unwrap_or(usize::MAX);
         while self.ghost_keys.len() > capacity {
             let Some((oldest, id)) = self.ghost.pop_front() else {
                 break;
@@ -647,7 +646,11 @@ mod tests {
         }
 
         fn fifo(&self) -> S3Fifo<()> {
-            S3Fifo::new(CacheLimits::new(self.max_bytes, 1_000_000, self.max_entry_bytes))
+            S3Fifo::new(CacheLimits::new(
+                self.max_bytes,
+                1_000_000,
+                self.max_entry_bytes,
+            ))
         }
     }
 
@@ -679,7 +682,12 @@ mod tests {
 
     /// One pass of the loop whose keys start at `base`; returns the indices
     /// served from the cache.
-    fn pass(fifo: &mut S3Fifo<()>, g: &Geometry, base: u64, metrics: &CacheMetrics) -> BTreeSet<u64> {
+    fn pass(
+        fifo: &mut S3Fifo<()>,
+        g: &Geometry,
+        base: u64,
+        metrics: &CacheMetrics,
+    ) -> BTreeSet<u64> {
         (0..N)
             .filter(|&i| touch(fifo, base + i, (g.size)(i), metrics))
             .collect()
@@ -697,9 +705,18 @@ mod tests {
 
     /// Every pass from `first_pass` (1-based) on serves at least the floor,
     /// and the last two passes serve the same set.
-    fn assert_converged_from(g: &Geometry, what: &str, served: &[BTreeSet<u64>], first_pass: usize) {
+    fn assert_converged_from(
+        g: &Geometry,
+        what: &str,
+        served: &[BTreeSet<u64>],
+        first_pass: usize,
+    ) {
         let fractions: Vec<f64> = served.iter().map(|s| served_fraction(g, s)).collect();
-        eprintln!("{}, {what}: served per pass {fractions:.3?}, floor {:.3}", g.label, g.floor());
+        eprintln!(
+            "{}, {what}: served per pass {fractions:.3?}, floor {:.3}",
+            g.label,
+            g.floor()
+        );
         for pass in first_pass - 1..served.len() {
             assert!(
                 fractions[pass] >= g.floor(),
@@ -770,7 +787,9 @@ mod tests {
         for i in 0..3 * N {
             touch(&mut fifo, 10_000_000 + i, (g.size)(i % N), &metrics);
         }
-        (0..passes).map(|_| pass(&mut fifo, g, 0, &metrics)).collect()
+        (0..passes)
+            .map(|_| pass(&mut fifo, g, 0, &metrics))
+            .collect()
     }
 
     /// ADR-2677 decision 3's bounds for a loop after a cold scan, which this
@@ -821,8 +840,14 @@ mod tests {
 
         let served = loop_after_a_cold_scan(&g, 6);
         let fractions: Vec<f64> = served.iter().map(|s| served_fraction(&g, s)).collect();
-        eprintln!("{}, loop after a 3N cold scan: served per pass {fractions:.3?}", g.label);
-        assert!(served.iter().all(BTreeSet::is_empty), "served per pass {fractions:.3?}");
+        eprintln!(
+            "{}, loop after a 3N cold scan: served per pass {fractions:.3?}",
+            g.label
+        );
+        assert!(
+            served.iter().all(BTreeSet::is_empty),
+            "served per pass {fractions:.3?}"
+        );
     }
 
     const HOT: u64 = 10;
@@ -905,6 +930,10 @@ mod tests {
             cold - 1_000_000 > 4 * 200,
             "the cold scan must be several times the cache"
         );
-        assert_eq!(hits, ROUNDS * HOT, "every hot touch under the cold scan must be served");
+        assert_eq!(
+            hits,
+            ROUNDS * HOT,
+            "every hot touch under the cold scan must be served"
+        );
     }
 }

@@ -795,15 +795,7 @@ async fn measure_opt(
 ) -> Shape {
     let base = Arc::new(MemoryStore::new());
     let snapshot = build_snapshot(base.as_ref()).await;
-    measure_with_snapshot(
-        label,
-        filters,
-        cache,
-        plan_concurrency,
-        base,
-        snapshot,
-    )
-    .await
+    measure_with_snapshot(label, filters, cache, plan_concurrency, base, snapshot).await
 }
 
 /// Same measurement as [`measure_opt`], against a caller-supplied snapshot
@@ -1250,7 +1242,10 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     // so it moves the same bytes.
     assert_eq!(big.bytes, 264_375, "q20 with no eviction");
     assert_eq!(big.gets, 48, "q20 with no eviction: GETs");
-    assert_eq!(big_cache.hits, 8, "q20 with no eviction: probe windows reused");
+    assert_eq!(
+        big_cache.hits, 8,
+        "q20 with no eviction: probe windows reused"
+    );
     for s in [&big, &small] {
         assert_eq!(
             (s.plan_phase_gets, s.probe_phase_gets, s.scan_phase_gets),
@@ -1269,7 +1264,10 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     // windows were evicted before the scan read them, so 5 range GETs of
     // 8 KiB each go to storage again, and the cache serves 3 windows instead
     // of 8. Nothing else is read twice.
-    assert_eq!(pressured_cache.hits, 3, "q20 under pressure: probe windows reused");
+    assert_eq!(
+        pressured_cache.hits, 3,
+        "q20 under pressure: probe windows reused"
+    );
     assert_eq!(pressured.gets, 53, "q20 under pressure: GETs");
     assert_eq!(
         (
