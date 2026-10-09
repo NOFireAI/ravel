@@ -549,10 +549,11 @@ suite now has eight probes, and the two listing probes write 1002 keys each at
 the default page size; qualification also reads the bucket's versioning,
 lifecycle and Object Lock configuration (three read-only control-plane GETs)
 and runs the upload-checksum echo probe (a PUT, a GET and a DELETE). One
-healthy attempt is budgeted at 2083 sequential operations (the concurrent
-create probe's eight parallel PUTs count as one round trip, so as requests the
-same budget is 2090): 2074 for the suite, 3 control-plane
-GETs, 3 for the echo probe and 3 for the `sys/qualification` record. The
+healthy attempt is budgeted at 2083 sequential operations (superseded by the
+2089-operation budget amendment below; the concurrent create probe's eight
+parallel PUTs count as one round trip, so as requests the same budget is
+2090): 2074 for the suite, 3 control-plane GETs, 3 for the echo probe and 3
+for the `sys/qualification` record. The
 suite's figure counts two requests for the listing-order probe's
 `list_after` tail from the second key: that tail holds exactly 1000 keys, a
 full page carries a continuation token, and following it returns an empty
@@ -570,9 +571,35 @@ attempt over eleven hours, which bounds nothing, so the budget now assumes
 500 ms per request: 2083 x 0.5 s = 1041.5 s, rounded up to 1042 s, plus the
 same ~140 s for scheduling and image pull, is 1182 s per attempt.
 `backoffLimit` stays 1, so the Job-wide `activeDeadlineSeconds` is
-2 x 1182 s = 2364 s. The reasoning is
+2 x 1182 s = 2364 s (2370 s under the 2089-operation budget amendment
+below). The reasoning is
 otherwise unchanged: the deadline is Job-wide, sized so a slow but healthy
 attempt and one retry both finish before it fires, and it stays out of the
 qualified-input hash. The qualified-input hash itself, which already covered
 `allowHttp`, now also covers `uploadIntegrity` and `requestStoredChecksum`,
 since each changes what the qualification exercises.
+
+## Amendment (2026-10-09): the 2089-operation budget
+
+<!-- amendment-supersedes: phrase="budgeted at 2083 sequential operations" pointer="2089-operation budget amendment" -->
+<!-- amendment-supersedes: phrase="2 x 1182 s = 2364 s" pointer="2089-operation budget amendment" -->
+
+Issue #2637 changes two of the qualification budget amendment's counts. S3
+listings now send Ravel's own ListObjectsV2 request, which ends a listing on
+a response that is not truncated, so the listing-order probe's `list_after`
+tail over exactly 1000 keys costs one request, not two. The suite also gains
+the `ListedKeysRoundTripPlusAndSpace` probe: 3 PUTs, a LIST and 3 DELETEs.
+One healthy attempt is now budgeted at 2089 sequential operations: 2080 for
+the suite, 3 control-plane GETs, 3 for the echo probe and 3 for the
+`sys/qualification` record. As requests on a fresh bucket that is 17 LIST,
+2034 PUT, 10 GET and 6 DELETE, plus the 3 control-plane GETs, 2070 in all;
+counting the eight concurrent PUTs as one round trip (less 7) and adding the
+24 writer retries and the record's 2 replacement requests gives 2089.
+
+At 500 ms per operation, 2089 x 0.5 s = 1044.5 s, rounded up to 1045 s, plus
+the same ~140 s for scheduling and image pull, is 1185 s per attempt.
+`backoffLimit` stays 1, so the Job-wide `activeDeadlineSeconds` is
+2 x 1185 s = 2370 s. ravel-cli's
+`one_attempt_at_the_default_page_size_issues_the_budgeted_requests` pins the
+request counts, and ravel-operator's `qualify_job_bounds_a_hung_attempt`
+pins the deadline.
