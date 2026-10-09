@@ -58,7 +58,7 @@ flowchart LR
     F --> H[(HEAD + parts)]
   end
   subgraph statement["one SQL statement"]
-    R["resolve: parts + empty tail<br/>LISTs = shards + 1 erasure"] --> P{object size over<br/>whole-read break-even?}
+    R["resolve: parts + empty tail<br/>LISTs = shards + 1 erasure"] --> P{object size over<br/>plan_whole_object_bound?}
     P -->|yes| PL[plan: tail probe, ranged scan]
     P -->|no| S1["scan: one whole GET,<br/>blocks pruned from the directory"]
     PL --> S2[scan: ranges]
@@ -153,9 +153,19 @@ partition) stays open for the above-break-even route.
 What it moves: a q20-shaped statement over the stock corpus (3.8 MB
 objects, all at or under the bound) goes from about 1.76x the corpus on
 the wire (17.3 GB over 9.84 GB) to about 1.0x, and from about 1.72 GETs
-per object (4,490 over 2,617) to one. The tuned large-object arm's 25 MB
-objects sit above the 18.9 MB bound and keep the planned route, so this
-decision changes nothing there.
+per object (4,490 over 2,617) to one.
+
+The bound depends on the fetch policy, and so does this decision's reach.
+Under `cost-based`, today's default everywhere and the remote default
+after decision 7, the bound is the 18.9 MB projection break-even: the
+stock corpus is under it, the large-object arm's 25 MB objects are above
+it and keep the planned route. Under `latency-first` and `byte-minimal` no
+break-even is derived (`crates/ravel-query/src/config.rs:596-634`) and the
+bound is the 512 KiB routing threshold, so every object in either corpus is
+planned with a tail probe and ranged reads, the plan phase never reads it
+whole, and this decision changes nothing. Its acceptance arm therefore
+runs the stock corpus under `cost-based`, stated explicitly once decision
+7 changes the loopback default.
 
 ### 3. The memory read cache serves a stable subset under a repeated scan
 
@@ -192,7 +202,13 @@ and `auditMs` (around the `.audit(...)` await in
 outcome). It also renders the scalar `ScanTiming` figures that are
 meaningful across partitions (`planInitMs`, `planningWaitMaxMs`,
 `openMaxMs`, `decodeBuildMaxMs`, `firstBatchMinMs`, `streamMaxMs`), never
-the overlapping per-partition sums and never the per-segment rows. A retried
+the overlapping per-partition sums and never the per-segment rows. Three of
+those, `planInitMs`, `firstBatchMinMs` and `streamMaxMs`, have one origin
+only while the plan holds a single logs scan: under a multi-scan plan (a
+`UNION ALL`, say) the offsets mix exec origins and the plan barrier is
+summed per scan (`executor.rs:495-514`). The response carries `scans`, the
+number of logs scans in the plan, and omits those three fields when it is
+not 1. A retried
 statement reports its successful attempt plus `attempts`, so the fields are
 not expected to sum to the client's latency, and the documentation says so.
 Arrow-IPC and Flight responses carry no `stats` today and that does not
@@ -260,12 +276,22 @@ cost about 19 GB of process peak. W1 was measured with `--fetch-concurrency
 256`, which set all three together, so permits alone may not reproduce it.
 Decision 8's cold band is therefore measured first with the permits
 derived and the partitions at the core default; if that arm misses the
-band, the partition count joins the same memory-share derivation, with its
-per-partition cost term pinned from ADR-1195's figure, as a second round
-on the same ticket rather than a silent widening. On a loopback endpoint the
+band, a second round on the same ticket sets the partition count from a
+measurement, not from that figure: ADR-1195 records that its 19 GB is a
+whole-process peak that includes the read cache and cached corpus, so it
+does not isolate a per-partition cost. The second round's precondition is
+an arm that does (the same statements at two partition counts with the
+cache held fixed), pre-registered. On a loopback endpoint the
 default `--logs-fetch-policy` becomes `latency-first`, which amends
 ADR-2023 decision 1 for the loopback case only; `cost-based` stays the
-default against a remote store, where ADR-1196 measured it. #1191 keeps
+default against a remote store, where ADR-1196 measured it. That puts a
+loopback store back on the ranged route ADR-2023 decision 1 took it off:
+with no break-even derived, every object over 512 KiB is planned and
+range-read. ADR-2023 left that route because small ranged reads pinned
+gp2 at its IOPS ceiling under ten connections; on 25 MB objects the same
+route measured a higher concurrent QPS than stock (0.727 against 0.653)
+with a higher error ratio (0.103 against 0.084), which is why this default
+waits for the bar below. #1191 keeps
 #1170 (the in-flight fetch buffers' own design gate); this decision bounds
 the permits by memory, it does not change what each permit reserves.
 
@@ -308,7 +334,7 @@ outside its band is a miss and stays open with its bottleneck named.
 | resolve LISTs per statement, folded against unfolded large-object arm | at least 80% fewer | fewer than 60% fewer |
 | `unfoldedSegmentsResolved` after the fold | 0 | any |
 | load time with `--fold-after-load` | at most 1.05x the same load without it | over 1.1x |
-| q20 GETs per object / wire bytes over corpus bytes, stock corpus arm (3.8 MB objects) | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
+| q20 GETs per object / wire bytes over corpus bytes, stock corpus arm (3.8 MB objects) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
 | q2 hot on 16 GB with the cache at about half the corpus | cache-served bytes at least 40% of wire bytes | under 25% |
 | hot geomean ratio to VictoriaLogs, 42 statements, +0.01 s | reported; the plan's eight-week figure (1.1) is not this epic's target | |
 | statements answered on the reference box | 43 of 43 | fewer |
@@ -395,7 +421,7 @@ measurements are orchestrator work on bot-style boxes.
 
 | task | decision | crates | risk |
 |---|---|---|---|
-| T1 seal ceiling, `--fold-after-load`, `--writers-stopped`, load-then-SQL e2e | 1 | ravel-catalog, ravel-cli, docs | high (visibility contract): `effort: high`, its own checkpoint review |
+| T1 seal-through hour, HEAD preflight refusal, `--fold-after-load`, `--writers-stopped`, load-then-SQL e2e | 1 | ravel-catalog, ravel-cli, docs | high (visibility contract): `effort: high`, its own checkpoint review |
 | T2 `stats.timings`, `stats.pruning`, pruning reachability through HTTP | 4, 5 | ravel-sql, ravel-server, docs | low |
 | T3 loop-stable memory cache, ADR-0046 amendment | 3 | ravel-cache, docs | medium |
 | T4 no plan phase for segments at or under `plan_whole_object_bound()` | 2 | ravel-query (`log_fetcher.rs`), ravel-sql | medium |
