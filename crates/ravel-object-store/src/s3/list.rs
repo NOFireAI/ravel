@@ -1008,6 +1008,30 @@ mod tests {
         );
     }
 
+    /// ListObjectsV2 may return fewer keys than `max-keys`: a backend paging at
+    /// 50 fills a 1000-key page in 20 responses.
+    #[tokio::test]
+    async fn a_page_of_short_responses_fills_without_reaching_the_ceiling() {
+        let responses: Vec<ListResponse> = (0..20)
+            .map(|response| {
+                let keys: Vec<String> = (0..50)
+                    .map(|key| format!("p/{:04}", response * 50 + key))
+                    .collect();
+                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                truncated(&keys, &format!("t{response}"))
+            })
+            .collect();
+        let script = Script::new(responses);
+        let page = list_page(&script, "p/", None, 1000).await.expect("page");
+        assert_eq!(page.objects.len(), 1000);
+        assert!(page.unaddressable.is_empty());
+        assert_eq!(page.next, Some(PageToken("p/0999".to_string())));
+        let seen = script.seen.lock();
+        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.first().map(|asked| asked.2), Some(1000));
+        assert_eq!(seen.last().map(|asked| asked.2), Some(50));
+    }
+
     #[tokio::test]
     async fn a_page_refuses_a_repeated_token_a_missing_token_and_too_many_responses() {
         let script = Script::new([truncated(&[], "t1"), truncated(&[], "t1")]);
