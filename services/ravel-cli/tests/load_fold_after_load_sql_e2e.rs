@@ -62,6 +62,12 @@ const QUERY_NOW_NS: i64 = (HOUR as i64 + 1) * NS_PER_HOUR + 60_000_000_000;
 /// would come in under it.
 const HEAD_PUT_DELAY: Duration = Duration::from_millis(500);
 
+/// How long every GET of the logs HEAD is held once a HEAD PUT has landed.
+/// The `--fold-after-load` coverage check reads the HEAD its fold just wrote,
+/// so a fold `elapsed` that left the check out would come in under
+/// `HEAD_PUT_DELAY + HEAD_GET_DELAY`.
+const HEAD_GET_DELAY: Duration = Duration::from_millis(500);
+
 const TENANT: &str = "acme";
 const TOKEN: &str = "acme-token";
 const SHARDS: u32 = 2;
@@ -84,21 +90,87 @@ struct SealMidLoad {
     advance_to: i64,
 }
 
+/// One step of a [`CommitScript`], run when the `at_commit`-th commit record
+/// (1-based) is PUT, before that PUT lands: first a fold by another process
+/// at the clock's current reading when `fold` is `Some` (its value is the
+/// seal-through hour, `None` for the margin alone), then the clock moves to
+/// `clock_after`.
+struct ScriptStep {
+    at_commit: usize,
+    fold: Option<Option<u32>>,
+    clock_after: i64,
+}
+
+/// Drives the load's clock and other processes' folds from the order of its
+/// commit record PUTs.
+struct CommitScript {
+    clock: Arc<AtomicI64>,
+    steps: Vec<ScriptStep>,
+    /// The ingest hour of every commit record PUT, in PUT order.
+    commit_hours: Mutex<Vec<u32>>,
+    /// The watermark each scripted fold left, in step order.
+    fold_watermarks: Mutex<Vec<Option<u32>>>,
+}
+
+impl CommitScript {
+    async fn on_commit_put(&self, inner: &Arc<dyn ObjectStoreBackend>, hour: u32) {
+        let index = {
+            let mut hours = self.commit_hours.lock().unwrap();
+            hours.push(hour);
+            hours.len()
+        };
+        for step in self.steps.iter().filter(|step| step.at_commit == index) {
+            if let Some(seal_through) = step.fold {
+                let catalog = Catalog::new(
+                    Arc::clone(inner),
+                    CatalogConfig {
+                        shard_count: SHARDS,
+                        ..CatalogConfig::default()
+                    },
+                )
+                .expect("catalog");
+                let fold = catalog
+                    .fold_with_seal_through(
+                        &TenantId::new(TENANT).hash(),
+                        ravel_types::Signal::Logs,
+                        uuid::Uuid::new_v4(),
+                        self.clock.load(Ordering::SeqCst),
+                        &[],
+                        None,
+                        &ravel_catalog::RefoldRequest::new(),
+                        seal_through,
+                    )
+                    .await
+                    .expect("the scripted fold");
+                self.fold_watermarks
+                    .lock()
+                    .unwrap()
+                    .push(fold.watermark_hour);
+            }
+            self.clock.store(step.clock_after, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Records every LIST prefix, every key a LIST returned and every PUT key,
 /// and holds each PUT of a key ending in `head_suffix` for
-/// [`HEAD_PUT_DELAY`].
+/// [`HEAD_PUT_DELAY`] and each later GET of one for [`HEAD_GET_DELAY`].
 struct RecordingStore {
     inner: Arc<dyn ObjectStoreBackend>,
     head_suffix: String,
+    head_written: AtomicBool,
+    /// When set, every GET of the HEAD after one is written is refused.
+    refuse_written_head_reads: AtomicBool,
     prefixes: Mutex<Vec<String>>,
     listed_keys: Mutex<Vec<String>>,
     put_keys: Mutex<Vec<String>>,
     seal_mid_load: Option<SealMidLoad>,
+    script: Option<CommitScript>,
 }
 
 impl RecordingStore {
     fn new(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
-        Self::build(inner, None)
+        Arc::new(Self::build(inner))
     }
 
     fn sealing_mid_load(
@@ -106,26 +178,43 @@ impl RecordingStore {
         clock: Arc<AtomicI64>,
         advance_to: i64,
     ) -> Arc<Self> {
-        Self::build(
-            inner,
-            Some(SealMidLoad {
-                fired: AtomicBool::new(false),
-                clock,
-                advance_to,
-            }),
-        )
+        let mut store = Self::build(inner);
+        store.seal_mid_load = Some(SealMidLoad {
+            fired: AtomicBool::new(false),
+            clock,
+            advance_to,
+        });
+        Arc::new(store)
     }
 
-    fn build(inner: Arc<dyn ObjectStoreBackend>, seal_mid_load: Option<SealMidLoad>) -> Arc<Self> {
+    fn scripted(
+        inner: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<AtomicI64>,
+        steps: Vec<ScriptStep>,
+    ) -> Arc<Self> {
+        let mut store = Self::build(inner);
+        store.script = Some(CommitScript {
+            clock,
+            steps,
+            commit_hours: Mutex::new(Vec::new()),
+            fold_watermarks: Mutex::new(Vec::new()),
+        });
+        Arc::new(store)
+    }
+
+    fn build(inner: Arc<dyn ObjectStoreBackend>) -> Self {
         let head_suffix = format!("/catalog/{}/HEAD", ravel_types::Signal::Logs.key_prefix());
-        Arc::new(Self {
+        Self {
             inner,
             head_suffix,
+            head_written: AtomicBool::new(false),
+            refuse_written_head_reads: AtomicBool::new(false),
             prefixes: Mutex::new(Vec::new()),
             listed_keys: Mutex::new(Vec::new()),
             put_keys: Mutex::new(Vec::new()),
-            seal_mid_load,
-        })
+            seal_mid_load: None,
+            script: None,
+        }
     }
 
     /// PUT keys of data objects and commit records, in PUT order.
@@ -195,12 +284,30 @@ impl ObjectStoreBackend for RecordingStore {
             assert_eq!(fold.watermark_hour, Some(HOUR), "{fold:?}");
             hook.clock.store(hook.advance_to, Ordering::SeqCst);
         }
-        if k.ends_with(&self.head_suffix) {
-            tokio::time::sleep(HEAD_PUT_DELAY).await;
+        if let Some(script) = &self.script
+            && let Ok(parsed) = keys::parse_commit_key(k)
+        {
+            script
+                .on_commit_put(&self.inner, parsed.ingest_hour_bucket)
+                .await;
         }
-        self.inner.put(k, d, o).await
+        if !k.ends_with(&self.head_suffix) {
+            return self.inner.put(k, d, o).await;
+        }
+        tokio::time::sleep(HEAD_PUT_DELAY).await;
+        let outcome = self.inner.put(k, d, o).await;
+        if outcome.is_ok() {
+            self.head_written.store(true, Ordering::SeqCst);
+        }
+        outcome
     }
     async fn get(&self, k: &str, r: GetRange) -> Result<GetOutcome, StoreError> {
+        if k.ends_with(&self.head_suffix) && self.head_written.load(Ordering::SeqCst) {
+            if self.refuse_written_head_reads.load(Ordering::SeqCst) {
+                return Err(StoreError::AccessDenied("HEAD read refused".to_string()));
+            }
+            tokio::time::sleep(HEAD_GET_DELAY).await;
+        }
         self.inner.get(k, r).await
     }
     async fn head(&self, k: &str) -> Result<ObjectMeta, StoreError> {
@@ -484,8 +591,8 @@ async fn load_with_fold_after_load_resolves_from_the_snapshot_through_sql() {
         "every loaded object is a snapshot entry: {fold:?}"
     );
     assert!(
-        fold.elapsed >= HEAD_PUT_DELAY,
-        "the fold's time covers its HEAD write: {fold:?}"
+        fold.elapsed >= HEAD_PUT_DELAY + HEAD_GET_DELAY,
+        "the fold's time covers its HEAD write and the coverage check's HEAD read: {fold:?}"
     );
     assert!(
         report.elapsed >= fold.elapsed,
@@ -637,7 +744,7 @@ async fn a_second_load_into_a_sealed_hour_is_refused_before_anything_is_written(
 /// the load's clock then moves into `H + 1`. The load's own fold seals
 /// through `H + 1`, so it is not a no-op and its watermark is not below any
 /// token hour, but the commits published into `H` after the other seal are
-/// outside the snapshot. The load fails with `FoldLeftHoursUncovered` naming
+/// outside the snapshot. The load fails with `FoldLeftCommitsUncovered` naming
 /// `H`, after every row is durable, and a token-less query misses those rows.
 #[tokio::test]
 async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
@@ -660,7 +767,7 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
     )
     .await
     .expect_err("the load fails");
-    let load::LoadError::FoldLeftHoursUncovered {
+    let load::LoadError::FoldLeftCommitsUncovered {
         durable,
         hours,
         report,
@@ -668,7 +775,7 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
         ..
     } = &err
     else {
-        panic!("expected FoldLeftHoursUncovered, got {err:?}");
+        panic!("expected FoldLeftCommitsUncovered, got {err:?}");
     };
     assert!(
         store
@@ -699,8 +806,9 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
     );
     let message = err.to_string();
     for needle in [
-        "durable",
-        "while this load was still writing",
+        "every object this load wrote is durable",
+        "are not in the snapshot of the catalog HEAD its fold left, in ingest hour(s) ",
+        "ravel-cli catalog verify --tenant acme --signal logs",
         "Rebuild the snapshot",
     ] {
         assert!(message.contains(needle), "{needle:?} in {message}");
@@ -780,4 +888,229 @@ fn the_load_summary_prints_the_fold_figures() {
         elapsed >= fold_elapsed,
         "summary elapsed {elapsed} includes the fold's {fold_elapsed}"
     );
+}
+
+/// `minutes:seconds` into hour `HOUR + hour_offset`, in nanoseconds.
+fn at(hour_offset: i64, minutes: i64, seconds: i64) -> i64 {
+    (i64::from(HOUR) + hour_offset) * NS_PER_HOUR + (minutes * 60 + seconds) * 1_000_000_000
+}
+
+/// The ingest hour of each commit record the load PUT, in PUT order: shard 0
+/// then shard 1 for each of its four batches.
+fn commit_hours(store: &RecordingStore) -> Vec<u32> {
+    store
+        .script
+        .as_ref()
+        .expect("script")
+        .commit_hours
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+fn fold_watermarks(store: &RecordingStore) -> Vec<Option<u32>> {
+    store
+        .script
+        .as_ref()
+        .expect("script")
+        .fold_watermarks
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+/// A load long enough to commit into `H`, `H + 1` and `H + 2`. Another
+/// process's writers-stopped fold seals `H` between the load's first and
+/// second commit into `H`, and the load's own fold runs at `H + 2:45`, past
+/// the full seal margin for `H`, so the margin alone would seal `H` at that
+/// time as well. The second commit into `H` is outside the snapshot all the
+/// same, and the load fails naming `H`.
+#[tokio::test]
+async fn a_seal_landing_mid_load_is_caught_after_the_margin_has_passed() {
+    let (_dir, parquet_path, mapping) = write_fixture();
+    let clock = Arc::new(AtomicI64::new(CLOCK_NS));
+    let fold_at = at(2, 45, 0);
+    let store = RecordingStore::scripted(
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&clock),
+        vec![
+            ScriptStep {
+                at_commit: 2,
+                fold: Some(Some(HOUR)),
+                clock_after: at(1, 5, 0),
+            },
+            ScriptStep {
+                at_commit: 4,
+                fold: None,
+                clock_after: at(2, 0, 30),
+            },
+            ScriptStep {
+                at_commit: 8,
+                fold: None,
+                clock_after: fold_at,
+            },
+        ],
+    );
+    let result = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        Arc::clone(&clock),
+    )
+    .await;
+    let hours = commit_hours(&store);
+    assert_eq!(
+        hours
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<u32>>(),
+        [HOUR, HOUR + 1, HOUR + 2].into_iter().collect(),
+        "the load committed into three hours: {hours:?}"
+    );
+    assert_eq!(&hours[..2], &[HOUR, HOUR], "two commits into H: {hours:?}");
+    assert_eq!(fold_watermarks(&store), vec![Some(HOUR)], "the other seal");
+    assert_eq!(clock.load(Ordering::SeqCst), fold_at);
+    let err = result.expect_err("the load fails naming hour H");
+    let load::LoadError::FoldLeftCommitsUncovered {
+        durable,
+        hours: uncovered,
+        finding,
+        report,
+        ..
+    } = &err
+    else {
+        panic!("expected FoldLeftCommitsUncovered, got {err:?}");
+    };
+    assert_eq!(durable.len(), hours.len(), "every commit is durable");
+    let fold = report.fold.clone().expect("the fold ran");
+    assert!(!fold.no_op, "{fold:?}");
+    assert_eq!(fold.watermark_hour, Some(HOUR + 2), "{fold:?}");
+    assert_eq!(fold.entry_count, hours.len() as u64 - 1, "{fold:?}");
+    assert_eq!(uncovered, &HOUR.to_string());
+    // The second commit into H, shard 1's first, landed after the other seal.
+    let late = durable
+        .iter()
+        .find(|t| t.shard == 1 && t.seq == 0)
+        .expect("shard 1's first commit");
+    assert_eq!(late.ingest_hour_bucket, HOUR);
+    let named = format!(
+        "1 of the 8 commits it published are not in the snapshot of the catalog HEAD its fold \
+         left, in ingest hour(s) {HOUR}: shard 1 hour {HOUR} writer {} epoch {} seq 0",
+        late.writer_id, late.epoch
+    );
+    assert_eq!(finding, &named);
+    assert!(err.to_string().contains(&named), "{err}");
+}
+
+/// The same long load with no asserted seal: another process's margin-only
+/// fold at `H + 2:25`, past the margin for `H` and after the load's last
+/// commit into `H`, seals `H`. Every commit is in the snapshot the load's
+/// own fold leaves, and the load succeeds.
+#[tokio::test]
+async fn a_margin_seal_after_the_last_commit_into_an_hour_is_not_reported() {
+    let (_dir, parquet_path, mapping) = write_fixture();
+    let clock = Arc::new(AtomicI64::new(CLOCK_NS));
+    let store = RecordingStore::scripted(
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&clock),
+        vec![
+            ScriptStep {
+                at_commit: 2,
+                fold: None,
+                clock_after: at(1, 5, 0),
+            },
+            ScriptStep {
+                at_commit: 4,
+                fold: None,
+                clock_after: at(2, 0, 30),
+            },
+            ScriptStep {
+                at_commit: 5,
+                fold: None,
+                clock_after: at(2, 25, 0),
+            },
+            ScriptStep {
+                at_commit: 6,
+                fold: Some(None),
+                clock_after: at(2, 45, 0),
+            },
+        ],
+    );
+    let report = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        clock,
+    )
+    .await
+    .expect("every commit is covered");
+    let hours = commit_hours(&store);
+    assert_eq!(
+        hours
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<u32>>(),
+        [HOUR, HOUR + 1, HOUR + 2].into_iter().collect(),
+        "the load committed into three hours: {hours:?}"
+    );
+    assert_eq!(
+        hours.iter().rposition(|&h| h == HOUR),
+        Some(1),
+        "no commit into H after the second: {hours:?}"
+    );
+    assert_eq!(fold_watermarks(&store), vec![Some(HOUR)], "the margin seal");
+    let fold = report.fold.expect("the fold ran");
+    assert_eq!(fold.watermark_hour, Some(HOUR + 2), "{fold:?}");
+    assert_eq!(
+        fold.entry_count,
+        hours.len() as u64,
+        "every commit is an entry"
+    );
+}
+
+/// The fold succeeds but the HEAD it wrote cannot be read back: coverage
+/// could not be checked, so the load fails in the uncovered class and says
+/// so, naming every hour it wrote.
+#[tokio::test]
+async fn an_unreadable_head_after_the_fold_fails_the_load_as_unchecked() {
+    let (_dir, parquet_path, mapping) = write_fixture();
+    let store = RecordingStore::new(Arc::new(MemoryStore::new()));
+    store
+        .refuse_written_head_reads
+        .store(true, Ordering::SeqCst);
+    let err = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        Arc::new(AtomicI64::new(CLOCK_NS)),
+    )
+    .await
+    .expect_err("coverage could not be checked");
+    let load::LoadError::FoldLeftCommitsUncovered {
+        durable,
+        hours,
+        finding,
+        report,
+        ..
+    } = &err
+    else {
+        panic!("expected FoldLeftCommitsUncovered, got {err:?}");
+    };
+    assert_eq!(durable.len(), report.objects_written());
+    let fold = report.fold.clone().expect("the fold ran");
+    assert!(!fold.no_op, "{fold:?}");
+    assert_eq!(fold.entry_count, durable.len() as u64, "{fold:?}");
+    assert_eq!(hours, &HOUR.to_string());
+    assert!(
+        finding.starts_with(&format!(
+            "whether the snapshot of the catalog HEAD its fold left covers the {} commits it \
+             published into ingest hour(s) {HOUR} could not be checked: ",
+            durable.len()
+        )),
+        "{finding}"
+    );
+    assert!(finding.contains("HEAD read refused"), "{finding}");
 }

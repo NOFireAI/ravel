@@ -3768,54 +3768,52 @@ mod load_skip_rows {
     }
 }
 
-/// `uncovered_hours` on the outcomes a `--fold-after-load` fold can have.
-/// `H` is the load's hour, and the margin alone seals `H - 3`.
+/// `uncovered_commits` turns a coverage result into the hours and sentence
+/// the `--fold-after-load` error carries: nothing when every token is
+/// covered; the missing hours, count and first ten commits otherwise; and
+/// every token hour when coverage could not be checked.
 #[test]
-fn uncovered_hours_names_every_hour_the_fold_left_out() {
+fn uncovered_commits_names_the_missing_commits() {
     const H: u32 = 472_222;
-    let margin = Some(H - 3);
+    let writer = uuid::Uuid::from_u128(0x6c3f_3102_5da4_454b_b826_aa47_f78c_ac09);
+    let tokens: Vec<CommitToken> = (0..12u64)
+        .map(|seq| CommitToken {
+            shard: (seq % 2) as u32,
+            writer_id: writer,
+            epoch: 7,
+            seq,
+            ingest_hour_bucket: if seq < 2 { H } else { H + 1 },
+        })
+        .collect();
+    let covered = ravel_catalog::SnapshotCoverage::default();
+    assert_eq!(uncovered_commits::<String>(&tokens, Ok(covered)), None);
 
-    // The fold sealed the load's hour from an unsealed HEAD: covered.
-    assert_eq!(
-        uncovered_hours(&[H, H], false, Some(H - 3), Some(H), margin),
-        None
-    );
-    // No tokens: nothing to cover, whatever the fold reported.
-    assert_eq!(uncovered_hours(&[], true, Some(H), Some(H), margin), None);
-
-    // A no-op with tokens: another fold had sealed through H already.
-    let (hours, reason) =
-        uncovered_hours(&[H], true, Some(H), Some(H), margin).expect("a no-op is uncovered");
-    assert_eq!(hours, vec![H]);
-    assert!(reason.contains("no-op"), "{reason}");
-    // A no-op whose previous watermark is at or below the margin hour names
-    // the highest token hour anyway.
-    let (hours, _) = uncovered_hours(&[H - 4, H - 5], true, Some(H - 3), Some(H - 3), margin)
-        .expect("a no-op is never a success");
-    assert_eq!(hours, vec![H - 4]);
-
-    // The crossing case: another fold sealed H while the load wrote, the
-    // load went on into H + 1, and this fold sealed through H + 1. The fold
-    // is not a no-op and its watermark covers the highest token hour, yet H
-    // was sealed before this load's last commit into it.
-    let (hours, reason) = uncovered_hours(&[H, H, H + 1], false, Some(H), Some(H + 1), margin)
-        .expect("H was sealed by another fold mid-load");
-    assert_eq!(hours, vec![H]);
+    let missing = ravel_catalog::SnapshotCoverage {
+        missing: tokens[1..].iter().map(token_identity).collect(),
+        ..ravel_catalog::SnapshotCoverage::default()
+    };
+    let (hours, finding) =
+        uncovered_commits::<String>(&tokens, Ok(missing)).expect("eleven are missing");
+    assert_eq!(hours, vec![H, H + 1]);
     assert!(
-        reason.contains("while this load was still writing"),
-        "{reason}"
+        finding.starts_with(
+            "11 of the 12 commits it published are not in the snapshot of the catalog HEAD its \
+             fold left, in ingest hour(s) 472222, 472223: shard 1 hour 472222 writer \
+             6c3f3102-5da4-454b-b826-aa47f78cac09 epoch 7 seq 1; "
+        ),
+        "{finding}"
     );
+    assert_eq!(finding.matches(" writer ").count(), 10, "{finding}");
+    assert!(finding.contains("seq 10; and 1 more"), "{finding}");
+    assert!(!finding.contains("seq 11"), "{finding}");
 
-    // An hour the margin alone had sealed by the fold's time counts as this
-    // fold's to cover, so a previous watermark there is not a finding.
+    let (hours, finding) =
+        uncovered_commits(&tokens, Err("part t/x/p.part: not found")).expect("unchecked");
+    assert_eq!(hours, vec![H, H + 1]);
     assert_eq!(
-        uncovered_hours(&[H - 4, H], false, Some(H - 4), Some(H), margin),
-        None
+        finding,
+        "whether the snapshot of the catalog HEAD its fold left covers the 12 commits it \
+         published into ingest hour(s) 472222, 472223 could not be checked: part t/x/p.part: \
+         not found"
     );
-
-    // A watermark left below a token hour.
-    let (hours, reason) = uncovered_hours(&[H, H + 1], false, Some(H - 3), Some(H), margin)
-        .expect("H + 1 is above the watermark");
-    assert_eq!(hours, vec![H + 1]);
-    assert!(reason.contains("below hour"), "{reason}");
 }

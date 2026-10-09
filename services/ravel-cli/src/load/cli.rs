@@ -459,7 +459,7 @@ pub(crate) async fn run_fold_warning_to(
     .await
     {
         Ok(report) => {
-            print_summary(&report);
+            print_summary(&report, true);
             if let Some(warning) = &report.load_memory_warning {
                 let _ = writeln!(warnings, "{warning}");
             }
@@ -927,7 +927,8 @@ pub(super) fn skip_rows_past_end_warning(
 }
 
 /// Print the completion summary (ADR-0089 deliverable 6) to stdout.
-fn print_summary(report: &LoadReport) {
+/// `fold_covered` is `false` beside a [`LoadError::FoldLeftCommitsUncovered`].
+fn print_summary(report: &LoadReport, fold_covered: bool) {
     let secs = report.elapsed.as_secs_f64();
     let rows_per_sec = if secs > 0.0 {
         report.rows_processed as f64 / secs
@@ -941,7 +942,7 @@ fn print_summary(report: &LoadReport) {
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
     if let Some(fold) = &report.fold {
-        print!("{}", fold_summary(fold));
+        print!("{}", fold_summary(fold, fold_covered));
     }
     let memory = &report.load_memory;
     // A resolved budget always has a nonzero floor; a derived budget can be 0.
@@ -964,15 +965,21 @@ fn print_summary(report: &LoadReport) {
 
 /// The `--fold-after-load` lines of the summary (ADR-2677 decision 1). The
 /// fold's elapsed is part of the `elapsed` line above it, not added to it.
-pub(super) fn fold_summary(fold: &LoadFold) -> String {
+/// `covered` is `false` when the snapshot the fold left was not confirmed to
+/// hold every commit the load wrote.
+pub(super) fn fold_summary(fold: &LoadFold, covered: bool) -> String {
     if fold.seal_through_hour.is_none() {
         return "  fold after load  : no fold: nothing was written\n".to_string();
     }
     let hour = |h: Option<u32>| h.map_or_else(|| "none".to_string(), |h| h.to_string());
-    let outcome = if fold.no_op {
-        "no-op, HEAD already sealed"
-    } else {
-        "sealed"
+    let outcome = match (fold.no_op, covered) {
+        (false, true) => "sealed",
+        (true, true) => "no-op, HEAD already sealed",
+        (false, false) => "folded, commits not confirmed in the snapshot (see the error below)",
+        (true, false) => {
+            "no-op, HEAD already sealed, commits not confirmed in the snapshot (see the error \
+             below)"
+        }
     };
     format!(
         "  fold after load  : {outcome}, seal_through_hour {}, watermark_hour {}, entries {}, \
@@ -1072,12 +1079,22 @@ fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
     // A `--fold-after-load` failure happens after every row is durable: the
     // load itself finished, so its summary is printed and nothing is partial.
     if let Some(report) = err.finished_report() {
-        print_summary(report);
-        println!(
-            "{} commit token(s)/segment(s) are durable (the whole file loaded; only the fold \
-             after it failed):",
-            tokens.len()
-        );
+        let uncovered = matches!(err, LoadError::FoldLeftCommitsUncovered { .. });
+        print_summary(report, !uncovered);
+        if uncovered {
+            println!(
+                "{} commit token(s)/segment(s) are durable (the whole file loaded and the fold \
+                 after it ran; the error below names what its snapshot was not confirmed to \
+                 hold):",
+                tokens.len()
+            );
+        } else {
+            println!(
+                "{} commit token(s)/segment(s) are durable (the whole file loaded; only the fold \
+                 after it failed):",
+                tokens.len()
+            );
+        }
         for token in tokens {
             println!("  {}", token.encode());
         }

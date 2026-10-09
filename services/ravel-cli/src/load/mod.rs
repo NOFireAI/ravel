@@ -413,7 +413,8 @@ impl LoadReport {
 /// signal, sealing through the highest ingest hour the load wrote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadFold {
-    /// Wall time of the router shutdown and the fold, already counted in
+    /// Wall time of the router shutdown, the fold and the check that its
+    /// snapshot covers every commit the load wrote, already counted in
     /// [`LoadReport::elapsed`].
     pub elapsed: Duration,
     /// Entries across every part of the HEAD the fold wrote. `0` on a no-op,
@@ -426,8 +427,9 @@ pub struct LoadFold {
     /// was no hour to seal and no fold ran.
     pub seal_through_hour: Option<u32>,
     /// `true` when HEAD already covered that hour, so the fold sealed nothing.
-    /// A load holding commit tokens fails on it with
-    /// [`LoadError::FoldLeftHoursUncovered`]; `false` when no fold ran.
+    /// The load still succeeds only when that HEAD's snapshot holds every
+    /// commit it wrote, and fails with [`LoadError::FoldLeftCommitsUncovered`]
+    /// otherwise; `false` when no fold ran.
     pub no_op: bool,
 }
 
@@ -608,24 +610,26 @@ pub enum LoadError {
         /// `watermark_hour + 1`, the first hour the HEAD has not sealed.
         first_open_hour: u64,
     },
-    /// The `--fold-after-load` fold left hours this load wrote outside its
-    /// own seal: a no-op, an hour another fold had already sealed while the
-    /// load was writing, or an hour above the resulting watermark. Every
-    /// object is durable; the commits published into those hours after their
-    /// seal are not in the snapshot. `report` is the finished load's summary,
-    /// printed ahead of this error.
+    /// After the `--fold-after-load` fold, the snapshot of the catalog HEAD
+    /// it left does not hold every commit this load wrote, as a level-0 entry
+    /// or superseded by a compaction or rewrite whose parts it holds; or that
+    /// snapshot could not be read, so coverage could not be checked. Every
+    /// object is durable. `report` is the finished load's summary, printed
+    /// ahead of this error.
     #[error(
-        "every object this load wrote is durable, but its fold did not cover ingest hour(s) \
-         {hours}: {reason}, so the commits this load published into them after that seal are \
-         not visible to queries that carry no commit token. Do not load the file again. Run \
+        "every object this load wrote is durable, but {finding}. A commit outside the snapshot \
+         is not visible to queries that carry no commit token. Do not load the file again. Run \
          `{verify}` to list the commits missing from the snapshot, then rebuild the catalog HEAD \
          (docs/guides/operations/troubleshooting.md, \"Rebuild the snapshot\")"
     )]
-    FoldLeftHoursUncovered {
+    FoldLeftCommitsUncovered {
         durable: Vec<CommitToken>,
-        /// The uncovered hours, comma-separated.
+        /// The ingest hours of the uncovered commits, or of every commit when
+        /// coverage could not be checked, comma-separated.
         hours: String,
-        reason: String,
+        /// Names the hours, how many commits are missing and up to ten of
+        /// them, or why coverage could not be checked.
+        finding: String,
         /// The `catalog verify` command line for this tenant and signal.
         verify: String,
         report: Box<LoadReport>,
@@ -643,7 +647,7 @@ impl LoadError {
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. }
             | LoadError::Fold { durable, .. }
-            | LoadError::FoldLeftHoursUncovered { durable, .. } => durable,
+            | LoadError::FoldLeftCommitsUncovered { durable, .. } => durable,
         }
     }
 
@@ -651,14 +655,14 @@ impl LoadError {
     /// `None` for [`LoadError::Setup`], which occurs before the load applies an
     /// offset or writes anything, so it has no figures to resume from, and for
     /// [`LoadError::HourAlreadySealed`], which occurs before anything either,
-    /// and for [`LoadError::Fold`] and [`LoadError::FoldLeftHoursUncovered`],
+    /// and for [`LoadError::Fold`] and [`LoadError::FoldLeftCommitsUncovered`],
     /// which occur once every row is durable, so there is nothing to resume.
     pub fn resume_figures(&self) -> Option<ResumeFigures> {
         match self {
             LoadError::Setup(_)
             | LoadError::HourAlreadySealed { .. }
             | LoadError::Fold { .. }
-            | LoadError::FoldLeftHoursUncovered { .. } => None,
+            | LoadError::FoldLeftCommitsUncovered { .. } => None,
             LoadError::BatchFailed { resume, .. }
             | LoadError::RowRejected { resume, .. }
             | LoadError::Flush { resume, .. } => Some(*resume),
@@ -676,7 +680,7 @@ impl LoadError {
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. }
             | LoadError::Fold { durable, .. }
-            | LoadError::FoldLeftHoursUncovered { durable, .. } => Some(durable),
+            | LoadError::FoldLeftCommitsUncovered { durable, .. } => Some(durable),
         }
     }
 
@@ -684,7 +688,7 @@ impl LoadError {
     /// that occur once every row is durable. `None` for every other variant.
     pub fn finished_report(&self) -> Option<&LoadReport> {
         match self {
-            LoadError::Fold { report, .. } | LoadError::FoldLeftHoursUncovered { report, .. } => {
+            LoadError::Fold { report, .. } | LoadError::FoldLeftCommitsUncovered { report, .. } => {
                 Some(report)
             }
             LoadError::Setup(_)

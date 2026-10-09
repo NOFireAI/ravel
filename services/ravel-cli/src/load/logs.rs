@@ -936,17 +936,17 @@ pub(super) async fn load_with_drain_reflush_period(
             Err(FoldFailure::Uncovered {
                 fold,
                 hours,
-                reason,
+                finding,
             }) => {
                 report.fold = Some(fold);
-                Err(LoadError::FoldLeftHoursUncovered {
+                Err(LoadError::FoldLeftCommitsUncovered {
                     durable: report.tokens.clone(),
                     hours: hours
                         .iter()
                         .map(u32::to_string)
                         .collect::<Vec<_>>()
                         .join(", "),
-                    reason,
+                    finding,
                     verify: format!(
                         "ravel-cli catalog verify --tenant {} --signal logs",
                         shell_word(tenant)
@@ -1031,69 +1031,90 @@ fn shell_word(word: &str) -> String {
 enum FoldFailure {
     /// The fold could not run or returned an error.
     Failed(String),
-    /// The fold ran, and left hours this load wrote outside its own seal.
+    /// The fold ran, and the snapshot of the HEAD it left does not cover every
+    /// commit this load wrote, or that could not be checked.
     Uncovered {
         fold: LoadFold,
         hours: Vec<u32>,
-        reason: String,
+        finding: String,
     },
 }
 
-/// The ingest hours among `token_hours` that a `--fold-after-load` fold did
-/// not cover, with the reason. An hour at or below the watermark HEAD carried
-/// before this fold (`previous_watermark_hour`) was sealed by another fold
-/// while the load was writing, since the preflight found every hour from the
-/// load's start unsealed; it counts when it is above `margin_hour`, the hour
-/// the seal margin alone seals at the fold's time, because no fold could have
-/// sealed it by the margin and only an asserted seal could have done so
-/// before the load's last commit into it. An hour above the fold's resulting
-/// watermark counts too. A no-op fold with tokens is never a success: when
-/// neither rule names an hour, the highest token hour is reported.
-pub(super) fn uncovered_hours(
-    token_hours: &[u32],
-    no_op: bool,
-    previous_watermark_hour: Option<u32>,
-    watermark_hour: Option<u32>,
-    margin_hour: Option<u32>,
+/// The most commits an uncovered-commits finding names one by one.
+const UNCOVERED_COMMITS_NAMED: usize = 10;
+
+/// The snapshot entry identity of the L0 commit `token` names.
+fn token_identity(token: &CommitToken) -> ravel_catalog::EntryIdentity {
+    (
+        token.shard,
+        token.ingest_hour_bucket,
+        *token.writer_id.as_bytes(),
+        token.epoch,
+        token.seq,
+    )
+}
+
+/// What a `--fold-after-load` coverage check over `tokens` found, as the
+/// ingest hours to name and the sentence naming them; `None` when the
+/// snapshot covers every token. A `coverage` error names every token hour,
+/// since none of them could be confirmed.
+fn uncovered_commits<E: std::fmt::Display>(
+    tokens: &[CommitToken],
+    coverage: Result<ravel_catalog::SnapshotCoverage, E>,
 ) -> Option<(Vec<u32>, String)> {
-    let max_hour = token_hours.iter().copied().max()?;
-    let sealed_by_another = |h: u32| {
-        previous_watermark_hour.is_some_and(|w| h <= w) && margin_hour.is_none_or(|m| h > m)
+    let joined = |hours: &[u32]| {
+        hours
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let above_watermark = |h: u32| watermark_hour.is_none_or(|w| h > w);
-    let mut hours: Vec<u32> = token_hours
-        .iter()
-        .copied()
-        .filter(|&h| sealed_by_another(h) || above_watermark(h))
-        .collect();
-    hours.sort_unstable();
-    hours.dedup();
-    if hours.is_empty() && no_op {
-        hours.push(max_hour);
+    match coverage {
+        Ok(coverage) if coverage.missing.is_empty() => None,
+        Ok(coverage) => {
+            let missing = &coverage.missing;
+            let mut hours: Vec<u32> = missing.iter().map(|id| id.1).collect();
+            hours.sort_unstable();
+            hours.dedup();
+            let mut named = missing
+                .iter()
+                .take(UNCOVERED_COMMITS_NAMED)
+                .map(|(shard, hour, writer_id, epoch, seq)| {
+                    format!(
+                        "shard {shard} hour {hour} writer {} epoch {epoch} seq {seq}",
+                        uuid::Uuid::from_bytes(*writer_id)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if missing.len() > UNCOVERED_COMMITS_NAMED {
+                named.push_str(&format!(
+                    "; and {} more",
+                    missing.len() - UNCOVERED_COMMITS_NAMED
+                ));
+            }
+            let finding = format!(
+                "{} of the {} commits it published are not in the snapshot of the catalog HEAD \
+                 its fold left, in ingest hour(s) {}: {named}",
+                missing.len(),
+                tokens.len(),
+                joined(&hours)
+            );
+            Some((hours, finding))
+        }
+        Err(err) => {
+            let mut hours: Vec<u32> = tokens.iter().map(|t| t.ingest_hour_bucket).collect();
+            hours.sort_unstable();
+            hours.dedup();
+            let finding = format!(
+                "whether the snapshot of the catalog HEAD its fold left covers the {} commits it \
+                 published into ingest hour(s) {} could not be checked: {err}",
+                tokens.len(),
+                joined(&hours)
+            );
+            Some((hours, finding))
+        }
     }
-    if hours.is_empty() {
-        return None;
-    }
-    let hour = |h: Option<u32>| h.map_or_else(|| "none".to_string(), |h| h.to_string());
-    let reason = if no_op {
-        format!(
-            "the fold was a no-op, because the catalog HEAD was already sealed through hour {} \
-             by another fold before this one ran",
-            hour(previous_watermark_hour)
-        )
-    } else if hours.iter().any(|&h| above_watermark(h)) {
-        format!(
-            "the fold left the watermark at hour {}, below hour {max_hour} this load wrote",
-            hour(watermark_hour)
-        )
-    } else {
-        format!(
-            "another fold sealed the catalog HEAD through hour {} while this load was still \
-             writing, so this fold did not list those hours",
-            hour(previous_watermark_hour)
-        )
-    };
-    Some((hours, reason))
 }
 
 /// The `--fold-after-load` step (ADR-2677 decision 1), run once every write
@@ -1101,9 +1122,11 @@ pub(super) fn uncovered_hours(
 /// its last flush and closes its mailbox, which is what makes the loader's
 /// assertion true: nothing it started can publish into an hour after the
 /// fold seals it. The fold then seals the logs snapshot through the highest
-/// ingest hour among `tokens`, at a fresh reading of `clock`, and fails with
-/// [`FoldFailure::Uncovered`] when [`uncovered_hours`] names any hour. With
-/// no tokens there is nothing to seal and no fold runs.
+/// ingest hour among `tokens`, at a fresh reading of `clock`. Last, the
+/// snapshot of the HEAD the fold left is read back, and the step fails with
+/// [`FoldFailure::Uncovered`] unless it covers every one of `tokens` (see
+/// [`ravel_catalog::snapshot_coverage`]) or when it cannot be read. With no
+/// tokens there is nothing to seal, no fold runs and nothing is read.
 async fn fold_after_load_through(
     store: Arc<dyn ObjectStoreBackend>,
     router: Arc<LogIngestRouter>,
@@ -1130,6 +1153,7 @@ async fn fold_after_load_through(
         });
     };
     let now_ns = clock.now_ns();
+    let coverage_store = Arc::clone(&store);
     let catalog = crate::catalog::enforcing_catalog(
         store,
         ravel_catalog::CatalogConfig {
@@ -1151,6 +1175,14 @@ async fn fold_after_load_through(
         )
         .await
         .map_err(|err| FoldFailure::Failed(err.to_string()))?;
+    let identities: Vec<ravel_catalog::EntryIdentity> = tokens.iter().map(token_identity).collect();
+    let coverage = ravel_catalog::snapshot_coverage(
+        coverage_store.as_ref(),
+        &tenant_id.hash(),
+        Signal::Logs,
+        &identities,
+    )
+    .await;
     let load_fold = LoadFold {
         elapsed: started.elapsed(),
         entry_count: fold.entry_count,
@@ -1158,18 +1190,12 @@ async fn fold_after_load_through(
         seal_through_hour: Some(seal_through_hour),
         no_op: fold.no_op,
     };
-    match uncovered_hours(
-        &token_hours,
-        fold.no_op,
-        fold.previous_watermark_hour,
-        fold.watermark_hour,
-        catalog.margin_watermark_hour(now_ns),
-    ) {
+    match uncovered_commits(tokens, coverage) {
         None => Ok(load_fold),
-        Some((hours, reason)) => Err(FoldFailure::Uncovered {
+        Some((hours, finding)) => Err(FoldFailure::Uncovered {
             fold: load_fold,
             hours,
-            reason,
+            finding,
         }),
     }
 }
