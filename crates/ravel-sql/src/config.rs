@@ -22,9 +22,7 @@ use datafusion::execution::memory_pool::MemoryPool;
 use ravel_query::EngineConfig;
 use ravel_types::accounting::QueryAccounting;
 
-use crate::memory::{
-    AggregateRelease, CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant,
-};
+use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 
 /// Default per-query RecordBatch byte budget: 256 MiB. This is the shipped
 /// default, not a guess awaiting a number: an operator overrides it per process
@@ -553,23 +551,22 @@ impl SqlConfig {
     /// (ADR-0044); the pool reports this query's reserved-bytes high-water
     /// mark into it on every grow, feeding `peak_intermediate_bytes`.
     ///
-    /// The pool holds a hash aggregate's released bytes until its stream ends
-    /// unless spill is configured ([`AggregateRelease::for_spill`]).
+    /// The pool holds a grouped hash aggregate's released bytes until its
+    /// stream ends unless that stream can spill to disk, which is decided per
+    /// statement: [`crate::build_session`] tells the pool whether its
+    /// statement has a disk ([`TenantDelegatingPool::set_disk_spill`]).
     pub fn query_pool(
         &self,
         tenant: Arc<TenantMemoryAccountant>,
         accounting: QueryAccounting,
     ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
         let breach = CeilingBreach::new();
-        let pool = Arc::new(
-            TenantDelegatingPool::new(
-                self.max_query_bytes,
-                tenant,
-                Arc::clone(&breach),
-                accounting,
-            )
-            .with_aggregate_release(AggregateRelease::for_spill(self.spill.is_some())),
-        );
+        let pool = Arc::new(TenantDelegatingPool::new(
+            self.max_query_bytes,
+            tenant,
+            Arc::clone(&breach),
+            accounting,
+        ));
         (pool, breach)
     }
 }

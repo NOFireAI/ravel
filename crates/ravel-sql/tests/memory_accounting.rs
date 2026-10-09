@@ -35,7 +35,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     LogsTableProvider, RavelTableProvider, SessionTable, SpillDecision, SqlConfig,
-    TenantMemoryAccountant, build_session,
+    TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantId;
 use ravel_types::accounting::QueryAccounting;
@@ -178,6 +178,74 @@ async fn a_multi_batch_aggregate_query_returns_every_reserved_byte() {
     .await;
 
     assert_eq!(pool.reserved(), 0);
+    assert_eq!(accountant.reserved(), 0);
+}
+
+/// Issue #2633: `HASH_AGGREGATE_CONSUMER_PREFIX` against the consumer name
+/// DataFusion itself gives a grouped hash aggregate, not a hand-written one.
+/// A real `GROUP BY` through the production pool (`SqlConfig::query_pool`,
+/// then `build_session` with spill disabled) must leave bytes held while its
+/// stream is alive: an aggregate's emit shrinks its reservation before it
+/// returns the batch, so by the time any output batch arrives one has
+/// shrunk, and nothing releases the hold until the stream drops.
+///
+/// FLIP: set `HASH_AGGREGATE_CONSUMER_PREFIX` to a string DataFusion does
+/// not produce and the hold reads 0 after every batch.
+#[tokio::test]
+async fn a_real_group_by_is_held_by_the_production_pool() {
+    let tenant = tenant_id("acme");
+    let specs = big_segment();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    let accountant = TenantMemoryAccountant::new(1 << 30);
+    let (pool, _breach) =
+        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
+    let held = || {
+        pool.downcast_ref::<TenantDelegatingPool>()
+            .expect("query_pool builds a TenantDelegatingPool")
+            .held_bytes()
+    };
+
+    let snapshot = fixture.snapshot(&tenant).await;
+    let provider = Arc::new(RavelTableProvider::new(
+        snapshot,
+        tenant.hash(),
+        SegmentFetcher::new(Arc::clone(&fixture.store)),
+        SqlConfig::default(),
+        PhaseAccounting::new(),
+    ));
+    let ctx = build_session(
+        &SqlConfig::default(),
+        Arc::clone(&pool),
+        SessionTable::Metrics(provider),
+        false,
+        SpillDecision::Disabled,
+    )
+    .expect("session");
+    let mut stream = ctx
+        .sql("SELECT ts, count(value) FROM samples GROUP BY ts")
+        .await
+        .expect("plan")
+        .execute_stream()
+        .await
+        .expect("execute");
+
+    let mut groups = 0usize;
+    let mut least_held = usize::MAX;
+    while let Some(next) = stream.next().await {
+        groups += next.expect("batch").num_rows();
+        least_held = least_held.min(held());
+    }
+    assert_eq!(groups, SAMPLES as usize, "one group per sample timestamp");
+    assert!(
+        least_held > 0,
+        "no bytes were held after some output batch of a live GROUP BY stream \
+         (least {least_held}): the pool did not recognise DataFusion's \
+         aggregate consumer name"
+    );
+
+    drop(stream);
+    assert_eq!(held(), 0, "the hold is released when the stream drops");
     assert_eq!(accountant.reserved(), 0);
 }
 

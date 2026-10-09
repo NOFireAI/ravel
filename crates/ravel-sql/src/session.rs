@@ -146,6 +146,7 @@ use crate::late_materialization::TopKLateMaterialization;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
+use crate::memory::TenantDelegatingPool;
 use crate::metadata_agg::MetadataOnlyAggregate;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::parquet::ParquetSession;
@@ -672,7 +673,10 @@ fn repartition_free(spill: SpillDecision<'_>) -> bool {
 ///
 /// The caller owns `pool` (typically a `TenantDelegatingPool` from
 /// [`SqlConfig::query_pool`](crate::SqlConfig::query_pool)) so it can read
-/// the reserved-byte counters after the query finishes.
+/// the reserved-byte counters after the query finishes. A
+/// `TenantDelegatingPool` is told whether `spill` gives this session a disk
+/// ([`TenantDelegatingPool::set_disk_spill`]); the last session built on a
+/// pool decides.
 pub fn build_session(
     config: &SqlConfig,
     pool: Arc<dyn MemoryPool>,
@@ -689,6 +693,10 @@ pub fn build_session(
         }
         _ => Arc::new(EmptyObjectStoreRegistry),
     };
+    // The pool's aggregate hold depends on whether this runtime can spill.
+    if let Some(pool) = pool.downcast_ref::<TenantDelegatingPool>() {
+        pool.set_disk_spill(matches!(spill, SpillDecision::Enabled { .. }));
+    }
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(registry)
@@ -1753,6 +1761,57 @@ mod tests {
                  re-read what the new or removed planner admits before updating \
                  this list"
             );
+        }
+    }
+
+    /// The production pool learns from each session whether its statement can
+    /// spill: a grouped hash aggregate consumer marked `can_spill` is held on
+    /// a spill-disabled session and released at once on a spill-enabled one.
+    /// The executor rebuilds a statement's session with spill disabled when
+    /// its executed plan fails the spill re-check, and that rebuild decides.
+    ///
+    /// FLIP: delete the `set_disk_spill` call in `build_session` and the
+    /// spill-disabled cases read 200, since a new pool assumes a disk.
+    #[test]
+    fn build_session_tells_the_query_pool_whether_its_statement_can_spill() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let dir = tempfile::tempdir().expect("scratch");
+        let enabled = SpillDecision::Enabled {
+            dir: dir.path(),
+            max_bytes: 1 << 20,
+        };
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        for (decisions, expected) in [
+            (vec![SpillDecision::Disabled], 1000),
+            (vec![enabled], 200),
+            (vec![enabled, SpillDecision::Disabled], 1000),
+        ] {
+            let tenant = TenantMemoryAccountant::new(1 << 30);
+            let (pool, _breach) =
+                SqlConfig::default().query_pool(Arc::clone(&tenant), QueryAccounting::new());
+            let mut ctx = None;
+            for decision in &decisions {
+                ctx = Some(
+                    build_session(
+                        &SqlConfig::default(),
+                        Arc::clone(&pool),
+                        logs_table(&store),
+                        false,
+                        *decision,
+                    )
+                    .expect("session builds"),
+                );
+            }
+            let runtime_pool = Arc::clone(&ctx.expect("one session").runtime_env().memory_pool);
+            let res = MemoryConsumer::new("GroupedHashAggregateStream[0] (count(1))")
+                .with_can_spill(true)
+                .register(&runtime_pool);
+            res.try_grow(1000).expect("within every ceiling");
+            res.shrink(800);
+            assert_eq!(tenant.reserved(), expected, "{decisions:?}");
+            drop(res);
+            assert_eq!(tenant.reserved(), 0, "{decisions:?}");
         }
     }
 
