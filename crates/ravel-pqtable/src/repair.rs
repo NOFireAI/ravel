@@ -931,9 +931,9 @@ mod tests {
         "u/v/00000000000000000007.pqm",
     ];
 
-    /// Stray keys the S3 adapter cannot list, because `Path::parse` refuses
-    /// them: control characters, an empty segment, a `.` and a `..` segment,
-    /// and an empty table segment.
+    /// Stray keys the S3 adapter cannot address, because `Path::from`
+    /// rewrites them: control characters, an empty segment, a `.` and a `..`
+    /// segment, and an empty table segment.
     const UNLISTABLE: [&str; 5] = [
         "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
         "hits//v/00000000000000000003.pqm",
@@ -1394,23 +1394,34 @@ mod tests {
         assert_eq!(stray_undeletable, stray_tilde_keys);
     }
 
-    /// On S3 a stray key `Path::parse` refuses fails the listing that meets
-    /// it; `MemoryStore` reports it unaddressable.
+    /// A stray key with a control character, an empty segment or a `.` or
+    /// `..` segment is listed unaddressable by the S3 adapter, so
+    /// [`list_stray`] names it as undeletable beside the other strays, and
+    /// [`delete_stray`] refuses it.
     #[tokio::test]
-    async fn a_key_the_s3_adapter_cannot_list_fails_list_stray_with_the_store_error() {
+    async fn a_key_the_s3_adapter_cannot_address_is_listed_as_undeletable() {
         for rest in UNLISTABLE {
             let store = stray_store().await;
             let key = stray_key(&TENANT_A, rest);
             memory(&store).insert_foreign(&key, Bytes::from_static(b"x"));
-            let got = list_stray(&store, &TENANT_A).await;
-            assert!(
-                matches!(&got, Err(RepairError::Store {
-                    key: prefix,
-                    source: StoreError::Permanent(msg),
-                }) if *prefix == tenant_manifest_prefix(&TENANT_A)
-                    && msg.starts_with("invalid path")),
-                "{rest:?}: {got:?}"
+            let listed = list_stray(&store, &TENANT_A).await.expect("list");
+            assert_eq!(
+                listed
+                    .iter()
+                    .filter(|e| e.key == key)
+                    .map(|e| e.class)
+                    .collect::<Vec<_>>(),
+                [StrayClass::Undeletable],
+                "{rest:?}: {listed:?}"
             );
+            assert!(
+                matches!(
+                    delete_stray(&store, &TENANT_A, std::slice::from_ref(&key), false).await,
+                    Err(RepairError::Undeletable { .. })
+                ),
+                "{rest:?}"
+            );
+            assert_eq!(deletes_sent(&store), 0, "{rest:?}");
             assert!(
                 unaddressable_under(memory(&store), &tenant_manifest_prefix(&TENANT_A))
                     .await

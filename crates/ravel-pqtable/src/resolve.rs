@@ -26,11 +26,20 @@
 //! adapter cannot list such a key holding a control character, an empty
 //! segment or a `.` or `..` segment: the listing fails with
 //! [`ResolveError::Store`] instead.
+//!
+//! A key the store lists but reports unaddressable
+//! ([`ravel_object_store::is_addressable_key`]) is in no listing's objects, so
+//! no reader resolves it. Every listing here and in the sweep that the store
+//! reports such keys in is counted per tenant ([`unaddressable_listings`]),
+//! and [`tenant_listing`] returns how many it skipped
+//! ([`TenantListing::unaddressable`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{
+    GetRange, ObjectStoreBackend, StoreError, Unaddressable, list_all_reporting,
+};
 use ravel_types::TenantHash;
 
 use crate::keys::{
@@ -98,12 +107,16 @@ pub const ABOVE_BOUND_WARN_EVERY: u64 = 1024;
 /// resolves, per (tenant hash, table), for at most [`ABOVE_BOUND_TABLES_MAX`]
 /// pairs, and a saturating count of listings the full map had no room for.
 /// `invalid_tables` and `invalid_tables_overflow` are the same per tenant hash
-/// for [`ListedManifestKey::InvalidTable`] keys, under the same cap.
+/// for [`ListedManifestKey::InvalidTable`] keys, under the same cap, and
+/// `unaddressable` and `unaddressable_overflow` the same for listings the
+/// store reported unaddressable keys in.
 struct AboveBoundState {
     seen: BTreeMap<(String, String), u64>,
     overflow: u64,
     invalid_tables: BTreeMap<String, u64>,
     invalid_tables_overflow: u64,
+    unaddressable: BTreeMap<String, u64>,
+    unaddressable_overflow: u64,
 }
 
 static ABOVE_BOUND: Mutex<AboveBoundState> = Mutex::new(AboveBoundState {
@@ -111,6 +124,8 @@ static ABOVE_BOUND: Mutex<AboveBoundState> = Mutex::new(AboveBoundState {
     overflow: 0,
     invalid_tables: BTreeMap::new(),
     invalid_tables_overflow: 0,
+    unaddressable: BTreeMap::new(),
+    unaddressable_overflow: 0,
 });
 
 /// Count one listing of `key` in `seen`, which holds at most `cap` entries,
@@ -246,6 +261,43 @@ pub fn invalid_table_listings(tenant: &TenantHash) -> u64 {
         .unwrap_or(0)
 }
 
+/// Count one listing under `tenant`'s manifest prefix in which the store
+/// reported `skipped` unaddressable keys. Nothing when it reported none. The
+/// store's adapter already warns once per key, naming it, so this logs
+/// nothing.
+pub(crate) fn note_unaddressable(tenant: &TenantHash, skipped: &Unaddressable) {
+    if skipped.count == 0 {
+        return;
+    }
+    let mut state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    let AboveBoundState {
+        unaddressable,
+        unaddressable_overflow,
+        ..
+    } = &mut *state;
+    record_in(
+        unaddressable,
+        unaddressable_overflow,
+        tenant.to_hex(),
+        ABOVE_BOUND_TABLES_MAX,
+        ABOVE_BOUND_WARN_EVERY,
+    );
+}
+
+/// How many listings under `tenant`'s manifest prefix in this process, by a
+/// resolve, a tenant-wide listing or a sweep, skipped a key because the store
+/// reported it unaddressable ([`ravel_object_store::is_addressable_key`]).
+/// Zero for a tenant first seen after [`ABOVE_BOUND_TABLES_MAX`] others were
+/// recorded.
+pub fn unaddressable_listings(tenant: &TenantHash) -> u64 {
+    let state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    state
+        .unaddressable
+        .get(&tenant.to_hex())
+        .copied()
+        .unwrap_or(0)
+}
+
 /// `versions` (ascending) up to and including [`MAX_MANIFEST_VERSION`], and
 /// the rest.
 pub fn split_at_bound(versions: &[u64]) -> (&[u64], &[u64]) {
@@ -330,22 +382,31 @@ pub struct TenantListing {
     /// name ([`ListedManifestKey::InvalidTable`]), whole and ascending. No
     /// reader resolves them and no table owns them.
     pub invalid_table_keys: Vec<String>,
+    /// The keys the store skipped because no request reaches them unchanged
+    /// ([`ravel_object_store::is_addressable_key`]): how many, and the first
+    /// [`ravel_object_store::UNADDRESSABLE_SAMPLE_MAX`] in listing order. No
+    /// reader resolves them, and only a delete of the exact key through an S3
+    /// tool removes them.
+    pub unaddressable: Unaddressable,
 }
 
 /// Every key under `prefix`, grouped by table. `only_table` is the table a
 /// per-table prefix belongs to, which every key must name. Each table with a
-/// key no reader resolves is passed to [`note_unresolvable`], and the keys
-/// under no valid table, which only a tenant-wide listing can see, to
-/// [`note_invalid_tables`].
+/// key no reader resolves is passed to [`note_unresolvable`], the keys under
+/// no valid table, which only a tenant-wide listing can see, to
+/// [`note_invalid_tables`], and the keys the store skipped as unaddressable to
+/// [`note_unaddressable`].
 async fn list_grouped(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     prefix: &str,
     only_table: Option<&str>,
 ) -> Result<TenantListing, ResolveError> {
-    let listed = list_all(store, prefix)
+    let listing = list_all_reporting(store, prefix)
         .await
         .map_err(|e| store_error(prefix, e))?;
+    note_unaddressable(tenant, &listing.unaddressable);
+    let listed = listing.objects;
     let foreign = |key: String, reason: String| ResolveError::ForeignKey {
         key,
         prefix: prefix.to_string(),
@@ -407,6 +468,7 @@ async fn list_grouped(
     Ok(TenantListing {
         tables,
         invalid_table_keys,
+        unaddressable: listing.unaddressable,
     })
 }
 
@@ -414,9 +476,11 @@ async fn list_grouped(
 /// `v/` prefix, including any above [`MAX_MANIFEST_VERSION`]. A `.pqm` key
 /// whose slot names no version ([`ListedManifestKey::InvalidVersion`]) is
 /// skipped and counted ([`above_bound_resolves`]); any other key that is not a
-/// version of this table is [`ResolveError::ForeignKey`]. On S3 such a key
-/// holding a control character, an empty segment or a `.` or `..` segment
-/// fails the listing with [`ResolveError::Store`].
+/// version of this table is [`ResolveError::ForeignKey`]. A key the store
+/// reports unaddressable is skipped, and the listing is counted per tenant
+/// ([`unaddressable_listings`]). On S3 such a key holding a control
+/// character, an empty segment or a `.` or `..` segment fails the listing with
+/// [`ResolveError::Store`].
 pub async fn versions(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -437,9 +501,11 @@ pub async fn versions(
 /// that is not a valid table name ([`ListedManifestKey::InvalidTable`]) are
 /// skipped, and the listing is counted per tenant
 /// ([`invalid_table_listings`]). Any other key under that prefix that is not
-/// a manifest key is [`ResolveError::ForeignKey`]. On S3 a key under that
-/// prefix holding a control character, an empty segment or a `.` or `..`
-/// segment fails the listing with [`ResolveError::Store`].
+/// a manifest key is [`ResolveError::ForeignKey`]. Keys the store reports
+/// unaddressable are skipped, returned in [`TenantListing::unaddressable`],
+/// and the listing is counted per tenant ([`unaddressable_listings`]). On S3
+/// a key under that prefix holding a control character, an empty segment or a
+/// `.` or `..` segment fails the listing with [`ResolveError::Store`].
 pub async fn tenant_listing(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -804,8 +870,8 @@ pub(crate) mod tests {
         "a/b/v/00000000000000000001.pqm",
     ];
 
-    /// Keys of the same kind that the S3 adapter cannot list, because
-    /// `object_store`'s `Path::parse` refuses them: control characters, an
+    /// Keys of the same kind that the S3 adapter cannot address, because
+    /// `object_store`'s path encoding rewrites them: control characters, an
     /// empty segment, a `.` and a `..` segment, and an empty table segment.
     pub(crate) const UNLISTABLE_SHAPES: [&str; 5] = [
         "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
@@ -815,11 +881,14 @@ pub(crate) mod tests {
         "/v/00000000000000000001.pqm",
     ];
 
-    /// Whether `err` is the S3 adapter's error for a listed key
-    /// `object_store` could not parse.
-    pub(crate) fn is_unparsed_listing(err: &StoreError) -> bool {
-        matches!(err, StoreError::Permanent(msg) if msg.starts_with("invalid path"))
-    }
+    /// The three unaddressable keys of ADR-2637 Task 2's acceptance tenant:
+    /// a control character and a `*` in a version slot, and an empty segment
+    /// after the table name.
+    const ACCEPTANCE_UNADDRESSABLE: [&str; 3] = [
+        "Hits/v/0000000000000000001\u{1}.pqm",
+        "Hits/v/0000000000000000001*.pqm",
+        "hits//v/00000000000000000001.pqm",
+    ];
 
     /// Write `t/<tenant>/pq/t/<rest>` raw with a body that is not a
     /// manifest, and return the key.
@@ -921,6 +990,8 @@ pub(crate) mod tests {
         let listing = tenant_listing(&store, &TENANT).await.expect("listing");
         assert!(listing.invalid_table_keys.is_empty());
         assert_eq!(invalid_table_listings(&TENANT), 0);
+        assert_eq!(listing.unaddressable.count, 1);
+        assert_eq!(unaddressable_listings(&TENANT), 2);
         let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
         assert!(!text.contains("v/\""), "{text}");
         assert_eq!(
@@ -936,10 +1007,12 @@ pub(crate) mod tests {
         assert_eq!(stray_warnings_naming(&logs, &stray), 0, "{text}");
     }
 
-    /// On S3 a stray key `Path::parse` refuses fails the tenant-wide listing
-    /// with the store error; `MemoryStore` reports it unaddressable.
+    /// A stray key the S3 adapter cannot address is skipped by the
+    /// tenant-wide listing, which still resolves the valid table, returns the
+    /// key in `unaddressable` rather than among the invalid-table keys, and is
+    /// counted in [`unaddressable_listings`].
     #[tokio::test]
-    async fn a_stray_key_the_s3_adapter_cannot_list_fails_the_tenant_listing() {
+    async fn a_stray_key_the_s3_adapter_cannot_address_is_skipped_and_counted() {
         for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x70 + i as u8; 16]);
             let store = S3KeyStore {
@@ -949,50 +1022,42 @@ pub(crate) mod tests {
                 put_version(&store.inner, &tenant, v).await;
             }
             let stray = put_stray(&store.inner, &tenant, rest).await;
-            for got in [
-                tables(&store, &tenant).await.map(drop),
-                tenant_listing(&store, &tenant).await.map(drop),
-            ] {
-                assert!(
-                    matches!(&got, Err(ResolveError::Store { key, source })
-                        if *key == tenant_manifest_prefix(&tenant)
-                            && is_unparsed_listing(source)),
-                    "{rest:?}: {got:?}"
-                );
-            }
+            assert_eq!(
+                tables(&store, &tenant).await.expect("tables"),
+                BTreeMap::from([("hits".to_string(), vec![1, 2])]),
+                "{rest:?}"
+            );
+            let listing = tenant_listing(&store, &tenant).await.expect("listing");
+            assert!(listing.invalid_table_keys.is_empty(), "{rest:?}");
+            assert_eq!(listing.unaddressable.count, 1, "{rest:?}");
+            assert_eq!(
+                listing
+                    .unaddressable
+                    .sample
+                    .iter()
+                    .map(|k| &k.key)
+                    .collect::<Vec<_>>(),
+                [&stray],
+                "{rest:?}"
+            );
             assert_eq!(invalid_table_listings(&tenant), 0, "{rest:?}");
+            assert_eq!(unaddressable_listings(&tenant), 2, "{rest:?}");
             // The table's own listing never meets it.
             assert_eq!(
                 versions(&store, &tenant, "hits").await.expect("versions"),
                 vec![1, 2],
                 "{rest:?}"
             );
-            let listing = tenant_listing(&store.inner, &tenant)
-                .await
-                .expect("listing");
-            assert!(listing.invalid_table_keys.is_empty(), "{rest:?}");
-            let reported = ravel_object_store::list_all_reporting(
-                &store.inner,
-                &tenant_manifest_prefix(&tenant),
-            )
-            .await
-            .expect("list")
-            .unaddressable
-            .sample;
-            assert_eq!(
-                reported.iter().map(|k| &k.key).collect::<Vec<_>>(),
-                [&stray],
-                "{rest:?}"
-            );
+            assert_eq!(unaddressable_listings(&tenant), 2, "{rest:?}");
         }
     }
 
-    /// On S3 a key under the table's own `v/` prefix whose slot names no
-    /// version and that `Path::parse` refuses fails every listing that meets
-    /// it, the table's own included; `MemoryStore` reports it unaddressable
-    /// and skips it.
+    /// A key under the table's own `v/` prefix whose slot names no version
+    /// and that the S3 adapter cannot address is skipped by every listing
+    /// that meets it, the table's own included, and each of those listings is
+    /// counted in [`unaddressable_listings`], not as a key naming no version.
     #[tokio::test]
-    async fn a_key_naming_no_version_the_s3_adapter_cannot_list_fails_every_listing() {
+    async fn a_key_naming_no_version_the_s3_adapter_cannot_address_is_skipped_and_counted() {
         for (i, slot) in [
             "\u{1b}[2J\u{7}xxxxxxxxxxxxxxx",
             "/00000000000000000003",
@@ -1010,34 +1075,76 @@ pub(crate) mod tests {
                 put_version(&store.inner, &tenant, v).await;
             }
             put_invalid(&store.inner, &tenant, slot).await;
-            let prefix = manifest_prefix(&tenant, "hits").expect("prefix");
-            let got = versions(&store, &tenant, "hits").await;
-            assert!(
-                matches!(&got, Err(ResolveError::Store { key, source })
-                    if *key == prefix && is_unparsed_listing(source)),
-                "{slot:?}: {got:?}"
-            );
-            assert!(
-                matches!(
-                    newest(&store, &tenant, "hits").await,
-                    Err(ResolveError::Store { .. })
-                ),
-                "{slot:?}"
-            );
-            assert!(
-                matches!(
-                    tables(&store, &tenant).await,
-                    Err(ResolveError::Store { .. })
-                ),
-                "{slot:?}"
-            );
             assert_eq!(
-                versions(&store.inner, &tenant, "hits")
-                    .await
-                    .expect("versions"),
+                versions(&store, &tenant, "hits").await.expect("versions"),
                 vec![1, 2],
                 "{slot:?}"
             );
+            assert_eq!(
+                newest(&store, &tenant, "hits").await.expect("resolve"),
+                Some(live_manifest("hits", 2, &[2])),
+                "{slot:?}"
+            );
+            assert_eq!(
+                tables(&store, &tenant).await.expect("tables"),
+                BTreeMap::from([("hits".to_string(), vec![1, 2])]),
+                "{slot:?}"
+            );
+            assert_eq!(unaddressable_listings(&tenant), 3, "{slot:?}");
+            assert_eq!(above_bound_resolves(&tenant, "hits"), 0, "{slot:?}");
+        }
+    }
+
+    /// ADR-2637 Task 2's acceptance tenant: a valid table beside a control
+    /// character and a `*` in a version slot under an invalid table segment,
+    /// and an empty segment after a table name, all put by a writer outside
+    /// Ravel. The valid table resolves, and the tenant-wide listing counts
+    /// exactly the three keys it skipped, which a count of the listed objects
+    /// alone would miss.
+    #[tokio::test]
+    async fn a_tenant_with_three_unaddressable_keys_resolves_and_counts_all_three() {
+        const TENANT: TenantHash = TenantHash([0x3c; 16]);
+        let store = S3KeyStore {
+            inner: MemoryStore::with_page_size(2),
+        };
+        for v in [1, 2] {
+            put_version(&store.inner, &TENANT, v).await;
+        }
+        let mut seeded = Vec::new();
+        for rest in ACCEPTANCE_UNADDRESSABLE {
+            seeded.push(put_stray(&store.inner, &TENANT, rest).await);
+        }
+        seeded.sort();
+        assert_eq!(
+            newest(&store, &TENANT, "hits").await.expect("resolve"),
+            Some(live_manifest("hits", 2, &[2]))
+        );
+        let listing = tenant_listing(&store, &TENANT).await.expect("listing");
+        assert_eq!(
+            listing.tables.keys().collect::<Vec<_>>(),
+            ["hits"],
+            "{listing:?}"
+        );
+        assert_eq!(listing.tables["hits"].versions, vec![1, 2]);
+        assert!(listing.invalid_table_keys.is_empty(), "{listing:?}");
+        assert_eq!(listing.unaddressable.count, 3, "{listing:?}");
+        assert_eq!(
+            listing
+                .unaddressable
+                .sample
+                .iter()
+                .map(|k| k.key.clone())
+                .collect::<Vec<_>>(),
+            seeded
+        );
+        // One tenant-wide listing; the resolve of `hits` met none of them.
+        assert_eq!(unaddressable_listings(&TENANT), 1);
+        for key in &seeded {
+            store
+                .inner
+                .head(key)
+                .await
+                .expect_err("refused, not deleted");
         }
     }
 

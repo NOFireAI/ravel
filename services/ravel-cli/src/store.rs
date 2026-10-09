@@ -689,12 +689,22 @@ pub fn build_store_handle(
 }
 
 /// Reads `key_or_path` from the local filesystem if it names an existing
-/// file, otherwise fetches it as a key from the configured object store.
+/// file, otherwise fetches it as a key from the configured object store. A
+/// value that is neither, such as a missing absolute path, which the store
+/// cannot address, fails with an [`std::io::ErrorKind::NotFound`] error that
+/// says so, without building the store.
 pub async fn read_bytes(args: &StoreArgs, key_or_path: &str) -> anyhow::Result<Vec<u8>> {
     if Path::new(key_or_path).is_file() {
         return tokio::fs::read(key_or_path)
             .await
             .map_err(|err| anyhow::anyhow!("failed to read {key_or_path}: {err}"));
+    }
+    if !ravel_object_store::is_addressable_key(key_or_path) {
+        return Err(
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)).context(
+                format!("no file at {key_or_path:?}, and it is not an object store key"),
+            ),
+        );
     }
     let store = build_store(args)?;
     let outcome = store
@@ -904,6 +914,39 @@ mod tests {
             Ok(_) => panic!("{context}"),
             Err(err) => err.to_string(),
         }
+    }
+
+    /// A missing absolute path is no store key: the store's path encoding
+    /// drops its leading `/`. `read_bytes` reports it not found, and says it
+    /// is not a key, rather than the store's refusal to address it.
+    #[tokio::test]
+    async fn read_bytes_of_a_missing_absolute_path_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.rseg");
+        let missing = missing.to_str().expect("utf8");
+        assert!(missing.starts_with('/'), "{missing}");
+        let args = StoreArgs::try_parse_from(["ravel-cli", "--store", "memory"]).expect("parse");
+        let err = read_bytes(&args, missing).await.expect_err("missing");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "{err:#}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("no file at {missing:?}, and it is not an object store key")
+        );
+        assert!(
+            !format!("{err:#}").contains("is not addressable"),
+            "{err:#}"
+        );
+        // A missing key the store can address still reaches the store.
+        let err = read_bytes(&args, "absent.rseg").await.expect_err("missing");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to fetch absent.rseg: object not found"
+        );
     }
 
     /// Stand up a minimal always-succeeding mock IMDSv2 on an ephemeral
