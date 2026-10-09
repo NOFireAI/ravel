@@ -3,6 +3,8 @@
 
 use super::*;
 
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
 /// Bulk-import `parquet_path` into `tenant`'s logs signal.
 ///
 /// - `shards` is the configured shard count. It is validated against (or, for a
@@ -400,6 +402,18 @@ pub(super) async fn load_with_drain_reflush_period(
 
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
+
+    // Before the provisioning check below, which can write a record.
+    if fold_after_load {
+        refuse_a_sealed_current_hour(
+            Arc::clone(&store),
+            tenant,
+            &tenant_id,
+            shards,
+            clock.now_ns(),
+        )
+        .await?;
+    }
 
     // Reuse the server's provisioning validation/adoption. Fresh signal: pins
     // the record at `shards`. Existing record: a differing count is refused
@@ -893,21 +907,193 @@ pub(super) async fn load_with_drain_reflush_period(
         if let Some(stall_flusher) = stall_flusher {
             stall_flusher.stop().await;
         }
-        report.fold = Some(
-            fold_after_load_through(
-                store,
-                router,
-                clock.as_ref(),
-                &tenant_id,
-                shards,
-                &report.tokens,
-                fold_started,
-            )
-            .await?,
-        );
+        let outcome = fold_after_load_through(
+            store,
+            router,
+            clock.as_ref(),
+            &tenant_id,
+            shards,
+            &report.tokens,
+            fold_started,
+        )
+        .await;
+        report.elapsed = started.elapsed();
+        return match outcome {
+            Ok(fold) => {
+                report.fold = Some(fold);
+                Ok(report)
+            }
+            Err(FoldFailure::Failed(cause)) => Err(LoadError::Fold {
+                durable: report.tokens.clone(),
+                cause,
+                rerun: format!(
+                    "ravel-cli catalog fold --tenant {} --shards {shards} --signal logs \
+                     --writers-stopped",
+                    shell_word(tenant)
+                ),
+                report: Box::new(report),
+            }),
+            Err(FoldFailure::Uncovered {
+                fold,
+                hours,
+                reason,
+            }) => {
+                report.fold = Some(fold);
+                Err(LoadError::FoldLeftHoursUncovered {
+                    durable: report.tokens.clone(),
+                    hours: hours
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    reason,
+                    verify: format!(
+                        "ravel-cli catalog verify --tenant {} --signal logs",
+                        shell_word(tenant)
+                    ),
+                    report: Box::new(report),
+                })
+            }
+        };
     }
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// The `--fold-after-load` preflight (ADR-2677 decision 1): refuse the load
+/// when the logs catalog HEAD has already sealed the hour bucket of `now_ns`.
+/// Only an earlier operator-asserted seal puts the watermark that high, and
+/// every object this load would write falls in that hour or a later one, so
+/// the part written before the next hour begins would be invisible to
+/// queries that carry no commit token. An absent HEAD, or a watermark below
+/// the current hour, passes.
+pub(super) async fn refuse_a_sealed_current_hour(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    tenant_id: &TenantId,
+    shards: u32,
+    now_ns: i64,
+) -> Result<(), LoadError> {
+    let hour = u32::try_from(now_ns.div_euclid(NS_PER_HOUR)).map_err(|_| {
+        LoadError::Setup(format!(
+            "--fold-after-load: clock reading {now_ns} ns has no ingest-hour bucket"
+        ))
+    })?;
+    let catalog = crate::catalog::enforcing_catalog(
+        store,
+        ravel_catalog::CatalogConfig {
+            shard_count: shards.max(1),
+            ..ravel_catalog::CatalogConfig::default()
+        },
+    )
+    .map_err(|err| {
+        LoadError::Setup(format!(
+            "--fold-after-load: failed to build catalog for the preflight: {err}"
+        ))
+    })?;
+    let watermark_hour = catalog
+        .head_watermark_hour(&tenant_id.hash(), Signal::Logs)
+        .await
+        .map_err(|err| {
+            LoadError::Setup(format!(
+                "--fold-after-load: could not read the logs catalog HEAD for tenant {tenant:?}: \
+                 {err}"
+            ))
+        })?;
+    match watermark_hour {
+        Some(watermark_hour) if watermark_hour >= hour => Err(LoadError::HourAlreadySealed {
+            tenant: tenant.to_string(),
+            hour,
+            watermark_hour,
+            first_open_hour: u64::from(watermark_hour) + 1,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `word` as one shell word: unchanged when it holds only characters no
+/// shell treats specially, single-quoted otherwise.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/@+=,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// Why the `--fold-after-load` step did not succeed. The caller attaches the
+/// finished report and turns it into a [`LoadError`].
+#[derive(Debug)]
+enum FoldFailure {
+    /// The fold could not run or returned an error.
+    Failed(String),
+    /// The fold ran, and left hours this load wrote outside its own seal.
+    Uncovered {
+        fold: LoadFold,
+        hours: Vec<u32>,
+        reason: String,
+    },
+}
+
+/// The ingest hours among `token_hours` that a `--fold-after-load` fold did
+/// not cover, with the reason. An hour at or below the watermark HEAD carried
+/// before this fold (`previous_watermark_hour`) was sealed by another fold
+/// while the load was writing, since the preflight found every hour from the
+/// load's start unsealed; it counts when it is above `margin_hour`, the hour
+/// the seal margin alone seals at the fold's time, because no fold could have
+/// sealed it by the margin and only an asserted seal could have done so
+/// before the load's last commit into it. An hour above the fold's resulting
+/// watermark counts too. A no-op fold with tokens is never a success: when
+/// neither rule names an hour, the highest token hour is reported.
+pub(super) fn uncovered_hours(
+    token_hours: &[u32],
+    no_op: bool,
+    previous_watermark_hour: Option<u32>,
+    watermark_hour: Option<u32>,
+    margin_hour: Option<u32>,
+) -> Option<(Vec<u32>, String)> {
+    let max_hour = token_hours.iter().copied().max()?;
+    let sealed_by_another = |h: u32| {
+        previous_watermark_hour.is_some_and(|w| h <= w) && margin_hour.is_none_or(|m| h > m)
+    };
+    let above_watermark = |h: u32| watermark_hour.is_none_or(|w| h > w);
+    let mut hours: Vec<u32> = token_hours
+        .iter()
+        .copied()
+        .filter(|&h| sealed_by_another(h) || above_watermark(h))
+        .collect();
+    hours.sort_unstable();
+    hours.dedup();
+    if hours.is_empty() && no_op {
+        hours.push(max_hour);
+    }
+    if hours.is_empty() {
+        return None;
+    }
+    let hour = |h: Option<u32>| h.map_or_else(|| "none".to_string(), |h| h.to_string());
+    let reason = if no_op {
+        format!(
+            "the fold was a no-op, because the catalog HEAD was already sealed through hour {} \
+             by another fold before this one ran",
+            hour(previous_watermark_hour)
+        )
+    } else if hours.iter().any(|&h| above_watermark(h)) {
+        format!(
+            "the fold left the watermark at hour {}, below hour {max_hour} this load wrote",
+            hour(watermark_hour)
+        )
+    } else {
+        format!(
+            "another fold sealed the catalog HEAD through hour {} while this load was still \
+             writing, so this fold did not list those hours",
+            hour(previous_watermark_hour)
+        )
+    };
+    Some((hours, reason))
 }
 
 /// The `--fold-after-load` step (ADR-2677 decision 1), run once every write
@@ -915,7 +1101,9 @@ pub(super) async fn load_with_drain_reflush_period(
 /// its last flush and closes its mailbox, which is what makes the loader's
 /// assertion true: nothing it started can publish into an hour after the
 /// fold seals it. The fold then seals the logs snapshot through the highest
-/// ingest hour among `tokens`, at a fresh reading of `clock`.
+/// ingest hour among `tokens`, at a fresh reading of `clock`, and fails with
+/// [`FoldFailure::Uncovered`] when [`uncovered_hours`] names any hour. With
+/// no tokens there is nothing to seal and no fold runs.
 async fn fold_after_load_through(
     store: Arc<dyn ObjectStoreBackend>,
     router: Arc<LogIngestRouter>,
@@ -924,23 +1112,20 @@ async fn fold_after_load_through(
     shards: u32,
     tokens: &[CommitToken],
     started: Instant,
-) -> Result<LoadFold, LoadError> {
-    let fold_failed = |cause: String| LoadError::Fold {
-        durable: tokens.to_vec(),
-        cause,
-    };
+) -> Result<LoadFold, FoldFailure> {
     // Every write task, the drain ticker and the stall flusher have been
     // joined by now, so this is the last handle.
     let router = Arc::try_unwrap(router).map_err(|_| {
-        fold_failed("the ingest router is still shared, so it cannot be shut down".to_string())
+        FoldFailure::Failed(
+            "the ingest router is still shared, so it cannot be shut down".to_string(),
+        )
     })?;
     router.shutdown().await;
 
-    let Some(seal_through_hour) = tokens.iter().map(|t| t.ingest_hour_bucket).max() else {
-        // Nothing was written, so no hour of this load needs sealing.
+    let token_hours: Vec<u32> = tokens.iter().map(|t| t.ingest_hour_bucket).collect();
+    let Some(seal_through_hour) = token_hours.iter().copied().max() else {
         return Ok(LoadFold {
             elapsed: started.elapsed(),
-            no_op: true,
             ..LoadFold::default()
         });
     };
@@ -952,7 +1137,7 @@ async fn fold_after_load_through(
             ..ravel_catalog::CatalogConfig::default()
         },
     )
-    .map_err(|err| fold_failed(format!("failed to build catalog: {err}")))?;
+    .map_err(|err| FoldFailure::Failed(format!("failed to build catalog: {err}")))?;
     let fold = catalog
         .fold_with_seal_through(
             &tenant_id.hash(),
@@ -965,14 +1150,28 @@ async fn fold_after_load_through(
             Some(seal_through_hour),
         )
         .await
-        .map_err(|err| fold_failed(err.to_string()))?;
-    Ok(LoadFold {
+        .map_err(|err| FoldFailure::Failed(err.to_string()))?;
+    let load_fold = LoadFold {
         elapsed: started.elapsed(),
         entry_count: fold.entry_count,
         watermark_hour: fold.watermark_hour,
         seal_through_hour: Some(seal_through_hour),
         no_op: fold.no_op,
-    })
+    };
+    match uncovered_hours(
+        &token_hours,
+        fold.no_op,
+        fold.previous_watermark_hour,
+        fold.watermark_hour,
+        catalog.margin_watermark_hour(now_ns),
+    ) {
+        None => Ok(load_fold),
+        Some((hours, reason)) => Err(FoldFailure::Uncovered {
+            fold: load_fold,
+            hours,
+            reason,
+        }),
+    }
 }
 
 /// Aborts its task when dropped, so every return path of the loader stops it.

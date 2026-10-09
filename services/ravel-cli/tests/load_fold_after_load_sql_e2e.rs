@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,24 +75,72 @@ impl Clock for FixedClock {
     }
 }
 
-/// Records every LIST prefix and every key a LIST returned, and holds each
-/// PUT of a key ending in `head_suffix` for [`HEAD_PUT_DELAY`].
+/// Seals the logs snapshot through hour `HOUR` (a writers-stopped fold by
+/// another process) when the first commit record is PUT, before that PUT
+/// lands, then moves the load's clock to `advance_to`.
+struct SealMidLoad {
+    fired: AtomicBool,
+    clock: Arc<AtomicI64>,
+    advance_to: i64,
+}
+
+/// Records every LIST prefix, every key a LIST returned and every PUT key,
+/// and holds each PUT of a key ending in `head_suffix` for
+/// [`HEAD_PUT_DELAY`].
 struct RecordingStore {
     inner: Arc<dyn ObjectStoreBackend>,
     head_suffix: String,
     prefixes: Mutex<Vec<String>>,
     listed_keys: Mutex<Vec<String>>,
+    put_keys: Mutex<Vec<String>>,
+    seal_mid_load: Option<SealMidLoad>,
 }
 
 impl RecordingStore {
     fn new(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
+        Self::build(inner, None)
+    }
+
+    fn sealing_mid_load(
+        inner: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<AtomicI64>,
+        advance_to: i64,
+    ) -> Arc<Self> {
+        Self::build(
+            inner,
+            Some(SealMidLoad {
+                fired: AtomicBool::new(false),
+                clock,
+                advance_to,
+            }),
+        )
+    }
+
+    fn build(inner: Arc<dyn ObjectStoreBackend>, seal_mid_load: Option<SealMidLoad>) -> Arc<Self> {
         let head_suffix = format!("/catalog/{}/HEAD", ravel_types::Signal::Logs.key_prefix());
         Arc::new(Self {
             inner,
             head_suffix,
             prefixes: Mutex::new(Vec::new()),
             listed_keys: Mutex::new(Vec::new()),
+            put_keys: Mutex::new(Vec::new()),
+            seal_mid_load,
         })
+    }
+
+    /// PUT keys of data objects and commit records, in PUT order.
+    fn data_and_commit_puts(&self) -> Vec<String> {
+        self.put_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| is_data_key(key) || keys::parse_commit_key(key).is_ok())
+            .cloned()
+            .collect()
+    }
+
+    fn put_count(&self) -> usize {
+        self.put_keys.lock().unwrap().len()
     }
 
     fn reset(&self) {
@@ -118,6 +166,35 @@ impl RecordingStore {
 #[async_trait]
 impl ObjectStoreBackend for RecordingStore {
     async fn put(&self, k: &str, d: Bytes, o: PutOptions) -> Result<PutOutcome, StoreError> {
+        self.put_keys.lock().unwrap().push(k.to_string());
+        if let Some(hook) = &self.seal_mid_load
+            && keys::parse_commit_key(k).is_ok()
+            && !hook.fired.swap(true, Ordering::SeqCst)
+        {
+            let catalog = Catalog::new(
+                Arc::clone(&self.inner),
+                CatalogConfig {
+                    shard_count: SHARDS,
+                    ..CatalogConfig::default()
+                },
+            )
+            .expect("catalog");
+            let fold = catalog
+                .fold_with_seal_through(
+                    &TenantId::new(TENANT).hash(),
+                    ravel_types::Signal::Logs,
+                    uuid::Uuid::new_v4(),
+                    hook.clock.load(Ordering::SeqCst),
+                    &[],
+                    None,
+                    &ravel_catalog::RefoldRequest::new(),
+                    Some(HOUR),
+                )
+                .await
+                .expect("the mid-load seal");
+            assert_eq!(fold.watermark_hour, Some(HOUR), "{fold:?}");
+            hook.clock.store(hook.advance_to, Ordering::SeqCst);
+        }
         if k.ends_with(&self.head_suffix) {
             tokio::time::sleep(HEAD_PUT_DELAY).await;
         }
@@ -157,6 +234,11 @@ impl ObjectStoreBackend for RecordingStore {
             ..self.inner.capabilities()
         }
     }
+}
+
+/// A logs data object: `t/<tenant>/<signal>/l0/...`.
+fn is_data_key(key: &str) -> bool {
+    key.contains(&format!("/{}/l0/", ravel_types::Signal::Logs.key_prefix()))
 }
 
 const MAPPING: &str = "ts_column = \"ts\"\n\
@@ -211,8 +293,21 @@ async fn run_load(
     mapping: &Mapping,
     fold_after_load: bool,
 ) -> LoadReport {
-    let clock: Arc<dyn Clock> = Arc::new(FixedClock(Arc::new(AtomicI64::new(CLOCK_NS))));
-    let result = if fold_after_load {
+    let clock = Arc::new(AtomicI64::new(CLOCK_NS));
+    try_run_load(store, parquet_path, mapping, fold_after_load, clock)
+        .await
+        .expect("load succeeds")
+}
+
+async fn try_run_load(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    mapping: &Mapping,
+    fold_after_load: bool,
+    clock: Arc<AtomicI64>,
+) -> Result<LoadReport, load::LoadError> {
+    let clock: Arc<dyn Clock> = Arc::new(FixedClock(clock));
+    if fold_after_load {
         load::load_with_fold_after_load(
             store,
             parquet_path,
@@ -240,8 +335,7 @@ async fn run_load(
             clock,
         )
         .await
-    };
-    result.expect("load succeeds")
+    }
 }
 
 fn build_app(store: Arc<dyn ObjectStoreBackend>) -> Router {
@@ -445,13 +539,13 @@ async fn load_with_fold_after_load_resolves_from_the_snapshot_through_sql() {
     );
 }
 
-/// A second `--fold-after-load` into an hour the first one sealed breaks the
-/// first load's assertion: its fold has nothing left to seal, it reports a
-/// no-op at the first fold's watermark, and its objects stay out of the
-/// snapshot, so the query still counts only the first load's rows. This pins
-/// the hazard the flag's help and the summary's warning describe.
+/// A second `--fold-after-load` in an hour the first one sealed is refused by
+/// the preflight before any row is read: every object it wrote would sit in
+/// a sealed hour, invisible to queries without a commit token. Nothing is
+/// written, not even the provisioning record, and the query still counts the
+/// first load's rows. The same load once the next hour begins is accepted.
 #[tokio::test]
-async fn a_second_load_into_a_sealed_hour_folds_nothing_and_stays_invisible() {
+async fn a_second_load_into_a_sealed_hour_is_refused_before_anything_is_written() {
     let (_dir, parquet_path, mapping) = write_fixture();
     let store = RecordingStore::new(Arc::new(MemoryStore::new()));
     let first = run_load(
@@ -461,30 +555,163 @@ async fn a_second_load_into_a_sealed_hour_folds_nothing_and_stays_invisible() {
         true,
     )
     .await;
-    assert!(!first.fold.expect("first fold").no_op);
+    assert!(!first.fold.as_ref().expect("first fold").no_op);
+    let data_and_commits = store.data_and_commit_puts();
+    assert_eq!(
+        data_and_commits.len(),
+        2 * first.objects_written(),
+        "one data object and one commit record per object: {data_and_commits:?}"
+    );
+    let puts = store.put_count();
 
-    let second = run_load(
+    let err = try_run_load(
         Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
         &parquet_path,
         &mapping,
         true,
+        Arc::new(AtomicI64::new(CLOCK_NS)),
     )
-    .await;
-    assert!(
-        second.objects_written() > 0,
-        "the second load wrote objects"
+    .await
+    .expect_err("the second load is refused");
+    match &err {
+        load::LoadError::HourAlreadySealed {
+            tenant,
+            hour,
+            watermark_hour,
+            first_open_hour,
+        } => {
+            assert_eq!(tenant, TENANT);
+            assert_eq!(*hour, HOUR);
+            assert_eq!(*watermark_hour, HOUR);
+            assert_eq!(*first_open_hour, u64::from(HOUR) + 1);
+        }
+        other => panic!("expected HourAlreadySealed, got {other:?}"),
+    }
+    let message = err.to_string();
+    for needle in [
+        "already sealed",
+        "commit token",
+        "wait until hour",
+        "Rebuild the snapshot",
+    ] {
+        assert!(message.contains(needle), "{needle:?} in {message}");
+    }
+    assert!(err.durable_tokens().is_empty());
+    assert_eq!(
+        store.data_and_commit_puts(),
+        data_and_commits,
+        "the refused load PUT no data object and no commit record"
     );
-    let fold = second.fold.expect("second fold");
-    assert!(fold.no_op, "{fold:?}");
-    assert_eq!(fold.watermark_hour, Some(HOUR), "{fold:?}");
-    assert_eq!(fold.seal_through_hour, Some(HOUR), "{fold:?}");
-    assert_eq!(fold.entry_count, 0, "{fold:?}");
+    assert_eq!(store.put_count(), puts, "the refused load PUT nothing");
 
+    let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
+    assert_eq!(count_of(&value), ROWS as i64, "{value}");
+
+    // The first way out the refusal names: once hour H + 1 begins the same
+    // file loads, though its rows' timestamps are still in hour H, and its
+    // fold seals H + 1.
+    let third = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        Arc::new(AtomicI64::new(
+            (i64::from(HOUR) + 1) * NS_PER_HOUR + 30_000_000_000,
+        )),
+    )
+    .await
+    .expect("a load in the next hour is not refused");
+    let fold = third.fold.expect("third fold");
+    assert!(!fold.no_op, "{fold:?}");
+    assert_eq!(fold.watermark_hour, Some(HOUR + 1), "{fold:?}");
     let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
     assert_eq!(
         count_of(&value),
-        ROWS as i64,
-        "only the first load's rows are in the snapshot: {value}"
+        2 * ROWS as i64,
+        "both loads are visible: {value}"
+    );
+}
+
+/// The crossing case: another writers-stopped fold seals hour `H` after the
+/// preflight passed, just before this load's first commit record lands, and
+/// the load's clock then moves into `H + 1`. The load's own fold seals
+/// through `H + 1`, so it is not a no-op and its watermark is not below any
+/// token hour, but the commits published into `H` after the other seal are
+/// outside the snapshot. The load fails with `FoldLeftHoursUncovered` naming
+/// `H`, after every row is durable, and a token-less query misses those rows.
+#[tokio::test]
+async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
+    let (_dir, parquet_path, mapping) = write_fixture();
+    // Half a minute either side of the H + 1 boundary, so no flush open
+    // across the move outlives its flush lifetime.
+    let next_hour_ns = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+    let clock = Arc::new(AtomicI64::new(next_hour_ns - 30_000_000_000));
+    let store = RecordingStore::sealing_mid_load(
+        Arc::new(MemoryStore::new()),
+        Arc::clone(&clock),
+        next_hour_ns + 30_000_000_000,
+    );
+    let err = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        clock,
+    )
+    .await
+    .expect_err("the load fails");
+    let load::LoadError::FoldLeftHoursUncovered {
+        durable,
+        hours,
+        report,
+        verify,
+        ..
+    } = &err
+    else {
+        panic!("expected FoldLeftHoursUncovered, got {err:?}");
+    };
+    assert!(
+        store
+            .seal_mid_load
+            .as_ref()
+            .expect("hook")
+            .fired
+            .load(Ordering::SeqCst),
+        "the mid-load seal ran"
+    );
+    assert_eq!(report.rows_processed, ROWS as u64, "every row was written");
+    assert_eq!(durable.len(), report.objects_written());
+    let token_hours: std::collections::BTreeSet<u32> =
+        durable.iter().map(|t| t.ingest_hour_bucket).collect();
+    assert_eq!(
+        token_hours,
+        [HOUR, HOUR + 1].into_iter().collect(),
+        "the load wrote into both hours"
+    );
+    let fold = report.fold.clone().expect("the fold ran");
+    assert!(!fold.no_op, "this fold sealed something: {fold:?}");
+    assert_eq!(fold.seal_through_hour, Some(HOUR + 1), "{fold:?}");
+    assert_eq!(fold.watermark_hour, Some(HOUR + 1), "{fold:?}");
+    assert_eq!(hours, &HOUR.to_string());
+    assert_eq!(
+        verify,
+        "ravel-cli catalog verify --tenant acme --signal logs"
+    );
+    let message = err.to_string();
+    for needle in [
+        "durable",
+        "while this load was still writing",
+        "Rebuild the snapshot",
+    ] {
+        assert!(message.contains(needle), "{needle:?} in {message}");
+    }
+    assert!(!message.contains("--skip-rows"), "{message}");
+    assert!(!message.contains("partial"), "{message}");
+
+    let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
+    assert!(
+        count_of(&value) < ROWS as i64,
+        "the rows committed into hour {HOUR} after the other seal are invisible: {value}"
     );
 }
 

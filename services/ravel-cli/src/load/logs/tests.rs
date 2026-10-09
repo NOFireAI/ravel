@@ -3767,3 +3767,55 @@ mod load_skip_rows {
         );
     }
 }
+
+/// `uncovered_hours` on the outcomes a `--fold-after-load` fold can have.
+/// `H` is the load's hour, and the margin alone seals `H - 3`.
+#[test]
+fn uncovered_hours_names_every_hour_the_fold_left_out() {
+    const H: u32 = 472_222;
+    let margin = Some(H - 3);
+
+    // The fold sealed the load's hour from an unsealed HEAD: covered.
+    assert_eq!(
+        uncovered_hours(&[H, H], false, Some(H - 3), Some(H), margin),
+        None
+    );
+    // No tokens: nothing to cover, whatever the fold reported.
+    assert_eq!(uncovered_hours(&[], true, Some(H), Some(H), margin), None);
+
+    // A no-op with tokens: another fold had sealed through H already.
+    let (hours, reason) =
+        uncovered_hours(&[H], true, Some(H), Some(H), margin).expect("a no-op is uncovered");
+    assert_eq!(hours, vec![H]);
+    assert!(reason.contains("no-op"), "{reason}");
+    // A no-op whose previous watermark is at or below the margin hour names
+    // the highest token hour anyway.
+    let (hours, _) = uncovered_hours(&[H - 4, H - 5], true, Some(H - 3), Some(H - 3), margin)
+        .expect("a no-op is never a success");
+    assert_eq!(hours, vec![H - 4]);
+
+    // The crossing case: another fold sealed H while the load wrote, the
+    // load went on into H + 1, and this fold sealed through H + 1. The fold
+    // is not a no-op and its watermark covers the highest token hour, yet H
+    // was sealed before this load's last commit into it.
+    let (hours, reason) = uncovered_hours(&[H, H, H + 1], false, Some(H), Some(H + 1), margin)
+        .expect("H was sealed by another fold mid-load");
+    assert_eq!(hours, vec![H]);
+    assert!(
+        reason.contains("while this load was still writing"),
+        "{reason}"
+    );
+
+    // An hour the margin alone had sealed by the fold's time counts as this
+    // fold's to cover, so a previous watermark there is not a finding.
+    assert_eq!(
+        uncovered_hours(&[H - 4, H], false, Some(H - 4), Some(H), margin),
+        None
+    );
+
+    // A watermark left below a token hour.
+    let (hours, reason) = uncovered_hours(&[H, H + 1], false, Some(H - 3), Some(H), margin)
+        .expect("H + 1 is above the watermark");
+    assert_eq!(hours, vec![H + 1]);
+    assert!(reason.contains("below hour"), "{reason}");
+}

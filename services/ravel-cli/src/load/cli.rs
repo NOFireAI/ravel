@@ -965,32 +965,23 @@ fn print_summary(report: &LoadReport) {
 /// The `--fold-after-load` lines of the summary (ADR-2677 decision 1). The
 /// fold's elapsed is part of the `elapsed` line above it, not added to it.
 pub(super) fn fold_summary(fold: &LoadFold) -> String {
+    if fold.seal_through_hour.is_none() {
+        return "  fold after load  : no fold: nothing was written\n".to_string();
+    }
     let hour = |h: Option<u32>| h.map_or_else(|| "none".to_string(), |h| h.to_string());
     let outcome = if fold.no_op {
-        "nothing left to seal"
+        "no-op, HEAD already sealed"
     } else {
         "sealed"
     };
-    let mut out = format!(
+    format!(
         "  fold after load  : {outcome}, seal_through_hour {}, watermark_hour {}, entries {}, \
          elapsed {:.3}s (included in elapsed)\n",
         hour(fold.seal_through_hour),
         hour(fold.watermark_hour),
         fold.entry_count,
         fold.elapsed.as_secs_f64(),
-    );
-    // A no-op after this load wrote means an earlier fold had already sealed
-    // every hour the load wrote into, so the objects it published after that
-    // seal are not in the snapshot.
-    if let (true, Some(seal_through_hour)) = (fold.no_op, fold.seal_through_hour) {
-        out.push_str(&format!(
-            "  fold warning     : HEAD was already sealed through hour {} before this fold, at \
-             or above hour {seal_through_hour} this load wrote into; objects published after \
-             that seal are invisible to queries without a commit token until HEAD is rebuilt\n",
-            hour(fold.watermark_hour),
-        ));
-    }
-    out
+    )
 }
 
 /// Print the per-shard flush trigger mix (issue #983) under the summary totals.
@@ -1078,6 +1069,20 @@ fn print_stage_timings(report: &LoadReport) {
 /// [`SEQUENTIAL_RESUMABLE_SETTINGS`]).
 fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
     let tokens = err.durable_tokens();
+    // A `--fold-after-load` failure happens after every row is durable: the
+    // load itself finished, so its summary is printed and nothing is partial.
+    if let Some(report) = err.finished_report() {
+        print_summary(report);
+        println!(
+            "{} commit token(s)/segment(s) are durable (the whole file loaded; only the fold \
+             after it failed):",
+            tokens.len()
+        );
+        for token in tokens {
+            println!("  {}", token.encode());
+        }
+        return;
+    }
     let is_flush = matches!(err, LoadError::Flush { .. });
     if tokens.is_empty() {
         if is_flush {

@@ -416,16 +416,18 @@ pub struct LoadFold {
     /// Wall time of the router shutdown and the fold, already counted in
     /// [`LoadReport::elapsed`].
     pub elapsed: Duration,
-    /// Entries across every part of the HEAD the fold left.
+    /// Entries across every part of the HEAD the fold wrote. `0` on a no-op,
+    /// which writes no HEAD, and when no fold ran.
     pub entry_count: u64,
-    /// HEAD's watermark hour after the fold.
+    /// HEAD's watermark hour after the fold. `None` when no fold ran.
     pub watermark_hour: Option<u32>,
     /// The seal-through hour asserted: the highest `ingest_hour_bucket` over
     /// the load's commit tokens. `None` when the load wrote nothing, so there
     /// was no hour to seal and no fold ran.
     pub seal_through_hour: Option<u32>,
-    /// `true` when HEAD already covered that hour, so there was nothing left
-    /// to seal. Still a successful load.
+    /// `true` when HEAD already covered that hour, so the fold sealed nothing.
+    /// A load holding commit tokens fails on it with
+    /// [`LoadError::FoldLeftHoursUncovered`]; `false` when no fold ran.
     pub no_op: bool,
 }
 
@@ -573,14 +575,60 @@ pub enum LoadError {
     },
     /// The `--fold-after-load` fold failed after every row was written. The
     /// load's objects are all durable; only the snapshot is missing them, so
-    /// the fix is a fold, not a resumed load.
+    /// the fix is a fold, not a resumed load. `report` is the finished load's
+    /// summary, printed ahead of this error.
     #[error(
-        "fold after load failed: {cause}. Every loaded object is already durable; seal them \
-         with `ravel-cli catalog fold --signal logs --writers-stopped` once the cause is fixed"
+        "fold after load failed: {cause}. Every loaded object is already durable, so do not \
+         load the file again; seal them with `{rerun}` once the cause is fixed"
     )]
     Fold {
         durable: Vec<CommitToken>,
         cause: String,
+        /// The `catalog fold` command line that seals the loaded hours.
+        rerun: String,
+        report: Box<LoadReport>,
+    },
+    /// The `--fold-after-load` preflight found the clock's current ingest
+    /// hour already sealed in the logs catalog HEAD, which only an earlier
+    /// operator-asserted seal does. Refused before any row was read or any
+    /// object was written.
+    #[error(
+        "--fold-after-load refused this load before any row was read or any object was written: \
+         the current ingest hour {hour} is already sealed for tenant {tenant:?}, signal logs \
+         (the catalog HEAD's watermark is hour {watermark_hour}). Rows written into a sealed \
+         hour are not visible to queries that carry no commit token until the catalog HEAD is \
+         rebuilt. Either wait until hour {first_open_hour} begins and run the load again, or \
+         rebuild the HEAD first (docs/guides/operations/troubleshooting.md, \"Rebuild the \
+         snapshot\")"
+    )]
+    HourAlreadySealed {
+        tenant: String,
+        hour: u32,
+        watermark_hour: u32,
+        /// `watermark_hour + 1`, the first hour the HEAD has not sealed.
+        first_open_hour: u64,
+    },
+    /// The `--fold-after-load` fold left hours this load wrote outside its
+    /// own seal: a no-op, an hour another fold had already sealed while the
+    /// load was writing, or an hour above the resulting watermark. Every
+    /// object is durable; the commits published into those hours after their
+    /// seal are not in the snapshot. `report` is the finished load's summary,
+    /// printed ahead of this error.
+    #[error(
+        "every object this load wrote is durable, but its fold did not cover ingest hour(s) \
+         {hours}: {reason}, so the commits this load published into them after that seal are \
+         not visible to queries that carry no commit token. Do not load the file again. Run \
+         `{verify}` to list the commits missing from the snapshot, then rebuild the catalog HEAD \
+         (docs/guides/operations/troubleshooting.md, \"Rebuild the snapshot\")"
+    )]
+    FoldLeftHoursUncovered {
+        durable: Vec<CommitToken>,
+        /// The uncovered hours, comma-separated.
+        hours: String,
+        reason: String,
+        /// The `catalog verify` command line for this tenant and signal.
+        verify: String,
+        report: Box<LoadReport>,
     },
 }
 
@@ -590,22 +638,27 @@ impl LoadError {
     /// flushed).
     pub fn durable_tokens(&self) -> &[CommitToken] {
         match self {
-            LoadError::Setup(_) => &[],
+            LoadError::Setup(_) | LoadError::HourAlreadySealed { .. } => &[],
             LoadError::BatchFailed { durable, .. }
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. }
-            | LoadError::Fold { durable, .. } => durable,
+            | LoadError::Fold { durable, .. }
+            | LoadError::FoldLeftHoursUncovered { durable, .. } => durable,
         }
     }
 
     /// The rows skipped and the rows acked durable when this error occurred.
     /// `None` for [`LoadError::Setup`], which occurs before the load applies an
     /// offset or writes anything, so it has no figures to resume from, and for
-    /// [`LoadError::Fold`], which occurs once every row is durable, so there is
-    /// nothing left to resume.
+    /// [`LoadError::HourAlreadySealed`], which occurs before anything either,
+    /// and for [`LoadError::Fold`] and [`LoadError::FoldLeftHoursUncovered`],
+    /// which occur once every row is durable, so there is nothing to resume.
     pub fn resume_figures(&self) -> Option<ResumeFigures> {
         match self {
-            LoadError::Setup(_) | LoadError::Fold { .. } => None,
+            LoadError::Setup(_)
+            | LoadError::HourAlreadySealed { .. }
+            | LoadError::Fold { .. }
+            | LoadError::FoldLeftHoursUncovered { .. } => None,
             LoadError::BatchFailed { resume, .. }
             | LoadError::RowRejected { resume, .. }
             | LoadError::Flush { resume, .. } => Some(*resume),
@@ -618,11 +671,27 @@ impl LoadError {
     /// a batch could have flushed.
     fn durable_tokens_mut(&mut self) -> Option<&mut Vec<CommitToken>> {
         match self {
-            LoadError::Setup(_) => None,
+            LoadError::Setup(_) | LoadError::HourAlreadySealed { .. } => None,
             LoadError::BatchFailed { durable, .. }
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. }
-            | LoadError::Fold { durable, .. } => Some(durable),
+            | LoadError::Fold { durable, .. }
+            | LoadError::FoldLeftHoursUncovered { durable, .. } => Some(durable),
+        }
+    }
+
+    /// The finished load's report, for the two `--fold-after-load` errors
+    /// that occur once every row is durable. `None` for every other variant.
+    pub fn finished_report(&self) -> Option<&LoadReport> {
+        match self {
+            LoadError::Fold { report, .. } | LoadError::FoldLeftHoursUncovered { report, .. } => {
+                Some(report)
+            }
+            LoadError::Setup(_)
+            | LoadError::HourAlreadySealed { .. }
+            | LoadError::BatchFailed { .. }
+            | LoadError::RowRejected { .. }
+            | LoadError::Flush { .. } => None,
         }
     }
 }
