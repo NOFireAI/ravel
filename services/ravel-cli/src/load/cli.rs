@@ -352,7 +352,7 @@ pub(crate) async fn run_fold_warning_to(
     if let (true, Some(name)) = (fold_after_load, refused) {
         anyhow::bail!(
             "--fold-after-load supports only --signal logs; this {name} load was refused before \
-             anything was written. Load without it, then seal the loaded hours with \
+             any row was read or written. Load without it, then seal the loaded hours with \
              `ravel-cli catalog fold --signal {name} --writers-stopped` once the load has exited"
         );
     }
@@ -971,14 +971,26 @@ pub(super) fn fold_summary(fold: &LoadFold) -> String {
     } else {
         "sealed"
     };
-    format!(
+    let mut out = format!(
         "  fold after load  : {outcome}, seal_through_hour {}, watermark_hour {}, entries {}, \
          elapsed {:.3}s (included in elapsed)\n",
         hour(fold.seal_through_hour),
         hour(fold.watermark_hour),
         fold.entry_count,
         fold.elapsed.as_secs_f64(),
-    )
+    );
+    // A no-op after this load wrote means an earlier fold had already sealed
+    // every hour the load wrote into, so the objects it published after that
+    // seal are not in the snapshot.
+    if let (true, Some(seal_through_hour)) = (fold.no_op, fold.seal_through_hour) {
+        out.push_str(&format!(
+            "  fold warning     : HEAD was already sealed through hour {} before this fold, at \
+             or above hour {seal_through_hour} this load wrote into; objects published after \
+             that seal are invisible to queries without a commit token until HEAD is rebuilt\n",
+            hour(fold.watermark_hour),
+        ));
+    }
+    out
 }
 
 /// Print the per-shard flush trigger mix (issue #983) under the summary totals.

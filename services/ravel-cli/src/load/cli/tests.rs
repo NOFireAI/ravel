@@ -390,3 +390,55 @@ async fn a_failed_load_still_prints_the_one_batch_warning() {
         "naming the budget's source: {emitted}"
     );
 }
+
+/// The `--fold-after-load` summary lines for the three outcomes: a seal, a
+/// load that wrote nothing (no hour to seal, no warning), and a no-op after
+/// the load wrote, which warns that an earlier fold had already sealed the
+/// load's hour.
+#[test]
+fn fold_summary_names_the_outcome_and_warns_on_a_no_op_after_writes() {
+    let sealed = fold_summary(&LoadFold {
+        elapsed: Duration::from_millis(1_250),
+        entry_count: 7,
+        watermark_hour: Some(472_222),
+        seal_through_hour: Some(472_222),
+        no_op: false,
+    });
+    assert_eq!(
+        sealed,
+        "  fold after load  : sealed, seal_through_hour 472222, watermark_hour 472222, \
+         entries 7, elapsed 1.250s (included in elapsed)\n"
+    );
+
+    let empty = fold_summary(&LoadFold {
+        no_op: true,
+        ..LoadFold::default()
+    });
+    assert_eq!(
+        empty,
+        "  fold after load  : nothing left to seal, seal_through_hour none, watermark_hour \
+         none, entries 0, elapsed 0.000s (included in elapsed)\n"
+    );
+
+    let resealed = fold_summary(&LoadFold {
+        elapsed: Duration::ZERO,
+        entry_count: 0,
+        watermark_hour: Some(472_222),
+        seal_through_hour: Some(472_222),
+        no_op: true,
+    });
+    assert!(
+        resealed.starts_with("  fold after load  : nothing left to seal, "),
+        "{resealed}"
+    );
+    assert!(
+        resealed.contains(
+            "  fold warning     : HEAD was already sealed through hour 472222 before this fold"
+        ),
+        "{resealed}"
+    );
+    assert!(
+        resealed.contains("invisible to queries without a commit token until HEAD is rebuilt"),
+        "{resealed}"
+    );
+}

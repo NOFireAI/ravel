@@ -159,6 +159,16 @@ impl ObjectStoreBackend for RecordingStore {
     }
 }
 
+const MAPPING: &str = "ts_column = \"ts\"\n\
+                       ts_unit = \"nanos\"\n\
+                       body_column = \"body\"\n\
+                       \n\
+                       [[resource_attribute]]\n\
+                       key = \"service.name\"\n\
+                       column = \"svc\"\n\
+                       type = \"str\"\n";
+
+/// The fixture Parquet file, with `mapping.toml` written beside it.
 fn write_fixture() -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
     let dir = tempfile::tempdir().expect("tempdir");
     let parquet_path = dir.path().join("logs.parquet");
@@ -190,17 +200,8 @@ fn write_fixture() -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
     writer.write(&batch).expect("write batch");
     writer.close().expect("close writer");
 
-    let mapping = load::parse_mapping(
-        "ts_column = \"ts\"\n\
-         ts_unit = \"nanos\"\n\
-         body_column = \"body\"\n\
-         \n\
-         [[resource_attribute]]\n\
-         key = \"service.name\"\n\
-         column = \"svc\"\n\
-         type = \"str\"\n",
-    )
-    .expect("valid mapping");
+    std::fs::write(dir.path().join("mapping.toml"), MAPPING).expect("write mapping");
+    let mapping = load::parse_mapping(MAPPING).expect("valid mapping");
     (dir, parquet_path, mapping)
 }
 
@@ -441,5 +442,115 @@ async fn load_with_fold_after_load_resolves_from_the_snapshot_through_sql() {
         sealed_hour_keys(&store),
         Vec::<String>::new(),
         "no commit record of the sealed hour {HOUR} is listed"
+    );
+}
+
+/// A second `--fold-after-load` into an hour the first one sealed breaks the
+/// first load's assertion: its fold has nothing left to seal, it reports a
+/// no-op at the first fold's watermark, and its objects stay out of the
+/// snapshot, so the query still counts only the first load's rows. This pins
+/// the hazard the flag's help and the summary's warning describe.
+#[tokio::test]
+async fn a_second_load_into_a_sealed_hour_folds_nothing_and_stays_invisible() {
+    let (_dir, parquet_path, mapping) = write_fixture();
+    let store = RecordingStore::new(Arc::new(MemoryStore::new()));
+    let first = run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+    )
+    .await;
+    assert!(!first.fold.expect("first fold").no_op);
+
+    let second = run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+    )
+    .await;
+    assert!(
+        second.objects_written() > 0,
+        "the second load wrote objects"
+    );
+    let fold = second.fold.expect("second fold");
+    assert!(fold.no_op, "{fold:?}");
+    assert_eq!(fold.watermark_hour, Some(HOUR), "{fold:?}");
+    assert_eq!(fold.seal_through_hour, Some(HOUR), "{fold:?}");
+    assert_eq!(fold.entry_count, 0, "{fold:?}");
+
+    let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
+    assert_eq!(
+        count_of(&value),
+        ROWS as i64,
+        "only the first load's rows are in the snapshot: {value}"
+    );
+}
+
+/// The value after `label` up to the next `,` or ` `, parsed.
+fn field<T: std::str::FromStr>(line: &str, label: &str) -> T {
+    let rest = line
+        .split_once(label)
+        .unwrap_or_else(|| panic!("no {label:?} in {line:?}"))
+        .1;
+    let end = rest.find([',', ' ']).unwrap_or(rest.len());
+    rest[..end]
+        .trim_end_matches('s')
+        .parse()
+        .unwrap_or_else(|_| panic!("{label:?} in {line:?} does not parse"))
+}
+
+/// The real binary's summary carries the fold's figures on its own line, and
+/// the summary's `elapsed` is at least the fold's. The binary's clock is the
+/// system clock, so the hour is read back from the line rather than pinned:
+/// seal-through and watermark must agree, and every object is an entry.
+#[test]
+fn the_load_summary_prints_the_fold_figures() {
+    let (dir, parquet_path, _mapping) = write_fixture();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"));
+    for (key, _) in std::env::vars() {
+        if key.starts_with("RAVEL_") {
+            cmd.env_remove(key);
+        }
+    }
+    let output = cmd
+        .args(["--store", "memory", "--tenant-hash-unkeyed", "load"])
+        .arg("--parquet")
+        .arg(&parquet_path)
+        .arg("--mapping")
+        .arg(dir.path().join("mapping.toml"))
+        .args(["--tenant", TENANT, "--shards", "2", "--batch-rows", "10"])
+        .arg("--fold-after-load")
+        .output()
+        .expect("ravel-cli runs");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(output.status.success(), "load fails:\n{stdout}\n{stderr}");
+
+    let line = |prefix: &str| -> String {
+        let found: Vec<&str> = stdout.lines().filter(|l| l.starts_with(prefix)).collect();
+        assert_eq!(found.len(), 1, "one {prefix:?} line in:\n{stdout}");
+        found[0].to_string()
+    };
+    let fold = line("  fold after load  : ");
+    let objects: u64 = field(&line("  objects written  : "), ": ");
+    let elapsed: f64 = field(&line("  elapsed          : "), ": ");
+    assert!(
+        fold.starts_with("  fold after load  : sealed, "),
+        "the fold sealed something: {fold}"
+    );
+    let seal_through: u32 = field(&fold, "seal_through_hour ");
+    let watermark: u32 = field(&fold, "watermark_hour ");
+    assert_eq!(seal_through, watermark, "{fold}");
+    assert_eq!(field::<u64>(&fold, "entries "), objects, "{fold}");
+    let fold_elapsed: f64 = field(&fold, "elapsed ");
+    assert!(
+        fold.ends_with("(included in elapsed)"),
+        "the line says where its time is counted: {fold}"
+    );
+    assert!(
+        elapsed >= fold_elapsed,
+        "summary elapsed {elapsed} includes the fold's {fold_elapsed}"
     );
 }
