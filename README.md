@@ -71,9 +71,11 @@ latency on the write path.
   them.
 - Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
   and OTAP decode exemplars and then discard them.
-- Distributed read fan-out is off unless `--distributed-query` and
-  `--fragment-key-file` are both given. The PromQL lane and the SQL lane (on
-  the Flight SQL service) are both in the published image.
+- Distributed read fan-out is off unless `--distributed-query` is given, and
+  that flag requires `--fragment-key-file`, the dedicated fragment listener
+  (`--fragment-listener` with its TLS files) and `--sql-ticket-key-file`. The
+  PromQL lane and the SQL lane (on the Flight SQL service) are both in the
+  published image.
 
 **Who should wait.** Wait if one of these describes you:
 

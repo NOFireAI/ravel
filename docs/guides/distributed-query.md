@@ -5,7 +5,9 @@ from more than one cluster. Both are off by default and both need explicit
 configuration:
 
 - Intra-cluster fan-out needs `--distributed-query` together with
-  `--fragment-key-file`.
+  `--fragment-key-file`, the dedicated fragment listener
+  (`--fragment-listener` and its TLS files) and, in a build that serves
+  Flight SQL, `--sql-ticket-key-file`.
 - Federation needs at least one `--remote-cluster`.
 
 Two scope limits apply. On the fan-out lane of the engine, only the metrics
@@ -513,6 +515,11 @@ ravel-server --mode query \
   --listen-grpc 10.0.0.11:4317 \
   --distributed-query \
   --fragment-key-file /etc/ravel/fragment.keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket.keys \
+  --fragment-listener 10.0.0.11:4319 \
+  --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
+  --fragment-tls-key /etc/ravel/fragment-tls/tls.key \
+  --fragment-tls-ca /etc/ravel/fragment-ca/ca.crt \
   --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls-ca-file=/etc/ravel/eu-ca.pem,skip-unavailable=true \
   --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,soft-timeout=15s \
   --remote-cluster-soft-timeout 10s

@@ -2436,12 +2436,15 @@ takes the client path and is refused there.
 
 Label: `mode`. The counter renders on every process that built the Flight SQL
 service, from zero. It is coordinator side: one increment per SQL slice
-`DoGet` this process dials to a worker, over TLS to the worker's dedicated
-fragment listener. A PromQL fan-out does not move it.
+`DoGet` this process dials to a worker with its client TLS configuration
+attached. The server builds every slice location as `https://`, so each
+count is a TLS dial to the worker's dedicated fragment listener; the counter
+records that the configuration was attached, not the handshake itself. A
+PromQL fan-out does not move it.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_sql_slice_tls_dials_total` | Outbound SQL slice `DoGet` fetches this coordinator dialed over TLS. A distributed SQL statement adds one per slice fetch it sends to a worker, a re-dispatch included; a statement that runs whole-set on the coordinator, and a slice read coordinator-local, add none. |
+| `ravel_sql_slice_tls_dials_total` | Outbound SQL slice `DoGet` fetches this coordinator dialed with its client TLS configuration. A distributed SQL statement adds one per slice fetch it sends to a worker, a re-dispatch included; a statement that runs whole-set on the coordinator, and a slice read coordinator-local, add none. |
 
 ### CPU gates and runtime
 

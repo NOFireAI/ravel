@@ -438,6 +438,25 @@ pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
     ) -> DFResult<SendableRecordBatchStream>;
 }
 
+/// Slice `DoGet` channels this coordinator dialed with its client TLS
+/// configuration (ADR-1689 decision 1), one per slice fetch; the server builds
+/// every slice location as `https://`, so each is a TLS dial. Cheap to clone;
+/// clones share one count, so a server reads the count its Flight service
+/// records into.
+#[derive(Debug, Clone, Default)]
+pub struct SliceTlsDialCounter(Arc<AtomicU64>);
+
+impl SliceTlsDialCounter {
+    /// The slice fetches dialed with the client TLS configuration so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn record(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The production [`WorkerSliceClient`]: dials a worker's Arrow Flight location
 /// over tonic and redeems a slice ticket through its `DoGet`, decoding the
 /// internal-schema record batches the worker's scan-only fragment path streams
@@ -459,23 +478,6 @@ pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
 ///
 /// [`SqlTicketKeys::mint_key`]: crate::flight_ticket::SqlTicketKeys::mint_key
 /// [`TicketSurface::Slice`]: crate::flight_ticket::TicketSurface::Slice
-/// Slice `DoGet` channels a coordinator built over TLS (ADR-1689 decision 1),
-/// one per slice fetch. Cheap to clone; clones share one count, so a server
-/// reads the count its Flight service records into.
-#[derive(Debug, Clone, Default)]
-pub struct SliceTlsDialCounter(Arc<AtomicU64>);
-
-impl SliceTlsDialCounter {
-    /// The slice fetches dialed over TLS so far.
-    pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    fn record(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 #[derive(Clone)]
 pub struct FlightWorkerSliceClient {
     /// The coordinator's slice mint key, used to sign each slice ticket the
