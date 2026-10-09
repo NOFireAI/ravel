@@ -128,12 +128,6 @@ fn manifest_lines(manifest: &Manifest) -> Vec<String> {
     out
 }
 
-fn print_manifest(manifest: &Manifest) {
-    for line in manifest_lines(manifest) {
-        println!("{line}");
-    }
-}
-
 /// `parquet ls`: every table's newest manifest version at or below the
 /// manifest version bound, or every retained version of one named table.
 pub async fn ls(
@@ -141,14 +135,63 @@ pub async fn ls(
     tenant: &str,
     table: Option<&str>,
 ) -> anyhow::Result<()> {
+    let mut lines = Vec::new();
+    let result = collect_ls(store.as_ref(), tenant, table, &mut lines).await;
+    print_lines(&lines, &mut std::io::stdout())?;
+    result
+}
+
+/// [`collect_ls`]'s lines, or its error.
+#[cfg(test)]
+async fn ls_lines(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    table: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    collect_ls(store, tenant, table, &mut lines).await?;
+    Ok(lines)
+}
+
+/// Push to `out` what [`ls`] prints. A key the store lists but cannot
+/// address was put by a writer outside Ravel, so it is printed quoted and
+/// escaped, as [`repair`] prints it.
+async fn collect_ls(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    table: Option<&str>,
+    out: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let hash = TenantId::new(tenant).hash();
-    let listing = resolve::tenant_listing(store.as_ref(), &hash).await?;
+    let listing = resolve::tenant_listing(store, &hash).await?;
     let stray = listing.invalid_table_keys.len();
     if stray > 0 {
-        println!(
+        out.push(format!(
             "{stray} manifest-shaped key(s) under no valid table name, skipped by every \
              reader: run `ravel-cli parquet repair --tenant {tenant} --stray`"
-        );
+        ));
+    }
+    let unaddressable = &listing.unaddressable;
+    if unaddressable.count > 0 {
+        out.push(format!(
+            "{} key(s) the store's path encoding cannot address, skipped by every reader and \
+             undeletable by Ravel: delete each exact key with the Maintain credential through \
+             an S3 tool",
+            unaddressable.count
+        ));
+        for skipped in &unaddressable.sample {
+            out.push(format!("  key: {:?}", skipped.key));
+            out.push(format!(
+                "    a request for this key reaches {:?}",
+                skipped.addresses
+            ));
+        }
+        let unnamed = unaddressable
+            .count
+            .saturating_sub(unaddressable.sample.len() as u64);
+        if unnamed > 0 {
+            out.push(format!("  ({unnamed} more not named here)"));
+        }
     }
     let all = listing.tables;
     let selected: Vec<(&String, &resolve::TableListing)> = match table {
@@ -156,10 +199,10 @@ pub async fn ls(
         None => all.iter().collect(),
     };
     if selected.is_empty() {
-        match table {
-            Some(name) => println!("tenant {tenant} has no Parquet table named {name}"),
-            None => println!("tenant {tenant} has no Parquet tables"),
-        }
+        out.push(match table {
+            Some(name) => format!("tenant {tenant} has no Parquet table named {name}"),
+            None => format!("tenant {tenant} has no Parquet tables"),
+        });
         return Ok(());
     }
     for (name, listing) in selected {
@@ -174,20 +217,25 @@ pub async fn ls(
         } else {
             bounded.last().map(std::slice::from_ref).unwrap_or(&[])
         };
-        println!("table: {name} ({} retained versions)", bounded.len());
+        out.push(format!(
+            "table: {name} ({} retained versions)",
+            bounded.len()
+        ));
         let skipped = above.len() + listing.invalid_keys.len();
         if skipped > 0 {
-            println!(
+            out.push(format!(
                 "  {skipped} version key(s) above the version bound {MAX_MANIFEST_VERSION} or \
                  naming no version, skipped by every reader: run \
                  `ravel-cli parquet repair --tenant {tenant} --table {name}`"
-            );
+            ));
         }
         for &version in wanted {
-            match resolve::read_version(store.as_ref(), &hash, name, version).await? {
-                Some(manifest) => print_manifest(&manifest),
+            match resolve::read_version(store, &hash, name, version).await? {
+                Some(manifest) => out.extend(manifest_lines(&manifest)),
                 // Listed and then deleted: a concurrent sweep, not a defect.
-                None => println!("  version: {version} (deleted since it was listed)"),
+                None => out.push(format!(
+                    "  version: {version} (deleted since it was listed)"
+                )),
             }
         }
     }
@@ -1085,13 +1133,12 @@ mod tests {
         assert_eq!(deletes(denied.inner()), 2);
     }
 
-    /// Handles keys the way the S3 adapter's `object_store` client does, and
-    /// records the key every `delete` is sent to. A list page holding a key
-    /// `Path::parse` refuses (a control character, an empty segment, a `.` or
-    /// `..` segment; no key here starts or ends with `/`) fails, whether the
-    /// page reports it as an object or unaddressable, and a delete
-    /// goes to [`store_path`] of its key. With `lose_deletes` set, a delete
-    /// reports success and removes nothing.
+    /// Handles keys the way the S3 adapter does under ADR-2637, and records
+    /// the key of every `delete` call. A request for a key its path encoding
+    /// would rewrite fails with `UnaddressableKey` naming the key it would
+    /// reach, and never reaches `inner`; a list page reports such a key in
+    /// `unaddressable`, never as an object. With `lose_deletes` set, a delete
+    /// of an addressable key reports success and removes nothing.
     struct S3Keys<S> {
         inner: S,
         deletes: std::sync::Mutex<Vec<String>>,
@@ -1112,10 +1159,39 @@ mod tests {
         }
     }
 
-    fn s3_lists(key: &str) -> bool {
-        key.split('/').all(|segment| {
-            !matches!(segment, "" | "." | "..") && !segment.chars().any(|c| c.is_ascii_control())
-        })
+    /// `key`, or the S3 adapter's refusal of a key its path encoding rewrites.
+    fn addressable(key: &str) -> Result<&str, ravel_object_store::StoreError> {
+        if ravel_object_store::is_addressable_key(key) {
+            Ok(key)
+        } else {
+            Err(ravel_object_store::StoreError::UnaddressableKey {
+                key: key.to_string(),
+                addresses: store_path(key),
+            })
+        }
+    }
+
+    /// Move every object of `objects` the S3 adapter cannot address into
+    /// `unaddressable`, in key order.
+    fn classify(
+        objects: &mut Vec<ravel_object_store::ObjectMeta>,
+        unaddressable: &mut Vec<ravel_object_store::UnaddressableKey>,
+    ) {
+        let (kept, moved): (Vec<_>, Vec<_>) = std::mem::take(objects)
+            .into_iter()
+            .partition(|meta| ravel_object_store::is_addressable_key(&meta.key));
+        *objects = kept;
+        unaddressable.extend(
+            moved
+                .into_iter()
+                .map(|meta| ravel_object_store::UnaddressableKey {
+                    addresses: store_path(&meta.key),
+                    key: meta.key,
+                    size: meta.size,
+                    last_modified_unix_ms: meta.last_modified_unix_ms,
+                }),
+        );
+        unaddressable.sort_by(|a, b| a.key.cmp(&b.key));
     }
 
     #[async_trait::async_trait]
@@ -1126,7 +1202,7 @@ mod tests {
             data: Bytes,
             opts: PutOptions,
         ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
-            self.inner.put(key, data, opts).await
+            self.inner.put(addressable(key)?, data, opts).await
         }
 
         async fn get(
@@ -1134,7 +1210,7 @@ mod tests {
             key: &str,
             range: ravel_object_store::GetRange,
         ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
-            self.inner.get(key, range).await
+            self.inner.get(addressable(key)?, range).await
         }
 
         async fn put_multipart<'a>(
@@ -1142,14 +1218,14 @@ mod tests {
             key: &str,
         ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
         {
-            self.inner.put_multipart(key).await
+            self.inner.put_multipart(addressable(key)?).await
         }
 
         async fn head(
             &self,
             key: &str,
         ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
-            self.inner.head(key).await
+            self.inner.head(addressable(key)?).await
         }
 
         async fn list(
@@ -1157,18 +1233,8 @@ mod tests {
             prefix: &str,
             page: Option<ravel_object_store::PageToken>,
         ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
-            let page = self.inner.list(prefix, page).await?;
-            if let Some(key) = page
-                .objects
-                .iter()
-                .map(|meta| &meta.key)
-                .chain(page.unaddressable.iter().map(|skipped| &skipped.key))
-                .find(|key| !s3_lists(key))
-            {
-                return Err(ravel_object_store::StoreError::Permanent(format!(
-                    "invalid path: {key:?}"
-                )));
-            }
+            let mut page = self.inner.list(prefix, page).await?;
+            classify(&mut page.objects, &mut page.unaddressable);
             Ok(page)
         }
 
@@ -1176,16 +1242,25 @@ mod tests {
             &self,
             prefix: &str,
         ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
-            self.inner.list_delimited(prefix).await
+            let mut listed = self.inner.list_delimited(prefix).await?;
+            classify(&mut listed.objects, &mut listed.unaddressable);
+            let (kept, moved): (Vec<String>, Vec<String>) =
+                std::mem::take(&mut listed.common_prefixes)
+                    .into_iter()
+                    .partition(|p| ravel_object_store::is_addressable_prefix(p));
+            listed.common_prefixes = kept;
+            listed.unaddressable_prefixes.extend(moved);
+            listed.unaddressable_prefixes.sort();
+            Ok(listed)
         }
 
         async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
-            let path = store_path(key);
-            self.deletes.lock().expect("lock").push(path.clone());
+            self.deletes.lock().expect("lock").push(key.to_string());
+            let key = addressable(key)?;
             if self.lose_deletes {
                 return Ok(());
             }
-            self.inner.delete(&path).await
+            self.inner.delete(key).await
         }
 
         fn capabilities(&self) -> ravel_object_store::Capabilities {
@@ -1643,18 +1718,147 @@ mod tests {
         assert_eq!(store.deletes().len(), 3);
     }
 
-    /// On S3 a stray key holding a control character fails the listing, so
-    /// the command fails with the store error and deletes nothing.
+    /// A stray key holding a control character is listed unaddressable, so
+    /// `--stray --delete` names it undeletable by Ravel, deletes the other
+    /// stray key, and sends it no delete.
     #[tokio::test]
-    async fn repair_stray_fails_on_a_key_the_s3_adapter_cannot_list() {
+    async fn repair_stray_names_a_key_with_a_control_character_and_leaves_it() {
         let control = "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm";
         let store = stray_table(&[STRAYS[0], control]).await;
-        let err = match repair_stray_lines(&store, "acme", true, false).await {
-            Ok(report) => panic!("listed: {:?}", report.lines),
-            Err(err) => err,
-        };
-        assert!(format!("{err:#}").contains("invalid path"), "{err:#}");
-        assert!(store.deletes().is_empty());
+        let report = repair_stray_lines(&store, "acme", true, false)
+            .await
+            .expect("repair");
+        let printed = report.lines.join("\n");
+        assert!(
+            printed.contains(&format!("  key: {:?}", acme_key(control))),
+            "{printed}"
+        );
+        assert!(!printed.contains('\u{1b}'), "{printed}");
+        assert_eq!(
+            printed.matches("undeletable by Ravel").count(),
+            2,
+            "{printed}"
+        );
+        assert_eq!(store.deletes(), vec![acme_key(STRAYS[0])]);
+        assert_eq!(
+            unaddressable_under(store.inner.inner(), &acme_prefix()).await,
+            vec![acme_key(control)]
+        );
+    }
+
+    /// ADR-2637 Task 2's acceptance tenant: `acme`'s valid table `hits`
+    /// beside three keys a writer outside Ravel put, none of which the store
+    /// can address.
+    const ACCEPTANCE_UNADDRESSABLE: [&str; 3] = [
+        "Hits/v/0000000000000000001\u{1}.pqm",
+        "Hits/v/0000000000000000001*.pqm",
+        "hits//v/00000000000000000001.pqm",
+    ];
+
+    /// `parquet ls` on the acceptance tenant still resolves `hits`, and
+    /// reports the three unaddressable keys with each key named escaped
+    /// beside the key a request for it reaches.
+    #[tokio::test]
+    async fn ls_reports_and_names_every_unaddressable_key() {
+        let store = stray_table(&ACCEPTANCE_UNADDRESSABLE).await;
+        let lines = ls_lines(&store, "acme", None).await.expect("ls");
+        let printed = lines.join("\n");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("cannot address"))
+                .collect::<Vec<_>>(),
+            [
+                "3 key(s) the store's path encoding cannot address, skipped by every reader \
+                 and undeletable by Ravel: delete each exact key with the Maintain credential \
+                 through an S3 tool"
+            ],
+            "{printed}"
+        );
+        for key in sorted(&ACCEPTANCE_UNADDRESSABLE) {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| **l == format!("  key: {key:?}"))
+                    .count(),
+                1,
+                "{key:?}: {printed}"
+            );
+            assert!(
+                printed.contains(&format!(
+                    "  key: {key:?}\n    a request for this key reaches {:?}",
+                    store_path(&key)
+                )),
+                "{key:?}: {printed}"
+            );
+        }
+        assert!(!printed.contains('\u{1}'), "{printed}");
+        assert!(
+            printed.contains("table: hits (2 retained versions)"),
+            "{printed}"
+        );
+        assert!(!printed.contains("more not named here"), "{printed}");
+    }
+
+    /// Past the drain's sample, `parquet ls` still reports the full count and
+    /// says how many keys it does not name.
+    #[tokio::test]
+    async fn ls_reports_unaddressable_keys_beyond_the_sample() {
+        let rests: Vec<String> = (0..ravel_object_store::UNADDRESSABLE_SAMPLE_MAX + 2)
+            .map(|i| format!("Hits/v/{i:019}*.pqm"))
+            .collect();
+        let store = stray_table(&rests.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        let lines = ls_lines(&store, "acme", None).await.expect("ls");
+        let printed = lines.join("\n");
+        assert!(
+            printed.starts_with(&format!(
+                "{} key(s) the store's path encoding cannot address",
+                ravel_object_store::UNADDRESSABLE_SAMPLE_MAX + 2
+            )),
+            "{printed}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("  key: ")).count(),
+            ravel_object_store::UNADDRESSABLE_SAMPLE_MAX,
+            "{printed}"
+        );
+        assert!(
+            printed.contains("\n  (2 more not named here)\n"),
+            "{printed}"
+        );
+    }
+
+    /// `parquet repair --stray --delete` on the acceptance tenant names all
+    /// three unaddressable keys undeletable by Ravel, sends none of them a
+    /// delete, and the store still holds all three afterwards.
+    #[tokio::test]
+    async fn repair_stray_delete_names_every_unaddressable_key_and_keeps_it() {
+        let store = stray_table(&ACCEPTANCE_UNADDRESSABLE).await;
+        let report = repair_stray_lines(&store, "acme", true, false)
+            .await
+            .expect("repair");
+        let printed = report.lines.join("\n");
+        assert_eq!(
+            report.lines.first().map(String::as_str),
+            Some("tenant: acme (3 key(s) under no valid table name)"),
+            "{printed}"
+        );
+        for key in sorted(&ACCEPTANCE_UNADDRESSABLE) {
+            assert!(
+                printed.contains(&format!(
+                    "  key: {key:?}\n    stored_unix_ms: 5000 (the store's clock)\n    \
+                     undeletable by Ravel: the store's path encoding sends a delete of this \
+                     key to {:?}",
+                    store_path(&key)
+                )),
+                "{key:?}: {printed}"
+            );
+        }
+        assert!(store.deletes().is_empty(), "{:?}", store.deletes());
+        assert_eq!(
+            unaddressable_under(store.inner.inner(), &acme_prefix()).await,
+            sorted(&ACCEPTANCE_UNADDRESSABLE)
+        );
     }
 
     /// A bucket no server has bootstrapped has no deployment minimum, so the
