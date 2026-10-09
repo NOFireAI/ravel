@@ -96,6 +96,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Refuse a bad tenant-hash mode before anything starts: the start sites read
+# ravel_server_cmd through a process substitution, which drops its status.
+chaos_tenant_hash_args || exit 64
+
 if [[ "$MODE" == "check" ]]; then
   echo "== kill-maintain-worker.sh --check (scenario 2: kill maintain worker mid-compaction) =="
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
