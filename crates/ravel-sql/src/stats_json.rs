@@ -80,12 +80,16 @@ fn ms(ns: u64) -> f64 {
 /// which runs outside the executor.
 ///
 /// Only the scan figures that hold across partitions are rendered: the
-/// per-partition extremes and the once-per-query barrier cost, never a sum
-/// over partitions (their intervals overlap) and never the per-segment rows.
+/// per-partition extremes and the barrier cost, never a sum over partitions
+/// (their intervals overlap) and never the per-segment rows. `scans` is the
+/// number of logs scans in the plan. `planInitMs`, `firstBatchMinMs` and
+/// `streamMaxMs` are rendered only when it is 1: each scan times from its own
+/// creation and pays its own barrier, so with two scans the offsets mix
+/// origins and the barrier is a sum, and with none there is nothing to time.
 pub fn timings_json(stats: &SqlStats, audit: Duration) -> Json {
     let wall = &stats.wall;
     let scan = &stats.scan_timing;
-    json!({
+    let mut rendered = json!({
         "attempts": stats.attempts,
         "resolveMs": ms(wall.resolve_ns),
         "planMs": ms(wall.plan_ns),
@@ -93,13 +97,22 @@ pub fn timings_json(stats: &SqlStats, audit: Duration) -> Json {
         "firstBatchMs": ms(wall.first_batch_ns),
         "drainMs": ms(wall.drain_ns),
         "auditMs": audit.as_secs_f64() * 1_000.0,
-        "planInitMs": ms(scan.plan_init_elapsed_ns),
+        "scans": scan.scans,
         "planningWaitMaxMs": ms(scan.planning_wait_elapsed_max_ns),
         "openMaxMs": ms(scan.open_elapsed_max_ns),
         "decodeBuildMaxMs": ms(scan.decode_build_elapsed_max_ns),
-        "firstBatchMinMs": ms(scan.first_batch_elapsed_min_ns),
-        "streamMaxMs": ms(scan.stream_elapsed_max_ns),
-    })
+    });
+    if scan.scans == 1
+        && let Some(fields) = rendered.as_object_mut()
+    {
+        fields.insert("planInitMs".into(), ms(scan.plan_init_elapsed_ns).into());
+        fields.insert(
+            "firstBatchMinMs".into(),
+            ms(scan.first_batch_elapsed_min_ns).into(),
+        );
+        fields.insert("streamMaxMs".into(), ms(scan.stream_elapsed_max_ns).into());
+    }
+    rendered
 }
 
 /// The successful attempt's object- and block-level pruning counts, rendered
@@ -281,17 +294,22 @@ mod tests {
         scan.decode_build_elapsed_max_ns = 9_000_000;
         scan.first_batch_elapsed_min_ns = 10_000_000;
         scan.stream_elapsed_max_ns = 11_000_000;
+        scan.scans = 1;
         stats
     }
 
-    /// `timings_json`'s key set is exactly the thirteen fields below, and
-    /// each reads its own source: the scan figures are the per-partition
-    /// maxima and minimum, never the overlapping sums the fixture sets far
-    /// larger. Exact set equality, so a stray key fails like a missing one.
+    /// The three fields that have one origin only under a single logs scan.
+    const SINGLE_SCAN_KEYS: [&str; 3] = ["planInitMs", "firstBatchMinMs", "streamMaxMs"];
+
+    /// `timings_json`'s key set is exactly the fields below for each scan
+    /// count, and each reads its own source: the scan figures are the
+    /// per-partition maxima and minimum, never the overlapping sums the
+    /// fixture sets far larger. `planInitMs`, `firstBatchMinMs` and
+    /// `streamMaxMs` appear only at `scans == 1`. Exact set equality, so a
+    /// stray key fails like a missing one.
     #[test]
     fn timings_json_names_every_field_exactly_once() {
-        let rendered = timings_json(&distinct_stats(), Duration::from_millis(12));
-        let expected: std::collections::BTreeSet<&str> = [
+        let always: std::collections::BTreeSet<&str> = [
             "attempts",
             "resolveMs",
             "planMs",
@@ -299,32 +317,46 @@ mod tests {
             "firstBatchMs",
             "drainMs",
             "auditMs",
-            "planInitMs",
+            "scans",
             "planningWaitMaxMs",
             "openMaxMs",
             "decodeBuildMaxMs",
-            "firstBatchMinMs",
-            "streamMaxMs",
         ]
         .into_iter()
         .collect();
-        assert_eq!(keys(&rendered), expected);
-        assert_eq!(rendered["attempts"], 2);
-        for (key, value) in [
-            ("resolveMs", 1.0),
-            ("planMs", 2.0),
-            ("startMs", 3.0),
-            ("firstBatchMs", 4.0),
-            ("drainMs", 5.0),
-            ("planInitMs", 6.0),
-            ("planningWaitMaxMs", 7.0),
-            ("openMaxMs", 8.0),
-            ("decodeBuildMaxMs", 9.0),
-            ("firstBatchMinMs", 10.0),
-            ("streamMaxMs", 11.0),
-            ("auditMs", 12.0),
-        ] {
-            assert_eq!(rendered[key].as_f64(), Some(value), "{key}: {rendered}");
+        for scans in [0u64, 1, 2] {
+            let mut stats = distinct_stats();
+            stats.scan_timing.scans = scans;
+            let rendered = timings_json(&stats, Duration::from_millis(12));
+            let mut expected = always.clone();
+            if scans == 1 {
+                expected.extend(SINGLE_SCAN_KEYS);
+            }
+            assert_eq!(keys(&rendered), expected, "scans = {scans}");
+            assert_eq!(rendered["attempts"], 2);
+            assert_eq!(rendered["scans"].as_u64(), Some(scans));
+            for (key, value) in [
+                ("resolveMs", 1.0),
+                ("planMs", 2.0),
+                ("startMs", 3.0),
+                ("firstBatchMs", 4.0),
+                ("drainMs", 5.0),
+                ("planningWaitMaxMs", 7.0),
+                ("openMaxMs", 8.0),
+                ("decodeBuildMaxMs", 9.0),
+                ("auditMs", 12.0),
+            ] {
+                assert_eq!(rendered[key].as_f64(), Some(value), "{key}: {rendered}");
+            }
+            if scans == 1 {
+                for (key, value) in [
+                    ("planInitMs", 6.0),
+                    ("firstBatchMinMs", 10.0),
+                    ("streamMaxMs", 11.0),
+                ] {
+                    assert_eq!(rendered[key].as_f64(), Some(value), "{key}: {rendered}");
+                }
+            }
         }
     }
 

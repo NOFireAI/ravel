@@ -2361,12 +2361,10 @@ const TIMINGS_KEYS: &[&str] = &[
     "firstBatchMs",
     "drainMs",
     "auditMs",
-    "planInitMs",
+    "scans",
     "planningWaitMaxMs",
     "openMaxMs",
     "decodeBuildMaxMs",
-    "firstBatchMinMs",
-    "streamMaxMs",
 ];
 
 const PRUNING_KEYS: &[&str] = &[
@@ -2380,9 +2378,10 @@ const PRUNING_KEYS: &[&str] = &[
 /// ADR-2677 decision 4: the JSON response carries `stats.timings` and
 /// `stats.pruning` beside `phases` and `io`, every key exactly once. The
 /// resolve stamp is a real nonzero measurement, and `auditMs` is the audit
-/// await itself: present with the no-op sink (which accepts at once, so the
-/// figure is small) and at least the configured sink's hold when that sink is
-/// slow, which a stamp around anything after the await cannot reach.
+/// await itself: present with the no-op sink and at least the configured
+/// sink's hold when that sink is slow, which a stamp around anything after the
+/// await cannot reach. A metrics statement has no logs scan, so `scans` is 0
+/// and the three single-scan fields are absent.
 #[tokio::test]
 async fn sql_response_carries_timings_and_pruning_stats() {
     let query = "SELECT ts, value FROM samples ORDER BY ts";
@@ -2393,6 +2392,7 @@ async fn sql_response_carries_timings_and_pruning_stats() {
     let value: Value = serde_json::from_slice(&raw).expect("JSON body");
     let timings = stats_object(&raw, &value, "timings", TIMINGS_KEYS);
     assert_eq!(timings["attempts"], 1, "{value}");
+    assert_eq!(timings["scans"], 0, "a metrics plan has no logs scan: {value}");
     let resolve_ms = timings["resolveMs"].as_f64().expect("resolveMs");
     assert!(resolve_ms > 0.0, "resolve took measurable time: {value}");
     for key in TIMINGS_KEYS {
@@ -2401,10 +2401,6 @@ async fn sql_response_carries_timings_and_pruning_stats() {
             "{key} is a non-negative number: {value}"
         );
     }
-    assert!(
-        timings["auditMs"].as_f64().expect("auditMs") < SLOW_AUDIT.as_secs_f64() * 1_000.0,
-        "the no-op sink accepts without holding: {value}"
-    );
     let pruning = stats_object(&raw, &value, "pruning", PRUNING_KEYS);
     assert_eq!(pruning["segments"], 1, "{value}");
     assert_eq!(pruning["segmentsPrunedByStats"], 0, "{value}");

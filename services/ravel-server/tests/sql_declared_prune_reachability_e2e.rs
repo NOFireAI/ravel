@@ -365,6 +365,41 @@ fn pruning(value: &serde_json::Value, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("stats.pruning.{key}: {value}"))
 }
 
+/// The timing fields present for every statement, and the three that are
+/// present only when the plan holds exactly one logs scan.
+const TIMINGS_ALWAYS: [&str; 11] = [
+    "attempts",
+    "resolveMs",
+    "planMs",
+    "startMs",
+    "firstBatchMs",
+    "drainMs",
+    "auditMs",
+    "scans",
+    "planningWaitMaxMs",
+    "openMaxMs",
+    "decodeBuildMaxMs",
+];
+const TIMINGS_SINGLE_SCAN: [&str; 3] = ["planInitMs", "firstBatchMinMs", "streamMaxMs"];
+
+/// `stats.timings.scans`, after checking the object's key set is exactly the
+/// one that scan count renders.
+fn scans(value: &serde_json::Value) -> u64 {
+    let timings = value["stats"]["timings"]
+        .as_object()
+        .unwrap_or_else(|| panic!("stats.timings: {value}"));
+    let scans = timings["scans"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("stats.timings.scans: {value}"));
+    let mut expected: BTreeSet<&str> = TIMINGS_ALWAYS.into_iter().collect();
+    if scans == 1 {
+        expected.extend(TIMINGS_SINGLE_SCAN);
+    }
+    let keys: BTreeSet<&str> = timings.keys().map(String::as_str).collect();
+    assert_eq!(keys, expected, "stats.timings for scans = {scans}: {value}");
+    scans
+}
+
 fn rows(user_ids: std::ops::Range<i64>, counter_id: i64, event_date: i64) -> Vec<Row> {
     user_ids
         .map(|user_id| Row {
@@ -390,7 +425,10 @@ fn rows(user_ids: std::ops::Range<i64>, counter_id: i64, event_date: i64) -> Vec
 /// `CounterID = 62 AND EventDate >= 100 AND EventDate <= 150` returns `a`'s
 /// three rows and `d`'s two `CounterID = 62` rows at or before 150, and fetches
 /// neither `b` nor `c`; so does the `BETWEEN` spelling of the same statement. `UserID = 21` returns one row of `c` and fetches none
-/// of `a`, `b`, `d`.
+/// of `a`, `b`, `d`. Each of those plans holds one logs scan (`scans == 1`).
+/// `UserID = 21 UNION ALL UserID = 2` holds two: it reports `scans == 2`,
+/// omits the three single-scan timing fields, and its pruning counters are the
+/// sums of the two branches run alone.
 ///
 /// Flipped assertions: making `prune_segments_by_stats` keep every segment
 /// (`if true || arms.is_empty()`) fetches `b` and fails the zero-GET
@@ -453,6 +491,7 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
     }
     assert_eq!(pruning(&value, "segments"), 4, "{value}");
     assert_eq!(pruning(&value, "segmentsPrunedByStats"), 2, "{value}");
+    assert_eq!(scans(&value), 1, "{value}");
 
     // The same statement spelled with `BETWEEN`, as ADR-2677 decision 5
     // writes it.
@@ -468,6 +507,7 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
         assert_eq!(fx.gets.gets_of_since(key, since), 0, "{key} never fetched");
     }
     assert_eq!(pruning(&value, "segmentsPrunedByStats"), 2, "{value}");
+    assert_eq!(scans(&value), 1, "{value}");
 
     let since = fx.gets.len();
     let value = fx
@@ -484,6 +524,43 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
     assert!(fx.gets.gets_of_since(&c, since) > 0, "c holds 21");
     assert_eq!(pruning(&value, "segments"), 4, "{value}");
     assert_eq!(pruning(&value, "segmentsPrunedByStats"), 3, "{value}");
+    assert_eq!(scans(&value), 1, "{value}");
+    let user_21 = value;
+
+    let user_2 = fx
+        .sql("SELECT \"UserID\" FROM logs WHERE \"UserID\" = 2")
+        .await;
+    assert_eq!(user_ids(&user_2), vec![2], "{user_2}");
+    assert_eq!(pruning(&user_2, "segmentsPrunedByStats"), 3, "{user_2}");
+    assert_eq!(scans(&user_2), 1, "{user_2}");
+
+    // Two branches with different predicates over the same table: the
+    // optimizer keeps two scans, each pruning the one snapshot on its own, so
+    // the pruning counters are the two single-branch figures added together
+    // and `segmentsPrunedByStats` exceeds `segments`.
+    let value = fx
+        .sql(
+            "SELECT \"UserID\" FROM logs WHERE \"UserID\" = 21 \
+             UNION ALL SELECT \"UserID\" FROM logs WHERE \"UserID\" = 2 \
+             ORDER BY \"UserID\"",
+        )
+        .await;
+    assert_eq!(user_ids(&value), vec![2, 21], "{value}");
+    assert_eq!(scans(&value), 2, "{value}");
+    assert_eq!(pruning(&value, "segments"), 4, "{value}");
+    for key in [
+        "segmentsPrunedByStats",
+        "blocksTotal",
+        "blocksScanned",
+        "blocksPrunedByPostings",
+    ] {
+        assert_eq!(
+            pruning(&value, key),
+            pruning(&user_21, key) + pruning(&user_2, key),
+            "{key} sums the two scans: {value}"
+        );
+    }
+    assert_eq!(pruning(&value, "segmentsPrunedByStats"), 6, "{value}");
 
     fx.running.shutdown().await.expect("graceful shutdown");
 }
@@ -521,6 +598,12 @@ async fn declared_column_block_level_range_pruning_reduces_blocks_scanned_throug
         "the blocks whose UserID range excludes 5 are skipped: {value}"
     );
     assert_eq!(blocks_scanned, 1, "only the first block holds 5: {value}");
+    assert_eq!(
+        pruning(&value, "blocksPrunedByPostings"),
+        0,
+        "the skipped blocks are the NumRange skip, not POSTINGS: {value}"
+    );
+    assert_eq!(scans(&value), 1, "{value}");
 
     fx.running.shutdown().await.expect("graceful shutdown");
 }
