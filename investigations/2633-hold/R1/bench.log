@@ -1,0 +1,105 @@
+q01 cold=Some(0.048943601) hot=Some(0.012267724) verdict=Fail error=none
+q02 cold=Some(0.032683896) hot=Some(0.02232266) verdict=Fail error=none
+q03 cold=Some(0.041031659) hot=Some(0.026243711) verdict=Fail error=none
+q04 cold=Some(0.052255986) hot=Some(0.023444649) verdict=Fail error=none
+q05 cold=Some(0.089845188) hot=Some(0.079203535) verdict=Fail error=none
+q06 cold=Some(0.153866764) hot=Some(0.100115999) verdict=Fail error=none
+q07 cold=Some(0.027170864) hot=Some(0.014907411) verdict=Fail error=none
+q08 cold=Some(0.048808717) hot=Some(0.022427354) verdict=Fail error=none
+q09 cold=Some(0.118574621) hot=Some(0.103027624) verdict=Fail error=none
+q10 cold=Some(0.141990091) hot=Some(0.131730497) verdict=Fail error=none
+q11 cold=Some(0.077481891) hot=Some(0.06690741) verdict=Fail error=none
+q12 cold=Some(0.082029337) hot=Some(0.069592649) verdict=Fail error=none
+q13 cold=Some(0.194719468) hot=Some(0.175276011) verdict=Fail error=none
+q14 cold=Some(0.220162759) hot=Some(0.225282209) verdict=Fail error=none
+q15 cold=Some(0.188121389) hot=Some(0.159388305) verdict=Fail error=none
+q16 cold=Some(0.093373937) hot=Some(0.090819652) verdict=Fail error=none
+q17 cold=Some(0.218521576) hot=Some(0.213045286) verdict=Fail error=none
+q18 cold=Some(0.206571781) hot=Some(0.206235133) verdict=Fail error=none
+q19 cold=Some(0.424345588) hot=Some(0.371785765) verdict=Fail error=none
+q20 cold=Some(0.023263065) hot=Some(0.023673846) verdict=Pass error=none
+q21 cold=Some(0.354526544) hot=Some(0.154262364) verdict=Fail error=none
+q22 cold=Some(0.168159389) hot=Some(0.162075544) verdict=Fail error=none
+q23 cold=Some(0.727688604) hot=Some(0.39262385) verdict=Fail error=none
+q24 cold=Some(1.028504596) hot=Some(0.410084235) verdict=Fail error=none
+q25 cold=Some(0.113983013) hot=Some(0.103298111) verdict=Fail error=none
+q26 cold=Some(0.109419747) hot=Some(0.102537522) verdict=Fail error=none
+q27 cold=Some(0.118864827) hot=Some(0.119673769) verdict=Fail error=none
+q28 cold=Some(0.166887671) hot=Some(0.139713538) verdict=Fail error=none
+q29 cold=Some(0.888099461) hot=Some(0.826556662) verdict=Fail error=none
+q30 cold=Some(0.044306119) hot=Some(0.042693458) verdict=Fail error=none
+q31 cold=Some(0.138258091) hot=Some(0.121268149) verdict=Fail error=none
+q32 cold=Some(0.171691452) hot=Some(0.158007785) verdict=Fail error=none
+q33 cold=Some(0.535276523) hot=Some(0.538118946) verdict=Fail error=none
+q34 cold=Some(0.468680968) hot=Some(0.457552514) verdict=Fail error=none
+q35 cold=Some(0.458522879) hot=Some(0.454797334) verdict=Fail error=none
+q36 cold=Some(0.090449673) hot=Some(0.092627829) verdict=Fail error=none
+q37 cold=Some(0.100252993) hot=Some(0.100860259) verdict=Fail error=none
+q38 cold=Some(0.064285718) hot=Some(0.066655958) verdict=Fail error=none
+q39 cold=Some(0.056863978) hot=Some(0.056494239) verdict=Fail error=none
+q40 cold=Some(0.496604159) hot=Some(0.436236271) verdict=Fail error=none
+q41 cold=Some(0.050093966) hot=Some(0.045100428) verdict=Fail error=none
+q42 cold=Some(0.04514614) hot=Some(0.045706464) verdict=Pass error=none
+q43 cold=Some(0.036736136) hot=Some(0.036722005) verdict=Fail error=none
+concurrency: 10 tasks, 2903 completed, 55 errors in 360.793531987 s (configured 360 s), qps=8.046153111482608, error_ratio=0.01859364435429344 (RLOG entry: 0.101; reported, not judged)
+report written to bench-report.json: hot 7.201364663999998 s, cold 8.917064825000002 s, 43 answered, failed []
+finding: pre-registered failure q19 answered
+finding: pre-registered failure q29 answered
+finding: pre-registered failure q33 answered
+finding: pre-registered failure q34 answered
+finding: pre-registered failure q35 answered
+violation: q1 answered with verdict Fail; the accepted verdict is Pass
+violation: q2 answered with verdict Fail; the accepted verdict is Pass
+violation: q3 answered with verdict Fail; the accepted verdict is Pass
+violation: q4 answered with verdict Fail; the accepted verdict is Pass
+violation: q5 answered with verdict Fail; the accepted verdict is Pass
+violation: q6 answered with verdict Fail; the accepted verdict is Pass
+violation: q7 answered with verdict Fail; the accepted verdict is Pass
+violation: q8 answered with verdict Fail; the accepted verdict is Pass
+violation: q9 answered with verdict Fail; the accepted verdict is Pass
+violation: q10 answered with verdict Fail; the accepted verdict is Pass
+violation: q11 answered with verdict Fail; the accepted verdict is Pass
+violation: q12 answered with verdict Fail; the accepted verdict is Pass
+violation: q13 answered with verdict Fail; the accepted verdict is Pass
+violation: q14 answered with verdict Fail; the accepted verdict is Pass
+violation: q15 answered with verdict Fail; the accepted verdict is Pass
+violation: q16 answered with verdict Fail; the accepted verdict is Pass
+violation: q17 answered with verdict Fail; the accepted verdict is Pass
+violation: q18 answered with verdict Fail; the accepted verdict is CardinalityOnly
+violation: q19 answered with verdict Fail; the accepted verdict is Pass
+violation: q21 answered with verdict Fail; the accepted verdict is Pass
+violation: q22 answered with verdict Fail; the accepted verdict is Pass
+violation: q23 answered with verdict Fail; the accepted verdict is Pass
+violation: q24 answered with verdict Fail; the accepted verdict is Pass
+violation: q25 answered with verdict Fail; the accepted verdict is CardinalityOnly(ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output)
+violation: q26 answered with verdict Fail; the accepted verdict is Pass
+violation: q27 answered with verdict Fail; the accepted verdict is CardinalityOnly(ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output)
+violation: q28 answered with verdict Fail; the accepted verdict is Pass
+violation: q29 answered with verdict Fail; the accepted verdict is Pass
+violation: q30 answered with verdict Fail; the accepted verdict is Pass
+violation: q31 answered with verdict Fail; the accepted verdict is Pass
+violation: q32 answered with verdict Fail; the accepted verdict is Pass
+violation: q33 answered with verdict Fail; the accepted verdict is Pass
+violation: q34 answered with verdict Fail; the accepted verdict is Pass
+violation: q35 answered with verdict Fail; the accepted verdict is Pass
+violation: q36 answered with verdict Fail; the accepted verdict is Pass
+violation: q37 answered with verdict Fail; the accepted verdict is Pass
+violation: q38 answered with verdict Fail; the accepted verdict is Pass
+violation: q39 answered with verdict Fail; the accepted verdict is Pass
+violation: q40 answered with verdict Fail; the accepted verdict is Pass
+violation: q41 answered with verdict Fail; the accepted verdict is Pass
+violation: q43 answered with verdict Fail; the accepted verdict is Pass
+violation: q5 errored 1 times in the concurrency phase and is not pre-registered
+violation: q6 errored 1 times in the concurrency phase and is not pre-registered
+violation: q9 errored 2 times in the concurrency phase and is not pre-registered
+violation: q13 errored 1 times in the concurrency phase and is not pre-registered
+violation: q14 errored 1 times in the concurrency phase and is not pre-registered
+violation: q15 errored 1 times in the concurrency phase and is not pre-registered
+violation: q17 errored 1 times in the concurrency phase and is not pre-registered
+violation: q18 errored 3 times in the concurrency phase and is not pre-registered
+violation: q24 errored 3 times in the concurrency phase and is not pre-registered
+violation: q31 errored 1 times in the concurrency phase and is not pre-registered
+violation: q36 errored 1 times in the concurrency phase and is not pre-registered
+violation: q40 errored 1 times in the concurrency phase and is not pre-registered
+D7 check: 53 violations
+bench exit 1
