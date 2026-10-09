@@ -1347,11 +1347,30 @@ shrinks its reservation when it emits, while the emitted batch still holds
 those bytes, so releasing them would let other queries be granted memory that
 is still live. The held bytes stay charged and count toward every ceiling, a
 later grow by the same aggregate is served from them first, and they are
-released when the aggregate's stream is dropped, so the pool over-charges an
-aggregate from its first shrink until its stream is dropped. The hold is off
-whenever SQL spill is configured, because the pool cannot tell a shrink after
-a spill, which frees memory, from a shrink after an emit.
+released when the aggregate's stream is dropped. The hold is chosen per
+stream: it applies to an aggregate whose memory consumer DataFusion marks as
+unable to spill: a final or single-stage aggregate on a statement that runs
+without spill, or one whose input is fully sorted on the group key. A partial
+aggregate is never held, because it emits early into the exchange that feeds
+the final aggregate and that exchange reserves what it buffers. A final
+aggregate that can spill is not held either, because its shrink can follow a
+spill to disk, which frees the memory.
 `ravel_sql::sql_memory_held_bytes()` reports the bytes held across the process.
+
+The hold over-charges. From the aggregate's first shrink until its stream is
+dropped, its bytes stay charged while a downstream operator, for example a
+Sort over the aggregate's output, also reserves the emitted batches it is
+handed. A statement that used to fit under `max_query_bytes` can therefore now
+be refused with 422 `ResourcesExhausted`. The extra charge is bounded by the
+aggregate's own peak: a held aggregate stays charged at the largest
+reservation it has held, never more, because a later grow is served from the
+hold first. The sizing guidance for `--sql-max-query-bytes` is unchanged. In
+the reservation-lag matrix (`crates/ravel-sql/tests/group_by_reservation_lag.rs`,
+where result batches are dropped as they arrive), peak reserved bytes with the
+hold on differed from a run with it off by -11.6% to +15.9%, no more than the
+16.7% spread the runs with it on show among themselves (303.1 to 353.7 MiB
+for one configuration). A statement whose aggregate output is reserved downstream was
+not measured, and that is where the extra charge appears.
 
 `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
 the summed sizes of live fetch reservations that a fetcher marked handed off
