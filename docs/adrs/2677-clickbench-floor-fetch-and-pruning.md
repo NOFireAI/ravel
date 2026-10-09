@@ -1,6 +1,6 @@
 # ADR-2677: the ClickBench ranking gap: seal at load end, plan once, serve a stable subset, prove the pruning
 
-Status: Proposed. Issue #2677 (epic). Stage 0 is the measured record on
+Status: Accepted (2026-10-09). Issue #2677 (epic). Stage 0 is the measured record on
 #2639, #2615, #2592 and #2121; no new profile run preceded this ADR.
 No persistent format changes: every RLOG object, catalog part, HEAD and
 commit record keeps its bytes and its layout. The three levers that would
@@ -94,8 +94,17 @@ the seal lemma (`docs/catalog-and-mvcc.md`, "Sealed hours") rests on
 no later commit landing in a sealed hour: a record that does lands in a
 bucket reconcile skips without a GET and stays invisible to non-token
 queries until a HEAD rebuild, detected only by the maintain-mode scrub or
-`catalog verify`. The loader is the one writer that can assert this about
-its own hours. A seal-through hour below the natural watermark changes
+`catalog verify`. The loader can assert this about its own hours, but not
+about a writer that starts later: the documented bulk-load workflow (load,
+then start the server, then live ingest in the same hour) is exactly that
+case. So the fold keeps an operator-sealed hour open to late commits until
+its natural seal: for an hour above `sealed_watermark_hour(now)` the
+reconcile pass does not skip buckets holding only level-0 records, and the
+fold does not take its no-op return. A commit into an operator-sealed hour
+is then visible at the next fold tick, not refused and not lost; the
+"Catalog snapshot staleness" bound in `docs/consistency-model.md` gains
+that clause. This is task T8 (#2691), and the release that ships
+`--fold-after-load` waits for it. A seal-through hour below the natural watermark changes
 nothing, and the scheduled fold no-ops on the sealed hours until the
 natural seal time passes, as it does today (`fold.rs:1182-1186`).
 
@@ -350,7 +359,7 @@ because decision 2 acts only on objects under the bound; its row says so.
 | statements answered on the reference box | 43 of 43 | fewer |
 | c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal |
 | c6a.2xlarge (16 GB), no server flags | no statement refused that stock answers (42 of 43, #2627 R6); cold reported against the tuned 377.1 s and the stock arm | any such refusal |
-| concurrent phase on c6a.4xlarge, RustFS, no server flags: first the #2044 fix alone, then with the derived defaults | error ratio at most 0.058 (ADR-2023 decision 4) and QPS not below stock v0.23.0's 0.653 (stock today: 0.084; W1 tuned: 0.727 at 0.103) | error ratio over 0.058, or QPS below 0.653 |
+| concurrent phase on c6a.4xlarge, RustFS, no server flags: first the #2044 fix alone, then with the derived defaults; three phases per arm on one box, beside three stock phases on the same box as the paired control (one pass is not a result: stock measured 0.058 and 0.027 on two S3 passes, 0.084 and 0.093 on two RustFS passes) | pooled error ratio at most 0.058 (ADR-2023 decision 4), no single phase over 0.08, pooled QPS not below the paired stock phases' | pooled error ratio over 0.058, a phase over 0.08, or QPS below the paired stock |
 | unaffected statements | no confirmed regression over 5% | |
 
 The v0.23 nine-machine pass already in flight (pre-registration #2592
@@ -426,7 +435,7 @@ and its result stays separate from stock.
 
 ## Plan
 
-Six fleet tasks, crate-disjoint within a wave; the
+Eight fleet tasks, crate-disjoint within a wave; the
 measurements are orchestrator work on bot-style boxes.
 
 | task | decision | crates | risk |
@@ -436,16 +445,35 @@ measurements are orchestrator work on bot-style boxes.
 | T3 loop-stable memory cache, ADR-0046 amendment | 3 | ravel-cache, docs | medium |
 | T4 no plan phase for segments at or under `plan_whole_object_bound()` | 2 | ravel-query (`log_fetcher.rs`), ravel-sql | medium |
 | T5 permits and loopback policy from host memory, ADR-2023 amendment, the three stale doc comments in `crates/ravel-query/src/config.rs` (the "not bounded" note, LatencyFirst's "operator opt-in", `LATENCY_FIRST_MEASURED_CONCURRENCY`) | 7 | ravel-server, docs, ravel-query (doc comments in `config.rs` only) | medium |
+| T6 (#2044) admission wait on accounted headroom; fetch-memory refusal message | 7 | ravel-query (admission), ravel-sql (Flight admission, error message), ravel-server (callers) | medium |
+| T7 (#2694) ordered block skip from the TopK dynamic filter | 6 | ravel-sql, ravel-logseg (reader), ravel-query (scan passthrough) | medium |
+| T8 (#2691) operator-sealed hours stay open to late commits until their natural seal | 1 | ravel-catalog, docs | medium |
 
-T6 (#2044, ravel-server and ravel-sql memory limits, medium) brings the
-stock concurrent error ratio under 0.058; its shape is decided by the
-refusal-class measurement, and T5 does not dispatch before T6 lands and
-its arm meets the bar.
+T6 (#2044, medium) brings the stock concurrent error ratio under 0.058.
+The attribution arms on #2044 show process-budget refusals while the
+tenant sits under its limit, spill making it worse (one statement holds
+the whole spill ceiling), and fetch reservations of 4.4 to 5.1 GB on the
+same remainder. Its shape: a bounded wait at admission while the process
+budget's reserved bytes exceed a fraction of its limit, refusing at the
+statement deadline (a wait at reservation growth would be hold-and-wait),
+built as the async admission call ADR-2633's resident check later joins.
+Before it, one measurement: how much of the fetch figure is cache-hit
+bytes charged a second time (`handoff_overlap`); if most of it, removing
+that double charge goes first. T6 also renames the client message a
+refused fetch reservation carries, which today reads as a storage error.
+T5 does not dispatch before T6 lands and its arm meets the bar.
 
-Wave 1: T1, T2, T3, concurrently. After it, each later task is its own
-wave, in this order: T4; then T6; then T5. T7 (#2694, the ordered block
-skip that decision 6's measurement cleared) follows T4, which it shares
-`logs_scan.rs` and `log_fetcher.rs` with. Then the arms of decision 8. The
-high-risk-solo wave rule is relaxed for wave 1 on the owner's
-days-not-weeks instruction; T1 compensates with its own reviewer and
-`effort: high`.
+T7 (#2694, medium) is the ordered block skip decision 6's measurement
+cleared: blocks visited 0.42% for q25 and 2.8% for q24 on the stored
+tenant, worth about a fifth of the hot geometric mean over four
+statements. T8 (#2691, ravel-catalog, medium) is decision 1's late-commit
+guard.
+
+Wave 1: T1, T2, T3, concurrently. Then T6 and T7 once T2 has landed (both
+touch ravel-sql), and T8 once T1 has landed (same `fold.rs`). T5 after
+T6's arm clears. T4 last: the entry recipe writes 25 MB objects, above the
+18.9 MB bound decision 2 acts under, so T4 moves no statement in the
+ranked entry; T7 shares `logs_scan.rs` and `log_fetcher.rs` with it and
+goes first. The high-risk-solo wave rule is relaxed for wave 1 on the
+owner's days-not-weeks instruction; T1 compensates with its own reviewer
+and `effort: high`.
