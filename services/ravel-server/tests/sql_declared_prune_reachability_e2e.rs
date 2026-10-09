@@ -410,36 +410,10 @@ fn rows(user_ids: std::ops::Range<i64>, counter_id: i64, event_date: i64) -> Vec
         .collect()
 }
 
-/// Four stamped objects, each laid out so its stamp alone decides whether a
-/// predicate can match it:
-///
-/// - `a`: CounterID 62, EventDate 100..=102, UserID 1..=3 (matches the range
-///   statement).
-/// - `b`: CounterID 10, EventDate 100..=102, UserID 10..=12 (excluded by
-///   `CounterID = 62`).
-/// - `c`: CounterID 62, EventDate 200..=202, UserID 20..=22 (excluded by the
-///   `EventDate` range).
-/// - `d`: CounterID 62 and 63, EventDate 140..=160, UserID 30..=33 (straddles
-///   the range end, so it is read and filtered row by row).
-///
-/// `CounterID = 62 AND EventDate >= 100 AND EventDate <= 150` returns `a`'s
-/// three rows and `d`'s two `CounterID = 62` rows at or before 150, and fetches
-/// neither `b` nor `c`; so does the `BETWEEN` spelling of the same statement. `UserID = 21` returns one row of `c` and fetches none
-/// of `a`, `b`, `d`. Each of those plans holds one logs scan (`scans == 1`).
-/// `UserID = 21 UNION ALL UserID = 2` holds two: it reports `scans == 2`,
-/// omits the three single-scan timing fields, and its pruning counters are the
-/// sums of the two branches run alone.
-///
-/// Flipped assertions: making `prune_segments_by_stats` keep every segment
-/// (`if true || arms.is_empty()`) fetches `b` and fails the zero-GET
-/// assertion. Counting the skip but scanning the unpruned list (the provider
-/// building `LogsScanExec` over `segments.clone()`) fails the same assertion.
-/// Publishing a zero for the counter while still skipping
-/// (`with_segments_pruned_by_stats(0)` in the provider) leaves the GETs at zero
-/// and fails the count alone (`0 != 2`).
-#[tokio::test]
-async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
-    let mut fx = Fixture::start().await;
+/// Ingest objects `a` to `d` as laid out on
+/// [`declared_column_equality_prunes_segments_before_fetch_through_http`],
+/// returning their keys in that order.
+async fn ingest_four(fx: &mut Fixture) -> [String; 4] {
     let a = fx.ingest(&rows(1..4, 62, 100)).await;
     let b = fx.ingest(&rows(10..13, 10, 100)).await;
     let c = fx.ingest(&rows(20..23, 62, 200)).await;
@@ -467,6 +441,37 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
             },
         ])
         .await;
+    [a, b, c, d]
+}
+
+/// Four stamped objects, each laid out so its stamp alone decides whether a
+/// predicate can match it:
+///
+/// - `a`: CounterID 62, EventDate 100..=102, UserID 1..=3 (matches the range
+///   statement).
+/// - `b`: CounterID 10, EventDate 100..=102, UserID 10..=12 (excluded by
+///   `CounterID = 62`).
+/// - `c`: CounterID 62, EventDate 200..=202, UserID 20..=22 (excluded by the
+///   `EventDate` range).
+/// - `d`: CounterID 62 and 63, EventDate 140..=160, UserID 30..=33 (straddles
+///   the range end, so it is read and filtered row by row).
+///
+/// `CounterID = 62 AND EventDate >= 100 AND EventDate <= 150` returns `a`'s
+/// three rows and `d`'s two `CounterID = 62` rows at or before 150, and fetches
+/// neither `b` nor `c`; so does the `BETWEEN` spelling of the same statement. `UserID = 21` returns one row of `c` and fetches none
+/// of `a`, `b`, `d`. Each of those plans holds one logs scan (`scans == 1`).
+///
+/// Flipped assertions: making `prune_segments_by_stats` keep every segment
+/// (`if true || arms.is_empty()`) fetches `b` and fails the zero-GET
+/// assertion. Counting the skip but scanning the unpruned list (the provider
+/// building `LogsScanExec` over `segments.clone()`) fails the same assertion.
+/// Publishing a zero for the counter while still skipping
+/// (`with_segments_pruned_by_stats(0)` in the provider) leaves the GETs at zero
+/// and fails the count alone (`0 != 2`).
+#[tokio::test]
+async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
+    let mut fx = Fixture::start().await;
+    let [a, b, c, d] = ingest_four(&mut fx).await;
 
     let since = fx.gets.len();
     let value = fx
@@ -525,19 +530,25 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
     assert_eq!(pruning(&value, "segments"), 4, "{value}");
     assert_eq!(pruning(&value, "segmentsPrunedByStats"), 3, "{value}");
     assert_eq!(scans(&value), 1, "{value}");
-    let user_21 = value;
 
-    let user_2 = fx
-        .sql("SELECT \"UserID\" FROM logs WHERE \"UserID\" = 2")
-        .await;
-    assert_eq!(user_ids(&user_2), vec![2], "{user_2}");
-    assert_eq!(pruning(&user_2, "segmentsPrunedByStats"), 3, "{user_2}");
-    assert_eq!(scans(&user_2), 1, "{user_2}");
+    fx.running.shutdown().await.expect("graceful shutdown");
+}
 
-    // Two branches with different predicates over the same table: the
-    // optimizer keeps two scans, each pruning the one snapshot on its own, so
-    // the pruning counters are the two single-branch figures added together
-    // and `segmentsPrunedByStats` exceeds `segments`.
+/// `UserID = 21 UNION ALL UserID = 2` over the same four objects: two branches
+/// with different predicates, which the optimizer keeps as two logs scans.
+/// The response reports `scans == 2`, omits `planInitMs`, `firstBatchMinMs`
+/// and `streamMaxMs` while carrying every other timing field, and its pruning
+/// counters are the two single-branch figures added together, so
+/// `segmentsPrunedByStats` (3 + 3) exceeds `segments` (4).
+///
+/// Flipped assertions: rendering the three fields whatever `scans` says, and
+/// counting every plan node rather than every `LogsScanExec`, each fail the
+/// union's own assertions before either branch runs alone.
+#[tokio::test]
+async fn a_union_all_of_two_logs_branches_reports_two_scans_through_http() {
+    let mut fx = Fixture::start().await;
+    ingest_four(&mut fx).await;
+
     let value = fx
         .sql(
             "SELECT \"UserID\" FROM logs WHERE \"UserID\" = 21 \
@@ -547,7 +558,30 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
         .await;
     assert_eq!(user_ids(&value), vec![2, 21], "{value}");
     assert_eq!(scans(&value), 2, "{value}");
+    let timings = &value["stats"]["timings"];
+    for key in TIMINGS_SINGLE_SCAN {
+        assert!(timings.get(key).is_none(), "{key} is omitted: {value}");
+    }
+    for key in TIMINGS_ALWAYS {
+        assert!(timings[key].as_f64().is_some(), "{key} is present: {value}");
+    }
     assert_eq!(pruning(&value, "segments"), 4, "{value}");
+    assert_eq!(pruning(&value, "segmentsPrunedByStats"), 6, "{value}");
+
+    // Each branch alone: one scan each, and the union's pruning counters are
+    // exactly their sum.
+    let user_21 = fx
+        .sql("SELECT \"UserID\" FROM logs WHERE \"UserID\" = 21")
+        .await;
+    assert_eq!(user_ids(&user_21), vec![21], "{user_21}");
+    assert_eq!(pruning(&user_21, "segmentsPrunedByStats"), 3, "{user_21}");
+    assert_eq!(scans(&user_21), 1, "{user_21}");
+    let user_2 = fx
+        .sql("SELECT \"UserID\" FROM logs WHERE \"UserID\" = 2")
+        .await;
+    assert_eq!(user_ids(&user_2), vec![2], "{user_2}");
+    assert_eq!(pruning(&user_2, "segmentsPrunedByStats"), 3, "{user_2}");
+    assert_eq!(scans(&user_2), 1, "{user_2}");
     for key in [
         "segmentsPrunedByStats",
         "blocksTotal",
@@ -560,7 +594,6 @@ async fn declared_column_equality_prunes_segments_before_fetch_through_http() {
             "{key} sums the two scans: {value}"
         );
     }
-    assert_eq!(pruning(&value, "segmentsPrunedByStats"), 6, "{value}");
 
     fx.running.shutdown().await.expect("graceful shutdown");
 }
