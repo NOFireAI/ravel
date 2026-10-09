@@ -78,9 +78,9 @@ CHAOS_TENANT_NAME="${CHAOS_TENANT_NAME:-chaos-tenant}"
 # Tenant-hash scheme (ADR-0050 section 3). The tenant hash is keyed by default,
 # and a fresh bucket refuses a server that names neither scheme; `rustfs_up`
 # empties the bucket before every scenario, so every start here meets a fresh
-# bucket. The chaos bucket is dev-only and emptied per scenario, and the
-# scenarios' oracles read tenant prefixes under `t/`, so it is unkeyed by
-# default. A keyed run sets CHAOS_TENANT_HASH_MODE=keyed together with
+# bucket. The lane has no deployment key to give a fresh bucket, and a keyed
+# run would need one provisioned per run, so the dev-only chaos bucket is
+# unkeyed by default. A keyed run sets CHAOS_TENANT_HASH_MODE=keyed together with
 # CHAOS_TENANT_HASH_KEY_FILE, which selects --tenant-hash-key-file instead.
 CHAOS_TENANT_HASH_MODE="${CHAOS_TENANT_HASH_MODE:-unkeyed}"
 CHAOS_TENANT_HASH_KEY_FILE="${CHAOS_TENANT_HASH_KEY_FILE:-}"
@@ -109,6 +109,10 @@ chaos_tenant_hash_args() {
     keyed)
       if [[ -z "${CHAOS_TENANT_HASH_KEY_FILE}" ]]; then
         log "CHAOS_TENANT_HASH_MODE=keyed needs CHAOS_TENANT_HASH_KEY_FILE"
+        return 64
+      fi
+      if [[ ! -r "${CHAOS_TENANT_HASH_KEY_FILE}" ]]; then
+        log "CHAOS_TENANT_HASH_KEY_FILE is not a readable file: ${CHAOS_TENANT_HASH_KEY_FILE}"
         return 64
       fi
       CHAOS_TENANT_HASH_ARGS=(--tenant-hash-key-file "${CHAOS_TENANT_HASH_KEY_FILE}")
