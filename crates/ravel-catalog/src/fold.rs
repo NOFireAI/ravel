@@ -9342,7 +9342,15 @@ mod tests {
         let margin_hour = H - 3;
         assert_eq!(catalog.margin_watermark_hour(now), Some(margin_hour));
         publish_segment(&store, 0, Uuid::new_v4(), 1, H - 5, now - 5 * NS_PER_HOUR).await;
-        publish_segment(&store, 0, Uuid::new_v4(), 2, margin_hour, now - 3 * NS_PER_HOUR).await;
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            margin_hour,
+            now - 3 * NS_PER_HOUR,
+        )
+        .await;
 
         let report = fold_sealing(&catalog, now, Some(H - 5)).await;
         assert!(!report.no_op, "{report:?}");
