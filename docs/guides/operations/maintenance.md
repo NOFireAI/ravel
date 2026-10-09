@@ -1683,9 +1683,11 @@ To remove the flagged keys:
 
    A key whose characters the store's path encoding changes, such as `~`,
    is listed escaped and marked `undeletable by Ravel`, with the key a delete
-   of it would reach instead. `--delete` never sends it a delete, prints it
-   as skipped and exits non-zero naming it. Delete that exact key with the
-   Maintain credential through an S3 tool.
+   of it would reach instead. `--delete` never sends it a delete. When the
+   key is flagged, `--delete` prints it as skipped and exits non-zero naming
+   it; a key that is not flagged, such as one that is not a manifest key at
+   all, is only listed and does not fail the run. Delete that exact key with
+   the Maintain credential through an S3 tool.
 
 ### Forged version within the bound
 
