@@ -93,7 +93,10 @@ fi
 # ---------------------------------------------------------------------------
 
 SERVER_PID=""
-SERVER_LOG="$(chaos_logfile ingest-flush server)"
+# One log per server instance: the restart must not truncate the pre-kill
+# instance's output, which is where a flush killed mid-write would show.
+SERVER_LOG="$(chaos_logfile ingest-flush server-pre-kill)"
+SERVER_RESTART_LOG="$(chaos_logfile ingest-flush server-post-kill)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
@@ -107,22 +110,24 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  chaos_release_logs "$code" "$SERVER_LOG"
+  chaos_release_logs "$code" "$SERVER_LOG" "$SERVER_RESTART_LOG"
   rm -f "$FIXTURE_PATH"
   rustfs_down
 }
 trap cleanup EXIT
 
 start_server_bg() {
-  # Launch the server in the background and capture its PID for a later
-  # SIGKILL. mapfile reads the NUL-delimited argv emitted by ravel_server_cmd.
+  # Launch the server in the background, writing to the log file $1, and
+  # capture its PID for a later SIGKILL. mapfile reads the NUL-delimited argv
+  # emitted by ravel_server_cmd.
+  local logfile="$1"
   local argv=()
   mapfile -d '' -t argv < <(ravel_server_cmd \
     --store s3 \
     --listen-http "$HTTP_ADDR" \
     --listen-grpc "$GRPC_ADDR" \
     --tenant-token "${CHAOS_TENANT_TOKEN}=${CHAOS_TENANT_NAME}")
-  "${argv[@]}" >"$SERVER_LOG" 2>&1 &
+  "${argv[@]}" >"$logfile" 2>&1 &
   SERVER_PID=$!
 }
 
@@ -139,7 +144,7 @@ log "generating OTLP fixture"
 chaos_gen_fixture > "$FIXTURE_PATH"
 
 log "starting ravel-server (pre-kill instance)"
-start_server_bg
+start_server_bg "$SERVER_LOG"
 chaos_wait_for "server to accept connections" 60 server_reachable
 
 # Record the flush baseline before driving load, so "flush started" is a
@@ -176,7 +181,7 @@ sigkill_pid "$SERVER_PID"
 SERVER_PID=""
 
 log "restarting ravel-server (post-kill instance)"
-start_server_bg
+start_server_bg "$SERVER_RESTART_LOG"
 chaos_wait_for "server to accept connections after restart" 60 server_reachable
 
 # ---- Oracle (each pinned assertion independently) ----
