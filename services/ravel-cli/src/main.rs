@@ -773,13 +773,17 @@ enum Command {
         /// left to seal is a success; a failed fold fails the load, though
         /// every loaded object is already durable and `catalog fold --signal
         /// logs --writers-stopped` seals them once the cause is fixed. Logs
-        /// only: a metrics or spans load with this flag is refused before
-        /// anything is written.
+        /// only: a metrics or spans load with this flag is refused before any
+        /// row is read or written.
         ///
         /// UNSAFE under a live writer: a commit another writer publishes into
         /// a sealed hour is never picked up by a later incremental fold and
         /// stays invisible to queries without a commit token until HEAD is
         /// rebuilt. Use it only when this load is the tenant's sole writer.
+        /// That includes a later load: one into the same tenant before the
+        /// sealed hour has ended writes into it, its own fold has nothing
+        /// left to seal, and the summary warns that its objects are
+        /// invisible until HEAD is rebuilt.
         #[arg(long)]
         fold_after_load: bool,
     },
