@@ -608,10 +608,11 @@ It records your choice.
 `--advertise-fragment-endpoint` because a published listener binds an
 unspecified address.
 
-**Cause.** Under distributed query the process publishes its bound listener
-addresses for siblings to dial. No peer can dial `0.0.0.0` or `::`.
+**Cause.** Under distributed query the process publishes the bound address of
+its `--fragment-listener` for siblings to dial. No peer can dial `0.0.0.0` or
+`::`.
 
-**Confirm.** The error names each offending listener flag with its address.
+**Confirm.** The error names the offending listener flag with its address.
 
 **Action.** Pass `--advertise-fragment-endpoint <host[:port]>` with a host
 that peers can reach, or bind the listener to a specific address. Without the
@@ -643,22 +644,24 @@ Without the refusal, the process starts and serves the direction that the
 certificate carries. It fails every handshake in the other direction and
 falls back to coordinator-local execution, and nothing reports why.
 
-### Advertised port without listener
+### Distributed query without the dedicated listener
 
-**Symptom.** Startup error that `--advertise-fragment-endpoint` carries a port
-but no `--fragment-listener` is configured.
+**Symptom.** Startup error that `--distributed-query` requires
+`--fragment-listener`, or that it requires `--sql-ticket-key-file`.
 
-**Cause.** In the combined layout the public gRPC listener serves both
-published endpoints. The port half of the flag reaches the fragment endpoint
-only. The Flight SQL endpoint keeps the bound port, so one of the two
-endpoints published for the same socket is then wrong.
+**Cause.** Both distributed lanes dial only each worker's dedicated TLS
+fragment listener, so `--distributed-query` needs that listener. In a build
+that serves Flight SQL, every node also signs and verifies SQL slice tickets
+with the keys in the SQL ticket key file, and no ticket key is derived from
+the fragment key file.
 
-**Confirm.** The error names the value as written and the gRPC listener
-address that both lanes share.
+**Confirm.** The error names the missing flag.
 
-**Action.** Advertise a host only, which keeps the bound port of each
-listener. Or configure `--fragment-listener` so that the fragment lane has its
-own port to map.
+**Action.** Set `--fragment-listener` with `--fragment-tls-cert`,
+`--fragment-tls-key` and `--fragment-tls-ca`, and `--sql-ticket-key-file`
+(see [the deployment guide](deployment.md#the-dedicated-fragment-listener)).
+A `RavelCluster` with `spec.query.distributedQuery.enabled` and all four Secret
+references set already renders both. Or drop `--distributed-query`.
 
 ## Readiness, storage and authentication
 

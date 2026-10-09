@@ -213,6 +213,8 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         distrib: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_rejects: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_tls_dials: None,
         durable_auth: None,
         ingest_byte_metrics: std::sync::Arc::new(
             ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
@@ -502,7 +504,7 @@ mod flight {
         );
         // This surface does not exercise the ADR-0071 distributed scan; run
         // every statement whole-set on the coordinator.
-        let service = ravel_server::flight::service(state, ceiling, None);
+        let service = ravel_server::flight::service(state, ceiling);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -636,6 +638,8 @@ mod flight {
             distrib: None,
             #[cfg(feature = "flight-sql")]
             sql_slice_rejects: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_tls_dials: None,
             durable_auth: None,
             ingest_byte_metrics: std::sync::Arc::new(
                 ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),

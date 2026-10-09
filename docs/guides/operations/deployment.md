@@ -588,8 +588,11 @@ alert rules are in
 ## The dedicated fragment listener
 
 This section applies only under `--distributed-query`. The flag requires
-`--fragment-key-file`. A process with the flag and no key file refuses to
-start, so it never exposes an unauthenticated fetch surface.
+`--fragment-key-file`, `--fragment-listener` with its three `--fragment-tls-*`
+files, and, in a build that serves Flight SQL, `--sql-ticket-key-file`. The
+published image is such a build. A process with the flag and any of these
+missing refuses to start, so it never exposes an unauthenticated fetch surface
+and never dials an intra-cluster fragment or SQL slice in plaintext.
 
 ### The fragment key file
 
@@ -618,21 +621,16 @@ The Flight SQL lane signs its tickets with a separate key file,
   file.
 - Give it different keys from the fragment key file.
 - It requires `--distributed-query`. Setting it alone fails startup.
-- It is optional in this release. A node without it derives its SQL ticket
-  secret from the first fragment key, as earlier releases did.
-- This release turns that secret into separate client and slice keys. An
-  upgrade from an earlier release therefore has the client-ticket window
-  described below until every node runs this release.
-
-A node in `all` or `query` mode without the file logs a startup warning. The
-warning names what release B requires with `--distributed-query`: both
-`--fragment-listener` and `--sql-ticket-key-file`. Release B is the release
-after the operator renders the dedicated listener. A node that lacks only
-`--fragment-listener` logs the same warning.
+- `--distributed-query` requires it in a build that serves Flight SQL.
+- No node derives a SQL ticket key from the fragment key file. A node of the
+  previous release that ran without this file did: it derived its SQL ticket
+  secret from the first fragment key, and turned that secret into separate
+  client and slice keys.
 
 Two nodes that do not share a SQL ticket key disagree on every ticket, and
-they coexist during a rolling deploy. If you roll a new key file directly onto
-a fleet on the derived key, two things fail until the roll finishes:
+they coexist during a rolling deploy. If you roll a key file holding a new key
+onto a fleet whose nodes still use the derived key, two things fail until the
+roll finishes:
 
 - A client query fails. `GetFlightInfo` returns one endpoint with no location,
   so a client behind a balancer can send `DoGet` to any node. A ticket minted
@@ -641,10 +639,13 @@ a fleet on the derived key, two things fail until the roll finishes:
 - SQL slices between two such nodes fail the worker's MAC and run on the
   coordinator, so the query loses parallelism.
 
-After every node runs this release, you can switch without that window. Make
-the first key file equal to the key that the nodes already use, then rotate.
-Do not do this in the same roll as the upgrade. The upgrade itself changes
-the keys that an older node uses, so the window stays.
+To upgrade a fleet that runs the previous release without the file, make the
+first key file equal to the key that its nodes derive, and then rotate. A
+node on that one-line file and a node of the previous release on the derived
+key hold the same client and slice keys, so the upgrade roll itself can carry
+the file. An upgrade straight from a release before the one that added
+`--sql-ticket-key-file` has the window either way: such a node signs with the
+derived key itself, not with keys derived from it.
 
 1. Compute the key that each node derives today. `ravel-server` does not print
    it and has no flag that does. It is the BLAKE3 derive-key of the first key
@@ -666,8 +667,9 @@ the keys that an older node uses, so the window stays.
    `sql_distrib` unit tests pin the context string, the lowercase-hex input
    and the resulting key. Nothing checks this page's copy of the command.
 2. Roll `--sql-ticket-key-file`, pointing at that one-line file, onto every
-   node. A node on the file and a node on the derived key now hold the same
-   key, so nothing fails during the roll.
+   node, in the same roll as the upgrade or before it. A node on the file and
+   a node on the derived key now hold the same keys, so nothing fails during
+   the roll.
 3. Add a freshly generated key (`openssl rand -hex 32`) as the *second* line
    and roll. Every node then verifies the new key before any node mints with
    it. This step starts the rotation off the derived key, which anyone who
@@ -684,26 +686,14 @@ still on `[old]` cannot verify that ticket.
 
 ### Where the fragment surface listens
 
-`--fragment-listener` decides where SQL slice tickets travel:
+The cluster-internal fragment surface, on which one query worker fetches a
+slice for another, has its own listener. The dedicated listener terminates
+TLS in-process: `--fragment-listener <addr>`, with `--fragment-tls-cert`,
+`--fragment-tls-key` and `--fragment-tls-ca`. Both distributed lanes use it.
 
-- Without it, the SQL lane dials each worker's `--listen-grpc` address and
-  slice tickets travel there in plaintext. A slice ticket read off that
-  network is a replayable read capability for its tenant and segment set until
-  its deadline. Every `--distributed-query` process in `--mode all` or
-  `--mode query` that serves Flight SQL logs this once at startup. The only
-  mitigation is to keep the public gRPC port on a network that you trust.
-- With it, SQL slices use the dedicated TLS listener described below and that
-  line is not logged.
-
-With the key file in place, you can move the cluster-internal fragment
-surface off the public gRPC listener. On that surface one query worker fetches
-a slice for another. The dedicated listener terminates TLS in-process:
-`--fragment-listener <addr>`, with `--fragment-tls-cert`, `--fragment-tls-key`
-and `--fragment-tls-ca`. Both distributed lanes move onto it.
-
-**The PromQL lane's pinned fragment fetches.** The public gRPC listener then
-serves only cross-cluster federation with ordinary tenant credentials and
-refuses pinned fetches. The dedicated listener serves pinned fetches and
+**The PromQL lane's pinned fragment fetches.** On the fragment surface, the
+public gRPC listener serves only cross-cluster federation with ordinary tenant
+credentials and refuses pinned fetches. The dedicated listener serves pinned fetches and
 refuses federation.
 
 **The SQL lane's slice `DoGet`.** The dedicated listener serves `DoGet` for a
@@ -723,11 +713,8 @@ The public gRPC listener keeps the client Flight SQL surface:
 - A forged slice ticket, or one under a key this node lacks, takes the client
   path and is refused there, uncounted.
 
-A coordinator dials each worker's advertised `fragment_endpoint` over TLS. A
-worker with the flag advertises its dedicated listener there. A worker without
-the flag advertises its public gRPC address. During a rolling deploy, a
-coordinator with the flag therefore dials that address over `https`, and the
-TLS handshake fails before any request is sent.
+A coordinator dials each worker's advertised `fragment_endpoint` over TLS, on
+both lanes. A worker advertises its dedicated listener there.
 
 Startup refuses a `--fragment-listener` address equal to `--listen-http`,
 `--listen-grpc` or `--mtls-listener`, so the surfaces always stay separate.
@@ -832,7 +819,7 @@ ravel-server --mode all --distributed-query \
 
 `--advertise-fragment-endpoint` is required in this example. Both listeners
 bind the wildcard so that they answer on the pod's own address, but the
-heartbeat record must publish addresses that siblings can dial. Project the
+heartbeat record must publish an address that siblings can dial. Project the
 pod IP with the downward API (`fieldRef: status.podIP`), or pass the pod's
 stable DNS name from a headless Service. Without the flag, startup refuses and
 does not publish `0.0.0.0:4319` for every peer to fail against.
@@ -841,10 +828,9 @@ does not publish `0.0.0.0:4319` for every peer to fail against.
 carries client Flight SQL and federation. It defaults to `127.0.0.1:4317`,
 which nothing outside the pod's own loopback reaches.
 
-The advertised host applies to both published endpoints. With
-`--fragment-listener` set, SQL slices dial the fragment endpoint. Only a peer
-that still runs without `--fragment-listener` dials the published public gRPC
-address, and this node refuses the slice tickets that such a peer sends there.
+The heartbeat record publishes one endpoint, the fragment listener, and both
+distributed lanes dial it. This node refuses a slice ticket sent to its public
+gRPC address.
 
 cert-manager rewrites the Secret on renewal, but Ravel reads the files only at
 startup. Schedule a rolling restart of the query fleet on the renewal cadence.
@@ -893,18 +879,28 @@ Authentication`. A certificate issued against a release that documented
 
 ### Rolling onto the dedicated listener
 
-The dedicated listener is opt-in per process, so a fleet migrates one rolling
-restart at a time. Results stay identical throughout. Only which nodes a slice
-can fan out to changes during the roll.
+`--distributed-query` refuses to start without `--fragment-listener` and,
+in a Flight SQL build, without `--sql-ticket-key-file`. The previous release
+accepts both flags, so a fleet that runs it without them moves in two rolls:
+turn both flags on while still on the previous release, then upgrade. Results
+stay identical throughout. Only which nodes a slice can fan out to changes
+during a roll.
 
-- A node with `--fragment-listener` advertises its TLS fragment endpoint. It
-  refuses pinned fetches and SQL slice tickets on the public port.
-- A node without the flag keeps serving the fragment surface on the public
-  gRPC listener.
-- A slice between a node with the flag and a node without it fails its first
-  dial. The cause is a TLS dial to a plaintext port, or a slice ticket that
-  the public listener refuses. The slice is re-dispatched once to another
-  worker. It runs coordinator-local only if that attempt fails too.
+A fleet that upgrades a node of the previous release without the dedicated
+listener straight onto this release mixes the two layouts for one roll:
+
+- An upgraded node advertises its TLS fragment endpoint. It refuses pinned
+  fetches and SQL slice tickets on the public port.
+- A node of the previous release without the flag advertises its public gRPC
+  address as its fragment endpoint and keeps serving the fragment surface
+  there.
+- An upgraded node's first dial to a node of the previous release fails: it
+  is a TLS dial to a plaintext port. A node of the previous release fails its
+  first PromQL dial to an upgraded node, a plaintext dial to a TLS port, and
+  sends it no SQL slice at all, because the upgraded node's record carries no
+  public gRPC address for that node's SQL lane to dial.
+- A failed dial is re-dispatched once to another worker. The slice runs
+  coordinator-local only if that attempt fails too.
 
 The release that moves SQL slices onto the dedicated listener also moves the
 `queryfrag` protocol version from 4 to 5. Coordinators drop workers that

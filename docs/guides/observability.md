@@ -2424,13 +2424,24 @@ family: a `gateway` or `maintain` mode process, or a build without the
 
 | Metric | Meaning |
 |---|---|
-| `ravel_sql_slice_rejects_total{reason}` | Inbound SQL slice `DoGet` requests refused at slice capability verification. Worker side. `reason="missing"`: a `DoGet` on the dedicated fragment listener that carries no slice capability, which is either a `TicketStatementQuery` whose handle is empty or ends before a complete ticket, or a ticket that decodes as a protobuf `Any` but names no Flight SQL command. A handle long enough to hold a ticket that then fails verification is `bad_mac`, not `missing`. Two refusals on that listener are not counted under any reason: a `DoGet` carrying another Flight SQL command, refused `permission_denied` before slice verification, and a ticket that is not a valid protobuf `Any` (or names a Flight SQL command whose body does not decode), refused by the Flight SQL dispatcher before the service sees it. `reason="bad_mac"`: the ticket verifies under neither this node's slice keys nor its client keys. `reason="expired"`: the ticket's deadline has passed. `reason="wrong_surface"`: a client ticket presented as a slice, a slice-key ticket that is not a servable slice, or a slice ticket on the public listener once `--fragment-listener` is set. |
+| `ravel_sql_slice_rejects_total{reason}` | Inbound SQL slice `DoGet` requests refused at slice capability verification. Worker side. `reason="missing"`: a `DoGet` on the dedicated fragment listener that carries no slice capability, which is either a `TicketStatementQuery` whose handle is empty or ends before a complete ticket, or a ticket that decodes as a protobuf `Any` but names no Flight SQL command. A handle long enough to hold a ticket that then fails verification is `bad_mac`, not `missing`. Two refusals on that listener are not counted under any reason: a `DoGet` carrying another Flight SQL command, refused `permission_denied` before slice verification, and a ticket that is not a valid protobuf `Any` (or names a Flight SQL command whose body does not decode), refused by the Flight SQL dispatcher before the service sees it. `reason="bad_mac"`: the ticket verifies under neither this node's slice keys nor its client keys. `reason="expired"`: the ticket's deadline has passed. `reason="wrong_surface"`: a client ticket presented as a slice, a slice-key ticket that is not a servable slice, or a slice ticket on the public listener. |
 
 Only the dedicated fragment listener counts `missing` and `bad_mac`. The public
 listener recognises a slice ticket only when its MAC verifies under this
 node's slice keys. A forged ticket, or one minted under a key that this node
 does not hold, is not recognised as a slice ticket and is not counted. It
 takes the client path and is refused there.
+
+### SQL slice TLS dials (`ravel_sql_slice_tls_dials_total`)
+
+Label: `mode`. The counter renders on every process that built the Flight SQL
+service, from zero. It is coordinator side: one increment per SQL slice
+`DoGet` this process dials to a worker, over TLS to the worker's dedicated
+fragment listener. A PromQL fan-out does not move it.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_sql_slice_tls_dials_total` | Outbound SQL slice `DoGet` fetches this coordinator dialed over TLS. A distributed SQL statement adds one per slice fetch it sends to a worker, a re-dispatch included; a statement that runs whole-set on the coordinator, and a slice read coordinator-local, add none. |
 
 ### CPU gates and runtime
 

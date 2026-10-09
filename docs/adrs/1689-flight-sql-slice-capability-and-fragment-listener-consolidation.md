@@ -136,7 +136,7 @@ renders it instead). This ADR builds on both.
    (`services/ravel-server/src/config.rs:4556-4570`); the public gRPC
    listener's fragment role is always `PublicFederation`; and the plaintext
    dial (`client_tls: None`) is deleted, so every fragment and slice dial is
-   TLS with a client certificate.
+   TLS with a client certificate (shipped; see the release B amendment below).
 
 ```mermaid
 flowchart LR
@@ -236,7 +236,8 @@ flowchart LR
      block in the operator-rendering amendment below.
   4. Release B: delete `Combined`, add the `Cli::validate` refusals, and
      delete the plaintext dial path, with the guide's "without the flag"
-     paragraph removed in the same commit.
+     paragraph removed in the same commit. Done; see the release B amendment
+     below.
 
 ## Amendment (2026-09-28): the refusal codes on each listener
 
@@ -316,3 +317,46 @@ renders none of it and records `Degraded` with reason
 absent or disabled, none of it renders and the NetworkPolicy is deleted.
 The operator's ClusterRole gains `create`, `patch`, and `delete` on
 `networkpolicies`.
+
+## Amendment (2026-10-09): the release B amendment
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="release B amendment" -->
+
+Follow-up task 4 shipped (issue #2664). Its gate held: the operator rendering
+of follow-up task 3 shipped in v0.21.0, and v0.22.0 and v0.23.0 were cut
+after it. What shipped:
+
+- `FragmentListenerRole::Combined` is deleted, with the release A startup
+  warning and every branch that served the `Combined` layout. The public gRPC
+  listener mounts the fragment service as `PublicFederation` and the Flight
+  service as `ClientOnly`; the dedicated listener mounts them as
+  `DedicatedFragment` and `SliceOnly`.
+- `Cli::validate` refuses `--distributed-query` without `--fragment-listener`,
+  and without `--sql-ticket-key-file` in a build that serves Flight SQL, each
+  error naming the missing flag and this ADR. Decision 4 names both flags
+  without that qualifier. A build without Flight SQL has no SQL lane and no
+  SQL ticket to key, so it is refused only for the missing
+  `--fragment-listener`. The published image serves Flight SQL.
+- The plaintext dial is deleted. `RoutingSliceFetcher` takes its client TLS
+  configuration as a required argument and dials `https` only, and the SQL
+  roster names `https://{fragment_endpoint}` only. The server supplies the
+  pinned-CA configuration with this process's client certificate to both.
+  ravel-sql keeps decision 1's optional `ClientTlsConfig` seam and its own
+  `FlightListenerRole::Combined` default for an embedding with one listener;
+  the server mounts neither the plaintext dial nor `Combined`.
+- `flight_sql_endpoint` left `QueryWorkerRecord`, its constructors and the
+  heartbeat encoding. A heartbeat object written before release B that still
+  carries the field decodes, and the field is ignored. The record is transient
+  heartbeat state, so this needed no version bump. A release B coordinator
+  dials a previous-release worker that ran without `--fragment-listener` over
+  TLS at the public gRPC address that worker advertised; the handshake fails
+  and the slice is re-dispatched or runs coordinator-local.
+- No SQL ticket key is derived from the first fragment key on any server path,
+  as decision 2 required: settings without `--sql-ticket-key-file` fail the SQL
+  lane's setup.
+- The heartbeat publishes one endpoint, so `--advertise-fragment-endpoint`
+  applies to the fragment listener alone. A wildcard `--listen-grpc` is no
+  longer a published listener, and the issue #1724 refusal of an advertised
+  port without `--fragment-listener` is gone with the layout it guarded.
+- A new coordinator-side counter, `ravel_sql_slice_tls_dials_total{mode}`,
+  counts SQL slice fetches dialed over TLS. No metric or label was removed.

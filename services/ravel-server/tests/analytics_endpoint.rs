@@ -9,6 +9,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::float_cmp)]
 
+#[path = "support/fragment_tls.rs"]
+mod fragment_tls;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -198,6 +201,7 @@ fn build_router_distributed(
         Arc::new(vec![[0u8; 32]]),
         service,
         metrics,
+        fragment_tls::client_tls(),
     ));
     let distributed = Arc::new(Distributed::new(
         fetcher,

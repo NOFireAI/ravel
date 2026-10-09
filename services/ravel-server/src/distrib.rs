@@ -677,17 +677,11 @@ pub fn fragment_client_tls(
 /// per-listener difference, so it lives outside the `Arc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragmentListenerRole {
-    /// The pre-amendment layout: one listener serves both `Pinned` (intra-cluster
-    /// fan-out) and `Resolve` (cross-cluster federation). Used on the public gRPC
-    /// listener when no dedicated `--fragment-listener` is configured, so
-    /// distribution keeps working before an operator stands the dedicated
-    /// listener up (and across a rolling deploy).
-    Combined,
-    /// The public gRPC listener under the amendment: serves `Resolve`/federation
-    /// with ordinary tenant credentials only, and rejects `Pinned` outright. The
-    /// dedicated fragment listener carries all `Pinned` traffic instead.
+    /// The public gRPC listener: serves `Resolve`/federation with ordinary
+    /// tenant credentials only, and rejects `Pinned` outright. The dedicated
+    /// fragment listener carries all `Pinned` traffic instead.
     PublicFederation,
-    /// The dedicated TLS fragment listener under the amendment: serves `Pinned`
+    /// The dedicated TLS fragment listener: serves `Pinned`
     /// capability-authorized fetches only, and rejects `Resolve` outright.
     DedicatedFragment,
 }
@@ -700,12 +694,12 @@ pub enum FragmentListenerRole {
 pub struct FragmentService {
     inner: Arc<FragmentServiceInner>,
     /// The listener this clone is mounted on, gating which scopes `fetch`
-    /// accepts (ADR-0071 amendment decision 1). Defaults to [`Combined`]; the
-    /// listener assembly in `lib.rs` overrides it per listener with
+    /// accepts (ADR-0071 amendment decision 1). Defaults to [`DedicatedFragment`];
+    /// the listener assembly in `lib.rs` sets it per listener with
     /// [`FragmentService::with_role`]. Irrelevant for the coordinator's
     /// no-hop local execution, which bypasses `fetch` entirely.
     ///
-    /// [`Combined`]: FragmentListenerRole::Combined
+    /// [`DedicatedFragment`]: FragmentListenerRole::DedicatedFragment
     role: FragmentListenerRole,
     /// This worker's own query limits, wired from the resolved process
     /// configuration by `lib.rs` through
@@ -787,10 +781,10 @@ impl FragmentService {
                 metrics,
                 get_limiter,
             }),
-            // Backward-compatible default: a directly-constructed service serves
-            // both scopes. `lib.rs` sets an explicit role per listener via
-            // `with_role`.
-            role: FragmentListenerRole::Combined,
+            // A directly-constructed service serves `Pinned` only, as the
+            // dedicated listener does. `lib.rs` sets an explicit role per
+            // listener via `with_role`.
+            role: FragmentListenerRole::DedicatedFragment,
             engine: ravel_query::EngineConfig::default(),
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
@@ -846,13 +840,11 @@ impl FragmentService {
 
     /// Wrap this service in the generated gRPC server, ready to add to a
     /// cluster-internal `tonic` router. Mounted on the public gRPC listener
-    /// (as [`PublicFederation`] or [`Combined`]) and, when configured, the
-    /// dedicated TLS fragment listener (as [`DedicatedFragment`]); never the
-    /// public HTTP or mTLS client listeners.
+    /// (as [`PublicFederation`]) and the dedicated TLS fragment listener (as
+    /// [`DedicatedFragment`]); never the public HTTP or mTLS client listeners.
     ///
     /// [`PublicFederation`]: FragmentListenerRole::PublicFederation
     /// [`DedicatedFragment`]: FragmentListenerRole::DedicatedFragment
-    /// [`Combined`]: FragmentListenerRole::Combined
     pub fn into_server(&self) -> SeriesFetchServer<FragmentService> {
         SeriesFetchServer::new(self.clone())
     }
@@ -1679,13 +1671,11 @@ pub struct RoutingSliceFetcher {
     /// probe) readmits it; an endpoint absent from the live view is pruned.
     quarantine: Mutex<HashMap<String, i64>>,
     /// The client TLS configuration for dialing a remote worker's dedicated
-    /// fragment listener (ADR-0071 amendment decision 1). `Some` when this
-    /// process runs a `--fragment-listener` (workers advertise that TLS address
-    /// as their `fragment_endpoint`), pinning the operator CA and verifying the
-    /// fixed [`FRAGMENT_TLS_SERVER_NAME`] server name. `None` under the
-    /// pre-amendment layout, where fragment endpoints are the plaintext public
-    /// gRPC listener; the dial then stays plaintext, byte-identical to before.
-    client_tls: Option<tonic::transport::ClientTlsConfig>,
+    /// fragment listener (ADR-0071 amendment decision 1), which every worker
+    /// advertises as its `fragment_endpoint`: it pins the operator CA, verifies
+    /// the fixed [`FRAGMENT_TLS_SERVER_NAME`] server name, and presents this
+    /// process's fragment certificate ([`fragment_client_tls`]).
+    client_tls: tonic::transport::ClientTlsConfig,
     /// The per-slice response frame cap this coordinator decodes under (issue
     /// #1687 part B). Always [`codec::MAX_SLICE_RESPONSE_FRAMES`] in a real
     /// process; only the tests lower it, so a test can drive a real stream
@@ -1700,12 +1690,15 @@ pub struct RoutingSliceFetcher {
 }
 
 impl RoutingSliceFetcher {
+    /// `client_tls` is the configuration every remote dial uses; there is no
+    /// plaintext dial (ADR-1689 decision 4).
     pub fn new(
         self_id: Arc<OnceLock<Uuid>>,
         live_workers: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>,
         fragment_keys: Arc<Vec<[u8; 32]>>,
         local: FragmentService,
         metrics: Arc<FragmentMetrics>,
+        client_tls: tonic::transport::ClientTlsConfig,
     ) -> Self {
         RoutingSliceFetcher {
             self_id,
@@ -1714,10 +1707,7 @@ impl RoutingSliceFetcher {
             local,
             channels: Mutex::new(HashMap::new()),
             quarantine: Mutex::new(HashMap::new()),
-            // Plaintext dial by default (the pre-amendment layout). A coordinator
-            // running a dedicated fragment listener enables TLS via
-            // `with_client_tls`.
-            client_tls: None,
+            client_tls,
             max_slice_frames: codec::MAX_SLICE_RESPONSE_FRAMES,
             max_slice_bytes: codec::MAX_SLICE_RESPONSE_BYTES,
             metrics,
@@ -1740,22 +1730,6 @@ impl RoutingSliceFetcher {
     #[cfg(test)]
     fn with_max_slice_bytes(mut self, max_slice_bytes: u64) -> Self {
         self.max_slice_bytes = max_slice_bytes;
-        self
-    }
-
-    /// Enable TLS on this coordinator's outbound fragment dials (ADR-0071
-    /// amendment decision 1), pinning the operator CA and the fixed
-    /// [`FRAGMENT_TLS_SERVER_NAME`] server name. Set when the process runs a
-    /// `--fragment-listener`, so remote workers advertise their TLS fragment
-    /// endpoint. A `None` argument leaves the dial plaintext, so this is a no-op
-    /// under the pre-amendment layout. Added as a post-construction builder (not
-    /// a `new` parameter) so existing call sites that dial plaintext are
-    /// unchanged.
-    pub fn with_client_tls(
-        mut self,
-        client_tls: Option<tonic::transport::ClientTlsConfig>,
-    ) -> Self {
-        self.client_tls = client_tls;
         self
     }
 
@@ -2034,36 +2008,25 @@ impl RoutingSliceFetcher {
 
     /// Get (or open and cache) a channel to a remote worker's fragment endpoint.
     ///
-    /// When this coordinator runs a dedicated fragment listener (`client_tls` is
-    /// `Some`), the dial terminates TLS against the pinned operator CA with the
-    /// fixed [`FRAGMENT_TLS_SERVER_NAME`] server name (ADR-0071 amendment
-    /// decision 1): the coordinator authenticates that it reached a real cluster
-    /// worker before any capability crosses the wire. Under the pre-amendment
-    /// layout (`client_tls` is `None`) the dial stays plaintext `http://`,
-    /// byte-identical to before. The channel cache is unchanged either way.
+    /// The dial is `https://` and terminates mutual TLS against the pinned
+    /// operator CA with the fixed [`FRAGMENT_TLS_SERVER_NAME`] server name
+    /// (ADR-0071 amendment decision 1): the coordinator authenticates that it
+    /// reached a real cluster worker before any capability crosses the wire.
     async fn channel(&self, endpoint: &str) -> Result<Channel, DistribError> {
         if let Some(channel) = self.channels.lock().get(endpoint).cloned() {
             return Ok(channel);
         }
-        let scheme = if self.client_tls.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        let uri = format!("{scheme}://{endpoint}");
-        let mut endpoint_builder = Channel::from_shared(uri)
+        let channel = Channel::from_shared(format!("https://{endpoint}"))
             .map_err(|e| {
                 DistribError::Transport(format!("invalid worker endpoint {endpoint}: {e}"))
             })?
-            .connect_timeout(REMOTE_CONNECT_TIMEOUT);
-        if let Some(tls) = &self.client_tls {
-            endpoint_builder = endpoint_builder.tls_config(tls.clone()).map_err(|e| {
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+            .tls_config(self.client_tls.clone())
+            .map_err(|e| {
                 DistribError::Transport(format!(
                     "failed to configure fragment TLS for {endpoint}: {e}"
                 ))
-            })?;
-        }
-        let channel = endpoint_builder
+            })?
             .connect()
             .await
             .map_err(|e| DistribError::Transport(format!("connect to {endpoint} failed: {e}")))?;
@@ -2895,7 +2858,8 @@ mod tests {
             )]);
         let resolver: Arc<dyn TenantResolver> =
             Arc::new(ravel_query::http::StaticBearerTokenResolver::new(tokens));
-        let service = service_with_admission(metrics.clone(), admission.clone(), resolver, now);
+        let service = service_with_admission(metrics.clone(), admission.clone(), resolver, now)
+            .with_role(FragmentListenerRole::PublicFederation);
 
         // Saturate and permanently hold the Pinned class: an intra-cluster
         // fan-out backlog at the cap, forever.
@@ -3141,6 +3105,7 @@ mod tests {
             Arc::new(vec![key_new, key_old]),
             test_service(metrics.clone()),
             metrics,
+            test_client_tls(),
         );
         let tenant = [4u8; 16];
         let query = [5u8; 16];
@@ -3186,7 +3151,6 @@ mod tests {
             let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
-                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: version,
                 started_unix_ns: 0,
             }])));
@@ -3196,6 +3160,7 @@ mod tests {
                 test_keys(),
                 test_service(metrics.clone()),
                 metrics.clone(),
+                test_client_tls(),
             )
         };
 
@@ -3230,6 +3195,7 @@ mod tests {
             test_keys(),
             service,
             metrics.clone(),
+            test_client_tls(),
         );
 
         // No live workers: the router owns nothing remotely, so the slice runs
@@ -3259,7 +3225,6 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
-                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -3268,13 +3233,18 @@ mod tests {
                 // Reserved-for-docs TEST-NET address that never accepts a
                 // connection, so any slice mapped here fails at transport.
                 fragment_endpoint: "192.0.2.1:9".to_string(),
-                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
         ])));
-        let fetcher =
-            RoutingSliceFetcher::new(self_cell, live, test_keys(), service, metrics.clone());
+        let fetcher = RoutingSliceFetcher::new(
+            self_cell,
+            live,
+            test_keys(),
+            service,
+            metrics.clone(),
+            test_client_tls(),
+        );
 
         // Pinned BEFORE the loop runs, on purpose. Once the loop's first
         // dead-mapped tenant quarantines the endpoint, the remote drops out of
@@ -3379,14 +3349,12 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
-                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
-                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -3397,6 +3365,7 @@ mod tests {
             test_keys(),
             service,
             metrics.clone(),
+            test_client_tls(),
         );
 
         // Find a tenant whose unit maps to the remote worker (proven by a
@@ -3420,7 +3389,6 @@ mod tests {
         *live.write() = Arc::new(vec![QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
-            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         }]);
@@ -3480,7 +3448,6 @@ mod tests {
         let self_record = QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
-            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -3489,7 +3456,6 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
-                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -3500,6 +3466,7 @@ mod tests {
             test_keys(),
             service,
             metrics.clone(),
+            test_client_tls(),
         );
 
         // Step 1: find a tenant whose unit maps to the dead remote (proven by a
@@ -3581,7 +3548,6 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
-                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 1_000,
             },
@@ -3633,14 +3599,12 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
-                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
-                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -3651,6 +3615,7 @@ mod tests {
             test_keys(),
             service,
             metrics.clone(),
+            test_client_tls(),
         );
 
         // Drive a real transport-failure quarantine mark: find a tenant whose
@@ -3740,7 +3705,6 @@ mod tests {
         let self_record = QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
-            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -3749,7 +3713,6 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
-                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -3760,6 +3723,7 @@ mod tests {
             test_keys(),
             service,
             metrics.clone(),
+            test_client_tls(),
         );
 
         // Quarantine the dead endpoint (a query whose unit maps to it falls back).
@@ -3800,11 +3764,7 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults(
-            "127.0.0.1:7000",
-            "127.0.0.1:7100",
-            codec::PROTOCOL_VERSION,
-        );
+        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION);
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -3825,11 +3785,7 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults(
-            "127.0.0.1:7001",
-            "127.0.0.1:7101",
-            codec::PROTOCOL_VERSION,
-        );
+        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -3870,7 +3826,6 @@ mod tests {
         for port in 0..3u16 {
             let dead = QueryWorkers::with_defaults(
                 format!("127.0.0.1:{}", 7200 + port),
-                format!("127.0.0.1:{}", 7300 + port),
                 codec::PROTOCOL_VERSION,
             );
             dead.write_heartbeat(&memory, now_ns - 10 * H_NS)
@@ -3892,7 +3847,6 @@ mod tests {
 
         let workers = Arc::new(QueryWorkers::with_defaults(
             "127.0.0.1:7000",
-            "127.0.0.1:7100",
             codec::PROTOCOL_VERSION,
         ));
         let interval = workers.heartbeat_interval();
@@ -3910,11 +3864,7 @@ mod tests {
             tokio::time::sleep(interval).await;
         }
 
-        let observer = QueryWorkers::with_defaults(
-            "127.0.0.1:7001",
-            "127.0.0.1:7101",
-            codec::PROTOCOL_VERSION,
-        );
+        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
         let self_id = workers.process_id().to_string();
         let live = observer
             .live_set(store.as_ref(), now_ns)
@@ -3976,20 +3926,24 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
-                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
-                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
         ])));
-        let fetcher =
-            RoutingSliceFetcher::new(self_cell, live, test_keys(), service, metrics.clone());
+        let fetcher = RoutingSliceFetcher::new(
+            self_cell,
+            live,
+            test_keys(),
+            service,
+            metrics.clone(),
+            test_client_tls(),
+        );
 
         // Outside a scope: recording is a no-op (must not panic, records
         // nothing).
@@ -4065,7 +4019,6 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> = memory.clone();
         let workers = Arc::new(QueryWorkers::new(
             "127.0.0.1:7000",
-            "127.0.0.1:7100",
             codec::PROTOCOL_VERSION,
             Duration::ZERO,
             3,
@@ -4211,6 +4164,7 @@ mod tests {
             metrics,
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
+        .with_role(FragmentListenerRole::PublicFederation)
     }
 
     /// A resolve-scope request naming `wire_tenant` on the wire, over a window
@@ -5372,13 +5326,21 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
 -----END CERTIFICATE-----
 ";
 
-    /// Stand up a real TLS-terminating fragment listener over `service` (mounted
-    /// with the `DedicatedFragment` role, exactly as `lib.rs` mounts it) on an
-    /// ephemeral loopback port. Returns the bound address and a shutdown handle;
-    /// dropping the handle without sending stops the task at test end.
-    async fn spawn_tls_fragment_listener(
-        service: FragmentService,
-    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    /// The coordinator-side TLS configuration over the test material, exactly
+    /// what [`fragment_client_tls`] builds from a configured listener.
+    fn test_client_tls() -> tonic::transport::ClientTlsConfig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        fragment_client_tls(&crate::config::FragmentListenerSettings {
+            addr: "127.0.0.1:0".parse().expect("addr"),
+            tls_cert_pem: TEST_FRAGMENT_SERVER_CERT_PEM.as_bytes().to_vec(),
+            tls_key_pem: TEST_FRAGMENT_SERVER_KEY_PEM.as_bytes().to_vec(),
+            tls_ca_pem: TEST_FRAGMENT_CA_PEM.as_bytes().to_vec(),
+        })
+    }
+
+    /// A server builder terminating mutual TLS with the test material, as
+    /// `lib.rs` configures the dedicated fragment listener (issue #1690).
+    fn tls_server_builder() -> tonic::transport::Server {
         // The unit tests do not call `start()`, which installs the provider in a
         // real process; install it here too (idempotent, `Err` when already set).
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -5386,22 +5348,28 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             TEST_FRAGMENT_SERVER_CERT_PEM,
             TEST_FRAGMENT_SERVER_KEY_PEM,
         );
-        // Mutual TLS, exactly as `lib.rs` configures it (issue #1690): the
-        // pinned CA is both what this listener proves itself with and the
-        // roster of clients it will complete a handshake with.
         let tls = tonic::transport::ServerTlsConfig::new()
             .identity(identity)
             .client_ca_root(tonic::transport::Certificate::from_pem(
                 TEST_FRAGMENT_CA_PEM,
             ));
-        let server = tonic::transport::Server::builder()
+        tonic::transport::Server::builder()
             .tls_config(tls)
             .expect("server TLS config")
-            .add_service(
-                service
-                    .with_role(FragmentListenerRole::DedicatedFragment)
-                    .into_server(),
-            );
+    }
+
+    /// Stand up a real TLS-terminating fragment listener over `service` (mounted
+    /// with the `DedicatedFragment` role, exactly as `lib.rs` mounts it) on an
+    /// ephemeral loopback port. Returns the bound address and a shutdown handle;
+    /// dropping the handle without sending stops the task at test end.
+    async fn spawn_tls_fragment_listener(
+        service: FragmentService,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let server = tls_server_builder().add_service(
+            service
+                .with_role(FragmentListenerRole::DedicatedFragment)
+                .into_server(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -5478,20 +5446,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             frames.push(frame);
         }
         decode_slice_frames(frames).expect("frames decode")
-    }
-
-    /// Drive `service.fetch` in-process (no metadata) and decode the frames.
-    async fn fetch_pinned_inproc(
-        service: &FragmentService,
-        request: pb::FetchRequest,
-    ) -> Result<SliceResponse, tonic::Status> {
-        let response = service.fetch(tonic::Request::new(request)).await?;
-        let mut frames = Vec::new();
-        let mut stream = response.into_inner();
-        while let Some(frame) = stream.next().await {
-            frames.push(frame.expect("in-crate stream never errors"));
-        }
-        Ok(decode_slice_frames(frames).expect("frames decode"))
     }
 
     /// End to end over a REAL TLS channel: a dedicated fragment listener with
@@ -5688,8 +5642,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         );
     }
 
-    /// The public gRPC listener (mounted `PublicFederation` when a dedicated
-    /// fragment listener exists) refuses a `Pinned` fetch with a typed
+    /// The public gRPC listener (mounted `PublicFederation`) refuses a `Pinned` fetch with a typed
     /// `PermissionDenied`, whether or not it carries a valid capability: the scope
     /// is rejected before the capability is inspected (ADR-0071 amendment decision
     /// 1 tests deliverable 5).
@@ -5724,54 +5677,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             err.message().contains("public gRPC listener"),
             "the rejection names the surface: {}",
             err.message()
-        );
-    }
-
-    /// The capability mechanism and the transport are genuinely decoupled: one
-    /// capability, minted with no knowledge of which listener will serve it
-    /// (the mint side is `RoutingSliceFetcher`, transport-agnostic), verifies
-    /// byte-for-byte the same on the new dedicated `Pinned` listener as on the
-    /// legacy combined surface (ADR-0071 amendment decision 1 tests deliverable
-    /// 6). This proves the two listeners are not incompatible islands.
-    #[tokio::test]
-    async fn capability_is_decoupled_from_listener_transport() {
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let tenant = ravel_types::TenantId::new("decoupled-tenant".to_string());
-        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
-        let now = 4 * HOUR_NS;
-        let seg = only_segment(&store, tenant.hash(), now).await;
-        let envelope = TimeRange {
-            start_ns: seg.min_event_ts_ns,
-            end_ns: seg.max_event_ts_ns,
-        };
-        let query_id = [0xC0; 16];
-        let capability = mint(
-            &TEST_KEY,
-            tenant.hash().0,
-            metrics_signal(),
-            query_id,
-            now + HOUR_NS,
-        );
-        let mut request = pinned_over_window(tenant.hash(), &seg, envelope);
-        request.query_id = query_id.to_vec();
-        request.fragment_capability = capability;
-
-        let dedicated =
-            pinned_service(store.clone(), now).with_role(FragmentListenerRole::DedicatedFragment);
-        let on_dedicated = fetch_pinned_inproc(&dedicated, request.clone())
-            .await
-            .expect("the dedicated Pinned listener accepts the capability");
-        assert_eq!(on_dedicated.status, pb::status::Code::Ok);
-
-        let combined = pinned_service(store, now).with_role(FragmentListenerRole::Combined);
-        let on_combined = fetch_pinned_inproc(&combined, request)
-            .await
-            .expect("the legacy combined surface accepts the identical capability");
-        assert_eq!(on_combined.status, pb::status::Code::Ok);
-
-        assert_eq!(
-            on_dedicated.series_returned, on_combined.series_returned,
-            "the same capability yields the same result regardless of transport"
         );
     }
 
@@ -5856,7 +5761,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         }
     }
 
-    /// Stand up a [`FrameFlood`] on an ephemeral plaintext loopback port.
+    /// Stand up a [`FrameFlood`] on an ephemeral TLS loopback port.
     /// Returns its `host:port`, the produced-message counter, and a shutdown
     /// handle whose drop stops the task at test end.
     async fn spawn_frame_flood(
@@ -5866,12 +5771,34 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         Arc<std::sync::atomic::AtomicUsize>,
         tokio::sync::oneshot::Sender<()>,
     ) {
+        spawn_frame_flood_on(tls_server_builder(), total).await
+    }
+
+    /// [`spawn_frame_flood`] in plaintext, as a federation peer's public gRPC
+    /// listener is dialed when its `--remote-cluster` spec opts out of TLS.
+    async fn spawn_plaintext_frame_flood(
+        total: usize,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        spawn_frame_flood_on(tonic::transport::Server::builder(), total).await
+    }
+
+    async fn spawn_frame_flood_on(
+        mut builder: tonic::transport::Server,
+        total: usize,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
         let produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server =
-            tonic::transport::Server::builder().add_service(SeriesFetchServer::new(FrameFlood {
-                total,
-                produced: Arc::clone(&produced),
-            }));
+        let server = builder.add_service(SeriesFetchServer::new(FrameFlood {
+            total,
+            produced: Arc::clone(&produced),
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -5905,7 +5832,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
             process_id: uuid::Uuid::from_u128(2).to_string(),
             fragment_endpoint: endpoint.to_string(),
-            flight_sql_endpoint: endpoint.to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         }])));
@@ -5915,6 +5841,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             test_keys(),
             test_service(metrics.clone()).with_engine_config(engine),
             metrics,
+            test_client_tls(),
         )
     }
 
@@ -5965,6 +5892,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 test_keys(),
                 test_service(Arc::new(FragmentMetrics::new())),
                 Arc::new(FragmentMetrics::new()),
+                test_client_tls(),
             )
             .max_slice_frames,
             codec::MAX_SLICE_RESPONSE_FRAMES,
@@ -6181,7 +6109,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         const TOTAL: usize = 20_000;
         const MAX_BYTES: u64 = 32 * 1024;
 
-        let (endpoint, produced, _shutdown) = spawn_frame_flood(TOTAL).await;
+        let (endpoint, produced, _shutdown) = spawn_plaintext_frame_flood(TOTAL).await;
         let channel = Channel::from_shared(format!("http://{endpoint}"))
             .expect("valid uri")
             .connect_timeout(REMOTE_CONNECT_TIMEOUT)
@@ -6379,7 +6307,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         }
     }
 
-    /// Stand up a [`ScriptedWorker`] on an ephemeral plaintext loopback port.
+    /// Stand up a [`ScriptedWorker`] on an ephemeral TLS loopback port.
     /// Returns its `host:port`, its attempt counter, and a shutdown handle whose
     /// drop stops the task at test end.
     async fn spawn_scripted(
@@ -6388,14 +6316,12 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         ending: Ending,
     ) -> (String, Arc<AtomicU64>, tokio::sync::oneshot::Sender<()>) {
         let attempts = Arc::new(AtomicU64::new(0));
-        let server = tonic::transport::Server::builder().add_service(SeriesFetchServer::new(
-            ScriptedWorker {
-                spend,
-                code,
-                ending,
-                attempts: Arc::clone(&attempts),
-            },
-        ));
+        let server = tls_server_builder().add_service(SeriesFetchServer::new(ScriptedWorker {
+            spend,
+            code,
+            ending,
+            attempts: Arc::clone(&attempts),
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -6424,6 +6350,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             test_keys(),
             pinned_service(store, now_ns),
             Arc::new(FragmentMetrics::new()),
+            test_client_tls(),
         )
     }
 
@@ -7148,7 +7075,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
             process_id: uuid::Uuid::from_u128(7).to_string(),
             fragment_endpoint: endpoint.clone(),
-            flight_sql_endpoint: endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         }])));
@@ -7158,6 +7084,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             test_keys(),
             pinned_service(store, now),
             Arc::new(FragmentMetrics::new()),
+            test_client_tls(),
         );
 
         let sink = FragmentStatsSink::new();
@@ -7223,6 +7150,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 test_keys(),
                 pinned_service(store.clone(), now),
                 Arc::new(FragmentMetrics::new()),
+                test_client_tls(),
             ),
             expiries: Mutex::new(Vec::new()),
         });
@@ -7673,9 +7601,13 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let mut request = fx.resolve_request.clone();
         request.deadline_unix_ns = EXPIRY_NOW_NS;
 
-        let response = fetch_decoded(&fx.service, request, PEER_TOKEN)
-            .await
-            .expect("refused in-band");
+        let response = fetch_decoded(
+            &fx.service.with_role(FragmentListenerRole::PublicFederation),
+            request,
+            PEER_TOKEN,
+        )
+        .await
+        .expect("refused in-band");
 
         assert_eq!(response.status, pb::status::Code::Timeout);
         assert_eq!(
@@ -7705,7 +7637,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
 
         let control = expiry_fixture("federated-control").await;
         let served = fetch_decoded(
-            &control.service,
+            &control
+                .service
+                .with_role(FragmentListenerRole::PublicFederation),
             control.resolve_request.clone(),
             PEER_TOKEN,
         )
@@ -7723,7 +7657,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let gate = fx
             .fault
             .hold(Op::Get, Some(fx.data_key.clone()), Occurrence::Nth(1));
-        let service = fx.service.clone();
+        let service = fx.service.with_role(FragmentListenerRole::PublicFederation);
         let request = fx.resolve_request.clone();
         let fetch = tokio::spawn(async move { fetch_decoded(&service, request, PEER_TOKEN).await });
         gate.wait_until_held(1).await;
@@ -7819,7 +7753,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let entry_ns = fx.clock.now_ns();
         let request_deadline = Duration::from_secs(5);
         let peer = Arc::new(SpendingPeer {
-            service: fx.service.clone(),
+            service: fx.service.with_role(FragmentListenerRole::PublicFederation),
             clock: fx.clock.clone(),
             first_spend: Duration::from_secs(3),
             deadlines: Mutex::new(Vec::new()),
@@ -7923,7 +7857,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let worker = |id: u128, endpoint: &str| QueryWorkerRecord {
             process_id: uuid::Uuid::from_u128(id).to_string(),
             fragment_endpoint: endpoint.to_string(),
-            flight_sql_endpoint: endpoint.to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -7937,6 +7870,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             test_keys(),
             pinned_service(local_store.clone(), now),
             metrics.clone(),
+            test_client_tls(),
         ));
         let distributed = Arc::new(ravel_query::distrib::Distributed::new(
             routing.clone(),
@@ -8007,7 +7941,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             .map(|(i, endpoint)| QueryWorkerRecord {
                 process_id: uuid::Uuid::from_u128(100 + i as u128).to_string(),
                 fragment_endpoint: endpoint.to_string(),
-                flight_sql_endpoint: endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             })
@@ -8018,6 +7951,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             test_keys(),
             pinned_service(store, now_ns),
             Arc::new(FragmentMetrics::new()),
+            test_client_tls(),
         )
     }
 

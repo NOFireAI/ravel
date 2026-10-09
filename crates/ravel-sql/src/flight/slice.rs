@@ -19,8 +19,9 @@ use crate::flight_ticket::{FlightTicket, FlightTicketError, SqlTicketKeys, Ticke
 /// supplies it when it mounts the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FlightListenerRole {
-    /// Both the client Flight SQL surface and slice `DoGet`, on one listener.
-    /// The layout of a process without a dedicated fragment listener.
+    /// Both the client Flight SQL surface and slice `DoGet`, on one listener:
+    /// the default for an embedding that mounts the service once. ravel-server
+    /// mounts `ClientOnly` and `SliceOnly` instead (ADR-1689 decision 4).
     #[default]
     Combined,
     /// The public listener once a dedicated fragment listener is configured:

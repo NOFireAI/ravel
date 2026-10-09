@@ -20,6 +20,9 @@
 #![cfg(feature = "flight-sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/fragment_tls.rs"]
+mod fragment_tls;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,25 +83,46 @@ fn key_file(keys: &[&str]) -> tempfile::NamedTempFile {
     file
 }
 
+/// A file holding `contents`.
+fn pem_file(contents: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().expect("temp PEM file");
+    std::fs::write(file.path(), contents).expect("write");
+    file
+}
+
 /// The distributed settings a real `ravel-server` process builds from its flags,
-/// with the cost gate forced open so every statement fans out.
+/// with `--fragment-listener` on an ephemeral loopback port and the cost gate
+/// forced open so every statement fans out. `--listen-http` and
+/// `--listen-grpc` name fixed ports only so validation sees distinct
+/// listeners; the server binds the ephemeral ones in [`ServerConfig`].
 fn distrib_settings(
     fragment_key_file: &tempfile::NamedTempFile,
     sql_ticket_key_file: &tempfile::NamedTempFile,
 ) -> DistribSettings {
+    let cert = pem_file(fragment_tls::TEST_FRAGMENT_CERT_PEM);
+    let key = pem_file(fragment_tls::TEST_FRAGMENT_KEY_PEM);
+    let ca = pem_file(fragment_tls::TEST_FRAGMENT_CA_PEM);
     let cli = Cli::try_parse_from([
         "ravel-server",
         "--mode",
         "all",
         "--listen-http",
-        "127.0.0.1:0",
+        "127.0.0.1:8080",
         "--listen-grpc",
-        "127.0.0.1:0",
+        "127.0.0.1:4317",
         "--distributed-query",
         "--fragment-key-file",
         fragment_key_file.path().to_str().expect("utf8"),
         "--sql-ticket-key-file",
         sql_ticket_key_file.path().to_str().expect("utf8"),
+        "--fragment-listener",
+        "127.0.0.1:0",
+        "--fragment-tls-cert",
+        cert.path().to_str().expect("utf8"),
+        "--fragment-tls-key",
+        key.path().to_str().expect("utf8"),
+        "--fragment-tls-ca",
+        ca.path().to_str().expect("utf8"),
         "--distribute-bytes-threshold",
         "0",
         "--distribute-segments-threshold",

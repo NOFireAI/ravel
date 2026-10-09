@@ -1475,6 +1475,8 @@ fn ddl_metrics_router(
         distrib: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_rejects: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_tls_dials: None,
         durable_auth: None,
         ingest_byte_metrics: Arc::new(ravel_server::ingest_byte_metrics::IngestByteMetrics::new()),
         normalize_reject_metrics: Arc::new(
@@ -4264,7 +4266,7 @@ mod flight_wire {
             let ceiling = ravel_server::gc_config::flight_ceiling(
                 &ravel_maintain::GcConfigValues::maintain_defaults(),
             );
-            let service = ravel_server::flight::service(state, ceiling, None);
+            let service = ravel_server::flight::service(state, ceiling);
             let task = tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(service)

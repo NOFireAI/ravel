@@ -426,9 +426,6 @@ does not expose yet:
 - The operator gives the query Deployment no `--listen-grpc`, so its Flight
   SQL service listens on loopback only.
 - The HTTP SQL endpoint executes every statement locally.
-- The Flight SQL address that each query pod publishes in its worker record
-  (its pod IP on port 4317) is not reachable from other pods. Nothing dials
-  it while every pod runs the fragment listener.
 
 ```yaml
 spec:

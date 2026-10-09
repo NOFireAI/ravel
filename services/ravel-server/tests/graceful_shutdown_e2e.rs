@@ -12,6 +12,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/fragment_tls.rs"]
+mod fragment_tls;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +60,7 @@ static DRAIN_OVERRUN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 
 /// The cluster fragment key the distributed test mints capabilities under.
 const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
+const SQL_TICKET_KEY: [u8; 32] = [0x5c; 32];
 
 fn now_ns() -> i64 {
     std::time::SystemTime::now()
@@ -215,7 +219,7 @@ async fn start_server_configured(
 fn always_distribute_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
-        sql_ticket_keys: None,
+        sql_ticket_keys: Some(vec![SQL_TICKET_KEY]),
         max_inflight_fragments: 32,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
@@ -223,7 +227,7 @@ fn always_distribute_settings() -> DistribSettings {
             min_segments: 0,
             max_parallel_slices: 8,
         },
-        fragment_listener: None,
+        fragment_listener: fragment_tls::listener_settings(),
         advertise_endpoint: None,
     }
 }
@@ -270,7 +274,7 @@ async fn worker_records(store: &dyn ObjectStoreBackend) -> Vec<QueryWorkerRecord
 
 /// A reader that is not the server under test, as a sibling coordinator is.
 fn sibling_reader() -> QueryWorkers {
-    QueryWorkers::with_defaults("127.0.0.1:1", "127.0.0.1:2", 1)
+    QueryWorkers::with_defaults("127.0.0.1:1", 1)
 }
 
 /// A buffered-mode ingest ack is written to the shard buffer and acked before

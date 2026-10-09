@@ -7377,6 +7377,30 @@ fn render_sql_slice_reject_family(
     }
 }
 
+/// The ADR-1689 decision 1 SQL slice TLS dial counter: one sample under
+/// `mode`, rendered whenever the process built the Flight service, zero until
+/// its coordinator fans a slice out. `None` (no Flight service in this
+/// process) renders nothing.
+#[cfg(feature = "flight-sql")]
+fn render_sql_slice_tls_dial_family(out: &mut String, mode: Mode, dials: Option<u64>) {
+    let Some(dials) = dials else {
+        return;
+    };
+    write_header(
+        out,
+        "ravel_sql_slice_tls_dials_total",
+        "Outbound SQL slice DoGet fetches this coordinator dialed over TLS to a worker's \
+         dedicated fragment listener (ADR-1689 decision 1).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_sql_slice_tls_dials_total",
+        &[Label::Mode(mode)],
+        dials,
+    );
+}
+
 // One argument per metric source, each a distinct snapshot type: bundling
 // them into one struct would only move the same list behind a name without
 // removing a caller's need to build every field, so the sources stay
@@ -7740,6 +7764,12 @@ pub struct MetricsState {
     /// `ravel_sql_slice_rejects_total` off the exposition.
     #[cfg(feature = "flight-sql")]
     pub sql_slice_rejects: Option<ravel_sql::SliceRejectCounters>,
+    /// SQL slice fetches this coordinator dialed over TLS (ADR-1689 decision
+    /// 1), the counter the Flight service records into. `Some` only when the
+    /// process built the Flight service; `None` leaves
+    /// `ravel_sql_slice_tls_dials_total` off the exposition.
+    #[cfg(feature = "flight-sql")]
+    pub sql_slice_tls_dials: Option<ravel_sql::SliceTlsDialCounter>,
     /// The durable `sys/auth` background-refresh state (ADR-0066 decision 6),
     /// read at scrape time for its three refresh-loop counters. `Some` only
     /// when `--deployment-key` is set in a request-serving mode
@@ -8110,6 +8140,15 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .as_ref()
             .map(SqlSliceRejectSnapshot::from_counters)
             .as_ref(),
+    );
+    #[cfg(feature = "flight-sql")]
+    render_sql_slice_tls_dial_family(
+        &mut body,
+        state.mode,
+        state
+            .sql_slice_tls_dials
+            .as_ref()
+            .map(ravel_sql::SliceTlsDialCounter::get),
     );
     // Appended for the same reason: DDL exists only in a `sql` build.
     #[cfg(feature = "sql")]
@@ -12117,6 +12156,31 @@ mod tests {
         assert_eq!(off, "", "no Flight service must render no family");
     }
 
+    /// ADR-1689 decision 1: the SQL slice TLS dial counter renders one sample
+    /// under exactly `{mode}` carrying the count, and nothing at all for a
+    /// process that built no Flight service.
+    #[cfg(feature = "flight-sql")]
+    #[test]
+    fn sql_slice_tls_dial_family_renders_one_sample() {
+        let mut body = String::new();
+        render_sql_slice_tls_dial_family(&mut body, Mode::Query, Some(13));
+        assert_eq!(
+            body.matches("# TYPE ravel_sql_slice_tls_dials_total counter\n")
+                .count(),
+            1,
+            "exactly one counter TYPE header:\n{body}"
+        );
+        let samples: Vec<&str> = body.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            samples,
+            vec!["ravel_sql_slice_tls_dials_total{mode=\"query\"} 13"]
+        );
+
+        let mut off = String::new();
+        render_sql_slice_tls_dial_family(&mut off, Mode::Query, None);
+        assert_eq!(off, "", "no Flight service must render no family");
+    }
+
     /// The three DDL families (issue #2374): one counter header each, the
     /// bytes HELP carrying `DDL_COST_BYTES` word for word, each statement row
     /// under `{mode, tenant_hash, kind, outcome}`, and every (phase, op) and
@@ -14053,6 +14117,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             distrib: None,
             #[cfg(feature = "flight-sql")]
             sql_slice_rejects: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_tls_dials: None,
             durable_auth: None,
             ingest_byte_metrics: Arc::new(crate::ingest_byte_metrics::IngestByteMetrics::new()),
             normalize_reject_metrics: Arc::new(
