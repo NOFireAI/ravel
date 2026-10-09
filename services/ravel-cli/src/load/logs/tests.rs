@@ -2241,6 +2241,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         RlogZstdLevel::DEFAULT,
         UNREACHED_REFLUSH_PERIOD,
         None,
+        false,
     );
 
     let driver = async {

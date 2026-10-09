@@ -763,6 +763,25 @@ enum Command {
         /// when it is set. `0` is rejected.
         #[arg(long, value_name = "BYTES")]
         load_memory_bytes: Option<u64>,
+        /// Fold the loaded tenant's catalog once the load succeeds (ADR-2677
+        /// decision 1), so the next query resolves the loaded hours from the
+        /// snapshot instead of listing them. The loader asserts that it was
+        /// the only writer for this tenant: no other writer will publish into
+        /// any hour up to and including the latest ingest hour the load
+        /// wrote. The fold seals through that hour without moving the clock,
+        /// and its time is part of the summary's elapsed. A fold with nothing
+        /// left to seal is a success; a failed fold fails the load, though
+        /// every loaded object is already durable and `catalog fold --signal
+        /// logs --writers-stopped` seals them once the cause is fixed. Logs
+        /// only: a metrics or spans load with this flag is refused before
+        /// anything is written.
+        ///
+        /// UNSAFE under a live writer: a commit another writer publishes into
+        /// a sealed hour is never picked up by a later incremental fold and
+        /// stays invisible to queries without a commit token until HEAD is
+        /// rebuilt. Use it only when this load is the tenant's sole writer.
+        #[arg(long)]
+        fold_after_load: bool,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -1931,6 +1950,21 @@ enum CatalogCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// Seal through the hour this fold runs in, as well as every hour the
+        /// seal margin seals. Asserts that no writer will publish into the
+        /// current hour or any earlier one, so a load that has finished can
+        /// be folded completely now instead of once the margin has passed its
+        /// last hour. The fold's clock is not moved; the report's
+        /// `seal_through_hour` names the hour applied. Combines with
+        /// `--max-flush-lifetime`. UNSAFE under a live writer: a commit record
+        /// published into a bucket this fold already sealed is never picked up
+        /// by a later incremental fold, which re-lists only hours after the
+        /// watermark, and stays invisible to queries that carry no commit
+        /// token until the HEAD is rebuilt. Use this only for a tenant known
+        /// quiescent, such as one whose bulk load has finished and whose
+        /// writer process has exited.
+        #[arg(long)]
+        writers_stopped: bool,
         /// Print the full `FoldReport` as JSON instead of the human-readable
         /// text report. Either form carries every counter on the report.
         #[arg(long)]
@@ -2122,10 +2156,11 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     shards,
                     signal,
                     max_flush_lifetime,
+                    writers_stopped,
                     json,
                     tenant_kms,
                 },
-        } => catalog::fold(
+        } => catalog::fold_with_writers_stopped(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -2133,6 +2168,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             shards,
             signal,
             max_flush_lifetime,
+            writers_stopped,
             now_ns()?,
             json,
         )
@@ -2826,6 +2862,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             max_flush_delay,
             zstd_level,
             load_memory_bytes,
+            fold_after_load,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -2845,6 +2882,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 max_flush_delay,
                 zstd_level,
                 load_memory_bytes,
+                fold_after_load,
                 now_ns()?,
             )
             .await;
