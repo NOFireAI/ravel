@@ -125,7 +125,6 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider, Checksum};
-use object_store::client::HttpConnector;
 use object_store::path::Path;
 use object_store::{
     ClientOptions, GetOptions as OsGetOptions, GetRange as OsGetRange,
@@ -158,7 +157,7 @@ mod list;
 use list::ListClient;
 
 mod connector;
-use connector::{GetObservation, ObservedStoreTime, S3HttpConnector};
+use connector::{GetObservation, ObservedStoreTime, S3HttpConnector, ShuffleResolver};
 
 use crate::instrument::{StoreMetrics, StoreOp};
 
@@ -881,6 +880,40 @@ fn client_options(http: &S3HttpConfig) -> ClientOptions {
         .with_default_headers(default_headers)
 }
 
+/// `User-Agent` of the ListObjectsV2 client's requests.
+const LIST_USER_AGENT: &str = concat!("ravel-object-store/", env!("CARGO_PKG_VERSION"));
+
+/// The reqwest client the ListObjectsV2 client sends through (ADR-2637
+/// decision 1): what `object_store` 0.14's `ClientOptions::client` builds
+/// from [`client_options`] and `allow_http`, less the default headers
+/// [`S3HttpConnector`] drops anyway, and with redirects off. `object_store`
+/// sets no redirect policy, so its client follows up to ten; a followed
+/// wrong-region 301 would fail with the target's signature error instead of
+/// the region hint, and would carry the signed request to another host.
+fn list_http_client(
+    http: &S3HttpConfig,
+    allow_http: bool,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(LIST_USER_AGENT)
+        .timeout(http.request_timeout)
+        .connect_timeout(http.connect_timeout)
+        .pool_idle_timeout(http.pool_idle_timeout)
+        .http2_keep_alive_interval(http.http2_keep_alive_interval)
+        .http2_keep_alive_timeout(http.http2_keep_alive_timeout)
+        .http2_keep_alive_while_idle(true)
+        // `ClientOptions` defaults to HTTP/1 only.
+        .http1_only()
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .dns_resolver(Arc::new(ShuffleResolver))
+        .https_only(!allow_http)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// S3 backend implementing [`ObjectStoreBackend`] over
 /// `object_store`'s `AmazonS3` client.
 pub struct S3Store {
@@ -943,9 +976,10 @@ pub struct S3Store {
     /// store; a caller holding only `dyn ObjectStoreBackend` does not.
     control_plane: Arc<BucketControlPlaneClient>,
     /// The raw-key ListObjectsV2 client behind `list`, `list_after` and
-    /// `list_delimited` (ADR-2637 decision 1). Its requests go through the
-    /// same [`S3HttpConnector`] as the data plane, so they are billed and
-    /// timed the same way.
+    /// `list_delimited` (ADR-2637 decision 1). Its requests are recorded by
+    /// the same [`S3HttpConnector`] as the data plane's, so they are billed
+    /// and timed the same way, over a client of their own that follows no
+    /// redirect ([`list_http_client`]).
     lister: Arc<ListClient>,
 }
 
@@ -1041,9 +1075,11 @@ impl S3Store {
         .map_err(|e| {
             StoreError::Permanent(format!("failed to build bucket control-plane client: {e}"))
         })?;
-        let list_http = S3HttpConnector::new(Arc::clone(&metrics), Arc::clone(&store_time))
-            .connect(&client_options(&http).with_allow_http(config.allow_http))
-            .map_err(|e| StoreError::Permanent(format!("failed to build S3 list client: {e}")))?;
+        let list_http = S3HttpConnector::new(Arc::clone(&metrics), Arc::clone(&store_time)).wrap(
+            list_http_client(&http, config.allow_http).map_err(|e| {
+                StoreError::Permanent(format!("failed to build S3 list client: {e}"))
+            })?,
+        );
         let lister = Arc::new(ListClient::new(
             list_http,
             Arc::clone(&control_plane_credentials),

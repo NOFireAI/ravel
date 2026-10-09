@@ -959,11 +959,10 @@ mod tests {
     /// operations, with the 8 concurrent create-if-absent PUTs as one round
     /// trip, and adding the budget this fresh bucket does not exercise (up to
     /// 3 retries for each of the 8 writers, and the get and CAS put that
-    /// replace an older `sys/qualification` record), that is 2089, 6 more
-    /// than the 2083 the operator's deadline arithmetic names; at its 500 ms
-    /// per operation the 6 take 3 s of the 140 s per-attempt allowance. The 8
-    /// HEADs the S3 store sends to disambiguate each losing create-if-absent
-    /// PUT are not in that figure, and are pinned apart from it.
+    /// replace an older `sys/qualification` record), that is 2089, the figure
+    /// the operator's deadline arithmetic names. The 8 HEADs the S3 store
+    /// sends to disambiguate each losing create-if-absent PUT are not in that
+    /// figure, and are pinned apart from it.
     #[tokio::test]
     async fn one_attempt_at_the_default_page_size_issues_the_budgeted_requests() {
         use crate::fake_s3::{Echo, spawn};

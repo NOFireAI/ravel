@@ -1172,34 +1172,31 @@ multipart-complete visibility as probes for this suite. Cross-page listing
 is the `CrossPageListing` probe above; multipart-complete visibility is
 still not implemented.
 
-`CONFORMANCE_SUITE_VERSION` is `2`. Version 1 checked four properties (the two
+`CONFORMANCE_SUITE_VERSION` is `3`. Version 1 checked four properties (the two
 conditional-write modes, read-after-write, and list-after-write); version 2 is
 the eight-probe suite in the list above, adding concurrent single-winner create,
-lexicographic listing order, cross-page listing, and delete visibility. A
-record written under version 1 was never checked against those four, so
-ravel-server refuses startup on it (a stale record that reads as a current pass
-is worse than none: a missing record fails closed, a stale one passes). A
-bucket qualified under the old suite must be re-qualified. `ravel-cli store
-qualify` does that in place: a re-run overwrites a below-floor
-`sys/qualification` record with the current pass, and leaves an
-equal-or-newer record untouched. Re-recording is the only way to clear the
-refusal, because the record is written with `CreateIfAbsent` and cannot
-otherwise be replaced.
+lexicographic listing order, cross-page listing, and delete visibility.
+Version 3 adds `ListedKeysRoundTripPlusAndSpace`: keys holding `+` and a space
+must list back verbatim. A record written under an older version was never
+checked against what the newer one adds, so ravel-server refuses startup on it
+as stale (a stale record that reads as a current pass is worse than none: a
+missing record fails closed, a stale one passes). Upgrading to a build with
+version 3 therefore refuses startup on every bucket holding a version 2 record
+until it is re-qualified. `ravel-cli store qualify` from the new build does
+that in place: a re-run overwrites a below-floor `sys/qualification` record
+with the current pass, and leaves an equal-or-newer record untouched.
+Re-recording is the only way to clear the refusal, because the record is
+written with `CreateIfAbsent` and cannot otherwise be replaced.
 
-The three ADR-2637 properties do not bump it either.
+The other two ADR-2637 properties did not need a bump.
 `OperationsRefuseUnaddressableKeys` gates every run, but it checks the Ravel
 binary's own refusal, which holds before any request reaches the bucket, so
 a record written without it says nothing false about the bucket.
 `UnaddressableKeysAreCounted` needs a seeder, which `ravel-cli store
 qualify` does not pass, so a qualification run leaves it in `not_run`.
-`ListedKeysRoundTripPlusAndSpace` does check the bucket and was added
-without a bump, so a version 2 record taken before it existed does not
-attest it, and a re-run of `ravel-cli store qualify` leaves that record in
-place (the once-per-bucket no-op below); the re-run's printed probe results
-are the evidence for it.
 
 Conditional reads are deliberately not a gating property, and
-`CONFORMANCE_SUITE_VERSION` stays at `2` for them. The suite qualifies the
+`CONFORMANCE_SUITE_VERSION` was not bumped for them. The suite qualifies the
 bucket Ravel writes, and nothing on Ravel's own write or read path issues a
 pinned read: every object Ravel writes is immutable. The store that needs
 qualifying for `get_pinned` is a granted external bucket, which is a
@@ -1225,7 +1222,7 @@ JSON record to `sys/qualification` via `CreateIfAbsent`:
 
 ```json
 {
-  "suite_version": 2,
+  "suite_version": 3,
   "backend_identity": "s3://<bucket>@<endpoint>",
   "qualified_unix_ns": 1234567890000000000,
   "passed_properties": ["conditional_write_create_if_absent", "..."]
@@ -1273,8 +1270,9 @@ five list-after-write, one concurrent-create, and the delete probe's
 surviving key): 2018 objects at the default page size of 1000, against 24
 before the page size became a parameter. The delete probe's second key, the
 three `ListedKeysRoundTripPlusAndSpace` keys and the stored-checksum echo
-probe's object are the only scratch objects a run deletes; the echo object stays too when its delete is refused, and the run
-prints a note naming it. Nothing else is deleted afterward and each run's
+probe's object are the only scratch objects a run deletes; the echo object
+stays too when its delete is refused, and the run prints a note naming it.
+Nothing else is deleted afterward and each run's
 prefix is unique, so this is unbounded untracked
 storage a runbook should sweep periodically (delete `sys/qualify/` between
 runs), not a correctness issue. A bucket qualified with a small
@@ -1283,16 +1281,10 @@ less.
 
 A `sys/qualification` record written by this suite before the page size
 became a parameter recorded a pass that never crossed a real pagination
-boundary, so it is weaker evidence than its version number suggests.
-`CONFORMANCE_SUITE_VERSION` deliberately stays at `2`: bumping it would make
-`ravel-server` refuse startup on every deployed bucket's record until each
-was re-qualified, which is an outage traded for evidence of a property no
-deployment has been observed to lack. The consequence is that re-running
-`store qualify` against such a bucket does not replace the record: the
-stored version is the current one, so the run leaves it untouched and
-reports it (the once-per-bucket no-op above). The re-run's own printed probe
-results are the evidence that pagination holds; installing a fresh record
-instead requires removing the old one out of band.
+boundary, so it was weaker evidence than its version number suggested.
+Such a record carries version 2 or older, so version 3 retires it as well:
+the re-qualification that version 3 requires writes a record whose run
+crossed the declared page size.
 
 ## Required bucket configuration (ADR-0064 §7, ADR-0072 decision 3)
 
@@ -1700,7 +1692,8 @@ counter on the same `StoreMetrics` block, filled in by the S3 adapter's counting
 HTTP connector (`S3Store::with_metrics`, installed via
 `AmazonS3Builder::with_http_connector`), which records one attempt per HTTP
 request `object_store` issues, retries included, and per ListObjectsV2
-request the listing's own retry loop issues, which shares the connector. `attempts >= calls` holds
+request the listing's own retry loop issues, which goes through the same
+recording on its own redirect-free HTTP client. `attempts >= calls` holds
 exactly when every store the decorator counts a `calls` on records its attempts
 into the same `StoreMetrics` handle: a store built with `S3Store::new` (no
 handle) wrapped in `InstrumentedStore::with_metrics` would count `calls` while
