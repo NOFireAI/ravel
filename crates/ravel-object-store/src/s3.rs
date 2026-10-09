@@ -2,18 +2,15 @@
 //! (ADR-0008). This module never leaks `object_store` types across the
 //! [`ObjectStoreBackend`] boundary; every conversion happens here.
 //!
+//! Listing does not go through `object_store`: `list`, `list_after` and
+//! `list_delimited` send their own signed ListObjectsV2 requests with a raw
+//! prefix and a raw `start-after` and return raw keys (`s3/list.rs`,
+//! ADR-2637 decision 1), so a listing matches
+//! [`crate::memory::MemoryStore`]'s raw `str::starts_with` prefix and resumes
+//! on the exact key a page ended on.
+//!
 //! ## Known divergences from the contract, forced by `object_store`
 //!
-//! - **Prefix listing is segment-based, not a raw string prefix.**
-//!   `object_store`'s list machinery always appends the path delimiter (`/`)
-//!   to a non-empty prefix before calling the backend (see
-//!   `client::list::ListClientExt::list_paginated`), because S3's own
-//!   `ListObjectsV2` `Prefix` parameter is conventionally a "directory"
-//!   path. So `list("a", ..)` against this store only matches keys under
-//!   `a/`, never a sibling key literally named `a` or `ab` --- unlike
-//!   [`crate::memory::MemoryStore`], which does a raw `str::starts_with`.
-//!   Callers (and the shared contract suite) MUST use segment-aligned
-//!   prefixes (empty, or ending in `/`) for portable behavior.
 //! - **`Version` is always the S3 ETag, never `object_store`'s own
 //!   `PutResult::version`.** On a versioned bucket that field is an S3
 //!   version-id, but `AmazonS3`'s conditional-put path
@@ -128,6 +125,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider, Checksum};
+use object_store::client::HttpConnector;
 use object_store::path::Path;
 use object_store::{
     ClientOptions, GetOptions as OsGetOptions, GetRange as OsGetRange,
@@ -155,6 +153,9 @@ mod checksum;
 use checksum::{CHECKSUM_MODE_ENABLED, CHECKSUM_MODE_HEADER, ObservedChecksum};
 
 mod http_date;
+
+mod list;
+use list::ListClient;
 
 mod connector;
 use connector::{GetObservation, ObservedStoreTime, S3HttpConnector};
@@ -941,6 +942,11 @@ pub struct S3Store {
     /// `--require-bucket-protection` startup gate reach it through the concrete
     /// store; a caller holding only `dyn ObjectStoreBackend` does not.
     control_plane: Arc<BucketControlPlaneClient>,
+    /// The raw-key ListObjectsV2 client behind `list`, `list_after` and
+    /// `list_delimited` (ADR-2637 decision 1). Its requests go through the
+    /// same [`S3HttpConnector`] as the data plane, so they are billed and
+    /// timed the same way.
+    lister: Arc<ListClient>,
 }
 
 impl S3Store {
@@ -1035,6 +1041,17 @@ impl S3Store {
         .map_err(|e| {
             StoreError::Permanent(format!("failed to build bucket control-plane client: {e}"))
         })?;
+        let list_http = S3HttpConnector::new(Arc::clone(&metrics), Arc::clone(&store_time))
+            .connect(&client_options(&http).with_allow_http(config.allow_http))
+            .map_err(|e| StoreError::Permanent(format!("failed to build S3 list client: {e}")))?;
+        let lister = Arc::new(ListClient::new(
+            list_http,
+            Arc::clone(&control_plane_credentials),
+            config.bucket.clone(),
+            config.region.clone(),
+            config.endpoint.clone(),
+            config.force_path_style,
+        ));
         let control_plane = Arc::new(BucketControlPlaneClient::new(
             control_plane_client,
             control_plane_credentials,
@@ -1063,6 +1080,7 @@ impl S3Store {
             metrics,
             store_time,
             control_plane,
+            lister,
         })
     }
 
@@ -1264,19 +1282,13 @@ impl S3Store {
         Ok((builder, credential_provider, instance_role_provider))
     }
 
-    /// Same backend, a different `list()`/`list_after()` page size. This is a
-    /// client-side cut of one wire response, not a smaller request: nothing
-    /// here sets `ListObjectsV2`'s `MaxKeys`, so S3 answers with its default
-    /// of up to 1000 keys. [`ObjectStoreBackend::list`] opens a fresh
-    /// `object_store` listing stream per [`crate::ListPage`], pulls at most
-    /// `page_size` entries off it, and drops it, which leaves that response's
-    /// own `NextContinuationToken` unfollowed unless `page_size` exceeds what
-    /// one response carries. Shrinking `page_size` therefore only shortens
-    /// what Ravel reads out of a single S3 response; it cannot, by itself,
-    /// make the backend serve a continuation boundary.
-    /// Proving [`crate::conformance::run_conformance_suite`]'s cross-page
-    /// probe against this backend needs more keys than this store's actual
-    /// page size, not a smaller declared one.
+    /// Same backend, a different `list()`/`list_after()` page size. Each
+    /// ListObjectsV2 request asks for `max-keys` of the keys the page still
+    /// needs, at most 1000, and a page larger than 1000 follows
+    /// `NextContinuationToken` within the call until it is full. A small
+    /// `page_size` therefore makes the backend itself serve a page boundary,
+    /// which is what lets [`crate::conformance::run_conformance_suite`]'s
+    /// cross-page probe exercise `start-after` against a real store.
     pub fn with_page_size(config: S3Config, page_size: usize) -> Result<Self, StoreError> {
         Self::with_http_config_and_page_size(config, S3HttpConfig::default(), page_size)
     }
@@ -1425,47 +1437,6 @@ fn bucket_config_probe(
 pub(crate) fn path_of(key: &str) -> Result<Path, StoreError> {
     crate::check_addressable(key)?;
     Ok(Path::from(key))
-}
-
-/// `prefix -> Option<Path>`, `None` for the empty (whole-bucket) prefix so
-/// `object_store` does not append a stray delimiter.
-pub(crate) fn prefix_of(prefix: &str) -> Option<Path> {
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(Path::from(prefix))
-    }
-}
-
-/// One page of an `object_store` listing of up to `page_size` keys, classified,
-/// with a continuation token when the page is full.
-///
-/// The token is the page's last addressable key. The next page resumes after
-/// `Path::from(token)`, which re-encodes an unaddressable key: resuming after
-/// `p/a#b` starts at `p/a%23b` and skips `p/a$`, and resuming after `p/é`
-/// starts at `p/%C3%A9` and re-delivers keys this page already returned. An
-/// unaddressable tail after the token is listed and reported again on the
-/// next page, and a drain counts a tail of two or more keys twice. A full
-/// page with no addressable key keeps its raw last key as the token, which
-/// still re-encodes until the raw listing of ADR-2637 decision 1 replaces
-/// this one.
-pub(crate) fn assemble_page(prefix: &str, listed: Vec<ObjectMeta>, page_size: usize) -> ListPage {
-    let next = if listed.len() == page_size {
-        listed
-            .iter()
-            .rev()
-            .find(|m| crate::is_addressable_key(&m.key))
-            .or(listed.last())
-            .map(|m| PageToken(m.key.clone()))
-    } else {
-        None
-    };
-    let (objects, unaddressable) = crate::classify_objects(prefix, listed);
-    ListPage {
-        objects,
-        next,
-        unaddressable,
-    }
 }
 
 fn map_meta(meta: object_store::ObjectMeta) -> Result<ObjectMeta, StoreError> {
@@ -2770,25 +2741,11 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        connector::scope(StoreOp::List, async move {
-            let prefix_path = prefix_of(prefix);
-            let mut stream = match &page {
-                Some(PageToken(after)) => {
-                    let offset = Path::from(after.as_str());
-                    self.store.list_with_offset(prefix_path.as_ref(), &offset)
-                }
-                None => self.store.list(prefix_path.as_ref()),
-            };
-            let mut out = Vec::with_capacity(self.page_size.min(1024));
-            while out.len() < self.page_size {
-                match stream.next().await {
-                    Some(Ok(meta)) => out.push(map_meta(meta)?),
-                    Some(Err(e)) => return Err(map_error_common(e)),
-                    None => break,
-                }
-            }
-            Ok(assemble_page(prefix, out, self.page_size))
-        })
+        let after = page.as_ref().map(|PageToken(after)| after.as_str());
+        connector::scope(
+            StoreOp::List,
+            self.lister.list_page(prefix, after, self.page_size),
+        )
         .await
     }
 
@@ -2798,65 +2755,22 @@ impl ObjectStoreBackend for S3Store {
         start_after: Option<&str>,
         page: Option<PageToken>,
     ) -> Result<ListPage, StoreError> {
-        connector::scope(StoreOp::List, async move {
-            let prefix_path = prefix_of(prefix);
-            // A page token resumes strictly after the previous page's last key;
-            // on the first page `start_after` plays the same role. Both map to
-            // `object_store`'s `list_with_offset`, whose offset is exclusive
-            // (ListObjectsV2 `start-after`), so keys equal to the offset are
-            // skipped server-side and never transferred. A present page token is
-            // always past `start_after`, so it takes precedence.
-            let offset = match (&page, start_after) {
-                (Some(PageToken(after)), _) => Some(Path::from(after.as_str())),
-                (None, Some(after)) => Some(Path::from(after)),
-                (None, None) => None,
-            };
-            let mut stream = match &offset {
-                Some(offset) => self.store.list_with_offset(prefix_path.as_ref(), offset),
-                None => self.store.list(prefix_path.as_ref()),
-            };
-            let mut out = Vec::with_capacity(self.page_size.min(1024));
-            while out.len() < self.page_size {
-                match stream.next().await {
-                    Some(Ok(meta)) => out.push(map_meta(meta)?),
-                    Some(Err(e)) => return Err(map_error_common(e)),
-                    None => break,
-                }
-            }
-            Ok(assemble_page(prefix, out, self.page_size))
-        })
+        // Both resume as ListObjectsV2 `start-after`, which is exclusive, so a
+        // key equal to it is skipped server-side. A present page token is
+        // always past `start_after`, so it takes precedence.
+        let after = match &page {
+            Some(PageToken(after)) => Some(after.as_str()),
+            None => start_after,
+        };
+        connector::scope(
+            StoreOp::List,
+            self.lister.list_page(prefix, after, self.page_size),
+        )
         .await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        connector::scope(StoreOp::ListDelimited, async move {
-            let prefix_path = prefix_of(prefix);
-            let result = self
-                .store
-                .list_with_delimiter(prefix_path.as_ref())
-                .await
-                .map_err(map_error_common)?;
-            let listed = result
-                .objects
-                .into_iter()
-                .map(map_meta)
-                .collect::<Result<Vec<_>, _>>()?;
-            let listed_prefixes = result
-                .common_prefixes
-                .into_iter()
-                .map(|p| format!("{p}/"))
-                .collect();
-            let (objects, unaddressable) = crate::classify_objects(prefix, listed);
-            let (common_prefixes, unaddressable_prefixes) =
-                crate::classify_prefixes(prefix, listed_prefixes);
-            Ok(DelimitedList {
-                objects,
-                common_prefixes,
-                unaddressable,
-                unaddressable_prefixes,
-            })
-        })
-        .await
+        connector::scope(StoreOp::ListDelimited, self.lister.list_delimited(prefix)).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
@@ -2928,124 +2842,6 @@ mod tests {
     use object_store::{PutResult, UploadPart};
 
     use super::*;
-
-    fn listed(keys: &[&str]) -> Vec<ObjectMeta> {
-        keys.iter()
-            .map(|key| ObjectMeta {
-                key: (*key).to_string(),
-                size: 1,
-                etag: Etag("\"e\"".to_string()),
-                version: Version("\"e\"".to_string()),
-                last_modified_unix_ms: 0,
-            })
-            .collect()
-    }
-
-    fn object_keys(page: &ListPage) -> Vec<&str> {
-        page.objects.iter().map(|m| m.key.as_str()).collect()
-    }
-
-    fn unaddressable_keys(page: &ListPage) -> Vec<&str> {
-        page.unaddressable.iter().map(|u| u.key.as_str()).collect()
-    }
-
-    /// A full page ending in an unaddressable key resumes after the last
-    /// addressable one: `Path::from("p/a#b")` is `p/a%23b`, which sorts past
-    /// `p/a$`, so resuming there would skip it.
-    #[test]
-    fn a_page_token_skips_an_encoded_tail_that_sorts_higher() {
-        let page = assemble_page("p/", listed(&["p/0", "p/a", "p/a#b"]), 3);
-        assert_eq!(page.next, Some(PageToken("p/a".to_string())));
-        assert_eq!(object_keys(&page), ["p/0", "p/a"]);
-        assert_eq!(unaddressable_keys(&page), ["p/a#b"]);
-    }
-
-    /// `p/é` encodes to `p/%C3%A9`, which sorts below `p/b`: resuming there
-    /// would deliver `p/b` again, out of order.
-    #[test]
-    fn a_page_token_skips_an_encoded_tail_that_sorts_lower() {
-        let page = assemble_page("p/", listed(&["p/a", "p/b", "p/é"]), 3);
-        assert_eq!(page.next, Some(PageToken("p/b".to_string())));
-        assert_eq!(object_keys(&page), ["p/a", "p/b"]);
-        assert_eq!(unaddressable_keys(&page), ["p/é"]);
-    }
-
-    /// With no addressable key there is no safe offset, so the raw last key
-    /// stays the token.
-    #[test]
-    fn a_page_of_only_unaddressable_keys_keeps_its_raw_last_key() {
-        let page = assemble_page("p/", listed(&["p/a#b", "p/é"]), 2);
-        assert_eq!(page.next, Some(PageToken("p/é".to_string())));
-        assert!(page.objects.is_empty());
-        assert_eq!(unaddressable_keys(&page), ["p/a#b", "p/é"]);
-    }
-
-    /// The tail after the token is listed again, and the drain drops only a
-    /// repeat of the key it recorded last, so a tail of two keys counts four.
-    #[tokio::test]
-    async fn a_drain_counts_a_relisted_unaddressable_tail_twice() {
-        let stored = ["p/a", "p/b#1", "p/b#2"];
-        let mut objects = Vec::new();
-        let unaddressable = crate::drain_pages(
-            "p/",
-            None,
-            crate::MAX_LIST_PAGES,
-            |_, token: Option<PageToken>| async move {
-                let offset = token.map(|PageToken(after)| Path::from(after).to_string());
-                let rest: Vec<&str> = stored
-                    .into_iter()
-                    .filter(|key| offset.as_deref().is_none_or(|after| *key > after))
-                    .take(3)
-                    .collect();
-                Ok::<_, StoreError>(assemble_page("p/", listed(&rest), 3))
-            },
-            |meta| {
-                objects.push(meta.key);
-                Ok(crate::DrainStep::Continue)
-            },
-        )
-        .await
-        .expect("drain");
-        assert_eq!(objects, ["p/a"]);
-        assert_eq!(unaddressable.count, 4);
-    }
-
-    /// A full page of only unaddressable keys resumes after its encoded last
-    /// key, `p/%C3%A92`, which sorts below both keys: the next page is the
-    /// same page with the same token, and the drain fails.
-    #[tokio::test]
-    async fn a_page_of_only_unaddressable_keys_can_repeat_and_fail_the_drain() {
-        let stored = ["p/é1", "p/é2"];
-        let err = crate::drain_pages(
-            "p/",
-            None,
-            crate::MAX_LIST_PAGES,
-            |_, token: Option<PageToken>| async move {
-                let offset = token.map(|PageToken(after)| Path::from(after).to_string());
-                let rest: Vec<&str> = stored
-                    .into_iter()
-                    .filter(|key| offset.as_deref().is_none_or(|after| *key > after))
-                    .take(2)
-                    .collect();
-                Ok::<_, StoreError>(assemble_page("p/", listed(&rest), 2))
-            },
-            |_| Ok(crate::DrainStep::Continue),
-        )
-        .await
-        .expect_err("the page repeats");
-        assert!(
-            matches!(err, StoreError::ListRepeatedToken { .. }),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn a_short_page_has_no_token() {
-        let page = assemble_page("p/", listed(&["p/a", "p/a#b"]), 3);
-        assert_eq!(page.next, None);
-        assert_eq!(object_keys(&page), ["p/a"]);
-        assert_eq!(unaddressable_keys(&page), ["p/a#b"]);
-    }
 
     /// The probe for one lifecycle document, with versioning `Enabled`.
     fn probe_for_lifecycle(

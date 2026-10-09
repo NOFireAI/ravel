@@ -57,12 +57,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use ravel_object_store::conformance::{
+    ForeignKeySeeder, Property, run_conformance_suite_with_seeder,
+};
 use ravel_object_store::s3::{
     MULTIPART_PART_SIZE, MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
 };
 use ravel_object_store::scheduling::{ClassedStore, SchedulerConfig};
 use ravel_object_store::{
-    GetRange, InstrumentedStore, ObjectStoreBackend, Pin, PutOptions, StoreError, StoreMetrics,
+    GetRange, InstrumentedStore, ListPage, ObjectStoreBackend, Pin, PutOptions, StoreError,
+    StoreMetrics, is_addressable_key, list_all_reporting,
 };
 use tokio::sync::Notify;
 
@@ -111,8 +115,10 @@ enum Op {
     UploadPart,
     CompleteMultipart,
     AbortMultipart,
-    /// `ListObjectsV2`, served as an empty listing: no test here asserts on
-    /// listing contents, only on how the request was signed.
+    /// `ListObjectsV2`: the next scripted [`FakeState::list_bodies`] entry if
+    /// there is one, else a listing of the stored objects that honors
+    /// `prefix`, `start-after`, `continuation-token`, `max-keys`, `delimiter`
+    /// and `encoding-type=url` the way S3 does.
     List,
 }
 
@@ -139,6 +145,11 @@ enum Fault {
     OkWithSlowDownBody,
     /// 403 `AccessDenied`: permanent, must not be retried at all.
     AccessDenied,
+    /// 301 with no `Location`, the redirect S3 answers a request sent to the
+    /// wrong region with: permanent, never retried.
+    MovedPermanently,
+    /// 400 `InvalidArgument`: permanent, never retried.
+    BadRequest,
     /// `DeleteObjects` only: a 200 whose `DeleteResult` carries an `<Error>`
     /// with this code and message for every requested key. S3 reports a
     /// per-key refusal (a deny policy, a missing `s3:DeleteObject`) this way,
@@ -250,6 +261,9 @@ struct Seen {
     /// The raw request body of a `DeleteObjects` request, which is where its
     /// keys and any `VersionId` go. `None` for every other operation.
     delete_body: Option<String>,
+    /// The query parameters, percent-decoded: what a `ListObjectsV2` request
+    /// asked for (`prefix`, `start-after`, `continuation-token`, ...).
+    query: HashMap<String, String>,
 }
 
 impl Seen {
@@ -273,6 +287,9 @@ struct FakeState {
     /// Per-operation fault applied to *every* matching request, after the
     /// scripted queue for that operation is empty.
     always: Mutex<HashMap<Op, Fault>>,
+    /// `ListBucketResult` bodies served verbatim, one per `ListObjectsV2`
+    /// request that draws no fault, before the fake lists `objects` itself.
+    list_bodies: Mutex<VecDeque<String>>,
     log: Mutex<Vec<Seen>>,
     next_upload_id: Mutex<u64>,
     /// Requests the handler is serving right now, and the most it has ever
@@ -366,6 +383,7 @@ impl FakeState {
             version_id: query.get("versionId").cloned(),
             delete_body: (op == Op::DeleteObjects)
                 .then(|| String::from_utf8_lossy(body).into_owned()),
+            query: query.clone(),
         });
     }
 }
@@ -508,6 +526,31 @@ impl FakeS3 {
         self.requests(op).len()
     }
 
+    /// Serve `bodies` verbatim, in order, to the next `ListObjectsV2` requests
+    /// that draw no fault.
+    fn script_list(&self, bodies: impl IntoIterator<Item = String>) {
+        self.state.list_bodies.lock().extend(bodies);
+    }
+
+    /// The decoded query of every `ListObjectsV2` request, in arrival order.
+    fn list_queries(&self) -> Vec<HashMap<String, String>> {
+        self.requests(Op::List)
+            .into_iter()
+            .map(|seen| seen.query)
+            .collect()
+    }
+
+    /// Every request the endpoint has seen, of any kind.
+    fn total_requests(&self) -> usize {
+        self.state.log.lock().len()
+    }
+
+    /// A [`ForeignKeySeeder`] writing straight into this fake's storage, which
+    /// is how a key `S3Store` refuses gets into a bucket it lists.
+    fn seeder(&self) -> FakeSeeder {
+        FakeSeeder(Arc::clone(&self.state))
+    }
+
     /// Hold every request of the `ops` until `target` requests have been in
     /// flight at once or `grace` passes, whichever comes first.
     fn hold(&self, ops: &[Op], target: usize, grace: Duration) {
@@ -535,25 +578,69 @@ impl FakeS3 {
     }
 }
 
-/// Split `/{bucket}/{key...}` into the key. Ravel's keys are plain ASCII, which
-/// `object_store::path::Path` round-trips unencoded.
+/// Writes into the fake's storage directly, bypassing `S3Store`'s key rules.
+struct FakeSeeder(Arc<FakeState>);
+
+#[async_trait::async_trait]
+impl ForeignKeySeeder for FakeSeeder {
+    async fn seed(&self, key: &str, data: Bytes) -> Result<(), StoreError> {
+        self.0.objects.lock().insert(key.to_string(), data);
+        Ok(())
+    }
+
+    async fn remove(&self, key: &str) -> Result<(), StoreError> {
+        self.0.objects.lock().remove(key);
+        Ok(())
+    }
+}
+
+/// `%XX` to the byte it names, and `+` to a space when `plus_is_space`. A
+/// malformed escape is kept as text.
+fn percent_decode(text: &str, plus_is_space: bool) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| text.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[i], escaped) {
+            (_, Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (b'+', None) if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            (byte, None) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Split `/{bucket}/{key...}` into the key, percent-decoded: `object_store`
+/// escapes every byte outside the unreserved set and `/` in a request path.
 fn key_of(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     match trimmed.split_once('/') {
-        Some((_bucket, key)) => key.to_string(),
+        Some((_bucket, key)) => percent_decode(key, false),
         None => String::new(),
     }
 }
 
-/// Query string to pairs. Values here (`uploadId`, `partNumber`) are plain
-/// alphanumerics, so no percent-decoding is needed.
+/// Query string to percent-decoded pairs.
 fn query_pairs(query: &str) -> HashMap<String, String> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((name, value)) => (name.to_string(), value.to_string()),
-            None => (pair.to_string(), String::new()),
+            Some((name, value)) => (percent_decode(name, true), percent_decode(value, true)),
+            None => (percent_decode(pair, true), String::new()),
         })
         .collect()
 }
@@ -859,6 +946,14 @@ async fn handle(
             "AccessDenied",
             "Access Denied by the fake endpoint.",
         ),
+        Some(Fault::MovedPermanently) => {
+            build(StatusCode::MOVED_PERMANENTLY, vec![], Body::empty())
+        }
+        Some(Fault::BadRequest) => error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Invalid argument.",
+        ),
         Some(Fault::DeleteKeyError { code, message }) => {
             let errors: String = delete_objects_keys(&data)
                 .iter()
@@ -1156,18 +1251,199 @@ fn serve(
             state.uploads.lock().remove(&upload_id);
             build(StatusCode::NO_CONTENT, vec![], Body::empty())
         }
-        Op::List => build(
-            StatusCode::OK,
-            vec![(header::CONTENT_TYPE, "application/xml".to_string())],
-            Body::from(format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-                 <Name>{BUCKET}</Name><Prefix></Prefix><KeyCount>0</KeyCount>\
-                 <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
-                 </ListBucketResult>"
-            )),
-        ),
+        Op::List => {
+            let body = state
+                .list_bodies
+                .lock()
+                .pop_front()
+                .unwrap_or_else(|| list_objects(state, query));
+            build(
+                StatusCode::OK,
+                vec![(header::CONTENT_TYPE, "application/xml".to_string())],
+                Body::from(body),
+            )
+        }
     }
+}
+
+/// Fixed `LastModified` of every listed object, the ISO-8601 form of
+/// [`LAST_MODIFIED`].
+const LIST_LAST_MODIFIED: &str = "2015-10-21T07:28:00.000Z";
+
+/// A key as S3 writes it under `encoding-type=url`: a space as `+`, every byte
+/// outside the unreserved set and `/` as `%XX`.
+fn list_encode(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for &byte in key.as_bytes() {
+        if byte == b' ' {
+            out.push('+');
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn hex_encode(text: &str) -> String {
+    text.bytes().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(text: &str) -> Option<String> {
+    let bytes = (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// A `ListBucketResult` body. `contents` and `prefixes` are written verbatim,
+/// so a test passes them already encoded the way the response claims.
+fn list_body(
+    encoding_type: Option<&str>,
+    contents: &[&str],
+    prefixes: &[&str],
+    truncated: bool,
+    next_token: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{BUCKET}</Name><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys>\
+         <IsTruncated>{truncated}</IsTruncated>",
+        contents.len() + prefixes.len()
+    );
+    if let Some(encoding_type) = encoding_type {
+        body.push_str(&format!("<EncodingType>{encoding_type}</EncodingType>"));
+    }
+    if let Some(token) = next_token {
+        body.push_str(&format!(
+            "<NextContinuationToken>{token}</NextContinuationToken>"
+        ));
+    }
+    for key in contents {
+        body.push_str(&format!(
+            "<Contents><Key>{key}</Key><LastModified>{LIST_LAST_MODIFIED}</LastModified>\
+             <ETag>\"fake-etag\"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass>\
+             </Contents>"
+        ));
+    }
+    for prefix in prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{prefix}</Prefix></CommonPrefixes>"
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    body
+}
+
+/// List the stored objects as S3 would. The continuation token is the hex of
+/// the last entry served, a key or a common prefix; resuming from a common
+/// prefix skips every key under it.
+fn list_objects(state: &FakeState, query: &HashMap<String, String>) -> String {
+    let prefix = query.get("prefix").cloned().unwrap_or_default();
+    let delimiter = query.get("delimiter").filter(|d| !d.is_empty()).cloned();
+    let max_keys: usize = query
+        .get("max-keys")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1000);
+    let encode = query
+        .get("encoding-type")
+        .is_some_and(|value| value == "url");
+    let token = query.get("continuation-token").and_then(|t| hex_decode(t));
+    // S3 ignores `start-after` once a continuation token is present.
+    let resume = token.clone().or_else(|| query.get("start-after").cloned());
+    let skip_under = token.filter(|t| delimiter.as_ref().is_some_and(|d| t.ends_with(d.as_str())));
+
+    let mut keys: Vec<(String, Bytes)> = state
+        .objects
+        .lock()
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(key, data)| (key.clone(), data.clone()))
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut contents: Vec<(String, Bytes)> = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut last: Option<String> = None;
+    let mut truncated = false;
+    for (key, data) in keys {
+        if resume.as_ref().is_some_and(|after| key <= *after)
+            || skip_under
+                .as_ref()
+                .is_some_and(|under| key.starts_with(under.as_str()))
+        {
+            continue;
+        }
+        let common = delimiter.as_ref().and_then(|d| {
+            key[prefix.len()..]
+                .find(d.as_str())
+                .map(|at| key[..prefix.len() + at + d.len()].to_string())
+        });
+        if common.is_some() && prefixes.last() == common.as_ref() {
+            continue;
+        }
+        if contents.len() + prefixes.len() == max_keys {
+            truncated = true;
+            break;
+        }
+        match common {
+            Some(common) => {
+                last = Some(common.clone());
+                prefixes.push(common);
+            }
+            None => {
+                last = Some(key.clone());
+                contents.push((key, data));
+            }
+        }
+    }
+    let write = |text: &str| match encode {
+        true => list_encode(text),
+        false => xml_escape(text),
+    };
+    let mut body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{BUCKET}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount>\
+         <MaxKeys>{max_keys}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
+        write(&prefix),
+        contents.len() + prefixes.len()
+    );
+    if encode {
+        body.push_str("<EncodingType>url</EncodingType>");
+    }
+    if truncated && let Some(last) = &last {
+        body.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            hex_encode(last)
+        ));
+    }
+    for (key, data) in &contents {
+        body.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{LIST_LAST_MODIFIED}</LastModified>\
+             <ETag>{}</ETag><Size>{}</Size>\
+             <StorageClass>STANDARD</StorageClass></Contents>",
+            write(key),
+            etag_of(data),
+            data.len()
+        ));
+    }
+    for common in &prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            write(common)
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    body
 }
 
 /// Whether the request carries an `x-amz-*` header its SigV4 `Authorization`
@@ -1580,7 +1856,7 @@ async fn no_request_carries_an_unsigned_checksum_mode_header() {
         .list("signed/", None)
         .await
         .expect("a LIST must not carry an unsigned header");
-    assert!(page.objects.is_empty(), "the fake serves an empty listing");
+    assert_eq!(object_keys(&page), ["signed/k"]);
 
     let log = fake.state.log.lock().clone();
     for op in [Op::Put, Op::Head, Op::Get, Op::List] {
@@ -3851,5 +4127,421 @@ async fn an_error_response_is_observed_like_any_other() {
     assert!(
         store.observed_store_time_ns().is_some(),
         "a 403 response still reports the store's clock"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Raw-key ListObjectsV2 (ADR-2637 decision 1)
+// ---------------------------------------------------------------------------
+
+fn object_keys(page: &ListPage) -> Vec<&str> {
+    page.objects.iter().map(|meta| meta.key.as_str()).collect()
+}
+
+fn unaddressable_keys(page: &ListPage) -> Vec<&str> {
+    page.unaddressable.iter().map(|u| u.key.as_str()).collect()
+}
+
+fn page_size_store(fake: &FakeS3, page_size: usize) -> S3Store {
+    S3Store::with_page_size(fake.config(), page_size).expect("a fake-endpoint S3Store must build")
+}
+
+/// A key with `\x01` in the middle of a page is reported, not listed, and the
+/// keys around it still come back, with the metric counting it.
+#[tokio::test]
+async fn a_control_character_mid_page_is_reported_and_the_page_survives() {
+    let fake = FakeS3::start().await;
+    fake.seed("mid/a", b"1");
+    fake.seed("mid/a\u{1}b", b"2");
+    fake.seed("mid/c", b"3");
+    let store = InstrumentedStore::new(fake.store());
+
+    let page = store
+        .list("mid/", None)
+        .await
+        .expect("an unaddressable key does not fail the page");
+
+    assert_eq!(object_keys(&page), ["mid/a", "mid/c"]);
+    assert_eq!(unaddressable_keys(&page), ["mid/a\u{1}b"]);
+    assert_eq!(page.unaddressable[0].addresses, "mid/a%01b");
+    assert!(page.next.is_none());
+    assert_eq!(store.metrics().list_unaddressable(), 1);
+}
+
+/// `*` encodes lower (`%2A`). The next request resumes from the raw key, so the
+/// drain sees every key once and no `ListOrderViolation`.
+#[tokio::test]
+async fn a_page_ending_on_a_key_that_encodes_lower_resumes_from_the_raw_key() {
+    let fake = FakeS3::start().await;
+    fake.seed("low/a*", b"1");
+    fake.seed("low/b", b"2");
+    let store = page_size_store(&fake, 1);
+
+    let listing = list_all_reporting(&store, "low/")
+        .await
+        .expect("the drain completes without an order violation");
+
+    let listed: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(listed, ["low/b"]);
+    assert_eq!(listing.unaddressable.count, 1);
+    assert_eq!(listing.unaddressable.sample[0].key, "low/a*");
+    let queries = fake.list_queries();
+    assert_eq!(queries.len(), 2, "{queries:?}");
+    assert_eq!(queries[0].get("start-after"), None);
+    assert_eq!(
+        queries[1].get("start-after").map(String::as_str),
+        Some("low/a*")
+    );
+    assert_eq!(queries[1].get("continuation-token"), None);
+}
+
+/// `#` encodes higher (`%23`). Resuming from the raw key keeps `a$`, which
+/// sorts between `a#` and `a%23`, in the listing.
+#[tokio::test]
+async fn a_page_ending_on_a_key_that_encodes_higher_skips_nothing() {
+    assert!(!is_addressable_key("high/a#"));
+    assert!(is_addressable_key("high/a$"));
+    assert!("high/a#" < "high/a$" && "high/a$" < "high/a%23");
+    let fake = FakeS3::start().await;
+    fake.seed("high/a#", b"1");
+    fake.seed("high/a$", b"2");
+    fake.seed("high/b", b"3");
+    let store = page_size_store(&fake, 1);
+
+    let listing = list_all_reporting(&store, "high/")
+        .await
+        .expect("the drain completes");
+
+    let listed: Vec<&str> = listing.objects.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(
+        listed,
+        ["high/a$", "high/b"],
+        "no key between the raw and the encoded form of the boundary key is skipped"
+    );
+    assert_eq!(listing.unaddressable.count, 1);
+    assert_eq!(listing.unaddressable.sample[0].key, "high/a#");
+    let queries = fake.list_queries();
+    assert_eq!(
+        queries[1].get("start-after").map(String::as_str),
+        Some("high/a#")
+    );
+}
+
+/// `get`, `put` and `delete` of an unaddressable key are refused before any
+/// request is sent.
+#[tokio::test]
+async fn operations_on_an_unaddressable_key_send_no_request() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    for key in ["refuse/a\u{1}b", "refuse/a*b"] {
+        let outcomes = [
+            store.get(key, GetRange::Full).await.map(|_| ()),
+            store
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .map(|_| ()),
+            store.delete(key).await,
+        ];
+        for outcome in outcomes {
+            assert!(
+                matches!(&outcome, Err(StoreError::UnaddressableKey { key: refused, .. }) if refused == key),
+                "{key:?}: expected UnaddressableKey, got {outcome:?}"
+            );
+        }
+    }
+    assert_eq!(fake.total_requests(), 0, "the server saw no request");
+}
+
+/// A truncated response with no `Contents` is followed by the token request,
+/// and the keys after it come back.
+#[tokio::test]
+async fn an_empty_truncated_response_is_followed_by_its_token() {
+    let fake = FakeS3::start().await;
+    fake.script_list([
+        list_body(Some("url"), &[], &[], true, Some("t1")),
+        list_body(Some("url"), &["e/a", "e/b"], &[], false, None),
+    ]);
+    let store = fake.store();
+
+    let page = store
+        .list("e/", None)
+        .await
+        .expect("an empty truncated response does not fail the listing");
+
+    assert_eq!(object_keys(&page), ["e/a", "e/b"]);
+    assert!(page.next.is_none());
+    let queries = fake.list_queries();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].get("continuation-token"), None);
+    assert_eq!(
+        queries[1].get("continuation-token").map(String::as_str),
+        Some("t1")
+    );
+    assert_eq!(queries[1].get("start-after"), None);
+}
+
+/// The `discover_tenants` shape: three truncated responses of common prefixes
+/// only. The follow-up requests carry `continuation-token` and never
+/// `start-after`, and every prefix comes back once.
+#[tokio::test]
+async fn a_delimited_listing_of_prefix_only_responses_follows_tokens() {
+    let fake = FakeS3::start().await;
+    fake.script_list([
+        list_body(Some("url"), &[], &["p/t1/", "p/t2/"], true, Some("k1")),
+        list_body(Some("url"), &[], &["p/t3/"], true, Some("k2")),
+        list_body(Some("url"), &[], &["p/t4/"], false, None),
+    ]);
+    let store = fake.store();
+
+    let listing = store
+        .list_delimited("p/")
+        .await
+        .expect("a delimited listing over truncated responses completes");
+
+    assert_eq!(
+        listing.common_prefixes,
+        ["p/t1/", "p/t2/", "p/t3/", "p/t4/"]
+    );
+    let queries = fake.list_queries();
+    assert_eq!(queries.len(), 3);
+    assert_eq!(
+        queries
+            .iter()
+            .map(|q| q.get("continuation-token").map(String::as_str))
+            .collect::<Vec<_>>(),
+        [None, Some("k1"), Some("k2")]
+    );
+    for query in &queries {
+        assert_eq!(query.get("start-after"), None, "{query:?}");
+        assert_eq!(query.get("delimiter").map(String::as_str), Some("/"));
+    }
+}
+
+/// A common prefix with `\x01` lands in `unaddressable_prefixes`, not in
+/// `common_prefixes`, and counts toward `ravel_store_list_unaddressable_total`.
+#[tokio::test]
+async fn an_unaddressable_common_prefix_is_reported_and_counted() {
+    let fake = FakeS3::start().await;
+    fake.seed("t/a\u{1}/x", b"1");
+    fake.seed("t/b/x", b"2");
+    let store = InstrumentedStore::new(fake.store());
+
+    let listing = store
+        .list_delimited("t/")
+        .await
+        .expect("an unaddressable prefix does not fail the listing");
+
+    assert_eq!(listing.common_prefixes, ["t/b/"]);
+    assert_eq!(listing.unaddressable_prefixes, ["t/a\u{1}/"]);
+    assert_eq!(store.metrics().list_unaddressable(), 1);
+}
+
+#[tokio::test]
+async fn a_repeated_continuation_token_is_refused() {
+    let fake = FakeS3::start().await;
+    fake.script_list([
+        list_body(Some("url"), &["r/a"], &[], true, Some("r1")),
+        list_body(Some("url"), &["r/b"], &[], true, Some("r1")),
+    ]);
+    let store = fake.store();
+
+    let error = store
+        .list("r/", None)
+        .await
+        .expect_err("a repeated token must fail the listing");
+
+    assert!(
+        matches!(&error, StoreError::ListRepeatedToken { prefix } if prefix == "r/"),
+        "got {error:?}"
+    );
+    assert_eq!(fake.count(Op::List), 2);
+}
+
+/// Responses that stay truncated and empty with a fresh token each time stop
+/// at the per-page response ceiling: `ceil(1 / 1000) + 16` at page size 1.
+#[tokio::test]
+async fn a_listing_that_never_ends_stops_at_the_response_ceiling() {
+    let fake = FakeS3::start().await;
+    fake.script_list(
+        (0..40).map(|i| list_body(Some("url"), &[], &[], true, Some(&format!("c{i}")))),
+    );
+    let store = page_size_store(&fake, 1);
+
+    let error = store
+        .list("c/", None)
+        .await
+        .expect_err("a token that never ends must fail the listing");
+
+    assert!(
+        matches!(&error, StoreError::ListPageCeiling { prefix, ceiling: 17 } if prefix == "c/"),
+        "got {error:?}"
+    );
+    assert_eq!(fake.count(Op::List), 17);
+}
+
+#[tokio::test]
+async fn a_truncated_response_without_a_token_is_permanent() {
+    let fake = FakeS3::start().await;
+    fake.script_list([list_body(Some("url"), &["n/a"], &[], true, None)]);
+    let store = fake.store();
+
+    let error = store
+        .list("n/", None)
+        .await
+        .expect_err("a truncated response without a token must fail");
+
+    assert!(
+        matches!(&error, StoreError::Permanent(message)
+            if message.contains("\"n/\"") && message.contains("NextContinuationToken")),
+        "got {error:?}"
+    );
+    assert_eq!(fake.count(Op::List), 1);
+}
+
+/// Under `EncodingType=url`, `%2B` is `+`, `+` is a space and `%0A` a newline;
+/// without it the text is read literally.
+#[tokio::test]
+async fn listed_keys_are_url_decoded_only_when_the_response_says_so() {
+    let fake = FakeS3::start().await;
+    fake.script_list([
+        list_body(
+            Some("url"),
+            &["d/%0A", "d/a+b", "d/a%2Bb"],
+            &[],
+            false,
+            None,
+        ),
+        list_body(None, &["l/a%2Bb", "l/a+b"], &[], false, None),
+    ]);
+    let store = fake.store();
+
+    let encoded = store.list("d/", None).await.expect("encoded listing");
+    assert_eq!(object_keys(&encoded), ["d/a b", "d/a+b"]);
+    assert_eq!(unaddressable_keys(&encoded), ["d/\n"]);
+
+    let literal = store.list("l/", None).await.expect("literal listing");
+    assert_eq!(object_keys(&literal), ["l/a+b"]);
+    assert_eq!(unaddressable_keys(&literal), ["l/a%2Bb"]);
+}
+
+/// The status table of decision 1, with the attempt count the retry rules
+/// imply: 403, 301 and 400 are sent once, 429 is retried, and a 503 that never
+/// clears is sent `1 + max_retries` times and surfaces as `Throttled`.
+#[tokio::test]
+async fn list_statuses_map_per_the_decision_one_table() {
+    type Expected = fn(&StoreError) -> bool;
+    let cases: [(Fault, Expected); 3] = [
+        (Fault::AccessDenied, |e| {
+            matches!(e, StoreError::AccessDenied(_))
+        }),
+        (
+            Fault::MovedPermanently,
+            |e| matches!(e, StoreError::Permanent(m) if m.contains("301") && m.contains("redirect")),
+        ),
+        (
+            Fault::BadRequest,
+            |e| matches!(e, StoreError::Permanent(m) if m.contains("400") && m.contains("InvalidArgument")),
+        ),
+    ];
+    for (fault, expected) in cases {
+        let fake = FakeS3::start().await;
+        fake.script(Op::List, [fault]);
+        let error = fake
+            .store()
+            .list("s/", None)
+            .await
+            .expect_err("a permanent status fails the listing");
+        assert!(expected(&error), "{fault:?}: got {error:?}");
+        assert!(!error.is_retryable(), "{fault:?}: {error:?}");
+        assert_eq!(fake.count(Op::List), 1, "{fault:?} is never retried");
+    }
+
+    let fake = FakeS3::start().await;
+    fake.seed("s/a", b"1");
+    fake.script(Op::List, [Fault::TooManyRequests]);
+    let page = fake
+        .store()
+        .list("s/", None)
+        .await
+        .expect("a 429 is retried and the retry succeeds");
+    assert_eq!(object_keys(&page), ["s/a"]);
+    assert_eq!(fake.count(Op::List), 2);
+
+    let fake = FakeS3::start().await;
+    fake.always(Op::List, Fault::ServiceUnavailable);
+    let error = fake
+        .store()
+        .list("s/", None)
+        .await
+        .expect_err("a 503 that never clears fails the listing");
+    assert!(
+        matches!(error, StoreError::Throttled { .. }),
+        "got {error:?}"
+    );
+    assert_eq!(fake.count(Op::List), 11, "one attempt plus ten retries");
+}
+
+/// The three ADR-2637 properties pass on `S3Store` against this endpoint, with
+/// the fake's storage as the foreign-key seeder.
+#[tokio::test]
+async fn the_unaddressable_key_properties_pass_on_the_scripted_endpoint() {
+    let fake = FakeS3::start().await;
+    let store = page_size_store(&fake, 2);
+    let seeder = fake.seeder();
+
+    let report =
+        run_conformance_suite_with_seeder(&store, "sys/qualify/fake-s3/", 2, Some(&seeder)).await;
+
+    assert!(report.not_run.is_empty(), "{:?}", report.not_run);
+    for property in [
+        Property::OperationsRefuseUnaddressableKeys,
+        Property::UnaddressableKeysAreCounted,
+        Property::ListedKeysRoundTripPlusAndSpace,
+    ] {
+        let result = report
+            .results
+            .iter()
+            .find(|r| r.property == property)
+            .expect("every property is probed");
+        assert!(result.passed, "{}: {}", property.name(), result.detail);
+    }
+}
+
+/// The listing's own requests are billed through the counting connector: a
+/// `list` retried once records two `list` attempts, and a `list_delimited`
+/// records its attempt under `list_delimited`, not `list`.
+#[tokio::test]
+async fn listing_attempts_are_billed_per_request_and_per_operation() {
+    let fake = FakeS3::start().await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        fake.store_with_metrics(Arc::clone(&metrics)),
+        Arc::clone(&metrics),
+    );
+    fake.seed("billed/k", b"v");
+    fake.script(Op::List, [Fault::ServiceUnavailable]);
+
+    let page = store
+        .list("billed/", None)
+        .await
+        .expect("one 503 is retried");
+    assert_eq!(object_keys(&page), ["billed/k"]);
+    let after_list = metrics.snapshot();
+    assert_eq!(fake.count(Op::List), 2, "one faulted request, one served");
+    assert_eq!(after_list.list.calls, 1);
+    assert_eq!(
+        after_list.list.attempts, 2,
+        "every ListObjectsV2 request is an attempt"
+    );
+
+    store
+        .list_delimited("billed/")
+        .await
+        .expect("an unfaulted delimited listing succeeds");
+    let after_delimited = metrics.snapshot();
+    assert_eq!(after_delimited.list_delimited.attempts, 1);
+    assert_eq!(
+        after_delimited.list.attempts, 2,
+        "a delimited listing is not billed to list"
     );
 }

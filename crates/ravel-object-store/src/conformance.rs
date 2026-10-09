@@ -35,11 +35,10 @@ use crate::{GetRange, ObjectStoreBackend, Pin, PutMode, PutOptions, StoreError};
 /// record can be told apart from one taken under the current suite.
 ///
 /// Version 1 checked four properties (the two conditional-write modes,
-/// read-after-write, and list-after-write). Version 2 is the eight-probe suite
-/// [`run_conformance_suite`] runs today: the four above plus concurrent
+/// read-after-write, and list-after-write). Version 2 added concurrent
 /// single-winner create, lexicographic listing order, cross-page listing, and
 /// delete visibility. A record written under version 1 was never checked
-/// against the last four, so `ravel-server` startup refuses it as stale
+/// against those four, so `ravel-server` startup refuses it as stale
 /// (`services/ravel-server/src/qualification.rs`) and `ravel-cli store qualify`
 /// re-records over it when re-run against the same bucket.
 ///
@@ -49,6 +48,10 @@ use crate::{GetRange, ObjectStoreBackend, Pin, PutMode, PutOptions, StoreError};
 /// than the bucket a record attests, and
 /// [`Property::UnaddressableKeysAreCounted`] runs only with a
 /// [`ForeignKeySeeder`], which `ravel-cli store qualify` does not pass.
+/// [`Property::ListedKeysRoundTripPlusAndSpace`] does check the bucket and was
+/// added without a bump, so a version 2 record taken before it existed does
+/// not attest it, and a re-run of `ravel-cli store qualify` leaves that record
+/// in place.
 pub const CONFORMANCE_SUITE_VERSION: u32 = 2;
 
 /// Root-prefix key for the durable qualification record (ADR-0050 section 6,
@@ -148,6 +151,12 @@ pub enum Property {
     /// unaddressable (ADR-2637). Needs a [`ForeignKeySeeder`]; without one it
     /// is reported in [`ConformanceReport::not_run`], never as passed.
     UnaddressableKeysAreCounted,
+    /// Keys containing a literal `+` and a space, written with an ordinary
+    /// `put`, come back from a listing verbatim and none is reported
+    /// unaddressable. `S3Store` lists with `encoding-type=url` and reads `+`
+    /// as a space and `%2B` as `+`, so this checks that the backend encodes
+    /// the two that way (ADR-2637 decision 1). Runs on every subject.
+    ListedKeysRoundTripPlusAndSpace,
 }
 
 impl Property {
@@ -168,6 +177,7 @@ impl Property {
             Property::DeleteVisibility => "delete_visibility",
             Property::OperationsRefuseUnaddressableKeys => "operations_refuse_unaddressable_keys",
             Property::UnaddressableKeysAreCounted => "unaddressable_keys_are_counted",
+            Property::ListedKeysRoundTripPlusAndSpace => "listed_keys_round_trip_plus_and_space",
         }
     }
 }
@@ -1085,6 +1095,7 @@ pub async fn run_conformance_suite_with_seeder(
         probe_cross_page_listing(store, &prefix, page_size).await,
         probe_delete_visibility(store, &prefix).await,
         probe_operations_refuse_unaddressable_keys(store, &prefix, seeder).await,
+        probe_listed_keys_round_trip_plus_and_space(store, &prefix).await,
     ];
     let mut not_run = Vec::new();
     match seeder {
@@ -1723,12 +1734,11 @@ const _: () = assert!(
 
 /// How many keys the two LIST probes ([`probe_lexicographic_listing_order`]
 /// and [`probe_cross_page_listing`]) write, given the caller's declared list
-/// page size. `page_size + 2` guarantees a real continuation-token boundary is
-/// crossed rather than merely a client-side re-chunking of an already fully
-/// streamed listing (`S3Store::with_page_size` does not change the wire-level
-/// `ListObjectsV2` page size, so shrinking it alone proves nothing about a
-/// real backend); floored at 5 so the existing page-size-2 pagination-oracle
-/// fixtures in this module's tests keep their exact 5-key/3-page shape.
+/// page size. `page_size + 2` guarantees at least one page boundary, where the
+/// next page resumes from `start-after` (`S3Store::with_page_size` sets
+/// ListObjectsV2's `max-keys`, so against S3 that boundary is the backend's
+/// own); floored at 5 so the existing page-size-2 pagination-oracle fixtures
+/// in this module's tests keep their exact 5-key/3-page shape.
 ///
 /// `page_size` reaches here from operator input (`ravel-cli store qualify
 /// --list-page-size`), so the addition saturates: a page size near
@@ -2323,6 +2333,89 @@ async fn probe_unaddressable_keys_are_counted(
     }
 }
 
+/// Keys with a literal `+`, a space, and both, written with `put` and listed
+/// back. A backend that left `+` unescaped under `encoding-type=url` would
+/// list `a+b` as `a b`; one that encoded a space as `%20` still passes, since
+/// `%20` decodes to a space as well.
+async fn probe_listed_keys_round_trip_plus_and_space(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+) -> ProbeResult {
+    let property = Property::ListedKeysRoundTripPlusAndSpace;
+    let list_prefix = format!("{prefix}plus-space/");
+    let mut expected: Vec<String> = ["a b", "a+b", "a+b c"]
+        .iter()
+        .map(|suffix| format!("{list_prefix}{suffix}"))
+        .collect();
+    expected.sort();
+    for key in &expected {
+        if let Err(err) = store
+            .put(key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+        {
+            return ProbeResult::fail(property, format!("put {key:?} failed: {err}"));
+        }
+    }
+    let failure = match drain_membership(store, &list_prefix, expected.len()).await {
+        Err(detail) => Some(detail),
+        Ok((listed, reported)) => {
+            let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+            if listed != expected || !reported.is_empty() {
+                Some(format!(
+                    "listing {list_prefix:?} returned {listed:?} and {} unaddressable keys \
+                     {reported:?}, expected exactly {expected:?}",
+                    reported.len()
+                ))
+            } else {
+                None
+            }
+        }
+    };
+    for key in &expected {
+        if let Err(err) = store.delete(key).await {
+            return ProbeResult::fail(property, format!("delete {key:?} failed: {err}"));
+        }
+    }
+    match failure {
+        Some(detail) => ProbeResult::fail(property, detail),
+        None => ProbeResult::pass(
+            property,
+            format!("{expected:?} each listed back verbatim, none reported unaddressable"),
+        ),
+    }
+}
+
+/// Drain `prefix` through `list` and return the distinct addressable keys in
+/// sorted order and the unaddressable keys in delivery order. Order and
+/// cross-page repeats are LexicographicListingOrder's to judge, so neither
+/// fails this drain the way they fail [`crate::list_all_reporting`].
+async fn drain_membership(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    keys_written: usize,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let max_pages = max_probe_pages(keys_written);
+    let mut listed = std::collections::BTreeSet::new();
+    let mut reported = Vec::new();
+    let mut token = None;
+    for _ in 0..max_pages {
+        let page = store
+            .list(prefix, token)
+            .await
+            .map_err(|err| format!("list({prefix}) failed: {err}"))?;
+        listed.extend(page.objects.into_iter().map(|meta| meta.key));
+        reported.extend(page.unaddressable.into_iter().map(|u| u.key));
+        match page.next {
+            Some(next) => token = Some(next),
+            None => return Ok((listed.into_iter().collect(), reported)),
+        }
+    }
+    Err(format!(
+        "list({prefix}) still returned a continuation token after {max_pages} pages over far \
+         fewer keys; this backend's pagination does not terminate"
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -2338,7 +2431,7 @@ mod tests {
     /// Every property [`run_conformance_suite`] gates on. Pinned here so a new
     /// probe has to be acknowledged in the tests that assert the suite's shape
     /// rather than silently widening them.
-    const GATING_PROPERTIES: usize = 9;
+    const GATING_PROPERTIES: usize = 10;
 
     /// The `sys/qualification` JSON shape is a frozen contract (ADR-0050
     /// section 6): a record written before this struct was relocated out of
@@ -2615,6 +2708,82 @@ mod tests {
         );
     }
 
+    /// Lists every `+` back as a space, as a client decoding
+    /// `encoding-type=url` would against a backend that left `+` unescaped.
+    struct PlusAsSpaceStore(MemoryStore);
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PlusAsSpaceStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.0.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.0.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.0.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut listed = self.0.list(prefix, page).await?;
+            for meta in &mut listed.objects {
+                meta.key = meta.key.replace('+', " ");
+            }
+            Ok(listed)
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.0.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.0.capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_lists_plus_as_space_fails_the_round_trip_property() {
+        let store = PlusAsSpaceStore(MemoryStore::new());
+        let report = run_conformance_suite(&store, "sys/qualify/plus/", 1000).await;
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert!(
+            failed.contains(&Property::ListedKeysRoundTripPlusAndSpace),
+            "{failed:?}"
+        );
+        let result = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ListedKeysRoundTripPlusAndSpace)
+            .expect("round-trip result present");
+        assert!(
+            result.detail.contains(
+                "returned [\"sys/qualify/plus/plus-space/a b\", \
+                 \"sys/qualify/plus/plus-space/a b c\"] and 0 unaddressable keys"
+            ),
+            "{}",
+            result.detail
+        );
+        assert_eq!(
+            Property::ListedKeysRoundTripPlusAndSpace.name(),
+            "listed_keys_round_trip_plus_and_space"
+        );
+    }
+
     /// Wraps `MemoryStore` and simulates eventually consistent listing: the
     /// call to `list`/`list_all` immediately following a key's `put` never
     /// includes it (the key becomes visible starting from the NEXT listing
@@ -2693,6 +2862,7 @@ mod tests {
                 Property::LexicographicListingOrder,
                 Property::CrossPageListing,
                 Property::DeleteVisibility,
+                Property::ListedKeysRoundTripPlusAndSpace,
             ],
             "every listing-dependent property should be named (the delete probe confirms the \
              deletion through a listing too); conditional writes and read-after-write are \
@@ -2793,8 +2963,9 @@ mod tests {
                 Property::LexicographicListingOrder.name(),
                 Property::CrossPageListing.name(),
                 Property::DeleteVisibility.name(),
+                Property::ListedKeysRoundTripPlusAndSpace.name(),
             ]),
-            "exactly the four probes that drain `list` see a list-only defect: {failed:?}"
+            "exactly the five probes that drain `list` see a list-only defect: {failed:?}"
         );
         let failure = report
             .results
@@ -2895,6 +3066,7 @@ mod tests {
                 Property::LexicographicListingOrder.name(),
                 Property::CrossPageListing.name(),
                 Property::DeleteVisibility.name(),
+                Property::ListedKeysRoundTripPlusAndSpace.name(),
             ]),
             "every probe that drains `list` trips the endless token: {failed:?}"
         );
