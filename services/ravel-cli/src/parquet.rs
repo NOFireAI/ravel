@@ -1132,10 +1132,12 @@ mod tests {
             .collect()
     }
 
-    /// The [`UNDELETABLE`] keys are reported unaddressable by the listing, so
-    /// the command neither lists nor prints them.
+    /// The [`UNDELETABLE`] keys are reported unaddressable by the listing.
+    /// The command names each, escaped, with the key a request for it would
+    /// reach and how to remove it, and counts them among the keys `--delete`
+    /// skips.
     #[tokio::test]
-    async fn repair_stray_lists_exactly_the_addressable_stray_keys_and_deletes_nothing() {
+    async fn repair_stray_names_every_stray_key_and_deletes_nothing() {
         let store = stray_table(&every_stray()).await;
         let report = repair_stray_lines(&store, "acme", false, false)
             .await
@@ -1146,24 +1148,35 @@ mod tests {
             .iter()
             .filter_map(|l| l.strip_prefix("  key: "))
             .collect();
-        let mut rests = STRAYS.to_vec();
-        rests.push(RESERVED);
-        let expected: Vec<String> = sorted(&rests).iter().map(|k| format!("{k:?}")).collect();
+        let expected: Vec<String> = sorted(&every_stray())
+            .iter()
+            .map(|k| format!("{k:?}"))
+            .collect();
         assert_eq!(listed, expected, "{printed}");
         assert_eq!(
             printed
                 .matches("stored_unix_ms: 5000 (the store's clock)")
                 .count(),
-            4
+            6
         );
         assert_eq!(
             unaddressable_under(&store, &acme_prefix()).await,
             sorted(&UNDELETABLE)
         );
-        assert!(!printed.contains("undeletable by Ravel"), "{printed}");
-        assert!(!printed.contains("Hits~"), "{printed}");
+        for key in sorted(&UNDELETABLE) {
+            assert_ne!(store_path(&key), key);
+            let named = format!(
+                "  key: {key:?}\n    stored_unix_ms: 5000 (the store's clock)\n    undeletable \
+                 by Ravel: the store's path encoding sends a delete of this key to {:?}; delete \
+                 the exact key with the Maintain credential through an S3 tool",
+                store_path(&key)
+            );
+            assert!(printed.contains(&named), "{printed}");
+        }
+        assert_eq!(printed.matches("undeletable by Ravel").count(), 2);
+        // Printed escaped, never raw.
+        assert!(printed.contains("v/\\\"\\\\x"), "{printed}");
         assert!(!printed.contains("v/\""), "{printed}");
-        assert!(!printed.contains("v/\\\"\\\\x"), "{printed}");
         let reserved = format!(
             "  key: {:?}\n    stored_unix_ms: 5000 (the store's clock)\n    possibly a table \
              created before the name was reserved",
@@ -1174,7 +1187,7 @@ mod tests {
         assert!(!printed.contains("/hits/"), "{printed}");
         assert!(
             printed.ends_with(
-                "4 key(s) listed; rerun with --delete to remove 3 of them; it skips the other 1, \
+                "6 key(s) listed; rerun with --delete to remove 3 of them; it skips the other 3, \
                  marked above"
             ),
             "{printed}"
@@ -1197,8 +1210,9 @@ mod tests {
 
     /// A key under a reserved name is skipped, and the listing after the
     /// deletes names it, so the command fails. A key the store's path
-    /// encoding changes is never listed, so it is never sent a delete that
-    /// would land on another key, and it stays in place.
+    /// encoding changes is skipped and named, never sent a delete that would
+    /// land on another key, so it stays in place and the command fails
+    /// naming it too.
     #[tokio::test]
     async fn repair_stray_with_the_flag_deletes_what_it_can_and_fails_naming_the_rest() {
         let store = Arc::new(stray_table(&every_stray()).await);
@@ -1209,7 +1223,15 @@ mod tests {
         let printed = report.lines.join("\n");
         assert_eq!(store.deletes(), sorted(&STRAYS), "{printed}");
         assert!(printed.contains("deleted 3 key(s)"), "{printed}");
-        assert!(!printed.contains("undeletable by Ravel"), "{printed}");
+        for key in sorted(&UNDELETABLE) {
+            assert!(
+                printed.contains(&format!(
+                    "skipped {key:?}: undeletable by Ravel; delete the exact key with the \
+                     Maintain credential through an S3 tool"
+                )),
+                "{printed}"
+            );
+        }
         assert!(
             printed.contains(&format!(
                 "skipped {:?}: possibly a table created before the name was reserved; pass \
@@ -1218,7 +1240,9 @@ mod tests {
             )),
             "{printed}"
         );
-        let left = vec![acme_key(RESERVED)];
+        let mut left = sorted(&UNDELETABLE);
+        left.push(acme_key(RESERVED));
+        left.sort();
         assert_eq!(report.remaining, left);
         // The valid table keeps every key it had, flagged ones included.
         assert_eq!(
@@ -1235,7 +1259,7 @@ mod tests {
             .expect_err("keys remain");
         let text = err.to_string();
         assert!(
-            text.starts_with("1 key(s) under no valid table name still listed after --delete"),
+            text.starts_with("3 key(s) under no valid table name still listed after --delete"),
             "{text}"
         );
         for key in &left {
@@ -1243,14 +1267,14 @@ mod tests {
         }
         assert_eq!(store.deletes().len(), 3);
 
-        // With reserved names included, the reserved one goes and nothing
-        // listed is left; the unaddressable keys are still there.
+        // With reserved names included, the reserved one goes; the
+        // unaddressable keys are still there, and the run still names them.
         let report = repair_stray_lines(store.as_ref(), "acme", true, true)
             .await
             .expect("repair");
         assert_eq!(store.deletes().len(), 4);
         assert_eq!(store.deletes()[3], acme_key(RESERVED));
-        assert!(report.remaining.is_empty());
+        assert_eq!(report.remaining, sorted(&UNDELETABLE));
         assert_eq!(
             unaddressable_under(store.as_ref(), &acme_prefix()).await,
             sorted(&UNDELETABLE)
