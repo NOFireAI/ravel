@@ -180,6 +180,9 @@ the large one, so it is where the working set actually lives. A scan that
 evicts it converts every subsequent query back into the cold path this
 epic was written to remove.
 
+A repeated scan larger than the cache is a case this decision did not
+consider; the loop amendment below adds it for both tiers.
+
 ### 7. No encryption inside Ravel
 
 The disk tier stores object bytes in plaintext. Deployments requiring
@@ -353,3 +356,59 @@ until `S3Store` surfaces the real `x-amz-version-id`, every S3 file is
 pinned by ETag alone (ADR-2040's pinning amendment), so the bound applies
 to every S3 bucket, versioned or not. GCS files, and Azure files on a
 bucket with versioning on, are pinned by version and are outside it.
+
+## Amendment (2026-10-09): a repeated scan larger than the cache serves a stable subset (ADR-2677)
+
+<!-- amendment-applies: sections="6. Scan-resistant eviction" pointer="loop amendment" -->
+
+Refs: #2681. Decision 6 guards a hot working set against a cold scan that
+passes once. It did not consider a hot scan that repeats: a query run again
+over the same N objects in the same order, over a cache that holds C < N
+of them. Plain S3-FIFO serves that loop nothing. Each entry leaves
+probation untouched, because its next touch is a whole pass away, and the
+ghost window is sized from `max_bytes / max_entry_bytes`: 25 to 74 keys
+for a 1.7 to 5.0 GB cache under the server's 64 MiB `max_entry_bytes`,
+against a 2,617-object loop of 3.8 MB objects. So no entry reached main, and a 1.7 to 5.0 GB cache served
+0.01 GB per hot pass (#2615); on a 32 GB host whose derived cache fell
+0.8 GB under the corpus, it served nothing (#2639 W2).
+
+Two rules in `crates/ravel-cache/src/s3fifo.rs` close this. The ghost sizing
+is unchanged.
+
+- **Fill main while it has room.** An entry leaving probation untouched
+  moves into main, rather than out of the cache, while main has room inside
+  its share of the bounds: `max_bytes` less the probation quota of one
+  tenth, and `max_entries` less one tenth of it (at least one entry). This evicts nothing to make that room, so it cannot
+  displace a working set. A cold scan can occupy main only while main has
+  space nothing else is using, and a later hot entry promoted out of
+  probation evicts it through the main CLOCK as before.
+- **No displacement of a more recent main entry by a ghost hit.** Once main
+  is full, a key returning from the ghost queue takes the slot of the main
+  entry at the front only if that entry has gone untouched for longer than
+  the returning key's own reuse distance, both counted in touches (hits
+  plus admissions). Otherwise the returning key starts over in probation.
+  Under a loop every main entry is touched once per pass, so it has always
+  been idle for less than a pass, and no returning loop key displaces it.
+  A hot key with a short reuse distance still displaces a cold main entry.
+
+The result for a loop: the first pass fills main with its first entries,
+and the passes after it serve those same entries. The crate test
+`repeated_scan_larger_than_the_cache_serves_a_stable_subset` pins at least
+0.8 x C/N of the touches served on passes 2 and 3, and an identical served
+set on both, at the #2615 geometry (C about N/2) and the #2639 W2 geometry
+(C about 0.9 N), plus a W2 case whose ghost covers the whole cache so that
+returning loop keys do hit it. `background_cold_scan_does_not_evict_the_hot_working_set`
+pins decision 6 with the cache already full of cold entries: a hot working
+set that arrives later, under a continuing cold scan, takes residency and
+keeps it.
+
+Both tiers keep one policy. The disk tier and the catalog byte cache build
+the same `S3Fifo`, so they get the loop behaviour too, and the disk tier
+keeps decision 6's protection: its
+`disk_tier_survives_repeated_scans_via_s3_fifo_eviction` test passes
+unchanged. No `CacheLimits` option was needed, and `max_entry_bytes` is
+unchanged.
+
+ADR-2677's rejected alternatives cover the other two fixes: bypassing the
+cache for one-pass scans refuses the hot run, and plain LRU serves nothing
+on a loop larger than itself.
