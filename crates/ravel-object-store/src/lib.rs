@@ -536,6 +536,9 @@ struct UnaddressableWarnState {
     overflow: u64,
 }
 
+/// The warn-once set is process-global: every store in the process shares it,
+/// so a key warned about in one test is not warned about again by any later
+/// test in the same test binary.
 static UNADDRESSABLE_WARNED: std::sync::Mutex<UnaddressableWarnState> =
     std::sync::Mutex::new(UnaddressableWarnState {
         warned: std::collections::BTreeSet::new(),
@@ -1771,7 +1774,8 @@ mod addressable_tests {
     /// The addressability rule spelled out byte by byte, independent of
     /// `Path::from`: the empty key, or printable ASCII outside the set `Path`
     /// percent-encodes, with no leading or trailing `/` and no empty, `.` or
-    /// `..` segment.
+    /// `..` segment. The one deliberate second implementation of the rule:
+    /// every other predicate delegates to [`is_addressable_key`].
     fn addressable_by_rule(key: &str) -> bool {
         const PATH_ENCODED: &[u8] = b"\\{^}%`]\">[~<#|*?";
         key.is_empty()

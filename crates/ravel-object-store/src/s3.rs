@@ -1445,9 +1445,10 @@ pub(crate) fn prefix_of(prefix: &str) -> Option<Path> {
 /// `p/a#b` starts at `p/a%23b` and skips `p/a$`, and resuming after `p/é`
 /// starts at `p/%C3%A9` and re-delivers keys this page already returned. An
 /// unaddressable tail after the token is listed and reported again on the
-/// next page, and a drain counts a tail of two or more keys twice. A full page with no addressable key keeps its raw last key as
-/// the token, which still re-encodes until the raw listing of ADR-2637
-/// decision 1 replaces this one.
+/// next page, and a drain counts a tail of two or more keys twice. A full
+/// page with no addressable key keeps its raw last key as the token, which
+/// still re-encodes until the raw listing of ADR-2637 decision 1 replaces
+/// this one.
 pub(crate) fn assemble_page(prefix: &str, listed: Vec<ObjectMeta>, page_size: usize) -> ListPage {
     let next = if listed.len() == page_size {
         listed
@@ -3007,6 +3008,35 @@ mod tests {
         .expect("drain");
         assert_eq!(objects, ["p/a"]);
         assert_eq!(unaddressable.count, 4);
+    }
+
+    /// A full page of only unaddressable keys resumes after its encoded last
+    /// key, `p/%C3%A92`, which sorts below both keys: the next page is the
+    /// same page with the same token, and the drain fails.
+    #[tokio::test]
+    async fn a_page_of_only_unaddressable_keys_can_repeat_and_fail_the_drain() {
+        let stored = ["p/é1", "p/é2"];
+        let err = crate::drain_pages(
+            "p/",
+            None,
+            crate::MAX_LIST_PAGES,
+            |_, token: Option<PageToken>| async move {
+                let offset = token.map(|PageToken(after)| Path::from(after).to_string());
+                let rest: Vec<&str> = stored
+                    .into_iter()
+                    .filter(|key| offset.as_deref().is_none_or(|after| *key > after))
+                    .take(2)
+                    .collect();
+                Ok::<_, StoreError>(assemble_page("p/", listed(&rest), 2))
+            },
+            |_| Ok(crate::DrainStep::Continue),
+        )
+        .await
+        .expect_err("the page repeats");
+        assert!(
+            matches!(err, StoreError::ListRepeatedToken { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
