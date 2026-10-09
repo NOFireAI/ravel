@@ -395,39 +395,59 @@ check "scenario 1 gives the restarted server its own log file" "yes" \
 # scheme, and the lane empties its bucket before every scenario.
 # ---------------------------------------------------------------------------
 
+# Both launchers have two branches: a binary on PATH, which is what the
+# nightly takes (it puts target/release on PATH), and the `cargo run`
+# fallback. ARGV_BRANCH (path | cargo) pins one in the subshell by replacing
+# chaos_have_command, and replaces `cargo` with a function that prints the
+# arguments after `--`, so neither branch builds or runs anything.
+PIN_BRANCH='
+case "${ARGV_BRANCH:?}" in
+  path) chaos_have_command() { return 0; } ;;
+  cargo)
+    chaos_have_command() { return 1; }
+    cargo() { while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done; shift; printf "%s\n" "$@"; }
+    ;;
+esac'
+
 # One argv element per line, from a fresh shell that sources lib.sh with the
 # tenancy variables taken from the arguments (VAR=value ...) and nothing else.
 server_argv() {
   env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE "$@" \
-    bash -c 'source "$1" && ravel_server_cmd --store s3 | tr "\0" "\n"' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null
+    bash -c 'source "$1" && eval "$2" && ravel_server_cmd --store s3 | tr "\0" "\n"' \
+    _ "${CHAOS_DIR}/lib.sh" "${PIN_BRANCH}" 2>/dev/null
 }
 server_cmd_rc() {
   env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE "$@" \
-    bash -c 'source "$1"; rc=0; ravel_server_cmd --store s3 >/dev/null || rc=$?; echo "${rc}"' \
-    _ "${CHAOS_DIR}/lib.sh" 2>/dev/null
+    bash -c 'source "$1"; eval "$2"; rc=0; ravel_server_cmd --store s3 >/dev/null || rc=$?; echo "${rc}"' \
+    _ "${CHAOS_DIR}/lib.sh" "${PIN_BRANCH}" 2>/dev/null
 }
 tenant_hash_flags() {
   grep -- '^--tenant-hash-' || true
 }
 
-check "server argv: exactly one tenant-hash flag, --tenant-hash-unkeyed by default" \
-  "--tenant-hash-unkeyed" "$(server_argv | tenant_hash_flags)"
-check "server argv: the caller's own flags are kept" "--store"$'\n'"s3" \
-  "$(server_argv | grep -x -A1 -- '--store')"
 KEY_FILE="${SCRATCH}/deployment.key"
 printf '%064d' 0 > "${KEY_FILE}"
-check "server argv: keyed mode emits --tenant-hash-key-file and no other tenant-hash flag" \
-  "--tenant-hash-key-file" \
-  "$(server_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}" | tenant_hash_flags)"
-check "server argv: keyed mode passes the key file path after the flag" "${KEY_FILE}" \
-  "$(server_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}" \
-      | grep -x -A1 -- '--tenant-hash-key-file' | tail -n 1)"
-check "server argv: an unknown mode is refused with 64" "64" \
-  "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=bogus)"
-check "server argv: keyed mode with no key file is refused with 64" "64" \
-  "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=keyed)"
-check "server argv: a key file under unkeyed mode is refused with 64" "64" \
-  "$(server_cmd_rc CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+for ARGV_BRANCH in path cargo; do
+  export ARGV_BRANCH
+  check "server argv (${ARGV_BRANCH}): exactly one tenant-hash flag, --tenant-hash-unkeyed by default" \
+    "--tenant-hash-unkeyed" "$(server_argv | tenant_hash_flags)"
+  check "server argv (${ARGV_BRANCH}): the caller's own flags are kept" "--store"$'\n'"s3" \
+    "$(server_argv | grep -x -A1 -- '--store')"
+  check "server argv (${ARGV_BRANCH}): keyed mode emits --tenant-hash-key-file and no other tenant-hash flag" \
+    "--tenant-hash-key-file" \
+    "$(server_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}" | tenant_hash_flags)"
+  check "server argv (${ARGV_BRANCH}): keyed mode passes the key file path after the flag" "${KEY_FILE}" \
+    "$(server_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}" \
+        | grep -x -A1 -- '--tenant-hash-key-file' | tail -n 1)"
+  check "server argv (${ARGV_BRANCH}): an unknown mode is refused with 64" "64" \
+    "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=bogus)"
+  check "server argv (${ARGV_BRANCH}): keyed mode with no key file is refused with 64" "64" \
+    "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=keyed)"
+  check "server argv (${ARGV_BRANCH}): a key file under unkeyed mode is refused with 64" "64" \
+    "$(server_cmd_rc CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+  check "server argv (${ARGV_BRANCH}): keyed mode with an unreadable key file is refused with 64" "64" \
+    "$(server_cmd_rc CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${SCRATCH}/absent.key")"
+done
 for s in kill-ingest-flush.sh kill-maintain-worker.sh; do
   check "${s}: an unknown tenant-hash mode is refused with 64 before anything starts" "64" \
     "$(CHAOS_TENANT_HASH_MODE=bogus rc_of bash "${CHAOS_DIR}/${s}" --check)"
@@ -458,13 +478,17 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@"\n' >"${CLI_STUB_DIR}/ravel-cli
 chmod +x "${CLI_STUB_DIR}/ravel-cli"
 cli_argv() {
   env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE PATH="${CLI_STUB_DIR}:${PATH}" "$@" \
-    bash -c 'source "$1" && ravel_cli store qualify' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null | paste -sd' ' -
+    bash -c 'source "$1" && eval "$2" && ravel_cli store qualify' \
+    _ "${CHAOS_DIR}/lib.sh" "${PIN_BRANCH}" 2>/dev/null | paste -sd' ' -
 }
-check "ravel_cli: unkeyed puts --tenant-hash-unkeyed before the subcommand" \
-  "--tenant-hash-unkeyed store qualify" "$(cli_argv)"
-check "ravel_cli: keyed puts --tenant-hash-key-file before the subcommand" \
-  "--tenant-hash-key-file ${KEY_FILE} store qualify" \
-  "$(cli_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+for ARGV_BRANCH in path cargo; do
+  export ARGV_BRANCH
+  check "ravel_cli (${ARGV_BRANCH}): unkeyed puts --tenant-hash-unkeyed before the subcommand" \
+    "--tenant-hash-unkeyed store qualify" "$(cli_argv)"
+  check "ravel_cli (${ARGV_BRANCH}): keyed puts --tenant-hash-key-file before the subcommand" \
+    "--tenant-hash-key-file ${KEY_FILE} store qualify" \
+    "$(cli_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
+done
 
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]
