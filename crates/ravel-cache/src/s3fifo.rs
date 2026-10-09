@@ -79,8 +79,8 @@
 //! ghost. They return as ghost hits on the second pass and take the scan's
 //! idle slots, and from the third pass on the loop serves a stable subset.
 //! That needs the ghost to remember the loop's keys for a whole pass, so it
-//! holds for a loop up to about twice the cache. A longer loop after such a
-//! scan is not served at all until something else evicts the scan's entries.
+//! holds for a loop up to about twice the cache. A loop five times the
+//! cache, after such a scan, serves nothing in six passes.
 //!
 //! Main's share is where untouched entries stop filling it, not a cap:
 //! promoting an entry read again in probation, or a displacement that
