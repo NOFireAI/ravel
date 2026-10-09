@@ -74,9 +74,9 @@ fn ms(ns: u64) -> f64 {
 
 /// The statement's wall time per stage, rendered under `stats.timings`
 /// (ADR-2677 decision 4). These are wall-clock stages, not the request
-/// accounting buckets `stats.phases` names, and they overlap: the scan
-/// figures are measured inside a scan created during `startMs` and drained
-/// during `drainMs`. `audit` is the caller's wait on its audit submission,
+/// accounting buckets `stats.phases` names. The five executor stages run one
+/// after another; the scan figures overlap them, measured inside a scan
+/// created during `startMs` and drained during `drainMs`. `audit` is the caller's wait on its audit submission,
 /// which runs outside the executor.
 ///
 /// Only the scan figures that hold across partitions are rendered: the

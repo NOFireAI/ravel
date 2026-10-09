@@ -408,6 +408,57 @@ async fn a_logs_query_with_an_indexed_predicate_prunes_blocks_by_postings() {
     );
 }
 
+/// `scan_timing.scans` counts `LogsScanExec` nodes, not plan nodes and not
+/// row reads: a late-materialized `SELECT * ... ORDER BY ts LIMIT k` holds
+/// one scan (phase 2's `LogsRowFetchExec` re-reads rows without a second
+/// scan), a `UNION ALL` of two logs branches holds two, and a metrics
+/// statement holds none.
+#[tokio::test]
+async fn scan_timing_counts_logs_scans_in_the_plan() {
+    let tenant = tenant_id("logs-scan-count");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_logs_with_region_postings(store.as_ref(), &tenant).await;
+    let fixture = Fixture::build(Arc::clone(&store), &[], SqlConfig::default(), 1 << 30).await;
+
+    let topk = request("SELECT * FROM logs WHERE attrs['region'] = 'region-0' ORDER BY ts LIMIT 2");
+    let explain = fixture
+        .executor
+        .explain(tenant.hash(), &topk)
+        .await
+        .expect("explain the TopK");
+    assert!(
+        explain.plan_text.contains("LogsRowFetchExec"),
+        "the late-materialization rule fired: {}",
+        explain.plan_text
+    );
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &topk)
+        .await
+        .expect("late-materialized TopK");
+    assert_eq!(outcome.output.num_rows(), 2);
+    assert_eq!(outcome.stats.scan_timing.scans, 1, "{:?}", outcome.stats);
+
+    let union = request(
+        "SELECT ts FROM logs WHERE attrs['region'] = 'region-0' \
+         UNION ALL SELECT ts FROM logs WHERE attrs['region'] = 'region-1'",
+    );
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &union)
+        .await
+        .expect("two-branch union");
+    assert_eq!(outcome.output.num_rows(), 2 * POSTINGS_PRUNE_GROUP_SIZE);
+    assert_eq!(outcome.stats.scan_timing.scans, 2, "{:?}", outcome.stats);
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT count(*) FROM samples"))
+        .await
+        .expect("metrics statement");
+    assert_eq!(outcome.stats.scan_timing.scans, 0, "{:?}", outcome.stats);
+}
+
 fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> {
     let mut out: HashMap<[u8; 16], HashMap<i64, u64>> = HashMap::new();
     for batch in batches {
