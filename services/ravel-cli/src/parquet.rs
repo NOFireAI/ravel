@@ -720,14 +720,21 @@ mod tests {
     /// format, plus a forged version one above the bound and one at
     /// `u64::MAX`, in a store that counts deletes.
     async fn forged_table() -> InstrumentedStore<MemoryStore> {
-        let store = InstrumentedStore::new(MemoryStore::new());
-        let hash = TenantId::new("acme").hash();
-        for (version, by) in [
+        table_with(&[
             (1, "ddl"),
             (MAX_MANIFEST_VERSION, "ddl"),
             (MAX_MANIFEST_VERSION + 1, "forger"),
             (u64::MAX, "forger"),
-        ] {
+        ])
+        .await
+    }
+
+    /// `acme`'s `hits` holding each of `versions`, written by its `created_by`,
+    /// through the writer's format, in a store that counts deletes.
+    async fn table_with(versions: &[(u64, &str)]) -> InstrumentedStore<MemoryStore> {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let hash = TenantId::new("acme").hash();
+        for &(version, by) in versions {
             let manifest = Manifest {
                 table: "hits".into(),
                 version,
@@ -880,6 +887,84 @@ mod tests {
         }
         assert_eq!(deletes(&store), 2);
         assert_eq!(unaddressable_under(&store, &prefix).await, [key]);
+    }
+
+    /// A key under the `v/` prefix that does not parse as a manifest key is
+    /// never flagged, so when the listing also reports it unaddressable it is
+    /// only reported: `--delete` removes the flagged version and succeeds,
+    /// and the key is left in place.
+    #[tokio::test]
+    async fn repair_reports_an_unflagged_undeletable_key_and_does_not_fail_on_it() {
+        let hash = TenantId::new("acme").hash();
+        let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
+        let junk = format!("{prefix}junk~");
+        let junk_key = junk.as_str();
+        let seeded = move || async move {
+            let store = table_with(&[(1, "ddl"), (MAX_MANIFEST_VERSION + 1, "forger")]).await;
+            store.inner().insert_foreign(junk_key, Bytes::from_static(b"x"));
+            store
+        };
+        let named = format!(
+            "    key: {junk:?}\n    stored_unix_ms: 0 (the store's clock)\n    undeletable by \
+             Ravel: the store's path encoding sends a delete of this key to {:?}",
+            store_path(&junk)
+        );
+
+        let store = seeded().await;
+        let lines = repair_lines(&store, "acme", "hits", RepairAction::DeleteFlagged)
+            .await
+            .expect("an unflagged key is not a deletion candidate");
+        let printed = lines.join("\n");
+        assert!(printed.contains(&named), "{printed}");
+        assert!(!printed.contains("skipped"), "{printed}");
+        let flagged_key = manifest_key(&hash, "hits", MAX_MANIFEST_VERSION + 1).expect("key");
+        assert!(
+            printed.ends_with(&format!("deleted 1 manifest versions\n  {flagged_key:?}")),
+            "{printed}"
+        );
+        assert_eq!(deletes(&store), 1);
+        assert_eq!(
+            resolve::versions(&store, &hash, "hits")
+                .await
+                .expect("versions"),
+            vec![1]
+        );
+        assert_eq!(unaddressable_under(&store, &prefix).await, [junk.clone()]);
+
+        // Nothing is flagged now; the key is still reported, and still kept.
+        let lines = repair_lines(&store, "acme", "hits", RepairAction::DeleteFlagged)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        assert!(printed.contains(&named), "{printed}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "no versions above the version bound and no keys naming no version; 1 key(s) \
+                 not flagged and undeletable by Ravel, marked above, are left in place"
+            ),
+            "{printed}"
+        );
+        assert_eq!(deletes(&store), 1);
+        assert_eq!(unaddressable_under(&store, &prefix).await, [junk.clone()]);
+
+        // On the same tree, the list-only run flags the one version.
+        let listed = seeded().await;
+        let lines = repair_lines(&listed, "acme", "hits", RepairAction::List)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        assert!(printed.contains(&named), "{printed}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "1 version(s) flagged; rerun with --delete to remove exactly these; 1 key(s) \
+                 not flagged and undeletable by Ravel, marked above, are left in place"
+            ),
+            "{printed}"
+        );
+        assert_eq!(deletes(&listed), 0);
+        assert_eq!(unaddressable_under(&listed, &prefix).await, [junk]);
     }
 
     #[tokio::test]
