@@ -1,0 +1,204 @@
+Total: 1046763237 B
+       0   0.0%   0.0% 1046763237 100.0% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed.rs:2275
+       0   0.0%   0.0% 1046763237 100.0% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panic/unwind_safe.rs:275
+       0   0.0%   0.0% 1046763237 100.0% ::call_once::{shim:vtable#0} /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250
+       0   0.0%   0.0% 1046763237 100.0% ::launch::{closure#0} (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:514
+       0   0.0%   0.0% 1046763237 100.0% ::new::thread_start /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/thread/unix.rs:118
+       0   0.0%   0.0% 1046763237 100.0% ::poll (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/future/future.rs:133
+       0   0.0%   0.0% 1046763237 100.0% ::poll (inline) futures-util-0.3.33/src/future/future/map.rs:55
+       0   0.0%   0.0% 1046763237 100.0% ::poll (inline) tokio-1.53.1/src/runtime/blocking/task.rs:42
+       0   0.0%   0.0% 1046763237 100.0% ::poll (inline) tokio-1.53.1/src/runtime/task/core.rs:369
+       0   0.0%   0.0% 1046763237 100.0% ::poll (inline) tokio-1.53.1/src/runtime/task/harness.rs:155
+       0   0.0%   0.0% 1046763237 100.0% ::poll (inline) tokio-1.53.1/src/runtime/task/raw.rs:273
+       0   0.0%   0.0% 1046763237 100.0% ::poll futures-util-0.3.33/src/lib.rs:85
+       0   0.0%   0.0% 1046763237 100.0% ::poll::{closure#0} (inline) tokio-1.53.1/src/runtime/task/core.rs:380
+       0   0.0%   0.0% 1046763237 100.0% ::poll_inner (inline) tokio-1.53.1/src/runtime/task/harness.rs:210
+       0   0.0%   0.0% 1046763237 100.0% ::run (inline) tokio-1.53.1/src/runtime/blocking/pool.rs:161
+       0   0.0%   0.0% 1046763237 100.0% ::run (inline) tokio-1.53.1/src/runtime/blocking/pool.rs:518
+       0   0.0%   0.0% 1046763237 100.0% ::run (inline) tokio-1.53.1/src/runtime/task/mod.rs:519
+       0   0.0%   0.0% 1046763237 100.0% ::run (inline) tokio-1.53.1/src/runtime/task/mod.rs:565
+       0   0.0%   0.0% 1046763237 100.0% ::run_task tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:689
+       0   0.0%   0.0% 1046763237 100.0% ::set:: (inline) tokio-1.53.1/src/runtime/context/scoped.rs:40
+       0   0.0%   0.0% 1046763237 100.0% ::spawn_thread::{closure#0} (inline) tokio-1.53.1/src/runtime/blocking/pool.rs:474
+       0   0.0%   0.0% 1046763237 100.0% ::try_with:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/local.rs:462
+       0   0.0%   0.0% 1046763237 100.0% ::with:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/local.rs:426
+       0   0.0%   0.0% 1046763237 100.0% ::with_mut:: (inline) tokio-1.53.1/src/loom/std/unsafe_cell.rs:16
+       0   0.0%   0.0% 1046763237 100.0% __clone@@GLIBC_2.2.5 ??:?
+       0   0.0%   0.0% 1046763237 100.0% _rjem_je_prof_backtrace /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/prof_sys.c:530
+       0   0.0%   0.0% 1046763237 100.0% _rjem_je_prof_tctx_create /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/prof.c:232
+       0   0.0%   0.0% 1046763237 100.0% datafusion_common_runtime::trace_utils::trace_future::::{closure#0} datafusion-common-runtime-54.1.0/src/trace_utils.rs:137
+       0   0.0%   0.0% 1046763237 100.0% prof_alloc_prep (inline) /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/include/jemalloc/internal/prof_inlines.h:171
+1046763237 100.0% 100.0% 1046763237 100.0% prof_backtrace_impl /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/prof_sys.c:107
+       0   0.0% 100.0% 1046763237 100.0% pthread_condattr_setpshared@GLIBC_2.2.5 ??:?
+       0   0.0% 100.0% 1046763237 100.0% std::panic::catch_unwind:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panic.rs:359
+       0   0.0% 100.0% 1046763237 100.0% std::panicking::catch_unwind:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:544
+       0   0.0% 100.0% 1046763237 100.0% std::panicking::catch_unwind::do_call:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:581
+       0   0.0% 100.0% 1046763237 100.0% std::sys::backtrace::__rust_begin_short_backtrace:: /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/backtrace.rs:166
+       0   0.0% 100.0% 1046763237 100.0% std::thread::lifecycle::spawn_unchecked::::{closure#1} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/lifecycle.rs:68
+       0   0.0% 100.0% 1046763237 100.0% std::thread::lifecycle::spawn_unchecked::::{closure#1}::{closure#0} (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/thread/lifecycle.rs:70
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::context::runtime::enter_runtime:: (inline) tokio-1.53.1/src/runtime/context/runtime.rs:65
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::context::set_scheduler:: (inline) tokio-1.53.1/src/runtime/context.rs:187
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::context::set_scheduler::::{closure#0} (inline) tokio-1.53.1/src/runtime/context.rs:187
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::scheduler::multi_thread::worker::run tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:548
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0} (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:556
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0} (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:561
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::task::harness::poll_future:: (inline) tokio-1.53.1/src/runtime/task/harness.rs:523
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::task::harness::poll_future::::{closure#0} (inline) tokio-1.53.1/src/runtime/task/harness.rs:535
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::task::raw::poll::@41327f0 tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0% 1046763237 100.0% tokio::runtime::task::raw::poll::@6537af0 tokio-1.53.1/src/runtime/task/raw.rs:343
+       0   0.0% 100.0% 1046763237 100.0% tokio::task::coop::budget:: (inline) tokio-1.53.1/src/task/coop/mod.rs:133
+       0   0.0% 100.0% 1046763237 100.0% tokio::task::coop::with_budget:: (inline) tokio-1.53.1/src/task/coop/mod.rs:167
+       0   0.0% 100.0% 1011443471  96.6% ::run_task::{closure#0} (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:698
+       0   0.0% 100.0% 945625560  90.3% ::poll_next datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:745
+       0   0.0% 100.0% 941542664  89.9% ::poll (inline) futures-util-0.3.33/src/stream/stream/next.rs:32
+       0   0.0% 100.0% 941542664  89.9% ::poll_next (inline) futures-core-0.3.33/src/stream.rs:130
+       0   0.0% 100.0% 941542664  89.9% ::poll_next_unpin (inline) futures-util-0.3.33/src/stream/stream/mod.rs:1637
+       0   0.0% 100.0% 893071580  85.3% ::group_aggregate_batch (inline) datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:965
+       0   0.0% 100.0% 893071580  85.3% ::insert_if_new:: (inline) datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:227
+       0   0.0% 100.0% 893071580  85.3% ::intern datafusion-physical-plan-54.1.0/src/aggregates/group_values/single_group_by/bytes_view.rs:57
+       0   0.0% 100.0% 752236194  71.9% ::alloc (inline) tikv-jemallocator-0.7.0/src/lib.rs:100
+       0   0.0% 100.0% 752236194  71.9% __rustc::__rust_alloc (inline) /var/lib/fleet/work/428ccefa-2a93-4412-ae02-50fc82265f78/services/ravel-server/src/main.rs:22
+       0   0.0% 100.0% 752236194  71.9% _rjem_je_malloc_default /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1785
+       0   0.0% 100.0% 752236194  71.9% alloc::alloc::alloc (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:101
+       0   0.0% 100.0% 752236194  71.9% imalloc (inline) /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1750
+       0   0.0% 100.0% 752236194  71.9% imalloc_body (inline) /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:1613
+       0   0.0% 100.0% 645060567  61.6% ::insert_if_new_inner:: (inline) datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:360
+       0   0.0% 100.0% 624833993  59.7% ::run (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:608
+       0   0.0% 100.0% 510855228  48.8% ::alloc_impl (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:332
+       0   0.0% 100.0% 510855228  48.8% ::alloc_impl_runtime (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:210
+       0   0.0% 100.0% 510855228  48.8% ::allocate (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:449
+       0   0.0% 100.0% 499452564  47.7% ::with_capacity (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:524
+       0   0.0% 100.0% 499452564  47.7% ::try_allocate_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:465
+       0   0.0% 100.0% 499452564  47.7% ::with_capacity_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:177
+       0   0.0% 100.0% 499452564  47.7% ::with_capacity_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:434
+       0   0.0% 100.0% 499452564  47.7% ::with_capacity_in (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:977
+       0   0.0% 100.0% 483152214  46.2% ::poll_next datafusion-physical-plan-54.1.0/src/projection.rs:535
+       0   0.0% 100.0% 483152214  46.2% ::run_input::{closure#0} (inline) datafusion-physical-plan-54.1.0/src/stream.rs:360
+       0   0.0% 100.0% 458390450  43.8% ::pull_from_input::{closure#0} (inline) datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1630
+       0   0.0% 100.0% 421929244  40.3% ::run (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:596
+       0   0.0% 100.0% 408068135  39.0% ::append_value datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:439
+       0   0.0% 100.0% 305929707  29.2% ::grow_amortized (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:528
+       0   0.0% 100.0% 294527043  28.1% ::finish_grow /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:556
+       0   0.0% 100.0% 294527043  28.1% ::grow (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:474
+       0   0.0% 100.0% 294527043  28.1% ::grow_impl (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:362
+       0   0.0% 100.0% 294527043  28.1% ::grow_impl_runtime (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:259
+       0   0.0% 100.0% 294527043  28.1% ::realloc (inline) tikv-jemallocator-0.7.0/src/lib.rs:133
+       0   0.0% 100.0% 294527043  28.1% __rustc::__rust_realloc (inline) /var/lib/fleet/work/428ccefa-2a93-4412-ae02-50fc82265f78/services/ravel-server/src/main.rs:22
+       0   0.0% 100.0% 294527043  28.1% alloc::alloc::realloc_nonnull (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/alloc.rs:155
+       0   0.0% 100.0% 294527043  28.1% do_rallocx /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:2517
+       0   0.0% 100.0% 294527043  28.1% irallocx_prof (inline) /var/lib/fleet/cache/cargo-target/428ccefa-2a93-4412-ae02-50fc82265f78/release/build/tikv-jemalloc-sys-14b1e5886a6f3908/out/build/src/jemalloc.c:2458
+       0   0.0% 100.0% 244106569  23.3% ::fallible_with_capacity:: hashbrown-0.17.1/src/raw.rs:1634
+       0   0.0% 100.0% 244106569  23.3% ::insert_accounted:: (inline) datafusion-common-54.1.0/src/utils/proxy.rs:180
+       0   0.0% 100.0% 244106569  23.3% ::insert_if_new_inner:: (inline) datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:371
+       0   0.0% 100.0% 244106569  23.3% ::prepare_resize:: (inline) hashbrown-0.17.1/src/raw.rs:2696
+       0   0.0% 100.0% 244106569  23.3% ::reserve:: (inline) hashbrown-0.17.1/src/raw.rs:914
+       0   0.0% 100.0% 244106569  23.3% ::reserve:: (inline) hashbrown-0.17.1/src/table.rs:846
+       0   0.0% 100.0% 244106569  23.3% ::reserve_rehash:: hashbrown-0.17.1/src/raw.rs:962
+       0   0.0% 100.0% 244106569  23.3% ::reserve_rehash_inner:: (inline) hashbrown-0.17.1/src/raw.rs:2784
+       0   0.0% 100.0% 244106569  23.3% ::resize_inner:: (inline) hashbrown-0.17.1/src/raw.rs:2898
+       0   0.0% 100.0% 241380965  23.1% ::alloc_impl (inline) allocator-api2-0.2.21/src/stable/alloc/global.rs:35
+       0   0.0% 100.0% 241380965  23.1% ::allocate (inline) allocator-api2-0.2.21/src/stable/alloc/global.rs:100
+       0   0.0% 100.0% 241380965  23.1% ::new_uninitialized:: (inline) hashbrown-0.17.1/src/raw.rs:1576
+       0   0.0% 100.0% 241380965  23.1% hashbrown::alloc::inner::do_alloc:: (inline) hashbrown-0.17.1/src/alloc.rs:40
+       0   0.0% 100.0% 211784055  20.2% ::reserve (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:341
+       0   0.0% 100.0% 211784055  20.2% ::reserve (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:675
+       0   0.0% 100.0% 211784055  20.2% ::reserve (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:1471
+       0   0.0% 100.0% 211784055  20.2% ::reserve::do_reserve_and_handle:: /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:668
+       0   0.0% 100.0% 147768455  14.1% ::append_elements (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:2932
+       0   0.0% 100.0% 147768455  14.1% ::append_value datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:446
+       0   0.0% 100.0% 147768455  14.1% ::extend_from_slice (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3557
+       0   0.0% 100.0% 147768455  14.1% ::spec_extend (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_extend.rs:56
+       0   0.0% 100.0% 106312210  10.2% ::coalesce datafusion-physical-plan-54.1.0/src/repartition/mod.rs:170
+       0   0.0% 100.0% 106312210  10.2% ::pull_from_input::{closure#0} (inline) datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1650
+       0   0.0% 100.0% 106312210  10.2% ::push_and_drain (inline) datafusion-physical-plan-54.1.0/src/repartition/mod.rs:247
+       0   0.0% 100.0% 106312210  10.2% ::push_batch datafusion-physical-plan-54.1.0/src/coalesce/mod.rs:118
+       0   0.0% 100.0% 102652778   9.8% ::push_batch arrow-select-58.4.0/src/coalesce.rs:499
+       0   0.0% 100.0% 95991708   9.2% ::copy_rows arrow-select-58.4.0/src/coalesce/byte_view.rs:341
+       0   0.0% 100.0% 95991708   9.2% ::next_buffer (inline) arrow-select-58.4.0/src/coalesce/byte_view.rs:384
+       0   0.0% 100.0% 94145651   9.0% ::grow_one (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:492
+       0   0.0% 100.0% 94145651   9.0% ::grow_one /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:188
+       0   0.0% 100.0% 94145651   9.0% ::push (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:1004
+       0   0.0% 100.0% 94145651   9.0% ::push_mut (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:1041
+       0   0.0% 100.0% 89223975   8.5% ::append_value datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:451
+       0   0.0% 100.0% 67936062   6.5% ::append_views_and_copy_strings arrow-select-58.4.0/src/coalesce/byte_view.rs:162
+       0   0.0% 100.0% 53695097   5.1% ::extend_with (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3649
+       0   0.0% 100.0% 53695097   5.1% ::resize (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/mod.rs:3526
+       0   0.0% 100.0% 35319765   3.4% ::run_task::{closure#0} (inline) tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs:775
+       0   0.0% 100.0% 30933185   3.0% ::group_aggregate_batch (inline) datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:999
+       0   0.0% 100.0% 30933185   3.0% ::update_batch datafusion-functions-aggregate-54.1.0/src/count.rs:649
+       0   0.0% 100.0% 28055645   2.7% ::append_views_and_copy_strings arrow-select-58.4.0/src/coalesce/byte_view.rs:203
+       0   0.0% 100.0% 21620793   2.1% ::group_aggregate_batch (inline) datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:1013
+       0   0.0% 100.0% 21620793   2.1% ::merge_batch datafusion-functions-aggregate-54.1.0/src/count.rs:681
+       0   0.0% 100.0% 11402663   1.1% ::finish_grow /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/raw_vec/mod.rs:559
+       0   0.0% 100.0%  5577777   0.5% ::copy_rows arrow-select-58.4.0/src/coalesce/primitive.rs:70
+       0   0.0% 100.0%  5577777   0.5% ::ensure_capacity (inline) arrow-select-58.4.0/src/coalesce/primitive.rs:59
+       0   0.0% 100.0%  4742725   0.5% ::copy_rows arrow-select-58.4.0/src/coalesce/byte_view.rs:309
+       0   0.0% 100.0%  4742725   0.5% ::ensure_capacity (inline) arrow-select-58.4.0/src/coalesce/byte_view.rs:102
+       0   0.0% 100.0%  3659431   0.3% ::push_batch arrow-select-58.4.0/src/coalesce.rs:485
+       0   0.0% 100.0%  3346666   0.3% ::insert_if_new_inner:: (inline) datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:?
+       0   0.0% 100.0%  3346666   0.3% ::intern::{closure#1} (inline) datafusion-physical-plan-54.1.0/src/aggregates/group_values/single_group_by/bytes_view.rs:68
+       0   0.0% 100.0%  2839568   0.3% ::poll_next datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:819
+       0   0.0% 100.0%  1633966   0.2% ::pull_from_input::{closure#0} (inline) datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1644
+       0   0.0% 100.0%  1050625   0.1% ::partition_indices (inline) datafusion-physical-plan-54.1.0/src/repartition/mod.rs:611
+       0   0.0% 100.0%  1050625   0.1% ::partition_iter datafusion-physical-plan-54.1.0/src/repartition/mod.rs:816
+       0   0.0% 100.0%   583341   0.1% ::partition_iter datafusion-physical-plan-54.1.0/src/repartition/mod.rs:806
+       0   0.0% 100.0%   557777   0.1% ::insert_if_new_inner:: (inline) datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:258
+       0   0.0% 100.0%   524384   0.1% ::new datafusion-datasource-parquet-54.1.0/src/metrics.rs:163
+       0   0.0% 100.0%   524384   0.1% ::plan_file datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:159
+       0   0.0% 100.0%   524384   0.1% ::poll_scan (inline) datafusion-datasource-54.1.0/src/file_stream/scan_state.rs:275
+       0   0.0% 100.0%   524384   0.1% ::prepare_open_file (inline) datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:572
+       0   0.0% 100.0%   524384   0.1% ::try_new (inline) datafusion-datasource-parquet-54.1.0/src/opener/mod.rs:480
+       0   0.0% 100.0%   524384   0.1% ::with_label (inline) datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:86
+       0   0.0% 100.0%   524384   0.1% ::with_new_label:: (inline) datafusion-physical-expr-common-54.1.0/src/metrics/builder.rs:111
+       0   0.0% 100.0%  -592840  -0.1% ::get_or_insert_with:: (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/option.rs:1823
+       0   0.0% 100.0%  -592840  -0.1% ::read_one_batch (inline) parquet-58.4.0/src/arrow/record_reader/mod.rs:234
+       0   0.0% 100.0%  -592840  -0.1% ::read_one_batch::{closure#0} (inline) parquet-58.4.0/src/arrow/record_reader/mod.rs:234
+       0   0.0% 100.0%  -592840  -0.1% ::with_capacity (inline) parquet-58.4.0/src/arrow/buffer/view_buffer.rs:75
+       0   0.0% 100.0% -1635362  -0.2% ::ensure_input_streams_initialized datafusion-physical-plan-54.1.0/src/repartition/mod.rs:379
+       0   0.0% 100.0% -1635362  -0.2% ::execute datafusion-physical-plan-54.1.0/src/repartition/mod.rs:1242
+       0   0.0% 100.0% -1635362  -0.2% ::new (inline) datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:476
+       0   0.0% 100.0% -1853781  -0.2% ::read_new_page parquet-58.4.0/src/column/reader.rs:419
+       0   0.0% 100.0% -1853781  -0.2% ::set_dict parquet-58.4.0/src/arrow/array_reader/byte_view_array.rs:170
+       0   0.0% 100.0% -2160657  -0.2% ::get_next_page parquet-58.4.0/src/file/serialized_reader.rs:965
+       0   0.0% 100.0% -2160657  -0.2% ::read_new_page parquet-58.4.0/src/column/reader.rs:406
+       0   0.0% 100.0% -2160657  -0.2% parquet::file::serialized_reader::decode_page parquet-58.4.0/src/file/serialized_reader.rs:448
+       0   0.0% 100.0% -2446622  -0.2% ::with_capacity (inline) parquet-58.4.0/src/arrow/buffer/view_buffer.rs:39
+       0   0.0% 100.0% -2725604  -0.3% ::execute datafusion-physical-plan-54.1.0/src/aggregates/mod.rs:1607
+       0   0.0% 100.0% -2725604  -0.3% ::execute datafusion-physical-plan-54.1.0/src/projection.rs:342
+       0   0.0% 100.0% -2725604  -0.3% ::execute_typed (inline) datafusion-physical-plan-54.1.0/src/aggregates/mod.rs:968
+       0   0.0% 100.0% -2725604  -0.3% ::fallible_with_capacity:: (inline) hashbrown-0.17.1/src/raw.rs:1634
+       0   0.0% 100.0% -2725604  -0.3% ::new (inline) datafusion-physical-expr-common-54.1.0/src/binary_view_map.rs:160
+       0   0.0% 100.0% -2725604  -0.3% ::new (inline) datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:597
+       0   0.0% 100.0% -2725604  -0.3% ::new datafusion-physical-plan-54.1.0/src/aggregates/group_values/single_group_by/bytes_view.rs:39
+       0   0.0% 100.0% -2725604  -0.3% ::run_input::{closure#0} (inline) datafusion-physical-plan-54.1.0/src/stream.rs:340
+       0   0.0% 100.0% -2725604  -0.3% ::with_capacity (inline) hashbrown-0.17.1/src/raw.rs:601
+       0   0.0% 100.0% -2725604  -0.3% ::with_capacity (inline) hashbrown-0.17.1/src/table.rs:92
+       0   0.0% 100.0% -2725604  -0.3% ::with_capacity:: (inline) hashbrown-0.17.1/src/raw.rs:1661
+       0   0.0% 100.0% -2725604  -0.3% ::with_capacity_in (inline) hashbrown-0.17.1/src/raw.rs:648
+       0   0.0% 100.0% -2725604  -0.3% datafusion_physical_plan::aggregates::group_values::new_group_values datafusion-physical-plan-54.1.0/src/aggregates/group_values/mod.rs:185
+       0   0.0% 100.0% -4014439  -0.4% ::has_next (inline) parquet-58.4.0/src/column/reader.rs:552
+       0   0.0% 100.0% -4014439  -0.4% ::read_one_batch (inline) parquet-58.4.0/src/arrow/record_reader/mod.rs:237
+       0   0.0% 100.0% -4014439  -0.4% ::read_records (inline) parquet-58.4.0/src/column/reader.rs:213
+       0   0.0% 100.0% -4082895  -0.4% ::call_once (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250
+       0   0.0% 100.0% -4082895  -0.4% ::poll_inner (inline) datafusion-datasource-54.1.0/src/file_stream/mod.rs:96
+       0   0.0% 100.0% -4082895  -0.4% ::poll_next datafusion-datasource-54.1.0/src/file_stream/mod.rs:125
+       0   0.0% 100.0% -4082895  -0.4% ::poll_next datafusion-physical-plan-54.1.0/src/coop.rs:154
+       0   0.0% 100.0% -4082895  -0.4% ::poll_next datafusion-physical-plan-54.1.0/src/stream.rs:739
+       0   0.0% 100.0% -4082895  -0.4% ::poll_next /var/lib/fleet/work/428ccefa-2a93-4412-ae02-50fc82265f78/crates/ravel-parquet/src/boundary.rs:257
+       0   0.0% 100.0% -4082895  -0.4% ::poll_next::{closure#0} (inline) /var/lib/fleet/work/428ccefa-2a93-4412-ae02-50fc82265f78/crates/ravel-parquet/src/boundary.rs:257
+       0   0.0% 100.0% -4082895  -0.4% ::poll_upstream (inline) datafusion-physical-plan-54.1.0/src/stream.rs:700
+       0   0.0% 100.0% -4607279  -0.4% ::into_stream::{closure#0}::{closure#0} (inline) datafusion-datasource-parquet-54.1.0/src/push_decoder.rs:131
+       0   0.0% 100.0% -4607279  -0.4% ::next (inline) /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/boxed/iter.rs:21
+       0   0.0% 100.0% -4607279  -0.4% ::next parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1361
+       0   0.0% 100.0% -4607279  -0.4% ::next_inner (inline) parquet-58.4.0/src/arrow/arrow_reader/mod.rs:1490
+       0   0.0% 100.0% -4607279  -0.4% ::poll_next (inline) futures-util-0.3.33/src/stream/unfold.rs:107
+       0   0.0% 100.0% -4607279  -0.4% ::poll_next futures-util-0.3.33/src/stream/stream/fuse.rs:53
+       0   0.0% 100.0% -4607279  -0.4% ::poll_scan (inline) datafusion-datasource-54.1.0/src/file_stream/scan_state.rs:159
+       0   0.0% 100.0% -4607279  -0.4% ::read_records (inline) parquet-58.4.0/src/arrow/record_reader/mod.rs:131
+       0   0.0% 100.0% -4607279  -0.4% ::read_records parquet-58.4.0/src/arrow/array_reader/byte_view_array.rs:105
+       0   0.0% 100.0% -4607279  -0.4% ::read_records parquet-58.4.0/src/arrow/array_reader/struct_array.rs:68
+       0   0.0% 100.0% -4607279  -0.4% ::transition::{closure#0} (inline) datafusion-datasource-parquet-54.1.0/src/push_decoder.rs:154
+       0   0.0% 100.0% -4607279  -0.4% ::try_decode parquet-58.4.0/src/arrow/push_decoder/mod.rs:277
+       0   0.0% 100.0% -4607279  -0.4% ::try_next_batch (inline) parquet-58.4.0/src/arrow/push_decoder/mod.rs:460
+       0   0.0% 100.0% -4607279  -0.4% parquet::arrow::array_reader::read_records:: (inline) parquet-58.4.0/src/arrow/array_reader/mod.rs:196
+       0   0.0% 100.0% -6922463  -0.7% ::poll_next datafusion-physical-plan-54.1.0/src/aggregates/row_hash.rs:728

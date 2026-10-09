@@ -1,0 +1,5 @@
+q35 rep0 http=200 0.512s n=16 delta=1.148GB sql=0.847GB gap=0.301GB pool_peak=0.853GB dumps=1 cache_d=0.000GB
+q35 rep1 http=200 0.481s n=15 delta=1.128GB sql=0.847GB gap=0.280GB pool_peak=0.859GB dumps=1 cache_d=0.000GB
+sampler errors=0 bad_runs=0
+
+EXIT=0

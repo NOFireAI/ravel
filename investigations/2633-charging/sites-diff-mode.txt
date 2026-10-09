@@ -1,0 +1,14 @@
+# q35 i20 minus i16, total 1046763219 B
+   333071013  31.8%  partial aggregate              append_value
+   311989548  29.8%  final aggregate                append_value
+   141796266  13.5%  final aggregate                allocator_api2
+    99584699   9.5%  partial aggregate              allocator_api2
+    95991704   9.2%  repartition output coalescer   next_buffer
+    30933185   3.0%  partial aggregate              CountGroupsAccumulator
+    21620792   2.1%  final aggregate                CountGroupsAccumulator
+    10320500   1.0%  repartition output coalescer   ensure_capacity
+     5019997   0.5%  final aggregate                GroupValuesBytesView
+     1050624   0.1%  repartition output coalescer   other: <datafusion_physical_plan::repartition::StrengthReducedU64>::partition_indices
+    -1115555  -0.1%  partial aggregate              GroupValuesBytesView
+    -2160657  -0.2%  partial aggregate              decode_page
+    -2446622  -0.2%  partial aggregate              other: <parquet::arrow::buffer::view_buffer::ViewBuffer>::with_capacity

@@ -1,0 +1,19 @@
+2026-10-09T00:26:15.907644Z  INFO ravel_server::config: performance default resolved setting="fetch_concurrency" value=32 source="derived"
+2026-10-09T00:26:15.907652Z  INFO ravel_server::config: performance default resolved setting="store_get_concurrency" value=32 source="derived"
+2026-10-09T00:26:15.907655Z  INFO ravel_server::config: performance default resolved setting="sql_partition_count" value=32 source="derived"
+2026-10-09T00:26:15.907658Z  INFO ravel_server::config: performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
+2026-10-09T00:26:15.907660Z  INFO ravel_server::config: performance default resolved setting="catalog_resolve_concurrency" value=1024 source="derived" query_concurrency=32 query_concurrency_input="cores" interim_cap_applied=true
+2026-10-09T00:26:15.907664Z  INFO ravel_server::config: performance default resolved setting="max_segments" value=1000000 source="derived"
+2026-10-09T00:26:15.907666Z  INFO ravel_server::config: performance default resolved setting="cache_max_bytes" value=3200000000 source="budget-carve-loopback"
+2026-10-09T00:26:15.907669Z  INFO ravel_server::config: performance default resolved setting="catalog_cache_max_bytes" value=400000000 source="budget-carve"
+2026-10-09T00:26:15.907672Z  INFO ravel_server::config: performance default resolved setting="memory_budget_bytes" value=8000000000 source="flag"
+2026-10-09T00:26:15.907675Z  INFO ravel_server::config: performance default resolved setting="memory_hard_caps_bytes" value=3600000000 source="flag" cache_disabled=false
+2026-10-09T00:26:15.907677Z  INFO ravel_server::config: performance default resolved setting="memory_remainder_bytes" value=4400000000 source="flag"
+2026-10-09T00:26:15.907681Z  INFO ravel_server::config: performance default resolved setting="sql_max_query_bytes" value=3960000000 source="derived" clamped=false remainder_capped=true
+2026-10-09T00:26:15.907684Z  INFO ravel_server::config: performance default resolved setting="sql_tenant_max_bytes" value=3960000000 source="derived" raised=false remainder_capped=true
+2026-10-09T00:26:15.907687Z  INFO ravel_server::config: performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
+2026-10-09T00:26:15.908385Z  INFO ravel_server::mem_stats: allocator background purge thread resolved allocator_background_thread=true source="server"
+2026-10-09T00:26:15.928923Z  INFO ravel_server::config: performance default resolved setting="rlog_l1_part_memory_target_bytes" value=268435456 source="derived" bound="floor" resolution=268435456 (resolved from a memory budget of 0 over 4 concurrent merges; bound by the 268435456-byte floor) rlog_max_l1_part_bytes=268435456 rspan_l1_part_memory_target_bytes=268435456 max_l1_part_bytes=268435456
+2026-10-09T00:26:15.932834Z  INFO ravel_server::query: performance default resolved setting="sql_spill_dir" value="none" source="unset"
+2026-10-09T00:26:15.932839Z  INFO ravel_server::query: performance default resolved setting="sql_spill_max_bytes" value="none" source="unset"
+2026-10-09T00:26:15.944014Z  INFO ravel_server: ravel-server listening http=127.0.0.1:4318 grpc=Some(127.0.0.1:4317)

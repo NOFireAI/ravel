@@ -1,0 +1,61 @@
+# q35 peak i20
+# total 1525547893 B (1.526 GB)
+
+## top 30 by site (first non-plumbing frame below the allocator)
+         bytes  share    cum  frame
+     650108416  42.6%  42.6%  <datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap<usize>>::append_value
+     417305151  27.4%  70.0%  object_store::util::collect_bytes::<core::pin::Pin<alloc::boxed::Box<dyn futures_core::stream::Stream<Item = core::result::Result<bytes::bytes::Bytes, object_store::Error>> + core::marker::Send>>, object_store::Error>::{
+     249379469  16.3%  86.3%  <allocator_api2::stable::alloc::global::Global>::alloc_impl
+      95991704   6.3%  92.6%  <arrow_select::coalesce::byte_view::BufferSource>::next_buffer
+      30933185   2.0%  94.6%  <datafusion_functions_aggregate::count::CountGroupsAccumulator as datafusion_expr_common::groups_accumulator::GroupsAccumulator>::update_batch
+      21620792   1.4%  96.1%  <datafusion_functions_aggregate::count::CountGroupsAccumulator as datafusion_expr_common::groups_accumulator::GroupsAccumulator>::merge_batch
+      18036326   1.2%  97.2%  parquet::file::serialized_reader::decode_page
+      10816573   0.7%  97.9%  <bytes::bytes_mut::BytesMut>::reserve_inner
+       5577776   0.4%  98.3%  <arrow_select::coalesce::primitive::InProgressPrimitiveArray<arrow_array::types::Int64Type>>::ensure_capacity
+       4742724   0.3%  98.6%  <arrow_select::coalesce::byte_view::InProgressByteViewArray<arrow_array::types::StringViewType>>::ensure_capacity
+       3346665   0.2%  98.8%  <datafusion_physical_plan::aggregates::group_values::single_group_by::bytes_view::GroupValuesBytesView as datafusion_physical_plan::aggregates::group_values::GroupValues>::intern::{closure#1}
+       3296131   0.2%  99.1%  <parquet::file::metadata::RowGroupMetaDataBuilder>::new
+       2768718   0.2%  99.2%  <ravel_ingest::metrics::ShardSkew>::with_capacity
+       2405629   0.2%  99.4%  <parquet::arrow::buffer::view_buffer::ViewBuffer>::with_capacity
+       1673332   0.1%  99.5%  <datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap<usize>>::insert_if_new_inner::<<datafusion_physical_plan::aggregates::group_values::single_group_by::bytes_view::GroupValuesBytesView as datafusion_phy
+       1573152   0.1%  99.6%  <datafusion_physical_expr_common::metrics::builder::MetricBuilder>::with_label
+       1050624   0.1%  99.7%  <datafusion_physical_plan::repartition::StrengthReducedU64>::partition_indices
+        609974   0.0%  99.7%  <arrow_row::RowConverter>::empty_rows
+        583341   0.0%  99.8%  <datafusion_physical_plan::repartition::BatchPartitioner>::partition_iter
+        557777   0.0%  99.8%  <i64 as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global>
+        540847   0.0%  99.8%  <sharded_slab::shard::Array<tracing_subscriber::registry::sharded::DataInner, sharded_slab::cfg::DefaultConfig>>::new
+        530462   0.0%  99.9%  <ravel_server::sql::handle as axum::handler::Handler<(axum_core::extract::private::ViaRequest, axum::extract::state::State<ravel_server::sql::SqlState>, http::request::Request<axum_core::body::Body>), ravel_server::sql::
+        525569   0.0%  99.9%  <datafusion_common_runtime::trace_utils::trace_future<core::result::Result<(), datafusion_common::error::DataFusionError>, <datafusion_physical_plan::repartition::RepartitionExec>::pull_from_input::{closure#0}>::{closure
+        524928   0.0%  99.9%  <reqwest::connect::verbose::Wrapper>::wrap::<hyper_rustls::stream::MaybeHttpsStream<hyper_util::rt::tokio::TokioIo<tokio::net::tcp::stream::TcpStream>>>
+        524336   0.0% 100.0%  parquet::schema::types::build_tree
+        524292   0.0% 100.0%  main
+
+## top 30 by crate of that site
+         bytes  share    cum  frame
+     653354900  42.8%  42.8%  datafusion_physical_expr_common
+     417305151  27.4%  70.2%  object_store
+     249379469  16.3%  86.5%  allocator_api2
+     106312204   7.0%  93.5%  arrow_select
+      52553977   3.4%  96.9%  datafusion_functions_aggregate
+      24262422   1.6%  98.5%  parquet
+      10816573   0.7%  99.2%  bytes
+       4980630   0.3%  99.6%  datafusion_physical_plan
+       2768718   0.2%  99.8%  ravel_ingest
+       1082069   0.1%  99.8%  ?
+        609974   0.0%  99.9%  arrow_row
+        540847   0.0%  99.9%  sharded_slab
+        530462   0.0%  99.9%  ravel_server
+        525569   0.0% 100.0%  datafusion_common_runtime
+        524928   0.0% 100.0%  reqwest
+
+## top 30 by innermost ravel_* frame on the stack
+         bytes  share    cum  frame
+    1077956623  70.7%  70.7%  <no ravel frame>
+     417305151  27.4%  98.0%  <ravel_object_store::s3::S3Store>::get_one::{closure#0}
+      21490723   1.4%  99.4%  <ravel_parquet::boundary::BoundaryStream as futures_core::stream::Stream>::poll_next::{closure#0}
+       3820467   0.3%  99.7%  ravel_parquet::reader::decode_footer::<ravel_parquet::error::ParquetReadError, <ravel_parquet::reader::PinnedParquetReader>::read_footer::{closure#0}::{closure#0}>::{closure#0}
+       2768718   0.2%  99.9%  <alloc::raw_vec::RawVec<ravel_ingest::metrics::ShardSkewAtomics>>::with_capacity_in
+        609974   0.0%  99.9%  <ravel_sql::executor::PinnedStream>::start_with_scratch
+        540847   0.0%  99.9%  ravel_tracing_export::fmt_only
+        530462   0.0% 100.0%  <alloc::boxed::Box<<ravel_server::sql::handle as axum::handler::Handler<(axum_core::extract::private::ViaRequest, axum::extract::state::State<ravel_server::sql::SqlState>, http::request::Request<axum_core::body::Body>), 
+        524928   0.0% 100.0%  <ravel_object_store::s3::connector::S3HttpService as object_store::client::http::connection::HttpService>::call::{closure#0}

@@ -85,7 +85,8 @@ def pool_dumps(log, offset):
         data = f.read()
         end = f.tell()
     dumps = []
-    for raw in data.decode(errors="replace").splitlines():
+    # Not splitlines(): it also splits on the \x1e row separator in the dump.
+    for raw in data.decode(errors="replace").split("\n"):
         line = ANSI.sub("", raw)
         if "pool consumer peaks" not in line:
             continue
@@ -120,7 +121,8 @@ def main():
                 code, body = post(base, token, sql)
                 t1 = time.time()
                 time.sleep(0.3)
-                win = [v for t, v in sampler.samples if t0 <= t <= t1 + 0.1]
+                win_t = [(t, v) for t, v in sampler.samples if t0 <= t <= t1 + 0.1]
+                win = [v for _, v in win_t]
                 pre_alloc = statistics.median(v["allocated"] for _, v in pre_samples)
                 pre_cache = statistics.median(v["cache"] for _, v in pre_samples)
                 time.sleep(0.5)
@@ -143,6 +145,9 @@ def main():
                         (v["allocated"] - pre_alloc - v["sql"] - v["fetch"] for v in win), default=None
                     ),
                     "dumps": dumps,
+                    "series": [
+                        (round(t, 3), v["allocated"], v["sql"], v["fetch"]) for t, v in win_t
+                    ],
                 }
                 if win:
                     rec["alloc_delta"] = rec["peak_allocated"] - pre_alloc
