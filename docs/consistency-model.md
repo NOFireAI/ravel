@@ -489,10 +489,14 @@ query sees. Guarantees:
   any earlier one (docs/catalog-and-mvcc.md "Operator-asserted seal"). The
   loader does not write into an hour it finds sealed: with
   `--fold-after-load`, a load whose current ingest hour the logs HEAD has
-  already sealed is refused before any row is read or any object written,
-  and a load whose own fold leaves a loaded hour outside the snapshot,
-  because another fold sealed that hour while the load was writing, exits
-  non-zero naming the hours. Any other writer that publishes into the
+  already sealed is refused before any row is read or any object written.
+  After its own fold, the load reads back the snapshot of the HEAD that fold
+  left and checks that every commit it published is in it, as a level-0
+  entry or replaced by a compaction or rewrite whose parts the snapshot
+  holds. It exits non-zero naming the hours, the count of missing commits
+  and up to ten of them when one is not (for example because another fold
+  sealed its hour while the load was writing), and also when that HEAD or
+  one of its parts cannot be read, since coverage was then not checked. Any other writer that publishes into the
   asserted hours, whether a live server or a load run without the flag, is
   not refused: its commit succeeds and is invisible to non-token queries the
   same way as the folder-fast case above, until a HEAD rebuild (see

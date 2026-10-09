@@ -781,10 +781,15 @@ enum Command {
         /// and its time is part of the summary's elapsed. A failed fold fails
         /// the load, though every loaded object is already durable and
         /// `catalog fold --signal logs --writers-stopped` seals them once the
-        /// cause is fixed. A fold that leaves a loaded hour out of the
-        /// snapshot, because another fold sealed it while the load was
-        /// writing, also fails the load and names the hours. A load that
-        /// wrote nothing runs no fold.
+        /// cause is fixed. After the fold, the load reads back the snapshot of
+        /// the HEAD it left and checks that every commit it wrote is in it, as
+        /// a level-0 entry or replaced by a compaction or rewrite whose parts
+        /// the snapshot holds. A commit missing from it (for example because
+        /// another fold sealed its hour while the load was writing), or a HEAD
+        /// or part that cannot be read for the check, also fails the load,
+        /// naming the hours and up to ten of the missing commits, or saying
+        /// the check could not be made. The check's time is part of the
+        /// fold's. A load that wrote nothing runs no fold and no check.
         #[arg(long)]
         fold_after_load: bool,
     },
