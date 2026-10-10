@@ -170,7 +170,7 @@ pub struct PurgeReport {
     pub arenas_purged: u32,
     /// Arena indices below `arenas.narenas` whose decay settings could not be
     /// read or set, which jemalloc answers with EFAULT for an uninitialised
-    /// arena. Nothing was changed on them.
+    /// arena. Their decay settings are left as found.
     pub arenas_skipped: u32,
     /// Decay writes that set a value back and failed, leaving that arena
     /// purging eagerly until something else writes it.
