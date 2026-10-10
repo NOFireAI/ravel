@@ -724,6 +724,12 @@ pub struct FragmentService {
     /// outside the `Arc` for the same reason. Defaults to
     /// `MemoryBudget::unlimited()`.
     memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// The ADR-1702 read CPU gate every slice's `SegmentFetcher` runs its
+    /// catalog decodes on, wired by `lib.rs` through
+    /// [`with_read_gate`](FragmentService::with_read_gate) to the server's
+    /// read gate. Lives beside `engine` outside the `Arc` for the same reason.
+    /// `None`, the default, decodes inline.
+    read_gate: Option<Arc<ravel_cpu_gate::ReadGate>>,
 }
 
 struct FragmentServiceInner {
@@ -787,6 +793,7 @@ impl FragmentService {
             role: FragmentListenerRole::DedicatedFragment,
             engine: ravel_query::EngineConfig::default(),
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            read_gate: None,
         }
     }
 
@@ -803,6 +810,7 @@ impl FragmentService {
             role: self.role,
             engine,
             memory_budget: self.memory_budget.clone(),
+            read_gate: self.read_gate.clone(),
         }
     }
 
@@ -818,6 +826,23 @@ impl FragmentService {
             role: self.role,
             engine: self.engine,
             memory_budget: budget,
+            read_gate: self.read_gate.clone(),
+        }
+    }
+
+    /// Return a clone of this service whose slices' `SegmentFetcher`s run
+    /// their catalog decodes on `gate` (ADR-1702 decision 4), sharing the same
+    /// `FragmentServiceInner`. Called once by `lib.rs` with the server's read
+    /// gate, before any listener or the coordinator's no-hop local path takes
+    /// a clone.
+    #[must_use]
+    pub fn with_read_gate(&self, gate: Arc<ravel_cpu_gate::ReadGate>) -> Self {
+        FragmentService {
+            inner: self.inner.clone(),
+            role: self.role,
+            engine: self.engine,
+            memory_budget: self.memory_budget.clone(),
+            read_gate: Some(gate),
         }
     }
 
@@ -835,6 +860,7 @@ impl FragmentService {
             role,
             engine: self.engine,
             memory_budget: self.memory_budget.clone(),
+            read_gate: self.read_gate.clone(),
         }
     }
 
@@ -1185,6 +1211,9 @@ impl FragmentService {
             .with_memory_budget(self.memory_budget.clone());
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(cache.clone());
+        }
+        if let Some(gate) = &self.read_gate {
+            fetcher = fetcher.with_read_gate(gate.clone());
         }
         // The worker's own limits clamp the coordinator's wire budget on every
         // slice (issue #1687 part A). A federated slice additionally enforces
@@ -4554,6 +4583,43 @@ mod tests {
             outside.series_returned, covering.series_returned,
             "the pin names the object, so the window cannot change what is read"
         );
+    }
+
+    /// A slice's `SegmentFetcher` decodes its catalog on the read gate
+    /// [`FragmentService::with_read_gate`] attached, and every later builder
+    /// keeps that gate: the one pinned segment counts one `segment_section`
+    /// run, inline under the byte floor. Drop the gate from `run_slice`, or
+    /// from any builder below, and the site reads `Some((0, 0))`.
+    #[tokio::test]
+    async fn slice_fetcher_decodes_on_the_attached_read_gate() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("gated-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let gate = crate::cpu_gates::CpuGates::new(Default::default()).read;
+        let service = pinned_service(store, now)
+            .with_read_gate(gate.clone())
+            .with_engine_config(ravel_query::EngineConfig::default())
+            .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::unlimited()))
+            .with_role(FragmentListenerRole::DedicatedFragment);
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let run = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope))
+            .await
+            .expect("local run");
+        assert_eq!(run.status, pb::status::Code::Ok);
+        assert_eq!(run.series_returned, 1);
+        let section = gate
+            .snapshot()
+            .sites
+            .iter()
+            .find(|counts| counts.site == ravel_cpu_gate::ReadSite::SegmentSection)
+            .map(|counts| (counts.jobs, counts.inline));
+        assert_eq!(section, Some((0, 1)));
     }
 
     /// The window-independence of [`pinned_slice_is_independent_of_the_request_window`]

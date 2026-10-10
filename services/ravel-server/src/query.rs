@@ -403,6 +403,10 @@ pub fn build_engine_config(
 /// SQL/Flight SQL paths, so a fetch this engine issues and a reservation
 /// `SqlExecutor` makes both draw down the same limit rather than each
 /// enforcing its own independent ceiling.
+///
+/// `read_gate` is the server's ADR-1702 read CPU gate: the engine runs its
+/// RSEG and RLOG catalog decodes and each PromQL evaluation at or above the
+/// gate's evaluation floor on it (decisions 1 and 4).
 #[allow(clippy::too_many_arguments)]
 pub fn build_app_state(
     catalog: Arc<Catalog>,
@@ -417,10 +421,12 @@ pub fn build_app_state(
     federation: Option<Arc<ravel_query::distrib::Federation>>,
     metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    read_gate: Arc<ravel_cpu_gate::ReadGate>,
 ) -> AppState {
     let mut engine = QueryEngine::new(catalog, store, engine_config)
         .with_get_limiter(get_limiter)
-        .with_memory_budget(process_memory_budget);
+        .with_memory_budget(process_memory_budget)
+        .with_read_gate(read_gate);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
@@ -1229,8 +1235,9 @@ fn build_sql_state_inner(
         .with_memory_budget(process_memory_budget.clone());
     // ADR-1702 decision 7: the `logs` and `spans` scans decode each block on
     // the read gate the fetcher carries, and the logs fetcher's opens run on
-    // it too.
+    // it too. The `metrics` scan's RSEG catalog decodes run on it as well.
     if let Some(gate) = read_gate {
+        metrics_fetcher = metrics_fetcher.with_read_gate(gate.clone());
         logs_fetcher = logs_fetcher.with_read_gate(gate.clone());
         span_fetcher = span_fetcher.with_read_gate(gate);
     }
@@ -1337,6 +1344,7 @@ mod catalog_cache_tests {
             None,
             None,
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         );
         assert_eq!(
             state.engine.config().max_bytes_scanned,

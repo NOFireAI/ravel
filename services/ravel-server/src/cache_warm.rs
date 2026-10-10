@@ -83,11 +83,20 @@ pub async fn warm_cache(
     clock: &dyn Clock,
     get_limiter: Arc<ravel_query::GetLimiter>,
     memory_budget: Arc<ravel_memory::MemoryBudget>,
+    read_gate: Arc<ravel_cpu_gate::ReadGate>,
 ) {
     let now_ns = clock.now_ns();
     match tokio::time::timeout(
         WARM_DEADLINE,
-        warm_cache_inner(store, catalog, cache, now_ns, get_limiter, memory_budget),
+        warm_cache_inner(
+            store,
+            catalog,
+            cache,
+            now_ns,
+            get_limiter,
+            memory_budget,
+            read_gate,
+        ),
     )
     .await
     {
@@ -109,6 +118,7 @@ async fn warm_cache_inner(
     now_ns: i64,
     get_limiter: Arc<ravel_query::GetLimiter>,
     memory_budget: Arc<ravel_memory::MemoryBudget>,
+    read_gate: Arc<ravel_cpu_gate::ReadGate>,
 ) {
     let started = tokio::time::Instant::now();
     let tenants = match ravel_maintain::discover_tenants(store.as_ref()).await {
@@ -124,14 +134,18 @@ async fn warm_cache_inner(
     // Issue #1255: a warm fetch decodes the part it reads into a buffer the
     // pass holds until the fetch returns, so it reserves against the same
     // process-wide `MemoryBudget` a query's fetch does.
+    // ADR-1702 decision 4: a warm fetch decodes the catalogs it reads, on the
+    // same read gate a query's fetch uses.
     let metrics_fetcher = SegmentFetcher::new(store.clone())
         .with_cache(cache.clone())
         .with_get_limiter(get_limiter.clone())
-        .with_memory_budget(memory_budget.clone());
+        .with_memory_budget(memory_budget.clone())
+        .with_read_gate(read_gate.clone());
     let logs_fetcher = LogSegmentFetcher::new(store)
         .with_cache(cache)
         .with_get_limiter(get_limiter)
-        .with_memory_budget(memory_budget);
+        .with_memory_budget(memory_budget)
+        .with_read_gate(read_gate);
 
     let mut total_parts_warmed: usize = 0;
     for tenant in tenants {
@@ -627,6 +641,7 @@ mod tests {
             1024 * 1024,
         )));
         assert!(cache.is_empty(), "sanity: nothing fetched yet");
+        let gate = crate::cpu_gates::CpuGates::new(Default::default()).read;
 
         warm_cache(
             store,
@@ -635,6 +650,7 @@ mod tests {
             &FixedClock(now),
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            gate.clone(),
         )
         .await;
 
@@ -642,6 +658,15 @@ mod tests {
             !cache.is_empty(),
             "warming a tenant with a real recent metric part must populate the cache"
         );
+        // The one part's catalog decode ran through the warm pass's read gate,
+        // inline under the byte floor (ADR-1702 decision 4).
+        let section = gate
+            .snapshot()
+            .sites
+            .iter()
+            .find(|counts| counts.site == ravel_cpu_gate::ReadSite::SegmentSection)
+            .map(|counts| (counts.jobs, counts.inline));
+        assert_eq!(section, Some((0, 1)));
     }
 
     /// Issue #1255: the warm pass reserves against the budget it is handed. A
@@ -673,6 +698,7 @@ mod tests {
                 &FixedClock(now),
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
                 budget.clone(),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
             )
             .await;
             assert_eq!(
@@ -823,6 +849,7 @@ mod tests {
             &FixedClock(now_ns()),
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         )
         .await;
 
@@ -854,6 +881,7 @@ mod tests {
             &FixedClock(now_ns()),
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         )
         .await;
 
@@ -1268,6 +1296,7 @@ mod tests {
                 &FixedClock(now_ns()),
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
             )
             .await;
         });
@@ -1306,6 +1335,7 @@ mod tests {
                 &FixedClock(now_ns()),
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
             )
             .await;
         });

@@ -1,5 +1,6 @@
 //! ADR-1702 task 8: a server built by [`ravel_server::start`] attaches its
-//! read CPU gate to the SQL `logs` and `spans` scans.
+//! read CPU gate to the SQL `logs` and `spans` scans, and to the `samples`
+//! scan's RSEG catalog decodes.
 //!
 //! The SQL state is built inside `start` by
 //! `query::build_sql_state_with_parquet`, and the gate is only observable from
@@ -23,9 +24,10 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::logstream::log_stream_id;
-use ravel_types::{Signal, TenantId};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use uuid::Uuid;
 
 const TOKEN: &str = "acme-token";
@@ -37,6 +39,10 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 /// statements push no predicate and their window covers every record, so
 /// each block is decoded exactly once.
 const BLOCKS: u64 = 4;
+/// RSEG segments in the `samples` fixture, each one series of
+/// [`METRIC_SAMPLES`] samples inside the statement's window.
+const METRIC_SEGMENTS: u64 = 3;
+const METRIC_SAMPLES: i64 = 5;
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
@@ -232,6 +238,71 @@ async fn publish_spans(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
     .await;
 }
 
+/// [`METRIC_SEGMENTS`] real RSEG segments, one `gate_metric` series each.
+async fn publish_metric_segments(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+    let labels = LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: "gate_metric".to_string(),
+    }])
+    .expect("valid labels");
+    for seq in 1..=METRIC_SEGMENTS {
+        let writer_id = Uuid::from_u128(6_000 + u128::from(seq));
+        let base_ns = i64::try_from(seq).expect("seq fits") * 60_000_000_000;
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id: SeriesId::compute(tenant, "gate_metric", &labels).expect("series id"),
+                labels: labels.clone(),
+                samples: (0..METRIC_SAMPLES)
+                    .map(|i| Sample {
+                        ts_ns: base_ns + i * 1_000_000_000,
+                        value: i as f64,
+                    })
+                    .collect(),
+            }],
+            SegmentIdentity {
+                tenant_hash: tenant.hash().0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: tenant.hash(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish commit");
+    }
+}
+
 /// Runs `sql` and returns how many result rows came back.
 async fn run_sql(client: &reqwest::Client, base: &str, sql: &str) -> usize {
     let response = client
@@ -343,6 +414,47 @@ async fn started_server_runs_sql_scan_block_decodes_through_its_read_gate() {
         read_gate_site(&client, &base, "span_block").await,
         (0, BLOCKS),
         "every spans block decode was counted at the read gate"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A `samples` statement against a started server decodes each fixture
+/// segment's RSEG catalog once, and each decode counts one `segment_section`
+/// run at the read gate. The catalogs are a few hundred bytes, under the
+/// 256 KiB floor, so every run is inline. Fails with the gate left off the
+/// metrics fetcher in `build_sql_state_inner`: the site then reads `(0, 0)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_server_runs_sql_metrics_catalog_decodes_through_its_read_gate() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    publish_metric_segments(store.as_ref(), &tenant).await;
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), tenant);
+    let running = ravel_server::start(
+        server_config(tokens),
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        read_gate_site(&client, &base, "segment_section").await,
+        (0, 0)
+    );
+    assert_eq!(
+        run_sql(&client, &base, "SELECT ts, value FROM samples").await,
+        (METRIC_SEGMENTS as i64 * METRIC_SAMPLES) as usize
+    );
+    assert_eq!(
+        read_gate_site(&client, &base, "segment_section").await,
+        (0, METRIC_SEGMENTS),
+        "every metrics segment's catalog decode was counted at the read gate"
     );
 
     running.shutdown().await.expect("graceful shutdown");

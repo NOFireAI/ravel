@@ -458,7 +458,9 @@ change, shown by reverting the change under test.
 7. **Query fetchers and PromQL evaluation on the read gate**
    (`ravel-query`, `ravel-promql`): `decode_selected` and
    `decode_sparse_catalog` in `fetcher.rs`, the LogQL and span fetcher
-   paths, and PromQL evaluation at or above the evaluation floor.
+   paths, and PromQL evaluation at or above the evaluation floor. Two
+   open-time decodes stay inline (see the inline open-decode amendment
+   below).
    Acceptance tests: the same floor-0 per-site counter test over a fixture
    RSEG, RLOG and RSPAN object, and
    `promql_evaluation_over_the_floor_runs_through_the_read_gate`, which
@@ -610,3 +612,27 @@ fold path this is the same outcome the decode-refusal amendment describes for
 an oversized object: refused on every tick while it holds, with the fold's
 typed budget error logged. The shipped server still never calls
 `Catalog::with_memory_budget`, so no deployment reaches this path yet.
+
+## Amendment (2026-10-10): the inline open-decode amendment
+
+<!-- amendment-applies: sections="Follow-up tasks, in order" pointer="inline open-decode amendment" -->
+
+Issue #2695 put the server's query engine, its SQL `samples` fetcher, the
+distributed fragment worker's fetcher and the cache warmup's fetchers on the
+read gate. Two decodes on those gated fetchers still run inline on the
+awaiting task, whatever gate the fetcher carries. Each needs either a codec
+crate API that decodes one section at a time or a site label for a set of
+sections, and decision 4 has the gate wrap one section per `log_section` or
+`span_section` job, so neither is wrapped under an existing label.
+
+- **RLOG plan-phase directories.**
+  `BlockRangeFetcher::fetch_plan_directories` decodes STREAM_DIR, FIELD_DIR,
+  SKIP_IDX and PAGE_DIR in one `RlogReader::decode_directories` call. The
+  block-range fetcher's other directory section decodes run as `log_section`
+  jobs; this one does not.
+- **RSPAN open.** `SpanSegmentFetcher::plan_candidates` opens each object
+  with `RspanReader::new`, which decodes the footer, SKIP_IDX and BLOOM in
+  one call. No caller submits `span_section` jobs.
+
+RSEG page decodes stay inline as before, as `QueryEngine::with_read_gate`
+documents.

@@ -2845,7 +2845,8 @@ pub async fn start_with_heartbeat(
             get_limiter.clone(),
         )
         .with_engine_config(engine_config)
-        .with_memory_budget(process_memory_budget.clone());
+        .with_memory_budget(process_memory_budget.clone())
+        .with_read_gate(cpu_gates.read.clone());
         // The coordinator dials remote workers' dedicated TLS fragment
         // listeners (ADR-0071 amendment decision 1): pin the operator CA,
         // verify the fixed `ravel-fragment` server name, and present this
@@ -3088,6 +3089,7 @@ pub async fn start_with_heartbeat(
             federation,
             metadata_cache.clone(),
             process_memory_budget.clone(),
+            cpu_gates.read.clone(),
         );
         // `build_app_state` installs `NoopQueryAuditSink` internally; override
         // with the process-wide pipeline (ADR-0062 decision 2b) so PromQL
@@ -3489,6 +3491,7 @@ pub async fn start_with_heartbeat(
                 &SystemClock,
                 get_limiter.clone(),
                 process_memory_budget.clone(),
+                cpu_gates.read.clone(),
             )
             .await;
         }
