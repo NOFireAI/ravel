@@ -43,6 +43,8 @@ CHAOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${CHAOS_DIR}/../.." && pwd)"
 # shellcheck source=scripts/chaos/lib.sh
 source "${CHAOS_DIR}/lib.sh"
+# The cases below pin the default; an operator's exported value must not flip them.
+unset CHAOS_KEEP_LOGS
 
 PASSED=0
 FAILED=0
@@ -406,6 +408,20 @@ check "classifier: B aborts rose (1 against 0), B published still fails" "1" \
 check "classifier: unreadable aborts counter fails even when A finished" "1" \
   "$(CURL_MODE=unreachable cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
 
+LOG_ACTIVITY="${SCRATCH}/activity.log"
+{ printf '%s\n' "${PUB_LINE}"; pass_line 0 1; pass_line 1 0; printf '%s\n' "${PUB_LINE}"; pass_line 2 3; } >"${LOG_ACTIVITY}"
+check "activity: whole log counts publishes, passes and summed compacted/not_sealed" \
+  "WORKER-ACTIVITY: w publishes=2 passes=3 compacted=4 not_sealed=0" \
+  "$(chaos_worker_activity_line w "${LOG_ACTIVITY}")"
+check "activity: only the lines past the given count" \
+  "WORKER-ACTIVITY: w publishes=1 passes=1 compacted=3 not_sealed=0" \
+  "$(chaos_worker_activity_line w "${LOG_ACTIVITY}" 3)"
+check "activity: a missing log reports zeros" \
+  "WORKER-ACTIVITY: w publishes=0 passes=0 compacted=0 not_sealed=0" \
+  "$(chaos_worker_activity_line w "${SCRATCH}/no-such.log")"
+check "activity: not_sealed is summed" "WORKER-ACTIVITY: w publishes=0 passes=1 compacted=0 not_sealed=2" \
+  "$(chaos_worker_activity_line w <(printf 'x maintenance: retention + compaction pass complete compacted=0 not_sealed=2\n'))"
+
 # Both workers run before the kill: B's publish counts only past its line
 # count at the kill. Args: A's log, B's log, B's line count at the kill.
 cons_from() { rc_of oracle_conservation_or_unmeasured "$1" http://stub 1 "$2" "$3"; }
@@ -621,6 +637,11 @@ printf 'server refused: the reason\n' > "${SCRATCH}/logs/kept.log"
 printf 'deleted on success\n' > "${SCRATCH}/logs/gone.log"
 check "release: exit 0 deletes the log even with CHAOS_LOG_DIR set" "no" \
   "$(CHAOS_LOG_DIR="${SCRATCH}/logs" chaos_release_logs 0 "${SCRATCH}/logs/gone.log" 2>/dev/null; [[ -f "${SCRATCH}/logs/gone.log" ]] && echo yes || echo no)"
+printf 'x\n' >"${SCRATCH}/logs/keep-on-pass.log"
+check "chaos_release_logs keeps a passing run's logs under CHAOS_KEEP_LOGS=1" "yes" \
+  "$(CHAOS_KEEP_LOGS=1 CHAOS_LOG_DIR="${SCRATCH}/logs" chaos_release_logs 0 "${SCRATCH}/logs/keep-on-pass.log" 2>/dev/null; [[ -f "${SCRATCH}/logs/keep-on-pass.log" ]] && echo yes || echo no)"
+check "chaos_release_logs ignores CHAOS_KEEP_LOGS without a log directory" "no" \
+  "$(CHAOS_KEEP_LOGS=1 CHAOS_LOG_DIR="" chaos_release_logs 0 "${SCRATCH}/logs/keep-on-pass.log" 2>/dev/null; [[ -f "${SCRATCH}/logs/keep-on-pass.log" ]] && echo yes || echo no)"
 kept_tail="$(CHAOS_LOG_DIR="${SCRATCH}/logs" chaos_release_logs 3 "${SCRATCH}/logs/kept.log" 2>&1 >/dev/null)"
 check "release: exit 3 with CHAOS_LOG_DIR keeps the log" "yes" \
   "$([[ -f "${SCRATCH}/logs/kept.log" ]] && echo yes || echo no)"
