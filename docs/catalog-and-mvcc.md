@@ -884,8 +884,14 @@ current declaration.
 
 **Reader.** For a lookup on `field = value`, the resolve narrows HEAD's parts
 to the window as `load_snapshot` does; a lookup with no time bound covers
-every part. For each covered part with a ref for the field whose slice holds
-the lookup's `key8`: GET 1 is `[0, prefix_len)` (header and directory,
+every part. A (part, field)'s slices tile the whole `key8` space: a single
+unsliced leaf has `key8_lo = 0` and `key8_hi = u64::MAX`, and a split
+produces adjacent slices whose bounds meet, so every `key8` falls in
+exactly one slice of every part that carries leaves for the field, and a
+lookup key between the keys present still probes (and prunes) rather than
+scanning. A part whose slices do not tile is `Corrupted` for that field.
+For each covered part, in the one slice that holds the lookup's `key8`:
+GET 1 is `[0, prefix_len)` (header and directory,
 verified by their crcs). The ref's copies of `field`, `key_type`, `key8_lo`,
 `key8_hi`, `bucket_bits`, `entry_count` and `part_blake3` serve only to
 pick the slice and size GET 1; the header is authoritative, being under the
@@ -960,17 +966,18 @@ horizon it reads the leaf header's `part_blake3`; if HEAD names a live part
 with that hash and no `key_index` ref for the leaf's field, the leaf is
 orphaned by an old folder, is kept, and is counted in
 `ravel_catalog_sweep_orphaned_leaves_total`. A leaf whose `part_blake3`
-names no live part is swept as before. The fold recovers the kept leaf:
-when it carries forward a part with no `key_index` ref for a declared
-field, it LISTs `idx/` once in that fold, opens the header of each leaf not
-named by HEAD, re-attaches every leaf whose `part_blake3` and field match
-a carried part (the ref is reconstructed from the header and validated as
-a reader would), and rebuilds from the sections only a part that still has
-no leaf; the fold report counts re-attached and rebuilt leaves separately. The fold report also
-counts leaves rebuilt from scratch, so a rebuild the previous fold did not
-need is a figure outside its band. The mixed-version combinations (old
-folder then new sweeper, old sweeper against a new HEAD, new folder after
-an old folder) are tested, not assumed (ADR-0849 section 1a).
+names no live part is swept as before. There is no automatic re-attach: a
+kept leaf is never read again, and the part is re-indexed by the next fold
+that re-encodes it (a compaction, an erasure rewrite or a retention
+change), after which the kept leaf names no live part and is swept like
+any other. Until then the part reads as uncovered for that field and is
+scanned, so the cost of a bad rollout is one extra rebuild per affected
+part when it is next re-encoded, never a whole-tenant backfill, and the
+fold's scope rule above holds without exception. The fold report counts
+leaves written per fold, so a fold that writes leaves for parts it did not
+re-encode is a figure outside its band. The mixed-version combinations
+(old folder then new sweeper, old sweeper against a new HEAD, new folder
+after an old folder) are tested, not assumed (ADR-0849 section 1a).
 
 ### Idempotency marker body layout
 

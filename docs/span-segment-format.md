@@ -499,14 +499,18 @@ no span of either trace and is skipped. Neither disagreement is an error:
 both are the two indexes pruning on different evidence. The intersection is
 read as its contiguous runs. Today's `RspanRangeReader::trace_block_span`
 derives its own candidate set from SKIP_IDX and refuses a non-contiguous
-one, so it cannot take the intersection; ADR-2707's T3 adds
-`RspanRangeReader::block_run_span(&self, blocks: &[usize])`, which takes
-one explicit contiguous run of block ordinals (adjacent, ascending, in
-range; anything else is `Corrupted`) and returns its byte range, and
-`trace_block_span` stays as the SKIP_IDX-only convenience that calls it on
-its own run. The reader splits the intersection into maximal contiguous
-runs, issues one ranged GET per run through `block_run_span`, and decodes
-each with `decode_trace`. Spans of one trace sort contiguously (the object
+one, so it cannot take the intersection; ADR-2707's T3 (which touches
+`ravel-rspan` for this) adds
+`RspanRangeReader::block_run_span(&self, trace_id: &[u8; 16], blocks: &[usize])
+-> Result<TraceBlockSpan, SpanSegError>`, which takes one explicit
+contiguous run of block ordinals (adjacent, ascending, in range; anything
+else is `Corrupted`) and returns the same `TraceBlockSpan` that
+`trace_block_span` returns, built inside the crate (the type's fields stay
+private); `trace_block_span` becomes the SKIP_IDX-only convenience that
+calls it on its own run. The reader splits the intersection into maximal
+contiguous runs, calls `block_run_span` per run, issues one ranged GET per
+returned span, and decodes each with `decode_trace(&span, bytes)` as
+today. Spans of one trace sort contiguously (the object
 sorts by `(trace_id, start_ts)`), so the intersection is one run in every
 case but a prefix collision whose other trace sits between this trace's
 blocks, which yields two runs and two GETs. A prefix collision (two traces sharing 8 leading

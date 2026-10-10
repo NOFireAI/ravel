@@ -328,7 +328,8 @@ flowchart LR
     whole-object, written before the part PUT so a refusal writes no object
     (the ADR-1413 order). `bucket_bits` balances the directory against the
     mean bucket, clamped to 12..=16 (13 at the Stage 0 day as one part,
-    derived: a 32 KB directory and 37 KB buckets); the body ceiling reuses
+    derived: a 32 KB directory and a 29 KB mean bucket at that body, 32 KB
+    at the ceiling); the body ceiling reuses
     `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB), and a larger (part, field)
     is sliced by key range, one leaf per slice, so a lookup opens exactly
     one leaf per (part, field).
@@ -341,13 +342,18 @@ flowchart LR
     not survive its CAS). The guard is in the sweeper: a leaf whose
     `part_blake3` names a live part with no `key_index` ref for its field
     is kept and counted (`ravel_catalog_sweep_orphaned_leaves_total`),
-    not swept. The recovery is the fold's, as an exception to its scope
-    rule: a fold that carries forward a part lacking a ref for a declared
-    field LISTs `idx/` once, re-attaches every unreferenced leaf whose
-    header matches a carried part (validated as a reader would), and
-    rebuilds from sections only what still has no leaf; the report counts
-    re-attached and rebuilt leaves separately. The mixed-version
-    combinations are a required test of the guard, not an intention.
+    not swept. There is no automatic re-attach: a kept leaf is never read
+    again, and the part is re-indexed by the next fold that re-encodes it
+    (a compaction, an erasure rewrite, or a retention change), after which
+    the kept leaf no longer names a live part and is swept like any other.
+    Until then the part reads as uncovered for that field and is scanned,
+    which is the safety lemma's outcome, and the cost after a bad rollout
+    is one extra rebuild per affected part, not a backfill. The fold
+    report counts leaves written per fold, so a fold that rebuilds parts
+    it did not re-encode is a figure outside its band. The mixed-version
+    combinations (old folder then new sweeper, old sweeper against a new
+    HEAD, new folder after an old folder) are a required test of the
+    guard, not an intention.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
   an unsupported version treating the leaf as absent (ADR-0849 section 4).
@@ -622,9 +628,9 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   its window: index buckets plus one or two blocks. The folded Stage 0
   tenant goes from 4.35 GB and 60 GETs per lookup to a few hundred KB
   (target, below). A lookup with no range still grows with the number of
-  covering parts, by one directory and one bucket per part (about 69 KB at
+  covering parts, by one directory and one bucket per part (about 64 KB at
   the balanced 13 bits): the trillion-span extrapolation goes from 22 TB
-  of data to about 70 KB of index per covering part, and the acceptance
+  of data to about 64 KB of index per covering part, and the acceptance
   table bands that figure rather than the count alone.
 - **Storage.** Tier 1 holds one `(key8, block)` entry per distinct pair,
   about 12 B before the bucket's zstd. On the Stage 0 spans corpus that is
@@ -670,7 +676,7 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes per covering part = `4 x 2^bucket_bits` (the directory) plus one bucket, where the balance rule at the 256 MiB body ceiling picks `bucket_bits` = 13 (a 32 KB directory, about 37 KB of bucket): about 69 KB per covering part, about 70 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 140 KB per covering part (2x the balanced figure) |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes per covering part = `4 x 2^bucket_bits` (the directory) plus one bucket, where the balance rule `4 x 2^b = body / 2^b` at the 256 MiB body ceiling gives `bucket_bits` = 13 (a 32 KB directory and a 32 KB mean bucket): at most about 64 KB per covering part, about 64 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 128 KB per covering part (2x the balanced figure) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages | a whole-object GET |
@@ -687,7 +693,7 @@ cache state) and stamped into the report.
 |---|---|---|---|
 | T1 resolve reads each record once | 8 | ravel-catalog | no |
 | T2 loader defaults for every signal, trigger mix and warning on every report, ADR-2614 amendment | 9 | ravel-cli, ravel-ingest (visibility) | no |
-| T3 ranged trace reads and the spans read cache | 7, 10 | ravel-query, ravel-server | no |
+| T3 ranged trace reads (`block_run_span` on the range reader) and the spans read cache | 7, 10 | ravel-rspan, ravel-query, ravel-server | no |
 | T4 fragments carry the pushdown | 11 | ravel-sql | no |
 | T5 `GET /api/traces/<id>`, `ravel_get_trace` without a range, the SQL window rule | 12 | ravel-server, ravel-sql | no |
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests | 1 | ravel-codec | yes (grammar) |
