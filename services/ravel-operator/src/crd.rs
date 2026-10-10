@@ -325,11 +325,21 @@ pub struct GatewaySpec {
     /// stalled flush cannot block co-resident tenants beyond this many permits.
     /// Ingest runs only in the gateway tier (the query and maintain modes never
     /// enter the ingest path), so this is a gateway-only field.
-    /// Omit to keep `ravel-server`'s own default of 1 (today's non-pipelined
-    /// behavior). The CRD schema enforces a minimum of 1 at admission:
-    /// `ravel-server` rejects 0 as a flush deadlock.
+    /// Omit to keep `ravel-server`'s own default of 4 (ADR-2708 D3). The CRD
+    /// schema enforces a minimum of 1 at admission: `ravel-server` rejects 0
+    /// as a flush deadlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inflight_flushes: Option<u32>,
+
+    /// How many of a shard's flush permits one tenant may hold or wait on at
+    /// once (`--max-inflight-flushes-per-tenant`, ADR-2708 D3). Omit to keep
+    /// `ravel-server`'s own default of `max(1, maxInflightFlushes - 1)`, which
+    /// leaves a permit for co-resident tenants whenever there is more than
+    /// one. Gateway-only, like `maxInflightFlushes`. The CRD schema enforces a
+    /// minimum of 1 at admission; `ravel-server` also rejects a value above
+    /// the shard's permit count at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_flushes_per_tenant: Option<u32>,
 }
 
 impl Default for GatewaySpec {
@@ -342,6 +352,7 @@ impl Default for GatewaySpec {
             ingest_affinity: None,
             exposure: None,
             max_inflight_flushes: None,
+            max_inflight_flushes_per_tenant: None,
         }
     }
 }
@@ -1143,7 +1154,8 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
 /// Attach OpenAPI `minimum: 1` bounds to the count and interval fields that
 /// must be positive: `spec.shards`, `spec.gateway.replicas`,
 /// `spec.query.replicas`, `spec.maintain.replicas`,
-/// `spec.gateway.maxInflightFlushes`, `spec.maintain.intervalSecs`, and
+/// `spec.gateway.maxInflightFlushes`,
+/// `spec.gateway.maxInflightFlushesPerTenant`, `spec.maintain.intervalSecs`, and
 /// `spec.maintain.fold.intervalSecs`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
@@ -1188,12 +1200,17 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
         // floor. ravel-server rejects `--max-inflight-flushes 0` as a flush
         // deadlock, so the CRD must refuse it at admission rather than let the
         // pod crashloop.
-        if let Some(max_inflight) = spec_props
+        // A zero per-tenant share would defer every flush trigger, which
+        // ravel-server refuses at startup.
+        if let Some(gateway_props) = spec_props
             .get_mut("gateway")
             .and_then(|g| g.properties.as_mut())
-            .and_then(|p| p.get_mut("maxInflightFlushes"))
         {
-            max_inflight.minimum = Some(1.0);
+            for field in ["maxInflightFlushes", "maxInflightFlushesPerTenant"] {
+                if let Some(bound) = gateway_props.get_mut(field) {
+                    bound.minimum = Some(1.0);
+                }
+            }
         }
         // ravel-server refuses a zero `--maintain-interval-secs` and a zero
         // `--fold-interval-secs` at startup, since either would run its loop
@@ -2354,6 +2371,7 @@ mod tests {
         let spec: RavelClusterSpec =
             serde_json::from_value(with_field).expect("deserialize with field");
         assert_eq!(spec.gateway.max_inflight_flushes, Some(4));
+        assert_eq!(spec.gateway.max_inflight_flushes_per_tenant, None);
 
         // Gateway only: the query and maintain schemas carry no such property,
         // so a field added to another tier without a renderer cannot hide here.
@@ -2375,7 +2393,32 @@ mod tests {
                 !props.contains_key("maxInflightFlushes"),
                 "{tier} must not carry maxInflightFlushes"
             );
+            assert!(
+                !props.contains_key("maxInflightFlushesPerTenant"),
+                "{tier} must not carry maxInflightFlushesPerTenant"
+            );
         }
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_is_optional_and_carries_a_minimum_one_bound() {
+        let props = gateway_schema_props();
+        assert_eq!(
+            props
+                .get("maxInflightFlushesPerTenant")
+                .expect("maxInflightFlushesPerTenant prop")
+                .minimum,
+            Some(1.0),
+            "maxInflightFlushesPerTenant must reject 0 at admission"
+        );
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } },
+            "gateway": { "maxInflightFlushesPerTenant": 2 }
+        }))
+        .expect("deserialize with field");
+        assert_eq!(spec.gateway.max_inflight_flushes_per_tenant, Some(2));
     }
 
     #[test]

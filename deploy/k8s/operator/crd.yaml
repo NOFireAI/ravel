@@ -235,7 +235,14 @@
                         ]
                       },
                       "maxInflightFlushes": {
-                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field.\nOmit to keep `ravel-server`'s own default of 1 (today's non-pipelined\nbehavior). The CRD schema enforces a minimum of 1 at admission:\n`ravel-server` rejects 0 as a flush deadlock.",
+                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field.\nOmit to keep `ravel-server`'s own default of 4 (ADR-2708 D3). The CRD\nschema enforces a minimum of 1 at admission: `ravel-server` rejects 0\nas a flush deadlock.",
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "maxInflightFlushesPerTenant": {
+                        "description": "How many of a shard's flush permits one tenant may hold or wait on at\nonce (`--max-inflight-flushes-per-tenant`, ADR-2708 D3). Omit to keep\n`ravel-server`'s own default of `max(1, maxInflightFlushes - 1)`, which\nleaves a permit for co-resident tenants whenever there is more than\none. Gateway-only, like `maxInflightFlushes`. The CRD schema enforces a\nminimum of 1 at admission; `ravel-server` also rejects a value above\nthe shard's permit count at startup.",
                         "format": "uint32",
                         "minimum": 1.0,
                         "nullable": true,
