@@ -382,6 +382,20 @@ impl LogSegmentScan {
         self.scan.as_ref().and_then(BlockScan::next_block_index)
     }
 
+    /// The skip index's stored `(min_ts, max_ts)` for the block the next
+    /// decode call would decode; see [`BlockScan::next_block_ts_bounds`].
+    /// `None` once the scan is exhausted or its cursor is lost.
+    pub fn next_block_ts_bounds(&self) -> Option<(i64, i64)> {
+        self.scan.as_ref().and_then(BlockScan::next_block_ts_bounds)
+    }
+
+    /// Move past the next surviving block without decoding it; see
+    /// [`BlockScan::skip_next_block`]. `false` once the scan is exhausted or
+    /// its cursor is lost.
+    pub fn skip_next_block(&mut self) -> bool {
+        self.scan.as_mut().is_some_and(BlockScan::skip_next_block)
+    }
+
     /// The read gate this scan's block decodes run on and the size each block
     /// job is charged at, the same pair
     /// [`next_block_on_gate`](Self::next_block_on_gate) submits with. For a

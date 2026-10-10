@@ -122,7 +122,7 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, Tr
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -261,9 +261,11 @@ impl PhysicalOptimizerRule for TopKLateMaterialization {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(|node| self.rewrite(node)).data()
+        let topk_filter = config.optimizer.enable_topk_dynamic_filter_pushdown;
+        plan.transform_down(|node| self.rewrite(node, topk_filter))
+            .data()
     }
 
     fn name(&self) -> &str {
@@ -299,9 +301,18 @@ enum PassThrough {
 impl TopKLateMaterialization {
     /// Try to rewrite one node. Returns the node unchanged unless it is a TopK
     /// over an admitted chain over a wide-enough [`LogsScanExec`].
+    ///
+    /// With `topk_filter` (DataFusion's `enable_topk_dynamic_filter_pushdown`),
+    /// the phase-1 TopK's dynamic filter is handed to the narrow scan, which
+    /// skips blocks and segments by its `ts` threshold (ADR-2677 decision 6).
+    /// This rule runs after DataFusion's own filter pushdown, so nothing else
+    /// would. Phase-1 row refs stay valid under a block skip: a skipped block
+    /// advances the scan's row-ref cursor with it, and phase 2 reopens each
+    /// referenced block by its address.
     fn rewrite(
         &self,
         node: Arc<dyn ExecutionPlan>,
+        topk_filter: bool,
     ) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
         let Some(sort) = node.downcast_ref::<SortExec>() else {
             return Ok(Transformed::no(node));
@@ -375,21 +386,35 @@ impl TopKLateMaterialization {
             .collect();
         let narrow_projection: Vec<usize> = narrow.iter().map(|&i| scan.projection()[i]).collect();
         let source = scan.row_fetch_source();
-        let mut phase1: Arc<dyn ExecutionPlan> = Arc::new(scan.reproject(narrow_projection, true)?);
+        let narrow_ordering = remap_ordering(sort.expr(), &remap)?;
+        let topk_filter = topk_filter.then(|| {
+            let keys = narrow_ordering
+                .iter()
+                .map(|e| Arc::clone(&e.expr))
+                .collect();
+            Arc::new(DynamicFilterPhysicalExpr::new(keys, lit(true)))
+        });
+        let mut narrow_scan = scan.reproject(narrow_projection, true)?;
+        if let Some(filter) = &topk_filter {
+            narrow_scan = narrow_scan.with_topk_filter(filter);
+        }
+        let mut phase1: Arc<dyn ExecutionPlan> = Arc::new(narrow_scan);
 
         for step in chain.iter().rev() {
             phase1 = match step {
-                PassThrough::Filter(filter) => Arc::new(FilterExec::try_new(
-                    remap_columns(filter.predicate(), &remap)?,
-                    phase1,
-                )?),
+                PassThrough::Filter(filter) => Arc::new(
+                    FilterExec::try_new(remap_columns(filter.predicate(), &remap)?, phase1)?
+                        .with_batch_size(filter.batch_size())?,
+                ),
                 PassThrough::Opaque(plan) => Arc::clone(plan).with_new_children(vec![phase1])?,
             };
         }
 
-        let narrow_ordering = remap_ordering(sort.expr(), &remap)?;
-        let phase1: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(narrow_ordering, phase1).with_fetch(Some(fetch)));
+        let mut topk = SortExec::new(narrow_ordering, phase1).with_fetch(Some(fetch));
+        if let Some(filter) = topk_filter {
+            topk = topk.with_dynamic_filter_expr(filter)?;
+        }
+        let phase1: Arc<dyn ExecutionPlan> = Arc::new(topk);
 
         // Phase 2, carrying the original ordering: the fetch emits phase 1's
         // rows in phase 1's order, so the ordering the `SortExec` established

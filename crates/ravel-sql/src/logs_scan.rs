@@ -312,12 +312,20 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::ColumnStatistics;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal,
+};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
@@ -1150,6 +1158,10 @@ pub struct LogsScanExec {
     /// fewer than `fetch` while more of a partition's owned data remains would
     /// silently under-answer the query and must never happen.
     fetch: Option<usize>,
+    /// The TopK dynamic filter of an `ORDER BY ts ... LIMIT k` above this scan
+    /// (ADR-2677 decision 6), kept for its `ts` threshold and never applied
+    /// to a row: the TopK stays the exact evaluator. See [`TopKThreshold`].
+    topk: Option<TopKThreshold>,
     /// The resolved full `logs` schema this scan projects, i.e.
     /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
     /// build a narrower sibling scan over the same table without re-deriving
@@ -1192,6 +1204,125 @@ pub struct LogsScanExec {
     /// from, so events from different partitions can be ordered against each
     /// other. Taken when the plan node is built, before any partition exists.
     created_at: Instant,
+}
+
+/// The `ts` threshold of an `ORDER BY ts [, ...] LIMIT k` TopK above a logs
+/// scan (ADR-2677 decision 6).
+///
+/// DataFusion's TopK publishes its heap's current worst row as a
+/// [`DynamicFilterPhysicalExpr`]: `lit(true)` until the heap holds `k` rows,
+/// then `ts < t`, or `ts < t OR (ts = t AND ...)` with further sort keys, and
+/// only tighter after that. [`Self::ceiling`] reads `t` off the filter's
+/// current expression: no row with `ts > t` can still enter the heap. A block
+/// or segment whose stored minimum ts is strictly above `t` holds no such row
+/// and is skipped; one whose minimum equals `t` is read, because its rows can
+/// tie on `ts` and win on a later key.
+///
+/// Kept only when the filter's leading key is the bare `ts` column, named by
+/// name so a rebuild that moves column indices keeps it valid. A descending
+/// `ts` key publishes `ts > t`, a lower bound, which [`Self::ceiling`] does
+/// not read, so a descending sort skips nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct TopKThreshold {
+    filter: Arc<DynamicFilterPhysicalExpr>,
+}
+
+/// The logs table's event-timestamp column name.
+const TS_COLUMN: &str = "ts";
+
+impl TopKThreshold {
+    /// The threshold `filter` carries, when its leading key is the bare
+    /// `ts` column.
+    fn from_filter(filter: &Arc<DynamicFilterPhysicalExpr>) -> Option<Self> {
+        let leading = filter.children().first().map(|c| Arc::clone(c))?;
+        is_ts_column(leading.as_ref()).then(|| Self {
+            filter: Arc::clone(filter),
+        })
+    }
+
+    /// `Some(t)` once the TopK's current filter bounds `ts` from above: no
+    /// row with `ts > t` can still be accepted. `None` while the heap is not
+    /// full (the filter is `lit(true)`), and for any filter shape
+    /// [`ts_ceiling`] does not recognize, which skips nothing.
+    fn ceiling(&self) -> Option<i64> {
+        let current = self.filter.current().ok()?;
+        ts_ceiling(current.as_ref())
+    }
+}
+
+/// Whether `expr` is the bare `ts` column.
+fn is_ts_column(expr: &dyn PhysicalExpr) -> bool {
+    expr.downcast_ref::<Column>()
+        .is_some_and(|c| c.name() == TS_COLUMN)
+}
+
+/// The largest `ts` a row satisfying `expr` can have, or `None` when `expr`
+/// does not bound `ts` from above in a shape read here.
+///
+/// `ts < t`, `ts <= t` and `ts = t` bound it by `t`. A conjunction is bounded
+/// by its tighter bounded side; a disjunction only when both sides are, by
+/// the looser. Anything else, `lit(true)` included, bounds nothing. The bound
+/// is never tighter than the predicate, so skipping a block whose minimum is
+/// above it never drops a row the predicate accepts.
+fn ts_ceiling(expr: &dyn PhysicalExpr) -> Option<i64> {
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    match binary.op() {
+        Operator::And => {
+            match (
+                ts_ceiling(binary.left().as_ref()),
+                ts_ceiling(binary.right().as_ref()),
+            ) {
+                (Some(l), Some(r)) => Some(l.min(r)),
+                (l, r) => l.or(r),
+            }
+        }
+        Operator::Or => {
+            let l = ts_ceiling(binary.left().as_ref())?;
+            let r = ts_ceiling(binary.right().as_ref())?;
+            Some(l.max(r))
+        }
+        Operator::Lt | Operator::LtEq | Operator::Eq => {
+            if !is_ts_column(binary.left().as_ref()) {
+                return None;
+            }
+            match binary.right().downcast_ref::<Literal>()?.value() {
+                ScalarValue::TimestampNanosecond(Some(t), _) => Some(*t),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The current ceiling of `topk`, if any; see [`TopKThreshold::ceiling`].
+fn topk_ceiling(topk: Option<&TopKThreshold>) -> Option<i64> {
+    topk.and_then(TopKThreshold::ceiling)
+}
+
+/// Skips the blocks at the front of `scan` whose stored minimum ts is above
+/// `ceiling`, before any of their columns is decoded, and returns how many.
+///
+/// Every candidate block is checked, not only up to the first one that
+/// survives: block minima are not ordered within a segment (several streams
+/// interleave), so a later block can be skippable after an earlier one is
+/// read. The caller checks again before each decode, so the threshold it
+/// reads is the latest the TopK has published.
+fn skip_blocks_above(scan: &mut LogSegmentScan, ceiling: i64) -> usize {
+    let mut skipped = 0;
+    while let Some((min, max)) = scan.next_block_ts_bounds() {
+        if !above_ceiling(min, max, ceiling) || !scan.skip_next_block() {
+            break;
+        }
+        skipped += 1;
+    }
+    skipped
+}
+
+/// Whether a block or segment whose stored ts bounds are `min..=max` can be
+/// skipped under `ceiling`: only when its minimum is strictly above it, and
+/// never on inverted bounds (`min > max`), which prove nothing.
+fn above_ceiling(min: i64, max: i64, ceiling: i64) -> bool {
+    min <= max && min > ceiling
 }
 
 /// Which conjunct kept a statement off the predicate-free full-window
@@ -1337,6 +1468,13 @@ struct BlockMetrics {
     /// `poll_next` calls, and how many of them returned `Pending`.
     polls: Count,
     polls_pending: Count,
+    /// Blocks of opened segments this partition skipped undecoded because
+    /// their minimum ts was above the TopK threshold (ADR-2677 decision 6).
+    blocks_skipped_by_threshold: Count,
+    /// Owned segments (on the striped path, owned shares of a segment) this
+    /// partition never opened because their minimum ts was above the TopK
+    /// threshold. Their blocks are not in [`Self::blocks_skipped_by_threshold`].
+    segments_skipped_by_threshold: Count,
 }
 
 impl BlockMetrics {
@@ -1364,6 +1502,10 @@ impl BlockMetrics {
             stream_elapsed: MetricBuilder::new(metrics).subset_time("stream_elapsed", partition),
             polls: MetricBuilder::new(metrics).counter("polls", partition),
             polls_pending: MetricBuilder::new(metrics).counter("polls_pending", partition),
+            blocks_skipped_by_threshold: MetricBuilder::new(metrics)
+                .counter("blocks_skipped_by_threshold", partition),
+            segments_skipped_by_threshold: MetricBuilder::new(metrics)
+                .counter("segments_skipped_by_threshold", partition),
             total: MetricBuilder::new(metrics).counter("blocks_total", partition),
             scanned: MetricBuilder::new(metrics).counter("blocks_scanned", partition),
             pruned_by_postings: MetricBuilder::new(metrics)
@@ -1551,6 +1693,7 @@ impl LogsScanExec {
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_fetch_pushed(self.fetch)
+                .with_topk(self.topk.clone())
         })
     }
 
@@ -1593,6 +1736,7 @@ impl LogsScanExec {
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_fetch_pushed(self.fetch)
+                .with_topk(self.topk.clone())
         })
     }
 
@@ -1644,6 +1788,69 @@ impl LogsScanExec {
     fn with_fetch_pushed(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
+    }
+
+    /// Install (or carry across a rebuild) the TopK threshold this scan
+    /// skips by. The threshold names the `ts` column by name, not by index,
+    /// so it stays valid across [`Self::reproject`] and
+    /// [`Self::reproject_attr_keys`], which change the output column indices.
+    fn with_topk(mut self, topk: Option<TopKThreshold>) -> Self {
+        self.topk = topk;
+        self
+    }
+
+    /// This scan skipping by `filter`, the dynamic filter of a `SortExec`
+    /// TopK over it, when that filter's leading key is the bare `ts` column,
+    /// and by nothing otherwise: any threshold carried from an earlier TopK
+    /// is dropped. Late materialization builds its phase-1 TopK after
+    /// DataFusion's filter pushdown has run, so it hands that TopK's filter
+    /// over through this instead.
+    pub(crate) fn with_topk_filter(self, filter: &Arc<DynamicFilterPhysicalExpr>) -> Self {
+        self.with_topk(TopKThreshold::from_filter(filter))
+    }
+
+    /// A sibling of this scan with `fetch` and `topk` installed.
+    ///
+    /// An exhaustive struct literal rather than a call through [`Self::build`]:
+    /// every field of [`LogsScanExec`] is named here explicitly, so a field
+    /// added to the struct later without a matching line here is a compile
+    /// error, not a silently-dropped one. `counts`, `prefetch_pool` and
+    /// `metrics` are shared with `self` rather than rebuilt: the optimizer
+    /// replaces `self` with the returned plan, so `self` is never executed and
+    /// nothing is double-counted or double-planned.
+    fn sibling(&self, fetch: Option<usize>, topk: Option<TopKThreshold>) -> Self {
+        LogsScanExec {
+            tenant_hash: self.tenant_hash,
+            fetcher: self.fetcher.clone(),
+            segments: Arc::clone(&self.segments),
+            target_partitions: self.target_partitions,
+            counts: Arc::clone(&self.counts),
+            prefetch_pool: Arc::clone(&self.prefetch_pool),
+            ts_min: self.ts_min,
+            ts_max: self.ts_max,
+            content: Arc::clone(&self.content),
+            prune: Arc::clone(&self.prune),
+            erasure: Arc::clone(&self.erasure),
+            projection: Arc::clone(&self.projection),
+            columns: self.columns.clone(),
+            projected_fraction: self.projected_fraction,
+            declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            column_stats: self.column_stats.clone(),
+            segment_timing: self.segment_timing,
+            segments_pruned_by_stats: self.segments_pruned_by_stats,
+            fetch,
+            topk,
+            full_schema: Arc::clone(&self.full_schema),
+            schema: Arc::clone(&self.schema),
+            row_refs: self.row_refs,
+            columnar_eligible: self.columnar_eligible,
+            stripe_blocks: self.stripe_blocks,
+            properties: Arc::clone(&self.properties),
+            phase_accounting: self.phase_accounting.clone(),
+            metrics: self.metrics.clone(),
+            created_at: self.created_at,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1778,6 +1985,7 @@ impl LogsScanExec {
             segment_timing: false,
             segments_pruned_by_stats: 0,
             fetch: None,
+            topk: None,
             full_schema: full,
             schema,
             row_refs,
@@ -2543,50 +2751,43 @@ impl ExecutionPlan for LogsScanExec {
     }
 
     /// Install a pushed `fetch` (issue #362), returning a sibling scan that is
-    /// otherwise identical to this one.
-    ///
-    /// An exhaustive struct literal rather than a call through [`Self::build`]:
-    /// every field of [`LogsScanExec`] is named here explicitly, so a field
-    /// added to the struct later without a matching line here is a compile
-    /// error, not a silently-dropped one (the exact bug class the
-    /// `segment_timing` fix on this file addressed for [`Self::reproject`]).
-    /// `counts`, `prefetch_pool` and `metrics` are shared with `self` via
-    /// `Arc`/`Arc<Mutex<_>>` clone rather than rebuilt, matching upstream's own `with_fetch` on leaf
-    /// nodes like `StreamingTableExec`: the optimizer replaces `self` with the
-    /// returned plan in the tree, so `self` is dropped and never executed, and
-    /// nothing is ever double-counted or double-planned.
+    /// otherwise identical to this one (see [`Self::sibling`]).
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(LogsScanExec {
-            tenant_hash: self.tenant_hash,
-            fetcher: self.fetcher.clone(),
-            segments: Arc::clone(&self.segments),
-            target_partitions: self.target_partitions,
-            counts: Arc::clone(&self.counts),
-            prefetch_pool: Arc::clone(&self.prefetch_pool),
-            ts_min: self.ts_min,
-            ts_max: self.ts_max,
-            content: Arc::clone(&self.content),
-            prune: Arc::clone(&self.prune),
-            erasure: Arc::clone(&self.erasure),
-            projection: Arc::clone(&self.projection),
-            columns: self.columns.clone(),
-            projected_fraction: self.projected_fraction,
-            declared: Arc::clone(&self.declared),
-            attr_keys: Arc::clone(&self.attr_keys),
-            column_stats: self.column_stats.clone(),
-            segment_timing: self.segment_timing,
-            segments_pruned_by_stats: self.segments_pruned_by_stats,
-            fetch: limit,
-            full_schema: Arc::clone(&self.full_schema),
-            schema: Arc::clone(&self.schema),
-            row_refs: self.row_refs,
-            columnar_eligible: self.columnar_eligible,
-            stripe_blocks: self.stripe_blocks,
-            properties: Arc::clone(&self.properties),
-            phase_accounting: self.phase_accounting.clone(),
-            metrics: self.metrics.clone(),
-            created_at: self.created_at,
-        }))
+        Some(Arc::new(self.sibling(limit, self.topk.clone())))
+    }
+
+    /// Keep a TopK's dynamic filter whose leading key is `ts` (ADR-2677
+    /// decision 6), and report every parent filter unsupported.
+    ///
+    /// The scan never applies the filter to a row: it only reads its `ts`
+    /// threshold to skip whole blocks and segments that cannot hold a
+    /// qualifying row, so the TopK above stays the exact evaluator. Only the
+    /// `Post` phase carries TopK filters. Any dynamic filter whose leading
+    /// child is `ts` is sound to skip by, a join's included: a pushed filter
+    /// rejects only rows that cannot contribute to the result.
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let filters = vec![PushedDown::No; child_pushdown_result.parent_filters.len()];
+        if phase != FilterPushdownPhase::Post || self.topk.is_some() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                filters,
+            ));
+        }
+        let topk = child_pushdown_result.parent_filters.iter().find_map(|f| {
+            let filter: Arc<dyn PhysicalExpr> = Arc::clone(&f.filter);
+            let dynamic = Arc::downcast::<DynamicFilterPhysicalExpr>(filter).ok()?;
+            TopKThreshold::from_filter(&dynamic)
+        });
+        let mut propagation = FilterPushdownPropagation::with_parent_pushdown_result(filters);
+        if let Some(topk) = topk {
+            let node: Arc<dyn ExecutionPlan> = Arc::new(self.sibling(self.fetch, Some(topk)));
+            propagation = propagation.with_updated_node(node);
+        }
+        Ok(propagation)
     }
 
     /// Report the exact row count and `ts` span straight from the catalog's
@@ -2750,8 +2951,15 @@ impl ExecutionPlan for LogsScanExec {
         let (work, fast_whole_segment, state) = match self.whole_segment_fast_path(&ctx.query) {
             Ok(relevant) => {
                 let n = self.target_partitions.max(1).min(relevant.max(1));
-                let work =
-                    owned_whole_segments(&self.segments, self.ts_min, self.ts_max, partition, n);
+                let order = visit_order(&self.segments, self.topk.is_some());
+                let work = owned_whole_segments(
+                    &self.segments,
+                    &order,
+                    self.ts_min,
+                    self.ts_max,
+                    partition,
+                    n,
+                );
                 (work, true, LogScanState::NextSegment)
             }
             Err(reason) => {
@@ -2776,8 +2984,10 @@ impl ExecutionPlan for LogsScanExec {
         };
         // ADR-2414 decision A2: the fast path pipelines its ranged opens at
         // its share of the GET permits, which `get_limiter_permits` reads off
-        // the process-shared limiter the server wires into the fetcher.
-        let prefetch_share = if fast_whole_segment && self.fetch.is_none() {
+        // the process-shared limiter the server wires into the fetcher. Not
+        // under a TopK threshold: a prefetch opens a segment before the
+        // threshold that could skip it is read.
+        let prefetch_share = if fast_whole_segment && self.fetch.is_none() && self.topk.is_none() {
             fast_path_prefetch_share(self.fetcher.get_limiter_permits(), self.target_partitions)
         } else {
             1
@@ -2804,6 +3014,7 @@ impl ExecutionPlan for LogsScanExec {
             stripe_blocks: self.stripe_blocks,
             fast_whole_segment,
             prefetch_share,
+            topk: self.topk.clone(),
             prefetch_pool: Arc::clone(&self.prefetch_pool),
             current_by_chunk: false,
             retrying: false,
@@ -3273,19 +3484,27 @@ fn row_groups(indices: &[usize], page_dir: &PageDir) -> Vec<Vec<usize>> {
 ///   by exactly one partition, so with nothing to coalesce re-opens the scan
 ///   still costs one read per segment rather than one per partition per segment.
 ///
+/// Segments are visited in `order` (see [`visit_order`]) rather than in
+/// snapshot order when they differ; each [`OwnedSeg::ordinal`] stays the
+/// segment's snapshot index either way.
+///
 /// Returns, per owned segment, the surviving whole-object block indices this
 /// partition drains, in ascending order.
 fn owned_work(
     counts: &PlanCounts,
     segments: &[SegmentRef],
+    order: &[usize],
     partition: usize,
     n: usize,
     stripe_blocks: bool,
 ) -> VecDeque<OwnedSeg> {
     let mut work = VecDeque::new();
+    let planned_segs = order
+        .iter()
+        .filter_map(|&seg_idx| counts.segs.get(seg_idx).map(|plan| (seg_idx, plan)));
     if stripe_blocks {
         let mut global_group = 0usize;
-        for (seg_idx, plan) in counts.segs.iter().enumerate() {
+        for (seg_idx, plan) in planned_segs {
             let Some(plan) = plan else { continue };
             let Some(planned) = &plan.planned else {
                 continue;
@@ -3311,7 +3530,7 @@ fn owned_work(
         }
     } else {
         let mut seg_ordinal = 0usize;
-        for (seg_idx, plan) in counts.segs.iter().enumerate() {
+        for (seg_idx, plan) in planned_segs {
             let Some(plan) = plan else { continue };
             let Some(planned) = &plan.planned else {
                 continue;
@@ -3344,8 +3563,11 @@ fn owned_work(
 /// Each relevant segment is proved fully contained in the query window and
 /// predicate-free before this runs (see [`LogsScanExec::whole_segment_fast_path`]),
 /// so every block survives and the block-index list is unused here.
+///
+/// Segments are numbered in `order` (see [`visit_order`]).
 fn owned_whole_segments(
     segments: &[SegmentRef],
+    order: &[usize],
     ts_min: i64,
     ts_max: i64,
     partition: usize,
@@ -3353,7 +3575,10 @@ fn owned_whole_segments(
 ) -> VecDeque<OwnedSeg> {
     let mut work = VecDeque::new();
     let mut ordinal = 0usize;
-    for (seg_idx, seg) in segments.iter().enumerate() {
+    for &seg_idx in order {
+        let Some(seg) = segments.get(seg_idx) else {
+            continue;
+        };
         if !LogSegmentFetcher::ts_range_relevant(seg, ts_min, ts_max) {
             continue;
         }
@@ -3371,6 +3596,23 @@ fn owned_whole_segments(
         ordinal += 1;
     }
     work
+}
+
+/// The order a scan deals its segments to partitions in, as snapshot indices.
+///
+/// Snapshot order without a TopK threshold. With one (ADR-2677 decision 6),
+/// ascending `min_event_ts_ns`, ties broken by snapshot index: each partition
+/// then opens its smallest-minimum segment first, so the TopK heap fills from
+/// the rows most likely to stay in it and the threshold tightens before the
+/// later segments are reached. A segment's minimum covers every row it holds,
+/// a late-arriving row included, so a segment written last that holds the
+/// smallest `ts` is visited first.
+fn visit_order(segments: &[SegmentRef], by_min_ts: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    if by_min_ts {
+        order.sort_by_key(|&i| (segments[i].min_event_ts_ns, i));
+    }
+    order
 }
 
 /// Everything one partition's fetches need, shared by every per-segment open
@@ -4293,6 +4535,9 @@ struct LogScanStream {
     /// sequential, with the prefetches behind it left in flight unless the
     /// budget refuses it ([`Self::on_open_refused`]).
     prefetch_share: usize,
+    /// [`LogsScanExec::topk`]: the TopK threshold this partition reads before
+    /// opening each owned segment and before decoding each block.
+    topk: Option<TopKThreshold>,
     /// The statement's prefetch pool, shared with the exec and every other
     /// partition's stream. This partition's issued opens of the owned
     /// segments after the current one live in its slot, [`Self::partition`].
@@ -4660,6 +4905,27 @@ impl LogScanStream {
 
     /// The row-ref address for the block just decoded (`decoded_block`, its
     /// whole-object index), and advance the cursor past it.
+    /// Skips, undecoded, the blocks at the front of the open segment whose
+    /// minimum ts is above the TopK threshold (ADR-2677 decision 6). Called
+    /// before each block decode on the `Rows` state (the `Columnar` arm does
+    /// the same inline), never on `RowFallbackBlock`, whose reopened scan
+    /// re-drains blocks by position.
+    ///
+    /// The row-ref cursor moves past the skipped blocks with the scan, so the
+    /// whole-segment path's check that the decoded block sits at the drain
+    /// position still holds and every later row keeps its address.
+    fn skip_threshold_blocks(&mut self) {
+        let Some(ceiling) = topk_ceiling(self.topk.as_ref()) else {
+            return;
+        };
+        let (LogScanState::Columnar(scan) | LogScanState::Rows(scan)) = &mut self.state else {
+            return;
+        };
+        let skipped = skip_blocks_above(scan, ceiling);
+        self.block_cursor += skipped;
+        self.blocks.blocks_skipped_by_threshold.add(skipped);
+    }
+
     fn take_block_range(&mut self, decoded_block: Option<usize>) -> DFResult<Option<RowRefRange>> {
         let range = self.current_block(decoded_block)?.map(|block| RowRefRange {
             segment: self.current_seg_ordinal,
@@ -5009,9 +5275,11 @@ impl LogScanStream {
                             }
                             this.blocks.plan_full_reads.add(counts.full_reads);
                         }
+                        let order = visit_order(&this.segments, this.topk.is_some());
                         this.work = owned_work(
                             &counts,
                             &this.segments,
+                            &order,
                             this.partition,
                             n,
                             this.stripe_blocks,
@@ -5094,6 +5362,14 @@ impl LogScanStream {
                             whole_object,
                             dirs,
                         }) => {
+                            // ADR-2677 decision 6: a segment whose every row
+                            // is above the TopK threshold is never opened.
+                            if topk_ceiling(this.topk.as_ref()).is_some_and(|ceiling| {
+                                above_ceiling(seg.min_event_ts_ns, seg.max_event_ts_ns, ceiling)
+                            }) {
+                                this.blocks.segments_skipped_by_threshold.add(1);
+                                continue;
+                            }
                             this.current_seg = Some(seg.clone());
                             this.current_seg_ordinal = ordinal;
                             this.current_indices = indices.clone();
@@ -5238,6 +5514,11 @@ impl LogScanStream {
                             ));
                         }
                         None => {
+                            if let Some(ceiling) = topk_ceiling(this.topk.as_ref()) {
+                                let skipped = skip_blocks_above(scan, ceiling);
+                                this.block_cursor += skipped;
+                                this.blocks.blocks_skipped_by_threshold.add(skipped);
+                            }
                             // The row-ref address of the block this call
                             // decodes, resolved from the scan's own next block
                             // (issue #2417), not from the cursor's position in
@@ -5400,6 +5681,9 @@ impl LogScanStream {
                     }
                 }
                 LogScanState::Rows(_) => {
+                    if this.decoded.is_none() {
+                        this.skip_threshold_blocks();
+                    }
                     let (decoded_block, next) = match this.next_row_block(RowResume::Rows) {
                         RowNext::Ready(block, next) => (block, next),
                         RowNext::Submitted => continue,
@@ -8965,7 +9249,8 @@ mod owned_work_tests {
     ) -> Vec<Vec<(usize, Vec<usize>)>> {
         (0..n)
             .map(|p| {
-                owned_work(counts, refs, p, n, stripe)
+                let order = visit_order(refs, false);
+                owned_work(counts, refs, &order, p, n, stripe)
                     .into_iter()
                     .map(|w| (w.ordinal, w.indices))
                     .collect()
@@ -11200,5 +11485,125 @@ mod read_gate_tests {
                 other => panic!("expected a transient store error, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod topk_threshold_tests {
+    //! ADR-2677 decision 6: which TopK filters bound `ts`, and which stored
+    //! bounds a block or segment may be skipped on.
+
+    use super::*;
+    use datafusion::physical_expr::expressions::lit;
+
+    const T: i64 = 1_700_000_000_000_000_000;
+
+    fn col(name: &str, index: usize) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Column::new(name, index))
+    }
+
+    fn ts_lit(t: i64) -> Arc<dyn PhysicalExpr> {
+        lit(ScalarValue::TimestampNanosecond(Some(t), None))
+    }
+
+    fn bin(
+        l: Arc<dyn PhysicalExpr>,
+        op: Operator,
+        r: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(l, op, r))
+    }
+
+    #[test]
+    fn ts_ceiling_reads_the_topk_filter_shapes() {
+        let ts = || col("ts", 0);
+        assert_eq!(ts_ceiling(lit(true).as_ref()), None, "an unfilled heap");
+        for op in [Operator::Lt, Operator::LtEq, Operator::Eq] {
+            assert_eq!(ts_ceiling(bin(ts(), op, ts_lit(T)).as_ref()), Some(T));
+        }
+        // `ts < t OR (ts = t AND body < b)`: the two-key filter.
+        let tie = bin(
+            bin(ts(), Operator::Eq, ts_lit(T)),
+            Operator::And,
+            bin(col("body", 1), Operator::Lt, lit("m")),
+        );
+        let two_key = bin(bin(ts(), Operator::Lt, ts_lit(T)), Operator::Or, tie);
+        assert_eq!(ts_ceiling(two_key.as_ref()), Some(T));
+        let both = bin(
+            bin(ts(), Operator::Lt, ts_lit(T + 5)),
+            Operator::And,
+            bin(ts(), Operator::Lt, ts_lit(T)),
+        );
+        assert_eq!(ts_ceiling(both.as_ref()), Some(T), "the tighter side");
+        let either = bin(
+            bin(ts(), Operator::Lt, ts_lit(T + 5)),
+            Operator::Or,
+            bin(ts(), Operator::Lt, ts_lit(T)),
+        );
+        assert_eq!(ts_ceiling(either.as_ref()), Some(T + 5), "the looser side");
+    }
+
+    #[test]
+    fn ts_ceiling_refuses_what_does_not_bound_ts_from_above() {
+        let open_or = bin(
+            bin(col("ts", 0), Operator::Lt, ts_lit(T)),
+            Operator::Or,
+            bin(col("body", 1), Operator::Lt, lit("m")),
+        );
+        for expr in [
+            bin(col("ts", 0), Operator::Gt, ts_lit(T)),
+            bin(col("ts", 0), Operator::GtEq, ts_lit(T)),
+            bin(col("observed_ts", 1), Operator::Lt, ts_lit(T)),
+            bin(col("ts", 0), Operator::Lt, lit(5i64)),
+            bin(
+                lit(ScalarValue::TimestampNanosecond(None, None)),
+                Operator::Gt,
+                col("ts", 0),
+            ),
+            bin(
+                col("ts", 0),
+                Operator::Lt,
+                lit(ScalarValue::TimestampNanosecond(None, None)),
+            ),
+            open_or,
+        ] {
+            assert_eq!(ts_ceiling(expr.as_ref()), None, "{expr}");
+        }
+    }
+
+    #[test]
+    fn above_ceiling_is_strict_and_refuses_inverted_bounds() {
+        assert!(above_ceiling(T + 1, T + 9, T));
+        assert!(!above_ceiling(T, T + 9, T), "a tie is read");
+        assert!(!above_ceiling(T + 1, T, T), "inverted bounds prove nothing");
+        assert!(!above_ceiling(0, 0, T), "an empty block reads min_ts 0");
+    }
+
+    #[test]
+    fn threshold_needs_a_leading_bare_ts_and_a_full_heap() {
+        let keys = |lead: Arc<dyn PhysicalExpr>| vec![lead, col("body", 1)];
+        for lead in [
+            col("body", 1),
+            col("observed_ts", 2),
+            bin(col("ts", 0), Operator::Plus, ts_lit(1)),
+        ] {
+            let filter = Arc::new(DynamicFilterPhysicalExpr::new(keys(lead), lit(true)));
+            assert!(TopKThreshold::from_filter(&filter).is_none());
+        }
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            keys(col("ts", 0)),
+            lit(true),
+        ));
+        let threshold = TopKThreshold::from_filter(&filter).expect("a leading ts key");
+        assert_eq!(threshold.ceiling(), None, "no bound until the heap is full");
+        filter
+            .update(bin(col("ts", 0), Operator::Lt, ts_lit(T)))
+            .expect("update");
+        assert_eq!(threshold.ceiling(), Some(T));
+        filter
+            .update(bin(col("ts", 0), Operator::Lt, ts_lit(T - 3)))
+            .expect("update");
+        assert_eq!(threshold.ceiling(), Some(T - 3), "the latest bound is read");
     }
 }

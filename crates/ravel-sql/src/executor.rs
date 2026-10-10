@@ -394,6 +394,16 @@ pub struct SqlStats {
     /// prunes the same snapshot again, so the sum can exceed it. Zero for a
     /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
+    /// Blocks of opened segments, and owned segments never opened, that the
+    /// successful attempt's logs scans skipped because their minimum `ts` was
+    /// above an `ORDER BY ts ... LIMIT k` TopK's threshold (ADR-2677 decision
+    /// 6), read off the scans' `blocks_skipped_by_threshold` and
+    /// `segments_skipped_by_threshold` counters and summed over every logs
+    /// scan in the plan. A skipped segment's blocks are not in the block
+    /// figure. On the striped path a segment is counted once per partition
+    /// that owned a share of it. Zero without such a TopK.
+    pub blocks_skipped_by_threshold: u64,
+    pub segments_skipped_by_threshold: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
     /// counters above are. All zero on the default configuration, where the
@@ -617,6 +627,8 @@ struct BlockCounts {
     scanned: u64,
     pruned_by_postings: u64,
     segments_pruned_by_stats: u64,
+    blocks_skipped_by_threshold: u64,
+    segments_skipped_by_threshold: u64,
     timing: ScanTiming,
     /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
     /// here rather than in a second walk because one traversal already reads
@@ -625,9 +637,10 @@ struct BlockCounts {
 }
 
 /// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings` /
-/// `segments_pruned_by_stats` DataFusion counters over `plan` and its
+/// `segments_pruned_by_stats` / `blocks_skipped_by_threshold` /
+/// `segments_skipped_by_threshold` DataFusion counters over `plan` and its
 /// descendants, plus the metrics scan's `histogram_series_skipped`. Only
-/// `LogsScanExec` publishes the first four names (crate::logs_scan) and only `RsegScanExec` the last
+/// `LogsScanExec` publishes the first six names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. Reads the
 /// counters the scans already maintain rather than counting a second time.
@@ -648,6 +661,8 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
         counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
+        counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
+        counts.segments_skipped_by_threshold += sum("segments_skipped_by_threshold");
         counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
         accumulate_scan_timing(&metrics, &mut counts.timing);
     }
@@ -1593,6 +1608,8 @@ impl SqlExecutor {
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
+                    stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
+                    stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
                     stats.scan_timing = blocks.timing;
                     stats.wall = PhaseWallTiming {
                         resolve_ns,
