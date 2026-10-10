@@ -1587,7 +1587,10 @@ mod tests {
                         base + i,
                         base + 100,
                         vec![
-                            string_kv("http.route", &format!("/r/{i}")),
+                            // Repeated for two spans, then a change.
+                            string_kv("http.route", &format!("/r/{}", i / 2)),
+                            string_kv("empty", ""),
+                            string_kv("alt", if i % 2 == 0 { "x" } else { "yy" }),
                             kv("code", AnyValueVariant::IntValue(-200)),
                             kv("ratio", AnyValueVariant::DoubleValue(0.125)),
                             kv("ok", AnyValueVariant::BoolValue(false)),
@@ -1648,11 +1651,18 @@ mod tests {
             out.rejected
         );
         assert_eq!(out.spans.len(), 12);
+        // What each span actually allocated: its attribute `Vec`'s element
+        // capacity and every key and value.
         let built: usize = out
             .spans
             .iter()
-            .flat_map(|s| s.attrs.iter())
-            .map(|(k, v)| k.len() + v.len() + std::mem::size_of::<(String, String)>())
+            .map(|s| {
+                s.attrs.capacity() * std::mem::size_of::<(String, String)>()
+                    + s.attrs
+                        .iter()
+                        .map(|(k, v)| k.capacity() + v.capacity())
+                        .sum::<usize>()
+            })
             .sum();
         assert!(built > 0);
         assert!(projected >= built, "projected {projected} < built {built}");

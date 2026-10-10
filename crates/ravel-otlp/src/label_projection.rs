@@ -18,7 +18,9 @@
 //! its attribute limit, a point over its attribute or bucket cap, a
 //! non-cumulative sum), and otherwise counts every copy whatever its later
 //! fate. Every label or attribute is charged its name and value bytes plus
-//! [`RESOLVED_LABEL_OVERHEAD_BYTES`] for the element holding them; a log
+//! [`RESOLVED_LABEL_OVERHEAD_BYTES`] for the element holding them, and an
+//! element slot reserved for an attribute the normalizer then drops is
+//! charged the overhead alone; a log
 //! record's copy of its stream preimage, a flat byte string, is charged its
 //! exact encoded length.
 //!
@@ -57,6 +59,11 @@ pub const RESOLVED_LABEL_OVERHEAD_BYTES: usize = 64;
 /// Longest suffix the classic histogram and summary explosion appends to a
 /// family name (`_bucket`, `_count`, `_sum`).
 const EXPLODE_SUFFIX_MAX_LEN: usize = "_bucket".len();
+
+/// The `_count` and `_sum` series of an exploded histogram or summary point:
+/// each is built in a `Vec` with a slot reserved for the `le`/`quantile`
+/// label it never gets, and the kept set keeps that slot.
+const EXPLODE_UNFILLED_SLOT_BYTES: usize = 2 * RESOLVED_LABEL_OVERHEAD_BYTES;
 
 /// `le="+Inf"`, the bucket label every classic histogram adds.
 const INF_LE_LABEL_BYTES: usize = "le".len() + "+Inf".len() + RESOLVED_LABEL_OVERHEAD_BYTES;
@@ -100,7 +107,8 @@ fn label_bytes(name_len: usize, value_len: usize) -> usize {
 /// prefix once; per point, `multiplicity x (prefix + __name__ + attribute
 /// labels)`, where multiplicity is 1 for gauges, sums and exponential
 /// histograms, `bounds + 3` for classic histograms (plus each bucket's `le`
-/// label) and `quantiles + 2` for summaries (plus each `quantile` label). A
+/// label) and `quantiles + 2` for summaries (plus each `quantile` label, and
+/// the slot the `_count` and `_sum` series reserve for one and leave empty). A
 /// run of consecutive points within one metric whose raw attributes are equal
 /// counts once, because the label memo builds once per such run and shares
 /// the set; the explode paths share nothing and get no run rule.
@@ -210,13 +218,17 @@ fn label_value_len(value: Option<&AnyValue>) -> Option<usize> {
 /// Bytes of the attribute labels one point builds, or `None` when one of its
 /// attributes has no label representation (the point is rejected before its
 /// set is kept). An empty value is dropped from the set, as `push_checked`
-/// drops it.
-fn point_attribute_bytes(attributes: &[KeyValue]) -> Option<usize> {
+/// drops it, but where the set's `Vec` was sized before the drops
+/// (`reserved_slots`) its slot stays allocated in the kept set and is charged
+/// [`RESOLVED_LABEL_OVERHEAD_BYTES`].
+fn point_attribute_bytes(attributes: &[KeyValue], reserved_slots: bool) -> Option<usize> {
     let mut total = 0usize;
     for kv in attributes {
         let len = label_value_len(kv.value.as_ref())?;
         if len > 0 {
             total = total.saturating_add(label_bytes(kv.key.len(), len));
+        } else if reserved_slots {
+            total = total.saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES);
         }
     }
     Some(total)
@@ -283,7 +295,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 {
                     continue;
                 }
-                let Some(attrs) = point_attribute_bytes(&dp.attributes) else {
+                let Some(attrs) = point_attribute_bytes(&dp.attributes, false) else {
                     continue;
                 };
                 let per_series = prefix
@@ -297,7 +309,8 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                     .fold(INF_LE_LABEL_BYTES, usize::saturating_add);
                 total = total
                     .saturating_add(per_series.saturating_mul(multiplicity))
-                    .saturating_add(le_labels);
+                    .saturating_add(le_labels)
+                    .saturating_add(EXPLODE_UNFILLED_SLOT_BYTES);
             }
             total
         }
@@ -309,7 +322,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 {
                     continue;
                 }
-                let Some(attrs) = point_attribute_bytes(&dp.attributes) else {
+                let Some(attrs) = point_attribute_bytes(&dp.attributes, false) else {
                     continue;
                 };
                 let per_series = prefix
@@ -323,7 +336,8 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                     .fold(0usize, usize::saturating_add);
                 total = total
                     .saturating_add(per_series.saturating_mul(multiplicity))
-                    .saturating_add(quantile_labels);
+                    .saturating_add(quantile_labels)
+                    .saturating_add(EXPLODE_UNFILLED_SLOT_BYTES);
             }
             total
         }
@@ -335,6 +349,10 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
 /// point's shares that point's set (the `SeriesIdMemo` hit rule). A point
 /// over the attribute cap is rejected before the memo is consulted, so it
 /// neither counts nor resets the run.
+///
+/// These paths size each set's `Vec` from the raw attribute count before
+/// empty values are dropped, and `LabelSet::new` keeps that `Vec` as built,
+/// so every empty-valued attribute still costs its slot.
 fn project_memo_run<'a>(
     points: impl Iterator<Item = &'a [KeyValue]>,
     base: usize,
@@ -350,7 +368,7 @@ fn project_memo_run<'a>(
             continue;
         }
         previous = Some(attributes);
-        if let Some(attrs) = point_attribute_bytes(attributes) {
+        if let Some(attrs) = point_attribute_bytes(attributes, true) {
             total = total.saturating_add(base.saturating_add(attrs));
         }
     }

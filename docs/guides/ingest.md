@@ -470,8 +470,9 @@ the quantiles of one `Summary` data point.
 `max_resolved_label_bytes_per_request` bounds the label bytes that
 normalization would build for the whole request, counting every bucket's and
 quantile's copy of the point's labels. A request over it is rejected whole
-with a partial success, and a request under it is charged against the ingest
-buffer byte budget until it is written; see
+with a partial success. A request under it is charged against the ingest
+buffer byte budget while it is normalized, and the charge is released just
+before the write takes its own charge for the normalized batch; see
 [Resolved-label bytes](admission-limits.md#resolved-label-bytes). The same
 bound, with the same default, applies to logs and spans.
 
