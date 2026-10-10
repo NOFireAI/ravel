@@ -563,6 +563,7 @@ pub fn build_sql_state(
         declared_columns,
         process_memory_budget,
         None,
+        None,
         ravel_sql::DEFAULT_MIN_GRACE_MS,
         &SqlSpillInputs::default(),
     )
@@ -1046,6 +1047,10 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// `spill` is what [`prepare_sql_spill`] settled: the executor's
 /// `SqlConfig::spill` comes from `SqlConfig::with_spill_resolved(spill.off,
 /// spill.cache_dir)`.
+///
+/// `read_gate` is the process's ADR-1702 read CPU gate, attached to the logs
+/// and spans fetchers so the `logs` and `spans` scans decode their blocks on
+/// it (decision 7). [`build_sql_state`] attaches none and decodes inline.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -1065,6 +1070,7 @@ pub fn build_sql_state_with_parquet(
     parquet_profiles: Option<crate::config::ParquetProfiles>,
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
+    read_gate: Arc<ravel_cpu_gate::ReadGate>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -1100,6 +1106,7 @@ pub fn build_sql_state_with_parquet(
         declared_columns,
         process_memory_budget,
         Some(sources),
+        Some(read_gate),
         ddl_min_grace_ms,
         spill,
     )
@@ -1122,6 +1129,7 @@ fn build_sql_state_inner(
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet: Option<ravel_sql::ParquetSources>,
+    read_gate: Option<Arc<ravel_cpu_gate::ReadGate>>,
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
@@ -1216,9 +1224,16 @@ fn build_sql_state_inner(
     // via #1080), so a `spans` query is isolated and metered like any other.
     // ADR-1195: shares the same process-wide `GetLimiter` as the metrics and
     // logs fetchers above, not a private pool.
-    let span_fetcher = SpanSegmentFetcher::new(store.clone())
+    let mut span_fetcher = SpanSegmentFetcher::new(store.clone())
         .with_get_limiter(get_limiter)
         .with_memory_budget(process_memory_budget.clone());
+    // ADR-1702 decision 7: the `logs` and `spans` scans decode each block on
+    // the read gate the fetcher carries, and the logs fetcher's opens run on
+    // it too.
+    if let Some(gate) = read_gate {
+        logs_fetcher = logs_fetcher.with_read_gate(gate.clone());
+        span_fetcher = span_fetcher.with_read_gate(gate);
+    }
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
         logs_fetcher = logs_fetcher.with_cache(cache);
@@ -2400,6 +2415,7 @@ mod tests {
             None,
             7_000,
             &SqlSpillInputs::default(),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -2453,6 +2469,7 @@ mod tests {
             None,
             expected_ms,
             &SqlSpillInputs::default(),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
@@ -2581,6 +2598,7 @@ mod tests {
                 profiles,
                 ravel_sql::DEFAULT_MIN_GRACE_MS,
                 &SqlSpillInputs::default(),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
             )
             .expect("sql state builds")
         };
@@ -3298,6 +3316,7 @@ mod tests {
             None,
             ravel_sql::DEFAULT_MIN_GRACE_MS,
             inputs,
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         )
         .expect("sql state builds");
         state.executor.config().spill.clone()

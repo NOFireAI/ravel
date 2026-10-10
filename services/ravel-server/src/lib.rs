@@ -2901,7 +2901,7 @@ pub async fn start_with_heartbeat(
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
         process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
-        cpu_gates,
+        cpu_gates: cpu_gates.clone(),
         // Both fold routes, not just the background task: the on-demand route
         // mounted below runs the same `Catalog::fold` into the same
         // process-global totals, and it is mounted whatever `--disable-fold`
@@ -3145,6 +3145,9 @@ pub async fn start_with_heartbeat(
                 config.parquet_profiles.clone(),
                 ddl_min_grace_ms,
                 &sql_spill.inputs,
+                // ADR-1702 decision 7: the `logs` and `spans` scans decode on
+                // the same read gate the catalog resolve runs on.
+                cpu_gates.read.clone(),
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).
