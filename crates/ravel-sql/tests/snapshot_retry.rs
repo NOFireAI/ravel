@@ -111,6 +111,9 @@ fn assert_stamps_exclude_the_held_attempt(wall: &PhaseWallTiming, elapsed: Durat
         wall.drain_ns,
     ];
     let sum = Duration::from_nanos(stages.iter().sum::<u64>());
+    // hygiene-allow: wall-clock -- the stamps under test are real monotonic
+    // durations by design (ADR-2677 decision 4), and this is a lower bound on
+    // the elapsed time: load can only make `elapsed` larger, never break it.
     assert!(
         sum + FIRST_ATTEMPT_HOLD <= elapsed,
         "the stage stamps carry the discarded attempt's {FIRST_ATTEMPT_HOLD:?} \
