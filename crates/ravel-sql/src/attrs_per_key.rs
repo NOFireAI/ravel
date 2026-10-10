@@ -80,6 +80,7 @@ use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion::scalar::ScalarValue;
 
@@ -227,7 +228,10 @@ fn try_rewrite(root: &Arc<dyn ExecutionPlan>) -> DFResult<Option<Arc<dyn Executi
     let mut attrs_live = true;
     for node in chain.iter().rev() {
         if !attrs_live {
-            child = Arc::clone(node).with_new_children(vec![child])?;
+            child = Arc::clone(node).replace_children(
+                vec![child],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?;
             continue;
         }
         let (rebuilt, still_live) = rebuild_node(node, child, attrs_idx, &slots)?;
@@ -380,7 +384,13 @@ fn rebuild_node(
         return Ok((Arc::new(rebuilt), false));
     }
     // Opaque pass-through: rebuild with the new child, nothing to remap.
-    Ok((Arc::clone(node).with_new_children(vec![child])?, true))
+    Ok((
+        Arc::clone(node).replace_children(
+            vec![child],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?,
+        true,
+    ))
 }
 
 /// A node between the `attrs` map's user and the scan that neither reads a

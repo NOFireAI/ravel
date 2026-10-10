@@ -117,7 +117,7 @@
 //! eligibility predicate classifies LOGICAL plan nodes, while an enabled disk
 //! manager is a permission held by every operator in the session's PHYSICAL
 //! plan, and `RepartitionExec` -- which appears in no logical plan -- spills in
-//! DataFusion 54. See [`repartition_free`].
+//! DataFusion 55. See [`repartition_free`].
 
 use std::sync::Arc;
 
@@ -385,12 +385,17 @@ pub const ADMITTED_SCALARS: [&str; 127] = [
 /// keeps this list exhaustive against the upstream registrations.
 ///
 /// `today` is here even though ADR-0097 decision 4 names only eight: it is a
-/// DataFusion alias of `current_date` (datafusion-functions 54's
+/// DataFusion alias of `current_date` (datafusion-functions 55's
 /// `current_date.rs` registers `aliases: vec!["today"]`), so it reads the same
 /// wall clock and is caught by the same rationale. It also cannot be admitted
 /// independently: deregistering `current_date` removes the shared UDF, dropping
 /// the `today` key too, so admitting it would make the drift test fail closed.
-pub const EXCLUDED_SCALARS: [&str; 9] = [
+///
+/// `input_file_name` and `file_row_index` (DataFusion 55 defaults) read the
+/// scan's file environment: the path of the object a row came from and the
+/// row's position in it. Neither is a function of the row's values, so they
+/// are unattestable by the same rationale.
+pub const EXCLUDED_SCALARS: [&str; 11] = [
     "uuid",
     "random",
     "rand",
@@ -400,6 +405,8 @@ pub const EXCLUDED_SCALARS: [&str; 9] = [
     "current_time",
     "version",
     "today",
+    "input_file_name",
+    "file_row_index",
 ];
 
 /// The v1 SQL window allowlist (ADR-0097 decision 6). The rank/offset families
@@ -586,7 +593,7 @@ pub fn session_config(
         .with_repartition_file_scans(false);
 
     // Issue #680 / ADR-0102 decision 2's amendment. Neither option has a
-    // fluent `with_*` setter in DataFusion 54, so both are written through
+    // fluent `with_*` setter in DataFusion 55, so both are written through
     // `options_mut` as typed fields (no string keys, so a renamed option is a
     // compile error rather than a silently ignored setting).
     if config.skip_partial_aggregation {
@@ -636,7 +643,7 @@ pub fn session_config(
 /// plan spill.
 ///
 /// `RepartitionExec` is the gap between those two scopes. It exists in no
-/// logical plan, so the predicate never sees it, and it spills in DataFusion 54:
+/// logical plan, so the predicate never sees it, and it spills in DataFusion 55:
 /// each output channel that the memory pool refuses falls back to a `SpillPool`
 /// channel (`datafusion::physical_plan::repartition`, whose disabled-disk-manager
 /// error is the `SpillPool (DiskManager is disabled)` message

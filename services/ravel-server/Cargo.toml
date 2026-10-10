@@ -195,9 +195,8 @@ ravel-mcp = { path = "../../crates/ravel-mcp", version = "0.23.0", optional = tr
 # the tool catalog's own rmcp types come through ravel-mcp.
 rmcp = { workspace = true, optional = true }
 
-# Flight service codegen for the `flight-sql` feature. This is arrow 58's
-# arrow-flight, a different arrow major than the `arrow` dev-dependency below;
-# the two never exchange types.
+# Flight service codegen for the `flight-sql` feature: arrow 59's arrow-flight,
+# the same arrow major datafusion carries.
 arrow-flight = { workspace = true, optional = true }
 
 # Global allocator, compiled into this binary (issue #972). Kept off the msvc
@@ -290,9 +289,8 @@ uuid = { workspace = true }
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 # Test-only: decodes the Arrow IPC response. This is the workspace arrow pin
-# (59), not the arrow 58 datafusion carries, so the assertion doubles as a
-# check that the IPC bytes the endpoint emits are readable by an independent
-# arrow version rather than only by the one that wrote them.
+# (59), the same arrow datafusion carries, so the decode is not a check
+# against an independent arrow version.
 arrow = { workspace = true }
 # Test-only: --tenant-kms-config unit tests (src/store.rs) need a real path on
 # disk; a unique NamedTempFile avoids the cross-test collision a hand-rolled

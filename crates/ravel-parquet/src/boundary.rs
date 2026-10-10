@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Statistics;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -28,7 +29,9 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, StatisticsArgs,
+};
 use futures::{Stream, StreamExt};
 
 use crate::error::ParquetReadError;
@@ -113,6 +116,13 @@ impl ExecutionPlan for ParquetPanicBoundaryExec {
         vec![&self.inner]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DfResult<TreeNodeRecursion>,
+    ) -> DfResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -138,8 +148,18 @@ impl ExecutionPlan for ParquetPanicBoundaryExec {
         }))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Arc<Statistics>> {
-        self.inner.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DfResult<Arc<Statistics>> {
+        input_stats.first().cloned().ok_or_else(|| {
+            DataFusionError::Internal("ParquetPanicBoundaryExec takes one child".to_string())
+        })
     }
 
     fn supports_limit_pushdown(&self) -> bool {

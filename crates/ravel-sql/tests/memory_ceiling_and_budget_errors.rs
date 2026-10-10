@@ -28,7 +28,7 @@ use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 /// `MemoryConsumer` name and `can_spill` flag.
 ///
 /// The budget-error message alone cannot say which operator tripped: an
-/// `RsegScanExec` scan reservation and the final `GroupedHashAggregateStream`
+/// `RsegScanExec` scan reservation and the final `FinalHashAggregateStream`
 /// reservation both surface the identical `"query memory pool exhausted: ..."`
 /// prefix when their `try_grow` is refused. Recording the failing consumer's
 /// identity is the signal that discriminates the two failure sites, which the
@@ -325,7 +325,7 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
 /// `try_grow` is refused -- `starts_with("query memory pool exhausted")`
 /// holds regardless of which consumer actually tripped, so it cannot
 /// discriminate the fixed tree from the broken one. This test wraps the real
-/// query pool in a [`RecordingPool`] and asserts a `(GroupedHashAggregateStream,
+/// query pool in a [`RecordingPool`] and asserts a `(FinalHashAggregateStream,
 /// can_spill == false)` entry is PRESENT among every consumer whose
 /// `try_grow` was refused (not that it was the LAST one refused -- the query
 /// executes across concurrent partitions, so failure order across a partial
@@ -336,18 +336,17 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
 /// removed from `build_session` (reverting to the pre-#456 tree), this exact
 /// query was observed to refuse `try_grow` for `RsegScanExec[0]`
 /// (`can_spill=false`) -- the scan itself, not the aggregate -- because
-/// spilling lets every `GroupedHashAggregateStream` reservation in this run
-/// succeed (registered `can_spill=true`, confirmed by inspecting every
-/// recorded failure), so the non-spillable scan reservation is what exhausts
-/// the pool instead. No `(GroupedHashAggregateStream*, can_spill=false)` entry
+/// with a disk the final aggregate registers `can_spill=true` and answers a
+/// refused grow by spilling (confirmed by inspecting every recorded failure),
+/// so the non-spillable scan reservation is what exhausts the pool instead. No `(FinalHashAggregateStream*, can_spill=false)` entry
 /// exists anywhere in that failure list, so the presence assertion below
 /// panics with the recorded failures dumped, e.g.:
 ///
 /// ```text
 /// thread 'a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan'
 /// panicked at crates/ravel-sql/tests/memory_ceiling_and_budget_errors.rs:
-/// expected a (GroupedHashAggregateStream*, can_spill=false) entry among the
-/// refused try_grow calls; got [("GroupedHashAggregateStream[0] (count(1))", true), ..., ("RsegScanExec[0]", false)]
+/// expected a (FinalHashAggregateStream*, can_spill=false) entry among the
+/// refused try_grow calls; got [("PartialHashAggregateStream[2]", true), ..., ("FinalHashAggregateStream[0]", true), ..., ("RsegScanExec[0]", false)]
 /// ```
 ///
 /// Verified by removing the line, observing the failure list above (no
@@ -444,10 +443,10 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
     let failed = recording.failed();
     let has_nonspillable_aggregate = failed
         .iter()
-        .any(|(name, can_spill)| name.starts_with("GroupedHashAggregateStream") && !can_spill);
+        .any(|(name, can_spill)| name.starts_with("FinalHashAggregateStream") && !can_spill);
     assert!(
         has_nonspillable_aggregate,
-        "expected a (GroupedHashAggregateStream*, can_spill=false) entry among \
+        "expected a (FinalHashAggregateStream*, can_spill=false) entry among \
          the refused try_grow calls; got {failed:?}"
     );
 }

@@ -460,13 +460,10 @@ fn authed<T>(message: T, token: &str) -> Request<T> {
 /// Decode a `DoGet` response into a row count and the column names it
 /// carried.
 ///
-/// Deliberately not a typed value comparison: arrow-flight carries arrow 58
-/// and this crate's `arrow` dev-dependency is the workspace 59 pin, so a
-/// downcast here would need a second arrow major declared just for a test.
-/// Row *values* are already compared bit-for-bit against
-/// `SqlExecutor::execute` in ravel-sql's own Flight test; what this level has
-/// to prove is that the bytes survive a real channel and decode to the right
-/// shape.
+/// Deliberately not a typed value comparison: row *values* are already
+/// compared bit-for-bit against `SqlExecutor::execute` in ravel-sql's own
+/// Flight test; what this level has to prove is that the bytes survive a real
+/// channel and decode to the right shape.
 async fn decode(
     stream: tonic::Streaming<FlightData>,
 ) -> Result<(usize, Vec<String>), arrow_flight::error::FlightError> {
@@ -494,12 +491,8 @@ async fn decode(
 /// The `table_name` column of a `CommandGetTables` `DoGet` response, in wire
 /// order.
 ///
-/// The values are read through the Arrow IPC bytes rather than by downcasting
-/// the decoded arrays: arrow-flight carries arrow 58 while this crate's arrow
-/// dev-dependency is the workspace 59 pin, so an arrow 58 `StringArray` and an
-/// arrow 59 one are distinct types and `downcast_ref` would always decline.
-/// The IPC byte format is the contract the two versions share, so each
-/// `FlightData` message is re-framed into a stream message (continuation
+/// The values are read through the Arrow IPC bytes rather than through
+/// arrow-flight's own decoder: each `FlightData` message is re-framed into a stream message (continuation
 /// marker, little-endian metadata length, padded metadata, body) and read back
 /// with this crate's own arrow.
 fn table_names(messages: &[FlightData]) -> Vec<String> {

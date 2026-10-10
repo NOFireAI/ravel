@@ -3566,10 +3566,10 @@ impl PinnedStream {
             && let Some(failure) = spill_failure_kind(&err)
         {
             return match failure {
-                // DataFusion raises the scratch-quota trip as a plain
-                // `ResourcesExhausted`, the same variant a memory-pool refusal
-                // uses, with text telling the caller to raise a DataFusion
-                // option no Ravel client can reach. The memory and scratch
+                // DataFusion raises the scratch-quota trip as an IO error from
+                // its spill writer, which the Arrow IPC writer wraps, with text
+                // telling the caller to raise a DataFusion option no Ravel
+                // client can reach. The memory and scratch
                 // budgets are independently enforced, so they stay
                 // independently reportable: re-typed here, with the figures
                 // restated from the disk manager's own gauge.
@@ -3610,8 +3610,10 @@ enum SpillFailure {
 /// intact if this returns `None`.
 fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
     match err {
-        DataFusionError::ResourcesExhausted(msg)
-            if msg.contains(crate::error::MSG_SPILL_QUOTA_MARKER) =>
+        DataFusionError::IoError(io)
+            if io
+                .to_string()
+                .contains(crate::error::MSG_SPILL_QUOTA_MARKER) =>
         {
             Some(SpillFailure::Quota)
         }
@@ -3624,6 +3626,9 @@ fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
             .downcast_ref::<DataFusionError>()
             .and_then(spill_failure_kind),
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+            ArrowError::IoError(desc, _) if desc.contains(crate::error::MSG_SPILL_QUOTA_MARKER) => {
+                Some(SpillFailure::Quota)
+            }
             ArrowError::ExternalError(boxed) => boxed
                 .downcast_ref::<DataFusionError>()
                 .and_then(spill_failure_kind),
@@ -5823,7 +5828,7 @@ mod tests {
     }
 
     /// Issue #740, finding 1: a `RepartitionExec` output channel's spill
-    /// refusal (DataFusion 54's `"... SpillPool (DiskManager is disabled)"`,
+    /// refusal (DataFusion 55's `"... SpillPool (DiskManager is disabled)"`,
     /// carrying no byte figures) is re-attributed from the stream's own pool
     /// occupancy at the moment of refusal, not passed through with the
     /// exchange's name and no figures. Exercises the real seam
@@ -5842,7 +5847,7 @@ mod tests {
             CeilingBreach::new(),
             QueryAccounting::new(),
         ));
-        let consumer = MemoryConsumer::new("GroupedHashAggregateStream[0]").register(&pool);
+        let consumer = MemoryConsumer::new("PartialHashAggregateStream[0]").register(&pool);
         consumer.try_grow(6144).expect("within the query ceiling");
 
         let df = DataFusionError::ResourcesExhausted(

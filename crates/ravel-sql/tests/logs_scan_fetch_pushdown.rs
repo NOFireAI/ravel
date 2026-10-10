@@ -28,12 +28,13 @@
 //!   attribute equality the postings index prunes one of three blocks, and a
 //!   fetch that stops the scan inside the first surviving block still reports
 //!   that one pruned block.
-//! - `fetch_narrows_the_scan_statistics`: the scan's `partition_statistics`
+//! - `fetch_narrows_the_scan_statistics`: the scan's `statistics_from_inputs`
 //!   count what it emits under a fetch, not every committed row.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::util;
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -779,7 +780,9 @@ fn fetched_stats(
         None => Arc::clone(plan),
     };
     let ts = plan.schema().index_of("ts").expect("a ts column");
-    let stats = plan.partition_statistics(None).expect("statistics");
+    let stats = StatisticsContext::new()
+        .compute(plan.as_ref(), &StatisticsArgs::new())
+        .expect("statistics");
     let col = &stats.column_statistics[ts];
     (stats.num_rows, col.min_value.clone(), col.max_value.clone())
 }
