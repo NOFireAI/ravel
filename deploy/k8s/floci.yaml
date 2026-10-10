@@ -164,8 +164,8 @@ spec:
         - name: create-bucket
           # Left on Docker Hub deliberately: no ghcr.io or quay.io mirror of
           # curlimages/curl was found, and this Job runs once per cluster
-          # bring-up rather than per CI run, so it does not share the
-          # per-runner pull pressure the quickstart job hits.
+          # bring-up rather than per CI run, so it does not add per-runner
+          # pull pressure.
           #
           # Digest resolved from the registry rather than mirrored from a
           # sibling pin, since no other reference to this image exists in the

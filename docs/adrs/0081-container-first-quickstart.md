@@ -138,7 +138,8 @@ lying would be the worst possible flake.
 build --file Dockerfile.prebuilt --target server` to assemble a runtime image
 from those binaries. This is the same split ADR-0053 D5 established for the kind
 lane, applied to a far smaller build, and it means the job verifies **the pull
-request's own code**, not a previously released image.
+request's own code**, not a previously released image. A6 in the Amendments
+section below removes this job.
 
 `ravel-cli` is not optional and not a convenience here: `Dockerfile.prebuilt`'s
 `server` target COPYs both binaries (`Dockerfile.prebuilt:65,72`), deliberately,
@@ -194,7 +195,7 @@ loudly on its own; the GIF is a recording of a passing run. Recording is a local
 step, not a CI step — CI runs the assertions.
 
 The job that runs it is the per-PR `quickstart` job from decision 6, as a step
-after the marked README blocks. Its path filter already covers `demo/**`, it
+after the marked README blocks (removed by A6 in the Amendments section below). Its path filter already covers `demo/**`, it
 already has the stack up, and it is the only lane that both has docker and gates
 a merge. Naming it here is not a formality: the fleet executors that write this
 script cannot run docker, so without an explicit job attachment the script would
@@ -261,7 +262,7 @@ dashboard is the hook; the kill script is the evidence.
 <!-- amendment-applies: sections="Decision" pointer="Amendments section below" -->
 
 Four things this ADR got wrong or left unsaid, found while implementing it
-(A1 to A4), and one later change to a decision (A5).
+(A1 to A4), and two later changes to decisions (A5, A6).
 Recorded here rather than silently patched into the decisions above, so the
 gap between what was designed and what shipped stays visible.
 
@@ -326,6 +327,22 @@ on pull requests, since an advisory job never stopped a merge; what changed is
 only where the break is first seen. The push run covers every landing in its
 merge-queue batch, so a red run names the batch, not the single commit.
 Tracked in issue #2520.
+
+**A6 (2026-10-09). The per-PR `quickstart` job is removed.** Decisions 6, 7 and
+9 described a job in `ci.yml` that built the change's own binaries, assembled
+an image, brought the compose stack up and ran the marked README blocks, the
+read-your-write walkthrough, the collector-delivery check and the
+kill-and-recover demo against it. It was the slowest job in the workflow
+(27 minutes on a pull request that touched its paths) and was never promoted
+to a required check, so it delayed feedback without gating anything. It is
+removed, with the two files only it used: the CI-only compose override
+`deploy/docker-compose/ci-host-bucket.yml` and
+`scripts/check-collector-delivery.sh`. Decision 8's weekly
+`quickstart-published` lane remains and still runs the marked README blocks,
+against the published images, so a README break in a change surfaces there
+only after a release ships it. No lane runs `demo/walkthrough.sh`,
+`demo/kill-and-recover.sh` or the collector-delivery assertion any more; a
+break in any of them surfaces only when someone runs the quickstart by hand.
 
 One thing outside this ADR that A2 exposes: `scripts/demo.sh` passes no
 tenant-hash flag either, so the from-source demo only works because a previous

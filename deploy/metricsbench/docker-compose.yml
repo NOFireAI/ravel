@@ -49,8 +49,8 @@ services:
   # in the same column as Ravel's durable-on-ack S3 result (ADR-0927 decision 3).
   # Left on Docker Hub deliberately: this is the only registry that
   # publishes prom/prometheus, and this compose file is not run by any CI
-  # job, so it carries none of the anonymous-pull-allowance pressure the
-  # quickstart job hits (rationale in deploy/README.md).
+  # job, so it carries none of the anonymous-pull-allowance pressure a per-PR
+  # job would (rationale in deploy/README.md).
   prometheus:
     image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
     command:
