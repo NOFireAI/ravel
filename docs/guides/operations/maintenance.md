@@ -1491,7 +1491,8 @@ basis and a classification against the records that it just read:
 
 A floor that `migrate` just raised is `current` until a record newer than its
 basis lands or the shard range grows. A `migrate` run at the version a floor
-already holds writes nothing, so an `unknown` floor stays `unknown` until a
+already holds appends no floor entry (it still rewrites any bucket below the
+target and saves or clears its resume cursor), so an `unknown` floor stays `unknown` until a
 later run raises that family to a higher version.
 
 Each format supports one version and carries no reader for the previous one.

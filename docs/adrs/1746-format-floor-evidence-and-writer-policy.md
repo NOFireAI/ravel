@@ -339,8 +339,15 @@ after v0.23.0. From that release:
 
 The rollout rule is decision 6's: a binary before v0.20.0 reads only
 versions 1 and 2 and refuses a version-3 record on every read path,
-including `GenerationSwitch`'s flush-time read, so every node must run
-v0.20.0 or later before any node runs Release B.
+including `GenerationSwitch`'s flush-time read, so every process (servers,
+`ravel-cli` and `ravel-operator` alike) must run v0.20.0 or later before any
+process runs Release B. A v0.20.0 to v0.23.0 binary reads a version-3 record
+but both its rewrite paths refuse it, so a reshard or a `maintain migrate`
+from a not-yet-upgraded CLI or operator fails closed with
+`RefusingToRewriteNewerRecord` on any record a Release B process wrote,
+including the first record of every tenant provisioned after the upgrade.
+That is the strip guard working as intended: upgrade the CLI and operator
+with the servers, or hold reshards and migrations until the rollout ends.
 
 `StorageLayoutWrite` (ADR-2135, #2146) is unrelated to this flip: it governs
 `TenantConfigRecord`'s `format_version`, a separate field on a separate
