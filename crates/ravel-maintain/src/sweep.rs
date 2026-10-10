@@ -346,7 +346,7 @@ pub async fn sweep_shard_with_holds(
     signal: Signal,
     shard: u32,
 ) -> Result<(SweepReport, SupersededHolds)> {
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let (superseded, superseded_data_bytes) = sweep_superseded_impl(
         &mut reach,
         store,
@@ -543,7 +543,7 @@ pub async fn sweep_shard_zoned_with_holds(
     hours: &[u32],
     orphan_pass: OrphanPass,
 ) -> Result<(SweepReport, SupersededHolds)> {
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let (superseded, superseded_data_bytes) = sweep_superseded_impl(
         &mut reach,
         store,
@@ -1254,7 +1254,7 @@ pub async fn sweep_superseded(
     signal: Signal,
     shard: u32,
 ) -> Result<SupersededSweepOutcome> {
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let (outcome, _data_bytes) = sweep_superseded_impl(
         &mut reach,
         store,
@@ -4042,7 +4042,7 @@ async fn observe_superseded_holds(
 ) -> Result<SupersededHolds> {
     // One pass, one reachability cache: HEAD is read at most once no matter how
     // many shards are observed.
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let mut holds = SupersededHolds::default();
 
     for shard in signal_shards(store, tenant, signal).await? {

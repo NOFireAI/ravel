@@ -64,14 +64,14 @@ fn seed_specs() -> Vec<(Uuid, u64, Vec<SpanRecord>)> {
 
 /// Compact a fresh store seeded from [`seed_specs`] and return the compaction
 /// record key, its encoded bytes, and every `(part key, part bytes)`.
-async fn compact_once() -> (String, Vec<u8>, Vec<(String, Vec<u8>)>) {
+async fn compact_once(config: &CompactorConfig) -> (String, Vec<u8>, Vec<(String, Vec<u8>)>) {
     let store = MemoryStore::new();
     for (writer_id, seq, records) in seed_specs() {
         seed_rspan_input(&store, writer_id, EPOCH, seq, &records).await;
     }
     let clock = FixedClock::new(sealed_now_ns());
     let bucket = spans_bucket();
-    compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
+    compact_bucket(&store, &clock, config, &bucket)
         .await
         .expect("compact");
 
@@ -215,8 +215,8 @@ async fn v3_bloom_and_service_name_column_rebuilt_from_union() {
 
 #[tokio::test]
 async fn same_inputs_same_bytes_and_keys() {
-    let (rk_a, rb_a, parts_a) = compact_once().await;
-    let (rk_b, rb_b, parts_b) = compact_once().await;
+    let (rk_a, rb_a, parts_a) = compact_once(&CompactorConfig::default()).await;
+    let (rk_b, rb_b, parts_b) = compact_once(&CompactorConfig::default()).await;
 
     assert_eq!(rk_a, rk_b, "record key deterministic");
     assert_eq!(rb_a, rb_b, "record bytes deterministic");
@@ -229,4 +229,51 @@ async fn same_inputs_same_bytes_and_keys() {
         );
     }
     assert!(!parts_a.is_empty());
+}
+
+/// A read gate with an inline floor of 0, so every compaction unit is a job.
+fn floor_zero_read_gate() -> std::sync::Arc<ravel_cpu_gate::ReadGate> {
+    std::sync::Arc::new(ravel_cpu_gate::ReadGate::new(
+        ravel_cpu_gate::CpuGateConfig {
+            inline_floor_bytes: 0,
+            ..ravel_cpu_gate::CpuGateConfig::with_permits(2)
+        },
+        std::sync::Arc::new(ravel_cpu_gate::InstantClock::new()),
+    ))
+}
+
+/// The gate's `(jobs, inline)` at `compaction`, asserting every other site
+/// stayed at zero.
+fn compaction_counts(gate: &ravel_cpu_gate::ReadGate) -> (u64, u64) {
+    let mut out = (0, 0);
+    for site in gate.snapshot().sites {
+        if site.site == ravel_cpu_gate::ReadSite::Compaction {
+            out = (site.jobs, site.inline);
+        } else {
+            assert_eq!((site.jobs, site.inline), (0, 0), "{:?}", site.site);
+        }
+    }
+    out
+}
+
+/// ADR-1702 task 10: with the read gate's inline floor at 0, one compaction
+/// moves its `compaction` site by exactly the count below and runs nothing
+/// inline, and the record and parts are byte-identical to the inline run.
+///
+/// One block decode per input (each input's few spans fit one block, so
+/// three) and one part encode with its footer read-back and hash.
+///
+/// Fails with the block decode's wrap removed (the count reads 1) or the
+/// part's (it reads 3).
+#[tokio::test]
+async fn gated_compaction_matches_inline_and_counts_its_jobs() {
+    let gate = floor_zero_read_gate();
+    let inline = compact_once(&CompactorConfig::default()).await;
+    let gated = compact_once(&CompactorConfig {
+        read_gate: ravel_maintain::read_gate::MaintainReadGate::new(std::sync::Arc::clone(&gate)),
+        ..CompactorConfig::default()
+    })
+    .await;
+    assert_eq!(gated, inline, "gated compaction output is byte-identical");
+    assert_eq!(compaction_counts(&gate), (3 + 1, 0));
 }

@@ -69,6 +69,7 @@ use std::pin::Pin;
 use bytes::Bytes;
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
+use ravel_cpu_gate::ReadSite;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
 use ravel_segment::{
@@ -328,7 +329,16 @@ pub async fn build_parts(
         let window = &builds[window_start..=i];
         let regions = fetch_batch_pages(store, &semaphore, window, ledger).await?;
         for build in window {
-            let series_v7 = materialize_series(build, &regions, migrate_keys, limits)?;
+            // Decode, merge and re-encode on the read gate (ADR-1702), one job
+            // per series, sized by the series' input page bytes. The job owns
+            // its pages, so nothing it reads is released while it waits.
+            let pages = slice_series_pages(build, &regions, migrate_keys)?;
+            let series_v7 = config
+                .read_gate
+                .run(ReadSite::Compaction, build.page_bytes, move || {
+                    materialize_series(pages, limits)
+                })
+                .await??;
             pending_estimate.push_series(&series_v7);
             pending.push(series_v7);
             if let Some(mut records) = exemplars_by_series.remove(&build.series_id.0) {
@@ -346,7 +356,9 @@ pub async fn build_parts(
                     part_index,
                     std::mem::take(&mut pending),
                     std::mem::take(&mut pending_exemplars),
-                )?;
+                    pending_estimate.bytes(),
+                )
+                .await?;
                 put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
                 // Cancellation checkpoint 4: a part boundary, after the PUT
                 // returned.
@@ -376,7 +388,9 @@ pub async fn build_parts(
             part_index,
             pending,
             pending_exemplars,
-        )?;
+            pending_estimate.bytes(),
+        )
+        .await?;
         put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
         // Cancellation checkpoint 4 for the tail part.
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
@@ -507,6 +521,47 @@ async fn fetch_one_range<'a>(
     Ok((key, start, got?.data))
 }
 
+/// One series' merge plan with every run's pages sliced out of its fetch
+/// window, owned so the materialization can move into a read-gate job: the
+/// labels and run plans are copies, and each page is a zero-copy `Bytes` view
+/// of the window's fetched buffers.
+struct SeriesPages {
+    series_id: SeriesId,
+    labels: LabelSet,
+    runs: Vec<RunPages>,
+}
+
+/// One run of a [`SeriesPages`], and whether its input is a migrate key.
+struct RunPages {
+    run: RunPlan,
+    ts_page: Bytes,
+    page: Bytes,
+    migrate: bool,
+}
+
+/// Slice `build`'s run pages out of the window's fetched `regions`.
+fn slice_series_pages(
+    build: &SeriesBuild<'_>,
+    regions: &BatchRegions<'_>,
+    migrate_keys: &HashSet<String>,
+) -> Result<SeriesPages> {
+    let mut runs = Vec::with_capacity(build.runs.len());
+    for (key, run) in &build.runs {
+        let (ts_page, page) = slice_run_pages(regions, key, run)?;
+        runs.push(RunPages {
+            run: (*run).clone(),
+            ts_page,
+            page,
+            migrate: migrate_keys.contains(*key),
+        });
+    }
+    Ok(SeriesPages {
+        series_id: build.series_id,
+        labels: build.labels.clone(),
+        runs,
+    })
+}
+
 /// Decode, merge, and re-encode one series into a single run-merged
 /// [`SeriesInputV7`]. What it contributes to the part's stored-size estimate
 /// (the figure `build_parts` splits parts on, ADR-0092 decision 3) is charged
@@ -522,15 +577,14 @@ async fn fetch_one_range<'a>(
 /// original in-page index)` -- in the per-sample provenance column, so a query
 /// over the merged run reproduces the same candidate multiset with the same
 /// priorities the unmerged runs produced (ADR-0092 decision 2).
-fn materialize_series(
-    build: &SeriesBuild<'_>,
-    regions: &BatchRegions<'_>,
-    migrate_keys: &HashSet<String>,
-    limits: ReaderLimits,
-) -> Result<SeriesInputV7> {
-    let series_id = build.series_id;
-    let kind = match build.runs.first() {
-        Some((_, run)) => run.kind,
+fn materialize_series(series: SeriesPages, limits: ReaderLimits) -> Result<SeriesInputV7> {
+    let SeriesPages {
+        series_id,
+        labels,
+        runs,
+    } = series;
+    let kind = match runs.first() {
+        Some(run) => run.run.kind,
         // A series with no runs cannot reach here: `build_parts` only builds a
         // `SeriesBuild` from a non-empty contribution list.
         None => {
@@ -542,18 +596,14 @@ fn materialize_series(
     };
 
     // Single-run fast path: no decode/merge, no provenance column.
-    if build.runs.len() == 1 {
-        let (key, run) = build.runs[0];
-        let object = regions.get(key).ok_or_else(|| {
-            MaintainError::Invariant(format!("no fetched region for object {key}"))
-        })?;
-        let ts_page = slice_region(object, run.ts_abs).ok_or_else(|| {
-            MaintainError::Invariant("coalesced fetch missing a TS page range".into())
-        })?;
-        let page = slice_region(object, run.page_abs).ok_or_else(|| {
-            MaintainError::Invariant("coalesced fetch missing a value page range".into())
-        })?;
-        let run_v4 = if migrate_keys.contains(key) {
+    if let [only] = runs.as_slice() {
+        let RunPages {
+            run,
+            ts_page,
+            page,
+            migrate,
+        } = only;
+        let run_v4 = if *migrate {
             reencode_run_to_current_version(
                 &series_id,
                 run,
@@ -579,7 +629,7 @@ fn materialize_series(
         };
         return Ok(SeriesInputV7 {
             series_id,
-            labels: build.labels.clone(),
+            labels,
             runs: vec![RunInputV7 {
                 run: run_v4,
                 provenance: None,
@@ -593,12 +643,12 @@ fn materialize_series(
     // then run order then in-page order -- deterministic), and re-encode into
     // one run carrying the per-sample provenance column.
     let (run_v4, provenance) = match kind {
-        ValueKind::Scalar => merge_scalar_runs(&series_id, build, regions, limits)?,
-        ValueKind::Histogram => merge_histogram_runs(&series_id, build, regions, limits)?,
+        ValueKind::Scalar => merge_scalar_runs(&series_id, &runs, limits)?,
+        ValueKind::Histogram => merge_histogram_runs(&series_id, &runs, limits)?,
     };
     Ok(SeriesInputV7 {
         series_id,
-        labels: build.labels.clone(),
+        labels,
         runs: vec![RunInputV7 {
             run: run_v4,
             provenance: Some(provenance),
@@ -809,16 +859,17 @@ fn merged_run_prefix(provenance: &[SampleProvenance]) -> (i64, u64, u64) {
 /// re-encoded run plus its per-sample provenance column.
 fn merge_scalar_runs(
     series_id: &SeriesId,
-    build: &SeriesBuild<'_>,
-    regions: &BatchRegions<'_>,
+    runs: &[RunPages],
     limits: ReaderLimits,
 ) -> Result<(RunInputV4, Vec<SampleProvenance>)> {
     let mut merged: Vec<(Sample, SampleProvenance)> = Vec::new();
     let mut scratch = Vec::new();
     let mut timestamps = Vec::new();
     let mut values = Vec::new();
-    for (key, run) in &build.runs {
-        let (ts_page, page) = slice_run_pages(regions, key, run)?;
+    for RunPages {
+        run, ts_page, page, ..
+    } in runs
+    {
         let entry = run_entry_for_decode(run);
         timestamps.clear();
         values.clear();
@@ -856,13 +907,14 @@ fn merge_scalar_runs(
 /// Histogram counterpart of [`merge_scalar_runs`].
 fn merge_histogram_runs(
     series_id: &SeriesId,
-    build: &SeriesBuild<'_>,
-    regions: &BatchRegions<'_>,
+    runs: &[RunPages],
     limits: ReaderLimits,
 ) -> Result<(RunInputV4, Vec<SampleProvenance>)> {
     let mut merged: Vec<(ravel_segment::HistogramSample, SampleProvenance)> = Vec::new();
-    for (key, run) in &build.runs {
-        let (ts_page, page) = slice_run_pages(regions, key, run)?;
+    for RunPages {
+        run, ts_page, page, ..
+    } in runs
+    {
         let entry = run_entry_for_decode(run);
         let samples =
             decode_run_histogram_pages(series_id, &entry, ts_page.as_ref(), page.as_ref(), limits)?;
@@ -1069,8 +1121,11 @@ fn merged_ingest_bounds(inputs: &[InputRecord]) -> IngestBounds {
     }
 }
 
+/// Encode one output part. The encode runs on the read gate (ADR-1702) as one
+/// job sized by `estimated_bytes`, the part's stored-size estimate; the job
+/// owns the part's series and exemplars.
 #[allow(clippy::too_many_arguments)]
-fn flush_part(
+async fn flush_part(
     bucket: &Bucket,
     config: &CompactorConfig,
     ingest_bounds: &IngestBounds,
@@ -1079,6 +1134,7 @@ fn flush_part(
     part_index: u32,
     batch: Vec<SeriesInputV7>,
     exemplars: Vec<ExemplarInput>,
+    estimated_bytes: u64,
 ) -> Result<BuiltPart> {
     let run_count: u64 = batch.iter().map(|s| s.runs.len() as u64).sum();
     let first_series_id = batch.iter().map(|s| s.series_id).min();
@@ -1106,8 +1162,12 @@ fn flush_part(
     // only field the copy changes (ADR-0047 decision 3). An exemplar naming a
     // series this part does not carry is a writer error, not a silent drop, so
     // a mis-assignment above fails the run instead of shrinking the output.
-    let written =
-        SegmentWriter::write_v7_with_provenance(batch, identity, ingest, meta, exemplars)?;
+    let written = config
+        .read_gate
+        .run(ReadSite::Compaction, estimated_bytes, move || {
+            SegmentWriter::write_v7_with_provenance(batch, identity, ingest, meta, exemplars)
+        })
+        .await??;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let key = keys::l1_part_key(

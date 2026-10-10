@@ -236,7 +236,7 @@ pub async fn retention_sweep_bucket(
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
     let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let outcome = retention_sweep_bucket_with_reach(
         &mut reach, store, clock, config, window_ns, lease, bucket,
     )
@@ -456,7 +456,7 @@ pub async fn maintain_bucket(
     bucket: &Bucket,
 ) -> Result<(RetentionOutcome, Option<ClaimedCompaction>)> {
     let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let (outcome, compaction, _acquisition) =
         maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
             .await?;
