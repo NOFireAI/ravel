@@ -703,8 +703,8 @@ pub async fn read_bytes(args: &StoreArgs, key_or_path: &str) -> anyhow::Result<V
         return Err(
             anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)).context(
                 format!(
-                    "{key_or_path:?} is neither an existing file nor an object store key (a \
-                     request for it would reach {:?})",
+                    "{key_or_path:?} is not a readable file, and a request for it as a key \
+                     would reach {:?} instead",
                     ravel_pqtable::keys::store_path(key_or_path)
                 ),
             ),
@@ -921,8 +921,9 @@ mod tests {
     }
 
     /// A missing absolute path is no store key: the store's path encoding
-    /// drops its leading `/`. `read_bytes` reports it not found, and says it
-    /// is not a key, rather than the store's refusal to address it.
+    /// drops its leading `/`. `read_bytes` reports it not found, says it is
+    /// not a readable file and names the key a request for it would reach,
+    /// rather than the store's refusal to address it.
     #[tokio::test]
     async fn read_bytes_of_a_missing_absolute_path_is_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -940,8 +941,8 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "{missing:?} is neither an existing file nor an object store key (a request \
-                 for it would reach {:?})",
+                "{missing:?} is not a readable file, and a request for it as a key would \
+                 reach {:?} instead",
                 missing.trim_start_matches('/')
             )
         );
