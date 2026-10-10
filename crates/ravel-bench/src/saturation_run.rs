@@ -1,12 +1,14 @@
 //! The server, fixture and probe plumbing the two ADR-1702 task 11 saturation
 //! bins share (issue #2670). Band logic lives in [`crate::saturation`].
 //!
-//! The server is started the way `ravel-server`'s own `main` starts it: a
-//! [`Heartbeat`] built and spawned on the server runtime, a [`HealthListener`]
-//! bound on it before [`ravel_server::start_with_heartbeat`], and the readiness
-//! handle attached once that returns. The server runtime is a multi-thread
-//! runtime with tokio's default worker count, one per core, the same as the
-//! binary's bare `#[tokio::main]`. Probes and load run on other runtimes and
+//! The server is started in the same call order as `ravel-server`'s own
+//! `main`: a [`Heartbeat`] built and spawned on the server runtime, a
+//! [`HealthListener`] bound on it before [`ravel_server::start_with_heartbeat`],
+//! and the readiness handle attached once that returns. The server runtime is
+//! a multi-thread runtime with tokio's default worker count, one per core, the
+//! same as the binary's bare `#[tokio::main]`. Each bin installs jemalloc as
+//! its global allocator and calls [`configure_allocator`] before the server
+//! starts, as `main` does before it binds a listener. Probes and load run on other runtimes and
 //! threads, so a probe never waits for a server runtime worker to be free
 //! before it is sent.
 //!
@@ -18,9 +20,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+pub use crate::saturation::Probe;
+use crate::saturation::slots_due;
 use anyhow::{Context, bail};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
@@ -50,6 +54,10 @@ pub const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Per-probe deadline. A probe that has not answered by then counts as
 /// unanswered.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline for a heartbeat `/metrics` scrape. Above the 10 s ADR bound, so a
+/// stall of 10 s to 15 s, which misses that bound, still returns an age
+/// rather than failing the scrape first.
+pub const HEARTBEAT_SCRAPE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // RSEG section kinds (docs/segment-format.md), the catalog sections the query
 // fetcher charges a catalog decode for.
@@ -340,10 +348,14 @@ pub fn encode_param(value: &str) -> String {
     out
 }
 
-pub async fn scrape(client: &reqwest::Client, http: SocketAddr) -> anyhow::Result<String> {
+pub async fn scrape(
+    client: &reqwest::Client,
+    http: SocketAddr,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     let response = client
         .get(format!("http://{http}/metrics"))
-        .timeout(PROBE_TIMEOUT)
+        .timeout(timeout)
         .send()
         .await
         .context("/metrics request")?;
@@ -386,26 +398,49 @@ fn truncate(body: &str) -> &str {
     &body[..end]
 }
 
-/// One probe the prober issued.
-#[derive(Debug, Clone, Copy)]
-pub struct Probe {
-    /// When it was issued, from the prober's start instant.
-    pub issued_at: Duration,
-    pub latency: Duration,
-    pub status: Option<u16>,
+/// Ends a measured window: the prober stops before the first slot due after
+/// it, and every other loop stops at its next check.
+#[derive(Debug)]
+pub struct WindowStop {
+    /// The last slot due in the window, `u64::MAX` while it is open.
+    last_slot: AtomicU64,
 }
 
-/// Probes `url` sequentially every `period` from `start` until `stop` is
-/// set, on a dedicated thread with its own `current_thread` runtime. Probe
-/// `k` is due at `start + k * period`; a probe that overruns its slot pushes
-/// every later one back rather than letting them catch up, so a slow listener
-/// shows up as fewer probes in a window.
+impl WindowStop {
+    pub fn new() -> Arc<Self> {
+        Arc::new(WindowStop {
+            last_slot: AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// Closes the window at `window` from its start.
+    pub fn close(&self, window: Duration) {
+        self.last_slot.store(slots_due(window), Ordering::Release);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.last_slot.load(Ordering::Acquire) != u64::MAX
+    }
+
+    fn past(&self, slot: u64) -> bool {
+        slot > self.last_slot.load(Ordering::Acquire)
+    }
+}
+
+/// Probes `url` sequentially, one probe per slot, from `start` until `stop`
+/// closes the window, on a dedicated thread with its own `current_thread`
+/// runtime. Slot `k` is due at `start + k * period`. A probe whose slot was due
+/// in the window is sent even when the prober wakes after the window closed,
+/// so every slot counted as due has its probe. A probe that overruns its slot
+/// skips every slot that came due while it ran, so a slow listener shows up as
+/// fewer probes in a window.
 pub fn spawn_prober(
     url: String,
     start: Instant,
     period: Duration,
-    stop: Arc<AtomicBool>,
+    stop: Arc<WindowStop>,
 ) -> anyhow::Result<std::thread::JoinHandle<anyhow::Result<Vec<Probe>>>> {
+    let period_ns = period.as_nanos().max(1);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -415,10 +450,13 @@ pub fn spawn_prober(
             runtime.block_on(async move {
                 let client = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?;
                 let mut probes = Vec::new();
-                let mut due = start + period;
+                let mut slot = 1u64;
                 loop {
-                    tokio::time::sleep_until(due.into()).await;
-                    if stop.load(Ordering::Acquire) {
+                    let offset = period
+                        .checked_mul(u32::try_from(slot)?)
+                        .context("probe slot offset")?;
+                    tokio::time::sleep_until((start + offset).into()).await;
+                    if stop.past(slot) {
                         break;
                     }
                     let issued = Instant::now();
@@ -432,11 +470,13 @@ pub fn spawn_prober(
                     };
                     let done = Instant::now();
                     probes.push(Probe {
+                        slot,
                         issued_at: issued.duration_since(start),
                         latency: done.duration_since(issued),
                         status,
                     });
-                    due = (due + period).max(done);
+                    let next = done.duration_since(start).as_nanos().div_ceil(period_ns);
+                    slot = (slot + 1).max(u64::try_from(next)?);
                 }
                 Ok(probes)
             })
@@ -450,6 +490,18 @@ pub fn join_prober(
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("prober thread panicked"))?
+}
+
+/// Enables jemalloc's background purge thread unless `_RJEM_MALLOC_CONF`
+/// sets it, as `ravel-server`'s `main` does before it binds a listener, and
+/// prints the state read back from the allocator.
+pub fn configure_allocator() {
+    let malloc_conf = std::env::var(ravel_server::mem_stats::MALLOC_CONF_ENV).ok();
+    let state = ravel_server::mem_stats::configure_background_thread(malloc_conf.as_deref());
+    println!(
+        "allocator: jemalloc background_thread enabled={} source={}",
+        state.enabled, state.source
+    );
 }
 
 /// Builds the multi-thread runtime the server runs on: tokio's default worker

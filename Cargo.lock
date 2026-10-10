@@ -4668,6 +4668,7 @@ dependencies = [
  "stats_alloc",
  "tempfile",
  "thiserror",
+ "tikv-jemallocator",
  "tokio",
  "toml",
  "tonic",

@@ -178,6 +178,13 @@ ravel-server = { path = "../../services/ravel-server", version = "0.23.0", optio
 ravel-cpu-gate = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 
+# The saturation bins install jemalloc as their global allocator the way
+# ravel-server's binary does, so the server they measure allocates as the
+# shipped one does. Workspace pin, no new external crate; kept off msvc as
+# ravel-server keeps it.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
 [features]
 # Parquet baseline harness. Off by default: the standard build
 # and gates never compile arrow/parquet/object_store or the gated bins.
@@ -230,7 +237,7 @@ flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
 # The ADR-1702 task 11 saturation bins (`liveness_under_decode`,
 # `heartbeat_under_query_load`, issue #2670). Off by default: they link
 # ravel-server and its SQL surface. Advisory lanes, run by hand.
-saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow"]
+saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator"]
 
 [dev-dependencies]
 criterion = { workspace = true }
