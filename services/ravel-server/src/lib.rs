@@ -3056,8 +3056,7 @@ pub async fn start_with_heartbeat(
         // Under `--audit-mode off` (ADR-0062 opt-in amendment) no pipeline is
         // spawned: every surface keeps the no-op sink, `/metrics` renders no
         // audit family, and shutdown has nothing to drain.
-        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = match &config.audit_pipeline
-        {
+        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = match &config.audit_pipeline {
             Some(audit_config) => {
                 let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
                     store.clone(),
