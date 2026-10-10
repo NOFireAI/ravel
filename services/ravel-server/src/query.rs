@@ -1765,7 +1765,7 @@ mod catalog_cache_tests {
             idle_tenant_state_ttl: Duration::from_secs(3600),
             distrib: None,
             remote_clusters: Vec::new(),
-            audit_pipeline: ravel_maintain::AuditPipelineConfig::default(),
+            audit_pipeline: None,
             audit_text: ravel_maintain::AuditTextPolicy::default(),
             shutdown_timeout: crate::DEFAULT_SHUTDOWN_TIMEOUT,
             drain_settle_interval: Duration::ZERO,
