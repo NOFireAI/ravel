@@ -2869,10 +2869,13 @@ buckets `stats.phases` names, and they live in their own object so the
   query-serving server always installs its audit pipeline, and a SQL router
   built over the no-op sink reports that sink's immediate accept.
 - `scans`: the number of logs scans (`LogsScanExec` nodes) in the executed
-  plan. Always present: 0 for a statement that reads no `logs`, 1 for a
-  single-table logs statement (a late-materialized `ORDER BY ... LIMIT`
-  included, whose second phase re-reads rows without a second scan), and 2
-  or more for a `UNION ALL` of two logs branches, a self-join, an
+  plan. Always present. 0 means no `LogsScanExec` ran: the statement names
+  no `logs` table, or its answer came from segment statistics (a
+  predicate-free `COUNT(*)` or `MIN`/`MAX(ts)` over `logs`, and the other
+  metadata-only aggregate shapes, plan no scan). 1 for a single-table logs
+  statement that scans (a late-materialized `ORDER BY ... LIMIT` included,
+  whose second phase re-reads rows without a second scan), and 2 or more
+  for a `UNION ALL` of two logs branches, a self-join, an
   `IN (SELECT ... FROM logs)`, or a CTE read twice.
 - `planInitMs`: the logs scan's shared plan barrier. Present only when
   `scans` is 1.
@@ -2884,7 +2887,9 @@ buckets `stats.phases` names, and they live in their own object so the
 - `firstBatchMinMs`: from scan creation to the earliest batch any partition
   emitted; 0 when none emitted one. Present only when `scans` is 1.
 - `streamMaxMs`: from scan creation to the last partition finishing. Present
-  only when `scans` is 1.
+  only when `scans` is 1. Under late materialization it covers the first
+  phase's scan only, and a `LIMIT` that stops the stream early can leave it
+  low or 0.
 
 The last six are the logs scan's own timers (`SqlStats::scan_timing`). Each
 scan pays its own plan barrier and times its offsets from its own creation,

@@ -411,8 +411,10 @@ async fn a_logs_query_with_an_indexed_predicate_prunes_blocks_by_postings() {
 /// `scan_timing.scans` counts `LogsScanExec` nodes, not plan nodes and not
 /// row reads: a late-materialized `SELECT * ... ORDER BY ts LIMIT k` holds
 /// one scan (phase 2's `LogsRowFetchExec` re-reads rows without a second
-/// scan), a `UNION ALL` of two logs branches holds two, and a metrics
-/// statement holds none.
+/// scan); a `UNION ALL` of two logs branches, a self-join, an
+/// `IN (SELECT ... FROM logs)` and a CTE read twice each hold two; a metrics
+/// statement holds none, and so does a predicate-free `count(*)` over logs,
+/// answered from segment statistics without a `LogsScanExec`.
 #[tokio::test]
 async fn scan_timing_counts_logs_scans_in_the_plan() {
     let tenant = tenant_id("logs-scan-count");
@@ -463,6 +465,51 @@ async fn scan_timing_counts_logs_scans_in_the_plan() {
         .await
         .expect("metrics statement");
     assert_eq!(outcome.stats.scan_timing.scans, 0, "{:?}", outcome.stats);
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT count(*) FROM logs"))
+        .await
+        .expect("predicate-free logs count");
+    assert_eq!(outcome.output.num_rows(), 1);
+    assert_eq!(
+        outcome.stats.scan_timing.scans, 0,
+        "answered from segment statistics, with no LogsScanExec: {:?}",
+        outcome.stats
+    );
+
+    let multi = [
+        (
+            "self-join",
+            "SELECT a.ts FROM logs a JOIN logs b ON a.ts = b.ts \
+             WHERE a.attrs['region'] = 'region-0'",
+            2,
+        ),
+        (
+            "IN subquery",
+            "SELECT ts FROM logs WHERE ts IN \
+             (SELECT ts FROM logs WHERE attrs['region'] = 'region-0')",
+            2,
+        ),
+        (
+            "CTE read twice",
+            "WITH r AS (SELECT ts FROM logs WHERE attrs['region'] = 'region-0') \
+             SELECT ts FROM r UNION ALL SELECT ts FROM r",
+            2,
+        ),
+    ];
+    let mut expected = Vec::new();
+    let mut reported = Vec::new();
+    for (shape, sql, scans) in multi {
+        let outcome = fixture
+            .executor
+            .execute(tenant.hash(), &request(sql))
+            .await
+            .unwrap_or_else(|err| panic!("{shape}: {err}"));
+        expected.push((shape, scans));
+        reported.push((shape, outcome.stats.scan_timing.scans));
+    }
+    assert_eq!(reported, expected);
 }
 
 fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> {
