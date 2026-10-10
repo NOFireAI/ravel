@@ -1331,40 +1331,60 @@ memory pool's own refusal, `ResourcesExhausted`, is the one the SQL path
 answers 422); the refused query holds no reservation afterwards, so the next
 query is admitted against the same remainder as before.
 
-The SQL query memory pool (`TenantDelegatingPool`) holds the bytes a grouped
-hash aggregate releases instead of returning them to the query, tenant and
-process budgets. DataFusion 54.1's `GroupedHashAggregateStream`
-shrinks its reservation when it emits, while the emitted batch still holds
-those bytes, so releasing them would let other queries be granted memory that
-is still live. The held bytes stay charged and count toward every ceiling, a
-later grow by the same aggregate is served from them first, and they are
-released when the aggregate's stream is dropped. The hold is chosen per
-stream: it applies to an aggregate whose memory consumer DataFusion marks as
+DataFusion 55.2 runs most grouped aggregates on its migrated streams
+(`PartialHashAggregateStream`, `FinalHashAggregateStream`,
+`SingleHashAggregateStream` and their ordered and partial-reduce variants).
+Each keeps its materialized output reserved in the SQL query memory pool
+(`TenantDelegatingPool`) until the last `batch_size` slice has been cut from
+it, and the pool forwards their shrinks to the query, tenant and process
+budgets at once (`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
+
+`AggregateExec::execute_typed` still falls back to the legacy
+`GroupedHashAggregateStream` for every shape it has not migrated: a
+single-stage aggregate that carries a limit, such as `SELECT DISTINCT ...
+LIMIT` with one SQL partition (`--sql-partition-count 1`); a single-stage
+aggregate over input ordered on all or part of the group key; the partial
+stage that expands a `GROUPING SETS`, `ROLLUP` or `CUBE`; and a
+partial-reduce stage, because the pool always reports a finite limit. That
+stream shrinks its reservation when it emits, while the emitted batch still
+holds those bytes, so releasing them would let other
+queries be granted memory that is still live. For that stream only, the pool
+holds the bytes it releases instead of returning them to the budgets. The
+held bytes stay charged and count toward every ceiling, a later grow by the
+same aggregate is served from them first, and they are released when the
+aggregate's stream is dropped. The hold is chosen per stream, from the
+consumer name DataFusion gives the legacy stream and its spill flag: it
+applies to a legacy aggregate whose memory consumer DataFusion marks as
 unable to spill: a final or single-stage aggregate on a statement that runs
-without spill, or one whose input is fully sorted on the group key. A partial
-aggregate is never held, because it emits early into the exchange that feeds
-the final aggregate and that exchange reserves what it buffers. A final
-aggregate that can spill is not held either, because its shrink can follow a
-spill to disk, which frees the memory. So on a deployment that runs with
-`--sql-spill-dir`, a final aggregate over an unordered group key is built
-spillable and still hands its live bytes back to the pool at emit: the hold
-does not cover it, and the over-release remains for those statements.
-`ravel_sql::sql_memory_held_bytes()` returns the bytes held across the
-process; no metric renders it yet.
+without spill, or one whose input is fully sorted on the group key. A
+partial aggregate is never held, because it emits early into the exchange
+that feeds the final aggregate and that exchange reserves what it buffers. A
+final aggregate that can spill is not held either, because its shrink can
+follow a spill to disk, which frees the memory. So on a deployment that runs
+with `--sql-spill-dir`, a legacy final aggregate over an unordered group key
+is built spillable and still hands its live bytes back to the pool at emit:
+the hold does not cover it, and the over-release remains for those
+statements. `ravel_sql::sql_memory_held_bytes()` returns the bytes held
+across the process; no metric renders it yet. The hold can be removed once
+Ravel runs a DataFusion release whose `execute_typed` no longer falls back to
+the legacy stream; upstream tracks that removal as apache/datafusion#25902,
+under the stream-split epic apache/datafusion#22710.
 
 The hold over-charges. From the aggregate's first shrink until its stream is
 dropped, its bytes stay charged while a downstream operator, for example a
 Sort over the aggregate's output, also reserves the emitted batches it is
-handed. A statement that used to fit under `max_query_bytes` can therefore now
-be refused with 422 `ResourcesExhausted`. The extra charge is bounded by the
-aggregate's own peak: a held aggregate stays charged at the largest
-reservation it has held, never more, because a later grow is served from the
-hold first. The sizing guidance for `--sql-max-query-bytes` is unchanged. In
-the reservation-lag matrix (`crates/ravel-sql/tests/group_by_reservation_lag.rs`,
-where result batches are dropped as they arrive), peak reserved bytes with the
-hold on differed from a run with it off by -11.6% to +15.9%, no more than the
-16.7% spread the runs with it on show among themselves (303.1 to 353.7 MiB
-for one configuration). A statement whose aggregate output is reserved downstream was
+handed. A statement that fits under `max_query_bytes` without the hold can
+therefore be refused with 422 `ResourcesExhausted`. The extra charge is
+bounded by the aggregate's own peak: a held aggregate stays charged at the
+largest reservation it has held, never more, because a later grow is served
+from the hold first. The sizing guidance for `--sql-max-query-bytes` is
+unchanged. On DataFusion 54.1, when every grouped aggregate ran on the legacy
+stream, the reservation-lag matrix
+(`crates/ravel-sql/tests/group_by_reservation_lag.rs`, where result batches
+are dropped as they arrive) read peak reserved bytes with the hold on
+-11.6% to +15.9% from a run with it off, no more than the 16.7% spread the
+runs with it on show among themselves (303.1 to 353.7 MiB for one
+configuration). A statement whose aggregate output is reserved downstream was
 not measured, and that is where the extra charge appears.
 
 `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
@@ -4216,9 +4236,9 @@ keeps the later-arriving group, and the unbounded sort's own tie-break is
 arrival-order dependent too; SQL leaves that order unspecified.
 
 On the test fixture (200,000 distinct keys, `ORDER BY max(ts) DESC LIMIT 10`)
-`peakIntermediateBytes` is 1,706,120 with the rule installed against 10,748,928
+`peakIntermediateBytes` is 1,706,120 with the rule installed against 9,438,720
 without it. Across a tenfold increase in distinct keys the rule-off figure grows
-9.4x and the rule-on figure 1.62x, and the residual growth on the rule-on side
+8.26x and the rule-on figure 1.62x, and the residual growth on the rule-on side
 is the scan's own batches rather than aggregate state. The statement orders by
 `ts`, a fixed non-nullable column, rather than a typed attribute column: a
 typed attribute column is always nullable and the ordering-input conjunct
@@ -4604,9 +4624,10 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
   running sum exceeds 2^53, so it depends on the single-partition fold order);
   any `sum`, `min`, `max` over a `Float16`/`Float32`/`Float64` input; and any
   **float GROUP BY key** (including a bare `SELECT DISTINCT float_col`),
-  because `-0.0`/NaN payloads are bit-significant here and no
-  merge-order-stable representative bit pattern for a float group key is
-  proven.
+  because no merge-order-stable representative bit pattern for a float group
+  key is proven: DataFusion 55 folds `-0.0` into `0.0` when it groups, but NaN
+  payloads stay bit-significant here (ADR-0094, negative-zero group key
+  amendment).
 
 A `DISTINCT ON` is classified by its ON keys the same way: a non-float key
 is eligible. The optimizer turns it into a `first_value` aggregate ordered by
@@ -4663,7 +4684,7 @@ arrival order varies.
 
 A declared `Str` column reaches Arrow as `Dictionary(Int32, Utf8)` (ADR-0099
 decision 5). That is the type a client receives, and it is deliberately not the
-type the engine groups on. DataFusion 54 has no specialized group-value table
+type the engine groups on. DataFusion 55 has no specialized group-value table
 for `Dictionary`: it is absent from both the single-column dispatch in
 `aggregates::group_values::new_group_values` and the `supported_type` list the
 multi-column `GroupValuesColumn` is built from, so a `GROUP BY` over one falls

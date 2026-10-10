@@ -576,10 +576,12 @@ pub(crate) fn decode_footer<E>(
 ) -> Result<DecodedFooter, DecodeError<E>> {
     let estimate = check_footer_shape(footer).map_err(DecodeError::Refused)?;
     let reservation = reserve(estimate).map_err(DecodeError::Reserve)?;
-    // The decoder asserts, rather than checks, that an INT96 column's
-    // statistics are 12 bytes long.
-    let metadata = match std::panic::catch_unwind(|| ParquetMetaDataReader::decode_metadata(footer))
-    {
+    // A decoder panic on a malformed footer is refused like a decoder error.
+    let metadata = match std::panic::catch_unwind(|| {
+        #[cfg(test)]
+        decode_panic_seam::fire();
+        ParquetMetaDataReader::decode_metadata(footer)
+    }) {
         Ok(Ok(metadata)) => metadata,
         Ok(Err(err)) => return Err(DecodeError::Refused(format!("footer: {err}"))),
         Err(_) => {
@@ -596,6 +598,29 @@ pub(crate) fn decode_footer<E>(
         estimate,
         reservation,
     })
+}
+
+/// A test-only way into [`decode_footer`]'s panic guard: no footer known to
+/// panic the parquet 59 decoder has been found, so a test arms this to make
+/// the decode closure panic instead.
+#[cfg(test)]
+pub(crate) mod decode_panic_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make the next decode on this thread panic.
+    pub(crate) fn arm() {
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn fire() {
+        if ARMED.with(|armed| armed.replace(false)) {
+            panic!("decode_panic_seam fired");
+        }
+    }
 }
 
 /// Why [`PinnedParquetReader::read_footer`] could not hand a footer out.
@@ -856,7 +881,7 @@ mod tests {
     ///
     /// The header (the filter's algorithm, hash, compression and bitset
     /// size) is the Thrift-compact encoding of four i32 fields, each 1 to 5
-    /// bytes, so at most 20 bytes total; parquet-58.4.0's own internal test
+    /// bytes, so at most 20 bytes total; parquet-59.3.0's own internal test
     /// `bloom_filter::mod::test_bloom_filter_header_size_assumption` uses
     /// the same bound. The bitset itself is always a whole number of
     /// 32-byte blocks (the SBBF block size), so `bloom_filter_length % 32`
@@ -1042,6 +1067,30 @@ mod tests {
         let (fixture, _, file) = recorded_file(limits).await;
         let metadata = fixture.reader(file).metadata().await.expect("decodes");
         assert_eq!(metadata.file_metadata().num_rows(), 3);
+    }
+
+    /// Guards: the `catch_unwind` around the parquet decoder in
+    /// `decode_footer`. A decoder panic is refused with its own message, and
+    /// the next decode of the same footer, with the seam disarmed, succeeds.
+    #[test]
+    fn a_decoder_panic_refuses_the_footer() {
+        let bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]);
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let footer = &bytes[end - footer_len_of(&bytes) as usize..end];
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+
+        decode_panic_seam::arm();
+        match decode_footer(footer, 0, |bytes| memory.reserve(bytes)) {
+            Err(DecodeError::Refused(message)) => {
+                assert_eq!(message, "the footer panicked the parquet decoder");
+            }
+            Err(DecodeError::Reserve(err)) => panic!("expected a refusal, got {err:?}"),
+            Ok(_) => panic!("expected a refusal, got a decoded footer"),
+        }
+        let decoded = decode_footer(footer, (end - footer.len()) as u64, |bytes| {
+            memory.reserve(bytes)
+        });
+        assert!(decoded.is_ok(), "the seam fires once");
     }
 
     /// Guards: the estimate `MetadataCache::insert` charges. A writer
@@ -2273,7 +2322,7 @@ mod tests {
     /// page).
     ///
     /// Retyping an actual dictionary page's own top-level header as a data
-    /// page does not reach this panic in parquet-58.4.0:
+    /// page does not reach this panic in parquet-59.3.0:
     /// `decode_page` has an explicit typed-error path for a mismatch between
     /// a `PageHeader`'s `type` field and the nested header struct it carries,
     /// which a type that no longer matches its own nested header always is.

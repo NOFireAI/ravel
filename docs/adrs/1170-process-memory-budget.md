@@ -150,7 +150,9 @@ counter, because its two consumers account differently:
   (`memory.rs:105-130`) and `TenantDelegatingPool` already forwards every
   DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
   refusal (`memory.rs:264-348`; a held aggregate's shrink is the one
-  exception, see the aggregate hold amendment below); the adapter forwards
+  exception, see the aggregate hold amendment below, which the DataFusion
+  55.2 hold amendment below narrows to the legacy aggregate stream); the
+  adapter forwards
   each of those to the
   process counter with the same delta, in the same order, so process-level
   bytes track SQL bytes exactly: tenant then process on the way up, process
@@ -1136,4 +1138,24 @@ every query, tenant and process figure the whole time, so the budgets never
 read lower than what is live; they can read higher, by at most the
 aggregate's own peak reservation, from its first shrink until its stream is
 dropped. ADR-0102's aggregate hold amendment records why `can_spill`
-selects it.
+selects it. The DataFusion 55.2 hold amendment below narrows which consumers
+carry that name.
+
+## Amendment (2026-10-10, #2720): on DataFusion 55.2 the hold covers only the legacy aggregate stream
+
+<!-- amendment-applies: sections="1. `MemoryBudget`, a process-wide accountant|Amendment (2026-10-09, #2633): an aggregate's shrink can be held" pointer="DataFusion 55.2 hold amendment" -->
+
+DataFusion 55.2 runs most grouped aggregates on migrated streams that keep
+an emitted batch reserved until the last `batch_size` slice is cut from it
+and register consumers under other names, so `TenantDelegatingPool`
+forwards their `grow`, `try_grow` and `shrink` to the counters 1:1, as
+decision 1 states. The held shrink of the #2633 amendment now arises only
+from the legacy `GroupedHashAggregateStream`, which DataFusion 55.2 still
+runs for the shapes `AggregateExec::execute_typed` has not migrated and
+marks unable to spill (a single-stage aggregate with a limit or over ordered
+input, or a partial-reduce stage under a finite pool); for those, the
+budgets can still read above what is live, by the same bound. ADR-0102's DataFusion 55.2
+hold amendment lists the shapes and the test that pins both halves. The
+exception goes away when Ravel runs a DataFusion release whose
+`execute_typed` no longer falls back to the legacy stream
+(apache/datafusion#25902).

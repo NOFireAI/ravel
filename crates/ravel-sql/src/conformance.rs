@@ -393,13 +393,14 @@ const EXCLUDED_WINDOW_EXAMPLES: [(&str, &str); 3] = [
 /// adding an example without adding the name to the constant (or vice versa)
 /// fails rather than passing tautologically.
 ///
-/// The set has nine entries, not the eight ADR-0097 decision 4 names, because
+/// The set has eleven entries, not the eight ADR-0097 decision 4 names, because
 /// `today` is a DataFusion alias of `current_date` that shares its wall-clock
-/// read and its `EXCLUDED_SCALARS` membership; it is refused by the same typed
-/// error and so earns a row. The three `current_*` niladic functions use their
-/// bare SQL-standard spelling (which parses as a function call); the rest,
-/// including `today`, take explicit parentheses.
-const EXCLUDED_SCALAR_EXAMPLES: [(&str, &str); 9] = [
+/// read and its `EXCLUDED_SCALARS` membership, and `input_file_name` and
+/// `file_row_index` are DataFusion 55 defaults that read the scan's file
+/// environment; each is refused by the same typed error and so earns a row.
+/// The three `current_*` niladic functions use their bare SQL-standard spelling
+/// (which parses as a function call); the rest take explicit parentheses.
+const EXCLUDED_SCALAR_EXAMPLES: [(&str, &str); 11] = [
     ("uuid", "SELECT uuid() FROM samples"),
     ("random", "SELECT random() FROM samples"),
     ("rand", "SELECT rand() FROM samples"),
@@ -409,6 +410,8 @@ const EXCLUDED_SCALAR_EXAMPLES: [(&str, &str); 9] = [
     ("current_time", "SELECT current_time FROM samples"),
     ("version", "SELECT version() FROM samples"),
     ("today", "SELECT today() FROM samples"),
+    ("input_file_name", "SELECT input_file_name() FROM samples"),
+    ("file_row_index", "SELECT file_row_index() FROM samples"),
 ];
 
 /// A representative aggregate call over the metrics table.

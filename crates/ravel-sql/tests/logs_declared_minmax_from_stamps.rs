@@ -34,6 +34,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -568,8 +569,9 @@ fn scan_stats_for(
     let accounting = QueryAccounting::new();
     let provider = provider_with(&store, snapshot, &accounting, stats, declared);
     let plan = provider.plan_filters(4, &[]).expect("plan_filters");
-    plan.partition_statistics(None)
-        .expect("partition_statistics")
+    StatisticsContext::new()
+        .compute(plan.as_ref(), &StatisticsArgs::new())
+        .expect("statistics")
 }
 
 fn scan_stats(snapshot: Snapshot, stats: Option<Arc<LoadedColumnStats>>) -> Arc<Statistics> {
@@ -602,7 +604,7 @@ async fn stamped_corpus(store: &Arc<CountingStore>) -> Snapshot {
 /// from statistics never opens a segment on either route.
 ///
 /// Prove-the-test: comment out the `min_value`/`max_value` assignment in
-/// `LogsScanExec::partition_statistics`
+/// `LogsScanExec::statistics_from_inputs`
 /// (crates/ravel-sql/src/logs_scan.rs, the `declared_min_max` loop) and the
 /// plan keeps its `LogsScanExec` with 2 GETs and 2 objects touched; every
 /// assertion below fails but the answer, which the scan then computes.
@@ -1022,7 +1024,7 @@ async fn a_differing_cstat_entry_leaves_the_stamp_answering() {
 /// Prove-the-test: in `LogsScanExec::declared_min_max_all`
 /// (crates/ravel-sql/src/logs_scan.rs) add each segment's `coverage.null_count`
 /// twice and this reads 3; delete the `col.null_count =
-/// Precision::Exact(nulls)` assignment in `partition_statistics` and the plan
+/// Precision::Exact(nulls)` assignment in `statistics_from_inputs` and the plan
 /// keeps its `LogsScanExec` with 2 GETs while the count still answers 4.
 #[tokio::test]
 async fn count_of_a_stamped_column_subtracts_the_null_count_exactly_once() {
@@ -1132,7 +1134,7 @@ async fn the_stamped_count_equals_the_scanned_count() {
 /// (crates/ravel-commit/src/declared_stats.rs) and a fabricated-extrema stamp
 /// over an all-NULL column becomes coverage; delete the
 /// `col.null_count = Precision::Exact(nulls)` assignment in
-/// `partition_statistics` (crates/ravel-sql/src/logs_scan.rs) and the count
+/// `statistics_from_inputs` (crates/ravel-sql/src/logs_scan.rs) and the count
 /// assertion fails with a `LogsScanExec` in the plan and 1 GET.
 #[tokio::test]
 async fn an_all_null_stamped_column_counts_zero_and_answers_null() {

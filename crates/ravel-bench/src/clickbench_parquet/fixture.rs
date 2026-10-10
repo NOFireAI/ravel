@@ -54,8 +54,8 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
-use parquet58::arrow::ArrowWriter;
-use parquet58::errors::ParquetError;
+use parquet::arrow::ArrowWriter;
+use parquet::errors::ParquetError;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -662,7 +662,7 @@ pub fn write_hits(dir: &Path, seed: u64) -> Result<(), FixtureError> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::Array;
-    use parquet58::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::collections::HashSet;
 
     fn read_all(path: &Path) -> Vec<RecordBatch> {

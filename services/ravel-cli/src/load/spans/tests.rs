@@ -465,14 +465,36 @@ type DictMapCell = Option<Vec<(Option<String>, Option<String>)>>;
 
 /// A map column whose keys and values are both dictionary-encoded
 /// `Utf8`, one cell per row.
+///
+/// A null key is a key index that points at a null slot of the key
+/// dictionary's values. The key field stays non-nullable, which Arrow 59
+/// requires of a map, and the key child carries no null of its own, so
+/// `ArrayData` validation accepts the map; `StructArray::try_new` would
+/// refuse it, because it also counts the dictionary's logical nulls.
 fn dict_attrs_map(cells: &[DictMapCell]) -> ArrayRef {
-    use arrow::array::StructArray;
+    use arrow::array::{Array, ArrayData, Int32Array, StringArray};
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Fields;
 
     let entries: Vec<&(Option<String>, Option<String>)> =
         cells.iter().flatten().flatten().collect();
-    let keys: DictionaryArray<Int32Type> = entries.iter().map(|(key, _)| key.as_deref()).collect();
+    let mut slots: Vec<Option<&str>> = Vec::new();
+    let mut slot_of: std::collections::HashMap<Option<&str>, i32> =
+        std::collections::HashMap::new();
+    let key_indices: Vec<i32> = entries
+        .iter()
+        .map(|(key, _)| {
+            *slot_of.entry(key.as_deref()).or_insert_with(|| {
+                slots.push(key.as_deref());
+                slots.len() as i32 - 1
+            })
+        })
+        .collect();
+    let keys = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(key_indices),
+        Arc::new(StringArray::from(slots)),
+    )
+    .expect("key dictionary");
     let values: DictionaryArray<Int32Type> =
         entries.iter().map(|(_, value)| value.as_deref()).collect();
     let mut offsets = vec![0i32];
@@ -480,31 +502,33 @@ fn dict_attrs_map(cells: &[DictMapCell]) -> ArrayRef {
         let len = cell.as_ref().map_or(0, Vec::len);
         offsets.push(offsets[offsets.len() - 1] + len as i32);
     }
-    // Arrow declares a map's key field non-nullable, and a struct
-    // refuses a null in a non-nullable child, so a fixture with a null
-    // key has to declare the field nullable to be built at all.
-    let null_keys = keys.null_count() > 0;
     let fields = Fields::from(vec![
-        Field::new("keys", keys.data_type().clone(), null_keys),
+        Field::new("keys", keys.data_type().clone(), false),
         Field::new("values", values.data_type().clone(), true),
     ]);
-    let entries = StructArray::new(
-        fields.clone(),
-        vec![Arc::new(keys) as ArrayRef, Arc::new(values) as ArrayRef],
-        None,
-    );
-    Arc::new(
-        MapArray::try_new(
-            Arc::new(Field::new("entries", DataType::Struct(fields), false)),
-            OffsetBuffer::new(offsets.into()),
-            entries,
-            Some(NullBuffer::from(
-                cells.iter().map(Option::is_some).collect::<Vec<_>>(),
-            )),
-            false,
-        )
-        .expect("map array"),
+    let entries = ArrayData::builder(DataType::Struct(fields.clone()))
+        .len(entries.len())
+        .add_child_data(keys.to_data())
+        .add_child_data(values.to_data())
+        .build()
+        .expect("entries struct");
+    let map = ArrayData::builder(DataType::Map(
+        Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+        false,
+    ))
+    .len(cells.len())
+    .nulls(Some(NullBuffer::from(
+        cells.iter().map(Option::is_some).collect::<Vec<_>>(),
+    )))
+    .add_buffer(
+        OffsetBuffer::<i32>::new(offsets.into())
+            .into_inner()
+            .into_inner(),
     )
+    .add_child_data(entries)
+    .build()
+    .expect("map array");
+    Arc::new(MapArray::from(map))
 }
 
 fn some_entries(entries: &[(&str, Option<&str>)]) -> DictMapCell {
@@ -802,8 +826,11 @@ fn an_attrs_map_key_a_resource_attribute_names_is_refused() {
 /// A map child whose dictionary is empty is answered row by row rather
 /// than taking the batch down in arrow's `normalized_keys`, which
 /// asserts the dictionary is non-empty. Every entry of such a child is
-/// null: a null value skips its entry, a null key refuses its own row,
-/// and the rows around it load.
+/// null. Only the value child is built empty here: an empty key
+/// dictionary leaves the key child's own slots null, and both
+/// `StructArray::try_new` and `ArrayData` validation refuse that in the
+/// non-nullable key field a map requires. A null value skips its entry
+/// and every row loads.
 #[test]
 fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
     use arrow::array::StructArray;
@@ -824,7 +851,7 @@ fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
     // Row 1 holds the map's one entry; rows 0 and 2 hold none.
     let batch_of = |keys: ArrayRef, values: ArrayRef| -> RecordBatch {
         let fields = Fields::from(vec![
-            Field::new("keys", keys.data_type().clone(), keys.null_count() > 0),
+            Field::new("keys", keys.data_type().clone(), false),
             Field::new("values", values.data_type().clone(), true),
         ]);
         let entries = StructArray::new(fields.clone(), vec![keys, values], None);
@@ -864,15 +891,22 @@ fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
         vec![method(), method(), method()],
         "an empty value dictionary skips its null entry"
     );
-    assert_eq!(
-        outcomes(&batch_of(empty_dictionary(), plain("eu"))),
-        vec![
-            method(),
-            Err("attrs_map_column \"attrs\" holds a null key".to_string()),
-            method(),
-        ],
-        "an empty key dictionary refuses only the row holding its entry"
-    );
+    let key_fields = Fields::from(vec![
+        Field::new("keys", empty_dictionary().data_type().clone(), false),
+        Field::new("values", DataType::Utf8, true),
+    ]);
+    StructArray::try_new(
+        key_fields.clone(),
+        vec![empty_dictionary(), plain("eu")],
+        None,
+    )
+    .expect_err("an empty key dictionary cannot fill a map's non-nullable key field");
+    arrow::array::ArrayData::builder(DataType::Struct(key_fields))
+        .len(1)
+        .add_child_data(empty_dictionary().to_data())
+        .add_child_data(plain("eu").to_data())
+        .build()
+        .expect_err("nor can it through ArrayData validation");
 }
 
 /// The map's dictionary children are read in place: the resolved child
@@ -1838,6 +1872,125 @@ async fn a_row_rejected_spans_load_counts_the_drops_built_before_it() {
         report.attributes_dropped, 2,
         "the two rows built before the rejection are counted, the rejected row is not"
     );
+}
+
+/// A Parquet file whose map key column is OPTIONAL reaches the loader's
+/// null-key refusal. `MapArray::try_new` refuses a nullable key field,
+/// but the Parquet reader builds its map arrays without that check, so
+/// the file's null key arrives in the batch and only the loader stops
+/// it. Row 0's entry has a key and loads; row 1's key is null.
+#[tokio::test]
+async fn a_parquet_map_with_an_optional_key_column_is_refused_at_the_null_key() {
+    use parquet::data_type::{ByteArray, ByteArrayType, Int64Type as PqInt64};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use ravel_object_store::memory::MemoryStore;
+
+    let schema = parse_message_type(
+        "message spans {
+            REQUIRED BYTE_ARRAY trace_id;
+            REQUIRED BYTE_ARRAY span_id;
+            REQUIRED BYTE_ARRAY name (UTF8);
+            REQUIRED INT64 start_ns;
+            REQUIRED INT64 end_ns;
+            REQUIRED BYTE_ARRAY method (UTF8);
+            OPTIONAL group attrs (MAP) {
+                REPEATED group key_value {
+                    OPTIONAL BYTE_ARRAY key (UTF8);
+                    OPTIONAL BYTE_ARRAY value (UTF8);
+                }
+            }
+        }",
+    )
+    .expect("parquet schema");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("spans.parquet");
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer = SerializedFileWriter::new(
+        file,
+        Arc::new(schema),
+        Arc::new(WriterProperties::builder().build()),
+    )
+    .expect("parquet writer");
+    let bytes = |values: &[&[u8]]| -> Vec<ByteArray> {
+        values.iter().map(|v| ByteArray::from(v.to_vec())).collect()
+    };
+    let mut row_group = writer.next_row_group().expect("row group");
+    let mut column = 0;
+    while let Some(mut writer) = row_group.next_column().expect("next column") {
+        match column {
+            0 => writer.typed::<ByteArrayType>().write_batch(
+                &bytes(&[&[1u8; 16], &[1u8; 16]]),
+                None,
+                None,
+            ),
+            1 => writer.typed::<ByteArrayType>().write_batch(
+                &bytes(&[&[2u8; 8], &[3u8; 8]]),
+                None,
+                None,
+            ),
+            2 => writer
+                .typed::<ByteArrayType>()
+                .write_batch(&bytes(&[b"op", b"op"]), None, None),
+            3 | 4 => writer
+                .typed::<PqInt64>()
+                .write_batch(&[NOW_NS, NOW_NS], None, None),
+            5 => writer
+                .typed::<ByteArrayType>()
+                .write_batch(&bytes(&[b"GET", b"GET"]), None, None),
+            // Definition level 3 is a present key, 2 an entry whose key is
+            // null; each row holds one entry.
+            6 => writer.typed::<ByteArrayType>().write_batch(
+                &bytes(&[b"peer"]),
+                Some(&[3, 2]),
+                Some(&[0, 0]),
+            ),
+            7 => writer.typed::<ByteArrayType>().write_batch(
+                &bytes(&[b"db", b"x"]),
+                Some(&[3, 3]),
+                Some(&[0, 0]),
+            ),
+            other => panic!("the schema has no column {other}"),
+        }
+        .expect("write column");
+        writer.close().expect("close column");
+        column += 1;
+    }
+    assert_eq!(column, 8, "every leaf column was written");
+    row_group.close().expect("close row group");
+    writer.close().expect("close parquet");
+
+    let text = MAPPING_TOML.replace("[spans]\n", "[spans]\nattrs_map_column = \"attrs\"\n");
+    let mapping = parse_spans_mapping(&text).expect("valid mapping");
+    let mut report = SpansLoadReport::default();
+    let err = load_spans_into(
+        &mut report,
+        Arc::new(MemoryStore::new()),
+        &pq,
+        "acme",
+        &mapping,
+        1,
+        10_000,
+        0,
+        1,
+        1,
+        1,
+        None,
+        NOW_NS,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect_err("the null key is refused");
+
+    let LoadError::RowRejected { row, reason, .. } = &err else {
+        panic!("expected a row rejection, got: {err}");
+    };
+    assert_eq!(
+        *row, 1,
+        "row 0's keyed entry loads; row 1 holds the null key"
+    );
+    assert_eq!(reason, "attrs_map_column \"attrs\" holds a null key");
 }
 
 /// The cap applies to the STORED string, so a bytes attribute is

@@ -182,12 +182,14 @@ async fn a_multi_batch_aggregate_query_returns_every_reserved_byte() {
 }
 
 /// Issue #2633: `HASH_AGGREGATE_CONSUMER_PREFIX` against the consumer name
-/// DataFusion itself gives a grouped hash aggregate, not a hand-written one.
-/// A real `GROUP BY` through the production pool (`SqlConfig::query_pool`,
-/// then `build_session` with spill disabled) must leave bytes held while its
-/// stream is alive: an aggregate's emit shrinks its reservation before it
-/// returns the batch, so by the time any output batch arrives one has
-/// shrunk, and nothing releases the hold until the stream drops.
+/// DataFusion itself gives the legacy grouped hash aggregate, not a
+/// hand-written one. A real single-stage `DISTINCT ... LIMIT`, a shape
+/// DataFusion 55.2 still runs on `GroupedHashAggregateStream`, through the
+/// production pool (`SqlConfig::query_pool`, then `build_session` with spill
+/// disabled) must leave bytes held while its stream is alive: that stream's
+/// emit shrinks its reservation before it returns the batch, so by the time
+/// any output batch arrives one has shrunk, and nothing releases the hold
+/// until the stream drops.
 ///
 /// FLIP: set `HASH_AGGREGATE_CONSUMER_PREFIX` to a string DataFusion does
 /// not produce and the hold reads 0 after every batch.
@@ -203,8 +205,8 @@ async fn a_real_group_by_is_held_by_the_production_pool() {
     );
 }
 
-/// The same `GROUP BY` on a session with a spill directory: DataFusion marks
-/// every aggregate stream's consumer `can_spill`, so the pool holds nothing.
+/// The same statement on a session with a spill directory: DataFusion marks
+/// the legacy stream's consumer `can_spill`, so the pool holds nothing.
 ///
 /// FLIP: drop the `!consumer.can_spill()` conjunct from the pool's `holds`
 /// and bytes are held after some batch here too.
@@ -220,7 +222,7 @@ async fn a_group_by_that_can_spill_is_not_held() {
     assert_eq!(most_held, 0, "a stream that can spill was held");
 }
 
-/// Run `SELECT ts, count(value) ... GROUP BY ts` over [`big_segment`] through
+/// Run `SELECT DISTINCT ts ... LIMIT` over [`big_segment`] through
 /// the production pool under `spill`, returning the group count and the
 /// least and most bytes the pool held after any output batch. Asserts that
 /// dropping the stream releases every held and reserved byte.
@@ -229,9 +231,13 @@ async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize)
     let specs = big_segment();
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
+    // `--sql-partition-count 1`: one SQL partition plans the aggregate
+    // single-stage, the stage DataFusion 55.2 has no migrated stream for
+    // under a limit.
+    let mut config = SqlConfig::default();
+    config.engine.sql_partition_count = Some(1);
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let (pool, _breach) =
-        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
+    let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
     let held = || {
         pool.downcast_ref::<TenantDelegatingPool>()
             .expect("query_pool builds a TenantDelegatingPool")
@@ -243,11 +249,11 @@ async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize)
         snapshot,
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
-        SqlConfig::default(),
+        config.clone(),
         PhaseAccounting::new(),
     ));
     let ctx = build_session(
-        &SqlConfig::default(),
+        &config,
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
         false,
@@ -255,7 +261,7 @@ async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize)
     )
     .expect("session");
     let mut stream = ctx
-        .sql("SELECT ts, count(value) FROM samples GROUP BY ts")
+        .sql("SELECT DISTINCT ts FROM samples LIMIT 1000000")
         .await
         .expect("plan")
         .execute_stream()

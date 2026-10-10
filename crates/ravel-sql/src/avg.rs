@@ -1,7 +1,7 @@
 //! Grouped-aware AVG/MEAN with two owned numerator kinds (ADR-0022 decisions
 //! 3, 4; ADR-0825 decisions 1, 2).
 //!
-//! DataFusion 54.1.0's built-in `avg` (`AvgAccumulator`, `average.rs`) sums
+//! DataFusion 55.2.0's built-in `avg` (`AvgAccumulator`, `average.rs`) sums
 //! each input batch with arrow's `compute::sum` kernel, which reduces
 //! lane-parallel partial accumulators whose lane count is
 //! architecture-dependent (4 on aarch64, 8 with AVX) and then folds the
@@ -494,7 +494,6 @@ impl GroupsAccumulator for SequentialAvgGroupsAccumulator {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> DFResult<()> {
         self.resize(total_num_groups);
@@ -508,9 +507,6 @@ impl GroupsAccumulator for SequentialAvgGroupsAccumulator {
                 )
             })?;
         for (row, &group_index) in group_indices.iter().enumerate() {
-            if row_is_filtered(opt_filter, row) {
-                continue;
-            }
             if sums.is_valid(row) {
                 self.fold(group_index, sums.value(row));
             }
@@ -541,6 +537,35 @@ impl GroupsAccumulator for SequentialAvgGroupsAccumulator {
         let sum_array: Float64Array = sums.into_iter().collect();
         let count_array: Int64Array = counts.into_iter().map(Some).collect();
         Ok(vec![Arc::new(sum_array), Arc::new(count_array)])
+    }
+
+    /// One state row per input row, for a partial aggregation that passes
+    /// rows through (`skip_partial_aggregation`). `merge_batch` folds a
+    /// non-null state sum with the same `fold` `update_batch` uses, so per-row
+    /// states merged in row order give the same bits as folding the rows. A
+    /// row the filter drops, or whose value is NULL, becomes a NULL sum and a
+    /// zero count, which `merge_batch` skips.
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> DFResult<Vec<ArrayRef>> {
+        let float = as_float64(&values[0])?;
+        let mut sums = Vec::with_capacity(float.len());
+        let mut counts = Vec::with_capacity(float.len());
+        for row in 0..float.len() {
+            if row_is_filtered(opt_filter, row) || float.is_null(row) {
+                sums.push(None);
+                counts.push(0i64);
+            } else {
+                sums.push(Some(float.value(row)));
+                counts.push(1i64);
+            }
+        }
+        Ok(vec![
+            Arc::new(Float64Array::from(sums)),
+            Arc::new(Int64Array::from(counts)),
+        ])
     }
 
     fn size(&self) -> usize {
@@ -753,7 +778,6 @@ impl GroupsAccumulator for ExactIntegerAvgGroupsAccumulator {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> DFResult<()> {
         self.resize(total_num_groups);
@@ -767,9 +791,6 @@ impl GroupsAccumulator for ExactIntegerAvgGroupsAccumulator {
                 )
             })?;
         for (row, &group_index) in group_indices.iter().enumerate() {
-            if row_is_filtered(opt_filter, row) {
-                continue;
-            }
             if sums.is_valid(row) {
                 self.sums[group_index] = checked_add_i128(self.sums[group_index], sums.value(row))?;
             }
@@ -847,10 +868,6 @@ impl GroupsAccumulator for ExactIntegerAvgGroupsAccumulator {
             Arc::new(sum_array),
             Arc::new(Int64Array::from(counts)),
         ])
-    }
-
-    fn supports_convert_to_state(&self) -> bool {
-        true
     }
 
     fn size(&self) -> usize {
@@ -1127,7 +1144,7 @@ mod tests {
                 let mut merged = ExactIntegerAvgGroupsAccumulator::new();
                 for idx in order {
                     merged
-                        .merge_batch(&states[idx], &merge_indices, None, GROUPED_PROPTEST_GROUPS)
+                        .merge_batch(&states[idx], &merge_indices, GROUPED_PROPTEST_GROUPS)
                         .expect("merge_batch must not fail");
                 }
                 prop_assert_eq!(
@@ -1186,7 +1203,7 @@ mod tests {
         );
         let mut merged = ExactIntegerAvgGroupsAccumulator::new();
         merged
-            .merge_batch(&state, &group_indices, None, 6)
+            .merge_batch(&state, &group_indices, 6)
             .expect("merge_batch must not fail");
 
         assert_eq!(
@@ -1194,7 +1211,57 @@ mod tests {
             grouped_integer_bits(&mut merged),
             "per-row states merged in the final stage must equal the direct fold"
         );
-        assert!(ExactIntegerAvgGroupsAccumulator::new().supports_convert_to_state());
+    }
+
+    /// The Float64 kind's `convert_to_state` followed by `merge_batch` folds
+    /// the same values in the same row order as `update_batch`, so the
+    /// per-group bits match, including a `-0.0`-only group (seeded by its
+    /// first value, not by `0.0`), a NaN payload, a NULL and a filtered row.
+    #[test]
+    fn sequential_convert_to_state_merges_to_the_update_batch_result() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.1),
+            None,
+            Some(0.2),
+            Some(-0.0),
+            Some(-0.0),
+            Some(nan_with_payload(0x5a5a)),
+            Some(1e300),
+            Some(7.0),
+            Some(1e-300),
+        ]));
+        let group_indices = vec![0usize, 0, 0, 1, 1, 2, 3, 3, 3];
+        let filter =
+            BooleanArray::from(vec![true, true, true, true, true, true, true, false, true]);
+
+        let bits = |acc: &mut SequentialAvgGroupsAccumulator| -> Vec<Option<u64>> {
+            let out = acc.evaluate(EmitTo::All).expect("evaluate must not fail");
+            let out = out
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64 output");
+            out.iter().map(|v| v.map(f64::to_bits)).collect()
+        };
+
+        let mut reference = SequentialAvgGroupsAccumulator::new();
+        reference
+            .update_batch(&[Arc::clone(&values)], &group_indices, Some(&filter), 5)
+            .expect("update_batch must not fail");
+
+        let state = SequentialAvgGroupsAccumulator::new()
+            .convert_to_state(&[values], Some(&filter))
+            .expect("convert_to_state must not fail");
+        assert_eq!(state.len(), 2, "state is a sum column and a count column");
+        assert_eq!(state[0].len(), 9, "one state row per input row");
+        let mut merged = SequentialAvgGroupsAccumulator::new();
+        merged
+            .merge_batch(&state, &group_indices, 5)
+            .expect("merge_batch must not fail");
+
+        let expected = bits(&mut reference);
+        assert_eq!(expected[1], Some((-0.0f64).to_bits()));
+        assert_eq!(expected[4], None, "a group with no row is NULL");
+        assert_eq!(expected, bits(&mut merged));
     }
 
     /// `EmitTo::First` must drain exactly the first `n` groups and leave the

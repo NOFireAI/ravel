@@ -222,7 +222,7 @@ struct AggRun {
 /// binding consumer, spilling it yields the same result as running it in memory
 /// and holds its pool-accounted peak under the cap.
 ///
-/// The group key is a `Utf8` string, not an integer, on purpose: DataFusion 54's
+/// The group key is a `Utf8` string, not an integer, on purpose: DataFusion's
 /// `GroupValues` for a primitive key under-reports its real hashbrown allocation
 /// (issue #740, documented in `crate::config`), so an integer key's reservation
 /// stays far below its true footprint and never trips a realistic budget. A
@@ -369,8 +369,8 @@ const IN_MEMORY_SPILL_BYTES: usize = 8 * 1024 * 1024;
 /// Distinct string group keys in the in-memory aggregation, and how many of
 /// them appear twice (yielding count 2 vs 1). Sized so the group state of the
 /// single sole-consumer aggregate (see [`run_grouped_count`]) far exceeds
-/// [`IN_MEMORY_SPILL_BYTES`] and the aggregate must spill: measured against the
-/// locked DataFusion 54.1.0, one `key-NNNNNNNNN` group costs well over 100
+/// [`IN_MEMORY_SPILL_BYTES`] and the aggregate must spill: measured against
+/// DataFusion 54.1.0, one `key-NNNNNNNNN` group costs well over 100
 /// bytes of pool-accounted `GroupValues` plus sort headroom, so 1,000,000
 /// groups reserve on the order of 150 MiB against the 8 MiB cap and spill
 /// incrementally.
@@ -463,11 +463,11 @@ const SCAN_ONLY_SQL: &str = "SELECT count(*) AS n FROM samples";
 ///
 /// `RsegScanExec` retains every decoded segment of this fixture as one
 /// non-spillable reservation, and that share measures 36,640,200 bytes
-/// ([`SCAN_ONLY_SQL`] under [`AMPLE_QUERY_BYTES`], locked DataFusion 54.1.0).
+/// ([`SCAN_ONLY_SQL`] under [`AMPLE_QUERY_BYTES`], DataFusion 55.2.0).
 /// At 16 MiB the scan alone cannot fit, so nothing about the AGGREGATE's spill
 /// threshold could be established from that budget: whichever consumer happened
 /// to ask at the pool boundary decided which error came back. 48 MiB is above
-/// the scan's whole share and still far below the grouped run's 68,162,568-byte
+/// the scan's whole share and still far below the grouped run's 53,634,116-byte
 /// peak, so the scan fits, the aggregate gets a bounded headroom to grow into,
 /// and the aggregate is the consumer that must spill. Each of those figures is
 /// asserted below.
@@ -484,7 +484,7 @@ const AMPLE_QUERY_BYTES: usize = 1 << 30;
 const SCAN_PEAK_CEILING_BYTES: u64 = 40 * 1024 * 1024;
 
 /// Floor on what the scan leaves for the aggregate under [`SPLIT_QUERY_BYTES`]
-/// (measured 13,671,416 bytes). The aggregate's spill threshold IS its pool
+/// (measured 13,691,448 bytes). The aggregate's spill threshold IS its pool
 /// refusal, so it can only reach it if this much of the budget is actually
 /// available to it.
 const AGGREGATE_HEADROOM_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
@@ -544,12 +544,16 @@ async fn drain_with_accounting(
 ///    [`AMPLE_QUERY_BYTES`] that does not spill, exceeds that headroom by more
 ///    than the headroom itself, so the aggregate cannot fit in what the scan
 ///    leaves and must reach its spill threshold;
-/// 4. the failing run's own figures show scratch bytes ALREADY WRITTEN when the
-///    quota refused the next write, which is only reachable by an aggregate that
-///    reached that threshold and spilled;
+/// 4. the error is `SpillBudgetExhausted`, which this crate raises only for the
+///    quota refusal of DataFusion's spill-file writer, so the aggregate reached
+///    its spill threshold and began a spill file; a second run read through
+///    the pinned stream asserts the same thing without the variant, from the
+///    aggregate's own spill-file count;
 /// 5. the quota in those figures is [`TINY_SCRATCH_BYTES`], so the refusal came
 ///    from this query's configured scratch ceiling and not from some other
-///    limit.
+///    limit, and the written figure is below it: DataFusion 55 refuses a write
+///    before it lands and backs it out of the gauge, so no figure the gauge
+///    reports can exceed the quota.
 #[tokio::test]
 async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhausted() {
     let tenant = tenant_id("acme");
@@ -662,21 +666,59 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
         quota, TINY_SCRATCH_BYTES,
         "the refusal must name this query's configured scratch quota"
     );
+    // The gauge the figure comes from (`DiskManager::used_disk_space`) excludes
+    // the refused write and the spill file that write was for, which is gone by
+    // the time the error reaches the stream. Measured: 0 bytes of a 65,536-byte
+    // quota.
     assert!(
-        written > 0,
-        "the aggregate must have reached its spill threshold and written \
-         scratch before the quota refused it; {written} bytes written means the \
-         query failed without spilling at all"
+        written < quota,
+        "the gauge never holds a write the quota refused; got {written} of {quota}"
     );
-    // The gauge the figure comes from (`DiskManager::used_disk_space`) already
-    // includes the write that pushed the query past its ceiling, so the reported
-    // total is at or above the quota, never below it. Measured: 133,312 bytes of
-    // a 65,536-byte quota. Below the quota would mean the refusal came from
-    // something other than this ceiling.
+
+    // 4, without the variant: the same query fails again, and the plan's spill
+    // counters show the aggregate opened a spill file before the refusal.
+    // DataFusion counts a spill file when it opens one, before the refused
+    // batch write, so the count moves though the gauge above reads 0.
+    let snapshot = fixture.snapshot(&tenant).await;
+    let mut stream = fixture
+        .executor
+        .plan_pinned(
+            tenant.hash(),
+            snapshot,
+            SPILLING_SQL,
+            &QueryAccounting::new(),
+            &[],
+        )
+        .await
+        .expect("the spilling query plans")
+        .execute()
+        .await
+        .expect("the spilling query starts");
+    let mut failed = false;
+    while let Some(next) = stream.next().await {
+        if next.is_err() {
+            failed = true;
+            break;
+        }
+    }
     assert!(
-        written >= quota,
-        "the refusal must report scratch at or above the quota it tripped; \
-         got {written} of {quota}"
+        failed,
+        "the tiny scratch quota must trip on the pinned stream too"
+    );
+    let (spilled, by_operator) = stream.spill_counts();
+    // The stream holds the query's scratch until it drops.
+    drop(stream);
+    eprintln!("spill counts at the refusal: {spilled:?} by operator {by_operator:?}");
+    assert!(
+        spilled.files >= 1,
+        "the aggregate must have opened a spill file before the refusal; got \
+         {spilled:?}"
+    );
+    assert!(
+        by_operator
+            .iter()
+            .any(|op| op.operator.contains("Aggregate") && op.files >= 1),
+        "the spill file must be the aggregate's; got {by_operator:?}"
     );
 
     // Requirement 7: a typed error cleans up its scratch too.
@@ -828,7 +870,7 @@ async fn physical_plan_text(
 /// is decided by a predicate over the LOGICAL plan
 /// (`plan_is_spill_eligible`, an allowlist of logical nodes), but the disk
 /// manager it arms belongs to the session: every operator in the physical plan
-/// may then spill. `RepartitionExec` spills in DataFusion 54 -- its output
+/// may then spill. `RepartitionExec` spills in DataFusion 55 -- its output
 /// channels fall back to a `SpillPool` when the pool refuses their reservation,
 /// which is where the `SpillPool (DiskManager is disabled)` message in
 /// `tests/memory_pool_attribution.rs` comes from -- and no predicate in this
@@ -912,11 +954,11 @@ async fn a_spill_enabled_query_gets_no_unclassified_repartition_exec() {
          got:\n{text}"
     );
     // The aggregate that spill exists for is still there and still able to
-    // spill. `mode=Single` is a NON-partial aggregate mode, and DataFusion 54
-    // gives every non-partial mode with no group ordering
-    // `OutOfMemoryMode::Spill` once the disk manager is enabled
-    // (`aggregates/row_hash.rs`); it is `mode=Partial` that emits early instead
-    // of spilling. So dropping the exchange costs parallelism, not the spill.
+    // spill. `mode=Single` is a NON-partial aggregate mode, and DataFusion 55
+    // runs it as a `SingleHashAggregateStream`, which spills whenever the disk
+    // manager can create temporary files (`aggregates/single_stream.rs`); it is
+    // `mode=Partial` that emits early instead of spilling. So dropping the
+    // exchange costs parallelism, not the spill.
     assert!(
         text.contains("AggregateExec: mode=Single"),
         "the spill-enabled plan must still carry the grouped aggregate as a \
@@ -1035,9 +1077,10 @@ async fn a_cancelled_spilling_stream_cleans_up_its_scratch() {
 ///
 /// The asserted quantity is the pool-accounted peak, which is what requirement 1
 /// governs and the only bound established by reasoning: `try_grow` refuses any
-/// reservation past the cap, and DataFusion 54's grouped-hash spill frees the
-/// group state (`clear_shrink(0)`) before it reserves the sort headroom out of
-/// the same pool, so no pool-accounted byte exceeds the ceiling. Process RSS is
+/// reservation past the cap, and DataFusion 55's single-stage aggregate
+/// reserves its sort headroom together with the group state on every grow,
+/// then frees the state before it sorts and spills, so no pool-accounted byte
+/// exceeds the ceiling. Process RSS is
 /// deliberately NOT asserted here: the ADR notes the pool-to-RSS gap (allocator
 /// overhead, Arrow rounding, the emitted-batch-plus-sort peak) is not bounded by
 /// reasoning, and on a shared multi-test process the resident set is dominated
@@ -1299,10 +1342,16 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
 }
 
 /// Run `sql` over the q33 table three times: in memory under
-/// [`AMPLE_QUERY_BYTES`], with spill forced by a per-query pool of a quarter
-/// of the in-memory run's measured peak, and with spill not configured at
-/// all. Asserts that only the second run spilled and that the third returned
-/// the first's rows, and returns `(spilled, in_memory)`.
+/// [`AMPLE_QUERY_BYTES`], with spill forced by a per-query pool of half the
+/// in-memory run's measured peak, and with spill not configured at all.
+/// Asserts that only the second run spilled and that the third returned the
+/// first's rows, and returns `(spilled, in_memory)`.
+///
+/// Half, not less: DataFusion 55's single-stage aggregate replays its spill
+/// runs through a merge that reserves read buffers for as many runs as the
+/// pool will seat, and the ordered final aggregate behind it then needs room
+/// for its own table. At a quarter or a third of the peak that table's grow is
+/// refused. With spill off the same statement is refused at half its peak.
 async fn spilled_and_in_memory(sql: &str) -> (TopTen, TopTen) {
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -1314,7 +1363,7 @@ async fn spilled_and_in_memory(sql: &str) -> (TopTen, TopTen) {
         )
     };
     let in_memory = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
-    let budget = usize::try_from(in_memory.peak_pool_bytes / 4).expect("fits");
+    let budget = usize::try_from(in_memory.peak_pool_bytes / 2).expect("fits");
     let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
 
     eprintln!(
@@ -1329,12 +1378,12 @@ async fn spilled_and_in_memory(sql: &str) -> (TopTen, TopTen) {
     );
     // The aggregate writes at most one state row per input row while it
     // consumes its input, and the merge of its spill files may write each of
-    // those once more (measured: 6 files, 364,250 rows).
+    // those once more (measured: 2 files, 200,350 rows).
     assert!(
         spilled.spill_files >= 1
             && spilled.spill_rows_written >= Q33_GROUPS / 2
             && spilled.spill_rows_written <= 2 * Q33_ROWS,
-        "under a quarter of its in-memory peak the aggregate must spill at least half of \
+        "under half its in-memory peak the aggregate must spill at least half of \
          its {Q33_GROUPS} groups' state, and at most two state rows per input row: \
          files={} rows_written={}",
         spilled.spill_files,
@@ -1411,7 +1460,7 @@ async fn an_order_by_alias_named_like_a_group_key_gives_the_same_top_ten_spilled
 ///
 /// Prove-the-test: gate the executed-plan rewrite on
 /// `plan_is_spill_eligible_ignoring_sort_order(&plan)` again and the re-check
-/// fails, so the quarter-budget run is refused with `ResourcesExhausted`
+/// fails, so the half-budget run is refused with `ResourcesExhausted`
 /// instead of spilling; gate it on a shape check that also requires every
 /// `avg` argument to resolve to `Int64` and the same refusal follows.
 #[tokio::test]
