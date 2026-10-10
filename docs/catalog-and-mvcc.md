@@ -964,36 +964,40 @@ affected parts read as uncovered for that field and are scanned (the
 ADR-0849 safety lemma). The lookup stays correct throughout. No HEAD field
 can constrain such a folder: it predates every field here, and the fold
 builds HEAD as a fresh struct, so an unknown field does not survive its
-CAS. A part is re-indexed only by a fold that re-encodes it, and a sealed,
-compacted historical part with no erasure pending is never re-encoded by
-the regular fold, so the repair is explicit: `ravel-cli catalog fold
---rebuild-key-index [--field <name>]`, the one sanctioned exception to the
-scope rule above, re-encodes every part in HEAD that lacks a `key_index`
-ref for a declared field (every part, for spans), builds each leaf from
-the sections as the regular fold does, and reports parts rebuilt, leaves
-written, section bytes read and ranged GETs issued (footer suffix and
-section reads together). It publishes in batches bounded in entries: a
-batch is the shortest run of the remaining unindexed parts, at least one,
-whose entry total reaches `--batch-entries` (default 100,000), and each
-batch is one fold attempt whose single HEAD CAS carries that batch's refs.
-The batch's parts are excluded from the by-content-hash carry-forward
-(`existing_by_blake3`), per batch, by the reconcile-dirty rule's mechanism
-below: an unchanged part re-encodes to the same blake3 and would otherwise
-be carried forward with its old, ref-less entry and skip the derived-object
-build. Every other part, including every earlier batch's, stays carried
-forward with its ref, so those refs survive each later attempt's CAS. A
-rebuild attempt skips the reconcile pass and its window LISTs (nothing is
-new under the `--writers-stopped` assertion it takes), and the report
-carries the attempt count and the per-attempt requests (snapshot PUT,
-HEAD CAS, leaf PUTs) beside the section figures. A run that stops or
-exhausts the CAS retries on one batch has therefore published every
-earlier batch, loses at most `2 x` the entries in that batch, and leaves
-that batch's leaves unreferenced for this sweep; the rerun skips every
-part whose ref an earlier batch published. A one-part tenant (a part holds
-up to `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES` = 250,000 entries) is a single
-batch, and an interruption there loses the whole run. Like the plain CLI
-fold it holds no claim and keeps no cursor (HEAD is the cursor), and it
-takes `--writers-stopped` as the same assertion the plain fold takes.
+CAS. The regular fold re-indexes a part only when it re-encodes it, and a
+sealed, compacted historical part with no erasure pending is never
+re-encoded by the regular fold, so the repair is explicit and is not a
+fold: `ravel-cli catalog fold --rebuild-key-index [--field <name>]`
+attaches leaves to parts it leaves unchanged. For every part in HEAD that
+lacks a `key_index` ref for a declared field (every part, for spans) it
+reads the part object once, reads each entry's footer suffix and KEY_IDX
+section (the two ranged GETs per entry of the fold's own leaf build),
+writes the leaves, and publishes a HEAD whose part refs are the current
+ones with `key_index` attached (`SnapshotHead.parts` carries the refs
+inline, so the publish is the HEAD CAS alone). The part objects, their
+blake3 and their `.csnap` baselines are untouched, so none of the fold's
+per-part machinery runs: no content-hash carry-forward, no dirty-hour
+reconcile, no column-stats baseline, no part or `.csnap` PUT, no window
+LIST. It publishes in batches bounded in entries: a batch is the longest
+run of the remaining unindexed parts whose entry total stays at or below
+`--batch-entries`, and at least one part, so an attempt costs at most
+`2 x max(batch_entries, largest part's entries)` ranged GETs, which is
+`2 x batch_entries` at the default of 250,000
+(`DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`). Each batch is one HEAD CAS, bounded
+like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt
+re-reads HEAD, keeps the refs for the batch parts whose blake3 the new
+HEAD still names (a leaf is keyed by `part_blake3`) and drops the rest,
+whose leaves this sweep deletes. The report carries parts rebuilt, leaves
+written, section bytes read, ranged GETs issued (footer suffix and section
+together), the attempt count, and per attempt the part GETs, leaf PUTs and
+HEAD CAS. A run that stops or exhausts the CAS retries on one batch has
+therefore published every earlier batch, loses at most `2 x` the entries
+in that batch, and leaves that batch's leaves unreferenced for this sweep;
+the rerun skips every part whose ref an earlier batch published. A
+one-part tenant is a single batch, and an interruption there loses the
+whole run. Like the plain CLI fold it holds no claim and keeps no cursor
+(HEAD is the cursor), and it takes `--writers-stopped` as the same
+assertion the plain fold takes.
 Detection: this sweep reports
 `CatalogSweepOutcome { deleted, kept }` with no per-kind split and no
 metric of its own today, so the leaf writer's change adds `deleted_kidx` to
@@ -1002,8 +1006,9 @@ the outcome and renders it as
 rising while HEAD carries no `key_index` refs is the signature an operator
 acts on. The cost of a bad rollout is one rebuild run over the affected
 parts, `2 x entries` ranged GETs in total (a footer suffix and a section
-range per entry, at most `2 x batch_entries` per attempt) plus the
-sections' bytes, and that run scans until it has run; nothing is retained
+range per entry, at most `2 x max(batch_entries, largest part's entries)`
+per attempt, 500,000 at the default) plus the sections' bytes, and that
+run scans until it has run; nothing is retained
 and nothing is silent. The mixed-version combinations (old folder then new
 sweeper, old sweeper against a new HEAD, new folder after an old folder,
 then the rebuild) are

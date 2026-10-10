@@ -358,47 +358,46 @@ flowchart LR
     fold that re-encodes it, and a sealed, compacted historical part with
     no erasure pending is never re-encoded by the regular fold, so the
     regular fold alone would leave such parts unindexed for the life of
-    the part. The repair is therefore explicit and operator-driven, the
-    one sanctioned exception to the fold's scope rule: `ravel-cli catalog
-    fold --rebuild-key-index [--field <name>]` re-encodes every part in
-    HEAD that lacks a `key_index` ref for a declared field (every part,
-    for spans), builds the leaf from the sections as a regular fold would,
-    and reports parts rebuilt, leaves written, section bytes read and
-    ranged GETs issued (the footer suffix and section reads together, the
-    figure the acceptance band counts). It publishes in batches bounded
-    in the unit the cost has: a batch is the shortest run of the remaining
-    unindexed parts, at least one, whose entry total reaches
-    `--batch-entries` (default 100,000), and each batch is one fold
-    attempt whose single HEAD CAS carries that batch's `key_index` refs,
-    so the fold's one-CAS-per-attempt rule holds and the run is a sequence
-    of attempts rather than one. The fold would otherwise carry an
-    unchanged part forward by content hash (`existing_by_blake3`, the
-    same bytes re-encode to the same blake3) with its old ref and skip
-    the per-part derived-object build, so the rebuild excludes the batch's
-    parts from that carry-forward, per batch, by the mechanism the
-    reconcile-dirty rule already uses; every other part, including every
-    earlier batch's, stays carried forward with its ref, which is what
-    lets those refs survive each later attempt's CAS. A rebuild attempt
-    skips the reconcile pass (there is nothing new to reconcile under the
-    `--writers-stopped` assertion it takes) and the window LISTs with it,
-    and the report carries the attempt count and the per-attempt requests
-    (snapshot PUT, HEAD CAS, leaf PUTs) beside the section figures, so a
-    many-batch run's fixed cost is visible rather than hidden in a band
-    that counts only sections. That is what makes it restartable: a run
-    that stops, or that loses one batch's CAS to the server's scheduled
-    fold `MAX_HEAD_CAS_ATTEMPTS` times (`FoldCasRetriesExhausted`), has
-    published every earlier batch, loses at most `2 x` the entries in the
-    current batch, and leaves that batch's leaves unreferenced for the
-    catalog sweep; the rerun skips every part whose ref an earlier batch
-    published. The bound is honest about small tenants: a part holds up to
-    `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES` = 250,000 entries and the Stage 0
-    load is one part of 80,000, so there the run is a single batch and an
-    interruption loses all 160,000 GETs; the batch bounds a month-scale
-    tenant with hour-ranged parts, not a one-part one. Like the CLI fold
-    it extends it holds no claim and keeps no cursor
-    (`services/ravel-cli/src/catalog.rs` has neither; HEAD is the cursor),
-    and it takes `--writers-stopped` as the same assertion the plain fold
-    takes, since nothing in the CLI can detect a live writer. Detection:
+    the part. The repair is therefore explicit and operator-driven, and it
+    is not a fold: `ravel-cli catalog fold --rebuild-key-index
+    [--field <name>]` attaches leaves to parts it leaves unchanged. For
+    every part in HEAD that lacks a `key_index` ref for a declared field
+    (every part, for spans) it reads the part object once, reads each
+    entry's footer suffix and KEY_IDX section (the two ranged GETs per
+    entry of decision 4's leaf build), writes the leaves, and publishes a
+    HEAD whose part refs are the current ones with `key_index` attached
+    (`SnapshotHead.parts` carries the refs inline, so the publish is the
+    HEAD CAS and nothing else). The part objects, their blake3 and their
+    `.csnap` baselines are untouched, so none of the fold's per-part
+    machinery is on this path: no content-hash carry-forward, no
+    dirty-hour reconcile, no column-stats baseline, no part or `.csnap`
+    PUT, no window LIST. It publishes in batches bounded in the unit the
+    cost has: a batch is the longest run of the remaining unindexed parts
+    whose entry total stays at or below `--batch-entries`, and at least
+    one part, so an attempt costs at most `2 x max(batch_entries, largest
+    part's entries)` ranged GETs, which is `2 x batch_entries` at the
+    default of 250,000 (`DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, so no single
+    part exceeds it). Each batch is one HEAD CAS, bounded like the fold's
+    at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD,
+    keeps the refs for the batch parts whose blake3 the new HEAD still
+    names (a leaf is keyed by `part_blake3`, so it is still that part's)
+    and drops the rest, whose leaves the catalog sweep deletes. The report
+    carries parts rebuilt, leaves written, section bytes read, ranged GETs
+    issued (footer suffix and section together, the figure the acceptance
+    band counts), the attempt count, and per attempt the part GETs, leaf
+    PUTs and HEAD CAS. That is what makes it restartable: a run that
+    stops, or exhausts the CAS retries on one batch, has published every
+    earlier batch, loses at most `2 x` the entries in that batch, and
+    leaves that batch's leaves unreferenced for the sweep; the rerun skips
+    every part whose ref an earlier batch published. The bound is honest
+    about small tenants: the Stage 0 load is one part of 80,000 entries,
+    so there the run is a single batch and an interruption loses all
+    160,000 GETs; the batch bounds a month-scale tenant with hour-ranged
+    parts, not a one-part one. Like the CLI fold it sits beside, it holds
+    no claim and keeps no cursor (`services/ravel-cli/src/catalog.rs` has
+    neither; HEAD is the cursor), and it takes `--writers-stopped` as the
+    same assertion the plain fold takes, since nothing in the CLI can
+    detect a live writer. Detection:
     the
     unreferenced-catalog-object sweep reports `CatalogSweepOutcome
     { deleted, kept }` with no per-kind split today and no metric of its
@@ -410,9 +409,10 @@ flowchart LR
     operator acts on. The cost of a bad rollout is one rebuild run over the
     affected parts: per part entry, one footer suffix GET and one section
     range GET, so `2 x entries` ranged GETs in total, at most
-    `2 x batch_entries` per attempt (about 160,000 on the Stage 0 spans
-    load as written, about 1,600 at the decision 9 geometry, one batch in
-    either case) and the sections' bytes (about 2% of logs bytes, about
+    `2 x max(batch_entries, largest part's entries)` per attempt, which
+    is 500,000 at the default (about 160,000 on the Stage 0 spans load as
+    written, about 1,600 at the decision 9 geometry, one batch in either
+    case) and the sections' bytes (about 2% of logs bytes, about
     6% of span bytes); the request figure is the one that decides
     viability, as the Context's 566 s resolve shows, and both figures are
     banded in the acceptance table. That run scans until it has run;
@@ -757,7 +757,7 @@ cache state) and stamped into the report.
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
-| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports attempts = `ceil(entries / batch_entries)` and per attempt one snapshot PUT, one HEAD CAS and the batch's leaf PUTs, no window LIST; all four figures on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, more attempts than the formula, any LIST or a per-attempt request beyond the three kinds, or any figure missing from the report |
+| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports its attempt count (at least `ceil(entries / batch_entries)`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and one HEAD CAS; no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object GET, or any figure missing from the report |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 
@@ -773,7 +773,7 @@ cache state) and stamped into the report.
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
 | T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), inspector | 3 | ravel-logseg, ravel-catalog (config), ravel-cli | yes |
-| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index [--batch-entries N]` (one fold attempt and HEAD CAS per batch, batch parts excluded from the content-hash carry-forward, no reconcile pass), `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
+| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index [--batch-entries N]` (not a fold: attaches refs to unchanged parts, one HEAD CAS per batch), `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
 | T10 spans read path: routing, tier 2, tier 1, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T12 Stage 1: the Stage 0 arms re-run against the table above, acceptance amendment | all | docs | no |
