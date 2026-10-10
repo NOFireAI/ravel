@@ -218,6 +218,11 @@ blake3 = { workspace = true }
 # span's bounded fields (ADR-0044 section 5), the same way
 # services/ravel-server's own span tests do.
 tracing-subscriber = { workspace = true }
+# Dev-only: the logs and spans scan read-gate tests (ADR-1702 task 8) park a
+# block decode job with `ParkOnFirstArmedCall` and bound the test with
+# `run_with_watchdog`, the shared shape every placement test uses. A dev-only
+# workspace crate with no dependency beyond parking_lot.
+ravel-test-support = { workspace = true }
 # Dev-only: the `alerts` table's own tests build fixtures by hand-encoding
 # RLOG attrs matching the assumed `ravel-alerting` convention, never checked
 # against that crate's actual writer. This dependency lets one test build a
@@ -326,6 +331,13 @@ path = "tests/declared_stat_cstat_drops.rs"
 [[test]]
 name = "flight_span"
 path = "tests/flight_span.rs"
+
+# Installs a global `tracing` subscriber whose probe parks a block decode, and
+# for the same callsite-interest reason as flight_span needs no other test
+# reaching the fetcher's `decode` span in its process.
+[[test]]
+name = "logs_scan_read_gate"
+path = "tests/logs_scan_read_gate.rs"
 
 # Its opt-in stress test replaces the process-wide panic hook, which would
 # swallow the panic output of every other test running in the process.

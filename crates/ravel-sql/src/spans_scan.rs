@@ -38,6 +38,14 @@
 //! stream-identity blob to decode or re-verify here: [`build_batch`] copies
 //! `record.attrs` straight into the `Map(Utf8, Utf8)` column, and reads
 //! `service_name` from the [`SpanRow`]'s direct v3-column value.
+//!
+//! # Block decodes leave the runtime worker
+//!
+//! A block decode at or above the read gate's inline floor runs on the read
+//! CPU gate rather than on a tokio worker (ADR-1702 decision 1): with a gate
+//! on the fetcher, both exits drain blocks through `next_block_on_gate`, one
+//! `span_block` job per block, and the partition's fetch future stays pending
+//! while a block decodes. With no gate the decode runs inline.
 
 use std::fmt;
 use std::future::Future;
@@ -689,9 +697,12 @@ async fn prepare_columnar(
         else {
             continue;
         };
-        while let Some(cb) = scan.next_block().map_err(SqlError::from)? {
+        // A block at or above the inline floor of the fetcher's read gate, when
+        // it carries one (`SpanSegmentFetcher::with_read_gate`), decodes on the
+        // gate, so this partition's future is pending and the worker free.
+        while let Some(cb) = scan.next_block_on_gate().await.map_err(SqlError::from)? {
             // Counted before the eligibility check below: this block's pages
-            // were decompressed by `next_block` whether or not the partition
+            // were decompressed by `next_block_on_gate` whether or not the partition
             // goes on to abandon the attempt.
             pages_decoded += cb.block.pages_decoded();
             pages_skipped += cb.block.pages_skipped();
@@ -1919,5 +1930,311 @@ mod tests {
         for row in &pruned.records {
             assert_eq!(row.service_name.as_deref(), Some("checkout"));
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod read_gate_tests {
+    //! ADR-1702 task 8: with a read gate on the fetcher, the spans scan decodes
+    //! each block as one `span_block` job on both exits, so a block decode
+    //! leaves the runtime's worker free.
+
+    use std::sync::{OnceLock, Weak};
+    use std::thread::ThreadId;
+    use std::time::Duration;
+
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::ExecutionPlan;
+    use futures::StreamExt;
+    use ravel_catalog::{SegmentLevel, SegmentRef};
+    use ravel_cpu_gate::{CpuGateConfig, InstantClock, MonotonicClock, ReadGate, ReadSite};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
+    use ravel_test_support::{ParkOnFirstArmedCall, run_with_watchdog};
+    use uuid::Uuid;
+
+    use super::*;
+
+    const TENANT: TenantHash = TenantHash([6u8; 16]);
+    /// Spans in the fixture's one object. Each has its own trace id and the
+    /// writer cuts a block per record (`block_target_records: 1`), so this is
+    /// also its block count; the query window covers every span and pushes no
+    /// trace id or bloom literal, so every block survives and is decoded once.
+    const BLOCKS: u64 = 4;
+    const KEY: &str = "t/gate0.rspan";
+    const WATCHDOG: Duration = Duration::from_secs(30);
+
+    fn span(n: u8) -> SpanRecord {
+        SpanRecord {
+            trace_id: [n; 16],
+            span_id: [n; 8],
+            parent_span_id: None,
+            name: format!("op-{n}"),
+            start_ts_ns: i64::from(n),
+            end_ts_ns: i64::from(n) + 1,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![("service.name".to_string(), "svc".to_string())],
+        }
+    }
+
+    async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
+        let mut writer = RspanWriter::new(
+            RspanConfig {
+                block_target_records: 1,
+                ..RspanConfig::default()
+            },
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: [2u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for n in 0..BLOCKS as u8 {
+            writer.push(span(n));
+        }
+        let bytes = writer.finish().expect("finish");
+        let object_size = bytes.len() as u64;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let segment = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: BLOCKS as i64,
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS,
+            series_count: 0,
+            shard: 0,
+            content_hash: [4u8; 32],
+            writer_id: Uuid::from_u128(2),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        (store, vec![segment])
+    }
+
+    /// A read gate whose byte floor is 0, so every block is a gate job.
+    fn floor_zero_gate(clock: Arc<dyn MonotonicClock>) -> Arc<ReadGate> {
+        Arc::new(ReadGate::new(
+            CpuGateConfig {
+                permits: 2,
+                inline_floor_bytes: 0,
+                eval_floor_samples: 0,
+            },
+            clock,
+        ))
+    }
+
+    fn span_block_counts(gate: &ReadGate) -> (u64, u64) {
+        gate.snapshot()
+            .sites
+            .iter()
+            .find(|counts| counts.site == ReadSite::SpanBlock)
+            .map_or((0, 0), |counts| (counts.jobs, counts.inline))
+    }
+
+    fn total_inline(gate: &ReadGate) -> u64 {
+        gate.snapshot().sites.iter().map(|c| c.inline).sum()
+    }
+
+    /// `trace_id` and `start_ts` alone take the columnar exit; `None` emits
+    /// the full schema, `attrs` included, which takes the row exit.
+    fn exec(
+        store: &Arc<dyn ObjectStoreBackend>,
+        segments: &[SegmentRef],
+        gate: Option<Arc<ReadGate>>,
+        rows: bool,
+    ) -> SpansScanExec {
+        let fetcher = SpanSegmentFetcher::new(Arc::clone(store));
+        let fetcher = match gate {
+            Some(gate) => fetcher.with_read_gate(gate),
+            None => fetcher,
+        };
+        let projection = (!rows).then(|| {
+            vec![
+                crate::spans_schema::SPAN_COL_TRACE_ID,
+                crate::spans_schema::SPAN_COL_START_TS,
+            ]
+        });
+        SpansScanExec::new(
+            TENANT,
+            fetcher,
+            segments,
+            1,
+            SpanQuery::ts_range(0, BLOCKS as i64 + 1),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(Vec::new()),
+            projection,
+            QueryAccounting::new(),
+        )
+        .expect("scan")
+    }
+
+    async fn collect(plan: &SpansScanExec) -> Vec<RecordBatch> {
+        plan.execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .map(|b| b.expect("batch"))
+            .collect()
+            .await
+    }
+
+    fn metric_total(plan: &dyn ExecutionPlan, name: &str) -> usize {
+        plan.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == name)
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// With the floor at 0, a scan moves the `span_block` job count by exactly
+    /// the fixture's [`BLOCKS`], on the columnar exit and on the row exit,
+    /// runs nothing inline, and returns what the same scan returns with no
+    /// gate.
+    ///
+    /// Fails with the columnar drain back on the inline `next_block` (the
+    /// columnar case reads `(0, 0)`).
+    #[tokio::test]
+    async fn span_block_decodes_run_through_the_read_gate() {
+        let (store, segments) = fixture().await;
+        for rows in [false, true] {
+            let gate = floor_zero_gate(Arc::new(InstantClock::new()));
+            let gated = exec(&store, &segments, Some(Arc::clone(&gate)), rows);
+            let got = collect(&gated).await;
+            assert_eq!(
+                span_block_counts(&gate),
+                (BLOCKS, 0),
+                "one span_block job per fixture block (rows: {rows})"
+            );
+            assert_eq!(total_inline(&gate), 0, "nothing ran inline (rows: {rows})");
+            let path_batches = if rows {
+                METRIC_ROWPATH_BATCHES
+            } else {
+                METRIC_COLUMNAR_BATCHES
+            };
+            assert!(
+                metric_total(&gated, path_batches) > 0,
+                "the scan took the exit under test (rows: {rows})"
+            );
+            let want = collect(&exec(&store, &segments, None, rows)).await;
+            assert_eq!(got, want, "gated and inline output agree (rows: {rows})");
+        }
+    }
+
+    /// The gate's clock, parking the start of the `span_block` job numbered
+    /// `target`: the gate reads its clock on the blocking thread as a job
+    /// starts, after the job's site count has moved, so the first read off
+    /// the runtime thread once `target` jobs were dispatched is that job
+    /// holding its permit, before its decode runs.
+    struct ParkJobStart {
+        park: ParkOnFirstArmedCall,
+        gate: OnceLock<Weak<ReadGate>>,
+        runtime_thread: ThreadId,
+        target: u64,
+        inner: InstantClock,
+    }
+
+    impl MonotonicClock for ParkJobStart {
+        fn now_nanos(&self) -> u64 {
+            if std::thread::current().id() != self.runtime_thread
+                && let Some(gate) = self.gate.get().and_then(Weak::upgrade)
+                && span_block_counts(&gate).0 == self.target
+            {
+                self.park.arm();
+                self.park.now_ns();
+            }
+            self.inner.now_nanos()
+        }
+    }
+
+    /// With the last block's gate job parked, a concurrent task on the
+    /// `current_thread` runtime completes; released, the scan's output
+    /// equals, batch for batch, the same scan run with no gate.
+    ///
+    /// Parking the LAST block's job fails against a drain that offloads only
+    /// a part's first block (the job count never reaches [`BLOCKS`]) and
+    /// against the inline `next_block` (no job at all): either way the scan
+    /// finishes with nothing parked.
+    #[test]
+    fn span_scan_yields_while_a_block_decodes() {
+        run_with_watchdog(
+            WATCHDOG,
+            || format!("test hung for {WATCHDOG:?}: the parked block job held the runtime"),
+            || {
+                let (announce_tx, mut announce_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let clock = Arc::new(ParkJobStart {
+                    park: ParkOnFirstArmedCall::new(
+                        move || {
+                            let _ = announce_tx.send(());
+                        },
+                        release_rx,
+                    ),
+                    gate: OnceLock::new(),
+                    runtime_thread: std::thread::current().id(),
+                    target: BLOCKS,
+                    inner: InstantClock::new(),
+                });
+                let gate = floor_zero_gate(Arc::clone(&clock) as Arc<dyn MonotonicClock>);
+                clock
+                    .gate
+                    .set(Arc::downgrade(&gate))
+                    .expect("the clock's gate is set once");
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    let (store, segments) = fixture().await;
+                    let gated = exec(&store, &segments, Some(Arc::clone(&gate)), false);
+                    let stream = gated
+                        .execute(0, Arc::new(TaskContext::default()))
+                        .expect("execute");
+                    let mut scan = tokio::spawn(async move {
+                        stream
+                            .map(|b| b.expect("batch"))
+                            .collect::<Vec<RecordBatch>>()
+                            .await
+                    });
+                    match futures::future::select(Box::pin(announce_rx.recv()), &mut scan).await {
+                        futures::future::Either::Left((announced, _)) => {
+                            assert_eq!(announced, Some(()), "the parked job announced");
+                        }
+                        futures::future::Either::Right(_) => panic!(
+                            "the scan finished with no block job parked; {:?} span_block jobs ran",
+                            span_block_counts(&gate),
+                        ),
+                    }
+                    assert_eq!(gate.running(), 1, "the parked job holds its permit");
+                    let concurrent = tokio::spawn(async { 7u32 }).await.expect("task");
+                    assert_eq!(
+                        concurrent, 7,
+                        "a concurrent task completes while the job is parked"
+                    );
+
+                    release_tx.send(()).expect("release the parked job");
+                    let got = scan.await.expect("scan task");
+                    assert_eq!(span_block_counts(&gate), (BLOCKS, 0));
+                    let want = collect(&exec(&store, &segments, None, false)).await;
+                    assert!(!want.is_empty(), "the baseline returned rows");
+                    assert_eq!(got, want, "released, the output equals the inline baseline");
+                });
+            },
+        );
     }
 }

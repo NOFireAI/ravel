@@ -281,6 +281,16 @@
 //! merged column), and a record-attribute override survives (the merge resolves
 //! the key to the record's value, which wins). The merged column and the
 //! residual are the whole correctness story.
+//!
+//! # Block decodes leave the runtime worker
+//!
+//! A block decode at or above the read gate's inline floor runs on the read
+//! CPU gate rather than on a tokio worker (ADR-1702 decision 1): with a gate on
+//! the fetcher, each block is one `log_block` job, the columnar decode and its
+//! Arrow build together, the row path's through
+//! [`LogSegmentScan::next_block_on_gate`], and the stream returns `Pending`
+//! from [`LogScanState::DecodingColumnar`] or [`LogScanState::DecodingRows`]
+//! while it runs. With no gate the decode runs inline.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -319,6 +329,7 @@ use ravel_catalog::{
     validate_min_max_presence,
 };
 use ravel_commit::declared_stats::{StatCarrier, observe_declared_stat_drops};
+use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_logseg::footer::LogFooter;
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
@@ -326,6 +337,7 @@ use ravel_logseg::{
     FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats,
     SegmentDirectories, StrDictColumn,
 };
+use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
@@ -1297,8 +1309,10 @@ struct BlockMetrics {
     prefetch_revocations: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
-    /// columnar path, `next_block` on the row path. Nothing nested is timed
-    /// twice, and the buffered-output drain is under [`Self::emit_elapsed`].
+    /// columnar path, `next_block` on the row path. A decode on the read gate
+    /// is timed from the job's submission to its return, so this includes the
+    /// wait for a permit. Nothing nested is timed twice, and the
+    /// buffered-output drain is under [`Self::emit_elapsed`].
     decode_build_elapsed: Time,
     /// Wall time handing buffered output downstream: `emit_next_row_batch`
     /// (which builds the row-path batch) and `emit_next_columnar_batch`.
@@ -2421,12 +2435,18 @@ impl RowFetchSource {
                 seg.data_object_key
             )));
         };
-        let records = scan.next_block().map_err(SqlError::from)?.ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "row-ref block {block} not in segment {}'s surviving list",
-                seg.data_object_key
-            ))
-        })?;
+        // On the fetcher's read gate when it carries one, like the scan's own
+        // row path.
+        let records = scan
+            .next_block_on_gate()
+            .await
+            .map_err(SqlError::from)?
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "row-ref block {block} not in segment {}'s surviving list",
+                    seg.data_object_key
+                ))
+            })?;
         let mut out = Vec::with_capacity(rows.len());
         for &(row, position) in rows {
             let record = records.get(row).ok_or_else(|| {
@@ -2802,6 +2822,7 @@ impl ExecutionPlan for LogsScanExec {
             current_whole_object: None,
             current_dirs: None,
             state,
+            decoded: None,
             fetch: self.fetch,
             rows_emitted: 0,
         }))
@@ -3850,7 +3871,189 @@ enum LogScanState {
         scan: Box<LogSegmentScan>,
         skip: usize,
     },
+    /// One columnar block's decode and Arrow build, running as a read-gate
+    /// job that owns the scan (ADR-1702 decision 7). Resolved, the scan goes
+    /// back to [`LogScanState::Columnar`] with the block's outcome in
+    /// [`LogScanStream::decoded`].
+    DecodingColumnar {
+        job: ColumnarJobFuture,
+        /// When the job was submitted, so `decode_build_elapsed` includes the
+        /// wait for a gate permit.
+        started: Instant,
+    },
+    /// One row-path block decoding on the read gate through
+    /// [`LogSegmentScan::next_block_on_gate`]. Resolved, the scan goes back
+    /// to the state `resume` names with the block in
+    /// [`LogScanStream::decoded`].
+    DecodingRows {
+        job: RowJobFuture,
+        resume: RowResume,
+        started: Instant,
+    },
     Done,
+}
+
+type ColumnarJobFuture =
+    Pin<Box<dyn Future<Output = Result<(Box<LogSegmentScan>, ColumnarStep), CpuGateError>> + Send>>;
+
+type RowJobFuture = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Box<LogSegmentScan>,
+                    Option<usize>,
+                    Result<Option<Vec<LogRecord>>, LogFetchError>,
+                ),
+            > + Send,
+    >,
+>;
+
+/// The row-path state a [`LogScanState::DecodingRows`] job returns its scan
+/// to.
+#[derive(Clone, Copy)]
+enum RowResume {
+    Rows,
+    FallbackBlock { skip: usize },
+}
+
+/// A block a gate job decoded, taken by the state the job resumed.
+enum Decoded {
+    Columnar(ColumnarStep),
+    Rows {
+        /// The block's whole-object index, read before the decode.
+        block: Option<usize>,
+        next: Result<Option<Vec<LogRecord>>, LogFetchError>,
+    },
+}
+
+/// What [`LogScanStream::next_row_block`] did.
+enum RowNext {
+    /// The block's whole-object index, read before the decode, and the block.
+    Ready(Option<usize>, Result<Option<Vec<LogRecord>>, LogFetchError>),
+    /// The decode went to the read gate; the state is now
+    /// [`LogScanState::DecodingRows`].
+    Submitted,
+    Failed(DataFusionError),
+}
+
+/// One columnar block's outcome, owned, so the view (which borrows the scan)
+/// is dropped before the stream's state or reservation is touched.
+enum ColumnarStep {
+    Exhausted(ScanStats),
+    /// A block carrying an `attrs_raw` overflow page (or, only defensively,
+    /// an unexpected pending erasure): fall the rest of this segment back to
+    /// the row path.
+    Fallback,
+    /// A clean block's built batches (possibly empty for a block with no
+    /// surviving row), and the decoded block's own heap footprint, read off
+    /// the view before its borrow ends because the block stays resident
+    /// behind the reader while those batches drain.
+    Held {
+        batches: Vec<RecordBatch>,
+        block_bytes: usize,
+    },
+    /// A decode or build error, carried out of the view's borrow.
+    Failed(DataFusionError),
+}
+
+/// Everything one columnar block's decode and build read besides the scan,
+/// owned so the two can run together as one read-gate job.
+struct ColumnarBlockJob {
+    schema: SchemaRef,
+    projection: Arc<Vec<usize>>,
+    declared: Arc<Vec<DeclaredColumn>>,
+    attr_keys: Arc<Vec<String>>,
+    full_len: usize,
+    /// The segment field of the block's row refs.
+    segment: usize,
+    /// The block's surviving-block position for its row refs, from
+    /// [`block_index`]; consulted only when a block is decoded.
+    block: DFResult<Option<usize>>,
+}
+
+impl ColumnarBlockJob {
+    /// Decodes `scan`'s next block and builds its batches.
+    fn run(self, scan: &mut LogSegmentScan) -> ColumnarStep {
+        match scan.next_block_columnar() {
+            Ok(ColumnarBlockOutcome::Exhausted) => ColumnarStep::Exhausted(scan.stats()),
+            // The fast path is only entered with no erasure, so this is
+            // unreachable in practice; fall back rather than risk serving an
+            // erased record columnar.
+            Ok(ColumnarBlockOutcome::ErasurePending) => ColumnarStep::Fallback,
+            Ok(ColumnarBlockOutcome::Block(view)) => {
+                if view.has_attrs_raw_page() {
+                    return ColumnarStep::Fallback;
+                }
+                let built = self.block.and_then(|block| {
+                    build_columnar_batches(
+                        &view,
+                        &self.schema,
+                        &self.projection,
+                        &self.declared,
+                        &self.attr_keys,
+                        self.full_len,
+                        block.map(|block| RowRefRange {
+                            segment: self.segment,
+                            block,
+                            first_row: 0,
+                        }),
+                    )
+                });
+                match built {
+                    Ok(batches) => ColumnarStep::Held {
+                        batches,
+                        block_bytes: view.decoded_bytes(),
+                    },
+                    Err(e) => ColumnarStep::Failed(e),
+                }
+            }
+            Err(e) => ColumnarStep::Failed(SqlError::from(e).into()),
+        }
+    }
+}
+
+/// `job` on `gate` as one [`ReadSite::LogBlock`] job: the block's decode and
+/// its Arrow build both leave the runtime worker, and the scan comes back
+/// with the outcome.
+fn columnar_block_on_gate(
+    gate: Arc<ReadGate>,
+    size: JobSize,
+    mut scan: Box<LogSegmentScan>,
+    job: ColumnarBlockJob,
+) -> ColumnarJobFuture {
+    Box::pin(async move {
+        gate.run(ReadSite::LogBlock, size, move || {
+            let step = job.run(&mut scan);
+            (scan, step)
+        })
+        .await
+    })
+}
+
+/// The row path's next block on the read gate, the scan returned with it.
+fn row_block_on_gate(mut scan: Box<LogSegmentScan>) -> RowJobFuture {
+    Box::pin(async move {
+        let block = scan.next_block_index();
+        let next = scan.next_block_on_gate().await;
+        (scan, block, next)
+    })
+}
+
+/// A columnar block job that failed on the gate, classified the way the
+/// fetcher classifies its own gated block decodes: a panic is the decode's
+/// failure, a job that never ran is transient.
+fn log_block_gate_failed(key: &str, err: CpuGateError) -> DataFusionError {
+    let fetch = match err {
+        CpuGateError::Panicked => LogFetchError::Corrupt {
+            key: key.to_string(),
+            source: LogSegError::Corrupted(format!("read CPU gate: {err}")),
+        },
+        CpuGateError::Cancelled | CpuGateError::Closed => LogFetchError::Store {
+            key: key.to_string(),
+            source: StoreError::Transient(format!("read CPU gate: {err}")),
+        },
+    };
+    SqlError::from(fetch).into()
 }
 
 /// The block currently being drained into output batches, and the form it is
@@ -4075,7 +4278,7 @@ struct LogScanStream {
     block_cursor: usize,
     /// Count of `attrs_raw`-overflow fallbacks (issue #1769) since the last
     /// clean columnar block in the current segment, reset to 0 at
-    /// `NextSegment` and by [`Step::Held`]. `max_dynamic_columns`
+    /// `NextSegment` and by [`ColumnarStep::Held`]. `max_dynamic_columns`
     /// (`crates/ravel-logseg/src/writer.rs`, `block.rs`) is a PER-OBJECT
     /// budget, so once a tenant's declared-plus-dynamic key count for a
     /// segment exceeds it, the overflow keys recur across most of that
@@ -4130,6 +4333,10 @@ struct LogScanStream {
     /// phase).
     current_dirs: Option<Arc<CarriedDirs>>,
     state: LogScanState,
+    /// The block a [`LogScanState::DecodingColumnar`] or
+    /// [`LogScanState::DecodingRows`] job decoded, taken by the state the job
+    /// returned its scan to on the next turn of the poll loop.
+    decoded: Option<Decoded>,
     /// The `fetch` pushed into the exec (issue #362), carried unchanged from
     /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
     /// it owns, exactly the pre-#362 behavior.
@@ -4507,6 +4714,68 @@ impl LogScanStream {
         self.pending = Pending::None;
     }
 
+    /// The scan the state holds reported exhaustion: publish its final
+    /// counters and move to the next owned segment.
+    fn end_scanned_segment(&mut self) {
+        if let LogScanState::Columnar(scan)
+        | LogScanState::Rows(scan)
+        | LogScanState::RowFallbackBlock { scan, .. } = &self.state
+        {
+            let stats = scan.stats();
+            self.blocks.record_scan(&stats);
+            if self.fast_whole_segment {
+                self.blocks.record_segment_totals(&stats);
+            }
+        }
+        self.mark_segment("seg_done_offset");
+        self.finish_segment();
+    }
+
+    /// The next block of the row-path scan the state holds: the one a
+    /// [`LogScanState::DecodingRows`] job just decoded, or, with none waiting,
+    /// a new decode. That decode goes to the read gate as a job when the
+    /// scan's fetcher carries one, leaving the state at
+    /// [`LogScanState::DecodingRows`] to return to `resume`, and runs inline
+    /// otherwise. Exhaustion decodes nothing and always runs inline.
+    fn next_row_block(&mut self, resume: RowResume) -> RowNext {
+        match self.decoded.take() {
+            Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, next),
+            Some(Decoded::Columnar(_)) => {
+                return RowNext::Failed(DataFusionError::Internal(
+                    "a columnar block resumed on the row path".into(),
+                ));
+            }
+            None => {}
+        }
+        let (LogScanState::Rows(scan) | LogScanState::RowFallbackBlock { scan, .. }) =
+            &mut self.state
+        else {
+            return RowNext::Failed(DataFusionError::Internal(
+                "row block requested off a row-path state".into(),
+            ));
+        };
+        if scan.remaining_blocks() > 0 && scan.block_gate().is_some() {
+            let (LogScanState::Rows(scan) | LogScanState::RowFallbackBlock { scan, .. }) =
+                std::mem::replace(&mut self.state, LogScanState::Done)
+            else {
+                return RowNext::Failed(DataFusionError::Internal(
+                    "row block requested off a row-path state".into(),
+                ));
+            };
+            self.state = LogScanState::DecodingRows {
+                job: row_block_on_gate(scan),
+                resume,
+                started: Instant::now(),
+            };
+            return RowNext::Submitted;
+        }
+        let decode_started = Instant::now();
+        let block = scan.next_block_index();
+        let next = scan.next_block();
+        self.blocks.decode_build_elapsed.add_elapsed(decode_started);
+        RowNext::Ready(block, next)
+    }
+
     /// This partition is done with the current segment: drop its handle on the
     /// segment's directories and move to the next owned segment.
     fn finish_segment(&mut self) {
@@ -4533,10 +4802,17 @@ impl LogScanStream {
                     self.blocks.record_segment_totals(&stats);
                 }
             }
+            // A block job runs only while nothing is held, so no row has been
+            // emitted since the last check and `fetch` cannot be reached with
+            // one in flight. Dropping it abandons the job; the scan folds its
+            // accounting when it drops, with the future or with the job's
+            // discarded result.
             LogScanState::Planning(_)
             | LogScanState::NextSegment
             | LogScanState::Opening(_)
             | LogScanState::ReopenRows { .. }
+            | LogScanState::DecodingColumnar { .. }
+            | LogScanState::DecodingRows { .. }
             | LogScanState::Done => {}
         }
         self.current_dirs = None;
@@ -4891,92 +5167,72 @@ impl LogScanStream {
                     Poll::Pending => return Poll::Pending,
                 },
                 LogScanState::Columnar(scan) => {
-                    // One of three outcomes, folded into an owned step so the
-                    // view (which borrows `scan`) is dropped before `this.state`
-                    // or the reservation is touched.
-                    enum Step {
-                        Exhausted(ScanStats),
-                        // A block carrying an `attrs_raw` overflow page (or, only
-                        // defensively, an unexpected pending erasure): fall the
-                        // rest of this segment back to the row path.
-                        Fallback,
-                        // A clean block's built batches (possibly empty for a
-                        // block with no surviving row), and the decoded block's
-                        // own heap footprint, read off the view before its
-                        // borrow ends because the block stays resident behind
-                        // the reader while those batches drain.
-                        Held {
-                            batches: Vec<RecordBatch>,
-                            block_bytes: usize,
-                        },
-                        // A decode or build error, carried out of the view's
-                        // borrow so it can be handled once the borrow ends.
-                        Failed(DataFusionError),
-                    }
-                    // The view borrows `scan`, so every outcome is folded into an
-                    // owned `Step` here; `this.fail`/`this.state` are only touched
-                    // after the match, once that borrow has ended.
-                    let decode_started = Instant::now();
-                    // The block this call decodes, read from the scan's own
-                    // survivor list before the decode (the view it returns
-                    // holds the scan borrowed until it is dropped).
-                    let decoded_block = scan.next_block_index();
-                    let step = match scan.next_block_columnar() {
-                        Ok(ColumnarBlockOutcome::Exhausted) => Step::Exhausted(scan.stats()),
-                        // The fast path is only entered with no erasure, so this
-                        // is unreachable in practice; fall back rather than
-                        // risk serving an erased record columnar.
-                        Ok(ColumnarBlockOutcome::ErasurePending) => Step::Fallback,
-                        Ok(ColumnarBlockOutcome::Block(view)) => {
-                            if view.has_attrs_raw_page() {
-                                Step::Fallback
-                            } else {
-                                // The row-ref address of the block just decoded,
-                                // resolved from `decoded_block` (issue #2417),
-                                // not from the cursor's position in
-                                // `current_indices`. It is built here, after
-                                // the decode, and folded into `Step::Failed`
-                                // rather than returned early because `scan`
-                                // borrows `this.state` for the whole arm.
-                                let built = block_index(
+                    let step = match this.decoded.take() {
+                        Some(Decoded::Columnar(step)) => step,
+                        Some(Decoded::Rows { .. }) => {
+                            return this.fail(DataFusionError::Internal(
+                                "a row-path block resumed on the columnar path".into(),
+                            ));
+                        }
+                        None => {
+                            // The row-ref address of the block this call
+                            // decodes, resolved from the scan's own next block
+                            // (issue #2417), not from the cursor's position in
+                            // `current_indices`. Read before the decode, since
+                            // the view it returns holds the scan borrowed; only
+                            // a decoded block consumes it, and with no next
+                            // block none is decoded.
+                            let block = match scan.next_block_index() {
+                                Some(next) => block_index(
                                     this.row_refs,
                                     this.current_survivors.as_deref().map(Vec::as_slice),
-                                    decoded_block,
+                                    Some(next),
                                     this.block_cursor,
                                     this.current_seg
                                         .as_ref()
                                         .map_or("", |s| s.data_object_key.as_str()),
-                                )
-                                .and_then(|block| {
-                                    build_columnar_batches(
-                                        &view,
-                                        &this.schema,
-                                        &this.projection,
-                                        &this.declared,
-                                        &this.attr_keys,
-                                        this.full_len,
-                                        block.map(|block| RowRefRange {
-                                            segment: this.current_seg_ordinal,
-                                            block,
-                                            first_row: 0,
-                                        }),
-                                    )
-                                });
-                                match built {
-                                    Ok(batches) => Step::Held {
-                                        batches,
-                                        block_bytes: view.decoded_bytes(),
-                                    },
-                                    Err(e) => Step::Failed(e),
+                                ),
+                                None => Ok(None),
+                            };
+                            let job = ColumnarBlockJob {
+                                schema: Arc::clone(&this.schema),
+                                projection: Arc::clone(&this.projection),
+                                declared: Arc::clone(&this.declared),
+                                attr_keys: Arc::clone(&this.attr_keys),
+                                full_len: this.full_len,
+                                segment: this.current_seg_ordinal,
+                                block,
+                            };
+                            match scan.block_gate() {
+                                // Exhaustion decodes nothing, so it submits no
+                                // job.
+                                Some((gate, size)) if scan.remaining_blocks() > 0 => {
+                                    let LogScanState::Columnar(scan) =
+                                        std::mem::replace(&mut this.state, LogScanState::Done)
+                                    else {
+                                        return this.fail(DataFusionError::Internal(
+                                            "columnar decode submitted off a non-columnar state"
+                                                .into(),
+                                        ));
+                                    };
+                                    this.state = LogScanState::DecodingColumnar {
+                                        job: columnar_block_on_gate(gate, size, scan, job),
+                                        started: Instant::now(),
+                                    };
+                                    continue;
+                                }
+                                _ => {
+                                    let decode_started = Instant::now();
+                                    let step = job.run(scan);
+                                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                                    step
                                 }
                             }
                         }
-                        Err(e) => Step::Failed(SqlError::from(e).into()),
                     };
-                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
                     match step {
-                        Step::Failed(e) => return this.fail(e),
-                        Step::Exhausted(stats) => {
+                        ColumnarStep::Failed(e) => return this.fail(e),
+                        ColumnarStep::Exhausted(stats) => {
                             this.blocks.record_scan(&stats);
                             // The whole-segment fast path has no plan phase, so
                             // the whole-segment prune totals are recorded here,
@@ -4988,7 +5244,7 @@ impl LogScanStream {
                             this.mark_segment("seg_done_offset");
                             this.finish_segment();
                         }
-                        Step::Fallback => {
+                        ColumnarStep::Fallback => {
                             // Re-open the segment on the row path over the SAME
                             // block-index list this partition owns (ADR-0102),
                             // skipping the blocks already fully emitted (columnar,
@@ -5037,7 +5293,7 @@ impl LogScanStream {
                                 skip: this.block_cursor,
                             };
                         }
-                        Step::Held {
+                        ColumnarStep::Held {
                             batches,
                             block_bytes,
                         } => {
@@ -5064,11 +5320,12 @@ impl LogScanStream {
                         }
                     }
                 }
-                LogScanState::Rows(scan) => {
-                    let decode_started = Instant::now();
-                    let decoded_block = scan.next_block_index();
-                    let next = scan.next_block();
-                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                LogScanState::Rows(_) => {
+                    let (decoded_block, next) = match this.next_row_block(RowResume::Rows) {
+                        RowNext::Ready(block, next) => (block, next),
+                        RowNext::Submitted => continue,
+                        RowNext::Failed(e) => return this.fail(e),
+                    };
                     match next {
                         Ok(Some(records)) => {
                             // Stamp the block's row-ref address before the
@@ -5087,47 +5344,36 @@ impl LogScanStream {
                         }
                         // Only `None` ends the segment. Its counters are final
                         // now, so publish them before moving on.
-                        Ok(None) => {
-                            let stats = scan.stats();
-                            this.blocks.record_scan(&stats);
-                            if this.fast_whole_segment {
-                                this.blocks.record_segment_totals(&stats);
-                            }
-                            this.mark_segment("seg_done_offset");
-                            this.finish_segment();
-                        }
+                        Ok(None) => this.end_scanned_segment(),
                         Err(e) => return this.fail(SqlError::from(e).into()),
                     }
                 }
-                LogScanState::RowFallbackBlock { scan, skip } => {
+                LogScanState::RowFallbackBlock { skip, .. } => {
                     // Drain and discard the blocks already fully emitted
                     // (columnar, or row-emitted by an earlier fallback in this
                     // same segment), then take exactly the next block -- the one
                     // that carried the `attrs_raw` overflow page -- through the
                     // row path.
-                    if *skip > 0 {
-                        let decode_started = Instant::now();
-                        let next = scan.next_block();
-                        this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                    let skip = *skip;
+                    let (decoded_block, next) =
+                        match this.next_row_block(RowResume::FallbackBlock { skip }) {
+                            RowNext::Ready(block, next) => (block, next),
+                            RowNext::Submitted => continue,
+                            RowNext::Failed(e) => return this.fail(e),
+                        };
+                    if skip > 0 {
                         match next {
-                            Ok(Some(_)) => *skip -= 1,
-                            Ok(None) => {
-                                let stats = scan.stats();
-                                this.blocks.record_scan(&stats);
-                                if this.fast_whole_segment {
-                                    this.blocks.record_segment_totals(&stats);
+                            Ok(Some(_)) => {
+                                if let LogScanState::RowFallbackBlock { skip, .. } = &mut this.state
+                                {
+                                    *skip -= 1;
                                 }
-                                this.mark_segment("seg_done_offset");
-                                this.finish_segment();
                             }
+                            Ok(None) => this.end_scanned_segment(),
                             Err(e) => return this.fail(SqlError::from(e).into()),
                         }
                         continue;
                     }
-                    let decode_started = Instant::now();
-                    let decoded_block = scan.next_block_index();
-                    let next = scan.next_block();
-                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
                     match next {
                         Ok(Some(records)) => {
                             // Stamp the block's row-ref address before the
@@ -5181,17 +5427,50 @@ impl LogScanStream {
                         // `skip` already discarded) must yield it too. Treated
                         // as end-of-segment rather than panicking, matching
                         // `ReopenRows`'s own `Ok(None)` handling above.
-                        Ok(None) => {
-                            let stats = scan.stats();
-                            this.blocks.record_scan(&stats);
-                            if this.fast_whole_segment {
-                                this.blocks.record_segment_totals(&stats);
-                            }
-                            this.mark_segment("seg_done_offset");
-                            this.finish_segment();
-                        }
+                        Ok(None) => this.end_scanned_segment(),
                         Err(e) => return this.fail(SqlError::from(e).into()),
                     }
+                }
+                LogScanState::DecodingColumnar { job, started } => {
+                    let started = *started;
+                    let ran = match job.as_mut().poll(cx) {
+                        Poll::Ready(ran) => ran,
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    this.blocks.decode_build_elapsed.add_elapsed(started);
+                    match ran {
+                        Ok((scan, step)) => {
+                            this.decoded = Some(Decoded::Columnar(step));
+                            this.state = LogScanState::Columnar(scan);
+                        }
+                        Err(err) => {
+                            let key = this
+                                .current_seg
+                                .as_ref()
+                                .map_or("", |s| s.data_object_key.as_str());
+                            let e = log_block_gate_failed(key, err);
+                            return this.fail(e);
+                        }
+                    }
+                }
+                LogScanState::DecodingRows {
+                    job,
+                    resume,
+                    started,
+                } => {
+                    let (resume, started) = (*resume, *started);
+                    let (scan, block, next) = match job.as_mut().poll(cx) {
+                        Poll::Ready(ran) => ran,
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    this.blocks.decode_build_elapsed.add_elapsed(started);
+                    this.decoded = Some(Decoded::Rows { block, next });
+                    this.state = match resume {
+                        RowResume::Rows => LogScanState::Rows(scan),
+                        RowResume::FallbackBlock { skip } => {
+                            LogScanState::RowFallbackBlock { scan, skip }
+                        }
+                    };
                 }
                 LogScanState::Done => return Poll::Ready(None),
             }
@@ -10524,5 +10803,242 @@ mod fast_path_prefetch_tests {
         assert_eq!(rows1, rows_of(&[0, 1, 2, 3, 4, 5]));
         drop(s1);
         assert_eq!(budget.reserved(), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod read_gate_tests {
+    //! ADR-1702 task 8: with a read gate on the fetcher, the logs scan
+    //! decodes each block as one `log_block` job. The placement test, that a
+    //! parked block decode leaves the runtime free, is
+    //! `tests/logs_scan_read_gate.rs`, in a binary of its own.
+
+    use super::*;
+    use datafusion::physical_plan::ExecutionPlan;
+    use ravel_catalog::SegmentLevel;
+    use ravel_cpu_gate::{CpuGateConfig, InstantClock};
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogWriter};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    /// Records in the fixture's one object. The writer cuts a block per
+    /// record (`block_target_records: 1`), so this is also its block count,
+    /// and with no predicate and a window over every record each block
+    /// survives pruning and is decoded exactly once.
+    const BLOCKS: u64 = 4;
+    const KEY: &str = "t/gate0.rlog";
+
+    /// One object of [`BLOCKS`] one-record blocks, each carrying one
+    /// attribute, so no block has an `attrs_raw` page and the columnar
+    /// drain never falls back.
+    fn object() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [5u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for ts in 0..BLOCKS as i64 {
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {ts} {}", "payload ".repeat(16)),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![("a".to_string(), AttrValue::Str(format!("a{ts}")))],
+                })
+                .expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let obj = object();
+        store
+            .put(KEY, bytes::Bytes::from(obj.clone()), PutOptions::default())
+            .await
+            .expect("put");
+        let segment = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: obj.len() as u64,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: BLOCKS as i64 - 1,
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS,
+            series_count: 0,
+            shard: 0,
+            content_hash: [3u8; 32],
+            writer_id: Uuid::from_u128(5),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        (store, vec![segment])
+    }
+
+    /// A read gate whose byte floor is 0, so every block is a gate job.
+    fn floor_zero_gate() -> Arc<ReadGate> {
+        Arc::new(ReadGate::new(
+            CpuGateConfig {
+                permits: 2,
+                inline_floor_bytes: 0,
+                eval_floor_samples: 0,
+            },
+            Arc::new(InstantClock::new()),
+        ))
+    }
+
+    fn site_counts(gate: &ReadGate, site: ReadSite) -> (u64, u64) {
+        gate.snapshot()
+            .sites
+            .iter()
+            .find(|counts| counts.site == site)
+            .map_or((0, 0), |counts| (counts.jobs, counts.inline))
+    }
+
+    fn total_inline(gate: &ReadGate) -> u64 {
+        gate.snapshot().sites.iter().map(|c| c.inline).sum()
+    }
+
+    /// `ts` alone is the columnar fast path; adding `attrs` makes the scan
+    /// statically ineligible for it, so every block drains the row path.
+    fn projection(rows: bool) -> Vec<usize> {
+        if rows {
+            vec![crate::logs_schema::LOG_COL_TS, LOG_COL_ATTRS]
+        } else {
+            vec![crate::logs_schema::LOG_COL_TS]
+        }
+    }
+
+    /// A one-partition scan over the whole fixture window, with `gate` on
+    /// the fetcher when given.
+    fn exec(
+        store: &Arc<dyn ObjectStoreBackend>,
+        segments: &[SegmentRef],
+        gate: Option<Arc<ReadGate>>,
+        rows: bool,
+    ) -> LogsScanExec {
+        let fetcher = LogSegmentFetcher::new(Arc::clone(store));
+        let fetcher = match gate {
+            Some(gate) => fetcher.with_read_gate(gate),
+            None => fetcher,
+        };
+        LogsScanExec::new(
+            TENANT,
+            fetcher,
+            segments,
+            1,
+            0,
+            BLOCKS as i64,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Some(&projection(rows)),
+            PhaseAccounting::new(),
+            crate::logs_schema::logs_schema_with_declared(&[]),
+            Arc::new(Vec::new()),
+        )
+        .expect("scan")
+    }
+
+    async fn collect(plan: &LogsScanExec) -> Vec<RecordBatch> {
+        plan.execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .map(|b| b.expect("batch"))
+            .collect()
+            .await
+    }
+
+    fn metric_total(plan: &dyn ExecutionPlan, name: &str) -> usize {
+        plan.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == name && m.labels().is_empty())
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// With the floor at 0, a scan moves the `log_block` job count by exactly
+    /// the fixture's [`BLOCKS`], on the columnar path and on the row path, runs
+    /// nothing inline, and returns what the same scan returns with no gate.
+    ///
+    /// Fails with the columnar path's `gate.run` wrap removed (the columnar
+    /// case reads `(0, 0)`), and with the row path back on the inline
+    /// `next_block` (the row case reads `(0, 0)`).
+    #[tokio::test]
+    async fn log_block_decodes_run_through_the_read_gate() {
+        let (store, segments) = fixture().await;
+        for rows in [false, true] {
+            let gate = floor_zero_gate();
+            let gated = exec(&store, &segments, Some(Arc::clone(&gate)), rows);
+            let got = collect(&gated).await;
+            assert_eq!(
+                site_counts(&gate, ReadSite::LogBlock),
+                (BLOCKS, 0),
+                "one log_block job per fixture block (rows path: {rows})"
+            );
+            assert_eq!(total_inline(&gate), 0, "nothing ran inline (rows: {rows})");
+            let path_batches = if rows {
+                "rowpath_batches"
+            } else {
+                "columnar_batches"
+            };
+            assert!(
+                metric_total(&gated, path_batches) > 0,
+                "the scan took the path under test (rows: {rows})"
+            );
+            let want = collect(&exec(&store, &segments, None, rows)).await;
+            assert_eq!(got, want, "gated and inline output agree (rows: {rows})");
+        }
+    }
+
+    /// The late-materialization re-read of one block
+    /// ([`RowFetchSource::fetch_block`]) is one `log_block` job per block, and
+    /// returns the record the same re-read returns with no gate.
+    ///
+    /// Fails with `fetch_block` back on the inline `next_block`: the count
+    /// reads `(0, 0)`.
+    #[tokio::test]
+    async fn row_ref_block_fetches_run_through_the_read_gate() {
+        let (store, segments) = fixture().await;
+        let gate = floor_zero_gate();
+        let gated = exec(&store, &segments, Some(Arc::clone(&gate)), false).row_fetch_source();
+        let inline = exec(&store, &segments, None, false).row_fetch_source();
+        for block in 0..BLOCKS as usize {
+            let got = gated
+                .fetch_block(0, block, &[(0, block)])
+                .await
+                .expect("gated fetch");
+            let want = inline
+                .fetch_block(0, block, &[(0, block)])
+                .await
+                .expect("inline fetch");
+            assert_eq!(got.len(), 1, "one record per one-record block");
+            assert_eq!(got, want, "gated and inline re-reads agree (block {block})");
+        }
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (BLOCKS, 0));
+        assert_eq!(total_inline(&gate), 0, "nothing ran inline");
     }
 }

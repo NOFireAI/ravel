@@ -382,6 +382,18 @@ impl LogSegmentScan {
         self.scan.as_ref().and_then(BlockScan::next_block_index)
     }
 
+    /// The read gate this scan's block decodes run on and the size each block
+    /// job is charged at, the same pair
+    /// [`next_block_on_gate`](Self::next_block_on_gate) submits with. For a
+    /// caller that moves this scan into its own gate job around
+    /// [`next_block_columnar`](Self::next_block_columnar), whose borrowed view
+    /// cannot leave a job. `None` when the fetcher has no gate.
+    pub fn block_gate(&self) -> Option<(Arc<ReadGate>, JobSize)> {
+        self.read_gate
+            .as_ref()
+            .map(|gate| (Arc::clone(gate), JobSize::Bytes(self.block_job_bytes)))
+    }
+
     /// Arms the test hook: the next gated block decode panics inside its job.
     #[cfg(test)]
     pub(crate) fn panic_next_gate_job_for_test(&mut self) {
