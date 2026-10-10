@@ -2386,10 +2386,15 @@ with its own credential.
 An entry with `tenant: None` is unkeyed and reachable by every local tenant.
 That is the shape of a deployment written before the mapping existed, and it is
 safe only where the coordinator runs queries for one local tenant, so
-`ravel-server` refuses one at startup whenever it runs queries for more than
-one. That covers a second `--tenant-token` tenant, a dynamic resolver, and an
+`ravel-server` refuses one at startup whenever it can serve more than one.
+That covers a second `--tenant-token` tenant, a dynamic resolver, an
 `--alert-rules-file` naming a tenant no token does, because the alert evaluator
-queries the same federated engine. The operator guide states which
+queries the same federated engine, and `--tenant-hash-key-file` set (a keyed
+bucket, which is the default for a fresh bucket) in All, Gateway or Query mode.
+Those three modes install the durable `sys/auth` bearer resolver, so a tenant
+can be onboarded without a restart, and the guard applies in all three; of
+them, only All and Query serve queries. On a keyed bucket every
+`--remote-cluster` needs `tenant=`, even with a single `--tenant-token`. The operator guide states which
 configurations that covers:
 docs/guides/distributed-query.md.
 

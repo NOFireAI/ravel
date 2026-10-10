@@ -75,7 +75,8 @@ the startup refusal for the configurations that still cannot be expressed.
 
 4. **An unkeyed remote still serves every local tenant, and is still refused on a
    multi-tenant coordinator.** `tenant: None` is the shape of every deployment
-   written before this ADR, and it stays byte-identical for them.
+   written before this ADR, and it stays byte-identical for them (on an unkeyed
+   bucket only; see the ADR-2708 D1 amendment below).
    `ensure_federation_tenant_mapping` (replacing
    `ensure_federation_single_tenant`) refuses an unkeyed spec whenever the
    coordinator runs queries for more than one local tenant, naming every such
@@ -129,7 +130,8 @@ the startup refusal for the configurations that still cannot be expressed.
   than passing the isolation assertion for the wrong reason.
 - Existing single-tenant deployments are unaffected: no spec changes, no
   behavior changes, and the pre-existing tests construct unkeyed remotes
-  unchanged.
+  unchanged. This holds on an unkeyed bucket only; see the ADR-2708 D1
+  amendment below.
 - The remote's `LabelSet` is still decoded from the wire rather than re-derived
   locally, and this ADR deliberately does not change that. `SeriesId::compute`
   takes the `TenantId` the series belongs to, and for a remote series that is the
@@ -146,3 +148,23 @@ the startup refusal for the configurations that still cannot be expressed.
 - `docs/guides/distributed-query.md`, `docs/guides/operations/deployment.md`,
   `docs/query-engine.md` and the generated flag reference all described
   federation as single-tenant and are updated with the mapping.
+
+## Amendment (2026-10-10): durable sys/auth tenancy on a keyed bucket (ADR-2708 D1)
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-2708 D1 amendment" -->
+
+ADR-2708 D1 (issue #2709) counts the durable `sys/auth` bearer resolver as a
+dynamic resolver. `start` installs it on a keyed bucket in All, Gateway or
+Query mode (`durable_auth_enabled`), and a keyed bucket is the default for a
+fresh bucket. There a tenant can be onboarded without a restart, so the
+static configuration does not bound the tenant set. Two effects on this ADR:
+
+- Decision 4: an unkeyed spec is refused on such a process even with one
+  `--tenant-token`. The byte-identical promise for pre-mapping deployments
+  holds only on a bucket created with `--tenant-hash-unkeyed`; a keyed
+  single-tenant deployment must add `tenant=` to every `--remote-cluster`.
+- Decision 5: the can-never-fire check does not apply on such a process, so a
+  `tenant` naming a tenant provisioned only through `sys/auth` starts.
+
+The Consequences bullet saying existing single-tenant deployments are
+unaffected holds on an unkeyed bucket only.

@@ -2399,8 +2399,11 @@ pub struct Cli {
     /// A remote cluster this coordinator federates a query out to (ADR-0071
     /// cross-cluster federation). Repeatable: one flag per remote. Its
     /// credential belongs to one local tenant, named by the `tenant` key; a
-    /// spec that names none is refused on a coordinator that runs queries for
-    /// more than one local tenant.
+    /// spec that names none is refused on a process that can serve more than
+    /// one local tenant. A bucket keyed with `--tenant-hash-key-file` (the
+    /// default for a fresh bucket) in all, gateway or query mode is such a
+    /// process: durable sys/auth bearer tokens can onboard a tenant there
+    /// without a restart, so `tenant` is required.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
@@ -2439,15 +2442,15 @@ pub struct Cli {
     ///
     /// Omitting `tenant` leaves the remote reachable by every local tenant,
     /// which is correct only where the coordinator runs queries for one. A
-    /// coordinator that runs queries for more than one (two or more
-    /// `--tenant-token` tenants, an `--alert-rules-file` naming a tenant no
-    /// token does, or any of `--dev-insecure-tenant-header`, `--oidc-issuer`,
-    /// or `--mtls-enabled`) refuses to start with such a spec, rather than
-    /// fanning every local tenant's selectors and discovery out under the same
-    /// credential and returning another tenant's series. A `tenant` named by
-    /// neither a `--tenant-token` nor an `--alert-rules-file` rule is also
-    /// refused where the tenant set is fully known: it can never fire. A
-    /// tenant that only alert rules name is a valid target.
+    /// process that can serve more than one (two or more `--tenant-token`
+    /// tenants, an `--alert-rules-file` naming a tenant no token does, any of
+    /// `--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`, or
+    /// a keyed bucket in all, gateway or query mode) refuses to start with such
+    /// a spec, rather than fanning every local tenant's selectors and discovery
+    /// out under the same credential and returning another tenant's series. A
+    /// `tenant` named by neither a `--tenant-token` nor an `--alert-rules-file`
+    /// rule is also refused where the tenant set is fully known: it can never
+    /// fire. A tenant that only alert rules name is a valid target.
     ///
     /// Example:
     /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme,skip-unavailable=true`
@@ -5016,9 +5019,10 @@ pub struct RemoteClusterConfig {
     /// `None` means the spec carried no `tenant` key: the remote serves every
     /// local tenant. That is only expressible on a coordinator that runs queries
     /// for at most one local tenant (its `--tenant-token` values and its
-    /// `--alert-rules-file` tenants together), which
-    /// [`crate::ensure_federation_tenant_mapping`] enforces at startup; it is
-    /// what every pre-`tenant` federation deployment already is.
+    /// `--alert-rules-file` tenants together) and has no dynamic resolver, which
+    /// [`crate::ensure_federation_tenant_mapping`] enforces at startup. Durable
+    /// sys/auth bearer tokens count as a dynamic resolver, so a keyed bucket in
+    /// all, gateway or query mode requires `tenant` on every spec.
     ///
     /// To serve two local tenants from one remote endpoint, write one
     /// `--remote-cluster` per local tenant, each with its own `name` and its own
@@ -6236,7 +6240,9 @@ impl Cli {
     /// endpoint is two specs, not one spec naming two tenants. A spec with no
     /// `tenant` key serves every local tenant and is accepted only on a
     /// coordinator that runs queries for at most one, which
-    /// [`crate::ensure_federation_tenant_mapping`] checks at startup.
+    /// [`crate::ensure_federation_tenant_mapping`] checks at startup. A keyed
+    /// bucket in all, gateway or query mode never qualifies: durable sys/auth
+    /// bearer tokens can onboard another tenant there without a restart.
     ///
     /// `tls` defaults to `true`. A spec that carries `tls-ca-file` and no `tls`
     /// key therefore means "TLS on, with this CA trusted" and is accepted; only
@@ -6280,7 +6286,8 @@ impl Cli {
                             anyhow::bail!(
                                 "invalid --remote-cluster '{spec}': tenant is empty; name the \
                                  local tenant whose queries fan out to this remote, or omit the \
-                                 key entirely on a single-tenant coordinator"
+                                 key entirely on a single-tenant coordinator over an unkeyed \
+                                 bucket"
                             );
                         }
                         // Refuse a repeat rather than take the last one. A spec

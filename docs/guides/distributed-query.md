@@ -520,8 +520,8 @@ ravel-server --mode query \
   --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
   --fragment-tls-key /etc/ravel/fragment-tls/tls.key \
   --fragment-tls-ca /etc/ravel/fragment-ca/ca.crt \
-  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls-ca-file=/etc/ravel/eu-ca.pem,skip-unavailable=true \
-  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,soft-timeout=15s \
+  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme,tls-ca-file=/etc/ravel/eu-ca.pem,skip-unavailable=true \
+  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tenant=acme,soft-timeout=15s \
   --remote-cluster-soft-timeout 10s
 ```
 
@@ -533,7 +533,7 @@ comma-separated `key=value` spec:
 | `name` | yes | The cluster's stable operator-facing label. This is the only identity a client ever sees for the remote (in `warnings`). |
 | `endpoint` | yes | `host:port` of the remote's fragment surface. |
 | `credential-file` | yes | File holding the bearer token this coordinator presents to that remote. |
-| `tenant` | no | The one local tenant whose queries fan out to this remote. Omitting it makes the remote reachable by every local tenant, which only a coordinator resolving at most one local tenant may do. See [One credential per local tenant](#one-credential-per-local-tenant). |
+| `tenant` | no | The one local tenant whose queries fan out to this remote. Omitting it makes the remote reachable by every local tenant, which only a coordinator resolving at most one local tenant may do. On a keyed bucket, the default for a fresh bucket, it is required. See [One credential per local tenant](#one-credential-per-local-tenant). |
 | `tls` | no | `true` or `false`, default `true`. Those two literals only; any other value fails startup with a message naming it. |
 | `tls-ca-file` | no | CA bundle for the remote's server certificate. A spec carrying this key and no `tls` key means TLS is on with that CA trusted, and is accepted. Only the explicit `tls=false` alongside a CA file fails startup, because there the bundle would be inert. |
 | `skip-unavailable` | no | `true` or `false`, default `false`. Same two literals only. |
@@ -617,8 +617,8 @@ account on a shared remote, writes one spec per local tenant:
 
 ```sh
 ravel-server --mode query \
-  --tenant-token acme-token:acme \
-  --tenant-token beta-token:beta \
+  --tenant-token acme-token=acme \
+  --tenant-token beta-token=beta \
   --remote-cluster name=eu-acme,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-acme.token,tenant=acme \
   --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
 ```
@@ -636,12 +636,12 @@ a tenant, add a spec with its `tenant`.
 
 A spec without `tenant` makes a remote reachable by **every** local tenant.
 That is correct on a coordinator that runs queries for only one local tenant,
-and it is what a single-tenant deployment writes. **A coordinator that runs
-queries for more than one local tenant refuses to start with an unmapped
-remote cluster.** The error names every spec that needs a `tenant`.
+and it is what a single-tenant deployment on a bucket created with
+`--tenant-hash-unkeyed` writes. **A process that can serve more than one local
+tenant refuses to start with an unmapped remote cluster.** The error names
+every spec that needs a `tenant`.
 
-A coordinator runs queries for more than one local tenant in each of these
-cases:
+A process can serve more than one local tenant in each of these cases:
 
 - Two or more `--tenant-token` values or `--tenant-token-file` lines name
   different tenants.
@@ -651,13 +651,22 @@ cases:
 - Any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
   `--oidc-issuer`, or `--mtls-enabled`. Each of them derives the tenant from a
   request header or a token claim.
+- `--tenant-hash-key-file` is set (a keyed bucket, which is the default for a
+  fresh bucket) in All, Gateway or Query mode. Those three modes install the
+  durable `sys/auth` bearer resolver, so a tenant can be onboarded without a
+  restart, and the guard applies in all three; of them, only All and Query
+  serve queries. On a keyed bucket every `--remote-cluster` needs `tenant=`,
+  even with a single `--tenant-token`.
 
 Startup also refuses a `tenant` that no `--tenant-token`,
 `--tenant-token-file`, or `--alert-rules-file` names. This check applies where
-the tenant set is fully known: static configuration and no dynamic resolver.
+the tenant set is fully known: static configuration, no dynamic resolver, and
+no durable `sys/auth` map.
 Such a mapping can never fire, and its only symptom is a remote that answers
-nobody. Under a dynamic resolver the static configuration is not the
-tenant set, so the check does not apply.
+nobody. Under a dynamic resolver, or on a keyed bucket where a tenant can be
+provisioned only in `sys/auth`, the static configuration is not the tenant
+set, so the check does not apply and a mapping to a `sys/auth`-only tenant
+starts.
 
 You can map a remote to a tenant that only `--alert-rules-file` names. That is
 a real deployment: alert rules for a tenant whose data lives partly on a
