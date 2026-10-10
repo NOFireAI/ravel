@@ -462,6 +462,9 @@ count of hours the pass actually re-listed and is `0` on the no-op path, so a
 caller retrying a DSAR-driven refold against an unchanged watermark can tell
 "nothing sealed since last time" apart from "the request was serviced" by
 reading that field rather than assuming success from `no_op: false`.
+(Narrowed by the held-open refold amendment at the end of this ADR: a no-op
+fold over hours an operator-asserted seal holds open does run the targeted
+pass, and can report reconciled hours.)
 
 ### Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
 
@@ -893,3 +896,21 @@ written and the query-time filter keeps applying. Callers that take no claim
 (`--no-claim`, `coordination = off`) keep only the re-list, and a claimed
 owner that stalls past its lease between its re-list and its PUT is caught by
 neither; ADR-1029's amendment states both windows.
+
+## Amendment (2026-10-10, #2691): a no-op held-open fold runs the targeted pass
+
+<!-- amendment-applies: sections="Amendment: a targeted refold closes the out-of-window gap on demand" pointer="held-open refold amendment" -->
+
+ADR-2677's held-open amendment keeps an hour sealed early by an
+operator-asserted seal open to late commits until the margin passes it:
+every fold re-lists that hour, including a fold that does not advance the
+watermark. Such a fold now also runs the targeted re-fold pass for the
+requested hours outside the held range, before it decides whether it is a
+no-op, so `FoldReport::refold_hours_reconciled` can be nonzero on a fold
+that reports `no_op: true`. The no-op carve-out above still holds for every
+other no-op fold: one with no held-open hour returns before the pass and
+reconciles zero hours. The scheduled folder removes a queued request after a
+fold that is not a no-op, as before, and after a no-op fold only when that
+fold reconciled at least one requested hour. A request whose hours all lie
+in the held range counts zero and stays queued until the first fold that
+advances the watermark, which removes it.
