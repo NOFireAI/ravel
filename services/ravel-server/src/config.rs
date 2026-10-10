@@ -2093,6 +2093,41 @@ pub struct Cli {
     #[arg(long)]
     pub disable_cache: bool,
 
+    /// Resident high-water mark of the memory gate, as a percentage (1 to 100) of the resolved memory budget; default 70.
+    ///
+    /// At or above the mark the `ravel-memory-gate` sampler forces a jemalloc
+    /// purge and, if the post-purge reading is still at or above it, closes
+    /// the gate (ADR-2633 section 2). Startup refuses a mark that the cache
+    /// hard caps plus, in `all` mode, a bounded `--max-ingest-buffer-bytes`
+    /// reach. The gate is off in `gateway` mode, with a fallback-sized
+    /// budget, and in a build whose allocator is not jemalloc. See
+    /// [`crate::memory_gate`].
+    #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub memory_gate_high_water_percent: Option<u8>,
+
+    /// Memory gate sampling interval in milliseconds (10 to 1000).
+    ///
+    /// Each sample refreshes the jemalloc stats epoch and reads
+    /// `stats.resident` (ADR-2633 section 1).
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = crate::memory_gate::DEFAULT_INTERVAL_MS,
+        value_parser = clap::value_parser!(u64).range(10..=1000)
+    )]
+    pub memory_gate_interval_ms: u64,
+
+    /// Query admission wait on a closed memory gate, in milliseconds (0 means no wait); resolved and stamped at startup, not yet read by admission.
+    ///
+    /// The admission wait that reads it is ADR-2633 task 3; until it lands, a
+    /// closed gate refuses a reservation at once whatever this is set to.
+    #[arg(long, value_name = "MS", default_value_t = crate::memory_gate::DEFAULT_WAIT_MS)]
+    pub memory_gate_wait_ms: u64,
+
+    /// Turn the resident memory gate off: no sampler thread, no forced purge, and the gate never closes.
+    #[arg(long)]
+    pub disable_memory_gate: bool,
+
     /// Path to the 32-byte deployment key that keys the tenant hash
     /// (ADR-0050 section 3). A file, never an env var or inline value, so the
     /// secret never appears in a process listing. Contents are either 64 hex
