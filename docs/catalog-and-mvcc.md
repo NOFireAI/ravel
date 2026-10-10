@@ -954,28 +954,32 @@ erasure completion rule for stale catalog objects is settled together with
 the column-statistics case, and the pending-erasure predicate keeps
 filtering rows after the index until the rewrite lands.
 
-**Rollout.** A fold process that predates field 8 would re-encode HEAD
-without it for every part it carries forward, after which the sweeper reaps
-the live leaves and the next fold rebuilds them from the sections; the
-lookup stays correct throughout, and the cost is silent. No HEAD field can
-constrain such a folder (it predates every field here, and the fold builds
-HEAD as a fresh struct, so an unknown field does not survive its CAS), so
-and the sweeper does not special-case the leaves it strips: a kept leaf
-that nothing re-attaches is never read again and costs its bytes for the
-life of the part, so `.kidx` objects are swept exactly as `.cstat` objects
-are, when HEAD does not name them past the protection horizon. The
+**Rollout.** A fold process that predates field 8 re-encodes HEAD without
+it for every part it carries forward; the leaves those parts had are then
+unreferenced, the sweeper deletes them past the protection horizon exactly
+as it deletes an unreferenced `.cstat` (a kept leaf that nothing re-attaches
+would cost its bytes for the life of the part and buy nothing), and the
 affected parts read as uncovered for that field and are scanned (the
-ADR-0849 safety lemma), and each is re-indexed by the next fold that
-re-encodes it (a compaction, an erasure rewrite or a retention change).
-The cost of a bad rollout is one rebuild per part when it is next
-re-encoded and scans until then, never a whole-tenant backfill and nothing
-retained; the fold's scope rule above holds without exception. It is
-detected rather than prevented: `ravel_catalog_sweep_deleted_total{kind="kidx"}`
-rising while HEAD carries no `key_index` refs is the signature, and the
-next new-format fold's leaves-written count names the parts. The
+ADR-0849 safety lemma). The lookup stays correct throughout. No HEAD field
+can constrain such a folder: it predates every field here, and the fold
+builds HEAD as a fresh struct, so an unknown field does not survive its
+CAS. A part is re-indexed only by a fold that re-encodes it, and a sealed,
+compacted historical part with no erasure pending is never re-encoded by
+the regular fold, so the repair is explicit: `ravel-cli catalog fold
+--rebuild-key-index [--field <name>]`, the one sanctioned exception to the
+scope rule above, re-encodes every part in HEAD that lacks a `key_index`
+ref for a declared field (every part, for spans), builds each leaf from
+the sections as the regular fold does, and reports parts rebuilt, section
+bytes read and leaves written. It runs under the fold's claim, resumes
+from the durable cursor, and refuses while a writer is live. Detection is
+the sweeper's counter: `ravel_maintain_objects_deleted_total` gains
+`kind="kidx"` beside its existing kinds, and that series rising while HEAD
+carries no `key_index` refs is the signature an operator acts on. The cost
+of a bad rollout is one rebuild run over the affected parts' sections and
+scans until it has run; nothing is retained and nothing is silent. The
 mixed-version combinations (old folder then new sweeper, old sweeper
-against a new HEAD, new folder after an old folder) are tested, not
-assumed (ADR-0849 section 1a).
+against a new HEAD, new folder after an old folder, then the rebuild) are
+tested, not assumed (ADR-0849 section 1a).
 
 ### Idempotency marker body layout
 

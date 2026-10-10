@@ -178,14 +178,18 @@ POSTINGS carries one.
   offset and bucket area, all under a header crc32c. The writer lays every
   field's directory directly after the header in field order and every
   bucket area after them, and `prefix_len` names the end of the last
-  directory. The writer keeps `prefix_len` at or below a fixed
-  `KEY_IDX_PREFIX_MAX` of 64 KiB (lowering `bucket_bits` for the object if
-  64 fields at 8 bits would exceed it), so a probe's first ranged GET is
-  `[0, min(len, 64 KiB))`, sized from the footer's section entry with no
-  section byte read first, and holds the header and every directory for any
-  conformant writer: at most two GETs per probe, and one when the section
-  fits in the first read. A `prefix_len` above the constant, or a directory
-  or bucket area on the wrong side of it, is `Corrupted`. Readers still
+  directory. The same value is carried on the footer's `Section` entry for
+  the KEY_IDX kind as an additive `uint32 prefix_len = 7`, in both
+  `ravel.logseg.v1.Section` and `ravel.rspan.v1.Section` (fields 1 to 6 are
+  frozen and unchanged; a reader that does not know field 7 ignores it,
+  as the format-change procedure allows for additive proto fields). The
+  footer is already under `footer_crc32c` and already in the tail probe, so
+  a probe's first ranged GET, `[0, prefix_len)`, is sized exactly before
+  any section byte is read and holds the header and every directory: two
+  GETs per probe for every conformant writer, about 1 KB per field at 8
+  bits for the first. A header `prefix_len` that differs from the footer
+  entry's, a zero or out-of-range footer `prefix_len`, or a directory or
+  bucket area on the wrong side of it, is `Corrupted`. Readers still
   address by the header's offsets, never by adjacency. **The indexed set is written here and never
   inferred from live config at read time** (ADR-0849 section 3): a field the
   header does not name is uncovered in this object for that field.
@@ -350,16 +354,27 @@ flowchart LR
     treats a `.kidx` exactly as it treats a `.cstat`, deleting what HEAD
     does not name past the protection horizon. After such a folder runs,
     every affected part reads as uncovered for that field and is scanned,
-    which is the safety lemma's outcome, and the part is re-indexed by the
-    next fold that re-encodes it. The cost of a bad rollout is therefore
-    the same as the cost of never having folded with leaves: one rebuild
-    per part when it is next re-encoded, and scans until then; no backfill
-    and nothing retained. It is detected, not prevented:
-    `ravel_catalog_sweep_deleted_total{kind="kidx"}` rising while HEAD
-    carries no `key_index` refs is the signature, and the fold report's
-    leaves-written count on the next new-format fold names the parts
-    affected. The mixed-version combinations (old folder then new sweeper,
-    old sweeper against a new HEAD, new folder after an old folder) are a
+    which is the safety lemma's outcome. A part is re-indexed by the next
+    fold that re-encodes it, and a sealed, compacted historical part with
+    no erasure pending is never re-encoded by the regular fold, so the
+    regular fold alone would leave such parts unindexed for the life of
+    the part. The repair is therefore explicit and operator-driven, the
+    one sanctioned exception to the fold's scope rule: `ravel-cli catalog
+    fold --rebuild-key-index [--field <name>]` re-encodes every part in
+    HEAD that lacks a `key_index` ref for a declared field (every part,
+    for spans), builds the leaf from the sections as a regular fold would,
+    and reports parts rebuilt, section bytes read and leaves written; it
+    runs under the fold's claim, is resumable from the durable cursor, and
+    refuses while a writer is live, like `--max-flush-lifetime`. Detection
+    is the sweeper's own counter: `ravel_maintain_objects_deleted_total`
+    gains `kind="kidx"` beside its existing kinds (T9), and that series
+    rising while HEAD carries no `key_index` refs is the signature the
+    operator acts on. The cost of a bad rollout is one `--rebuild-key-index`
+    run, which reads the affected parts' sections once (about 2% of logs
+    bytes, about 6% of span bytes), and scans until it has run; nothing is
+    retained and nothing is silent. The mixed-version combinations (old
+    folder then new sweeper, old sweeper against a new HEAD, new folder
+    after an old folder, then the rebuild) are a
     required test, not an intention.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
@@ -386,14 +401,16 @@ flowchart LR
 - **Tier 1.** A candidate with no block set (an uncovered segment) is
   probed in the object: the footer, the KEY_IDX directory, one bucket. A
   present key names the blocks; an absent key drops the object without a
-  block read. A tail object in RLOG costs the tail probe it already pays,
-  plus two small ranged GETs; in RSPAN the fetcher's suffix covers the
-  footer, BLOOM and SKIP_IDX (a reader choice, as RLOG's probe length is)
-  and stops there, since KEY_IDX sits below SKIP_IDX and its bucket frames
-  lie between its directory and the tail. A trace lookup then issues one
-  ranged GET for the KEY_IDX header and directory (about 1 KB) and one for
-  its bucket, both addressed from the footer's section entry; the suffix is
-  never sized to reach the directory.
+  block read. The probe is exactly two ranged GETs on either format, both
+  addressed and sized from the footer's section entry (decision 1): the
+  first is `[0, prefix_len)` of the section, the header and every
+  directory, about 1 KB per field at 8 bits; the second is one bucket,
+  2 to 8 KB at the Stage 0 entry counts. A tail object in RLOG pays those
+  two on top of the tail probe it already pays; in RSPAN the fetcher's
+  suffix covers the footer, BLOOM and SKIP_IDX (a reader choice, as RLOG's
+  probe length is) and stops there, since KEY_IDX sits below SKIP_IDX and
+  its bucket frames lie between its directory and the tail, and the suffix
+  is never sized to reach the directory.
 - **Blocks.** Spans read the trace's block run by range
   (`RspanRangeReader::trace_block_span` then `decode_trace`,
   `crates/ravel-rspan/src/ranged.rs`), never `GetRange::Full`. Logs read the
@@ -552,6 +569,10 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   re-encodes every input), and `maintain migrate` once a reader window
   exists. The `.kidx` leaf and the `SnapshotPartRef` field: Class B, rebuilt
   by the fold. `TypedAttrColumn.key_index` and
+  `Section.prefix_len = 7` on both footers: additive, read by the KEY_IDX
+  probe only, ignored by any reader that does not know it, and bumping no
+  trailer version (the footer protos are additive-only by the frozen-field
+  rule). `TypedAttrColumn.key_index` and
   `TypedAttrColumnConfig.index_trace_id`: Class C under the R1 amendment,
   additive with a `format_version` bump, readers first.
 - **Version regime.** Pre-v1.0 single version (ADR-0027, dated to v1.0 by
@@ -686,7 +707,7 @@ cache state) and stamped into the report.
 | spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes per covering part = `4 x 2^bucket_bits` (the directory) plus one bucket, where the balance rule `4 x 2^b = body / 2^b` at the 256 MiB body ceiling gives `bucket_bits` = 13 (a 32 KB directory and a 32 KB mean bucket): at most about 64 KB per covering part, about 64 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 128 KB per covering part (2x the balanced figure) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
-| q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages | a whole-object GET |
+| q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` wire bytes per probed object = `prefix_len` (about 1 KB per field at 8 bits) plus one bucket (2 to 8 KB at Stage 0 entry counts), so under 16 KB per object with up to four declared fields, about 6.5 MB over the 410-object corpus | a whole-object GET, or `keyIndex` bytes over 32 KB per probed object |
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
@@ -703,10 +724,10 @@ cache state) and stamped into the report.
 | T3 ranged trace reads (`block_run_span` on the range reader) and the spans read cache | 7, 10 | ravel-rspan, ravel-query, ravel-server | no |
 | T4 fragments carry the pushdown | 11 | ravel-sql | no |
 | T5 `GET /api/traces/<id>`, `ravel_get_trace` without a range, the SQL window rule | 12 | ravel-server, ravel-sql | no |
-| T6 KEY_IDX grammar in ravel-codec, fuzz and property tests | 1 | ravel-codec | yes (grammar) |
+| T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
 | T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), inspector | 3 | ravel-logseg, ravel-catalog (config), ravel-cli | yes |
-| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli | yes |
+| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set and `kind="kidx"` on `ravel_maintain_objects_deleted_total`, `catalog fold --rebuild-key-index`, `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
 | T10 spans read path: routing, tier 2, tier 1, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T12 Stage 1: the Stage 0 arms re-run against the table above, acceptance amendment | all | docs | no |

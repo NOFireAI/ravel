@@ -480,11 +480,13 @@ writer:
   RLOG placement, so the suffix probe that covers the footer, BLOOM and
   SKIP_IDX (a reader choice, as RLOG's probe length is) never has to span
   the bucket frames. A `trace_id =` lookup then issues one ranged GET for
-  `[0, min(len, 64 KiB))` of the section, sized from the footer's section
-  entry (the one-field header and directory are about 1 KB at `bucket_bits
-  = 8`, so that read also carries the first buckets), and one for the
-  bucket it needs when that bucket lies beyond the first read; neither GET
-  depends on adjacency. A read that is not a `trace_id` lookup
+  `[0, prefix_len)` of the section, where `prefix_len` is the additive
+  `uint32 prefix_len = 7` on the footer's `ravel.rspan.v1.Section` entry
+  for kind 4 (the same field ADR-2707 adds to the RLOG footer; fields 1 to
+  6 are frozen and unchanged), so the read is exact, about 1 KB for the
+  one-field header and directory at `bucket_bits = 8`, and one for the
+  bucket it needs; neither GET depends on adjacency, and no section byte is
+  read before the first GET is sized. A read that is not a `trace_id` lookup
   never touches the section.
 
 A `trace_id =` lookup probes KEY_IDX after the SKIP_IDX range test and

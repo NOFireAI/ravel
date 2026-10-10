@@ -164,7 +164,10 @@ are permitted.
 - summary (skip index level 2): `min_ts_ns`, `max_ts_ns`,
   `min_observed_ts_ns`, `max_observed_ts_ns`, `record_count`,
   `block_count`, `stream_count`.
-- `sections`: repeated `Section { kind, offset, len, crc32c, comp
+- `sections`: repeated `Section { kind, offset, len, crc32c, comp,
+  uncompressed_len, prefix_len }` (`prefix_len = 7` is additive under
+  ADR-2707, proposed: set only on a KEY_IDX entry, ignored by readers that
+  do not know it); the pre-ADR-2707 form is `Section { kind, offset, len, crc32c, comp
   (0=none, 2=zstd), uncompressed_len }`.
 - compaction identity (ADR-0032, field numbers 14-16, added in trailer
   version 2): `level` (uint32, 0 = L0 flush object, 1 = L1 compacted
@@ -1356,7 +1359,9 @@ a fixed multiplicative mix. The top bits of the key itself are not uniform
 for an auto-increment or timestamp-shaped `I64` key and would put an
 object's keys in one bucket; the mix makes bucket size a function of entry
 count alone. Within a bucket entries are sorted ascending by `(key8, block)`
-and unique, so a probe is a binary search. The writer uses `bucket_bits = 8`;
+and unique, so a probe is a binary search. The writer uses `bucket_bits = 8`
+(a fixed choice; the first GET is sized exactly from the footer entry, so
+no field count forces a smaller value);
 the reader accepts 1 to 16 and refuses anything else as `Corrupted`.
 
 ### Layout
@@ -1368,10 +1373,10 @@ key_idx (stored uncompressed; bucket payloads zstd):
   u16 LE   reserved           (= 0; non-zero is Corrupted)
   u32 LE   prefix_len         (bytes from the section start through the last
                                directory's dir_crc32c: the header, its crc
-                               and every field's directory; at most
-                               KEY_IDX_PREFIX_MAX = 64 KiB by construction,
-                               so the first GET is sized from the footer's
-                               section entry alone; above it is Corrupted)
+                               and every field's directory; the same value
+                               the footer's Section entry carries in its
+                               prefix_len field, which is what sizes the
+                               reader's first GET; a mismatch is Corrupted)
   uvarint  field_count        (1..=64; ascending by name bytes, unique)
   fields[field_count]:
     uvarint  name_len           (1..=128; longer is Corrupted)
@@ -1409,25 +1414,24 @@ rule fixes the probe cost, not the parser.
 
 ### Reading
 
-A probe's first ranged GET is sized from the footer's section entry alone,
-with no section byte read first: it is `[0, min(len, KEY_IDX_PREFIX_MAX))`
-of the section, where `KEY_IDX_PREFIX_MAX` is 64 KiB. The writer bounds
-`prefix_len` at or below that constant by construction: the header is
-under 1 KiB at the 64-field cap with the names ADR-2707 allows (at most
-128 bytes each) and a directory is `4 x 2^bucket_bits + 4` bytes, 1,028 B
-at the writer's 8 bits, so 64 directories take about 66 KB; a writer that
-would exceed the constant lowers `bucket_bits` for the object (the reader
-accepts 1..=16) until it fits, and a reader that finds `prefix_len` above
-`KEY_IDX_PREFIX_MAX` treats the section as `Corrupted`. The reader
-verifies `header_crc32c`, finds the field, verifies its `dir_crc32c`,
-finds the bucket, then reads that one bucket (verifying `frame_crc32c`,
-then the decompressed length). A section shorter than the constant is read
-whole in the first GET, buckets included, and the probe is then one GET.
-The section sits between BLOCKS and SKIP_IDX, so the 256 KiB tail probe
-(ADR-0699 decision 5) does not carry it: a key probe on an opened object
-costs at most two ranged GETs for every conformant writer, the first at
-most 64 KiB and in the common one- or two-field case about 1 to 2 KB of
-header and directory plus whatever buckets fit, the second one bucket.
+A probe's first ranged GET is `[0, prefix_len)` of the section, and the
+reader learns `prefix_len` before it reads any section byte: the footer's
+`Section` entry for kind 9 carries it as an additive field,
+`uint32 prefix_len = 7` on `ravel.logseg.v1.Section` (ADR-2707; field
+numbers 1 to 6 are frozen and unchanged, and a reader that does not know
+field 7 ignores it, as every other additive footer field is handled). The
+footer is already under `footer_crc32c` and already in the tail probe, so
+the first GET costs nothing to size and is exact: the header plus every
+directory, about 1 KB per field at 8 bits plus the header. The reader
+verifies `header_crc32c`, checks that the header's `prefix_len` equals the
+footer entry's (a disagreement is `Corrupted`), finds the field, verifies
+its `dir_crc32c`, finds the bucket, then reads that one bucket (verifying
+`frame_crc32c`, then the decompressed length). The section sits between
+BLOCKS and SKIP_IDX, so the 256 KiB tail probe (ADR-0699 decision 5) does
+not carry it: a key probe on an opened object costs exactly two ranged
+GETs for every conformant writer, the first of `prefix_len` bytes and the
+second one bucket. A `Section` entry for kind 9 whose `prefix_len` is zero
+or past `len` is `Corrupted`.
 At the measured sizes (p50 49,899 entries per 25 MB ClickBench object, about
 2% of object bytes) a bucket holds about 200 entries, a few KB (derived from
 the Stage 0 figures on ADR-2707).
