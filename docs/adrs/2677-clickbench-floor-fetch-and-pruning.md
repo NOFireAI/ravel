@@ -62,12 +62,15 @@ flowchart LR
     P -->|yes| PL[plan: tail probe, ranged scan]
     P -->|no| S1["scan: one whole GET,<br/>blocks pruned from the directory"]
     PL --> S2[scan: ranges]
-    S1 --> C[(read cache:<br/>stable subset under a loop)]
+    S1 --> C[(read cache)]
     S2 --> C
     C --> T["stats.timings: resolveMs, planMs,<br/>startMs, firstBatchMs, drainMs, auditMs"]
   end
   H --> R
 ```
+
+The read cache keeps today's policy: decision 3 is deferred (see the
+decision 3 deferral amendment below).
 
 ### 1. The loader seals what it wrote
 
@@ -179,7 +182,9 @@ runs the stock corpus under `cost-based`, stated explicitly once decision
 
 ### 3. The memory read cache serves a stable subset under a repeated scan
 
-Deferred: see the decision 3 deferral amendment below. The in-memory fetch cache (`--cache-max-bytes`, S3-FIFO) must, for a
+Deferred: see the decision 3 deferral amendment below.
+
+The in-memory fetch cache (`--cache-max-bytes`, S3-FIFO) must, for a
 repeated identical scan of N entries over a cache that holds C < N of them,
 serve a stable fraction on every pass after the first. The property is
 pinned by a test in `crates/ravel-cache`: a loop of N keys over a cache of C
@@ -355,7 +360,7 @@ because decision 2 acts only on objects under the bound; its row says so.
 | `unfoldedSegmentsResolved` after the fold | 0 | any |
 | load time with `--fold-after-load` | at most 1.05x the same load without it | over 1.1x |
 | q20 GETs per object / wire bytes over corpus bytes, loader-default corpus (3.8 MB objects, not the entry recipe) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
-| q2 hot on 16 GB with the cache at about half the corpus | cache-served bytes at least 40% of wire bytes | under 25% |
+| q2 hot on 16 GB with the cache at about half the corpus | not measured in this epic: decision 3 is deferred (see the decision 3 deferral amendment) | |
 | hot geomean ratio to VictoriaLogs, 42 statements, +0.01 s | reported; the plan's eight-week figure (1.1) is not this epic's target | |
 | statements answered on the reference box | 43 of 43 | fewer |
 | c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal |
@@ -424,8 +429,9 @@ and its result stays separate from stock.
   `plan` bucket drops to the probe-and-stats cost for those segments, and
   `docs/query-engine.md`'s description of the planned route says which
   segments it covers.
-- ADR-0046 decision 6 gets an amendment for the loop case; the memory tier
-  and the disk tier may size their ghost lists differently.
+- ADR-0046 decision 6 was to get an amendment for the loop case; it does
+  not, because decision 3 is deferred (see the decision 3 deferral
+  amendment).
 - ADR-2023 decision 1 gets an amendment: `latency-first` on a loopback
   endpoint, `cost-based` elsewhere, with the permits derived from memory.
   The tuned entry's `RAVEL_HOLD_STOCK_QUERY_BYTES` probe becomes
@@ -443,7 +449,7 @@ measurements are orchestrator work on bot-style boxes.
 |---|---|---|---|
 | T1 seal-through hour, HEAD preflight refusal, `--fold-after-load`, `--writers-stopped`, load-then-SQL e2e | 1 | ravel-catalog, ravel-cli, docs | high (visibility contract): `effort: high`, its own checkpoint review |
 | T2 `stats.timings`, `stats.pruning`, pruning reachability through HTTP | 4, 5 | ravel-sql, ravel-server, docs | low |
-| T3 loop-stable memory cache, ADR-0046 amendment | 3 | ravel-cache, docs | medium |
+| T3 loop-stable memory cache, ADR-0046 amendment: deferred, see the decision 3 deferral amendment | 3 | ravel-cache, docs | medium |
 | T4 no plan phase for segments at or under `plan_whole_object_bound()` | 2 | ravel-query (`log_fetcher.rs`), ravel-sql | medium |
 | T5 permits and loopback policy from host memory, ADR-2023 amendment, the three stale doc comments in `crates/ravel-query/src/config.rs` (the "not bounded" note, LatencyFirst's "operator opt-in", `LATENCY_FIRST_MEASURED_CONCURRENCY`) | 7 | ravel-server, docs, ravel-query (doc comments in `config.rs` only) | medium |
 | T6 (#2044) admission wait on accounted headroom; fetch-memory refusal message | 7 | ravel-query (admission), ravel-sql (Flight admission, error message), ravel-server (callers) | medium |
@@ -470,7 +476,8 @@ tenant, worth about a fifth of the hot geometric mean over four
 statements. T8 (#2691, ravel-catalog, medium) is decision 1's late-commit
 guard.
 
-Wave 1: T1, T2, T3, concurrently. Then T6 and T7 once T2 has landed (both
+Wave 1: T1, T2, T3, concurrently (T3 since deferred: see the decision 3
+deferral amendment). Then T6 and T7 once T2 has landed (both
 touch ravel-sql), and T8 once T1 has landed (same `fold.rs`). T5 after
 T6's arm clears. T4 last: the entry recipe writes 25 MB objects, above the
 18.9 MB bound decision 2 acts under, so T4 moves no statement in the
@@ -507,12 +514,13 @@ closed. Every other part of decision 1 stands.
 
 ## Amendment (2026-10-09): decision 3 is deferred
 
-<!-- amendment-applies: sections="3. The memory read cache serves a stable subset under a repeated scan" pointer="decision 3 deferral amendment" -->
+<!-- amendment-applies: sections="Decision|3. The memory read cache serves a stable subset under a repeated scan|8. Measurement protocol and targets|Consequences|Plan" pointer="decision 3 deferral amendment" -->
 
 Decision 3 is deferred, by the owner's decision after three blocked review
-rounds on task T3 (#2681). Nothing from those rounds lands, including the
-pinned byte figures in `crates/ravel-sql/tests/logs_selective_scan_amplification.rs`,
-which were measured under the parked policy.
+rounds on task T3 (#2681). Nothing from those rounds lands. That includes
+the revised byte figures #2681 proposed for
+`crates/ravel-sql/tests/logs_selective_scan_amplification.rs`, which were
+measured under the parked policy; the file's current figures stand.
 
 Why. Three single-policy variants of the S3-FIFO cache were built and
 simulated line for line (the evidence is on #2681):
@@ -535,8 +543,15 @@ also sat outside the memory budget, up to 0.3 to 0.8 GB per tier at small
 range sizes, on hosts that measured 0.17 to 0.25 GB of available memory at
 their low point.
 
-What it costs. Nothing on the ranked reference box: its derived cache
-(11.58 GB) holds the whole stored corpus (10.21 GB). It leaves the repeated
+What it costs. Nothing on the ranked reference box while its derived
+cache stays above the stored corpus: 11.58 GB against 10.21 GB in the
+attribution runs on #2044 (the entry-recipe load's on-object bytes, the
+driver's `Data size`; the 9.84 GB figure elsewhere in this ADR is the
+older stock load's), 1.37 GB of headroom. #2639 W2 measured the derived
+cache falling 0.8 GB under the corpus under 2 GB of host noise, and the
+hot column collapsing with it (q30 0.69 to 32.4 s). If that recurs on the
+reference box, today's policy serves nothing for the duration, and the
+deferred decision is what would have recovered part of it. It leaves the repeated
 scan larger than the cache served at zero, as today, on the 16 GB and 8 GB
 hosts and on real S3 at the 25% share (a 7.47 GB cache).
 
@@ -548,3 +563,7 @@ a `CacheLimits` flag; the loop policy's bookkeeping charged inside
 separates the two cases by what issued the read rather than by when it
 recurs. Any of them is gated on the loop tests and on both hot-set cases at
 server geometry with mixed sizes.
+
+The correction decision 3 assigned to T3 in `docs/guides/caching.md`,
+which calls both cache caps "LRU", is unowned with this deferral and is
+tracked on #2738.
