@@ -30,6 +30,20 @@
 # fires in that window, so the compaction is genuinely interrupted before its
 # record is published.
 #
+# SEAL WAIT: an ingest hour is compactable only once sealed, at the end of
+# the hour plus the catalog's seal margin (CatalogConfig::default(), logged
+# by the server as `seal_margin_secs=N`; 4800 s today). After the exports are
+# acknowledged the ingest server is stopped, so nothing writes into a later
+# hour, and the scenario sleeps until
+# (floor(last_ack / 3600) + 1) * 3600 + seal_margin + 120 s before starting
+# the maintain workers: up to about 2 h 22 min at the current margin.
+#
+# Exit status: 0 when every pinned oracle assertion held; 2 when any failed
+# (release-blocking); 3 on a setup error, when the server log carries no
+# parseable `seal_margin_secs=`, or when the kill provably missed the
+# compaction (worker A was not observed mid-compaction and had already
+# published its record) and no other assertion failed; 64 on a usage error.
+#
 # --check / --dry-run validates structure and dependencies WITHOUT starting
 # RustFS, spawning workers, or issuing a real kill. That is the only proof
 # available with no object store; a real run is the orchestrator's job.
@@ -63,7 +77,8 @@ INGEST_GRPC="${CHAOS_INGEST_GRPC:-127.0.0.1:14317}"
 
 # Number of strict-ack exports to drive into the ingest server so the bucket
 # carries real, compactable data for the maintain workers to own and compact.
-EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
+# Each carries CHAOS_FIXTURE_SERIES x CHAOS_FIXTURE_POINTS points (lib.sh).
+EXPORT_COUNT="${CHAOS_EXPORT_COUNT}"
 
 # Total ownable units across the world under test; the survivor must own all
 # of them after takeover. Sized by the load the setup drives (tenants x
@@ -106,6 +121,8 @@ if [[ "$MODE" == "check" ]]; then
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
   echo "mid-compaction trigger marker: units_owned>=1 before '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
+  echo "load: ${EXPORT_COUNT} exports of ${CHAOS_FIXTURE_SERIES} series x ${CHAOS_FIXTURE_POINTS} points"
+  echo "seal wait: end of last ack's hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
   rc=0
   check_dependencies || rc=$?
   exit "$rc"
@@ -186,9 +203,6 @@ ingest_reachable() {
 log "bringing up RustFS and qualifying the store"
 rustfs_up
 
-log "generating OTLP fixture"
-chaos_gen_fixture > "$FIXTURE_PATH"
-
 # Actually drive the generated load: start an ingest server and POST the
 # fixture through it so the bucket carries real, compactable data. A prior
 # version generated the fixture and never sent it, then commented that it
@@ -198,17 +212,37 @@ chaos_gen_fixture > "$FIXTURE_PATH"
 log "starting ingest server (${INGEST_HTTP}) and driving ${EXPORT_COUNT} exports"
 start_ingest_bg
 chaos_wait_for "ingest server to accept connections" 60 ingest_reachable
+# A fresh fixture per export: identical bytes would carry identical
+# timestamps, and deduplication would fold the repeats into one export's data.
 SENT=0
+LAST_ACK_UNIX_S=""
 for _ in $(seq 1 "$EXPORT_COUNT"); do
+  chaos_gen_fixture "$CHAOS_FIXTURE_SERIES" "$CHAOS_FIXTURE_POINTS" > "$FIXTURE_PATH"
   if drive_one_export "$INGEST_HTTP" "$FIXTURE_PATH" >/dev/null; then
     SENT=$(( SENT + 1 ))
+    LAST_ACK_UNIX_S="$(chaos_now_unix_s)"
   fi
 done
 if [[ "$SENT" -eq 0 ]]; then
   log "no exports were accepted; the maintain workers would own nothing"
   exit 3
 fi
-log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server"
+log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server (last ack at unix ${LAST_ACK_UNIX_S})"
+
+# Stop ingest before the wait, so nothing writes into a later hour while the
+# scenario waits for the hours it wrote to seal.
+log "stopping the ingest server before the seal wait"
+kill "$INGEST_PID" 2>/dev/null || true
+wait "$INGEST_PID" 2>/dev/null || true
+INGEST_PID=""
+
+SEAL_MARGIN_S="$(chaos_seal_margin_from_log "$(cat "$INGEST_LOG")")" || {
+  log "the ingest server log carries no parseable 'seal_margin_secs=N' line (${INGEST_LOG}); cannot compute when the written hours seal"
+  exit 3
+}
+SEALED_AT="$(chaos_sealed_at_unix_s "$LAST_ACK_UNIX_S" "$SEAL_MARGIN_S")"
+log "seal_margin_secs=${SEAL_MARGIN_S} (from the ingest log), safety ${CHAOS_SEAL_SAFETY_SECONDS}s"
+chaos_wait_until_sealed "$SEALED_AT"
 
 log "starting two maintain workers (A=${WORKER_A_HTTP}, B=${WORKER_B_HTTP})"
 start_worker "$WORKER_A_HTTP" "$WORKER_A_GRPC" "$WORKER_A_LOG" WORKER_A_PID
@@ -225,7 +259,9 @@ BREAKER_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_orphan_breaker_t
 [[ "${BREAKER_BASELINE%.*}" =~ ^[0-9]+$ ]] || BREAKER_BASELINE=0
 
 log "waiting for worker A to be mid-compaction"
+OBSERVED_MID_COMPACTION=0
 if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" 120; then
+  OBSERVED_MID_COMPACTION=1
   log "worker A observed mid-compaction -- issuing SIGKILL"
 else
   log "did not observe worker A mid-compaction within budget; killing anyway"
@@ -247,12 +283,16 @@ WORKER_A_PID=""
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
 oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
-oracle_conservation_holds "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" || true
+# Worker A is dead, so its log is final: whether it published before the kill
+# decides whether the conservation oracle measured anything.
+oracle_conservation_or_unmeasured "$OBSERVED_MID_COMPACTION" "$WORKER_A_LOG" \
+  "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
 oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
 
 # Release-blocking: pass `blocking` so a failure exits 2 and prints the
-# RELEASE-BLOCKING severity line.
+# RELEASE-BLOCKING severity line. A could-not-measure run exits 3, and only
+# when nothing else failed, so it never hides a real oracle failure.
 summary_rc=0
 print_oracle_summary "scenario 2: kill maintain worker mid-compaction" blocking || summary_rc=$?
 exit "$summary_rc"
