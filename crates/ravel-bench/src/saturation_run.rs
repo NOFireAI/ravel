@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use crate::saturation::Probe;
-use crate::saturation::{next_probe_slot, slots_due};
+use crate::saturation::{ProberStep, prober_step, slots_due};
 use anyhow::{Context, bail};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
@@ -435,8 +435,8 @@ impl WindowStop {
         self.last_slot.load(Ordering::Acquire) != u64::MAX
     }
 
-    fn past(&self, slot: u64) -> bool {
-        slot > self.last_slot.load(Ordering::Acquire)
+    fn last_slot(&self) -> u64 {
+        self.last_slot.load(Ordering::Acquire)
     }
 }
 
@@ -451,12 +451,12 @@ pub struct Prober {
 /// Probes `url` sequentially, one probe per slot, until `stop` closes the
 /// window, on a dedicated thread with its own `current_thread` runtime.
 /// Returns once the prober is ready to send its first probe, with the window
-/// start it took then. Slot `k` is due at `start + k * period`. A probe whose
-/// slot was due in the window is sent even when the prober wakes after the
-/// window closed, so every slot counted as due has its probe. A probe whose
-/// own duration crossed later slots' due times skips them
-/// ([`crate::saturation::next_probe_slot`]), so a slow listener shows up as
-/// fewer probes in a window; a prober that wakes late does not.
+/// start it took then. Slot `k` is due at `start + k * period`. Which slot
+/// comes next, and when the loop stops, is [`prober_step`]: a probe whose own
+/// duration crossed later slots' due times skips them, and a prober that
+/// wakes late skips nothing. Every probe sent is returned; whether it covered
+/// a slot is decided afterwards by [`crate::saturation::slot_coverage`],
+/// which refuses one sent more than a period late or after the window.
 pub fn spawn_prober(
     url: String,
     period: Duration,
@@ -475,14 +475,16 @@ pub fn spawn_prober(
                 ready_tx
                     .send(start)
                     .map_err(|_| anyhow::anyhow!("prober start not received"))?;
-                let mut probes = Vec::new();
-                let mut slot = 1u64;
-                loop {
+                let mut probes: Vec<Probe> = Vec::new();
+                while let ProberStep::Send(slot) =
+                    prober_step(probes.last(), period, stop.last_slot())
+                {
                     let offset = period
                         .checked_mul(u32::try_from(slot)?)
                         .context("probe slot offset")?;
                     tokio::time::sleep_until((start + offset).into()).await;
-                    if stop.past(slot) {
+                    // The window can close during the sleep.
+                    if prober_step(probes.last(), period, stop.last_slot()) == ProberStep::Stop {
                         break;
                     }
                     let issued = Instant::now();
@@ -500,7 +502,6 @@ pub fn spawn_prober(
                         latency: issued.elapsed(),
                         status,
                     };
-                    slot = next_probe_slot(&probe, period);
                     probes.push(probe);
                 }
                 Ok(probes)

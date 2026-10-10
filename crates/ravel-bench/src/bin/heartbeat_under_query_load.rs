@@ -1,5 +1,6 @@
 //! ADR-1702 task 11, scenario 2: query saturation versus the runtime
-//! heartbeat (issue #2670). Advisory: no CI lane runs it.
+//! heartbeat (issue #2670). Advisory: CI builds it and runs the band tests,
+//! and no CI lane runs the scenario.
 //!
 //! Run it in the release profile:
 //!
@@ -37,7 +38,8 @@
 //!   10 s, ADR-1702 decision 9's bound (a third of the 30 s readiness
 //!   threshold). At or above 10 s is a hard miss. `/metrics` is served by
 //!   the runtime being measured, so a scrape that returned no age counts its
-//!   own latency as an age here.
+//!   own latency as an age here. It is read before `heartbeat_scrapes`, so a
+//!   scrape that timed out past 10 s is named as this hard miss.
 //! - `heartbeat_age_expected`: the same maximum is under 2 s, the expected
 //!   band. Between 2 s and 10 s the run is outside the expected band and
 //!   inside the ADR's, and is reported as such.
@@ -181,6 +183,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let first = client_rt.block_on(run::scrape(&client, http, run::PROBE_TIMEOUT))?;
     if let Err(err) = run::require_families(&first) {
         println!("RESULT: FAIL {err}");
+        server_rt.block_on(server.shutdown())?;
         return Ok(ExitCode::from(2));
     }
 
@@ -291,7 +294,6 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         saturation::probes_in_window(&probes, window).len()
     );
     println!("{}", saturation::scrape_summary(&scrapes));
-    println!("{}", saturation::wake_lateness_line(&probes, window));
     let mut figs = FigureSet::new();
     figs.record(fig::WINDOW_MS, saturation::window_ms(window));
     figs.record(fig::PROMQL_QUERIES_OK, tally.promql_ok as f64);
@@ -299,6 +301,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     figs.record(fig::QUERIES_FAILED, tally.failures.len() as f64);
     saturation::record_heartbeat_scrapes(&mut figs, &scrapes);
     saturation::record_readyz_probes(&mut figs, window, &probes);
+    println!("{}", saturation::wake_lateness_line(&figs));
 
     let outcomes = saturation::evaluate_heartbeat_under_load(&figs);
     for outcome in &outcomes {

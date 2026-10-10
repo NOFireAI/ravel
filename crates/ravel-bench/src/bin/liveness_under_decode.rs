@@ -1,5 +1,6 @@
 //! ADR-1702 task 11, scenario 1: decode saturation versus liveness
-//! (issue #2670). Advisory: no CI lane runs it.
+//! (issue #2670). Advisory: CI builds it and runs the band tests, and no CI
+//! lane runs the scenario.
 //!
 //! Run it in the release profile:
 //!
@@ -30,15 +31,20 @@
 //!
 //! The bands, fixed before the first run:
 //!
-//! - `probes_issued`: exactly `floor(window_ms / 100)` probes in the decode
-//!   window. Probes are counted by due slot (slot `k` is due `k * 100` ms
-//!   after the window starts), the same definition the expected count uses.
-//!   A probe whose own duration crosses later slots' due times skips them,
-//!   so a slow listener reads as a short count. A prober that wakes late
-//!   skips nothing; its largest wake lateness prints once, with no band. The
-//!   window starts once the prober thread is ready to send its first probe.
-//! - `probes_answered`: every one of those probes answered 200.
-//! - `probe_latency_max`: the slowest probe took under 250 ms.
+//! - `probes_answered`: every probe sent for a slot due in the decode window
+//!   answered 200 (slot `k` is due `k * 100` ms after the window starts).
+//! - `probe_latency_max`: the slowest of those probes took under 250 ms.
+//!   It is read before the coverage band, so a slow listener is named as
+//!   slow.
+//! - `probe_slots_covered`: exactly `floor(window_ms / 100)` slots covered,
+//!   every slot due in the window. A slot is covered by a probe for it sent
+//!   no more than one period after its due time, inside the window, and
+//!   answered 200, or by such a probe for an earlier slot, under 250 ms, that
+//!   was in flight when the slot fell due. A probe sent more than a period
+//!   late or after the window covers nothing, so a prober that was not
+//!   scheduled for part of the window misses here. The prober's largest
+//!   wake lateness prints once, with no band. The window starts once the
+//!   prober thread is ready to send its first probe.
 //! - `inline_jobs`: `ravel_cpu_gate_inline_total` moved by exactly 0 over the
 //!   window, summed over every gate and site.
 //!
@@ -235,6 +241,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let before = client_rt.block_on(run::scrape(&client, http, run::PROBE_TIMEOUT))?;
     if let Err(err) = run::require_families(&before) {
         println!("RESULT: FAIL {err}");
+        server_rt.block_on(server.shutdown())?;
         return Ok(ExitCode::from(2));
     }
 
@@ -310,12 +317,15 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     figs.record(fig::DECODE_UNIT_BYTES, decode_bytes as f64);
     figs.record(fig::DECODE_UNIT_TARGET_BYTES, target as f64);
     figs.record(fig::QUERIES_FAILED, failures.len() as f64);
+    let coverage = saturation::slot_coverage(&probes, window);
     println!(
-        "window: {:.3} ms, probes due after the window (not counted): {}",
+        "window: {:.3} ms, slots due: {}, uncovered: {}, probes due after the window (not counted): {}",
         saturation::window_ms(window),
+        coverage.due,
+        coverage.uncovered(),
         probes.len() - saturation::probes_in_window(&probes, window).len()
     );
-    println!("{}", saturation::wake_lateness_line(&probes, window));
+    println!("{}", saturation::wake_lateness_line(&figs));
 
     let outcomes = saturation::evaluate_decode_liveness(&figs);
     for outcome in &outcomes {

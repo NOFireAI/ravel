@@ -1078,11 +1078,11 @@ jobs:
         with:
           phase: report
 
-  # Never-compiled ravel-bench feature combinations (ADR-0053 D6). Six cargo
+  # Never-compiled ravel-bench feature combinations (ADR-0053 D6). Seven cargo
   # features are off by default and no other job builds them, so a break in
   # any of them -- an unreachable e2e test path, four bench binaries that
   # never link -- ships undetected. This lane proves each combination still
-  # compiles (`cargo check`), and for three of them also runs their tests:
+  # compiles (`cargo check`), and for five of them also runs their tests:
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
@@ -1097,6 +1097,9 @@ jobs:
   #                                              per-stage ingest breakdown,
   #                                              ADR-0104. RUNS its test, does
   #                                              not merely compile it)
+  #   - ravel-bench --features saturation       (ravel-server/jemalloc; the
+  #                                              ADR-1702 task 11 bins. Clippy
+  #                                              and RUNS the band tests)
   #
   # The `ravel-server --features otap` lane used to live here too. It was split
   # out into `features-otap` below (issue #1590): commit 6951146b added the
@@ -1127,7 +1130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing]
+        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing, saturation]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1165,7 +1168,7 @@ jobs:
           LANE: ${{ matrix.lane }}
         run: |
           case "$LANE" in
-            parquet-baseline|sql-latency|sql-latency-wide|stage-timing)
+            parquet-baseline|sql-latency|sql-latency-wide|stage-timing|saturation)
               echo "lane: $LANE" ;;
             *)
               echo "::error::unknown features lane '$LANE'; no step would run for it"
@@ -1256,6 +1259,19 @@ jobs:
       - name: Doctests ravel-logseg + ravel-ingest --features stage-timing
         if: matrix.lane == 'stage-timing'
         run: cargo test --locked --doc --profile ci -p ravel-logseg -p ravel-ingest --features stage-timing
+      # The ADR-1702 task 11 saturation bins carry
+      # `required-features = ["saturation"]`, so outside this leg only the
+      # non-required all-features clippy builds them, and their band tests run
+      # only with the feature on.
+      - name: Clippy ravel-bench --features saturation
+        if: matrix.lane == 'saturation'
+        run: cargo clippy --locked --profile ci -p ravel-bench --features saturation --all-targets -- -D warnings
+      - name: Test ravel-bench --features saturation
+        if: matrix.lane == 'saturation'
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-bench --features saturation
+      - name: Doctests ravel-bench --features saturation
+        if: matrix.lane == 'saturation'
+        run: cargo test --locked --doc --profile ci -p ravel-bench --features saturation
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
