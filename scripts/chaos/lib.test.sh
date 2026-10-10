@@ -171,6 +171,7 @@ curl() {
   case "${CURL_MODE}" in
     serve-metrics) printf '%s\n' "${METRICS_SAMPLE}" ;;
     unreachable) return 7 ;;
+    slow-metrics) sleep 2; printf '%s\n' "${METRICS_SAMPLE}" ;;
     export)
       local dump="" prev=""
       local arg
@@ -395,8 +396,10 @@ check "classifier: A finished its pass, B silent is could-not-measure (3)" "3" \
   "$(cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
 check "classifier: B published passes conservation" "0" \
   "$(cons "${LOG_SILENT}" "${LOG_PUBLISHED}")"
-check "classifier: nothing published fails conservation" "1" \
+check "classifier: A published nothing, B silent is could-not-measure (3)" "3" \
   "$(cons "${LOG_SILENT}" "${LOG_SILENT}")"
+check "classifier: A published nothing, B aborts rose still fails" "1" \
+  "$(cons "${LOG_SILENT}" "${LOG_SILENT}" 0)"
 check "classifier: A published with no pass end, B silent fails conservation" "1" \
   "$(cons "${LOG_PUBLISHED}" "${LOG_SILENT}")"
 check "classifier: A published unit 1, started unit 2, B silent fails conservation" "1" \
@@ -421,6 +424,36 @@ check "activity: a missing log reports zeros" \
   "$(chaos_worker_activity_line w "${SCRATCH}/no-such.log")"
 check "activity: not_sealed is summed" "WORKER-ACTIVITY: w publishes=0 passes=1 compacted=0 not_sealed=2" \
   "$(chaos_worker_activity_line w <(printf 'x maintenance: retention + compaction pass complete compacted=0 not_sealed=2\n'))"
+
+# The scenarios run under set -eE and an ERR trap that exits 3; the in-flight
+# export's own exit code must still reach `wait`.
+bg_export_rc() {
+  (
+    set -eEuo pipefail
+    trap 'exit 3' ERR
+    drive_one_export() { return "$1"; }
+    chaos_start_background_export "$1" fixture "${SCRATCH}/bg-out"
+    rc=0
+    wait "$CHAOS_BG_EXPORT_PID" || rc=$?
+    echo "$rc"
+  )
+}
+check "background export: curl 52 survives the ERR trap" "52" "$(bg_export_rc 52)"
+check "background export: curl 22 survives the ERR trap" "22" "$(bg_export_rc 22)"
+check "background export: success is 0" "0" "$(bg_export_rc 0)"
+check "background export: 52 reads as unanswered" "0" "$(chaos_inflight_answered "$(bg_export_rc 52)")"
+
+# wait_for_flush_started's deadline is wall-clock: a scrape that takes 2 s
+# against a 1 s deadline returns after one scrape, not after 5 polls of it.
+flush_wait_seconds() {
+  local t0 t1
+  t0="$(date +%s)"
+  CURL_MODE=slow-metrics METRICS_SAMPLE="${METRICS_TIME_ONLY}" wait_for_flush_started http://stub 999 1 >/dev/null 2>&1
+  t1="$(date +%s)"
+  echo $(( t1 - t0 ))
+}
+check "flush wait: a slow /metrics stops at the deadline (at most 4 s for a 1 s deadline)" "yes" \
+  "$([[ "$(flush_wait_seconds)" -le 4 ]] && echo yes || echo no)"
 
 # Both workers run before the kill: B's publish counts only past its line
 # count at the kill. Args: A's log, B's log, B's line count at the kill.

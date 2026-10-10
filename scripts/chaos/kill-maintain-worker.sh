@@ -30,7 +30,10 @@
 # "maintenance: retention + compaction pass complete" lines with
 # compacted>=1 after the last one. No per-bucket start signal exists to read,
 # so this cannot tell a merge in progress from a pass still in its retention
-# or sweep work; see compaction_unfinished_in_log in lib.sh.
+# or sweep work; see compaction_unfinished_in_log in lib.sh. Nor can it tell
+# a first unit being merged from a pass with nothing to compact, so when A
+# published nothing before the kill and the survivor publishes nothing after
+# it, conservation reports could-not-measure rather than a failure.
 #
 # SEAL WAIT: an ingest hour is compactable only once sealed, at the end of
 # the hour plus the catalog's seal margin (CatalogConfig::default(), logged
@@ -231,8 +234,11 @@ for _ in $(seq 1 "$EXPORT_COUNT"); do
     LAST_ACK_UNIX_S="$(chaos_now_unix_s)"
   fi
 done
-if [[ "$SENT" -eq 0 ]]; then
-  log "no exports were accepted; the maintain workers would own nothing"
+# Every export must land: the seal wait is paid for a known compaction input,
+# and a rejected export (a 429 under the ingest byte rate, say) would shrink
+# it with nothing else in the output to say so.
+if [[ "$SENT" -lt "$EXPORT_COUNT" ]]; then
+  log "only ${SENT}/${EXPORT_COUNT} exports were accepted; the compaction input is short"
   exit 3
 fi
 log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server (last ack at unix ${LAST_ACK_UNIX_S})"
