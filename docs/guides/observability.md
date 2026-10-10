@@ -2342,8 +2342,10 @@ while stale data is still served. The operations guide pages on that state.
 
 Labels: `mode` only. The family carries no `tenant_hash` label, because that
 label discloses which tenant's writes failed on this unauthenticated route. The family renders only in a mode that installed the query-audit
-pipeline (`all` or `query`). A gateway-only or maintain-only process omits
-it.
+pipeline (`all` or `query`), and only when the query audit is enabled. The
+audit is off by default (`--audit-mode off`), and a process with it off
+omits both `ravel_audit_*` families. A gateway-only or maintain-only
+process omits them too.
 
 A flush writes one object per tenant. Within one flush, the failure counter
 increments once per tenant group whose write fails.
@@ -2365,8 +2367,8 @@ How the two counters read:
   until the budget ran out, not a single slow request. A climbing retry
   counter with a flat failure counter means that the store is degraded and
   the retries still absorb it.
-- Under `--audit-mode required` (the default) a failed audit write fails the
-  query with a 503 and is not counted here. The failure counter is therefore
+- Under `--audit-mode required` a failed audit write fails the query with a
+  503 and is not counted here. The failure counter is therefore
   always zero on a fail-closed deployment.
 - Under `--audit-mode best-effort`, any increase means that the audit trail
   is incomplete while queries keep succeeding. Alert on the increase, not on
