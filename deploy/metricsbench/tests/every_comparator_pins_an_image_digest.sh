@@ -41,10 +41,6 @@
 #      Scoped to these two files at the time: deploy/k8s's own registry
 #      images were pinned separately by category 6 below (issue #1720's
 #      residual round).
-#      deploy/docker-compose/ci-host-bucket.yml is deliberately out of scope:
-#      its only image is `${RAVEL_IMAGE:?...}` with `pull_policy: never`,
-#      Ravel's own locally built image, not a third-party pull. A
-#      third-party image added there needs this category widened first.
 #   5. every image argument of a `docker run`, `docker pull`, or
 #      `docker create` invocation inside a `run:` block, across every
 #      workflow under .github/workflows and every composite action under
@@ -147,8 +143,10 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # the matrix job adds a nextest install (taiki-e/install-action), and the
 # `features` job that reports on it uses no action at all. Raised 111->112
 # when k8s-nightly.yml's `chaos` job gained an upload-artifact step for the
-# scenarios' process logs on failure (issue #2666).
-WORKFLOW_EXPECTED_ACTION_COUNT=112
+# scenarios' process logs on failure (issue #2666). Lowered 112->110 when
+# ci.yml's per-PR `quickstart` job was removed (ADR-0081 A6): a checkout and a
+# rust-cache.
+WORKFLOW_EXPECTED_ACTION_COUNT=110
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
@@ -185,15 +183,17 @@ RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.23.0}'
 # DR_AWS_CLI_IMAGE's own default there. Lowered 18->15 when the three
 # AWS CLI container runs that created a RustFS bucket (ci.yml's
 # object-store-contract and bench-smoke, metricsbench-nightly.yml) moved to
-# the runner's own aws CLI (issue #2036).
-RUN_IMAGE_EXPECTED_COUNT=15
+# the runner's own aws CLI (issue #2036). Lowered 15->13 when ci.yml's
+# `quickstart` job and its two telemetrygen runs were removed (ADR-0081 A6).
+RUN_IMAGE_EXPECTED_COUNT=13
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
 # RUN_IMAGE_EXPECTED_COUNT. Raised 11->12 with the dr-rehearsal object-store run,
 # which is digest pinned. Lowered 12->9 with the three AWS CLI runs above,
-# all of which were digest pinned.
-RUN_IMAGE_EXPECTED_PINNED_COUNT=9
+# all of which were digest pinned. Lowered 9->7 with the two telemetrygen
+# runs above, both digest pinned.
+RUN_IMAGE_EXPECTED_PINNED_COUNT=7
 
 # The exact text of an extracted image argument (same stripping as the
 # extraction below: the whitespace-delimited token itself, quotes included
