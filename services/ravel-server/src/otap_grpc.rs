@@ -482,7 +482,7 @@ mod tests {
     use super::*;
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestConfig, IngestRouter,
-        MIN_PLAUSIBLE_INGEST_CLOCK_NS, SystemClock,
+        MIN_PLAUSIBLE_INGEST_CLOCK_NS, PendingAckBudget, SystemClock,
     };
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
@@ -496,6 +496,7 @@ mod tests {
             store,
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         IngestState {
             router,

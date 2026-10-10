@@ -212,7 +212,8 @@ mod tests {
     use std::sync::Arc;
 
     use ravel_ingest::{
-        AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, SystemClock,
+        AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, PendingAckBudget,
+        SystemClock,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::{Signal, TenantId};
@@ -246,6 +247,7 @@ mod tests {
             store.clone(),
             Signal::Metrics,
             clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let admission = AdmissionController::new(clock.clone(), AdmissionLimits::default());
 

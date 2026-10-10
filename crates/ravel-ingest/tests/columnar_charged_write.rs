@@ -19,7 +19,7 @@ use std::time::Duration;
 use common::{TestClock, tenant};
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, LogIngestRouter, LogWriteError,
-    WriteMode,
+    PendingAckBudget, WriteMode,
 };
 use ravel_logseg::{ColumnarLogBatch, LogRecord, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
@@ -51,7 +51,13 @@ fn one_shard_router(
         flush_tick: Duration::from_secs(3600),
         ..IngestConfig::default()
     };
-    LogIngestRouter::new(config, store, TestClock::new(BASE_NS)).with_budget(budget)
+    LogIngestRouter::new(
+        config,
+        store,
+        TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(budget)
 }
 
 fn unlimited() -> Arc<IngestByteBudget> {

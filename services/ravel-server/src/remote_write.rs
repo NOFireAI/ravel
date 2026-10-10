@@ -645,7 +645,7 @@ mod tests {
 
     use ravel_ingest::{
         AdmissionLimits, IngestByteBudgetLimit, IngestConfig, MIN_PLAUSIBLE_INGEST_CLOCK_NS,
-        SystemClock,
+        PendingAckBudget, SystemClock,
     };
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
@@ -749,6 +749,7 @@ mod tests {
             store,
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         Arc::new(RemoteWriteState {
             tenant_resolver,

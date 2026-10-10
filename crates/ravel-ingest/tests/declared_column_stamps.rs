@@ -27,7 +27,7 @@ use ravel_catalog::{
 use ravel_commit::declared_stats::read_commit_record;
 use ravel_commit::keys;
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, LogIngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::instrument::InstrumentedStore;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -247,7 +247,12 @@ async fn min_max_count_answered_from_ingest_stamps_with_zero_gets() {
     let expected_max = *values.iter().max().unwrap();
     let expected_non_null = values.len() as i64;
 
-    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&backend), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&backend),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let receipt = router
         .write(
             tenant(),
@@ -401,7 +406,12 @@ async fn edge_extrema_and_all_null_stamped_from_a_real_flush() {
     ];
     let sample_count = records.len() as u64;
 
-    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let receipt = router
         .write(
             tenant(),
@@ -445,7 +455,12 @@ async fn two_flushes_stamp_from_their_own_buffers() {
     let clock = TestClock::new(BASE_NS);
     declare_columns(store.as_ref(), i64_col_decl()).await;
 
-    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     // First flush: EventDate in {10, 30}.
     let first = router
@@ -533,7 +548,12 @@ async fn stamped_min_max_count(
     let clock = TestClock::new(BASE_NS);
     declare_columns(backend.as_ref(), i64_col_decl()).await;
 
-    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&backend), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&backend),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let receipt = router
         .write(
             tenant(),

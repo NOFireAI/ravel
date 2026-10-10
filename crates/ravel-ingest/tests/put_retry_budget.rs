@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
 };
@@ -65,6 +65,7 @@ async fn data_put_makes_exactly_max_attempts_plus_one_calls() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let err = router
@@ -118,6 +119,7 @@ async fn commit_put_makes_exactly_max_attempts_plus_one_calls() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let err = router
@@ -190,6 +192,7 @@ async fn retry_backoff_waits_on_the_injected_clock() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let write_router = Arc::clone(&router);

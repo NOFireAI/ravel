@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, PendingAckBudget, SystemClock, WriteMode};
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_types::{Signal, TenantId, TimeRange};
 use serde::Serialize;
@@ -477,6 +477,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         Arc::clone(&store),
         signal,
         Arc::clone(&clock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let catalog = Arc::new(
         Catalog::new(

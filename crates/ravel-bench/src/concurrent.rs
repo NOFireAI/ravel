@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, PendingAckBudget, SystemClock, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::NormalizedPoint;
 use ravel_promql::Value;
@@ -355,6 +355,7 @@ pub async fn run(config: &ConcurrentConfig) -> Report {
         Arc::clone(&store),
         signal,
         Arc::clone(&clock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let catalog = Arc::new(
         Catalog::new(

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use common::{make_point, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
@@ -59,7 +59,13 @@ async fn crash_before_data_put_leaves_nothing_stored_or_visible_at_depth_three()
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = common::TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let points = vec![make_point(&tid, "cpu_usage", &[("host", "a")], 1_000, 1.0)];
@@ -130,7 +136,13 @@ async fn crash_after_data_put_before_commit_orphans_at_depth_three() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = common::TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let points = vec![make_point(&tid, "cpu_usage", &[("host", "a")], 1_000, 1.0)];
@@ -215,7 +227,13 @@ async fn concurrent_flush_crash_is_isolated_from_a_healthy_sibling_at_depth_thre
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = common::TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let victim_points = vec![make_point(
         &victim,

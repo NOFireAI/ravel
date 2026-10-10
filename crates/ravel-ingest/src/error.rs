@@ -80,6 +80,16 @@ pub enum WriteError {
     /// with [`Self::DeferralCapReached`] instead.
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
+    /// The process-wide pending-strict-ack budget
+    /// (`IngestConfig::max_pending_strict_acks`, ADR-2793 decision 4) is at its
+    /// ceiling: `submit` could not take a pending-ack permit, so the write is
+    /// refused before the byte budget is charged and before any shard is
+    /// touched, with no commit token issued. Retryable, classified the same as
+    /// [`Self::BufferBudgetExceeded`]: a permit frees as soon as any in-flight
+    /// strict write's `acks()` resolves. Gateway status mapping is not yet
+    /// wired to this variant.
+    #[error("pending strict-ack budget reached")]
+    PendingAckLimitReached,
     /// A shard this write routes to has a flush that has stayed deferred at the
     /// queued-flush cap for the whole flush deferral cap
     /// ([`crate::IngestConfig::flush_deferral_cap_ns`], ADR-1642 deferral cap
@@ -133,6 +143,7 @@ impl WriteError {
             | WriteError::Abandoned(_)
             | WriteError::StaleProvisioningView
             | WriteError::BufferBudgetExceeded
+            | WriteError::PendingAckLimitReached
             | WriteError::DeferralCapReached => true,
             WriteError::SegmentBuild(_)
             | WriteError::SeriesIdCollision(_)
@@ -293,6 +304,7 @@ mod tests {
             Arc::clone(&store),
             Signal::Metrics,
             clock.clone(),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
 
         let tenant = TenantId::new("acme");

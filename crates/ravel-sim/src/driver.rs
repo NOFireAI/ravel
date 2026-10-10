@@ -37,7 +37,8 @@ use ravel_catalog::{
 };
 use ravel_commit::rng::{RngSource, SeededRng};
 use ravel_ingest::{
-    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteError, WriteMode,
+    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, PendingAckBudget, WriteError,
+    WriteMode,
 };
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, NoLeases, SweepReport,
@@ -1164,6 +1165,7 @@ async fn run_cycle_async(
             Signal::Metrics,
             Arc::clone(&clock),
             Arc::clone(&ingest_rng),
+            Arc::new(PendingAckBudget::new(0)),
         );
 
         // F13: ingest in per-sample-index batches rather than one batch for

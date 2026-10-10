@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use prost::Message;
 use ravel_catalog::config_key;
-use ravel_ingest::{IngestConfig, LogIngestRouter, TenantCount, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, PendingAckBudget, TenantCount, WriteMode};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -139,6 +139,7 @@ async fn an_unresolved_key_warns_once_per_refresh() {
         },
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let write = || async {
         router

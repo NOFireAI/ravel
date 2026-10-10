@@ -397,7 +397,8 @@ mod tests {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use ravel_ingest::{
-        AdmissionController, AdmissionLimits, IngestConfig, SystemClock, read_marker,
+        AdmissionController, AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock,
+        read_marker,
     };
     use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
     use ravel_object_store::ObjectStoreBackend;
@@ -429,6 +430,7 @@ mod tests {
             },
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         SpanIngestState {
             router,

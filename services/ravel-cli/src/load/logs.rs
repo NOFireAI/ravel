@@ -490,6 +490,7 @@ pub(super) async fn load_with_drain_reflush_period(
         },
         Arc::clone(&store),
         Arc::clone(&clock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     // Every Strict write below waits this long for its ack, and the wait is

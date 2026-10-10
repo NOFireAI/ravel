@@ -40,9 +40,9 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, FlushTriggerMix, IngestByteBudget, IngestByteCharge, IngestConfig, IngestRouter,
-    LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt, RlogZstdLevel,
-    STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError, SpanWriteReceipt, SystemClock,
-    WriteError, WriteMode, WriteReceipt,
+    LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt, PendingAckBudget,
+    RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
+    SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
 };
 use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;

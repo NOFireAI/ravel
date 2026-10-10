@@ -16,7 +16,7 @@ use prost::Message;
 use ravel_catalog::config_key;
 use ravel_commit::keys;
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, LogIngestRouter, TenantCount, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, PendingAckBudget, TenantCount, WriteMode};
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{
     LogFooter, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, kind, open,
@@ -183,6 +183,7 @@ async fn flush_one(
         flush_on_first(),
         Arc::clone(&store),
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let token = write(&router, records).await;
     router.shutdown().await;
@@ -478,6 +479,7 @@ async fn unresolved_key_column_writes_without_a_descriptor_and_counts() {
         flush_on_first(),
         Arc::clone(&store),
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let first = write(&router, bloom_records()).await;
@@ -545,6 +547,7 @@ async fn a_key_the_writer_refuses_writes_without_a_descriptor_and_counts() {
         flush_on_first(),
         Arc::clone(&store),
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let token = write(&router, bloom_records()).await;
@@ -567,7 +570,12 @@ async fn deleting_a_keyed_record_resets_the_flush_after_a_refresh() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     put_record(store.as_ref(), &config).await;
     let clock = TestClock::new(BASE_NS);
-    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let keyed = write(&router, clustering_records()).await;
     store
@@ -624,6 +632,7 @@ async fn one_config_get_serves_the_fields_and_the_layout() {
         flush_on_first(),
         Arc::clone(&store),
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     // One flush on a cold cache: one refresh, then the flush itself.
@@ -672,7 +681,12 @@ async fn key_change_is_picked_up_after_a_refresh() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     put_record(store.as_ref(), &key_a).await;
     let clock = TestClock::new(BASE_NS);
-    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let first = write(&router, clustering_records()).await;
     put_record(store.as_ref(), &key_b).await;

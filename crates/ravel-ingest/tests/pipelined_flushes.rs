@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -46,6 +46,7 @@ async fn pipelined_flushes_overlap_and_ack_isolation() {
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let acme = tenant("acme");
@@ -173,6 +174,7 @@ async fn actor_drains_while_flush_inflight() {
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let stuck = tenant("acme");
@@ -270,6 +272,7 @@ async fn pipelining_reaches_the_full_configured_depth_of_three() {
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let tenants: Vec<_> = ["acme", "globex", "initech"]

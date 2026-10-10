@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use common::{TestClock, expect_vector, make_point, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteError, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteError, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -49,7 +49,13 @@ async fn ack_timeout_then_late_commit_is_durable_and_unobservable() {
     // deadline elapses.
     let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
     let clock = TestClock::new(BASE_NS);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let event_ts = BASE_NS - NS_PER_MIN;

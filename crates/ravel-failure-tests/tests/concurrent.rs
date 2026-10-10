@@ -14,7 +14,7 @@ use common::{TestClock, catalog, expect_matrix, make_point, tenant};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{EngineConfig, QueryEngine};
@@ -54,6 +54,7 @@ async fn concurrent_ingest_and_query_never_sees_a_partially_visible_flush() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let tid = tenant("acme");
 

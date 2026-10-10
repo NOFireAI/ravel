@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestClock, commit_and_trailer_versions, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, SEGMENT_FORMAT_VERSION, WriteMode};
+use ravel_ingest::{
+    IngestConfig, IngestRouter, PendingAckBudget, SEGMENT_FORMAT_VERSION, WriteMode,
+};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
@@ -40,7 +42,13 @@ async fn retried_data_put_is_idempotent_and_commits_exactly_once() {
     );
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -97,7 +105,13 @@ async fn retried_data_put_is_idempotent_and_commits_exactly_once_with_v5() {
     );
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -158,7 +172,13 @@ async fn permanent_fault_before_data_put_leaves_no_visible_commit() {
     );
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -205,7 +225,13 @@ async fn permanent_fault_between_puts_leaves_data_object_orphaned() {
     );
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(

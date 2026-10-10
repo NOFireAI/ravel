@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestClock, catalog, tenant};
-use ravel_ingest::{IngestConfig, LogIngestRouter, SpanIngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, PendingAckBudget, SpanIngestRouter, WriteMode};
 use ravel_logseg::LogRecord;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -146,7 +146,12 @@ async fn discover_and_read_spans(
 async fn logs_and_spans_lost_ack_retry_serves_the_record_twice_logs() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
-    let router = LogIngestRouter::new(config(1), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        config(1),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let build = || vec![log_record("checkout failed", BASE_NS - 60_000_000_000)];
@@ -200,7 +205,12 @@ async fn logs_and_spans_lost_ack_retry_serves_the_record_twice_logs() {
 async fn logs_and_spans_lost_ack_retry_serves_the_record_twice_spans() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
-    let router = SpanIngestRouter::new(config(1), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        config(1),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let trace_id = [7u8; 16];

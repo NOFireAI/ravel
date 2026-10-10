@@ -58,7 +58,8 @@ use ravel_catalog::{
     append_generation, validate_or_adopt,
 };
 use ravel_ingest::{
-    Clock, DEFAULT_REFRESH_INTERVAL_NS, IngestConfig, IngestRouter, WriteError, WriteMode,
+    Clock, DEFAULT_REFRESH_INTERVAL_NS, IngestConfig, IngestRouter, PendingAckBudget, WriteError,
+    WriteMode,
 };
 use ravel_maintain::write_reshard_audit;
 use ravel_object_store::fault::{FaultPlan, Op, Rule, ScriptedFault};
@@ -178,6 +179,7 @@ fn build_router(
         store,
         SIGNAL,
         clock,
+        Arc::new(PendingAckBudget::new(0)),
     )
 }
 

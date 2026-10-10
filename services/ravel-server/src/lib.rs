@@ -87,7 +87,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use ravel_ingest::{
     AdmissionController, IngestConfig, IngestConfigError, IngestRouter, LogIngestRouter,
-    SpanIngestRouter, SystemClock,
+    PendingAckBudget, SpanIngestRouter, SystemClock,
 };
 use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
 #[cfg(feature = "otap")]
@@ -2344,6 +2344,7 @@ pub async fn start_with_heartbeat(
                 store.clone(),
                 Signal::Metrics,
                 Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(ingest_buffer_budget.clone()),
         ))
@@ -2424,6 +2425,7 @@ pub async fn start_with_heartbeat(
                 store.clone(),
                 Arc::new(SystemClock),
                 indexed_fields,
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(ingest_buffer_budget.clone()),
         ))
@@ -2451,8 +2453,13 @@ pub async fn start_with_heartbeat(
             Signal::Spans,
         )?;
         Some(Arc::new(
-            SpanIngestRouter::new(span_ingest_config, store.clone(), Arc::new(SystemClock))
-                .with_budget(ingest_buffer_budget.clone()),
+            SpanIngestRouter::new(
+                span_ingest_config,
+                store.clone(),
+                Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
+            )
+            .with_budget(ingest_buffer_budget.clone()),
         ))
     } else {
         None
@@ -4515,16 +4522,19 @@ mod shutdown_drain_tests {
             store.clone(),
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let log_router = Arc::new(LogIngestRouter::new(
             IngestConfig::default(),
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let span_router = Arc::new(SpanIngestRouter::new(
             IngestConfig::default(),
             store,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
 
         let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(
@@ -4862,8 +4872,8 @@ mod ingest_readiness_tests {
     use bytes::Bytes;
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_ingest::{
-        Clock, IngestConfig, LogIngestRouter, LogWriteError, SpanIngestRouter, SpanWriteError,
-        WriteMode, shard_for_span,
+        Clock, IngestConfig, LogIngestRouter, LogWriteError, PendingAckBudget, SpanIngestRouter,
+        SpanWriteError, WriteMode, shard_for_span,
     };
     use ravel_logseg::stream_attrs_bytes;
     use ravel_object_store::memory::MemoryStore;
@@ -5116,6 +5126,7 @@ mod ingest_readiness_tests {
             flush_on_first(shard_count),
             Arc::clone(&store),
             ShardTestClock::new(BASE_NS),
+            Arc::new(PendingAckBudget::new(0)),
         ));
 
         // Built exactly as `start` builds it, from the router's metrics handle.
@@ -5177,6 +5188,7 @@ mod ingest_readiness_tests {
             flush_on_first(shard_count),
             Arc::clone(&store),
             ShardTestClock::new(BASE_NS),
+            Arc::new(PendingAckBudget::new(0)),
         ));
 
         let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(

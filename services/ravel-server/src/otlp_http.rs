@@ -960,7 +960,8 @@ pub(crate) mod tests {
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestByteBudget, IngestByteBudgetLimit,
-        IngestConfig, IngestRouter, LogIngestRouter, RateLimit, SpanIngestRouter, SystemClock,
+        IngestConfig, IngestRouter, LogIngestRouter, PendingAckBudget, RateLimit, SpanIngestRouter,
+        SystemClock,
     };
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
@@ -1001,6 +1002,7 @@ pub(crate) mod tests {
                 store.clone(),
                 Signal::Metrics,
                 Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(budget.clone()),
         );
@@ -1009,6 +1011,7 @@ pub(crate) mod tests {
                 IngestConfig::default(),
                 store.clone(),
                 Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(budget.clone()),
         );
@@ -1017,6 +1020,7 @@ pub(crate) mod tests {
                 IngestConfig::default(),
                 store.clone(),
                 Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(budget.clone()),
         );

@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use common::{StallingStore, TestClock, make_point, tenant};
 use ravel_ingest::{
-    IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, WriteError, WriteMode,
+    IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, PendingAckBudget,
+    WriteError, WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -66,7 +67,14 @@ async fn stalled_flush_sheds_via_byte_budget_without_blocking_the_producer() {
     // A small bounded budget so a handful of pinned charges reach the ceiling.
     let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(8 * 1024));
     let router = Arc::new(
-        IngestRouter::new(config, store, Signal::Metrics, clock.clone()).with_budget(budget),
+        IngestRouter::new(
+            config,
+            store,
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(budget),
     );
 
     let tenant = tenant("acme");
@@ -179,6 +187,7 @@ async fn a_full_mailbox_parks_the_producer_while_the_actor_is_busy_off_the_permi
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let tenant = tenant("acme");
@@ -256,7 +265,13 @@ async fn task_count_is_fixed_at_construction_independent_of_point_count() {
         max_flush_delay: Duration::from_secs(3600),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     assert_eq!(router.shard_count(), 3);
 
     let tenant = tenant("acme");

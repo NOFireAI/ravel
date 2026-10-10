@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, IngestRouter, WriteError, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteError, WriteMode};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_types::Signal;
@@ -62,6 +62,7 @@ async fn colliding_series_ids_are_rejected_loud() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -123,6 +124,7 @@ async fn equal_label_sets_still_merge() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

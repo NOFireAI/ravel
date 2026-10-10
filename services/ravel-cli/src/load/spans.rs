@@ -1035,6 +1035,7 @@ pub(super) async fn load_spans_into(
         build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
         Arc::clone(&store),
         clock,
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let ack_deadline = write_ack_deadline(max_flush_delay);
 

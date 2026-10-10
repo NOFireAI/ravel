@@ -29,7 +29,7 @@ use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, LogIngestRouter,
-    SpanIngestRouter, WriteMode,
+    PendingAckBudget, SpanIngestRouter, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
@@ -117,6 +117,7 @@ async fn unlimited_budget_with_stalled_put_stops_spawning_at_the_cap() {
             Arc::clone(&store),
             Signal::Metrics,
             clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_budget(unlimited()),
     );
@@ -298,8 +299,14 @@ async fn a_deferred_trigger_spawns_on_the_next_tick_after_an_ack() {
         ..capped_config()
     };
     let router = Arc::new(
-        IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-            .with_budget(unlimited()),
+        IngestRouter::new(
+            config,
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(unlimited()),
     );
 
     let acme = tenant("acme");
@@ -377,8 +384,14 @@ async fn a_manual_drain_is_never_refused_by_the_cap() {
         ..capped_config()
     };
     let router = Arc::new(
-        IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-            .with_budget(unlimited()),
+        IngestRouter::new(
+            config,
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(unlimited()),
     );
 
     // More tenants than the cap, all on the one shard, so a capped Manual
@@ -496,8 +509,14 @@ async fn a_backstop_crossing_flush_spawns_even_at_the_queue_cap() {
         ..capped_config()
     };
     let router = Arc::new(
-        IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-            .with_budget(Arc::clone(&budget)),
+        IngestRouter::new(
+            config,
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(Arc::clone(&budget)),
     );
 
     let acme = tenant("acme");
@@ -749,8 +768,13 @@ async fn log_shard_stops_spawning_at_the_cap() {
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(BASE_NS);
     let router = Arc::new(
-        LogIngestRouter::new(capped_config(), Arc::clone(&store), clock.clone())
-            .with_budget(unlimited()),
+        LogIngestRouter::new(
+            capped_config(),
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(unlimited()),
     );
 
     let acme = tenant("acme");
@@ -919,8 +943,13 @@ async fn span_shard_stops_spawning_at_the_cap() {
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(BASE_NS);
     let router = Arc::new(
-        SpanIngestRouter::new(capped_config(), Arc::clone(&store), clock.clone())
-            .with_budget(unlimited()),
+        SpanIngestRouter::new(
+            capped_config(),
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(unlimited()),
     );
 
     let acme = tenant("acme");

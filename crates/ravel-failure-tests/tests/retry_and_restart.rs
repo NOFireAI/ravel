@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{TestClock, expect_vector, make_point, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
@@ -51,7 +51,13 @@ async fn assert_retry_recovers(fault: ScriptedFault, key_target: &str) {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(BASE_NS);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let event_ts = BASE_NS - NS_PER_MIN;
@@ -159,6 +165,7 @@ async fn restart_from_empty_local_state_sees_both_writer_generations() {
             Arc::clone(&store),
             Signal::Metrics,
             clock_a.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         );
         router_a
             .write(
@@ -186,6 +193,7 @@ async fn restart_from_empty_local_state_sees_both_writer_generations() {
         Arc::clone(&store),
         Signal::Metrics,
         clock_b.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let receipt_b = router_b
         .write(
@@ -315,7 +323,13 @@ async fn conditional_conflict_on_every_put_still_commits_exactly_once() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(BASE_NS);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let event_ts = BASE_NS - NS_PER_MIN;

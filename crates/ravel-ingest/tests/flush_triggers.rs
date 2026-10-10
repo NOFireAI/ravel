@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_ingest::{
-    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, SpanIngestRouter, SpanWriteError,
-    WriteError, WriteMode,
+    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget, SpanIngestRouter,
+    SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
@@ -32,7 +32,13 @@ async fn size_triggered_flush_lands_without_waiting_on_age() {
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -76,7 +82,13 @@ async fn age_triggered_flush_lands_below_size_threshold() {
         flush_tick: Duration::from_millis(10),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -175,7 +187,13 @@ async fn nonpositive_flush_clock_fails_loud() {
             flush_tick: Duration::from_millis(20),
             ..IngestConfig::default()
         };
-        let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+        let router = IngestRouter::new(
+            config,
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        );
         let tenant = tenant("acme");
         let points = vec![make_point(
             &tenant,
@@ -217,7 +235,12 @@ async fn nonpositive_flush_clock_fails_loud() {
             flush_tick: Duration::from_millis(20),
             ..IngestConfig::default()
         };
-        let router = LogIngestRouter::new(config, Arc::clone(&store), clock.clone());
+        let router = LogIngestRouter::new(
+            config,
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        );
         let tenant = tenant("acme");
         let records = vec![norm_log_record(1_000)];
 
@@ -253,7 +276,12 @@ async fn nonpositive_flush_clock_fails_loud() {
             flush_tick: Duration::from_millis(20),
             ..IngestConfig::default()
         };
-        let router = SpanIngestRouter::new(config, Arc::clone(&store), clock.clone());
+        let router = SpanIngestRouter::new(
+            config,
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        );
         let tenant = tenant("acme");
         let spans = vec![norm_span(1_000)];
 

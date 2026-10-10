@@ -330,6 +330,18 @@ pub struct SpanIngestMetricsSnapshot {
     /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
     /// directly for that.
     pub flush_trigger_deferred_total: u64,
+    /// Pending strict-mode acks outstanding against the process-wide
+    /// [`crate::PendingAckBudget`] (ADR-2793 decision 4). A gauge. Always 0 from
+    /// a bare [`SpanIngestMetrics::snapshot`], which has no budget to read;
+    /// populated by [`crate::SpanIngestRouter::metrics_snapshot`], the
+    /// router-level accessor that composes this snapshot with its own budget's
+    /// `held()`.
+    pub pending_strict_acks: u64,
+    /// Strict writes refused a pending-ack permit because
+    /// [`Self::pending_strict_acks`] was already at
+    /// `IngestConfig::max_pending_strict_acks`. Cumulative. Same populate-only-
+    /// through-the-router caveat as `pending_strict_acks`.
+    pub pending_ack_shed: u64,
 }
 
 impl SpanIngestMetrics {
@@ -697,6 +709,10 @@ impl SpanIngestMetrics {
                 .iter()
                 .map(|(_, stats)| stats.flush_trigger_deferred)
                 .sum(),
+            // No budget to read here; `SpanIngestRouter::metrics_snapshot`
+            // overwrites both with the router's `PendingAckBudget` figures.
+            pending_strict_acks: 0,
+            pending_ack_shed: 0,
         }
     }
 }

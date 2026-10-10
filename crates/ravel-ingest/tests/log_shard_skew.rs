@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SlowStore, TestClock, tenant};
-use ravel_ingest::{IngestConfig, LogIngestRouter, ShardSkewStats, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, PendingAckBudget, ShardSkewStats, WriteMode};
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -142,7 +142,12 @@ async fn log_flush_cost_is_recorded_off_actor_and_nothing_parks_on_a_free_permit
         SLOW,
     ));
     let store: Arc<dyn ObjectStoreBackend> = slow_store.clone();
-    let router = LogIngestRouter::new(one_shard_config(1), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        one_shard_config(1),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let t = tenant("acme");
 
     let write = {
@@ -265,7 +270,12 @@ async fn neither_write_window_alone_moves_the_wall_and_the_counters_say_which() 
             SLOW,
         ));
         let store: Arc<dyn ObjectStoreBackend> = slow_store.clone();
-        let router = LogIngestRouter::new(one_shard_config(1), Arc::clone(&store), clock.clone());
+        let router = LogIngestRouter::new(
+            one_shard_config(1),
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        );
         let t = tenant("acme");
 
         for i in 0..WRITES {
@@ -320,6 +330,7 @@ async fn neither_write_window_alone_moves_the_wall_and_the_counters_say_which() 
             one_shard_config(permits),
             Arc::clone(&store),
             clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let t = tenant("acme");
 

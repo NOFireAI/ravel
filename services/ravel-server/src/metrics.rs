@@ -8381,6 +8381,7 @@ pub fn router(state: MetricsState) -> Router {
 mod tests {
     use std::collections::HashSet;
 
+    use ravel_ingest::PendingAckBudget;
     use ravel_object_store::instrument::{OpMetricsSnapshot, STORE_ERROR_CLASS_COUNT};
 
     use super::*;
@@ -15564,8 +15565,14 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             ..IngestConfig::default()
         };
         let router = Arc::new(
-            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let acme = TenantId::new("acme");
         let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
@@ -15788,8 +15795,14 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         // enough, and it is the figure the loss window is stated as.
         let worst_age_ns = config.max_flush_lifetime.as_nanos() as i64;
         let router = Arc::new(
-            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let acme = TenantId::new("acme");
 
@@ -15989,6 +16002,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             },
             store.clone(),
             Arc::new(FrozenClock(BASE_TS_NS)),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let state = LogIngestState {
             router: router.clone(),

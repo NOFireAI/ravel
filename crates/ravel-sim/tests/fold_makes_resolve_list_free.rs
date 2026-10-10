@@ -56,7 +56,9 @@ use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_MAX_FLUSH_LIFETIME_NS,
 };
-use ravel_ingest::{Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteMode};
+use ravel_ingest::{
+    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, PendingAckBudget, WriteMode,
+};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
@@ -189,6 +191,7 @@ fn fold_makes_resolve_list_free() {
             Arc::clone(&backend),
             Signal::Metrics,
             Arc::clone(&clock),
+            Arc::new(PendingAckBudget::new(0)),
         );
 
         let samples_end_ts_ns = START_TS_NS + 3 * 1_000_000_000;
