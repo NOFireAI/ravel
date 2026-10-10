@@ -656,6 +656,17 @@ pub struct IngestConfig {
     /// POSTINGS term blocks of each RLOG object a log flush writes. Metrics and
     /// span flushes do not read it.
     pub rlog_zstd_level: RlogZstdLevel,
+    /// Prototype flush trigger for the strict-acknowledgement latency
+    /// experiment (issue #2592). When `true`, a log buffer holding a
+    /// strict-mode waiter is due on the next `flush_tick` instead of once its
+    /// oldest record reaches `max_flush_delay`; a buffer with no strict waiter
+    /// keeps the age thresholds it has with the flag off. The flush itself is
+    /// unchanged: data object, then commit record, then the ack.
+    ///
+    /// Read only by the log shard actor; the metrics and span actors do not
+    /// read it, and `ravel-server` does not set it. `false`, the default,
+    /// leaves the log age trigger as it is without this field.
+    pub strict_waiter_flushes_immediately: bool,
 }
 
 impl Default for IngestConfig {
@@ -709,6 +720,7 @@ impl Default for IngestConfig {
             strict_visibility_budget_ns: max_flush_delay.as_nanos() as i64
                 + STRICT_VISIBILITY_RESERVE_NS,
             rlog_zstd_level: RlogZstdLevel::DEFAULT,
+            strict_waiter_flushes_immediately: false,
         }
     }
 }
