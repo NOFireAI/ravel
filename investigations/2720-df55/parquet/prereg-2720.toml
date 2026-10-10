@@ -1,0 +1,10 @@
+# Scratch prereg for the #2720 DataFusion 55 comparison. memory_cap_bytes is
+# replaced per pass by run-pass.sh with the server's resolved
+# sql_max_query_bytes. The arm B (single-file) predictions are not measured
+# here and are set out of reach; the #2720 bands are judged by compare.py.
+memory_cap_bytes = 0
+arm_b_hot_s = 1000.0
+arm_b_cold_s = 1000.0
+failures = ["q19", "q29", "q33", "q34", "q35"]
+rlog_hot_ceiling_s = 101.7
+concurrency_qps_floor = 0.400

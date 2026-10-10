@@ -1,0 +1,50 @@
+q01 cold=Some(0.431787066) hot=Some(0.034835341) verdict=Pass error=none
+q02 cold=Some(0.65727445) hot=Some(0.069458238) verdict=Pass error=none
+q03 cold=Some(1.565273788) hot=Some(0.105556743) verdict=Pass error=none
+q04 cold=Some(2.669269876) hot=Some(0.086457214) verdict=Pass error=none
+q05 cold=Some(0.845641513) hot=Some(0.744450581) verdict=Pass error=none
+q06 cold=Some(3.4226038340000002) hot=Some(0.799816766) verdict=Pass error=none
+q07 cold=Some(0.111447358) hot=Some(0.032564607) verdict=Pass error=none
+q08 cold=Some(0.065904403) hot=Some(0.052149147) verdict=Pass error=none
+q09 cold=Some(1.162665869) hot=Some(0.906828736) verdict=Pass error=none
+q10 cold=Some(1.085040348) hot=Some(0.98868738) verdict=Pass error=none
+q11 cold=Some(0.818073874) hot=Some(0.343807815) verdict=Pass error=none
+q12 cold=Some(0.441103327) hot=Some(0.363255036) verdict=Pass error=none
+q13 cold=Some(1.044391106) hot=Some(0.906717238) verdict=Pass error=none
+q14 cold=Some(1.3533967709999999) hot=Some(1.336068149) verdict=Pass error=none
+q15 cold=Some(1.240994787) hot=Some(0.992212277) verdict=Pass error=none
+q16 cold=Some(1.074719939) hot=Some(0.930055415) verdict=Pass error=none
+q17 cold=Some(1.883717334) hot=Some(1.713484175) verdict=Pass error=none
+q18 cold=Some(1.715831385) hot=Some(1.634045992) verdict=CardinalityOnly error=none
+q19 cold=Some(3.563405496) hot=Some(2.840848741) verdict=Pass error=none
+q20 cold=Some(0.090559965) hot=Some(0.094956416) verdict=Pass error=none
+q21 cold=Some(11.280705891) hot=Some(1.247258025) verdict=Pass error=none
+q22 cold=Some(1.078877722) hot=Some(1.12264685) verdict=Pass error=none
+q23 cold=Some(8.568714978) hot=Some(1.75713811) verdict=Pass error=none
+q24 cold=Some(4.477555405) hot=Some(0.817593531) verdict=Pass error=none
+q25 cold=Some(0.200314533) hot=Some(0.19706617) verdict=CardinalityOnly(ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output) error=none
+q26 cold=Some(0.558641832) hot=Some(0.486229681) verdict=Pass error=none
+q27 cold=Some(0.384007072) hot=Some(0.28476001) verdict=CardinalityOnly(ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output) error=none
+q28 cold=Some(1.255332814) hot=Some(1.0244294840000001) verdict=Pass error=none
+q29 cold=Some(7.397438244) hot=Some(5.713027857) verdict=Pass error=none
+q30 cold=Some(0.311024144) hot=Some(0.13192892) verdict=Pass error=none
+q31 cold=Some(3.18355102) hot=Some(0.738257616) verdict=Pass error=none
+q32 cold=Some(2.950740087) hot=Some(1.013845612) verdict=Pass error=none
+q33 cold=Some(4.364504818) hot=Some(3.537045154) verdict=Pass error=none
+q34 cold=Some(8.269828142) hot=Some(3.979323851) verdict=Pass error=none
+q35 cold=Some(3.979284455) hot=Some(3.830852172) verdict=Pass error=none
+q36 cold=Some(0.93405482) hot=Some(0.857100848) verdict=Pass error=none
+q37 cold=Some(0.192497093) hot=Some(0.123879344) verdict=Pass error=none
+q38 cold=Some(0.107952865) hot=Some(0.069984559) verdict=Pass error=none
+q39 cold=Some(0.078607581) hot=Some(0.068315396) verdict=Pass error=none
+q40 cold=Some(1.112006336) hot=Some(0.695114189) verdict=Pass error=none
+q41 cold=Some(0.091687387) hot=Some(0.056589054) verdict=Pass error=none
+q42 cold=Some(0.061651216) hot=Some(0.051391451) verdict=Pass error=none
+q43 cold=Some(0.058051993) hot=Some(0.046501015) verdict=Pass error=none
+report written to /var/lib/fleet/work/48495dd1-2713-4de9-b90e-05bcc029e5dc/investigations/2720-df55/parquet/passes/smoke-A/bench-report.json: hot 42.826534906000006 s, cold 86.140132937 s, 43 answered, failed []
+finding: pre-registered failure q19 answered
+finding: pre-registered failure q29 answered
+finding: pre-registered failure q33 answered
+finding: pre-registered failure q34 answered
+finding: pre-registered failure q35 answered
+D7 check: no violations

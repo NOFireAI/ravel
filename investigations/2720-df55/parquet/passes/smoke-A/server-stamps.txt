@@ -1,0 +1,3 @@
+2026-10-10T10:55:27.903847Z  INFO ravel_server::mem_stats: allocator background purge thread resolved allocator_background_thread=true source="server"
+2026-10-10T10:55:28.097351Z  INFO ravel_server: ravel-server listening http=127.0.0.1:44318 grpc=Some(127.0.0.1:44317)
+2026-10-10T10:58:27.716730Z  INFO ravel_server: shutdown complete
