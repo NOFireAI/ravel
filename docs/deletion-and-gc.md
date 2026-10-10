@@ -282,13 +282,19 @@ the scheduled fold of the pair, through an in-process queue, when the
 process runs the scheduled fold and owns shard 0 of the pair, and therefore
 folds it. Only that process sweeps the pair, every shard of it, so a hold on
 any shard reaches the fold
-(docs/catalog-and-mvcc.md, "Targeted re-fold requests"). A request submitted to a fold call that
-turns out to be a **no-op** (nothing newly sealed beyond the previous
-watermark) reconciles **zero hours**, whatever hours it named: the targeted
-pass sits inside the same reconcile branch as the fixed window and the
-frontier band, and a no-op fold returns before that branch ever runs. The
-queue keeps such a request for the next fold of the pair that is not a
-no-op, so the hand-off does not wait for another sweep. Each fold takes at
+(docs/catalog-and-mvcc.md, "Targeted re-fold requests"). A request
+submitted to a fold call that turns out to be a **no-op** (nothing newly
+sealed beyond the previous watermark) reconciles **zero hours**, whatever
+hours it named: the targeted pass sits inside the same reconcile branch as
+the fixed window and the frontier band, and a no-op fold returns before
+that branch ever runs. The exception is a fold over hours an
+operator-asserted seal holds open (docs/catalog-and-mvcc.md,
+"Operator-asserted seal"): it runs the targeted pass for the requested
+hours outside the held range before it decides it is a no-op, so it can
+reconcile hours and still report a no-op. The queue keeps a request after a
+no-op fold that reconciled none of its hours, and removes it after any fold
+that is not a no-op or that reconciled at least one of them, so the
+hand-off does not wait for another sweep. Each fold takes at
 most `frontier_reconcile_max_hours` of the pair's oldest queued hours, the
 most it reconciles, and the rest stay queued for the pair's next fold that
 advances the watermark. A request lost with the process on restart, evicted
