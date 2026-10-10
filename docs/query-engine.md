@@ -2965,10 +2965,13 @@ and block-level reported independently:
 - `blocksSkippedByThreshold`: blocks of opened segments a logs scan skipped
   undecoded because their minimum `ts` was above an `ORDER BY ts ... LIMIT k`
   TopK's threshold (see "Ordered block skip for `ORDER BY ts LIMIT k`").
-- `segmentsSkippedByThreshold`: segments a logs scan never opened for the
-  same reason; their blocks are not in `blocksSkippedByThreshold`. On the
-  striped scan path a segment is counted once per partition that owned a
-  share of its blocks.
+- `segmentsSkippedByThreshold`: segments a logs scan did not open for their
+  blocks for the same reason; their blocks are not in
+  `blocksSkippedByThreshold`. On the whole-segment fast path such a segment
+  is never fetched and its blocks are not in `blocksTotal`; on the planned
+  path its footer and directories were already read at plan time and its
+  blocks are in `blocksTotal`. On the striped scan path a segment is counted
+  once per partition that owned a share of its blocks.
 
 All six counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
@@ -4102,10 +4105,26 @@ A `SortExec` with a `fetch` (a TopK) publishes a dynamic filter that is
 the `ts` of the heap's current worst row; with further sort keys it is
 `ts < t OR (ts = t AND ...)`, and it only ever tightens. DataFusion pushes
 that filter to the scan during its post-optimization filter pushdown.
-`LogsScanExec` keeps it when the sort's leading key is the bare `ts`
-column, ascending, and reports it unsupported, so the TopK above stays the
-exact evaluator and no row is ever dropped by the filter itself. The scan
-only reads `t` off the filter's current expression and uses it twice:
+`LogsScanExec` keeps the first pushed dynamic filter whose leading term
+bounds the bare `ts` column, and reports every filter unsupported, so the
+TopK above stays the exact evaluator and no row is ever dropped by the
+filter itself.
+
+A kept filter does nothing until the `ConfirmTopKThreshold` physical
+optimizer rule, which runs after every built-in rule, confirms it. The rule
+collects the dynamic filter of every `SortExec` with a `fetch` whose leading
+sort key is ascending with nulls last, and confirms the scan's filter only
+when its expression id is one of them; otherwise the scan drops it. The
+filter itself does not say which operator published it or in which
+direction: a descending TopK (`ts > t`), an `ASC NULLS FIRST` TopK
+(`ts IS NULL OR ts < t`), an aggregate's `min(ts)` bound, or a hash join's
+build-side bounds can all lead with `ts`, and none of them is a threshold
+this skip can serve. Such a scan keeps snapshot visit order and the fast
+path's open pipelining exactly as without the filter. The scan keeps only
+the first such filter, so when another operator's filter reaches it ahead
+of the TopK's, nothing is confirmed and nothing is skipped. A confirmed scan
+shows `topk_threshold=ts` in `EXPLAIN`. The scan only reads `t` off the
+confirmed filter's current expression and uses it twice:
 
 - Segments are dealt to partitions in ascending `min_event_ts_ns` (ties by
   snapshot index) instead of snapshot order, and a partition does not open
@@ -4127,12 +4146,14 @@ bounds as 0 and has no rows to lose. A row that arrives late lowers its
 segment's `min_event_ts_ns`, so the min-ts dealing order visits that
 segment early, not last. Each partition reads the shared threshold on its
 own, before each segment open and each block decode. The whole-segment
-fast path's open pipelining (ADR-2414 decision A2) is off under a
+fast path's open pipelining (ADR-2414 decision A2) is off under a confirmed
 threshold, because a pipelined open would fetch a segment before the
-threshold that could skip it is read.
+threshold that could skip it is read. The scan's `prefetch_share` metric is
+the sum over its partitions of the opens each may have in flight: 1 per
+partition under a confirmed threshold.
 
-Nothing is skipped for a descending `ts` key (its filter is a lower bound,
-`ts > t`, which this rule does not read), a leading key other than the bare
+Nothing is skipped for a descending `ts` key or `ASC NULLS FIRST` (their
+filters are never confirmed, see above), a leading key other than the bare
 `ts` column (a string key, an expression over `ts`), or the distributed
 plan, whose coordinator answers the statement with a fetch on the merge of
 the workers' sorted slices and so builds no TopK. Setting
@@ -4156,9 +4177,22 @@ reopens.
 `stats.pruning.blocksSkippedByThreshold` and
 `segmentsSkippedByThreshold` report what was skipped, from the scan's
 `blocks_skipped_by_threshold` and `segments_skipped_by_threshold`
-counters. A skipped segment is never opened, so its blocks are not in
-`blocksTotal`; on the whole-segment fast path `blocksTotal -
-blocksScanned` equals `blocksSkippedByThreshold`. On the striped path a
+counters. What a skipped segment still costs depends on the path. On the
+whole-segment fast path it is never fetched, and its blocks are not in
+`blocksTotal`. On the planned path (a block predicate, a `ts` bound that
+cuts a segment, a pending erasure, or fewer segments than partitions) the
+plan phase runs before any threshold exists: it reads the footer and
+directories of every segment, and partition 0 records every planned
+segment's blocks in `blocksTotal`. A skipped segment there still costs its
+plan-time reads; the skip saves only what opening it for its blocks would
+have read and decoded on top of those, and its blocks count in
+`blocksTotal` without being scanned or counted in
+`blocksSkippedByThreshold`. On the fast path, `blocksTotal -
+blocksScanned` equals `blocksSkippedByThreshold` only while no segment
+falls back from the columnar path to the row path for an `attrs_raw`
+column: the fallback reopens the segment and decodes every block before
+its cursor again, the skipped ones included, and `blocksScanned` counts
+each decode, so it can exceed `blocksTotal`. On the striped path a
 segment's row groups can be owned by several partitions, and each
 partition that skips its share counts one segment.
 `crates/ravel-sql/tests/logs_topk_threshold_skip.rs` pins the answers
