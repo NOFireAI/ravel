@@ -144,6 +144,7 @@ use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::late_materialization::TopKLateMaterialization;
 use crate::logs_provider::LogsTableProvider;
+use crate::logs_scan::ConfirmTopKThreshold;
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
 use crate::metadata_agg::MetadataOnlyAggregate;
@@ -754,6 +755,13 @@ pub fn build_session(
         builder =
             builder.with_physical_optimizer_rule(Arc::new(BoundedTopKAggregate::new(max_limit)));
     }
+    // ADR-2677 decision 6: confirm a `logs` scan's kept TopK filter only when
+    // it is the filter of an ascending nulls-last `ORDER BY ts ... LIMIT k`,
+    // and drop it otherwise. Appended last because it must see every filter
+    // installed before it: DataFusion's post-optimization filter pushdown and
+    // `TopKLateMaterialization`'s phase-1 TopK. See
+    // `crate::logs_scan::ConfirmTopKThreshold`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(ConfirmTopKThreshold));
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
 

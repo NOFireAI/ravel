@@ -39,18 +39,23 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, PhaseAccounting};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
     SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
@@ -124,6 +129,48 @@ fn log_record(stream: usize, ts: i64, body: String, debug: bool) -> LogRecord {
     }
 }
 
+/// The `Spill` fixture's records: one clean stream with blocks at `ts`
+/// offsets 0, 2, 4, 6 | 40, 41, 42, 43, then one stream at 1, 3, 5, 7 whose
+/// records carry the undeclared-by-the-writer `tags` key. Written with one
+/// dynamic column, `filler` (first in `(name, type)` order) takes it and
+/// `tags` overflows into `attrs_raw`, in that stream's block only. The writer
+/// orders streams by id, so the clean role goes to the smaller id.
+fn spill_records() -> Vec<LogRecord> {
+    let resource = |s: usize| {
+        vec![(
+            "service.name".to_string(),
+            AttrValue::Str(format!("svc{s}")),
+        )]
+    };
+    let id = |s: usize| ravel_types::logstream::log_stream_id(&resource(s), "scope", "1.0", &[]);
+    let (clean, spilled) = if id(0) < id(1) { (0, 1) } else { (1, 0) };
+    let mk = |s: usize, offset: i64, spills: bool| {
+        let mut attrs = vec![("filler".to_string(), AttrValue::Str("f".into()))];
+        if spills {
+            attrs.push(("tags".to_string(), AttrValue::Str(format!("t{offset}"))));
+        }
+        LogRecord {
+            stream_id: id(s),
+            stream_attrs: stream_attrs_bytes(&resource(s), "scope", "1.0", &[]),
+            ts_ns: TS_BASE + offset,
+            observed_ts_ns: TS_BASE + offset,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("o{offset}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        }
+    };
+    let mut recs: Vec<LogRecord> = [0, 2, 4, 6, 40, 41, 42, 43]
+        .into_iter()
+        .map(|o| mk(clean, o, false))
+        .collect();
+    recs.extend([1, 3, 5, 7].into_iter().map(|o| mk(spilled, o, true)));
+    recs
+}
+
 fn segment_records(segment: usize) -> Vec<LogRecord> {
     let r = rank(segment);
     let mut recs = Vec::with_capacity(PER_SEGMENT);
@@ -195,6 +242,18 @@ enum Fixture {
     /// boundary, and their bodies differ, so a second sort key decides which
     /// one wins.
     Tied,
+    /// One segment whose third block spills `tags` to `attrs_raw`; see
+    /// [`spill_records`].
+    Spill,
+}
+
+impl Fixture {
+    fn declared(self) -> Vec<DeclaredColumn> {
+        match self {
+            Fixture::Spill => vec![DeclaredColumn::new("tags", DeclaredType::Str)],
+            Fixture::Staggered | Fixture::Tied => declared_columns(),
+        }
+    }
 }
 
 async fn build_snapshot(
@@ -226,6 +285,13 @@ async fn build_snapshot(
                 .collect();
             segments.push(write_segment(store, 0, &recs, cfg).await);
         }
+        Fixture::Spill => {
+            let cfg = RlogConfig {
+                max_dynamic_columns: 1,
+                ..cfg
+            };
+            segments.push(write_segment(store, 0, &spill_records(), cfg).await);
+        }
     }
     Snapshot {
         segments,
@@ -242,6 +308,7 @@ struct Setup {
     fixture: Fixture,
     partitions: usize,
     group_blocks: Option<usize>,
+    cached: bool,
 }
 
 impl Setup {
@@ -251,7 +318,18 @@ impl Setup {
             fixture: Fixture::Staggered,
             partitions: 1,
             group_blocks: None,
+            cached: false,
         }
+    }
+    fn spill(mut self) -> Self {
+        self.fixture = Fixture::Spill;
+        self
+    }
+    /// A fetcher with ADR-0046's read cache, which makes the planned path
+    /// stripe blocks across partitions instead of dealing whole segments.
+    fn cached(mut self) -> Self {
+        self.cached = true;
+        self
     }
     fn skip(mut self, skip: bool) -> Self {
         self.skip = skip;
@@ -278,12 +356,73 @@ struct Run {
     blocks_total: usize,
     blocks_skipped: usize,
     segments_skipped: usize,
+    /// Segment keys in the order the run first issued a GET for each.
+    first_gets: Vec<String>,
+    plan: Arc<dyn ExecutionPlan>,
 }
 
 impl Run {
     fn has_fetch_node(&self) -> bool {
         self.explain.contains("LogsRowFetchExec")
     }
+    fn scan_metric(&self, name: &str) -> usize {
+        metric(&self.plan, "LogsScanExec", name)
+    }
+}
+
+/// Records the key of every `get`, in call order, so a test can read the
+/// order a scan opened its segments in.
+struct RecordingStore {
+    inner: MemoryStore,
+    gets: Mutex<Vec<String>>,
+}
+
+impl RecordingStore {
+    fn first_gets(&self) -> Vec<String> {
+        let mut seen = Vec::new();
+        for key in self.gets.lock().unwrap().iter() {
+            if !seen.contains(key) {
+                seen.push(key.clone());
+            }
+        }
+        seen
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for RecordingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.gets.lock().unwrap().push(key.to_string());
+        self.inner.get(key, range).await
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+fn read_cache() -> Arc<Cache<CacheFetchError>> {
+    let bytes = 64 << 20;
+    Arc::new(Cache::new(CacheLimits::new(bytes, 16_384, bytes)))
 }
 
 fn session(provider: LogsTableProvider, setup: Setup) -> SessionContext {
@@ -341,16 +480,23 @@ fn render(rows: &[RecordBatch]) -> String {
 }
 
 async fn run(sql: &str, setup: Setup) -> Run {
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(RecordingStore {
+        inner: MemoryStore::new(),
+        gets: Mutex::new(Vec::new()),
+    });
     let snapshot = build_snapshot(store.as_ref(), setup.fixture, setup.group_blocks).await;
     let accounting = QueryAccounting::new();
+    let mut fetcher = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+    if setup.cached {
+        fetcher = fetcher.with_cache(read_cache());
+    }
     let provider = LogsTableProvider::new(
         snapshot,
         TenantHash(TENANT),
-        LogSegmentFetcher::new(store as Arc<dyn ObjectStoreBackend>),
+        fetcher,
         PhaseAccounting::pooled_over(&accounting),
     )
-    .with_declared_columns(declared_columns());
+    .with_declared_columns(setup.fixture.declared());
     let ctx = session(provider, setup);
     let plan = ctx
         .sql(sql)
@@ -369,22 +515,30 @@ async fn run(sql: &str, setup: Setup) -> Run {
         blocks_total: metric(&plan, "LogsScanExec", "blocks_total"),
         blocks_skipped: metric(&plan, "LogsScanExec", "blocks_skipped_by_threshold"),
         segments_skipped: metric(&plan, "LogsScanExec", "segments_skipped_by_threshold"),
+        first_gets: store.first_gets(),
+        plan: Arc::clone(&plan),
     };
     eprintln!(
-        "[{}] blocks={}/{} skipped blocks={} segments={}\n{}",
+        "[{}] blocks={}/{} skipped blocks={} segments={} prefetch_share={} \
+         columnar={} rowpath={} reopens={} gets={:?}\n{}",
         if setup.skip { "skip" } else { "oracle" },
         run.blocks_scanned,
         run.blocks_total,
         run.blocks_skipped,
         run.segments_skipped,
+        run.scan_metric("prefetch_share"),
+        run.scan_metric("columnar_batches"),
+        run.scan_metric("rowpath_batches"),
+        run.scan_metric("reopens"),
+        run.first_gets,
         run.explain,
     );
     run
 }
 
 /// Runs `sql` with the skip off and on, asserts the rows are identical, and
-/// returns the skipping run.
-async fn same_rows(sql: &str, setup: Setup) -> Run {
+/// returns the oracle run and the skipping run.
+async fn oracle_and_skipping(sql: &str, setup: Setup) -> (Run, Run) {
     let oracle = run(sql, setup.skip(false)).await;
     assert_eq!(
         (oracle.blocks_skipped, oracle.segments_skipped),
@@ -396,7 +550,12 @@ async fn same_rows(sql: &str, setup: Setup) -> Run {
         skipping.rows, oracle.rows,
         "the skipping scan must return exactly the unskipped rows for {sql}"
     );
-    skipping
+    (oracle, skipping)
+}
+
+/// [`oracle_and_skipping`]'s skipping run.
+async fn same_rows(sql: &str, setup: Setup) -> Run {
+    oracle_and_skipping(sql, setup).await.1
 }
 
 /// The rows `ORDER BY ts LIMIT k` over the staggered fixture must return,
@@ -477,6 +636,11 @@ async fn non_monotone_blocks_and_late_segment_are_read_first() {
     assert_eq!(run.blocks_scanned, 3, "one first block per stream");
     assert_eq!(run.blocks_skipped, 3, "one second block per stream");
     assert_eq!(run.blocks_total, BLOCKS_PER_SEGMENT, "one segment opened");
+    assert_eq!(
+        run.first_gets,
+        ["logs/seg7.rlog"],
+        "the whole-segment fast path never fetches a skipped segment"
+    );
     assert_eq!(
         run.segments_skipped,
         SEGMENTS - 1,
@@ -618,4 +782,143 @@ async fn striped_row_groups_match() {
     let run = same_rows(sql, Setup::new().partitions(3).group_blocks(2)).await;
     assert_bodies_in_order(&run.rows, &smallest_bodies(10, true));
     assert!(run.blocks_skipped + run.segments_skipped > 0);
+}
+
+/// A pushed filter that leads with `ts` but that the skip cannot serve leaves
+/// the scan exactly as it is without one: segments opened in snapshot order,
+/// and the fast path's ranged-open prefetch at its full share. A descending
+/// TopK publishes `ts > t` and a nulls-first one `ts IS NULL OR ts < t`;
+/// neither is the sort the scan confirms its threshold against.
+///
+/// The ascending statement is the positive control on the same fixture: it
+/// opens the segment written last first (it holds the smallest minimum) and
+/// runs with prefetch off, so the two figures this test reads do move when a
+/// threshold is confirmed.
+#[tokio::test]
+async fn unservable_ts_filters_keep_snapshot_order_and_prefetch() {
+    let snapshot_order: Vec<String> = (0..SEGMENTS).map(|s| format!("logs/seg{s}.rlog")).collect();
+    for sql in [
+        "SELECT ts, body FROM logs ORDER BY ts DESC LIMIT 10",
+        "SELECT ts, body FROM logs ORDER BY ts ASC NULLS FIRST LIMIT 10",
+    ] {
+        let (oracle, run) = oracle_and_skipping(sql, Setup::new()).await;
+        assert_eq!(oracle.first_gets, snapshot_order, "{sql}: the oracle");
+        assert_eq!(run.first_gets, snapshot_order, "{sql}: the visit order");
+        let share = oracle.scan_metric("prefetch_share");
+        assert!(share >= 2, "{sql}: the oracle prefetches, share {share}");
+        assert_eq!(run.scan_metric("prefetch_share"), share, "{sql}: prefetch");
+        assert!(!run.explain.contains("topk_threshold=ts"), "{sql}");
+        assert_eq!(
+            (run.blocks_skipped, run.segments_skipped, run.blocks_scanned),
+            (0, 0, TOTAL_BLOCKS),
+            "{sql}"
+        );
+    }
+
+    let run = same_rows(
+        "SELECT ts, body FROM logs ORDER BY ts LIMIT 10",
+        Setup::new(),
+    )
+    .await;
+    assert_eq!(
+        run.first_gets[0], "logs/seg7.rlog",
+        "smallest minimum first"
+    );
+    assert_eq!(run.scan_metric("prefetch_share"), 1, "no prefetch");
+    assert!(
+        run.explain.contains("topk_threshold=ts"),
+        "the threshold is confirmed:\n{}",
+        run.explain
+    );
+}
+
+/// The striped planned path: a read cache makes the planned path deal blocks,
+/// not whole segments, and a `ts` bound that cuts the segment holding the
+/// smallest `ts` keeps the scan off the whole-segment fast path. Partition 0
+/// plans every segment, and each partition still skips by the shared
+/// threshold.
+#[tokio::test]
+async fn cached_striped_planned_path_matches_and_skips() {
+    // `TS_BASE` as a timestamp: the bound drops exactly the smallest row.
+    let sql = "SELECT ts, body FROM logs WHERE ts > TIMESTAMP '2023-11-14 22:13:20' \
+               ORDER BY ts LIMIT 10";
+    let run = same_rows(sql, Setup::new().cached().partitions(3)).await;
+    assert_bodies_in_order(&run.rows, &smallest_bodies(11, false)[1..]);
+    assert!(
+        run.scan_metric("fast_path_rejected_segment_not_contained") > 0,
+        "the planned path ran"
+    );
+    assert!(
+        run.blocks_skipped > 0 && run.segments_skipped > 0,
+        "the skip fired on both levels"
+    );
+}
+
+/// A block predicate the scan evaluates itself (`has_word` becomes a content
+/// predicate) keeps it off the fast path; on the planned path it skips by the
+/// threshold all the same.
+///
+/// The plan phase runs before any threshold exists: it reads every segment's
+/// footer and directories, and partition 0 records every planned segment's
+/// blocks in `blocks_total`, so a segment the skip later passes over is still
+/// read once and still counted.
+#[tokio::test]
+async fn block_predicate_planned_path_matches_and_skips() {
+    let sql = "SELECT ts, body FROM logs WHERE has_word(severity_text, 'INFO') \
+               ORDER BY ts LIMIT 10";
+    let run = same_rows(sql, Setup::new()).await;
+    assert_bodies_in_order(&run.rows, &smallest_bodies(10, true));
+    assert!(
+        run.scan_metric("fast_path_rejected_block_predicate") > 0,
+        "the planned path ran"
+    );
+    assert!(run.segments_skipped > 0, "the skip fired");
+    assert_eq!(run.blocks_total, TOTAL_BLOCKS, "skipped segments counted");
+    assert_eq!(run.first_gets.len(), SEGMENTS, "skipped segments planned");
+}
+
+/// Projecting the `attrs` map puts the scan on the row path (`Rows`), which
+/// checks the threshold before each block decode instead of inline.
+#[tokio::test]
+async fn attrs_projection_on_the_row_path_matches_and_skips() {
+    let sql = "SELECT ts, body, attrs FROM logs ORDER BY ts LIMIT 4";
+    let run = same_rows(sql, Setup::new()).await;
+    assert!(!run.has_fetch_node(), "one phase:\n{}", run.explain);
+    assert_bodies_in_order(&run.rows, &smallest_bodies(4, false));
+    assert_eq!(run.scan_metric("columnar_batches"), 0, "row path only");
+    assert!(run.scan_metric("rowpath_batches") > 0, "row path only");
+    assert!(run.blocks_skipped > 0, "the skip fired inside a segment");
+}
+
+/// An `attrs_raw` fallback after a skip. The clean stream's first block fills
+/// the heap of four at threshold offset 6, its second block (minimum 40) is
+/// skipped, and the spilled stream's block (minimum 1) is then read: it needs
+/// `attrs_raw`, so the scan reopens the segment on the row path and drains
+/// the blocks before it by position, the skipped one included.
+///
+/// The drain decodes the blocks it passes, so `blocks_scanned` counts the
+/// skipped block once and the first block twice: the columnar pass decodes
+/// the first block and starts on the spilled one (2), and the reopened row
+/// scan decodes all three (3), against `blocks_total` 3.
+#[tokio::test]
+async fn attrs_raw_fallback_after_a_skip_matches() {
+    let sql = "SELECT ts, tags FROM logs ORDER BY ts LIMIT 4";
+    let run = same_rows(sql, Setup::new().spill()).await;
+    for tag in ["t1", "t3"] {
+        assert!(run.rows.contains(tag), "{tag} in\n{}", run.rows);
+    }
+    assert!(!run.rows.contains("t5"), "{}", run.rows);
+    assert_eq!(run.blocks_skipped, 1, "the clean stream's second block");
+    assert_eq!(
+        run.scan_metric("columnar_batches"),
+        1,
+        "the first block is emitted columnar, before the fallback"
+    );
+    assert_eq!(run.scan_metric("reopens"), 1, "the fallback ran");
+    assert!(run.scan_metric("rowpath_batches") > 0, "the fallback ran");
+    assert_eq!(
+        (run.blocks_total, run.blocks_scanned),
+        (3, 5),
+        "the drain re-decodes the skipped block"
+    );
 }
