@@ -984,7 +984,7 @@ That is correct only where the coordinator runs queries for one local tenant.
 A coordinator that runs queries for more than one **refuses to start** with
 such a spec. It does not fan every local tenant's selectors and discovery out
 under the one credential and return another tenant's series. A coordinator
-runs queries for more than one local tenant in three cases:
+runs queries for more than one local tenant in four cases:
 
 - Two or more `--tenant-token` values or `--tenant-token-file` lines name
   different tenants.
@@ -995,6 +995,10 @@ runs queries for more than one local tenant in three cases:
 - Any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
   `--oidc-issuer`, or `--mtls-enabled`. Each of them derives the tenant from a
   request header or a token claim.
+- A deployment key is set in All, Gateway or Query mode (a keyed bucket). The
+  server then also resolves bearer tokens against the durable `sys/auth` map,
+  so a tenant can be onboarded without a restart. On a keyed bucket every
+  `--remote-cluster` needs `tenant=`, even with a single `--tenant-token`.
 
 The startup error names every spec that needs a `tenant` and what makes the
 deployment multi-tenant:
@@ -1010,8 +1014,9 @@ credential per local tenant ... Add tenant=<local tenant> to each of those specs
 Startup also refuses a `tenant` that no `--tenant-token`,
 `--tenant-token-file` line, or `--alert-rules-file` rule names. This check
 applies where the tenant set is fully known: static bearer tokens and alert
-rules, with no dynamic resolver. Such a mapping can never fire, and its only
-symptom is a remote that answers nobody. A tenant that only alert rules
+rules, with no dynamic resolver and no durable `sys/auth` map. Such a mapping
+can never fire, and its only symptom is a remote that answers nobody. On a
+keyed bucket a tenant provisioned only in `sys/auth` is a valid target. A tenant that only alert rules
 name is a valid target. Mapping a remote to it is the supported way to run
 alert rules over data that is partly on a remote.
 
