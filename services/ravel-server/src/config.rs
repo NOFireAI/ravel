@@ -1659,23 +1659,34 @@ pub struct Cli {
     /// so the shard actor never waits for one: it keeps draining its channel
     /// and firing age triggers for every tenant on the shard while a flush is
     /// stalled. This makes the knob the per-shard cross-tenant flush
-    /// isolation control as much as a throughput one. At the default of 1, a
-    /// tenant whose S3 key prefix is being throttled (`503 SlowDown`, applied
-    /// per prefix) holds the shard's only permit, and co-resident tenants'
-    /// flushes queue behind it until the stall clears. A queued flush's
-    /// `max_flush_lifetime` budget is measured from when it acquires the permit,
-    /// not from flush-open, so the wait itself does not abandon
-    /// it: a buffered write's rows stay invisible to queries until the stall
-    /// clears, then commit, rather than being dropped. A co-resident strict
-    /// write instead takes `WriteError::AckTimeout` once the request's ack
-    /// deadline elapses while its flush is still queued for the permit, even
-    /// though its own prefix stayed healthy. Raising the bound gives those
-    /// tenants a permit to flush on, at the cost of more concurrent PUTs and more
-    /// encode memory in flight. Queued flushes hold their buffers and their
-    /// ADR-0069 byte charges, so the byte budget, not this bound, is what
-    /// sheds when a shard backs up. Matches
+    /// isolation control as much as a throughput one: one tenant may hold at
+    /// most `--max-inflight-flushes-per-tenant` of the shard's permits
+    /// (ADR-2708 D3, default N-1), so at the default of 4 a tenant whose S3
+    /// key prefix is stalled leaves a permit for its co-resident tenants'
+    /// flushes. At 1 there is no permit to leave: a stalled tenant holds the
+    /// shard's only permit and co-resident tenants' flushes queue behind it
+    /// until the stall clears, and [`Cli::validate`] warns. How long one
+    /// stalled flush holds its permit depends on the stall. A hung
+    /// create-if-absent PUT is not retried inside object_store, so Ravel's
+    /// five attempts at the 20 s request timeout plus backoff hold it about
+    /// 101 s. A retryable status such as `503 SlowDown` (applied per prefix)
+    /// is retried inside object_store, so one Ravel attempt takes about 200 s
+    /// (`retry_timeout` plus one `request_timeout`) and five approach 1000 s,
+    /// bounded first by the flush deadline. A queued flush's deadline is set
+    /// when it acquires the permit, as `min(now, end(pinned hour)) +
+    /// max_flush_lifetime`: a wait inside the pinned hour's bound keeps the
+    /// full lifetime, so a buffered write's rows stay invisible until the
+    /// stall clears and then commit, while a flush granted past that bound is
+    /// abandoned without a PUT and counted on
+    /// `ravel_ingest_abandoned_hour_bound_total` rather than published into an
+    /// hour the maintain seal may already have closed. A strict write takes
+    /// `WriteError::AckTimeout` once the request's ack deadline elapses while
+    /// its flush is still queued for a permit. More permits cost more
+    /// concurrent PUTs and more encode memory in flight. Queued flushes hold
+    /// their buffers and their ADR-0069 byte charges, so the byte budget, not
+    /// this bound, is what sheds when a shard backs up. Matches
     /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
-    /// 1 (today's non-pipelined behavior). `0` is rejected by
+    /// 4. `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
     /// never acquire a permit to run one. A value ABOVE `--max-queued-flushes`
     /// (default 8) is accepted and raises the effective queue cap to match,
@@ -1686,8 +1697,25 @@ pub struct Cli {
     /// refusal would crash-loop an already-admitted cluster on upgrade.
     /// Nothing lowers this flag; set `--max-queued-flushes` yourself when you
     /// want the queue deeper than the permit count.
-    #[arg(long = "max-inflight-flushes", default_value_t = 1)]
+    #[arg(long = "max-inflight-flushes", default_value_t = 4)]
     pub max_inflight_flushes: u32,
+
+    /// How many of a shard's `--max-inflight-flushes` permits one tenant's
+    /// flushes may hold or wait on at once, for all three ingest pipelines
+    /// (ADR-2708 D3). Unset resolves to `max(1, --max-inflight-flushes - 1)`,
+    /// so one stalled tenant leaves at least one permit free for the shard's
+    /// other tenants whenever there is more than one. A trigger from a tenant
+    /// at its share is deferred and counted on
+    /// `ravel_ingest_flush_trigger_deferred_total`; its buffer keeps merging
+    /// until a slot frees, the memory backstop crosses, or its object
+    /// estimate reaches 4x the flush target, which fire regardless. `0` is
+    /// rejected by [`Cli::validate`] (every trigger would defer), and so is a
+    /// value above `--max-inflight-flushes`, which a tenant could never use.
+    #[arg(
+        long = "max-inflight-flushes-per-tenant",
+        env = "RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT"
+    )]
+    pub max_inflight_flushes_per_tenant: Option<usize>,
 
     /// Per-shard bound on flush tasks spawned and not yet reaped, for all
     /// three ingest pipelines (issue #1740). ADR-1642 moved the
@@ -6837,6 +6865,30 @@ impl Cli {
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
                  acquire a permit to run one. Set a positive count (1 keeps today's \
                  non-pipelined behavior)."
+            );
+        }
+        if let Some(share) = self.max_inflight_flushes_per_tenant {
+            if share == 0 {
+                anyhow::bail!(
+                    "--max-inflight-flushes-per-tenant '0' would defer every age and size \
+                     trigger: no tenant could ever take a flush permit. Set a positive count, \
+                     or leave it unset for max(1, --max-inflight-flushes - 1)."
+                );
+            }
+            if !u32::try_from(share).is_ok_and(|s| s <= self.max_inflight_flushes) {
+                anyhow::bail!(
+                    "--max-inflight-flushes-per-tenant '{share}' exceeds \
+                     --max-inflight-flushes '{}': a tenant can hold at most every permit on \
+                     its shard.",
+                    self.max_inflight_flushes
+                );
+            }
+        }
+        if self.max_inflight_flushes == 1 {
+            tracing::warn!(
+                "--max-inflight-flushes 1 gives no cross-tenant flush isolation: a tenant \
+                 whose object-store prefix stalls holds its shard's only flush permit, and \
+                 every co-resident tenant's flushes wait behind it (ADR-2708 D3)."
             );
         }
 
@@ -16076,6 +16128,56 @@ mod tests {
     }
 
     #[test]
+    fn zero_max_inflight_flushes_per_tenant_fails_validate() {
+        let err = cli(&["--max-inflight-flushes-per-tenant", "0"])
+            .validate()
+            .expect_err("a share of 0 would defer every trigger");
+        assert!(
+            err.to_string()
+                .contains("--max-inflight-flushes-per-tenant '0'"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_above_permits_fails_validate() {
+        let err = cli(&[
+            "--max-inflight-flushes",
+            "4",
+            "--max-inflight-flushes-per-tenant",
+            "5",
+        ])
+        .validate()
+        .expect_err("a share above the permit count could never be used");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--max-inflight-flushes-per-tenant '5'")
+                && msg.contains("--max-inflight-flushes '4'"),
+            "error names both flags and values: {msg}"
+        );
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_up_to_permits_validates() {
+        for share in ["1", "3", "4"] {
+            let parsed = cli(&[
+                "--max-inflight-flushes",
+                "4",
+                "--max-inflight-flushes-per-tenant",
+                share,
+            ]);
+            parsed
+                .validate()
+                .expect("a share in 1..=--max-inflight-flushes is fine");
+            assert_eq!(
+                parsed.max_inflight_flushes_per_tenant,
+                share.parse().ok(),
+                "flag parses into the field"
+            );
+        }
+    }
+
+    #[test]
     fn zero_max_queued_flushes_fails_validate() {
         let err = cli(&["--max-queued-flushes", "0"])
             .validate()
@@ -16242,8 +16344,18 @@ mod tests {
     fn max_inflight_flushes_and_adaptive_flush_delay_default() {
         let parsed = cli(&[]);
         assert_eq!(
-            parsed.max_inflight_flushes, 1,
+            parsed.max_inflight_flushes, 4,
             "default matches ravel_ingest::IngestConfig::max_inflight_flushes"
+        );
+        assert_eq!(
+            parsed.max_inflight_flushes_per_tenant, None,
+            "unset resolves to N-1 inside ravel_ingest"
+        );
+        let defaults = ravel_ingest::IngestConfig::default();
+        assert_eq!(defaults.max_inflight_flushes, parsed.max_inflight_flushes);
+        assert_eq!(
+            defaults.max_inflight_flushes_per_tenant,
+            parsed.max_inflight_flushes_per_tenant
         );
         assert!(
             !parsed.adaptive_flush_delay,

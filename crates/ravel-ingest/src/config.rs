@@ -404,6 +404,49 @@ pub(crate) fn memory_backstop_crossed(
     est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
 }
 
+/// How many `target_bytes` of object a buffer may hold before
+/// [`object_backstop_crossed`] fires (ADR-2708 D3).
+pub(crate) const OBJECT_BACKSTOP_TARGET_MULTIPLE: usize = 4;
+
+/// Whether a buffer whose flush would write `flush_est_bytes` of object has
+/// reached [`OBJECT_BACKSTOP_TARGET_MULTIPLE`] times `target_bytes`, the object
+/// counterpart of [`memory_backstop_crossed`] (ADR-2708 D3).
+///
+/// A buffer whose object estimate outruns its memory charge (a native
+/// histogram charges 16 bytes per point against far more object bytes) never
+/// crosses the memory backstop, so while its tenant sits at its flush share
+/// nothing else would stop the object growing. Each shard actor treats a
+/// crossing the way it treats a memory-backstop crossing: the flush fires and
+/// is exempt from both the per-tenant share deferral and the queued-flush cap.
+pub(crate) fn object_backstop_crossed(flush_est_bytes: usize, config: &IngestConfig) -> bool {
+    flush_est_bytes
+        >= config
+            .target_bytes
+            .saturating_mul(OBJECT_BACKSTOP_TARGET_MULTIPLE)
+}
+
+/// The deadline a flush pinned to ingest hour `ingest_hour_bucket` carries
+/// once it is granted its flush permit at `granted_ns` (ADR-2708 D3):
+/// `min(granted_ns + max_flush_lifetime, end(hour) + max_flush_lifetime)`.
+/// `None` when `granted_ns` is already at or past `end(hour) +
+/// max_flush_lifetime`: maintain seals the hour at that bound plus the clock
+/// skew allowance, so the flush must be abandoned without a PUT rather than
+/// publish into a sealed hour. The hour is never re-pinned here; the bucket
+/// the pin chose is the one the bound is measured from.
+pub(crate) fn grant_deadline_ns(
+    granted_ns: i64,
+    ingest_hour_bucket: u32,
+    max_flush_lifetime: Duration,
+) -> Option<i64> {
+    let lifetime_ns = duration_nanos_saturating(max_flush_lifetime);
+    let hour_end_ns = (i64::from(ingest_hour_bucket) + 1).saturating_mul(NS_PER_HOUR);
+    let hour_bound_ns = hour_end_ns.saturating_add(lifetime_ns);
+    if granted_ns >= hour_bound_ns {
+        return None;
+    }
+    Some(granted_ns.saturating_add(lifetime_ns).min(hour_bound_ns))
+}
+
 /// The size trigger, shared by the metrics, log, and span shard actors:
 /// `flush_est_bytes` is the object-bytes estimate for the flush this buffer
 /// would write and gates `target_bytes`; `est_bytes` is the conservative
@@ -587,16 +630,26 @@ pub struct IngestConfig {
     /// outlive a request) already carries the cross-request window; this one
     /// bounds what one object can hold.
     pub exemplar_cap_window_ns: i64,
-    /// Upper bound on concurrently in-flight flush tasks per shard
-    /// (ADR-0067 decision 2). The shard actor pins a flush's identity and
-    /// moves its buffer into a spawned task while continuing to drain its
-    /// channel; this semaphore is the only thing that can make a flush
-    /// trigger block. Default 1 reproduces today's one-flush-at-a-time
-    /// behavior bit for bit; raising it is a measured decision, not a routine tuning
-    /// change. Must be at least 1: a
-    /// value of 0 deadlocks every flush (`services/ravel-server`'s
-    /// `Cli::validate` rejects it at the edge).
+    /// Upper bound on concurrently executing flush tasks per shard
+    /// (ADR-0067 decision 2): the permit count of the shard's one FIFO flush
+    /// semaphore, which a spawned flush task holds from grant through its
+    /// last store call, retries included. The count bounds concurrent PUTs per
+    /// shard; it does not bound encode memory, which the ingest byte budget
+    /// does (ADR-2708 D3). Default 4 (ADR-2708 D3), so a tenant held at its
+    /// [`Self::max_inflight_flushes_per_tenant`] share leaves a permit for a
+    /// co-resident tenant. Must be at least 1: a value of 0 deadlocks every
+    /// flush (`services/ravel-server`'s `Cli::validate` rejects it at the
+    /// edge).
     pub max_inflight_flushes: u32,
+    /// How many flush tasks one tenant may have spawned and not yet finished on
+    /// one shard before its ordinary size and age triggers are deferred
+    /// (ADR-2708 D3), and how many of the shard's `max_inflight_flushes`
+    /// permits that tenant's flushes may hold at once. `None` resolves to
+    /// `max(1, max_inflight_flushes - 1)`, so one stalled tenant leaves at
+    /// least one permit free whenever `max_inflight_flushes` is above 1. Read
+    /// through [`Self::flush_share_per_tenant`]; [`Self::validate`] refuses 0
+    /// and any value above `max_inflight_flushes`.
+    pub max_inflight_flushes_per_tenant: Option<usize>,
     /// Upper bound on flush tasks one shard may have spawned and not yet
     /// reaped, counting both the flushes executing against the object store
     /// and those parked waiting for a `max_inflight_flushes` permit
@@ -681,11 +734,11 @@ impl Default for IngestConfig {
             put_retry_max_delay: Duration::from_secs(2),
             max_flush_lifetime: Duration::from_secs(3600),
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
-            max_inflight_flushes: 1,
+            max_inflight_flushes: 4,
+            max_inflight_flushes_per_tenant: None,
             // Issue #1740: eight flush windows per shard is deep enough that a
             // healthy shard never reaches it (a flush that is not stalled is
-            // reaped within one PUT round trip, and the default single permit
-            // admits one at a time), and shallow enough that a stalled prefix
+            // reaped within one PUT round trip), and shallow enough that a stalled prefix
             // holds a bounded number of windows rather than an unbounded queue.
             // What a window holds is BUFFERED MEMORY, bounded per buffer by
             // `buffer_memory_backstop_bytes` (64 MiB at the default 512 MiB
@@ -729,6 +782,21 @@ pub enum IngestConfigError {
         floor: usize,
         min_flush_bytes: usize,
     },
+    /// A `max_inflight_flushes_per_tenant` of 0, which would defer every
+    /// ordinary flush trigger (ADR-2708 D3).
+    #[error("max_inflight_flushes_per_tenant must be at least 1")]
+    ZeroFlushSharePerTenant,
+    /// A `max_inflight_flushes_per_tenant` above `max_inflight_flushes`: a
+    /// share no tenant can ever reach, since the shard semaphore admits at
+    /// most `max_inflight_flushes` at once (ADR-2708 D3).
+    #[error(
+        "max_inflight_flushes_per_tenant ({share}) must not exceed \
+         max_inflight_flushes ({max_inflight_flushes})"
+    )]
+    FlushShareAboveMaxInflightFlushes {
+        share: usize,
+        max_inflight_flushes: u32,
+    },
 }
 
 /// A level [`RlogZstdLevel::new`] refused.
@@ -749,7 +817,32 @@ impl IngestConfig {
                 min_flush_bytes: self.min_flush_bytes,
             });
         }
+        if let Some(share) = self.max_inflight_flushes_per_tenant {
+            if share == 0 {
+                return Err(IngestConfigError::ZeroFlushSharePerTenant);
+            }
+            if !u32::try_from(share).is_ok_and(|s| s <= self.max_inflight_flushes) {
+                return Err(IngestConfigError::FlushShareAboveMaxInflightFlushes {
+                    share,
+                    max_inflight_flushes: self.max_inflight_flushes,
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The per-(shard, tenant) flush share the shard actors enforce
+    /// (ADR-2708 D3): `max_inflight_flushes_per_tenant`, or `max(1,
+    /// max_inflight_flushes - 1)` when unset, clamped into `1..=max(1,
+    /// max_inflight_flushes)` so a library caller that skipped
+    /// [`Self::validate`] still gets a share the semaphore can honor.
+    pub(crate) fn flush_share_per_tenant(&self) -> usize {
+        let permits = usize::try_from(self.max_inflight_flushes)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        self.max_inflight_flushes_per_tenant
+            .unwrap_or(permits.saturating_sub(1))
+            .clamp(1, permits)
     }
 
     /// The per-shard queued-flush cap as the shard actors enforce it: at least
@@ -960,6 +1053,71 @@ mod tests {
         );
     }
 
+    /// ADR-2708 D3: an unset share resolves to `max(1, N - 1)`, and
+    /// `validate` refuses 0 and anything above N.
+    #[test]
+    fn flush_share_resolves_and_validates() {
+        let with = |n: u32, share: Option<usize>| IngestConfig {
+            max_inflight_flushes: n,
+            max_inflight_flushes_per_tenant: share,
+            ..IngestConfig::default()
+        };
+        assert_eq!(with(1, None).flush_share_per_tenant(), 1);
+        assert_eq!(with(2, None).flush_share_per_tenant(), 1);
+        assert_eq!(with(4, None).flush_share_per_tenant(), 3);
+        assert_eq!(with(8, None).flush_share_per_tenant(), 7);
+        assert_eq!(with(4, Some(2)).flush_share_per_tenant(), 2);
+        assert_eq!(with(4, Some(4)).flush_share_per_tenant(), 4);
+        assert_eq!(with(4, Some(4)).validate(), Ok(()));
+        assert_eq!(with(1, None).validate(), Ok(()));
+        assert_eq!(
+            with(4, Some(0)).validate(),
+            Err(IngestConfigError::ZeroFlushSharePerTenant)
+        );
+        assert_eq!(
+            with(4, Some(5)).validate(),
+            Err(IngestConfigError::FlushShareAboveMaxInflightFlushes {
+                share: 5,
+                max_inflight_flushes: 4,
+            })
+        );
+        // Unvalidated values are clamped into what the semaphore can honor.
+        assert_eq!(with(4, Some(0)).flush_share_per_tenant(), 1);
+        assert_eq!(with(4, Some(9)).flush_share_per_tenant(), 4);
+    }
+
+    /// ADR-2708 D3: the object backstop fires at exactly four times
+    /// `target_bytes` of object estimate.
+    #[test]
+    fn object_backstop_fires_at_four_targets() {
+        let cfg = IngestConfig::default();
+        assert_eq!(OBJECT_BACKSTOP_TARGET_MULTIPLE, 4);
+        assert!(!object_backstop_crossed(4 * cfg.target_bytes - 1, &cfg));
+        assert!(object_backstop_crossed(4 * cfg.target_bytes, &cfg));
+    }
+
+    /// ADR-2708 D3: the grant deadline is the lifetime from grant, clamped to
+    /// the pinned hour's end plus the lifetime, and none at all past that.
+    #[test]
+    fn grant_deadline_is_bounded_by_the_pinned_hour() {
+        let lifetime = Duration::from_secs(3600);
+        let bucket = 472_222_u32;
+        let hour_end = (i64::from(bucket) + 1) * NS_PER_HOUR;
+        let bound = hour_end + NS_PER_HOUR;
+        // Early in the hour, the lifetime from grant is the tighter bound.
+        let early = hour_end - 3000 * 1_000_000_000;
+        assert_eq!(
+            grant_deadline_ns(early, bucket, lifetime),
+            Some(early + NS_PER_HOUR)
+        );
+        // After the hour ends, the hour's bound is.
+        let late = hour_end + 1_000_000_000;
+        assert_eq!(grant_deadline_ns(late, bucket, lifetime), Some(bound));
+        assert_eq!(grant_deadline_ns(bound - 1, bucket, lifetime), Some(bound));
+        assert_eq!(grant_deadline_ns(bound, bucket, lifetime), None);
+        assert_eq!(grant_deadline_ns(bound + 1, bucket, lifetime), None);
+    }
+
     #[test]
     fn defaults_match_sizing_table() {
         let cfg = IngestConfig::default();
@@ -981,9 +1139,11 @@ mod tests {
             cfg.exemplar_cap_window_ns,
             ravel_types::ExemplarCap::DEFAULT_WINDOW_NS
         );
-        // ADR-0067 decision 2: default reproduces today's one-flush-at-a-time
-        // behavior bit for bit; the flip to 3 is a later measured decision.
-        assert_eq!(cfg.max_inflight_flushes, 1);
+        // ADR-2708 D3: four permits per shard, three of them per tenant.
+        assert_eq!(cfg.max_inflight_flushes, 4);
+        assert_eq!(cfg.max_inflight_flushes_per_tenant, None);
+        assert_eq!(cfg.flush_share_per_tenant(), 3);
+        assert_eq!(cfg.validate(), Ok(()));
         // Issue #1740: the count bound on spawned-but-unreaped flush tasks per
         // shard, the one that still holds under an Unlimited byte budget.
         assert_eq!(cfg.max_queued_flushes, 8);

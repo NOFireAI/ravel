@@ -677,11 +677,29 @@ tick for every co-resident tenant on the shard for the whole duration of the
 stall.
 
 That makes `max_inflight_flushes` the per-shard flush **isolation** control,
-not only a memory/latency knob. At the default **1** on `ravel-server`, one
-tenant's stalled flush holds the shard's only permit, so every co-resident
-tenant's flush queues behind it until the stall clears or its
-`max_flush_lifetime` abandons it. What queues is a spawned task, not the
-actor: the co-resident tenants' writes are still accepted, their age triggers
+not only a memory/latency knob. The default on `ravel-server` is **4**
+(ADR-2708 D3), and `max_inflight_flushes_per_tenant`
+(`IngestConfig::max_inflight_flushes_per_tenant`,
+`--max-inflight-flushes-per-tenant`, default `max(1, N - 1)`, so 3) caps how
+many flushes one tenant may have spawned and not yet finished on one shard. A size or age
+trigger for a tenant already at its share is refused through the same
+deferral path as the queued-flush cap below, and a tenant with no flush in
+flight is never refused by that cap. A share refusal counts toward the flush
+deferral cap like any other deferral, and that cap refuses writes for the whole
+shard: a tenant held at its share for 3559.8 s at the defaults refuses new
+writes for every tenant on its shard. So one tenant whose prefix is stalled
+holds at most N - 1 permits, and a co-resident tenant's flush takes the last
+one and acknowledges in one healthy round trip. Two stalled tenants on one
+shard can still take all four. How long a stalled flush holds its permit
+depends on the stall: a hung create-if-absent PUT is not retried inside
+object_store, so it holds about 101 s (five 20 s attempts plus backoff), while
+a retryable status such as `503 SlowDown` is retried inside object_store for
+up to about 200 s per attempt, so five attempts approach 1000 s, bounded first
+by the flush deadline. At one permit (`--max-inflight-flushes 1`, which logs
+a warning at startup) the share is 1 and gives no isolation: one tenant's
+stalled flush holds the shard's only permit, so every co-resident tenant's
+flush queues behind it until the stall clears or its `max_flush_lifetime`
+abandons it. What queues is a spawned task, not the actor: the co-resident tenants' writes are still accepted, their age triggers
 still fire, and each trigger hands its buffer off and spawns another waiting
 flush. So the queue grows with the stall, and every flush in it holds a whole
 flush window and its ADR-0069 byte charge from the moment it left the actor,
@@ -699,8 +717,9 @@ the next tick re-fires the same trigger as soon as a flush has been reaped.
 Nothing is acked and nothing is dropped by a refusal, which is why it is
 available under `Unlimited` where a shed is not (see the ADR-1642 amendment).
 The cost is deadline, not durability: a deferred age trigger misses
-`max_flush_delay` by however long the shard stays at its cap, and
-`flush_trigger_deferred` counts every refusal so that slippage is visible.
+`max_flush_delay` by however long the shard stays at its cap or the tenant at
+its share, and `flush_trigger_deferred` counts every refusal, of either cause,
+so that slippage is visible.
 Strict-mode writers behind those
 queued flushes stay unacked for the duration; buffered-mode writers were acked
 at enqueue and their data stays invisible to queries until the flush commits.
@@ -728,6 +747,13 @@ admission sheds once the charges reach the ceiling, which stops the refill;
 under `Unlimited` only the length of the stall does. Size the steady state
 from `max_queued_flushes`, and size the overshoot from the byte ceiling rather
 than from a count of buffers.
+A second exempt crossing is the object backstop (ADR-2708 D3): a buffer whose
+object estimate (`flush_est_bytes`) has reached 4x `target_bytes` (32 MiB at
+defaults) spawns past both the share and the cap. A deferred trigger keeps
+merging into the same buffer, and the memory backstop alone does not bound
+the object a native histogram encodes (16 bytes charged a point against up to
+`32 + 8 * (buckets + spans + custom_values)` object bytes), so this caps a
+deferred object at about 4x `target_bytes` plus one batch.
 `flushes_queued` reading above the cap while `flush_trigger_deferred` stays
 flat is this exemption, not a queue that lost its bound. Both are exported:
 `/metrics` renders them as `ravel_ingest_queued_flushes` (gauge) and
@@ -740,16 +766,32 @@ raising `--shards` is not (a strict write fans out to every shard its series
 hash to, so a wider shard set only raises the chance a write touches the
 throttled shard), and per-replica ingest affinity is not
 (docs/guides/ingest-affinity.md: within a replica every tenant still hashes
-across all that replica's shards). The two defaults differ because the two
-callers have different memory owners: **1** on `ravel-server`
-(`--max-inflight-flushes`, ADR-0067 decision 2 as superseded by ADR-1642),
-where nothing upstream caps the work a shard is offered; and **4** on
-`ravel-cli load` (`--max-inflight-flushes`, ADR-0807 as amended), where
-`--pipeline-depth` already caps the outstanding batches, so the flush window
-costs no further memory and only decides whether that bounded set of objects
-is written concurrently. `0` is rejected at the CLI edge (`Cli::validate` on
+across all that replica's shards). Both callers default to **4**, for different
+reasons: on `ravel-server` (`--max-inflight-flushes`, ADR-1642 as amended by
+ADR-2708 D3) it is what leaves a permit free for a co-resident tenant, and
+raising it does not raise resident buffered memory, since a window is held and
+charged from pin time whether it is queued or executing; on `ravel-cli load`
+(`--max-inflight-flushes`, ADR-0807 as amended) `--pipeline-depth` already
+caps the outstanding batches, so the flush window costs no further memory and
+only decides whether that bounded set of objects is written concurrently. The
+loader drives one tenant, so it sets the share to the permit count. `0` is rejected at the CLI edge (`Cli::validate` on
 the server, a typed `LoadError::Setup` on the loader): it would deadlock every
-flush, since a shard could never acquire a permit to run one.
+flush, since a shard could never acquire a permit to run one. On the server
+`--max-inflight-flushes-per-tenant 0` is rejected for the same reason, and a
+share above `--max-inflight-flushes` is rejected because it could never bind.
+
+A permit grant also bounds the flush's deadline by its pinned ingest hour `H`:
+the deadline is `min(now, end(H)) + max_flush_lifetime`. A flush granted past
+that bound, a buffered flush queued behind a stall that outlasted its hour's
+lifetime, is abandoned in the queue without a PUT and counted on
+`abandoned_hour_bound` (`ravel_ingest_abandoned_hour_bound_total`). It is not
+re-pinned to a later hour. The bound sits inside the maintain seal (`end(H) +
+max_flush_lifetime + clock_skew_allowance`, 65 minutes at defaults) and the
+fold seal (80 minutes), so a late flush cannot publish into an hour the
+catalog has already sealed, where token-less queries would not see it and
+retention could delete it with no trace. A flush granted inside its hour gets
+the full lifetime from grant. Strict writes are unaffected: their
+10 s ack deadline expires first.
 
 Backpressure at the bound now propagates through the ADR-0069 global byte
 budget rather than by parking the actor and filling the bounded channel: each
@@ -1501,7 +1543,8 @@ carries max token per shard).
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
-| max_inflight_flushes (per shard, all three pipelines) | 1 on `ravel-server`, 4 on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
+| max_inflight_flushes (per shard, all three pipelines) | 4 on `ravel-server` and on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
+| max_inflight_flushes_per_tenant (per shard and tenant, all three pipelines) | `max(1, N - 1)` on `ravel-server`, so 3 (`--max-inflight-flushes-per-tenant`, rejects 0 and values above `--max-inflight-flushes`); N on `ravel-cli load` |
 | max_queued_flushes (per shard, all three pipelines) | 8 (`--max-queued-flushes`, `RAVEL_MAX_QUEUED_FLUSHES`, rejects 0; a `max_inflight_flushes` above it raises the effective cap to match, with a warning; floored at 1 in `IngestConfig`; a buffer over its memory backstop spawns past the cap) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
@@ -1660,7 +1703,8 @@ the loader; its amendment moves both loader defaults to 4, having
 first closed the durable-token report gap that made the speed-up opt-in (the
 loader now resolves every outstanding write on a failure instead of abandoning
 it, so the report equals what landed at any depth). `ravel-server`'s own default
-is unchanged. Every published ClickBench load figure predates both changes and
+moved from 1 to 4 later, for tenant isolation rather than throughput (ADR-2708
+D3). Every published ClickBench load figure predates both changes and
 needs re-measuring.
 
 ## Metrics (self-observability)
@@ -1686,7 +1730,7 @@ Counters recorded today:
   drain, and the channel-close drop-path drain. These are **attempt-time**:
   incremented when a flush is opened, before the segment build or any PUT, so
   a later-abandoned flush is counted here as well as in an `abandoned_*`
-  counter. Successful flushes = the five trigger counters minus the three
+  counter. Successful flushes = the five trigger counters minus the four
   `abandoned_*` counters.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
   budget or `max_flush_lifetime` elapsed while the flush's own store calls were
@@ -1698,10 +1742,17 @@ Counters recorded today:
   object-store one; retryable. The abandonment deadline is re-derived from
   permit grant, so this fires only when a flush task is scheduled after its
   flush-open deadline already passed, never for a mere queue wait.
+- `abandoned_hour_bound`: flush abandoned at permit grant, before any store
+  call, because the grant came past `end(pinned hour) + max_flush_lifetime`
+  (ADR-2708 D3). It is not re-pinned. A buffered flush queued behind a stall
+  longer than its hour's bound lands here instead of publishing into an hour
+  the catalog has sealed, and drops rows that were already acknowledged.
+  Exported as `ravel_ingest_abandoned_hour_bound_total` by `{mode, signal}`.
 - `abandoned_input_rejected`: flush abandoned because the input could not be
   built into a durable object (`WriteError::SegmentBuild`). Client signal; not
-  retryable. The three-way split keeps a store problem, permit contention, and
-  a bad-input problem distinguishable by counter alone.
+  retryable. The split keeps a store problem, permit contention, an
+  hour-bound abandon, and a bad-input problem distinguishable by counter
+  alone.
 - `put_retries`: retried PUT attempts across the data-object and commit-record
   paths (first attempt of each excluded).
 - `buffered_bytes_total`, `buffered_points_total`: cumulative volume admitted
@@ -1819,14 +1870,16 @@ generation's actor at that index. Per shard
   them; a reading above the cap while `flush_trigger_deferred` stays flat is
   that exemption rather than a lost bound.
 - `flush_trigger_deferred`: counter, size or age triggers the shard refused
-  because it was already at `max_queued_flushes` and the tenant's buffer was
-  still under its memory backstop. A refused trigger leaves its
+  because it was already at `max_queued_flushes`, or because the tenant
+  already held its `max_inflight_flushes_per_tenant` share of the shard's
+  flushes (ADR-2708 D3), and the tenant's buffer was still under its memory
+  and object backstops. A refused trigger leaves its
   rows buffered with their age clock unreset, so the next tick retries it; the
   counter rising means flush windows, not buffer space, are the binding
   constraint on this shard, and its tenants' `max_flush_delay` deadlines are
   slipping by however long the shard stays at the cap. `FlushTrigger::Manual`
   is exempt from the cap and never counted here, and so is any trigger on a
-  buffer past its memory backstop: that one spawns instead of deferring, so
+  buffer past its memory or object backstop: that one spawns instead of deferring, so
   `flushes_queued` can rise while this counter does not.
 
 #### Which shards are covered
