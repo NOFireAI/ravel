@@ -1102,11 +1102,15 @@ mod tests {
 
     use bytes::Bytes;
     use ravel_catalog::CatalogConfig;
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
     use ravel_maintain::FixedClock;
     use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY};
     use ravel_object_store::PutOptions;
     use ravel_object_store::memory::MemoryStore;
-    use ravel_types::TenantId;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
 
     use super::*;
 
@@ -1782,6 +1786,185 @@ mod tests {
         queue.remove_hours(&tenant, Signal::Metrics, &RefoldRequest::from_hours([12]));
         assert_eq!(queue.pending_len(), 0);
         assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// Publishes one L0 metric segment at `ingest_hour_bucket`, real enough for
+    /// a fold to fold it: a real `SegmentWriter` object plus a real published
+    /// commit record, the same two puts production ingest performs.
+    async fn publish_metric_segment(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "refold_probe".to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, "refold_probe", &labels).expect("series id"),
+            labels,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(0x9_000 + u128::from(writer_seq));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10 + writer_seq as i64,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// `run_tick`'s half of the "refold queue dropped unreconciled" finding:
+    /// a held-open fold that stays `no_op` (nothing in the held range itself
+    /// changed) but whose targeted re-fold pass actually reconciled a
+    /// requested hour outside that range must still dequeue it, or a resolved
+    /// request sits in [`RefoldQueue`] forever because no later fold is ever
+    /// `!no_op` again.
+    ///
+    /// Watermark 1000 is sealed through an operator assertion
+    /// (`fold_with_seal_through`) while the real-time margin, at the fixed
+    /// `now`, only reaches hour 997: that gap is what makes the second,
+    /// `run_tick`-driven fold see `held_open = Some((998, 1000))` (`floor =
+    /// 1000 - 26 = 974` does not bind). Hour 995 sits outside that range, so
+    /// it is the targeted pass -- not the held range's own per-bucket loop --
+    /// that reconciles it, and it is already clean (no late record), so the
+    /// fold stays `no_op`.
+    ///
+    /// Flip to watch it fail: in `run_tick`'s `TenantTickOutcome::Folded`
+    /// arm, revert the `no_op` branch to the pre-fix
+    /// `if no_op { report.no_op.push(tenant); }` (no removal at all). Hour
+    /// 995 is still queued after the tick even though the fold just
+    /// reconciled it.
+    #[tokio::test]
+    async fn run_tick_dequeues_a_refold_request_a_no_op_held_open_fold_reconciled() {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        // margin_hour(now) == 997: now sits just past end(997) + the default
+        // margin (max_flush_lifetime 1h + clock_skew_allowance 5m +
+        // fold_safety_margin 15m == 4h20m)... no, 1h+5m+15m == 1h20m.
+        const MARGIN_NS: i64 = 3_600_000_000_000 + 300_000_000_000 + 900_000_000_000;
+        let now: i64 = 998 * NS_PER_HOUR + MARGIN_NS + 1;
+
+        let inner = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("run-tick-refold-dequeue");
+        let tenant = tenant_id.hash();
+        inner
+            .put(
+                &format!("t/{}/marker", tenant.to_hex()),
+                Bytes::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the tenant prefix discovery lists");
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+
+        publish_metric_segment(store.as_ref(), &tenant_id, 1, 995).await;
+        publish_metric_segment(store.as_ref(), &tenant_id, 2, 1000).await;
+
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog builds");
+
+        let first = catalog
+            .fold_with_seal_through(
+                &tenant,
+                Signal::Metrics,
+                Uuid::from_u128(1),
+                now,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                Some(1000),
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.watermark_hour, Some(1000), "{first:?}");
+
+        let refold = RefoldQueue::default();
+        refold.send(tenant, Signal::Metrics, BTreeSet::from([995]));
+
+        let worker = Arc::new(WorkerSet::new(
+            NOW_NS,
+            HEARTBEAT,
+            DEFAULT_LIVENESS_FACTOR,
+            DEFAULT_UNIT_CONCURRENCY,
+        ));
+        let live_set: Vec<Uuid> = worker.solo_live_set();
+        let retention = RetentionConfig::default();
+        let clock = FixedClock::new(now);
+
+        let report = run_tick(
+            &catalog,
+            store.as_ref(),
+            Signal::Metrics,
+            Some(&[tenant]),
+            Uuid::from_u128(2),
+            Duration::ZERO,
+            &retention,
+            &worker,
+            &live_set,
+            &clock,
+            &refold,
+        )
+        .await
+        .expect("run_tick");
+
+        assert_eq!(report.no_op, vec![tenant], "the held range itself was quiet: {report:?}");
+        assert_eq!(
+            report.refold_hours_reconciled, 1,
+            "the targeted pass reconciled the out-of-range requested hour: {report:?}"
+        );
+        assert!(
+            pending_hours(&refold, tenant, Signal::Metrics).is_empty(),
+            "a reconciled request must not stay queued forever"
+        );
     }
 
     /// The maintain loop gets the queue only in a process whose scheduled fold

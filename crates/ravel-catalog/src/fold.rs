@@ -1376,7 +1376,17 @@ impl Catalog {
                         .held_open_has_unfolded(head, held, &listings, &mut counters)
                         .await;
                     held_open_probe_cache = probe_cache;
-                    if !has_unfolded {
+                    // A quiet held range with no queued request bails out here,
+                    // before `load_previous_entries` pays for every snapshot
+                    // part: that is the cost the held-open fast path exists to
+                    // avoid, and the common case has no request to drop. A
+                    // non-empty `refold_request` must fall through instead, or
+                    // the targeted pass below never runs for it and the
+                    // request is silently dropped unreconciled (the "refold
+                    // queue dropped unreconciled" finding) -- paying the full
+                    // load here is the cost of the caller's own explicit ask,
+                    // not of the ordinary quiet tick.
+                    if !has_unfolded && refold_request.is_empty() {
                         return Ok(no_op_report(
                             Some(head.watermark_hour),
                             applied_seal_through,
@@ -9804,6 +9814,134 @@ mod tests {
         // HEAD and the tenant config, then each snapshot part, since the
         // listing names commit records.
         assert_eq!(quiet.get_requests, 2 + next.parts_total, "{quiet:?}");
+    }
+
+    /// "Refold queue dropped unreconciled": a [`RefoldRequest`] naming an hour
+    /// OUTSIDE the held-open range must still be reconciled by a fold whose
+    /// held-open range itself is quiet (`has_unfolded` false). Before the fix,
+    /// the held-open branch returned its no-op report as soon as the held
+    /// range alone looked unchanged, never reaching the targeted re-fold
+    /// pass: the request's hour stayed stale forever, no matter how many
+    /// times it was resubmitted, because every held-open fold took the same
+    /// early exit.
+    ///
+    /// FLIP to watch it fail: add `&& refold_request.is_empty()` back out of
+    /// the early-return guard in `fold_inner` (i.e. revert to
+    /// `if !has_unfolded {`). The second fold then returns a no-op report
+    /// with `refold_hours_reconciled == 0` and HEAD still names the
+    /// superseded L0 segment at hour `H - 5`.
+    #[tokio::test]
+    async fn held_open_quiet_fold_still_serves_a_refold_request_outside_the_range() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+
+        let stale = publish_segment(&store, 0, Uuid::new_v4(), 1, H - 5, now - 5 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+
+        // A late compaction lands in hour H - 5, well below the held-open
+        // range [H - 2, H] (margin hour H - 3, default 27-hour window), after
+        // the hour was already folded.
+        let compaction =
+            publish_compaction(&store, 0, H - 5, &[&stale], now - 4 * NS_PER_HOUR).await;
+
+        // Still well inside H's natural margin, and nothing new published
+        // into the held-open range itself: without a request this fold would
+        // be the ordinary quiet no-op the test above exercises.
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert!(later < now_at_seal(H));
+        let second = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later,
+                &[],
+                None,
+                &RefoldRequest::from_hours([H - 5]),
+                None,
+            )
+            .await
+            .expect("second fold");
+
+        assert!(
+            !second.no_op,
+            "the targeted pass found hour H-5 dirty: {second:?}"
+        );
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+        assert_eq!(
+            second.refold_hours_reconciled, 1,
+            "the out-of-range requested hour was reconciled, not dropped"
+        );
+
+        let head_keys = head_object_keys(store.as_ref()).await;
+        assert!(
+            head_keys.contains(
+                &keys::reconstruct_l1_part_key(&compaction, &compaction.parts[0])
+                    .expect("l1 part key")
+            ),
+            "hour H-5 must now name the compaction output: {head_keys:?}"
+        );
+        assert!(
+            !head_keys.contains(&keys::reconstruct_data_key(&stale).expect("data key")),
+            "hour H-5 must no longer name its superseded L0 input: {head_keys:?}"
+        );
+    }
+
+    /// The other half of "doesn't leave a request queued forever when its
+    /// hours legitimately need no work": a [`RefoldRequest`] naming an hour
+    /// that is already clean (no late record) must still report
+    /// `refold_hours_reconciled > 0`, even though the fold as a whole stays a
+    /// no-op. [`services/ravel-server/src/fold.rs`]'s `run_tick` dequeues a
+    /// no-op fold's request only when this count is nonzero; if the targeted
+    /// pass ran but reported `0` here for a clean hour, that caller would
+    /// treat it as never reconciled and keep resending it forever.
+    ///
+    /// FLIP to watch it fail: in `run_targeted_refold_pass`, return `Ok(0)`
+    /// unconditionally instead of `Ok(refold_hours.len() as u64)` -- the
+    /// assertion on `second.refold_hours_reconciled` below fails even though
+    /// the pass ran and correctly found nothing to change.
+    #[tokio::test]
+    async fn held_open_quiet_fold_reconciles_a_clean_requested_hour_without_going_dirty() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, H - 5, now - 5 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+
+        // No late record anywhere: hour H - 5 is already exactly what the
+        // snapshot holds, and the held-open range [H - 2, H] is quiet too.
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert!(later < now_at_seal(H));
+        let second = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later,
+                &[],
+                None,
+                &RefoldRequest::from_hours([H - 5]),
+                None,
+            )
+            .await
+            .expect("second fold");
+
+        assert!(
+            second.no_op,
+            "nothing changed anywhere, in or out of the held range: {second:?}"
+        );
+        assert_eq!(
+            second.refold_hours_reconciled, 1,
+            "the clean requested hour was still reconciled, so a caller can dequeue it"
+        );
     }
 
     #[test]
