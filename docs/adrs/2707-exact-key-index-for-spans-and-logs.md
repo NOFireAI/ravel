@@ -413,9 +413,8 @@ flowchart LR
     `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that
     series rising while HEAD carries no `key_index` refs is the signature
     the operator acts on. The cost of a bad rollout is one rebuild run over
-    the
-    affected parts: per part entry, one footer suffix GET and one section
-    range GET, so `2 x entries` ranged GETs in total, at most
+    the affected parts: per part entry, one footer suffix GET and one
+    section range GET, so `2 x entries` ranged GETs in total, at most
     `2 x max(batch_entries, largest part's entries)` per attempt, which
     is 500,000 at the default while no part exceeds the seal threshold
     and `2 x` the largest part otherwise (about 160,000 on the Stage 0
