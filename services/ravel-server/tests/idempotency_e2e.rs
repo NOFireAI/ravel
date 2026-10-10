@@ -99,6 +99,9 @@ fn log_state(
         normalize_metrics: Arc::new(
             ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
         ),
+        budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
     }
 }
 

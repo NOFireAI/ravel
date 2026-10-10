@@ -1247,6 +1247,44 @@ uncharged and remains term 2, but its per-request bound is larger than one
 16 MiB message and is not yet quantified (a `BatchArrowRecords` carries an
 uncapped vector of payloads, each capped at 16 MiB).
 
+### Projected resolved-label bytes (ADR-2708 D2)
+
+Normalization copies labels: every classic histogram bucket, every summary
+quantile, every log record and every span gets its own copy of the attributes
+it inherits. The 16 MiB body cap does not bound that output: a request of a
+few megabytes can name labels that normalization would expand to hundreds of
+megabytes. Before any OTLP normalizer allocates, a read-only pass in
+`ravel-otlp` (`project_resolved_label_bytes`,
+`project_log_resolved_label_bytes`, `project_span_resolved_label_bytes`)
+computes the bytes it would build, charging each label its name and value
+bytes plus 64 bytes of struct overhead (`RESOLVED_LABEL_OVERHEAD_BYTES`):
+
+| Signal | Projection unit |
+|---|---|
+| metrics | per point, `multiplicity x` (resource labels + metric name + point attributes); multiplicity is 1 for gauges and sums, `bounds + 3` for a classic histogram (plus each bucket's `le` label) and `quantiles + 2` for a summary (plus each `quantile` label); a run of consecutive points with identical raw attributes counts its attributes once, the label memo's own hit rule |
+| logs | per record, the encoded length of the stream preimage it copies (resource attributes, scope name, version and attributes) plus each record attribute with the overhead |
+| traces | per span, the resource and scope attributes merged into it, its own attributes, and the reserved attributes for kind, trace state, flags, events and links |
+
+A request whose projection exceeds `max_resolved_label_bytes_per_request`
+(default 256 MiB, 268,435,456 bytes, the same in `IngestLimits`,
+`LogIngestLimits` and `SpanIngestLimits`) is rejected whole before
+normalization allocates. The sender gets HTTP 200 (gRPC OK) with every unit
+counted in `rejected_data_points`, `rejected_log_records` or `rejected_spans`,
+and the rejection is counted as `ravel_admission_rejected_total{reason="resolved_label_bytes"}`.
+`max_summary_quantiles` (64, metrics only) bounds the quantiles of one summary
+point the way `max_histogram_buckets` (160) bounds the bounds of one histogram
+point, and rejects only that point.
+
+A projection within the bound is charged to this ingest byte budget in the
+signal's handler (`handle_export`, `handle_export_logs`,
+`handle_export_traces`, which HTTP and gRPC share), held across normalization,
+and released just before the router takes its own buffered charge, so the two
+never coexist. A budget that cannot admit it sheds the request with HTTP 429
+and `Retry-After` (gRPC `RESOURCE_EXHAUSTED`) before normalization runs. A
+projection over the bound takes no charge, so an over-bound request is always
+the whole-request rejection above and never a 429 that a retry cannot clear.
+OTAP and Remote Write do not take this charge.
+
 ### Worst-case resident memory
 
 Worst-case ingest resident memory is the sum of three named, config-bounded

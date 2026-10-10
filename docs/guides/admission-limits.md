@@ -217,6 +217,30 @@ A real
 exporter never meets the cap. A deployment that sees this rejection has a
 misconfigured or hostile sender, and the cap is not a limit to raise.
 
+`max_summary_quantiles` (64) is the same bound for the `quantile_values` of
+one `Summary` data point, and rejects only that data point. Prometheus client
+summaries emit 3 to 5 quantiles.
+
+### Resolved-label bytes
+
+The per-point caps do not bound a request's total label output, because
+normalization copies labels per unit: each histogram bucket and summary
+quantile gets its own copy of the point's labels, each log record a copy of
+its resource and scope attributes, and each span a copy of its resource
+attributes. Before normalization allocates, every OTLP metrics, logs and
+traces request is projected to the label bytes it would build, and a request
+over `max_resolved_label_bytes_per_request` (256 MiB, in the same three limits
+structs, not configurable) is rejected whole: HTTP 200 (gRPC OK) with every
+data point, log record or span in the partial-success rejected count, and the
+`resolved_label_bytes` reason on `ravel_admission_rejected_total`. Typical
+collector batches project well under a tenth of the bound.
+
+A request inside the bound has its projection charged to the process-wide
+ingest buffer byte budget (`--max-ingest-buffer-bytes`) until its points reach
+the router, so a host short of budget sheds it with 429 and `Retry-After`
+rather than normalizing it. [ingest.md](../ingest.md#projected-resolved-label-bytes-adr-2708-d2)
+gives the projection rule per signal.
+
 ### Event-time skew
 
 Metrics, logs and spans all enforce event-time skew at admission, through
@@ -383,7 +407,7 @@ controller. Each carries `mode`, `tenant_hash`, and `signal` labels:
 | `ravel_admission_admitted_total` | counter | Requests admitted past the byte-rate layer. |
 | `ravel_admission_admitted_bytes_total` | counter | Bytes charged against the byte-rate layer, which for a compressed request is the decompressed size. |
 | `ravel_ingest_wire_bytes_total` | counter | Request-body bytes as they arrived on the wire. Its ratio to the row above is a tenant's effective compression factor. |
-| `ravel_admission_rejected_total` | counter | Rejections, with a fourth `reason` label: `byte_rate`, `series_rate`, `series_cap`, `clock`, `skew`, `structural`. The first four count whole requests or series; `skew` and `structural` count individual points, log records, or spans, matching what the OTLP partial-success response tells the sender. |
+| `ravel_admission_rejected_total` | counter | Rejections, with a fourth `reason` label: `byte_rate`, `series_rate`, `series_cap`, `clock`, `skew`, `structural`, `resolved_label_bytes`. The first four count whole requests or series; `skew`, `structural` and `resolved_label_bytes` count individual points, log records, or spans, matching what the OTLP partial-success response tells the sender. |
 | `ravel_ingest_body_conversions_total` | counter | Log records whose structured body was converted to canonical JSON text at normalization. Not a rejection, and counted before the stream cap and the write, so not a count of stored records. Normative description: [the observability guide](observability.md#reading-the-reason-label). |
 | `ravel_ingest_resource_attrs_dropped_total` | counter | Metric resource attributes outside the allowlist, dropped rather than turned into labels. Not a rejection, and counted before the series cap and the write, so not a count of stored points. Covers OTLP HTTP and OTLP gRPC ingest only, for the metrics signal only. Normative description: [the observability guide](observability.md#resource-attributes-outside-the-allowlist). |
 | `ravel_admission_reconciliation_failures_total` | counter | Reconciliation cycles whose sibling-snapshot read failed. The last-known threshold stays in force, so this says fleet-wide accuracy is degrading, not that ingest is down. |

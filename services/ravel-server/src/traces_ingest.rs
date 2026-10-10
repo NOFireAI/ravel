@@ -40,6 +40,10 @@ pub struct SpanIngestState {
     /// Normalization's own admission decisions for this signal, the span
     /// counterpart of [`crate::ingest::IngestState::normalize_metrics`].
     pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
+    /// The process-wide ingest byte budget, charged with the request's
+    /// projected resolved-label bytes for the duration of normalization, as
+    /// [`crate::ingest::IngestState::budget`] is.
+    pub budget: Arc<ravel_ingest::IngestByteBudget>,
 }
 
 pub struct SpanIngestOutcome {
@@ -215,6 +219,14 @@ pub async fn handle_export_traces(
         }
     }
 
+    let label_charge = crate::ingest::charge_projected_labels(
+        &state.budget,
+        ravel_otlp::project_span_resolved_label_bytes(&request, &state.limits),
+        state.limits.max_resolved_label_bytes_per_request,
+    )
+    .map_err(|ravel_ingest::IngestByteShed| {
+        SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)
+    })?;
     let normalized = normalize_traces(request, &state.limits, ingest_ts_ns);
     // `rejected_spans` counts only spans that never reached storage. An
     // attribute-level rejection (one oversized/malformed attribute, an
@@ -234,6 +246,7 @@ pub async fn handle_export_traces(
     // Spans this request actually writes, captured before `spans` is moved.
     let written_count = normalized.spans.len() as u64;
 
+    drop(label_charge);
     let receipt = state
         .router
         .write(
@@ -429,6 +442,9 @@ mod tests {
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            budget: ravel_ingest::IngestByteBudget::shared(
+                ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            ),
         }
     }
 
@@ -646,6 +662,84 @@ mod tests {
             outcome.tokens.is_empty(),
             "buffered mode acks at enqueue, before any commit"
         );
+    }
+
+    /// `(skew, structural)` summed over the span rows of the normalize-reject
+    /// counters.
+    fn spans_normalize_totals(state: &SpanIngestState) -> (u64, u64) {
+        state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Spans)
+            .fold((0, 0), |acc, row| {
+                (acc.0 + row.skew_total, acc.1 + row.structural_total)
+            })
+    }
+
+    /// ADR-2708 D2: a budget one byte short of the projected label bytes
+    /// sheds the request, and the stale spans normalization would have
+    /// counted as skew move no counter. A budget that fits charges exactly the
+    /// projection and refunds it. That the shed happens before normalization
+    /// allocates is pinned by `tests/label_charge_allocations.rs`.
+    #[tokio::test]
+    async fn label_projection_is_charged_and_refunded() {
+        let too_old = BASE_TS_NS - SpanIngestLimits::default().max_ingest_lag_ns - 1;
+        let stale_request = || {
+            let mut stale = span("GET /checkout", vec![string_kv("k", "v")]);
+            stale.start_time_unix_nano = (too_old - 1_000) as u64;
+            stale.end_time_unix_nano = too_old as u64;
+            request(vec![stale.clone(), stale])
+        };
+        let projected =
+            ravel_otlp::project_span_resolved_label_bytes(&stale_request(), &state().limits);
+        assert!(projected > 0, "the fixture projects some label bytes");
+
+        let mut state = state();
+        state.budget = ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Bounded(projected as u64 - 1),
+        );
+        let err = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            stale_request(),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .err()
+        .expect("a projection over the budget must shed");
+        assert!(
+            matches!(
+                err,
+                SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)
+            ),
+            "expected the buffer-budget shed, got: {err:?}"
+        );
+        assert_eq!(state.budget.shed_total(), 1);
+        assert_eq!(
+            spans_normalize_totals(&state),
+            (0, 0),
+            "normalization must not run for a shed request"
+        );
+
+        state.budget = ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Bounded(projected as u64),
+        );
+        handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            stale_request(),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .expect("a projection that fits is admitted");
+        assert_eq!(state.budget.peak_bytes(), projected as u64);
+        assert_eq!(state.budget.in_flight_bytes(), 0);
+        assert_eq!(spans_normalize_totals(&state), (2, 0));
     }
 
     #[tokio::test]

@@ -5345,6 +5345,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
+ "stats_alloc",
  "tempfile",
  "thiserror",
  "tikv-jemalloc-ctl",
