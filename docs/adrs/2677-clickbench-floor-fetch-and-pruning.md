@@ -105,8 +105,9 @@ case. So the fold keeps an operator-sealed hour open to late commits until
 its natural seal: for an hour above `sealed_watermark_hour(now)` the
 reconcile pass does not skip buckets holding only level-0 records, and the
 fold does not take its no-op return (narrowed by the held-open amendment
-below: it still reports a no-op when it finds nothing new). A commit into an operator-sealed hour
-is then visible at the next fold tick, not refused and not lost; the
+below: it still reports a no-op when it finds nothing new). A commit into an
+operator-sealed hour is then visible at the next fold tick, not refused and
+not lost; the
 "Catalog snapshot staleness" bound in `docs/consistency-model.md` gains
 that clause. This is task T8 (#2691), and the release that ships
 `--fold-after-load` waits for it. A seal-through hour below the natural watermark changes
@@ -593,8 +594,11 @@ means only that it does not return before re-listing. Right after a seal of
 the current hour that is three held-open hours in the first twenty minutes
 of the hour and two after, falling to none as the margin passes them: at
 most twelve LISTs per fold on a four-shard tenant with the default margins,
-plus a GET of each part covering those hours when a listing names a commit
-HEAD lacks, and none when a fold's margin already covers HEAD's watermark.
+plus a GET of each part covering those hours whenever a listing names any
+commit record at all, and none when a fold's margin already covers HEAD's
+watermark. Held-open hours never reach further below the watermark than the
+fold's reconcile window, so a watermark far above the margin (a seal
+asserted from a fast clock) costs at most the window's LISTs.
 A held-open hour compacted before the seal costs more: its compacted level-0
 records stay listed until garbage collection, so each fold in the window
 reads that bucket's records before concluding there is nothing new (#2744).

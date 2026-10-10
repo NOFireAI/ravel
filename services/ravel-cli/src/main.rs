@@ -771,8 +771,9 @@ enum Command {
         /// hours open to late commits only until the seal margin passes each
         /// one, so a commit another writer publishes into a sealed hour after
         /// that, or with no fold running before then, stays invisible to
-        /// queries without a commit token until the HEAD is rebuilt. Logs only: a metrics or spans load
-        /// with this flag is refused before any row is read or written.
+        /// queries without a commit token until the HEAD is rebuilt. Logs
+        /// only: a metrics or spans load with this flag is refused before any
+        /// row is read or written.
         ///
         /// Before it reads any row, the load is refused when the logs catalog
         /// HEAD has already sealed the current ingest hour (for example by an
