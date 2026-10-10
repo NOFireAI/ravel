@@ -145,6 +145,21 @@ pub fn normalize_traces(
         };
     }
 
+    // Every span merges its resource and scope attributes into its own, so
+    // attribute bytes grow with spans times resource width, which no per-span
+    // limit bounds (ADR-2708 D2). Read-only, before any span is built.
+    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits);
+    if projected > limits.max_resolved_label_bytes_per_request {
+        return SpanNormalizeOutput {
+            spans: Vec::new(),
+            rejected: vec![SpanRejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: limits.max_resolved_label_bytes_per_request,
+                count: total_spans,
+            }],
+        };
+    }
+
     let mut spans = Vec::new();
     let mut rejected = Vec::new();
     for rs in &req.resource_spans {
@@ -1511,5 +1526,135 @@ mod tests {
         assert_eq!(span_kind_name(4).as_deref(), Some("producer"));
         assert_eq!(span_kind_name(5).as_deref(), Some("consumer"));
         assert_eq!(span_kind_name(42).as_deref(), Some("42"));
+    }
+
+    // --- resolved-label byte bound (ADR-2708 D2) ---
+
+    /// `n` attribute-free spans under one resource carrying a single
+    /// `width`-byte attribute, which every span inherits.
+    fn wide_resource_request(n: usize, width: usize) -> ExportTraceServiceRequest {
+        request(vec![resource_spans(
+            vec![string_kv("svc", &"x".repeat(width))],
+            vec![scope_spans(
+                "lib",
+                "1",
+                (0..n)
+                    .map(|i| span("op", 1_000 + i as u64, 2_000, vec![]))
+                    .collect(),
+            )],
+        )])
+    }
+
+    #[test]
+    fn spans_rejected_by_label_bytes() {
+        const N: usize = 50;
+        // `svc=<1000 bytes>` is 1067; `otel.scope.name="lib"` 82 and
+        // `otel.scope.version="1"` 83. Each span inherits 1232.
+        let req = wide_resource_request(N, 1_000);
+        let projected =
+            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default());
+        assert_eq!(projected, 1_067 + 165 + 1_232 * N);
+
+        let limits = SpanIngestLimits {
+            max_resolved_label_bytes_per_request: 10_000,
+            ..SpanIngestLimits::default()
+        };
+        let out = normalize_traces(req, &limits, 5_000);
+        assert!(out.spans.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![SpanRejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: 10_000,
+                count: N,
+            }]
+        );
+        let counts = crate::NormalizeRejectCounts::from_span_rejections(&out.rejected);
+        assert_eq!(counts.resolved_label_bytes, N);
+
+        let out = normalize(wide_resource_request(N, 1_000));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), N);
+    }
+
+    #[test]
+    fn projection_is_not_below_the_built_bytes() {
+        let spans = |base: u64| {
+            (0..4)
+                .map(|i| {
+                    let mut s = span(
+                        "op",
+                        base + i,
+                        base + 100,
+                        vec![
+                            string_kv("http.route", &format!("/r/{i}")),
+                            kv("code", AnyValueVariant::IntValue(-200)),
+                            kv("ratio", AnyValueVariant::DoubleValue(0.125)),
+                            kv("ok", AnyValueVariant::BoolValue(false)),
+                            kv("raw", AnyValueVariant::BytesValue(vec![0xab; 5])),
+                            kv(
+                                "dropped",
+                                AnyValueVariant::ArrayValue(ArrayValue { values: vec![] }),
+                            ),
+                        ],
+                    );
+                    s.kind = i as i32 + 1;
+                    s.trace_state = "k=v".to_string();
+                    s.flags = 0x301;
+                    s.events = vec![Event {
+                        name: "e".to_string(),
+                        time_unix_nano: base,
+                        attributes: vec![string_kv("ea", "1")],
+                        ..Default::default()
+                    }];
+                    s.links = vec![Link {
+                        trace_id: TRACE.to_vec(),
+                        span_id: SPAN.to_vec(),
+                        ..Default::default()
+                    }];
+                    s
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut scoped = scope_spans("lib", "1.0", spans(1_000));
+        if let Some(scope) = scoped.scope.as_mut() {
+            scope.attributes = vec![
+                string_kv("scope.attr", "s"),
+                kv(
+                    "m",
+                    AnyValueVariant::KvlistValue(KeyValueList { values: vec![] }),
+                ),
+            ];
+        }
+        let req = request(vec![
+            resource_spans(
+                vec![
+                    string_kv("service.name", "checkout"),
+                    kv("replicas", AnyValueVariant::IntValue(3)),
+                ],
+                vec![scoped, scope_spans("", "", spans(2_000))],
+            ),
+            resource_spans(vec![], vec![scope_spans("other", "", spans(3_000))]),
+        ]);
+        let limits = SpanIngestLimits::default();
+        let projected = crate::project_span_resolved_label_bytes(&req, &limits);
+        let out = normalize_traces(req, &limits, 5_000);
+        // Array and kvlist values are dropped with a notice, not the span.
+        assert!(
+            out.rejected
+                .iter()
+                .all(|r| matches!(r, SpanRejection::UnsupportedAttributeKind { .. })),
+            "{:?}",
+            out.rejected
+        );
+        assert_eq!(out.spans.len(), 12);
+        let built: usize = out
+            .spans
+            .iter()
+            .flat_map(|s| s.attrs.iter())
+            .map(|(k, v)| k.len() + v.len() + std::mem::size_of::<(String, String)>())
+            .sum();
+        assert!(built > 0);
+        assert!(projected >= built, "projected {projected} < built {built}");
     }
 }

@@ -1035,6 +1035,7 @@ pub(crate) mod tests {
                 provisioning: None,
                 metadata_sink: None,
                 normalize_metrics: normalize_metrics.clone(),
+                budget: budget.clone(),
             },
             logs_ingest: crate::logs_ingest::LogIngestState {
                 router: log_router,
@@ -1045,6 +1046,7 @@ pub(crate) mod tests {
                 recovery: None,
                 provisioning: None,
                 normalize_metrics: normalize_metrics.clone(),
+                budget: budget.clone(),
             },
             traces_ingest: crate::traces_ingest::SpanIngestState {
                 router: span_router,
@@ -1055,6 +1057,7 @@ pub(crate) mod tests {
                 recovery: None,
                 provisioning: None,
                 normalize_metrics: normalize_metrics.clone(),
+                budget: budget.clone(),
             },
             admission,
             budget,
