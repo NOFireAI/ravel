@@ -436,7 +436,8 @@ pub struct LogIngestMetricsSnapshot {
     /// Sum across shards of `flush_trigger_deferred` from
     /// [`LogIngestMetrics::shard_skew_by_shard`] at snapshot time: size and age
     /// flush triggers refused because the shard was already at
-    /// `max_queued_flushes` (issue #1740). Cumulative. The per-shard breakdown
+    /// `max_queued_flushes` (issue #1740) or the tenant at its per-tenant
+    /// flush share (ADR-2708 D3). Cumulative. The per-shard breakdown
     /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
     /// directly for that.
     pub flush_trigger_deferred_total: u64,

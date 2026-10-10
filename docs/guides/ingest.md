@@ -171,10 +171,18 @@ Acked buffered rows can be lost in these cases:
 - **A flush past its flush-open deadline.** The flush is abandoned without
   taking a permit, and its rows are lost the same way.
   `ravel_ingest_abandoned_queue_deadline_total` counts these flushes.
+- **A flush granted past its hour's bound.** A flush that waited for its
+  permit past the end of its pinned ingest hour plus `max_flush_lifetime` is
+  abandoned without a PUT rather than published into an hour the catalog has
+  already sealed. `ravel_ingest_abandoned_hour_bound_total` counts these
+  flushes.
 
-A flush queued behind a stalled co-resident prefix reaches the store once the
-stall clears. A co-resident stall by itself is therefore not a buffered-mode
-loss. See [docs/consistency-model.md](../consistency-model.md).
+One stalled tenant holds at most `--max-inflight-flushes-per-tenant` of its
+shard's permits (default 3 of 4), so a co-resident tenant's flush normally
+takes the free permit. A flush that does queue behind a stalled co-resident
+prefix reaches the store once the stall clears, unless the wait outlasts its
+hour's bound above. A co-resident stall by itself is therefore not a
+buffered-mode loss. See [docs/consistency-model.md](../consistency-model.md).
 
 ## Partial success and rejections
 

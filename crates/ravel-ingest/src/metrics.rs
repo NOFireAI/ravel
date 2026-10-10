@@ -560,8 +560,9 @@ impl ShardSkew {
     }
 
     /// One size or age flush trigger refused because shard `shard` was already
-    /// at `max_queued_flushes` and the buffer was under its memory backstop
-    /// (issue #1740).
+    /// at `max_queued_flushes` (issue #1740), or because the tenant already
+    /// held its per-tenant flush share (ADR-2708 D3), with the buffer under its
+    /// memory and object backstops.
     pub(crate) fn record_flush_trigger_deferred(&self, shard: u32) {
         if let Some(s) = self.shards.get(shard as usize) {
             s.flush_trigger_deferred.fetch_add(1, Ordering::Relaxed);
@@ -728,7 +729,9 @@ pub struct ShardSkewStats {
     /// cap is enforced against and it reads at or above the other.
     pub flushes_queued: u64,
     /// Size and age flush triggers this shard refused because `flushes_queued`
-    /// was already at `IngestConfig::max_queued_flushes` (issue #1740). The
+    /// was already at `IngestConfig::max_queued_flushes` (issue #1740), or
+    /// because the tenant already held its
+    /// `IngestConfig::max_inflight_flushes_per_tenant` share (ADR-2708 D3). The
     /// tenant's rows stay buffered with their arrival bookkeeping intact and
     /// the next tick re-fires the trigger, so a nonzero figure is deferred
     /// work, never lost work. Sustained growth means flushes are not draining
@@ -736,9 +739,9 @@ pub struct ShardSkewStats {
     ///
     /// Drain triggers ([`FlushTrigger::Manual`]: explicit flush-all, shutdown,
     /// channel close) are never refused and never counted here, and neither
-    /// is a trigger on a buffer over its memory backstop: that one spawns past
-    /// the cap rather than let a buffer grow unbounded, so `flushes_queued`
-    /// can rise while this stays flat.
+    /// is a trigger on a buffer over its memory or object backstop: that one
+    /// spawns past the cap rather than let a buffer grow unbounded, so
+    /// `flushes_queued` can rise while this stays flat.
     pub flush_trigger_deferred: u64,
 }
 
@@ -867,7 +870,8 @@ pub struct IngestMetricsSnapshot {
     /// Sum across shards of `flush_trigger_deferred` from
     /// [`IngestMetrics::shard_skew_by_shard`] at snapshot time: size and age
     /// flush triggers refused because the shard was already at
-    /// `max_queued_flushes` (issue #1740). Cumulative. The per-shard breakdown
+    /// `max_queued_flushes` (issue #1740) or the tenant at its per-tenant
+    /// flush share (ADR-2708 D3). Cumulative. The per-shard breakdown
     /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
     /// directly for that.
     pub flush_trigger_deferred_total: u64,

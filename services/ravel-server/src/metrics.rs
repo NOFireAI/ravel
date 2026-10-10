@@ -2074,7 +2074,8 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         out,
         "ravel_ingest_flush_trigger_deferred_total",
         "Size and age flush triggers refused because their shard was already holding \
-         --max-queued-flushes spawned flush tasks (issue #1740), summed across shards, by \
+         --max-queued-flushes spawned flush tasks (issue #1740) or their tenant already held \
+         its --max-inflight-flushes-per-tenant share (ADR-2708 D3), summed across shards, by \
          signal. A refusal is a deferral, not a shed: the buffer rides back untouched and the \
          next tick re-fires once a flush has been reaped, so a rise means flush latency slipped \
          past --max-flush-delay and nothing was dropped.",
