@@ -43,12 +43,14 @@ pub(crate) const LIST_MAX_BODY_BYTES: usize = 8 << 20;
 const WIRE_PAGE_KEYS: usize = 1000;
 
 /// The response ceiling of one [`crate::ObjectStoreBackend::list`] or
-/// `list_after` call on `S3Store`. Only a truncated response carrying no key
-/// is charged to it: after 16 of them the call fails with
-/// [`StoreError::ListPageCeiling`] instead of sending another request. Every
-/// other response adds at least one key, and ListObjectsV2 may return fewer
-/// than `max-keys`, so the page size alone bounds those, and one call receives
-/// at most `page_size + 16` responses. A drain is capped at
+/// `list_after` call on `S3Store`, counted in consecutive responses carrying
+/// no key: after 16 in a row the call fails with
+/// [`StoreError::ListPageCeiling`] instead of sending another request, and a
+/// response carrying a key starts the count again. Each such response adds at
+/// least one key, and ListObjectsV2 may return fewer than `max-keys`, so a call
+/// receives at most `page_size` of them, each after at most 15 keyless ones,
+/// and only a page left short of full takes up to 16 keyless ones after its
+/// last: at most `16 × page_size` responses in all. A drain is capped at
 /// [`crate::MAX_LIST_PAGES`] pages of that many.
 const EMPTY_RESPONSE_ALLOWANCE: usize = 16;
 
@@ -134,6 +136,8 @@ pub(crate) async fn list_page<F: ListFetch>(
         let response = fetch.fetch(&request).await?;
         if response.contents.is_empty() {
             empty_responses += 1;
+        } else {
+            empty_responses = 0;
         }
         listed.extend(response.contents);
         if !response.is_truncated {
@@ -229,8 +233,9 @@ fn next_token(
 /// Parse a ListObjectsV2 body. When it echoes `<EncodingType>url</EncodingType>`,
 /// every `Key` and `CommonPrefixes/Prefix` is URL-decoded with `+` read as a
 /// space and `%XX` as its byte; without it the text is literal. A key that is
-/// not UTF-8 once decoded keeps its still-encoded text, which carries a `%` and
-/// so is never addressable.
+/// not UTF-8 once decoded, or holds a `%` not followed by two hex digits, keeps
+/// its still-encoded text, which carries a `%` and so is never addressable: the
+/// listing reports it rather than failing on it.
 pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, ControlPlaneError> {
     let root = bucket_config::parse_document(body, "ListBucketResult")?;
     let encoded = match root.single("EncodingType")? {
@@ -267,11 +272,7 @@ pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, Cont
                 "a CommonPrefixes entry carries no Prefix".to_string(),
             ));
         };
-        common_prefixes.push(listed_text(
-            &element.text,
-            encoded,
-            "CommonPrefixes/Prefix",
-        )?);
+        common_prefixes.push(listed_text(&element.text, encoded));
     }
     Ok(ListResponse {
         contents,
@@ -283,7 +284,7 @@ pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, Cont
 
 fn parse_contents(entry: &XmlElement, encoded: bool) -> Result<ObjectMeta, ControlPlaneError> {
     let key = match entry.single("Key")? {
-        Some(element) => listed_text(&element.text, encoded, "Key")?,
+        Some(element) => listed_text(&element.text, encoded),
         None => {
             return Err(ControlPlaneError::Parse(
                 "a listed object carries no Key".to_string(),
@@ -321,17 +322,15 @@ fn parse_contents(entry: &XmlElement, encoded: bool) -> Result<ObjectMeta, Contr
     })
 }
 
-/// A listed key or common prefix as the store holds it.
-fn listed_text(text: &str, encoded: bool, element: &str) -> Result<String, ControlPlaneError> {
+/// A listed key or common prefix as the store holds it, or its still-encoded
+/// text when it does not decode.
+fn listed_text(text: &str, encoded: bool) -> String {
     if !encoded {
-        return Ok(text.to_string());
+        return text.to_string();
     }
     match url_decode(text) {
-        Some(Ok(decoded)) => Ok(decoded),
-        Some(Err(_not_utf8)) => Ok(text.to_string()),
-        None => Err(ControlPlaneError::Parse(format!(
-            "a {element} is not valid URL encoding"
-        ))),
+        Some(Ok(decoded)) => decoded,
+        Some(Err(_)) | None => text.to_string(),
     }
 }
 
@@ -866,12 +865,6 @@ mod tests {
         for bad in [
             "<Error><Code>InternalError</Code></Error>".to_string(),
             body(Some("url"), &[], &[], ""),
-            body(
-                Some("url"),
-                &["100%"],
-                &[],
-                "<IsTruncated>false</IsTruncated>",
-            ),
             body(Some("base64"), &[], &[], "<IsTruncated>false</IsTruncated>"),
             "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>k</Key>\
              </Contents></ListBucketResult>"
@@ -885,6 +878,38 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// A `%` not followed by two hex digits is not URL encoding, so the key
+    /// keeps its listed text, which `classify_objects` reports unaddressable
+    /// with the rest of the listing intact; a common prefix likewise.
+    #[test]
+    fn a_key_that_does_not_url_decode_is_unaddressable_not_fatal() {
+        let response = parse_list_bucket_result(
+            body(
+                Some("url"),
+                &["p/a", "p/100%", "p/%G1", "p/b"],
+                &["p/50%/"],
+                "<IsTruncated>false</IsTruncated>",
+            )
+            .as_bytes(),
+        )
+        .expect("an undecodable key does not fail the listing");
+        let keys: Vec<&str> = response.contents.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, ["p/a", "p/100%", "p/%G1", "p/b"]);
+        assert_eq!(response.common_prefixes, ["p/50%/"]);
+
+        let (objects, unaddressable) = crate::classify_objects("p/", response.contents);
+        let objects: Vec<&str> = objects.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(objects, ["p/a", "p/b"]);
+        let skipped: Vec<(&str, &str)> = unaddressable
+            .iter()
+            .map(|u| (u.key.as_str(), u.addresses.as_str()))
+            .collect();
+        assert_eq!(skipped, [("p/100%", "p/100%25"), ("p/%G1", "p/%25G1")]);
+        let (prefixes, refused) = crate::classify_prefixes("p/", response.common_prefixes);
+        assert!(prefixes.is_empty(), "{prefixes:?}");
+        assert_eq!(refused, ["p/50%/"]);
     }
 
     #[test]
@@ -1131,6 +1156,54 @@ mod tests {
         assert_eq!(page.next, None);
         assert_eq!(page.objects.len(), 31);
         assert_eq!(script.seen.lock().len(), 46);
+    }
+
+    /// The ceiling counts keyless responses in a row, not over the page: 45
+    /// of them in runs of 15 between keyed ones fill the page, and a run of 16
+    /// still fails it after a keyed response started the count again.
+    #[tokio::test]
+    async fn the_ceiling_counts_consecutive_keyless_responses_only() {
+        let mut responses = Vec::new();
+        for run in 0..3 {
+            responses.extend((0..15).map(|i| truncated(&[], &format!("e{run}-{i}"))));
+            responses.push(truncated(&[&format!("p/{run}")], &format!("k{run}")));
+        }
+        responses.push(last(&["p/z"]));
+        let script = Script::new(responses);
+        let page = list_page(&script, "p/", None, 1000).await.expect("page");
+        assert_eq!(page.next, None);
+        assert_eq!(page.objects.len(), 4);
+        assert_eq!(script.seen.lock().len(), 49);
+
+        let mut responses: Vec<ListResponse> =
+            (0..15).map(|i| truncated(&[], &format!("e{i}"))).collect();
+        responses.push(truncated(&["p/a"], "k"));
+        responses.extend((0..40).map(|i| truncated(&[], &format!("f{i}"))));
+        let script = Script::new(responses);
+        assert!(matches!(
+            list_page(&script, "p/", None, 1000).await,
+            Err(StoreError::ListPageCeiling { ceiling: 16, .. })
+        ));
+        assert_eq!(script.seen.lock().len(), 32);
+    }
+
+    /// A page can take exactly `16 × page_size` responses: a 3-key page of
+    /// single-key responses, each after 15 keyless ones, short by one key,
+    /// then the 16 keyless ones the ceiling allows.
+    #[tokio::test]
+    async fn a_page_takes_at_most_sixteen_responses_per_key() {
+        let mut responses = Vec::new();
+        for key in 0..2 {
+            responses.extend((0..15).map(|i| truncated(&[], &format!("e{key}-{i}"))));
+            responses.push(truncated(&[&format!("p/{key}")], &format!("k{key}")));
+        }
+        responses.extend((0..40).map(|i| truncated(&[], &format!("t{i}"))));
+        let script = Script::new(responses);
+        assert!(matches!(
+            list_page(&script, "p/", None, 3).await,
+            Err(StoreError::ListPageCeiling { ceiling: 16, .. })
+        ));
+        assert_eq!(script.seen.lock().len(), 16 * 3);
     }
 
     /// A page that fills on a truncated response is complete: the token it
