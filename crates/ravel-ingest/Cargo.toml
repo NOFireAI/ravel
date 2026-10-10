@@ -65,7 +65,9 @@ ravel-sql = { path = "../ravel-sql", version = "0.23.0" }
 # Match ravel-sql's datafusion pin exactly (same arrow 58 line) so the test's
 # SessionContext/collect interop with ravel-sql's plan types.
 datafusion = { version = "54", default-features = false, features = ["sql"] }
-tokio = { workspace = true }
+# test-util for `#[tokio::test(start_paused = true)]`: tests/strict_ack_latency.rs
+# runs the shard loop and its held PUTs on paused tokio time.
+tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 proptest = { workspace = true }
 # Captures the once-per-refresh unresolved-layout warning in
