@@ -276,16 +276,18 @@ trait honors cancellation by drop, so the query deadline (usually well under
   the client fails rather than looping forever, and a token that keeps
   changing without ending is bounded by a page ceiling (`MAX_LIST_PAGES`,
   100 000 pages, 100 million keys at the 1000-key page size). One
-  `S3Store` page can take several ListObjectsV2 responses (below). Only a
-  truncated response carrying no key is charged to that page's ceiling of
-  16; every other response adds at least one key, and ListObjectsV2 may
-  return fewer than `max-keys`, so a page takes at most `page_size + 16`
+  `S3Store` page can take several ListObjectsV2 responses (below). Only
+  truncated responses carrying no key are charged to that page's ceiling
+  of 16, counted in a row: a response carrying a key starts the count
+  again. Each response carrying a key adds at least one, and ListObjectsV2
+  may return fewer than `max-keys`, so a page takes at most `page_size` of
+  those, each after at most 15 keyless ones, and a page left short of full
+  takes up to 16 keyless ones after its last: at most `16 × page_size`
   responses. The request bound of one `S3Store` drain is the composed
-  `MAX_LIST_PAGES` times that figure: 101.6 million responses at the
-  default page size of 1000, a bound a backend reaches only by returning
-  one key per response. `list_delimited` is
-  one call that follows tokens to the end, bounded at `MAX_LIST_PAGES`
-  responses.
+  `MAX_LIST_PAGES` times that figure: 1.6 billion responses at the default
+  page size of 1000, a bound a backend reaches only by returning one key
+  per response after 15 keyless ones. `list_delimited` is one call that
+  follows tokens to the end, bounded at `MAX_LIST_PAGES` responses.
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
   would, minus every key `<= start_after`: each returned key compares
   strictly greater than `start_after`, in the same lexicographic order and
@@ -314,17 +316,19 @@ trait honors cancellation by drop, so the query deadline (usually well under
   `start-after` raw, asks for `encoding-type=url`, and decodes a response
   that echoes `EncodingType=url` (`+` is a space, `%XX` a byte); a
   response without `EncodingType` is read literally. A key that is not
-  UTF-8 once decoded is reported in `unaddressable` under its still-encoded
-  text. One `list` or `list_after` call is one page: it asks for at most
-  1000 keys per response and follows `NextContinuationToken` within the
-  call until the page holds `page_size` keys or the listing ends, so a
-  truncated response with no keys continues the page instead of ending it.
+  UTF-8 once decoded, or holds a `%` not followed by two hex digits, is
+  reported in `unaddressable` under its still-encoded text, so the rest
+  of the listing is returned. One `list` or `list_after` call is one page:
+  it asks for at most 1000 keys per response and follows
+  `NextContinuationToken` within the call until the page holds `page_size`
+  keys or the listing ends, so a truncated response with no keys continues
+  the page instead of ending it.
   A truncated response with no `NextContinuationToken` that leaves the page
   short is `Permanent` naming the prefix, a token equal to the one just
   sent is `ListRepeatedToken` (a response that fills the page is complete,
-  and its token is never checked or sent), and a page's 16th empty
-  truncated response ends it with `ListPageCeiling` instead of another
-  request. Its `list_delimited` follows tokens only and
+  and its token is never checked or sent), and a page's 16th keyless
+  truncated response in a row ends it with `ListPageCeiling` instead of
+  another request. Its `list_delimited` follows tokens only and
   never resumes from a key, since a common prefix can sort after a
   response's last key. An S3 grant read through `ExternalStore` lists
   through `S3Store`.
