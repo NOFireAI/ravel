@@ -2856,6 +2856,9 @@ impl ExecutionPlan for LogsScanExec {
         vec![]
     }
 
+    // Visits nothing: content/prune are Ravel `Predicate`s, not
+    // `PhysicalExpr`s, and the kept TopK filter is matched to its sort by
+    // `expression_id` in `ConfirmTopKThreshold`, never by walking this.
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,

@@ -139,6 +139,9 @@ impl ExecutionPlan for RsegDedupExec {
         vec![Some(self.input_ordering.clone())]
     }
 
+    // Visits nothing: the dedup reads fixed columns by index, and
+    // `input_ordering` is a requirement on the input, not an expression this
+    // node evaluates.
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,

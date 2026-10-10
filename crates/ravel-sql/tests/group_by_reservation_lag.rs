@@ -473,10 +473,13 @@ fn skip_probe_session(
 /// fires at all, but whether Ravel's exact integer `AVG` accumulator can take
 /// part in the skip once it does.
 /// `ExactIntegerAvgGroupsAccumulator::convert_to_state` (crates/ravel-sql/src/
-/// avg.rs) is what makes that possible; before it existed,
-/// `supports_convert_to_state` returned `false` and the partial stage built a
-/// full group hash table for every row regardless of what the probe's ratio
-/// showed.
+/// avg.rs) is what makes that possible. DataFusion 55.2 has no per-accumulator
+/// gate on the skip: `convert_to_state` is a required `GroupsAccumulator`
+/// method, and every partial stream with one grouping set builds the probe
+/// once the ratio threshold is below 1.0. So the first assertion below guards
+/// Ravel's session turning the probe on, and the second guards the states
+/// `convert_to_state` forwards, which must merge to the rows a stock partial
+/// aggregation gives.
 ///
 /// Deterministic and cheap: the only session-dependent quantity is the
 /// probe's row threshold, read off the session this test actually runs
@@ -489,10 +492,10 @@ fn skip_probe_session(
 /// as long as it is below 1.0 (a precondition `skip_partial_aggregation`
 /// requires to do anything at all).
 ///
-/// Prove-the-test: temporarily change
-/// `ExactIntegerAvgGroupsAccumulator::supports_convert_to_state` in
-/// crates/ravel-sql/src/avg.rs to return `false`. `skipped_aggregation_rows`
-/// falls to 0 and the first assertion below fails.
+/// Prove-the-test: in crates/ravel-sql/src/avg.rs, temporarily change
+/// `counts.push(1i64)` in `ExactIntegerAvgGroupsAccumulator::convert_to_state`
+/// to `counts.push(2i64)`. Every forwarded row then counts twice, each
+/// skipped group's average halves, and the second assertion below fails.
 #[test]
 fn exact_integer_avg_takes_part_in_the_partial_aggregation_skip() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -542,10 +545,11 @@ fn exact_integer_avg_takes_part_in_the_partial_aggregation_skip() {
         skipped > 0,
         "exact integer AVG's partial aggregation skipped 0 rows over \
          {PARTITIONS} partitions of {rows_per_partition} all-distinct keys \
-         each (probe threshold {probe_rows}); \
-         ExactIntegerAvgGroupsAccumulator::supports_convert_to_state must have \
-         stopped returning true, so the partial stage built a hash table \
-         instead of forwarding rows.\n{}",
+         each (probe threshold {probe_rows}); the session no longer sets a \
+         skip ratio threshold below 1.0 (session.rs \
+         SKIP_PARTIAL_AGGREGATION_PROBE_RATIO), or DataFusion stopped \
+         building the probe for this plan, so the partial stage built a hash \
+         table instead of forwarding rows.\n{}",
         datafusion::physical_plan::displayable(skip_plan.as_ref()).indent(true)
     );
 
@@ -553,7 +557,9 @@ fn exact_integer_avg_takes_part_in_the_partial_aggregation_skip() {
         extract_rows(&skip_batches),
         extract_rows(&stock_batches),
         "skip-enabled and skip-disabled runs of the same query produced \
-         different (key, avg, count) rows"
+         different (key, avg, count) rows; the states \
+         ExactIntegerAvgGroupsAccumulator::convert_to_state forwards for \
+         skipped rows no longer merge to the folded result"
     );
 }
 
@@ -598,13 +604,14 @@ fn group_by_allocation_lead_over_reservation() {
     /// Before `convert_to_state` existed on the exact integer `AVG`
     /// accumulator its partial aggregation could never skip, so every partial
     /// group table was built and its emitted state sat unreserved in the
-    /// exchange. Five `--release` runs on this amd64 host with
-    /// `supports_convert_to_state` forced back to `false` (the mutation
-    /// `exact_integer_avg_takes_part_in_the_partial_aggregation_skip` below
-    /// also catches) measured a 2.10x-2.57x ratio at 8 partitions and
-    /// 1.66x-1.96x at 32. With it restored, five runs measured 1.09x-1.21x at
-    /// 8 partitions and 1.07x-1.14x at 32. The bound sits between the two,
-    /// closer to the fixed side.
+    /// exchange. Five `--release` runs on this amd64 host on DataFusion 54.1,
+    /// with the accumulator's `supports_convert_to_state` forced back to
+    /// `false`, measured a 2.10x-2.57x ratio at 8 partitions and 1.66x-1.96x
+    /// at 32. With it restored, five runs measured 1.09x-1.21x at 8 partitions
+    /// and 1.07x-1.14x at 32. The bound sits between the two, closer to the
+    /// fixed side. DataFusion 55.2 removed that gate, so the unskipped
+    /// configuration can no longer be produced by flipping it; not
+    /// re-measured on DataFusion 55.2.
     const MAX_AVG_LIVE_OVER_COUNT_LIVE: f64 = 1.5;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -188,7 +188,8 @@ explained there.
      every aggregate in the same query is exact: this repo's own
      conventions make `-0.0` and NaN payloads bit-significant
      (`minmax.rs`'s reason for existing at all; ADR-0013's differential
-     gate), and this ADR has no proof that DataFusion's grouping
+     gate; for `-0.0` in a group key, see the negative-zero group key
+     amendment below), and this ADR has no proof that DataFusion's grouping
      mechanism picks a merge-order-stable representative bit pattern
      for a float group key under an arbitrary partition split. Absent
      that proof, a float group key disqualifies the query — this also
@@ -846,3 +847,18 @@ references no symbol from this crate or DataFusion, so a rework of
 `SequentialAvg`'s numerator to fixed-point arithmetic leaves it green. It
 documents why the premise is false; it does not detect the premise becoming
 true.
+
+## Amendment 2026-10-10 (issue #2720): negative zero in float group keys
+
+<!-- amendment-applies: sections="Decision" pointer="negative-zero group key amendment" -->
+
+Status: Accepted (qualifies decision 1's reason for excluding a float group
+key; the exclusion itself is unchanged).
+
+DataFusion 55 folds `-0.0` into `0.0` when it builds group keys, in its
+single-column primitive, multi-column and row-encoded group-value paths, so `-0.0` is no longer a distinct group
+key for any plan, serial or parallel. Decision 1's reason therefore rests on
+the other two parts: NaN payloads stay bit-significant as group keys
+(DataFusion keeps their bits), and no proof exists that DataFusion picks a
+merge-order-stable representative for a float group key under an arbitrary
+partition split. A float group key still disqualifies the query.

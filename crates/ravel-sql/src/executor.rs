@@ -3576,7 +3576,7 @@ impl PinnedStream {
     /// failed: a spill that happened before a failure is still a fact about the
     /// query. All zero, with no operators listed, for a query that did not
     /// spill.
-    fn spill_counts(&self) -> (SpillCounts, Vec<OperatorSpill>) {
+    pub fn spill_counts(&self) -> (SpillCounts, Vec<OperatorSpill>) {
         let mut totals = SpillCounts::default();
         let mut by_operator = Vec::new();
         accumulate_spill_counts(&self.plan, &mut totals, &mut by_operator);
