@@ -62,6 +62,10 @@ The frozen contracts:
 5. Extend fuzz and property tests to cover both versions, plus corrupt
    and truncated inputs for the new one.
 6. Update ravel-cli inspectors to print the new version's fields.
+7. Add a changelog fragment naming every signal the bumped format carries
+   (RLOG: logs, alerts, audit; RSPAN: spans; RSEG: metrics);
+   `scripts/guards/check-format-bump-release-note.sh` fails the pull request
+   otherwise (ADR-2708 D5d).
 
 If a change cannot follow this procedure, it does not happen. There is no
 fast path for format changes.

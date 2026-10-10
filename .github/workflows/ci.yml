@@ -345,6 +345,15 @@ jobs:
         # reachable from it and the guard attributes a neighbour's feat commit
         # to this pull request. head.sha is the branch tip itself.
         run: scripts/guards/check-changelog-touched.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+      # A change to an RLOG, RSPAN or RSEG reader version must ship a
+      # changelog fragment naming every signal that format carries (issue
+      # #2725, ADR-2708 D5d). Same base..head shape and head.sha reasoning as
+      # the changelog guard above.
+      - name: Format-bump release-note guard cases (issue #2725)
+        run: bash scripts/guards/check-format-bump-release-note.test.sh
+      - name: Format-bump release-note guard (issue #2725)
+        if: github.event_name == 'pull_request'
+        run: scripts/guards/check-format-bump-release-note.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
       # Changelog fragments under changelog.d/ are folded into CHANGELOG.md
       # before a release tag is cut (issue #2323). Validating them here makes
       # a malformed fragment fail at its pull request, not at release time.
