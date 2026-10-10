@@ -1,13 +1,19 @@
 # ADR-2633: Resident-aware memory admission
 
-Status: Accepted (2026-10-09). Issue #2633, epic #2040. Builds on ADR-1170 (one
+Status: Accepted (2026-10-09).
+
+Revised (2026-10-10): the high-water mark is re-derived from the uncharged heap
+measured after the aggregate hold (PR #2685); the default moves from 75 % to 70 %.
+
+Issue #2633, epic #2040. Builds on ADR-1170 (one
 process-wide memory budget) and, once accepted, changes the ADR-1170 sentences
 listed in section 6. No persistent format changes: no object Ravel writes, no
 key it builds and no protobuf schema changes. This decision adds a gate in
 front of the process `MemoryBudget` that reads the allocator's resident
 figure, forces a purge at a high-water mark, and refuses growth with the typed
 budget error while the mark is still exceeded. It also moves every
-memory-budget refusal on the fetch path from 503 to the budget's 422.
+memory-budget refusal on the fetch path, and the catalog decode refusal
+(`CatalogError::MemoryExhausted`), from 503 to the budget's 422.
 
 ## Context
 
@@ -47,16 +53,16 @@ What the table and the runs behind it establish:
   0.4 GB/s, that a decay timer of any length lags.
 - The 1 s decay costs 10.9 % qps, which cannot be separated from noise: the
   two default-decay runs alone differ by 9.2 %.
-- The uncharged live heap (`allocated` − accounted, the gap minus the
-  retention) is mostly DataFusion aggregation state. At each run's peak-gap
-  sample in the table above it is 0.15 to 1.68 GB. Its worst case is larger
-  and falls on other samples: the per-sample maximum of `allocated` −
-  accounted − handoff overlap (the overlap is counted twice in "accounted",
-  so it is subtracted) is, per run, 1.97 GB (baseline), 1.19 GB (rerun),
-  1.95 and 1.46 GB (decay A) and 2.07 and 1.83 GB (decay B), over every
-  5 s sample in each run's `samples.tsv`. The derivation in section 2 uses
-  that per-sample maximum, 2.07 GB, since a gate must hold at the worst
-  sample, not at the peak-gap one.
+- The uncharged live heap is mostly DataFusion aggregation state. It is
+  `allocated` − accounted + handoff overlap: the overlap is counted twice
+  inside "accounted", so it is added back, not subtracted. In nearly every
+  sample the overlap equals `fetch_reserved`, so in practice the figure is
+  `allocated` − `sql_reserved` − cache resident. Its per-sample maximum,
+  over every 5 s sample in each run's `samples.tsv`, is 4.46 GB (baseline),
+  3.15 GB (rerun), 3.43 and 1.91 GB (decay A) and 3.03 and 2.98 GB
+  (decay B). A gate must hold at the worst sample, not at the peak-gap one,
+  so the derivation in section 2 uses a per-sample maximum, taken after the
+  aggregate hold below.
 - `memory_overhead_reserve_bytes` is a fixed 2.1 GB at the 27 GB budget (it
   is `MEMORY_OVERHEAD_RESERVE_BYTES`, 2 GiB, in
   `crates/ravel-maintain/src/config.rs`).
@@ -66,6 +72,33 @@ The gap is therefore mostly memory nobody is using, which the allocator would
 return if asked. ADR-1170 cannot see it, because the budget counts
 reservations, and the allocator's decay cannot be relied on to return it
 before the kernel acts.
+
+### The aggregate hold, and what it leaves uncharged
+
+DataFusion 54.1 shrinks a `GroupedHashAggregateStream`'s reservation at emit
+while the emitted batch is still live, which left up to 1.2 GB per statement
+uncharged. PR #2685 (main `7b5c56134`) adds a hold: `TenantDelegatingPool`
+keeps a non-spillable `GroupedHashAggregateStream`'s shrunk bytes charged
+until the stream unregisters. On DataFusion `main` (55.1) the default
+aggregation path already keeps the reservation sized to the emitted batch
+(found while preparing apache/datafusion#26167), so the hold becomes
+removable when Ravel upgrades. The gate does not depend on it.
+
+The same scaled workload (8 GB budget, 20 files, 10 connections, 360 s), two
+runs at main `6b794db90` with the hold:
+
+| Run | Max uncharged heap per sample | Median uncharged heap | Typed 422 refusals | Peak retention (`resident` − `allocated`) | Peak VmRSS |
+|---|---|---|---|---|---|
+| hold R1 | 2.48 GB (a single-statement serial-pass sample; concurrency-phase maximum 1.33 GB) | 0.60 GB | 53 | 6.63 GB | 9.58 GB |
+| hold R2 | 1.82 GB (concurrency phase) | 0.54 GB | 87 | 6.00 GB | 9.77 GB |
+
+Against two runs without the hold, the median uncharged heap falls from 0.82
+and 0.73 GB, qps rises from 7.63 to 8.03 (mean), and typed 422 refusals rise
+from 37 and 42. The per-sample maximum falls from 1.91 to 4.46 GB across the
+six earlier runs to 1.82 and 2.48 GB. Charging did not touch retention: peak
+`resident` − `allocated` is 6.0 to 6.6 GB, and peak VmRSS is still 1.58 and
+1.77 GB above the budget. Retention is now the remaining overshoot the gate
+exists for.
 
 ### What the allocator exposes through the safe API
 
@@ -154,8 +187,9 @@ them, and a check site loads only the flag; the reading and mark are for
 refusal messages and metrics. The group sits on its own cache line, apart
 from `reserved`, so a reservation's CAS and a gate check never contend; it is
 written at most once per interval. Admission refusals do not pass through
-`MemoryBudget`: the admission call reads the same flag and returns its own
-typed refusal.
+`MemoryBudget`: the admission call in `ravel-query` reads the same flag,
+returns its own typed refusal, and owns the count behind
+`ravel_memory_gate_refusals_total{site="admission"}`.
 
 The 100 ms default is set by the burst slope: at the measured 0.4 GB/s, one
 interval lets about 40 MB of growth go unseen, small against the slack in
@@ -165,7 +199,7 @@ microseconds on this host's arena count, so the sampler costs well under
 
 ### 2. A forced purge at the high-water mark, and the default mark
 
-The mark is `--memory-gate-high-water-percent` (default 75, accepted 1 to 100)
+The mark is `--memory-gate-high-water-percent` (default 70, accepted 1 to 100)
 of the resolved `memory_budget_bytes`, the whole budget including the cache
 caps. At or above it, the sampler forces a purge through the safe decay write
 from the Context: for each initialised arena, set `muzzy_decay_ms` to 0 when
@@ -194,8 +228,9 @@ peak the gate permits is bounded by:
 ```text
 peak VmRSS <= M + D + G + O
   D  growth before the sampler sees it: 0.4 GB/s x (0.1 s interval + 0.05 s purge) = 0.06 GB
-  G  live growth a closed gate does not stop: the uncharged heap, at most 2.07 GB measured
-     (per-sample maximum net of handoff overlap, over six runs; see Context)
+  G  live growth a closed gate does not stop: the uncharged heap, at most 2.48 GB measured
+     (per-sample maximum of allocated - accounted + overlap, two runs with the
+     aggregate hold; see Context)
   O  VmRSS outside jemalloc resident (stacks, binary, kernel-side buffers): taken at
      NON_BUDGET_BASELINE_BYTES, 256 MiB = 0.27 GB, until task 2 measures it
 ```
@@ -207,28 +242,35 @@ the part no ledger sees. The acceptance band is B + S with S = 512 MiB
 sampling and measurement error. For the 8 GB run:
 
 ```text
-M <= B + S - D - G - O = 8.00 + 0.54 - 0.06 - 2.07 - 0.27 = 6.14 GB = 0.7675 B
+M <= B + S - D - G - O = 8.00 + 0.54 - 0.06 - 2.48 - 0.27 = 5.73 GB = 0.716 B
 ```
 
-The default is the largest whole-five-percent fraction under 0.7675: 75 %,
-a mark of 6.0 GB, which leaves 0.14 GB for an O or G larger than estimated.
-80 % (6.4 GB) overshoots the band by 0.26 GB in the same bound.
+G = 2.48 GB is R1's worst sample, taken while one statement ran alone in the
+serial pass. With the concurrency-phase maximum, G = 1.82 GB (R2), the same
+bound gives 8.00 + 0.54 − 0.06 − 1.82 − 0.27 = 6.39 GB = 0.80 B. The default
+takes the conservative figure, because the serial pass is a state the
+process really reaches: the largest whole-five-percent fraction under 0.716
+is 70 %, a mark of 5.6 GB, which leaves 0.13 GB for an O or G larger than
+estimated. 75 % (6.0 GB) overshoots the band by 0.27 GB in the same bound.
+The derivation assumes the hold is in the binary: with the baseline's
+4.46 GB maximum from before it, the same bound gives 3.75 GB.
 
 The mark costs little concurrency on the measured workload. Taking O at
-0.27 GB, the peak allocated figure (VmRSS − O − retention) of the current code
-is at most about 4.7 GB (rerun), against 6.2 GB on the pre-fix baseline. That
-assumes the peaks of the three figures coincide, which the run summaries do
-not say. A purge brings resident down to about the allocated figure, so on
-the current code the gate is expected to purge in every run and to refuse in
-none; on the baseline it would have refused. At the 27 GB budget the mark is
-20.25 GB, and the same bound gives a peak of about 22.5 GB on a 30 GB host.
+0.27 GB, the peak allocated figure (VmRSS − O − retention) is at most about
+2.7 and 3.5 GB in the two hold runs, 4.7 GB on the rerun before the hold, and
+6.2 GB on the pre-fix baseline. That assumes the peaks of the three figures
+coincide, which the run summaries do not say. A purge brings resident down to
+about the allocated figure, so on the current code the gate is expected to
+purge in every run and to refuse in none; on the baseline it would have
+refused. At the 27 GB budget the mark is 18.9 GB, and the same bound gives a
+peak of about 21.7 GB on a 30 GB host.
 
 The percentage applies to the budget, not the host, because the budget is the
 figure the operator chose and the acceptance test is stated against. A
 startup check refuses a configuration where the cache hard caps plus, in
 `all` mode, the ingest buffer ceiling reach the mark: those sit inside
 `resident`, and with them full the gate would never open. At the defaults the
-caps are 30 % of the budget (45 % on a loopback store), well under 75 %.
+caps are 30 % of the budget (45 % on a loopback store), well under 70 %.
 
 The gate is off, and the stamp says why, when there is no budget to take a
 fraction of (`--mode gateway`, or a budget that resolved from the fallback),
@@ -236,7 +278,8 @@ when `--disable-memory-gate` is passed, and on a build without jemalloc.
 
 ### 3. Where the check sits, and what it costs
 
-Three sites, all reading the same atomic:
+Three sites, all reading the open-or-closed flag of the same padded group of
+atomics:
 
 1. **Admission.** Every query admission that today calls
    `QueryAdmissionController::try_admit` (`QueryControls::admit` in
@@ -287,7 +330,8 @@ microbenchmark of `try_reserve` with the gate open, which must stay within
   draw it beside the reading.
 - `ravel_memory_gate_purges_total`, counter: forced purges.
 - `ravel_memory_gate_refusals_total{site="admission"|"reserve"|"grow"}`,
-  counter: refusals caused by the gate.
+  counter: refusals caused by the gate. The `admission` count lives in
+  `ravel-query`'s admission call (section 1); the server reads it for export.
 - `ravel_memory_budget_refusals_total{site="reserve"|"grow"}`, counter: the
   existing accounted refusals, which no metric counts today. The two families
   are separate so a reader can tell "the ledger is full" from "the process is
@@ -302,7 +346,7 @@ microbenchmark of `try_reserve` with the gate open, which must stay within
 
 Every family is unlabelled except `site`, a closed three-value set.
 
-### 5. The fetch-memory 503 is folded in
+### 5. The fetch-memory and catalog decode 503s are folded in
 
 ADR-1170 answers a fetch the budget cannot admit with 503 and the message
 "upstream storage temporarily unavailable" (`MSG_UNAVAILABLE`), on the SQL
@@ -385,7 +429,7 @@ The amendment text task 5 appends, with its markers:
 <!-- amendment-supersedes: phrase="still answers 503" pointer="resident-gate amendment" -->
 
 ADR-2633 adds a gate that reads jemalloc's `stats.resident`, forces a purge
-at a high-water mark (75 % of the budget by default), and refuses admission
+at a high-water mark (70 % of the budget by default), and refuses admission
 and reservation growth with the budget's 422 while the mark is still
 exceeded. Constraint 4 and the rejected "RSS as the ceiling" alternative stand
 for the ceiling itself; the acceptance test becomes peak VmRSS at or below the
@@ -400,17 +444,21 @@ gate is closed. Every `FetchMemoryExhausted` and every
 the host allows would have kept every measured run inside its host, but it
 costs concurrency at all times to cover a burst that happens some of the
 time, and the factor that is enough depends on the workload: retention at
-peak ranged from 2.54 to 6.54 GB on one workload at one budget. The gate pays
+peak ranged from 2.54 to 6.63 GB on one workload at one budget. The gate pays
 only while resident is actually high, and a purge recovers most of it.
 
 **The shorter decay alone.** The 1 s dirty decay cuts median retention to
 about 1.3 GB, but bursts of 4 to 5 GB remain, and the peak is what kills the
 process. Its 10.9 % qps cost cannot be told from noise in the runs so far.
 
-**Exact DataFusion charging.** Charging DataFusion's aggregation state and
-removing the handoff double count addresses the uncharged live heap, at
-most 2.07 GB per sample. The retention, 2.5 to 6.5 GB at peak, is freed memory no charging can
-see. It is worth doing for G in section 2, and it is not this decision.
+**Exact DataFusion charging.** Charging DataFusion's aggregation state
+addresses the uncharged live heap, not retention. The aggregate emit part is
+done in Ravel as an interim hold (PR #2685, see Context), and the upstream
+issues are filed: apache/datafusion#26165, #26166, and a comment on #23393.
+With the hold the per-sample maximum fell from up to 4.46 GB to 2.48 GB,
+which is the G section 2 now uses. Charging did not remove retention: peak
+`resident` − `allocated` stayed at 6.0 to 6.6 GB with the hold on, freed
+memory no charging can see. That is why the gate remains.
 
 **A cgroup memory limit.** `memory.max` makes the kernel enforce the bound by
 reclaiming and then killing. That is the outcome this decision exists to
@@ -435,7 +483,8 @@ current code is expected to purge and not refuse (section 2); a workload whose
 live heap really reaches the mark gets refusals instead of an OOM kill, which
 is the point.
 
-The fetch path's memory refusals move from 503 to 422. A client that retried
+The fetch path's memory refusals and the catalog decode refusal
+(`CatalogError::MemoryExhausted`) move from 503 to 422. A client that retried
 on 503 for these stops retrying; the message says the memory budget is
 exhausted rather than that storage is unavailable. This is a client-visible
 status change and goes in the changelog.
@@ -465,8 +514,8 @@ connections, 32 GB host, gate at its defaults, three runs.
   below 50 ms; sampler CPU below 0.1 % of one core; O (peak VmRSS minus peak
   `resident`) at or below 0.27 GB.
 - On a miss, check in this order: the run used the stated budget and the gate
-  stamp read enabled at 75 %; O and G as measured against the 0.27 and
-  2.07 GB used to derive the mark; only then the mark itself.
+  stamp read enabled at 70 %; O and G as measured against the 0.27 and
+  2.48 GB used to derive the mark; only then the mark itself.
 
 M1-shaped run: 30 GB host, 27 GB budget, the workload that was OOM-killed in
 3 of 3 attempts.
@@ -494,12 +543,14 @@ refusal counts fall with it.
 **Task 1: the gate state and the refusal cause in `MemoryBudget`** (crates:
 ravel-memory)
 
-- A padded gate atomic (open or closed, last reading, mark) on
-  `MemoryBudget`, written through one setter and read with relaxed loads.
+- The padded group of gate atomics (an open-or-closed flag, the last reading
+  and the mark) on `MemoryBudget`, written through one setter and read with
+  relaxed loads.
 - `try_reserve(n)` for n > 0 refuses while closed; `MemoryExhausted` gains a
   cause (accounted, or resident with the reading and the mark), and its
-  `Display` names it. Accounted and gate refusal counts as atomics on the
-  budget, read by the server's metrics.
+  `Display` names it. Accounted and gate refusal counts for the `reserve`
+  site as atomics on the budget, read by the server's metrics. The
+  `admission` count is not here: task 3 puts it in `ravel-query`.
 - Acceptance: a closed gate refuses `try_reserve(1)` with the resident cause
   and admits `try_reserve(0)`; an open gate behaves exactly as today across
   the existing tests; the counts move by one per refusal of each kind;
@@ -532,13 +583,18 @@ ravel-server)
   `ResourcesExhausted` message.
 - One async admission call in ravel-query that checks the gate, waits up to
   the wait and the deadline, then takes the concurrency permit; used by
-  `QueryControls::admit` and the Flight SQL service.
+  `QueryControls::admit` and the Flight SQL service. It owns the
+  `site="admission"` count of `ravel_memory_gate_refusals_total`.
 - Acceptance: with the gate held closed by a test setter, a SQL statement is
   refused at admission with 422 after the configured wait and not before; a
-  statement whose gate opens during the wait runs; a spill-capable query that
-  meets a closed gate mid-run spills and returns the exact result; an
-  infallible `grow` while closed fails the query with 422 and releases its
-  reservations; each site's refusal counter moves by one.
+  statement whose gate opens during the wait runs; over Flight SQL, a request
+  reaching each of the three former `try_admit` call sites in
+  `crates/ravel-sql/src/flight/service.rs` is refused with the SQL pool's
+  refusal status after the wait, and runs once the gate opens; a
+  spill-capable query that meets a closed gate mid-run spills and returns
+  the exact result; an infallible `grow` while closed fails the query with
+  422 and releases its reservations; each site's refusal counter moves by
+  one.
 
 **Task 4: the fetch and catalog-decode refusals answer 422** (crates:
 ravel-sql, ravel-query, ravel-catalog, ravel-server)
