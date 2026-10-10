@@ -28,6 +28,7 @@ t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapsho
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.kidx          per-part key-index leaf (immutable; ADR-2707, proposed)
 t/<tenant_hash>/pq/grants                                               Parquet table location grants record (CAS whole-record replace, format_version 1; ADR-2040 D1)
 t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm                        Parquet table manifest version (CreateIfAbsent, immutable, newest version is the table; ADR-2040 D1)
 sys/qualification                                                       store qualification record (once per suite version, re-recorded on a version bump; ADR-1302)
@@ -671,8 +672,11 @@ and the CAS read/write helpers.
   content-addressed key and swaps HEAD, leaving the old object in place (the
   "orphan part" crash case); without this rule each such fold leaks one object. The rule LISTs the two
   prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
-  `parts[].key`, the optional `postings.key`, and each part's optional
-  per-part column-statistics key `parts[].column_stats.key` (field 7) as
+  `parts[].key`, the optional `postings.key`, each part's optional
+  per-part column-statistics key `parts[].column_stats.key` (field 7), and
+  each part's key-index leaf keys `parts[].key_index[].key` (field 8,
+  ADR-2707, proposed: the reference-set change lands in the same change as
+  the first leaf writer, since a leaf HEAD does not name is swept) as
   referenced, and deletes any
   object under the two prefixes that HEAD does not name once its
   `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
@@ -814,6 +818,126 @@ this change is now unreferenced and swept once it crosses the protection
 horizon, exactly like any other orphaned catalog object. A v3 per-part
 object HEAD's current parts list still names is unaffected and is never
 swept as unreferenced while its owning part is live.
+
+### Per-part key-index leaves (ADR-2707, proposed)
+
+This section describes objects no shipped fold writes yet; the implementing
+task lands the writer, the reader, the proto fields and the removal of this
+"proposed" marker together.
+
+`SnapshotPartRef` carries an additive field 8, `repeated
+SnapshotKeyIndexLeafRef key_index`: one reference per (field, key slice) of
+the exact-key index over exactly this part's segments. Each points at a
+`.kidx` object, the second tier of the exact-key index whose first tier is
+the KEY_IDX section inside every data object (docs/log-segment-format.md
+"KEY_IDX", docs/span-segment-format.md "KEY_IDX"). Field 8 is absent (proto3
+default) for a part with no leaves; absence means uncovered and is never an
+error, and `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field
+7 precedent: an older reader ignores the field and scans. The ref carries
+`key` (the object key), `blake3` (32, of the leaf's full bytes), `size`,
+`field`, `key_type`, `key8_lo` and `key8_hi` (the inclusive key slice this
+leaf covers), `prefix_len` (the bytes through the directory crc, so the
+first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
+(32, the one covered part).
+
+**Object layout (RKI1 envelope).**
+
+```
+.kidx:
+  magic       "RKI1"
+  u32 LE      header_len
+  header      KeyIndexLeafHeader protobuf (ravel.catalog.v1): format_version
+              (1), tenant_hash (16), signal, part_blake3 (32), field,
+              key_type, key8_lo, key8_hi, bucket_bits, entry_count,
+              covered_entry_count (the part's entry count), repeated
+              uncovered_entry_ordinals, body_len
+  u32 LE      header_crc32c       (over magic, header_len and header)
+  u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
+  u32 LE      dir_crc32c
+  body:       bucket frames tiling [0, body_len) exactly, each
+              u32 LE entry_count, u32 LE frame_crc32c (over the zstd bytes),
+              zstd entries[entry_count]:
+                key8 [8]
+                uvarint entry_ordinal      (part-local SnapshotEntry ordinal)
+                uvarint block_count        (>= 1)
+                uvarint block_delta[block_count]  (ascending block ordinals,
+                                                   delta-coded from -1)
+```
+
+Entries are sorted ascending by `(key8, entry_ordinal)` and unique. Buckets
+are selected by the same mix the section uses
+(`(u64::from_be_bytes(key8).wrapping_mul(0x9E3779B97F4A7C15)) >> (64 -
+bucket_bits)`), over the key slice. A block set is the block bitmap
+ADR-0849 section 1b requires, in the encoding that is small for the sets
+measured (p50 one object per key on the ClickBench corpus).
+
+**Binding and coverage.** A leaf binds the covered part's exact `blake3`,
+never its `watermark_hour` (ADR-0849 section 1): the reader rejects a leaf
+whose header `part_blake3` differs from the part's hash in the HEAD it
+resolved, whose `tenant_hash` differs from the requesting tenant's (a hard
+`FieldMismatch`, ADR-0050 section 2, never a degrade), or whose
+`format_version` it does not support, and treats the part as uncovered for
+that field. `uncovered_entry_ordinals` lists the entries the fold could not
+index for this field: a segment with no KEY_IDX section, a section whose
+header does not name the field (declared after the flush opened, or
+de-declared), a failed or refused GET, a corrupt section. The reader
+subtracts exactly those from coverage and scans them (ADR-0849 section 3).
+Coverage is read from the leaf header and never inferred from the tenant's
+current declaration.
+
+**Reader.** For a lookup on `field = value`, the resolve narrows HEAD's parts
+to the window as `load_snapshot` does; a lookup with no time bound covers
+every part. For each covered part with a ref for the field whose slice holds
+the lookup's `key8`: GET 1 is `[0, prefix_len)` (header and directory,
+verified by their crcs), GET 2 is the one bucket the mix selects (verified
+by its frame crc and decompressed length), a binary search yields the
+`(entry_ordinal, block set)` matches. Exactly two ranged GETs per covering
+part, issued concurrently across parts, under a per-query ceiling of 2,048
+leaf GETs; parts beyond the ceiling are scanned, not probed. Candidates are
+the matches over covered entries plus every uncovered segment: the entries a
+leaf lists as uncovered, every part without a leaf for the field, every leaf
+that failed validation, every segment above the watermark (the unsealed
+tail, listed) and every token-resolved segment. Spans lookups also drop
+every entry and tail object outside the shard `shard_for_span` selects for
+that hour's generation (ADR-0052). These probes are their own cost phase
+(`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
+
+**Fold.** The fold writes leaves for exactly the parts it re-encodes this
+fold (a part carried forward by reference keeps its refs, as for field 7),
+for every field the tenant's key-index set names at fold time plus every
+field any entry's section header names, from the tier-1 sections and never
+from rows: per entry, a suffix GET for the footer and a ranged GET of the
+KEY_IDX section (about 1-2% of the object on the ADR-2707 Stage 0
+corpora), merged across the part's entries, sorted, bucketed and written
+before the part PUT, so a refusal writes no object. The object is
+content-addressed by its own bytes (`hash16` is the blake3 of the leaf),
+not by the part's hash, for the reason the column-statistics section gives:
+two folds whose per-entry degrade differed would otherwise collide under
+`AlreadyExists`. `bucket_bits` is chosen so that the directory and the mean
+bucket are about equal in bytes, clamped to 12..=16. The body ceiling is
+`DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB); a (part, field) whose body
+would exceed it is split by key range into several leaves under the
+ceiling, each with its own ref and slice, so a lookup opens exactly one leaf
+per (part, field). A per-entry failure lands the entry in
+`uncovered_entry_ordinals` and never aborts the leaf; the fold report counts
+section reads, bytes, leaves written and uncovered entries per fold.
+
+When a compaction or erasure rewrite record lands, the fold re-encodes the
+part and rebuilds its leaves from the new entry set. An erasure rewrite
+therefore removes the subject's `key8` from the next leaf; the stale leaf is
+unreferenced and swept past the protection horizon. A leaf holds key values
+(an `I64` subject value verbatim, an 8-byte hash prefix of a string value, a
+trace id), so the catalog family is no longer free of subject values; the
+erasure completion rule for stale catalog objects is settled together with
+the column-statistics case, and the pending-erasure predicate keeps
+filtering rows after the index until the rewrite lands.
+
+**Rollout.** A fold process that predates field 8 re-encodes HEAD without
+it for every part it carries forward, after which the sweeper reaps live
+leaves; such a folder must not run against a tenant once leaves exist. The
+mixed-version combinations (old sweeper against a new HEAD, new sweeper
+against a folder that strips the field) are tested, not assumed
+(ADR-0849 section 1a).
 
 ### Idempotency marker body layout
 

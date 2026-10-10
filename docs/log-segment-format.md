@@ -107,6 +107,7 @@ encodings.
 | STREAM_DIR   stream directory                     |  kind 1
 | FIELD_DIR    field directory                      |  kind 2
 | BLOCKS       row blocks (column pages)            |  kind 3
+| KEY_IDX      per-field exact (key8, block) index  |  kind 9 (optional, ADR-2707 proposed)
 | SKIP_IDX     multi-level min/max index            |  kind 4
 | PAGE_DIR     per row group, per column chunk,     |  kind 8
 |              per page: offset/len/enc/comp/crc    |
@@ -124,8 +125,10 @@ encodings.
 ```
 
 Writers emit the sections physically in the order shown above (PAGE_DIR
-between SKIP_IDX and BLOOM, not in kind order); readers rely only on the
-footer's section offsets, never on adjacency or on kind order. Bytes between
+between SKIP_IDX and BLOOM, not in kind order; KEY_IDX, when present,
+between BLOCKS and SKIP_IDX, so the tail probe keeps covering the footer,
+SKIP_IDX, PAGE_DIR and BLOOM); readers rely only on the footer's section
+offsets, never on adjacency or on kind order. Bytes between
 sections are permitted and MUST be `0x00`; readers never interpret them.
 
 `footer_crc32c` is computed over: the `LogFooter` bytes, then `footer_len`
@@ -208,7 +211,10 @@ Validation (all violations `Corrupted`, never panics):
   (kind 8, ADR-0699) is mandatory.
   POSTINGS (kind 6, ADR-0049) is optional: present only when the writer was
   given one or more indexed field names (`RlogWriter::with_indexed_fields`);
-  absence is legal and never treated as corruption.
+  absence is legal and never treated as corruption. KEY_IDX (kind 9,
+  ADR-2707, proposed) is optional the same way: present only when the
+  writer was given a non-empty key-index set; absence is legal and never
+  treated as corruption, and a reader that does not know the kind skips it.
 - Every section `[offset, offset+len)` lies within
   `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
 - `uncompressed_len` is capped by config (default 1 GiB per section) and
@@ -230,12 +236,13 @@ Validation (all violations `Corrupted`, never panics):
 | 6 | POSTINGS | per-field term -> block-index postings (optional) | none (per-block, zstd inside) |
 | 7 | GRAM_IDX | reserved (ADR-0105, not implemented) | - |
 | 8 | PAGE_DIR | per row group, per column chunk, per page: offset, length, enc/comp, crc32c | zstd |
+| 9 | KEY_IDX | per indexed field, every distinct (key8, block ordinal) pair, bucketed (optional; ADR-2707, proposed) | none (per-bucket, zstd inside) |
 
 STREAM_DIR, FIELD_DIR, and SKIP_IDX are compressed as whole sections
-(zstd level 3 default) and always read whole. BLOCKS, BLOOM, and
-POSTINGS are containers: not compressed as a unit, their entries
-individually addressable so one block, one bloom entry, or one term
-block is readable alone.
+(zstd level 3 default) and always read whole. BLOCKS, BLOOM, POSTINGS and
+KEY_IDX are containers: not compressed as a unit, their entries
+individually addressable so one block, one bloom entry, one term block, or
+one key bucket is readable alone.
 
 ## STREAM_DIR (uncompressed form)
 
@@ -1286,6 +1293,138 @@ existing-section grammar changes the carve-out does not cover, so it took the
 trailer bump to 4 (ADR-0699 decision 3), which is also what lets the version
 byte, rather than a section's presence, be what selects the layout.
 
+KEY_IDX (kind 9, ADR-2707, proposed) is added under the carve-out, as
+POSTINGS was: an optional kind an old reader skips and whose absence is
+legal, so the trailer stays at 5 and the section carries its own `version`
+byte. RSPAN adopts the same section as a mandatory kind, which is a legality
+change, so there it takes a trailer bump (docs/span-segment-format.md).
+
+## KEY_IDX
+
+Optional, kind 9 (ADR-2707, proposed: no shipped writer emits this section
+yet; the implementing task lands the writer, the reader and this text's
+"proposed" marker together). Exact block-level pruning for an equality on a
+high-cardinality key: a logs `trace_id`, a `request_id`, a typed `I64`
+attribute column such as a user id. POSTINGS cannot serve these (its
+per-field distinct-value cap drops such a field outright, ADR-0049 decision
+4); KEY_IDX is a different structure for a different cardinality, holding
+every distinct `(key8, block ordinal)` pair in the object per indexed field,
+sorted, in buckets a probe reads one at a time by range. One definition
+serves RLOG and RSPAN: the grammar below is implemented once in
+`ravel-codec`'s `key_index` module, as BLOOM is in `bloom_section`, and
+RSPAN uses it with its own fixed parameters (docs/span-segment-format.md,
+"KEY_IDX").
+
+Which fields are indexed is tenant configuration: a typed attribute column
+declared with `key_index` set (`TypedAttrColumn.key_index`, proto/ravel/sys.proto,
+additive under ADR-0066's R1 rule, readers first), of type `I64`, `STR` or
+`BYTES`, plus the fixed `trace_id` column when
+`TypedAttrColumnConfig.index_trace_id` is set. `BOOL` is never indexed. The
+writer receives that set (`RlogWriter::with_key_index_fields`) and **writes
+it into the section header; a reader never infers it from live config.** A
+field the header does not name is uncovered in this object for that field,
+whatever the tenant's current declaration says (ADR-0849 section 3).
+
+### Entries and keys
+
+One entry per distinct `(key8, block)` pair, where `block` is the SKIP_IDX
+level-0 block ordinal (8,192 rows by default). A row whose field is NULL,
+absent, or stored under a type other than the declared one contributes no
+entry; the indexed value is the one the `logs` SQL column reads for the row
+(the merged attribute view, ADR-0049 amendment), so a key held only at
+resource or scope level indexes every block of that stream.
+
+`key8` is 8 bytes derived by key type:
+
+| key_type | value | key8 |
+|---|---|---|
+| 1 `Id16` | a 16-byte id (`trace_id`) | the first 8 bytes |
+| 2 `I64` | an i64 `v` | the big-endian bytes of `(v as u64) ^ (1 << 63)`, the sign-flipped pattern `NumRange` orders by |
+| 3 `Str` | UTF-8 bytes | the first 8 bytes of the unkeyed blake3 of the bytes |
+| 4 `Bytes` | raw bytes | the first 8 bytes of the unkeyed blake3 of the bytes |
+
+A prefix or hash collision is a false positive: the probe names a block that
+holds a different key, and the exact row check removes it. There are no
+false negatives.
+
+### Buckets and the mix
+
+A field's entries are split into `2^bucket_bits` buckets by
+
+```
+bucket = (u64::from_be_bytes(key8).wrapping_mul(0x9E3779B97F4A7C15)) >> (64 - bucket_bits)
+```
+
+a fixed multiplicative mix. The top bits of the key itself are not uniform
+for an auto-increment or timestamp-shaped `I64` key and would put an
+object's keys in one bucket; the mix makes bucket size a function of entry
+count alone. Within a bucket entries are sorted ascending by `(key8, block)`
+and unique, so a probe is a binary search. The writer uses `bucket_bits = 8`;
+the reader accepts 1 to 16 and refuses anything else as `Corrupted`.
+
+### Layout
+
+```
+key_idx (stored uncompressed; bucket payloads zstd):
+  u8       version            (= 1: this section's own grammar version)
+  u8       bucket_bits        (writer 8; reader accepts 1..=16)
+  u16 LE   reserved           (= 0; non-zero is Corrupted)
+  uvarint  field_count        (1..=64; ascending by name bytes, unique)
+  fields[field_count]:
+    uvarint  name_len
+    name     name_len UTF-8 bytes   ("trace_id" for the fixed column)
+    u8       key_type           (1 Id16, 2 I64, 3 Str, 4 Bytes)
+    uvarint  entry_count        (over every bucket of the field)
+    uvarint  dir_offset         (relative to the section start)
+    uvarint  buckets_offset     (relative to the section start)
+    uvarint  buckets_len
+  u32 LE   header_crc32c       (over every header byte before it)
+
+  per field, at dir_offset:
+    u32 LE   ends[2^bucket_bits]   (cumulative end of bucket i, relative to
+                                    buckets_offset; bucket i is
+                                    [ends[i-1], ends[i]) with ends[-1] = 0,
+                                    non-decreasing, ends[last] = buckets_len)
+    u32 LE   dir_crc32c            (over the ends array)
+
+  per field, at buckets_offset, frames tiling [0, buckets_len) exactly:
+    u32 LE   entry_count
+    u32 LE   frame_crc32c          (over the zstd bytes that follow)
+    zstd     entries[entry_count]: key8 [8], block u32 LE
+                                   (decompresses to exactly entry_count x 12)
+```
+
+An empty bucket is the 8-byte frame header with no payload. Per-field
+directories and bucket areas may be laid out in any order inside the
+section; readers use the header's offsets only.
+
+### Reading
+
+A probe reads the header (and verifies `header_crc32c`) to find the field,
+the field's directory (verifying `dir_crc32c`) to find the bucket, and that
+one bucket (verifying `frame_crc32c`, then the decompressed length). Each
+read is a range inside the section. The section sits between BLOCKS and
+SKIP_IDX, so the 256 KiB tail probe (ADR-0699 decision 5) does not carry it:
+a key probe on an opened object costs one ranged GET for the header and
+directory (about 1 KB at 8 bits, plus the header) and one for the bucket.
+At the measured sizes (p50 49,899 entries per 25 MB ClickBench object, about
+2% of object bytes) a bucket holds about 200 entries, a few KB (derived from
+the Stage 0 figures on ADR-2707).
+
+A present key names its blocks, which the reader intersects with every other
+block-level proof (SKIP_IDX, BLOOM, POSTINGS) under the conjunctive rule
+"Pruning soundness" states; an absent key proves the field's value absent
+from every block and drops the object. The catalog fold reads this section
+by ranged GET to build the per-part `.kidx` leaf
+(docs/catalog-and-mvcc.md, "Per-part key-index leaves"), never rows.
+
+A probe declines (no prune, as for an unindexed field) when the section is
+absent or its header does not name the field. A section whose `version`
+byte is above the one the reader knows, or any violation of the grammar
+above, is a typed `Corrupted` error that disables the probe for the object;
+the object is then read as if it had no KEY_IDX. The result never changes,
+only the cost.
+
 ## Compaction (L0 → L1)
 
 Compaction (ADR-0032) rewrites many small L0 `.rlog` flush
@@ -1437,6 +1576,9 @@ framing, which is checked structurally (see below):
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
 | POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
 | one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
+| KEY_IDX header (`version`, `bucket_bits`, every field's name, type, counts and offsets) | `header_crc32c` | KEY_IDX, right after the header | before any offset in it is followed (ADR-2707, proposed) |
+| one KEY_IDX field's directory (`ends[]`) | `dir_crc32c` | KEY_IDX, right after the directory | before a bucket range is computed from it |
+| one KEY_IDX bucket's stored bytes | `frame_crc32c` | KEY_IDX bucket frame | before decompressing the bucket a probe lands on |
 
 The writer stores a `Section.crc32c` for BLOCKS and BLOOM as for every
 section, but `RlogReader::scan` does not verify either. BLOCKS is read by
@@ -1557,6 +1699,15 @@ All violations are `Corrupted`, never panics:
   trailing bytes left over once the declared term count is consumed; a
   declared term or posting count the block's remaining bytes cannot
   support.
+- key_idx (ADR-2707, proposed): header crc mismatch; `version` above the
+  one the reader knows; `bucket_bits` outside 1 to 16; non-zero reserved
+  bytes; `field_count` zero or over 64; field names not ascending or not
+  unique; an unknown `key_type`; a directory, bucket area or frame range
+  outside the section; `ends[]` decreasing or not ending at `buckets_len`;
+  frames that do not tile the bucket area exactly; directory or frame crc
+  mismatch; a decompressed length not equal to `entry_count x 12`; entries
+  not ascending or not unique; a key whose mix does not select the bucket
+  it sits in; a block ordinal at or past the object's block count.
 - page_dir: whole-section crc mismatch (checked before the section is decoded
   at all, so no offset in it is ever followed unverified); a group count over
   `MAX_BLOCKS`; a group with no blocks or no chunks; a group whose
