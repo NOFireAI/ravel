@@ -942,10 +942,11 @@ of the leaf), not by the part's hash, for the reason the
 column-statistics section gives:
 two folds whose per-entry degrade differed would otherwise collide under
 `AlreadyExists`. `bucket_bits` is chosen so that the directory and the mean
-bucket are about equal in bytes, clamped to 12..=13 at the writer (the
-balance `body = 4 x 2^(2b)` in decompressed bytes gives 12 at a 64 MiB body
-and 13 at the 256 MiB ceiling, so nothing higher is reachable under it, and
-below 64 MiB the floor of 12 holds with a fixed 16 KB directory); the
+bucket are about equal in bytes, with no floor (the balance
+`body = 4 x 2^(2b)` in decompressed bytes gives 9 at a 1.2 MB hour-sized
+part and 13 at the 256 MiB ceiling, the largest value reachable under it,
+so a probe costs about `4 x sqrt(body)` decompressed bytes per part) and a
+writer sanity bound of 1..=13; the
 reader accepts 1..=16 and rejects any other value before allocating the
 directory. The leaf's corruption conditions, each a typed `Corrupted` that
 makes the reader treat the part as uncovered for that field (never a panic,
