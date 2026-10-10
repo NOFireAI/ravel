@@ -129,7 +129,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -403,8 +403,11 @@ impl TopKLateMaterialization {
         for step in chain.iter().rev() {
             phase1 = match step {
                 PassThrough::Filter(filter) => Arc::new(
-                    FilterExec::try_new(remap_columns(filter.predicate(), &remap)?, phase1)?
-                        .with_batch_size(filter.batch_size())?,
+                    FilterExecBuilder::new(remap_columns(filter.predicate(), &remap)?, phase1)
+                        .with_default_selectivity(filter.default_selectivity())
+                        .with_batch_size(filter.batch_size())
+                        .with_fetch(filter.fetch())
+                        .build()?,
                 ),
                 PassThrough::Opaque(plan) => Arc::clone(plan).with_new_children(vec![phase1])?,
             };
