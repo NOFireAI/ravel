@@ -179,7 +179,7 @@ runs the stock corpus under `cost-based`, stated explicitly once decision
 
 ### 3. The memory read cache serves a stable subset under a repeated scan
 
-The in-memory fetch cache (`--cache-max-bytes`, S3-FIFO) must, for a
+Deferred: see the decision 3 deferral amendment below. The in-memory fetch cache (`--cache-max-bytes`, S3-FIFO) must, for a
 repeated identical scan of N entries over a cache that holds C < N of them,
 serve a stable fraction on every pass after the first. The property is
 pinned by a test in `crates/ravel-cache`: a loop of N keys over a cache of C
@@ -504,3 +504,47 @@ HEAD after the fold, or a HEAD or part that cannot be fetched or decoded). A
 rewrite with no output parts, and a retention tombstone, leave no level-1
 entry for their inputs, so a load whose commits one of them removed fails
 closed. Every other part of decision 1 stands.
+
+## Amendment (2026-10-09): decision 3 is deferred
+
+<!-- amendment-applies: sections="3. The memory read cache serves a stable subset under a repeated scan" pointer="decision 3 deferral amendment" -->
+
+Decision 3 is deferred, by the owner's decision after three blocked review
+rounds on task T3 (#2681). Nothing from those rounds lands, including the
+pinned byte figures in `crates/ravel-sql/tests/logs_selective_scan_amplification.rs`,
+which were measured under the parked policy.
+
+Why. Three single-policy variants of the S3-FIFO cache were built and
+simulated line for line (the evidence is on #2681):
+- sizing the ghost list from resident capacity alone served a first loop
+  but nothing to any later loop once the main queue was full;
+- adding overdue exits for entries whose reuse distance exceeds the
+  cache's capacity made later loops converge, and broke decision 6 of
+  ADR-0046: a hot working set touched once per long interval during a cold
+  scan is classified the same way as a loop entry, and at the server's
+  geometry (an 11.5 GB cache, a 33 MB hot set of 16 KiB ranges, 25 MB cold
+  objects) its hit rate fell from 1.0 on main to about 0.07;
+- keying the classification on the shorter of the last two gaps restored
+  the resident case and still lost a hot set established while a scan was
+  running.
+
+A loop larger than the cache and a rarely-touched hot entry during a long
+scan present the same reuse distance, so any rule keyed on reuse distance
+alone cannot serve one without starving the other. The overdue bookkeeping
+also sat outside the memory budget, up to 0.3 to 0.8 GB per tier at small
+range sizes, on hosts that measured 0.17 to 0.25 GB of available memory at
+their low point.
+
+What it costs. Nothing on the ranked reference box: its derived cache
+(11.58 GB) holds the whole stored corpus (10.21 GB). It leaves the repeated
+scan larger than the cache served at zero, as today, on the 16 GB and 8 GB
+hosts and on real S3 at the 25% share (a 7.47 GB cache).
+
+Candidate shapes for a later decision, none chosen: the disk tier keeps
+today's policy while the memory tier alone opts into a loop policy through
+a `CacheLimits` flag; the loop policy's bookkeeping charged inside
+`max_bytes` or capped by key count; a scan hint from the query engine
+(a statement that reads every object of a tenant marks its reads), which
+separates the two cases by what issued the read rather than by when it
+recurs. Any of them is gated on the loop tests and on both hot-set cases at
+server geometry with mixed sizes.
