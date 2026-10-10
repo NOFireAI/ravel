@@ -4624,9 +4624,10 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
   running sum exceeds 2^53, so it depends on the single-partition fold order);
   any `sum`, `min`, `max` over a `Float16`/`Float32`/`Float64` input; and any
   **float GROUP BY key** (including a bare `SELECT DISTINCT float_col`),
-  because `-0.0`/NaN payloads are bit-significant here and no
-  merge-order-stable representative bit pattern for a float group key is
-  proven.
+  because no merge-order-stable representative bit pattern for a float group
+  key is proven: DataFusion 55 folds `-0.0` into `0.0` when it groups, but NaN
+  payloads stay bit-significant here (ADR-0094, negative-zero group key
+  amendment).
 
 A `DISTINCT ON` is classified by its ON keys the same way: a non-float key
 is eligible. The optimizer turns it into a `first_value` aggregate ordered by
