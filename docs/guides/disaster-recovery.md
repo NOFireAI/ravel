@@ -836,16 +836,21 @@ load, or issuing a real kill:
 
 | Script | Scenario | Pinned oracle |
 |---|---|---|
-| `scripts/chaos/kill-ingest-flush.sh` | Drive load, `SIGKILL` the server mid-flush, restart. The kill fires the moment `ravel_ingest_flushes_by_size_total` rises past its pre-load baseline, which is flush-attempt time, so the kill lands inside the flush window. | Every write acknowledged under strict acknowledgement before the kill is durable and queryable after restart; no partial flush becomes visible; custody and catalog verification clean. |
-| `scripts/chaos/kill-maintain-worker.sh` | Two `maintain` mode workers under leased maintenance, `SIGKILL` one mid-compaction with the sibling running. The kill fires while the victim owns units and has not yet logged its compaction record as published. | The sibling takes over the dead worker's units within the liveness bound plus one maintenance tick; no unit stays orphaned; the interrupted compaction completes under the conservation gate; the dead worker's partial outputs age out with no leak past the horizon; custody and catalog verification clean. |
+| `scripts/chaos/kill-ingest-flush.sh` | Drive strict-acknowledged load, then send one more export in the background and `SIGKILL` the server mid-flush, restart. The kill fires the moment the sum of the `ravel_ingest_flushes_by_*_total` and `ravel_ingest_flushes_manual_total` families rises past its value read after the acknowledged exports, which is flush-attempt time whatever triggered the flush. A baseline that cannot be read exits 3. The run prints `KILL-TIMING: mid-flush=yes` or `mid-flush=no`, the latter when no flush was observed or the server answered the in-flight export before the kill. | Every write acknowledged under strict acknowledgement before the kill is durable and queryable after restart; no partial flush becomes visible; custody and catalog verification clean. |
+| `scripts/chaos/kill-maintain-worker.sh` | Two `maintain` mode workers under leased maintenance, `SIGKILL` one mid-compaction with the sibling running. The script first stops the ingest server and waits until every hour it wrote is sealed (the end of the hour plus the server's logged `seal_margin_secs`, plus 120 s), so there is something to compact. The kill fires while the victim owns units and its log shows unfinished compaction work, within one maintenance tick plus 120 s. | The sibling takes over the dead worker's units within the liveness bound plus one maintenance tick; no unit stays orphaned; the interrupted compaction completes under the conservation gate; the dead worker's partial outputs age out with no leak past the horizon; custody and catalog verification clean. |
 
 A failure of the second scenario is release-blocking. The exit codes are:
 
 - The second script names the failed assertions and exits 2 on any oracle
-  failure. Its oracle path exits only 0 or 2.
+  failure.
+- The second script exits 3 when the conservation oracle could not measure:
+  the survivor published nothing after the kill and the victim's log shows no
+  interrupted unit, because it published nothing before the kill or had
+  finished its last pass. Its summary names the reason in a
+  `RESULT: COULD NOT MEASURE` line. An oracle failure elsewhere still exits 2.
 - The first script exits 1 on an oracle failure.
-- For both scripts, 3 or more is a setup or usage error with no oracle
-  verdict.
+- For both scripts, 3 is otherwise, and anything above 3 always, a setup or
+  usage error with no oracle verdict.
 
 Both scenarios run nightly in the `chaos` job of
 `.github/workflows/k8s-nightly.yml`, against a RustFS that the scripts start

@@ -187,7 +187,13 @@ log "recorded ${#ACKED_TOKENS[@]} strict-ack commit token(s) before kill"
 # in-flight one, so the rise is that export's flush, whatever triggered it.
 chaos_gen_fixture "$CHAOS_FIXTURE_SERIES" "$CHAOS_FIXTURE_POINTS" > "$INFLIGHT_FIXTURE_PATH"
 FLUSH_BASELINE="$(flush_attempts "$BASE_URL")" || FLUSH_BASELINE=""
-[[ "$FLUSH_BASELINE" =~ ^[0-9]+$ ]] || FLUSH_BASELINE=0
+# A baseline that could not be read is not zero: after the acked exports the
+# count is already past zero, so a zero baseline would fire the kill on the
+# first poll, before the in-flight export reached the server.
+if [[ ! "$FLUSH_BASELINE" =~ ^[0-9]+$ ]]; then
+  log "could not read the flush-attempt baseline from /metrics; the mid-flush trigger needs it"
+  exit 3
+fi
 log "flush attempts before the in-flight export: ${FLUSH_BASELINE}"
 chaos_start_background_export "$HTTP_ADDR" "$INFLIGHT_FIXTURE_PATH" "$INFLIGHT_TOKENS_PATH"
 INFLIGHT_PID="$CHAOS_BG_EXPORT_PID"
