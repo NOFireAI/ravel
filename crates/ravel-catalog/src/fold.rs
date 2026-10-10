@@ -874,11 +874,21 @@ fn bucket_needs_reconcile(listing: &[ObjectMeta]) -> bool {
 /// fold keeps re-listing them until the margin alone seals them. `None` when
 /// the margin already seals the watermark, which is every HEAD no seal-through
 /// hour raised.
-fn held_open_hours(head_watermark: u32, margin_hour: Option<u32>) -> Option<(u32, u32)> {
+///
+/// The range never reaches below `window` hours under the watermark, the
+/// reconcile window a fold already pays for. A watermark far above the margin
+/// (a seal asserted from a fast clock, or a margin larger than the clock)
+/// would otherwise make every fold list an unbounded range.
+fn held_open_hours(
+    head_watermark: u32,
+    margin_hour: Option<u32>,
+    window: u32,
+) -> Option<(u32, u32)> {
+    let floor = head_watermark.saturating_sub(window);
     match margin_hour {
         Some(margin) if margin >= head_watermark => None,
-        Some(margin) => Some((margin + 1, head_watermark)),
-        None => Some((0, head_watermark)),
+        Some(margin) => Some((margin.saturating_add(1).max(floor), head_watermark)),
+        None => Some((floor, head_watermark)),
     }
 }
 
@@ -1327,7 +1337,11 @@ impl Catalog {
             // recorded anywhere, and the seal-through hour of this one says
             // nothing about what the HEAD already holds.
             let held_open = match &head_state {
-                HeadState::Valid { head, .. } => held_open_hours(head.watermark_hour, margin_hour),
+                HeadState::Valid { head, .. } => held_open_hours(
+                    head.watermark_hour,
+                    margin_hour,
+                    self.config().fold_reconcile_window_hours,
+                ),
                 _ => None,
             };
             let advance_to = target_hour
@@ -9702,8 +9716,10 @@ mod tests {
             Catalog::new(Arc::new(MemoryStore::new()), config(REFERENCE_SHARDS)).expect("catalog");
         let minute = 60 * 1_000_000_000;
         let start = i64::from(H) * NS_PER_HOUR;
+        let window = catalog.config().fold_reconcile_window_hours;
         let held = |now: i64| {
-            held_open_hours(H, catalog.margin_watermark_hour(now)).map_or(0, |(lo, hi)| hi - lo + 1)
+            held_open_hours(H, catalog.margin_watermark_hour(now), window)
+                .map_or(0, |(lo, hi)| hi - lo + 1)
         };
         assert_eq!(held(start), 3);
         assert_eq!(held(start + 20 * minute - 1), 3);
@@ -9713,6 +9729,32 @@ mod tests {
         assert_eq!(held(now_at_seal(H) - 1), 1);
         assert_eq!(held(now_at_seal(H)), 0);
         assert_eq!(held(now_at_seal(H + 5)), 0);
+    }
+
+    /// A watermark far above the margin hour, or a margin the clock cannot
+    /// reach at all, holds open at most the reconcile window's hours below
+    /// the watermark, never the whole gap.
+    ///
+    /// FLIP: drop the `.max(floor)` (or return `(0, head_watermark)` for a
+    /// `None` margin) in `held_open_hours` and the range widths below become
+    /// 1,000 and 480,001.
+    #[test]
+    fn held_open_hours_never_reach_below_the_reconcile_window() {
+        const H: u32 = 480_000;
+        const WINDOW: u32 = 27;
+        let width = |range: Option<(u32, u32)>| range.map_or(0, |(lo, hi)| hi - lo + 1);
+        assert_eq!(
+            held_open_hours(H, Some(H - 1_000), WINDOW),
+            Some((H - WINDOW, H))
+        );
+        assert_eq!(
+            width(held_open_hours(H, Some(H - 1_000), WINDOW)),
+            WINDOW + 1
+        );
+        assert_eq!(held_open_hours(H, None, WINDOW), Some((H - WINDOW, H)));
+        // A margin inside the window keeps its own, narrower range.
+        assert_eq!(held_open_hours(H, Some(H - 3), WINDOW), Some((H - 2, H)));
+        assert_eq!(held_open_hours(H, Some(H), WINDOW), None);
     }
 
     #[tokio::test]

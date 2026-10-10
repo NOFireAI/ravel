@@ -952,19 +952,25 @@ commit token from the next fold on (the scheduled fold runs every
 `--fold-interval-secs`, 300 s by default), at the same watermark if the fold
 does not advance it. A fold that finds nothing new there is a no-op, as
 before, and so is one given an S at or below the watermark. Held-open hours
-number at most the watermark minus the margin hour. Right after an assertion
-whose S is the fold's own hour that is three in the first twenty minutes of
-the hour and two after that, falling to one and then none as the margin
-catches up. A fold therefore issues at most that many LISTs per shard beyond
-what a fold over the same HEAD without held-open hours issues (twelve on a
-four-shard tenant), plus a GET of each snapshot part covering those hours
-when their listing names a commit record HEAD does not hold. When a held-open
-hour was compacted before the seal (the compact-then-seal order), its listing
-still names the compacted level-0 records until garbage collection removes
-them, so each fold in the window also reads that bucket's compaction and
-level-0 records before concluding there is nothing new: correct, and more
-reads than the uncompacted case. A fold whose margin hour is at or
-above HEAD's watermark issues no extra request. The query resolve path is unchanged. Once the margin passes an hour it is sealed by
+number the watermark minus the margin hour, and never more than
+`fold_reconcile_window_hours` plus one: an hour further below the watermark
+than the reconcile window is not held open, so a watermark far above the
+margin (a seal asserted from a fast clock) costs no more than the window.
+Right after an assertion whose S is the fold's own hour that is three in the
+first twenty minutes of the hour and two after that, falling to one and then
+none as the margin catches up. A fold therefore issues at most that many
+LISTs per shard beyond what a fold over the same HEAD without held-open
+hours issues (twelve on a four-shard tenant). It also GETs each snapshot
+part covering those hours whenever their listing names any commit record at
+all, which is the common case in the window, not only when a late commit
+landed. When a held-open hour was compacted before the seal (the
+compact-then-seal order), its listing still names the compacted level-0
+records until garbage collection removes them, so each fold in the window
+also reads that bucket's compaction and level-0 records before concluding
+there is nothing new: correct, and more reads than the uncompacted case. A
+fold whose margin hour is at or above HEAD's watermark issues no extra
+request. The query resolve path is unchanged. Once the margin passes an hour
+it is sealed by
 the lemma like any other, and a commit published into it after that is not
 folded by a later fold, because the reconcile window re-lists hours below the
 watermark but skips a bucket holding only level-0 commit records, so it is
@@ -1087,8 +1093,9 @@ already-sealed hours:
   listing contains a compaction record, a tombstone, or a rewrite record is
   classified and diffed, plus, in an hour an operator-asserted seal holds open
   (see "Operator-asserted seal" above), a bucket whose listing names a commit
-  record the in-progress entry set does not hold. When nothing late has landed, the pass costs only
-  the window LISTs and every unchanged sealed part is still carried forward
+  record the in-progress entry set does not hold. When nothing late has
+  landed, the pass costs only the window LISTs and every unchanged sealed
+  part is still carried forward
   by reference.
 - **Diff and apply.** A triggered bucket is classified by the same
   commit/compaction/tombstone logic the incremental path applies
