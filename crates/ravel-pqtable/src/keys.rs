@@ -149,9 +149,10 @@ pub enum ListedManifestKey {
     /// digits. The Query grant spells the version as 20 single-character
     /// wildcards, but its `*` binds any run of segments before `/v/`, so it
     /// admits these keys; readers skip one the store lists as they skip a
-    /// version above [`MAX_MANIFEST_VERSION`]. The S3 adapter cannot list one
-    /// holding a control character, an empty segment or a `.` or `..`
-    /// segment: its listing fails instead.
+    /// version above [`MAX_MANIFEST_VERSION`]. One holding a control
+    /// character, an empty segment or a `.` or `..` segment is not
+    /// addressable: a listing skips and counts it rather than listing it
+    /// (ADR-2637; `docs/object-store-contract.md` names the exceptions).
     InvalidVersion {
         tenant_hash: TenantHash,
         table: String,
@@ -163,9 +164,10 @@ pub enum ListedManifestKey {
     /// or a path such as `a/b`. The Query grant's `*` binds any such segment,
     /// so it admits these keys, but no table owns them. The tenant-wide
     /// listings skip one the store lists, and `ravel-cli parquet repair
-    /// --stray` removes one whose key is its own [`store_path`]. The S3
-    /// adapter cannot list a key holding a control character, an empty
-    /// segment or a `.` or `..` segment: its listing fails instead. `rest`
+    /// --stray` removes one whose key is its own [`store_path`]. A key
+    /// holding a control character, an empty segment or a `.` or `..`
+    /// segment is not addressable: a listing skips and counts it, and
+    /// `repair --stray` names it and never deletes it (ADR-2637). `rest`
     /// is the key text after [`tenant_manifest_prefix`].
     InvalidTable {
         tenant_hash: TenantHash,
