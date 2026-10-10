@@ -1245,8 +1245,9 @@ async fn fragment_do_get_serves_internal_schema() {
 /// Prove-the-test: admit the slice in `slice_do_get`
 /// (crates/ravel-sql/src/flight/service.rs) through the memory admission wait
 /// instead of `try_admit`. The slice then waits out its 1 s ticket and is
-/// refused `RESOURCE_EXHAUSTED`, so `expect("do_get slice")` fails, and
-/// `waits_total` reads 1.
+/// refused `RESOURCE_EXHAUSTED`, so `expect("do_get slice")` fails. The
+/// armed-gate assertion first proves the held budget sits above the
+/// threshold, so the zero-wait assertions cannot pass on a disabled gate.
 #[tokio::test]
 async fn slice_do_get_never_waits_for_memory_headroom() {
     let (store, snapshot) = two_shard_snapshot().await;
@@ -1262,6 +1263,10 @@ async fn slice_do_get_never_waits_for_memory_headroom() {
     );
     let service = wire_service_with_admission(Arc::clone(&backend), admission);
     let _held = budget.reserve(1 << 20).expect("the empty budget admits");
+    assert!(
+        budget.reserved() >= gate.threshold_bytes().expect("the gate is armed"),
+        "the held budget must sit at or above the admission threshold"
+    );
 
     let endpoints = endpoints_for(&snapshot);
     let ticket = endpoints[0].ticket.clone();
