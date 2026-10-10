@@ -174,8 +174,11 @@ POSTINGS carries one.
   grain; 4,096 is the right count one tier up (decision 4).
 - **Bucket frames.** Each bucket is `u32 entry_count`, `u32 crc32c` over the
   stored bytes, then zstd bytes that decompress to exactly `entry_count x 12`
-  bytes. An empty bucket is the 8-byte header with no payload. The section is
-  a container, uncompressed as a whole, so one bucket is readable alone.
+  bytes. An empty bucket occupies zero bytes: its directory end equals the
+  previous bucket's end and a zero-length range carries no frame, so a
+  declared field with no matching rows has `buckets_len = 0` and an
+  all-zero directory. The section is a container, uncompressed as a whole,
+  so one bucket is readable alone.
 - **Header.** `version` (1), `bucket_bits`, a reserved u16, a fixed-width
   `prefix_len`, then per field its name, key type, entry count, directory
   offset and bucket area, all under a header crc32c. The writer lays every
@@ -269,8 +272,12 @@ SKIP_IDX, PAGE_DIR and BLOOM.
 
 The indexed set is declared on the tenant's typed attribute columns:
 `TypedAttrColumn` (proto/ravel/sys.proto) gains `bool key_index = 3`, and
-`TypedAttrColumnConfig` gains `bool index_trace_id = 2` for the fixed
-`trace_id` column, which is not a typed attribute column. Eligible types are
+`TenantConfigRecord` gains `bool index_trace_id = 15` for the fixed
+`trace_id` column, which is not a typed attribute column. It does not go on
+`TypedAttrColumnConfig`, whose presence already carries meaning (absent is
+the deployment default, present and empty is an override to no declared
+columns), so materialising that sub-message for a flag would drop a
+tenant's default typed columns. Eligible types are
 `I64`, `STR` and `BYTES`; `BOOL` is refused by the config write gate. The
 record is CAS-mutable, so the change follows ADR-0066's R1 amendment: the
 record's `format_version` bumps, the reader that accepts the new version
@@ -472,10 +479,12 @@ flowchart LR
 - **Candidates.** `candidates = leaf matches over covered entries + every
   uncovered segment`, where uncovered means: an entry the leaf lists as
   uncovered, a part with no leaf for the field, a leaf that failed
-  validation, every part the per-query ceiling left unprobed, every
-  segment above the watermark (the unsealed tail), and every
-  token-resolved segment (ADR-0849 section 3). No false negatives.
-- **Tier 1.** A candidate with no block set (an uncovered segment) is
+  validation, every segment above the watermark (the unsealed tail), and
+  every token-resolved segment (ADR-0849 section 3); plus, scan-only and
+  never tier-1 probed, every segment of a part the per-query ceiling left
+  unprobed, which goes straight to the scan path. No false negatives.
+- **Tier 1.** A candidate with no block set (an uncovered segment, other
+  than a ceiling remainder) is
   probed in the object: the footer, the KEY_IDX directory, one bucket. A
   present key names the blocks; an absent key drops the object without a
   block read. The probe is exactly two ranged GETs on either format, both
@@ -674,7 +683,7 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   no trailer version (the footer protos take additive fields without one,
   by the frozen-field rule), and converging with the object it sits in.
   `TypedAttrColumn.key_index` and
-  `TypedAttrColumnConfig.index_trace_id`: Class C under the R1 amendment,
+  `TenantConfigRecord.index_trace_id`: Class C under the R1 amendment,
   additive with a `format_version` bump, readers first.
 - **Version regime.** Pre-v1.0 single version (ADR-0027, dated to v1.0 by
   ADR-0531): RSPAN's reader accepts exactly 5 after this change; RLOG stays
@@ -746,7 +755,9 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
 7. **Per-object index sidecars.** Rejected by construction in ADR-0849
    section 2: a probe per object relocates the floor instead of removing
    it. Tier 1 is probed only for uncovered candidates, a set bounded by the
-   fold lag and by shard routing.
+   fold lag, by shard routing and by `P_max`: the parts a rangeless lookup's
+   ceiling leaves unprobed are scanned, never tier-1 probed, so the probe
+   count has no term that grows with the tenant's part count.
 8. **One leaf per (part, field, shard).** It would let a routed lookup read a
    4x smaller bucket at the Stage 0 geometry's 4 shards, at 4 refs per
    (part, field) in HEAD and 4 leaf objects per (part, field) per fold,
@@ -827,7 +838,7 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 1 part GET per covering part in the `resolve` phase (the entry list lives in the part object, and shard routing reads it), resolve bytes = the covering parts' object sizes, both reported beside the part count; then 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 4.5 MB over 1,024 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 1 part GET per covering part, a part GET outside `resolve`, resolve bytes over the parts' summed sizes, more than 2 leaf GETs per part, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 1 part GET per covering part in the `resolve` phase (the entry list lives in the part object, and shard routing reads it), resolve bytes = the covering parts' object sizes, both reported beside the part count; then 2 leaf GETs per covering part up to `P_max`, `keyIndex` phase only, and 0 index GETs of either tier for a part beyond `P_max` (its scan bytes reported); `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 4.5 MB over 1,024 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 1 part GET per covering part, a part GET outside `resolve`, resolve bytes over the parts' summed sizes, more than 2 leaf GETs per part, any index GET for a part beyond `P_max`, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` decompressed bytes per probed object = `prefix_len` (stored as is, about 1 KB per field at 8 bits) plus one bucket's `uncompressed_len` (2 to 8 KB at Stage 0 entry counts; the frame on the wire is zstd and at most that), expected 3 to 9 KB per object (one declared field) and 1.2 to 3.7 MB over the 410-object corpus, bounded at 16 KB per object with up to four declared fields (6.5 MB), with wire bytes reported beside | a whole-object GET, or `keyIndex` decompressed bytes over 32 KB per probed object |

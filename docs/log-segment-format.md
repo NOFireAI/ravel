@@ -1319,7 +1319,7 @@ Which fields are indexed is tenant configuration: a typed attribute column
 declared with `key_index` set (`TypedAttrColumn.key_index`, proto/ravel/sys.proto,
 additive under ADR-0066's R1 rule, readers first), of type `I64`, `STR` or
 `BYTES`, plus the fixed `trace_id` column when
-`TypedAttrColumnConfig.index_trace_id` is set. `BOOL` is never indexed. The
+`TenantConfigRecord.index_trace_id` is set. `BOOL` is never indexed. The
 writer receives that set (`RlogWriter::with_key_index_fields`) and **writes
 it into the section header; a reader never infers it from live config.** A
 declared field with no matching rows in the object is still named, with
@@ -1408,7 +1408,10 @@ key_idx (stored uncompressed; bucket payloads zstd):
                                    (decompresses to exactly entry_count x 12)
 ```
 
-An empty bucket is the 8-byte frame header with no payload. The writer
+An empty bucket occupies zero bytes: its `ends[i]` equals `ends[i-1]` and a
+zero-length range carries no frame (a reader never decodes a frame header
+from a zero-length range), which is what gives a declared field with no
+matching rows `buckets_len = 0` and an all-zero directory. The writer
 lays the section out as the header, then every field's directory in field
 order, each directly after the previous one's `dir_crc32c`, then every
 field's bucket area: `prefix_len` names the end of the last directory, and

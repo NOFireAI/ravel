@@ -859,7 +859,9 @@ slice of the pair) and `part_blake3` (32, the one covered part).
                                    header)
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
   u32 LE      dir_crc32c
-  body:       bucket frames tiling [0, body_len) exactly, each
+  body:       bucket frames tiling [0, body_len) exactly (an empty bucket
+              occupies zero bytes and carries no frame: its end equals
+              the previous end), each
               u32 LE entry_count, u32 LE uncompressed_len (checked against
               the body ceiling before the buffer is allocated; the
               decompressed length must equal it exactly),
@@ -931,12 +933,14 @@ is allocated, then the frame crc and the exact decompressed length are
 verified, and a binary search yields the `(entry_ordinal, block set)`
 matches. Exactly two ranged GETs per covering
 part, issued concurrently across parts, under a per-query ceiling of 2,048
-leaf GETs; parts beyond the ceiling are scanned, not probed. Candidates are
-the matches over covered entries plus every uncovered segment: the entries a
-leaf lists as uncovered, every part without a leaf for the field, every leaf
-that failed validation, every part the per-query ceiling left unprobed,
-every segment above the watermark (the unsealed tail, listed) and every
-token-resolved segment. Spans lookups also drop
+leaf GETs; parts beyond the ceiling are scanned, not probed, at either
+tier. Candidates are the matches over covered entries plus every uncovered
+segment: the entries a leaf lists as uncovered, every part without a leaf
+for the field, every leaf that failed validation, every segment above the
+watermark (the unsealed tail, listed) and every token-resolved segment, each
+of which the tier-1 probe may still prune; plus, scan-only and excluded
+from the tier-1 probe, every segment of a part the ceiling left unprobed.
+Spans lookups also drop
 every entry and tail object outside the shard `shard_for_span` selects for
 that hour's generation (ADR-0052). These probes are their own cost phase
 (`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
