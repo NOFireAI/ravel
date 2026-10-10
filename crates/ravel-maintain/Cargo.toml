@@ -16,6 +16,8 @@ ravel-rspan = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-ingest = { workspace = true }
+# The ADR-1702 read gate maintenance decodes and encodes run on.
+ravel-cpu-gate = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

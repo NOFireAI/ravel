@@ -37,6 +37,7 @@ use crate::bucket::Bucket;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get, note_metadata};
+use ravel_cpu_gate::ReadSite;
 
 /// Persistent section-kind numbers (docs/segment-format.md); not re-exported
 /// by `ravel_segment`, named here as the format contract, same as ravel-bench.
@@ -432,10 +433,9 @@ pub async fn load_catalog_from_object(
             }
         }
     };
-    let footer = &loc.footer;
-
     let sparse = catalog_is_sparse(&loc)?;
-    let entries = if sparse {
+    let footer = loc.footer;
+    let sections = if sparse {
         // Sparse decode needs the whole object. An L0 flush of 4096+ series is
         // ordinary (a busy shard reaches it in one flush), so this branch is a
         // routine input shape, not a rare one; the whole-object GET is the
@@ -443,12 +443,93 @@ pub async fn load_catalog_from_object(
         // case.
         let whole = store.get(&object_key, GetRange::Full).await;
         note_get(ledger, RequestPhase::CatalogRead, &whole);
-        decode_catalog_v5(footer, &whole?.data, limits)?
+        CatalogSections::Sparse(whole?.data)
     } else {
-        let dict = get_section(store, &object_key, footer, LABEL_DICT, ledger).await?;
-        let ids = get_section(store, &object_key, footer, SERIES_IDS, ledger).await?;
-        let meta = get_section(store, &object_key, footer, SERIES_META, ledger).await?;
-        decode_catalog_v4(footer, &dict, &ids, &meta, limits)?
+        CatalogSections::Dense {
+            dict: get_section(store, &object_key, &footer, LABEL_DICT, ledger).await?,
+            ids: get_section(store, &object_key, &footer, SERIES_IDS, ledger).await?,
+            meta: get_section(store, &object_key, &footer, SERIES_META, ledger).await?,
+        }
+    };
+    // An absent EXEMPLARS section is legal and the common case: this costs two
+    // extra ranged GETs (the LABEL_DICT the attributes intern into, and the
+    // section itself) only for an object that actually carries exemplars.
+    let exemplar_sections = if footer.sections.iter().any(|s| s.kind == EXEMPLARS) {
+        Some((
+            get_section(store, &object_key, &footer, LABEL_DICT, ledger).await?,
+            get_section(store, &object_key, &footer, EXEMPLARS, ledger).await?,
+        ))
+    } else {
+        None
+    };
+
+    // Every decode of this catalog runs as one job on the read gate (ADR-1702),
+    // sized by the bytes it decodes. The job owns the fetched sections.
+    let bytes = sections.len()
+        + exemplar_sections
+            .as_ref()
+            .map_or(0, |(dict, section)| dict.len() + section.len());
+    let key = object_key.clone();
+    let (series, exemplars) = config
+        .read_gate
+        .run(ReadSite::Compaction, bytes as u64, move || {
+            let series = decode_catalog_plans(
+                &footer,
+                sections,
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
+                limits,
+            )?;
+            let exemplars =
+                decode_input_exemplars(&key, &footer, limits, &series, exemplar_sections)?;
+            Ok::<_, MaintainError>((series, exemplars))
+        })
+        .await??;
+
+    Ok(InputCatalog {
+        object_key,
+        series,
+        exemplars,
+    })
+}
+
+/// The catalog sections of one input, as fetched for its decode.
+enum CatalogSections {
+    /// The whole object, for the sparse catalog.
+    Sparse(bytes::Bytes),
+    /// LABEL_DICT, SERIES_IDS and SERIES_META, for the whole-section catalog.
+    Dense {
+        dict: bytes::Bytes,
+        ids: bytes::Bytes,
+        meta: bytes::Bytes,
+    },
+}
+
+impl CatalogSections {
+    fn len(&self) -> usize {
+        match self {
+            CatalogSections::Sparse(whole) => whole.len(),
+            CatalogSections::Dense { dict, ids, meta } => dict.len() + ids.len() + meta.len(),
+        }
+    }
+}
+
+/// Decode one input's catalog and plan every run's absolute page ranges,
+/// stamping each [`RunPlan`] with the given provenance.
+fn decode_catalog_plans(
+    footer: &ravel_segment::Footer,
+    sections: CatalogSections,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesPlan>> {
+    let entries = match sections {
+        CatalogSections::Sparse(whole) => decode_catalog_v5(footer, &whole, limits)?,
+        CatalogSections::Dense { dict, ids, meta } => {
+            decode_catalog_v4(footer, &dict, &ids, &meta, limits)?
+        }
     };
 
     // Absolute page ranges for every (series, run), in the same nested order
@@ -493,15 +574,7 @@ pub async fn load_catalog_from_object(
             "plan_ranges_v4 produced more ranges than runs".into(),
         ));
     }
-
-    let exemplars =
-        load_input_exemplars(store, &object_key, footer, limits, &series, ledger).await?;
-
-    Ok(InputCatalog {
-        object_key,
-        series,
-        exemplars,
-    })
+    Ok(series)
 }
 
 /// Whether an object carries the sparse catalog (SERIES_IDX kind 8 +
@@ -540,10 +613,8 @@ fn catalog_is_sparse(loc: &FooterLocation) -> Result<bool> {
 /// records to the output writer and let it re-resolve the index against the
 /// output's own SERIES_IDS ordering (docs/segment-format.md "Compaction rule").
 ///
-/// An absent section is legal and yields no exemplars, which is the common
-/// case: this costs two extra ranged GETs (the LABEL_DICT the attributes intern
-/// into, and the section itself) only for an object that actually carries
-/// exemplars.
+/// `sections` is the object's LABEL_DICT and EXEMPLARS section bytes, or `None`
+/// when the footer lists no EXEMPLARS section, which yields no exemplars.
 ///
 /// `series` MUST be the object's catalog in SERIES_IDS order, which is what
 /// `decode_catalog_v4`/`decode_catalog_v5` return: that ordering is what makes
@@ -551,17 +622,16 @@ fn catalog_is_sparse(loc: &FooterLocation) -> Result<bool> {
 /// beyond `footer.series_count`, and a catalog whose length disagrees with
 /// `series_count` is a corrupt object rather than something to index into
 /// hopefully, so it fails loud here.
-async fn load_input_exemplars(
-    store: &dyn ObjectStoreBackend,
+fn decode_input_exemplars(
     object_key: &str,
     footer: &ravel_segment::Footer,
     limits: ReaderLimits,
     series: &[SeriesPlan],
-    ledger: Option<&RequestLedger>,
+    sections: Option<(bytes::Bytes, bytes::Bytes)>,
 ) -> Result<Vec<ExemplarInput>> {
-    if !footer.sections.iter().any(|s| s.kind == EXEMPLARS) {
+    let Some((dict, section)) = sections else {
         return Ok(Vec::new());
-    }
+    };
     if series.len() as u64 != footer.series_count {
         return Err(MaintainError::Invariant(format!(
             "input {object_key} decoded {} series but its footer claims {}; \
@@ -570,8 +640,6 @@ async fn load_input_exemplars(
             footer.series_count
         )));
     }
-    let dict = get_section(store, object_key, footer, LABEL_DICT, ledger).await?;
-    let section = get_section(store, object_key, footer, EXEMPLARS, ledger).await?;
     let records = decode_exemplars_section(footer, &dict, &section, limits)?;
 
     let mut out = Vec::with_capacity(records.len());

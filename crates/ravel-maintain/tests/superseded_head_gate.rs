@@ -3181,3 +3181,67 @@ async fn an_unreadable_snapshot_hold_is_not_a_named_hour() {
         );
     }
 }
+
+// --- ADR-1702: the reachability reads run on the read gate -------------------
+
+/// The held-not-deleted fixture above, swept with a read gate whose inline
+/// floor is 0: the gate decodes HEAD once and hashes and decodes the one
+/// covering part once, so `reachability` counts exactly two jobs, nothing else
+/// on the gate moves, and the verdict is the inline one (every input held, no
+/// delete).
+///
+/// Fails with `SnapshotReachability::with_read_gate` dropped from
+/// `sweep_superseded`'s construction (the count reads `(0, 0)`), or with either
+/// of the two wraps in `ensure_head` and `ensure_part` removed (it reads 1).
+#[tokio::test]
+async fn snapshot_reachability_reads_run_through_the_read_gate() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let commit_keys = seed_two_hours(mem.as_ref()).await;
+    let input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
+    fold_head(&mem, created, 1, None).await;
+    run_rewrite(mem.as_ref(), &clock).await;
+    fold_head(&mem, created + 3 * NS_PER_HOUR, 2, None).await;
+
+    let gate = Arc::new(ravel_cpu_gate::ReadGate::new(
+        ravel_cpu_gate::CpuGateConfig {
+            inline_floor_bytes: 0,
+            ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+        },
+        Arc::new(ravel_cpu_gate::InstantClock::new()),
+    ));
+    let config = CompactorConfig {
+        read_gate: ravel_maintain::read_gate::MaintainReadGate::new(Arc::clone(&gate)),
+        ..cfg()
+    };
+    clock.set(past_horizon(created));
+    let b = old_bucket();
+    let outcome = sweep_superseded(
+        mem.as_ref(),
+        &clock,
+        &config,
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(outcome.records_deleted, 0);
+    assert_eq!(outcome.data_deleted, 0);
+    assert_eq!(outcome.held_by_snapshot, 4);
+    assert_eq!(
+        present_keys(mem.as_ref(), &input_data_keys).await,
+        input_data_keys
+    );
+    for site in gate.snapshot().sites {
+        let expected = if site.site == ravel_cpu_gate::ReadSite::Reachability {
+            (2, 0)
+        } else {
+            (0, 0)
+        };
+        assert_eq!((site.jobs, site.inline), expected, "{:?}", site.site);
+    }
+}

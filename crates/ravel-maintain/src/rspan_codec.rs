@@ -130,6 +130,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
@@ -146,7 +147,9 @@ use crate::codec::SegmentCodec;
 use crate::config::{CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
+use crate::read_gate::MaintainReadGate;
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
+use ravel_cpu_gate::ReadSite;
 
 /// The RSPAN output trailer version every L1 part carries. Recorded in each
 /// part's `CompactionPart.segment_format_version`, the span analogue of RSEG's
@@ -171,7 +174,8 @@ pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::SUPPORTED_VERSIONS.n
 pub struct SpanInputCatalog {
     pub object_key: String,
     pub footer: footer::SpanFooter,
-    pub reader: RspanRangeReader,
+    /// Shared so a block decode on the read gate can hold it.
+    pub reader: Arc<RspanRangeReader>,
 }
 
 /// The spans codec: implements the [`SegmentCodec`] seam for `.rspan` objects.
@@ -283,7 +287,7 @@ pub(crate) async fn load_catalog_from_object(
     Ok(SpanInputCatalog {
         object_key,
         footer: ftr,
-        reader,
+        reader: Arc::new(reader),
     })
 }
 
@@ -408,7 +412,14 @@ pub(crate) async fn merge(
         .iter()
         .enumerate()
         .map(|(idx, catalog)| {
-            Box::pin(open_cursor(store, catalog, idx, tracker, ledger)) as CursorFuture<'_, '_>
+            Box::pin(open_cursor(
+                store,
+                catalog,
+                idx,
+                &config.read_gate,
+                tracker,
+                ledger,
+            )) as CursorFuture<'_, '_>
         })
         .collect();
     let mut cursors: Vec<BlockCursor> = stream_iter(opens)
@@ -469,7 +480,15 @@ pub(crate) async fn merge(
                     part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
                 if over_cap && let Some(builder) = current.take() {
                     let built = builder
-                        .finish(store, bucket, input_set_hash, part_index, dry_run, ledger)
+                        .finish(
+                            store,
+                            bucket,
+                            config,
+                            input_set_hash,
+                            part_index,
+                            dry_run,
+                            ledger,
+                        )
                         .await?;
                     // Cancellation checkpoint 4: a part boundary, after the
                     // part PUT returned.
@@ -501,7 +520,15 @@ pub(crate) async fn merge(
         && !part.is_empty()
     {
         let built = part
-            .finish(store, bucket, input_set_hash, part_index, dry_run, ledger)
+            .finish(
+                store,
+                bucket,
+                config,
+                input_set_hash,
+                part_index,
+                dry_run,
+                ledger,
+            )
             .await?;
         // Cancellation checkpoint 4 for the tail part.
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
@@ -528,10 +555,11 @@ async fn open_cursor<'a>(
     store: &'a dyn ObjectStoreBackend,
     catalog: &'a SpanInputCatalog,
     input_index: usize,
+    read_gate: &'a MaintainReadGate,
     tracker: Option<&MergeMemoryTracker>,
     ledger: Option<&RequestLedger>,
 ) -> Result<BlockCursor<'a>> {
-    let mut cursor = BlockCursor::open(catalog, input_index);
+    let mut cursor = BlockCursor::open(catalog, input_index, read_gate);
     cursor.refill(store, tracker, ledger).await?;
     Ok(cursor)
 }
@@ -586,10 +614,12 @@ impl PartBuilder {
 
     /// Encode and PUT the part through the shared writer pipeline. See
     /// [`finalize_part`] for the encode/summary/PUT detail this reuses.
+    #[allow(clippy::too_many_arguments)]
     async fn finish(
         self,
         store: &dyn ObjectStoreBackend,
         bucket: &Bucket,
+        config: &CompactorConfig,
         input_set_hash: &[u8; 32],
         part_index: u32,
         dry_run: bool,
@@ -598,6 +628,8 @@ impl PartBuilder {
         finalize_part(
             store,
             bucket,
+            &config.read_gate,
+            self.estimate,
             self.writer,
             input_set_hash,
             part_index,
@@ -622,7 +654,9 @@ impl PartBuilder {
 struct BlockCursor<'a> {
     input_index: usize,
     object_key: &'a str,
-    reader: &'a RspanRangeReader,
+    reader: &'a Arc<RspanRangeReader>,
+    /// The read gate each block decode runs on.
+    read_gate: &'a MaintainReadGate,
     next_block: usize,
     total_blocks: usize,
     /// Remaining records of the current decoded block.
@@ -645,11 +679,16 @@ struct BlockCursor<'a> {
 impl<'a> BlockCursor<'a> {
     /// Open a cursor over every block of `catalog`. Does not fetch yet; call
     /// [`Self::refill`] once to load the first record.
-    fn open(catalog: &'a SpanInputCatalog, input_index: usize) -> Self {
+    fn open(
+        catalog: &'a SpanInputCatalog,
+        input_index: usize,
+        read_gate: &'a MaintainReadGate,
+    ) -> Self {
         BlockCursor {
             input_index,
             object_key: &catalog.object_key,
             reader: &catalog.reader,
+            read_gate,
             next_block: 0,
             total_blocks: catalog.reader.block_count(),
             block: Vec::new().into_iter(),
@@ -707,14 +746,24 @@ impl<'a> BlockCursor<'a> {
             if let Some(t) = tracker {
                 t.block_fetched(raw_len);
             }
-            let recs = self.reader.decode_block(&loc, got.data.as_ref())?;
+            // The decode runs on the read gate (ADR-1702), sized by the
+            // block's raw bytes. The job owns them and drops them when it
+            // returns, so they stay resident until the decoded block exists,
+            // as before.
+            let reader = Arc::clone(self.reader);
+            let data = got.data;
+            let recs = self
+                .read_gate
+                .run(ReadSite::Compaction, raw_len, move || {
+                    reader.decode_block(&loc, data.as_ref())
+                })
+                .await??;
             let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
             if let Some(t) = tracker {
                 // Records both raw and decoded resident at the high-water
-                // instant, then drops the raw buffer.
+                // instant; the raw buffer is already gone with the job.
                 t.block_decoded(raw_len, decoded_bytes);
             }
-            drop(got);
             self.block_bytes = decoded_bytes;
             self.block = recs.into_iter();
             if let Some(rec) = self.block.next() {
@@ -752,10 +801,15 @@ impl<'a> BlockCursor<'a> {
 /// `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
 /// `CreateIfAbsent`. The part's summary stats are read back from the produced
 /// object's own footer, so they describe exactly what was written.
+///
+/// The encode, the footer read-back and the content hash run on the read gate
+/// (ADR-1702) as one job owning the writer, sized by `estimated_bytes`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
+    read_gate: &MaintainReadGate,
+    estimated_bytes: u64,
     writer: RspanWriter,
     input_set_hash: &[u8; 32],
     part_index: u32,
@@ -763,15 +817,20 @@ pub(crate) async fn finalize_part(
     dry_run: bool,
     ledger: Option<&RequestLedger>,
 ) -> Result<BuiltPart> {
-    let object = writer.finish_compacted(1, input_set_hash.to_vec(), part_index)?;
-    let object = bytes::Bytes::from(object);
-
+    let input_set_hash_vec = input_set_hash.to_vec();
     // Authoritative summary (bounds, counts) from the object we just wrote. The
     // footer's trace_id bounds are the part's inclusive id range; because
     // traces are merged in sorted order and a trace never straddles a part,
     // adjacent parts' ranges are disjoint and ascending.
-    let ftr = footer::open(&object)?;
-    let content_hash: [u8; 32] = *blake3::hash(&object).as_bytes();
+    let (object, ftr, content_hash) = read_gate
+        .run(ReadSite::Compaction, estimated_bytes, move || {
+            let object = writer.finish_compacted(1, input_set_hash_vec, part_index)?;
+            let object = bytes::Bytes::from(object);
+            let ftr = footer::open(&object)?;
+            let content_hash: [u8; 32] = *blake3::hash(&object).as_bytes();
+            Ok::<_, MaintainError>((object, ftr, content_hash))
+        })
+        .await??;
 
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
     let hash16 = hex::encode(&content_hash[..8]);

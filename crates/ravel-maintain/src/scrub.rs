@@ -55,6 +55,8 @@ use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::clock::Clock;
+use crate::read_gate::MaintainReadGate;
+use ravel_cpu_gate::ReadSite;
 
 /// Suffix size probed to locate a footer in the structural tier. Matches
 /// [`crate::config::DEFAULT_FOOTER_PROBE_BYTES`]; a footer larger than this
@@ -229,6 +231,21 @@ pub async fn scrub_one_object(
     record: &CommitRecord,
     covering: Option<CoveringPostings<'_>>,
 ) -> ScrubResult {
+    scrub_one_object_on_gate(store, clock, record, covering, &MaintainReadGate::default()).await
+}
+
+/// [`scrub_one_object`], with the content tier's full-object blake3 run on
+/// `read_gate` under the `scrub` site (ADR-1702), sized by the object's length.
+/// The job owns the fetched bytes. The structural tier's footer reads and the
+/// postings tier's decodes stay on the calling task. A job the gate returns no
+/// result for is a retryable [`ScrubResult::ReadError`], not a finding.
+pub async fn scrub_one_object_on_gate(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    record: &CommitRecord,
+    covering: Option<CoveringPostings<'_>>,
+    read_gate: &MaintainReadGate,
+) -> ScrubResult {
     let signal = match ravel_commit::signal::from_proto(record.signal) {
         Ok(signal) => signal,
         Err(_) => {
@@ -273,7 +290,22 @@ pub async fn scrub_one_object(
         Ok(got) => got,
         Err(err) => return get_failure("full-object", err),
     };
-    let actual = *blake3::hash(full.data.as_ref()).as_bytes();
+    let data = full.data;
+    let size = data.len() as u64;
+    let actual = match read_gate
+        .run(ReadSite::Scrub, size, move || {
+            *blake3::hash(data.as_ref()).as_bytes()
+        })
+        .await
+    {
+        Ok(actual) => actual,
+        Err(err) => {
+            return ScrubResult::ReadError {
+                detail: format!("full-object hash: {err}"),
+                retryable: true,
+            };
+        }
+    };
     if actual != expected {
         tracing::warn!(
             object_key = key,
@@ -894,6 +926,8 @@ impl ScrubCursor {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use ravel_catalog::{DEFAULT_MAX_POSTINGS_BYTES, NamePostings, encode_postings};
     use ravel_commit::record::{self, NewCommitRecord};
@@ -1052,6 +1086,62 @@ mod tests {
 
         let result = scrub_one_object(&store, &clock, &record, None).await;
         assert_eq!(result, ScrubResult::Clean);
+    }
+
+    /// ADR-1702 task 10: the content tier's full-object hash runs on the read
+    /// gate as one `scrub` job per object, with the same verdict as inline: a
+    /// clean object stays clean, and a flipped bit is the same mismatch.
+    ///
+    /// Fails with `scrub_one_object_on_gate` hashing inline whatever gate it
+    /// is given: the count reads `(0, 0)`.
+    #[tokio::test]
+    async fn content_hash_runs_through_the_read_gate() {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(123);
+        let gate = Arc::new(ravel_cpu_gate::ReadGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes: 0,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ));
+        let read_gate = MaintainReadGate::new(Arc::clone(&gate));
+        let scrub_counts = || {
+            gate.snapshot()
+                .sites
+                .into_iter()
+                .find(|s| s.site == ReadSite::Scrub)
+                .map(|s| (s.jobs, s.inline))
+        };
+
+        let record = publish_metric_segment(&store, Uuid::new_v4(), 1, &["cpu", "mem"]).await;
+        let gated = scrub_one_object_on_gate(&store, &clock, &record, None, &read_gate).await;
+        assert_eq!(gated, ScrubResult::Clean);
+        assert_eq!(scrub_counts(), Some((1, 0)));
+
+        let mut bytes = store
+            .get(&record.object_key, GetRange::Full)
+            .await
+            .expect("get")
+            .data
+            .to_vec();
+        bytes[0] ^= 0x01;
+        store
+            .put(
+                &record.object_key,
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite");
+        let inline = scrub_one_object(&store, &clock, &record, None).await;
+        let gated = scrub_one_object_on_gate(&store, &clock, &record, None, &read_gate).await;
+        assert!(
+            matches!(inline, ScrubResult::ChecksumMismatch { .. }),
+            "{inline:?}"
+        );
+        assert_eq!(gated, inline);
+        assert_eq!(scrub_counts(), Some((2, 0)));
     }
 
     #[tokio::test]

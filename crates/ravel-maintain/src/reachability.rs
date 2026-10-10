@@ -39,9 +39,11 @@ use crate::bucket::Bucket;
 use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
+use crate::read_gate::MaintainReadGate;
 use crate::unnamed_marker::{
     MarkerAnchor, MarkerReapOutcome, PinnedQueryWindow, UnnamedMarker, put_marker, reap_listed,
 };
+use ravel_cpu_gate::ReadSite;
 
 /// [`SnapshotGate::Clear`] once `observed_unix_ns` is past the pinned-query
 /// window on the deleting sweeper's clock, read now.
@@ -194,6 +196,7 @@ pub struct SnapshotReachability {
     /// (fail-closed); `Some` = decoded and usable.
     parts: HashMap<String, Option<Arc<DecodedPart>>>,
     markers: MarkerCache,
+    read_gate: MaintainReadGate,
 }
 
 /// Whether a pass may write and delete unnamed-since markers, or only read
@@ -304,6 +307,15 @@ impl SnapshotReachability {
     /// A fresh, empty cache for one sweep pass.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Decodes HEAD, and hashes and decodes each snapshot part, on `gate`
+    /// under the `reachability` site (ADR-1702). Each job owns the fetched
+    /// bytes. The default runs both inline.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: MaintainReadGate) -> Self {
+        self.read_gate = gate;
+        self
     }
 
     /// The unnamed-since marker requests and transitions of this pass so far.
@@ -831,24 +843,35 @@ impl SnapshotReachability {
         if self.head.is_none() {
             let head_key = catalog_head_key(tenant, signal);
             let load = match store.get(&head_key, GetRange::Full).await {
-                Ok(got) => match decode_head(got.data.as_ref()) {
-                    Ok(head) => {
-                        self.head_version = got.version.0.clone();
-                        HeadLoad::Present(Box::new(head))
+                Ok(got) => {
+                    let version = got.version.0;
+                    let data = got.data;
+                    let size = data.len() as u64;
+                    let decoded = self
+                        .read_gate
+                        .run(ReadSite::Reachability, size, move || {
+                            decode_head(data.as_ref())
+                        })
+                        .await?;
+                    match decoded {
+                        Ok(head) => {
+                            self.head_version = version;
+                            HeadLoad::Present(Box::new(head))
+                        }
+                        Err(err) => {
+                            // Present but undecodable/newer: fail-closed. Cannot
+                            // prove non-reachability from a HEAD we cannot read.
+                            tracing::warn!(
+                                error = %err,
+                                key = %head_key,
+                                "maintain sweep: catalog HEAD failed to decode; blocking deletes \
+                                 fail-closed this pass rather than proving non-reachability from an \
+                                 unreadable HEAD"
+                            );
+                            HeadLoad::Unreadable
+                        }
                     }
-                    Err(err) => {
-                        // Present but undecodable/newer: fail-closed. Cannot
-                        // prove non-reachability from a HEAD we cannot read.
-                        tracing::warn!(
-                            error = %err,
-                            key = %head_key,
-                            "maintain sweep: catalog HEAD failed to decode; blocking deletes \
-                             fail-closed this pass rather than proving non-reachability from an \
-                             unreadable HEAD"
-                        );
-                        HeadLoad::Unreadable
-                    }
-                },
+                }
                 Err(StoreError::NotFound) => HeadLoad::Absent,
                 Err(err) => return Err(MaintainError::Store(err)),
             };
@@ -886,17 +909,24 @@ impl SnapshotReachability {
         let load: Option<Arc<DecodedPart>> = match store.get(&part_ref.key, GetRange::Full).await {
             Ok(got) => {
                 let data = got.data;
-                if blake3::hash(&data).as_bytes().as_slice() != part_ref.blake3.as_slice() {
-                    tracing::warn!(
-                        key = %part_ref.key,
-                        "maintain sweep: snapshot part hash mismatch; blocking deletes fail-closed"
-                    );
-                    None
-                } else {
-                    let limits = PartLimits {
-                        max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
-                    };
-                    match decode_part(data.as_ref(), &limits) {
+                let size = data.len() as u64;
+                let expected = part_ref.blake3.clone();
+                // The hash check and the decode run as one job on the read
+                // gate (ADR-1702); `None` is a hash mismatch.
+                let decoded = self
+                    .read_gate
+                    .run(ReadSite::Reachability, size, move || {
+                        if blake3::hash(&data).as_bytes().as_slice() != expected.as_slice() {
+                            return None;
+                        }
+                        let limits = PartLimits {
+                            max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
+                        };
+                        Some(decode_part(data.as_ref(), &limits))
+                    })
+                    .await?;
+                if let Some(decoded) = decoded {
+                    match decoded {
                         Ok(part)
                             if part.header.min_hour != part_ref.min_hour
                                 || part.header.watermark_hour != part_ref.watermark_hour =>
@@ -923,6 +953,12 @@ impl SnapshotReachability {
                             None
                         }
                     }
+                } else {
+                    tracing::warn!(
+                        key = %part_ref.key,
+                        "maintain sweep: snapshot part hash mismatch; blocking deletes fail-closed"
+                    );
+                    None
                 }
             }
             // HEAD names a part that is not present. Anomalous (a HEAD-named

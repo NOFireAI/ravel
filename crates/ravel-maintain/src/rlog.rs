@@ -262,7 +262,9 @@ use crate::compact::CompactionInputSkipReason;
 use crate::config::{AdmissionMode, CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, MergeCursorBudgetSite, Result};
 use crate::read::InputRecord;
+use crate::read_gate::MaintainReadGate;
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
+use ravel_cpu_gate::ReadSite;
 
 /// The RLOG output trailer version every L1 part carries (currently 3:
 /// ADR-0032 introduced v2, ADR-0095 moved it to v3). Recorded in each part's
@@ -1185,7 +1187,7 @@ impl RecordCounts {
 ///   only encodes at [`RlogWriter::finish_compacted`], so there is no incremental
 ///   encoded size to read; instead [`PartBuilder::stored_estimate`] (a cheap
 ///   pre-compression payload proxy) schedules an exact-encode probe
-///   ([`PartBuilder::encode_clone`]), and the part closes on the probe's real
+///   ([`PartBuilder::encode_clone_job`]), and the part closes on the probe's real
 ///   byte count, not on the proxy. The proxy only decides WHEN to probe, never
 ///   whether to close, so the compression ratio between payload and object no
 ///   longer sizes the part: on a wide, compressible schema a proxy-driven close
@@ -1279,7 +1281,7 @@ impl PartSink<'_> {
                 // The stored target governs object geometry, so it closes on the
                 // object's ACTUAL encoded size, not on the payload proxy (issue
                 // #872). The proxy only schedules this probe; encoding is what
-                // measures the bytes the knob is named for. `encode_clone`
+                // measures the bytes the knob is named for. `encode_clone_job`
                 // encodes a clone of the buffered records, so the builder can
                 // keep accumulating when the part is not yet full.
                 if let Some(t) = self.tracker {
@@ -1289,7 +1291,14 @@ impl PartSink<'_> {
                     // is known.
                     t.set_probe_bytes(part.estimate);
                 }
-                let probe = part.encode_clone(self.input_set_hash, self.part_index);
+                // The probe encode runs on the read gate (ADR-1702), sized by
+                // the part's stored-size estimate.
+                let probe_job = part.encode_clone_job(*self.input_set_hash, self.part_index);
+                let probe = self
+                    .config
+                    .read_gate
+                    .run(ReadSite::Compaction, part.stored_estimate, probe_job)
+                    .await?;
                 if let Some(t) = self.tracker {
                     if let Ok((object, _)) = probe.as_ref() {
                         t.set_probe_bytes(part.estimate.saturating_add(object.len() as u64));
@@ -1348,11 +1357,24 @@ impl PartSink<'_> {
             let declared_accum = std::mem::take(&mut builder.declared_accum);
             let (object, stats) = match pre_encoded {
                 Some(enc) => enc,
-                None => builder.into_encoded(self.input_set_hash, self.part_index)?,
+                // The closing encode runs on the read gate (ADR-1702) as one
+                // job owning the builder, sized by its stored-size estimate.
+                None => {
+                    let input_set_hash = *self.input_set_hash;
+                    let part_index = self.part_index;
+                    let size = builder.stored_estimate;
+                    self.config
+                        .read_gate
+                        .run(ReadSite::Compaction, size, move || {
+                            builder.into_encoded(&input_set_hash, part_index)
+                        })
+                        .await??
+                }
             };
             let built = finalize_part(
                 self.store,
                 self.bucket,
+                &self.config.read_gate,
                 object,
                 stats,
                 first_stream_id,
@@ -1620,7 +1642,7 @@ impl DeclaredSchema {
 /// (from [`declared_columns_from_inputs`]), so it tracks only the columns it
 /// will stamp rather than every eligible attribute the merge sees. It rides
 /// [`PartBuilder::push`], the same per-record path `estimate` and the stream
-/// bounds ride, so the exact-encode probe ([`PartBuilder::encode_clone`], which
+/// bounds ride, so the exact-encode probe ([`PartBuilder::encode_clone_job`], which
 /// clones the buffered records without re-pushing) folds no record twice. Each
 /// part gets its own accumulator, opened when the part opens and consumed when
 /// it closes, so a record folds into exactly the part it is written into: at a
@@ -1833,7 +1855,7 @@ const PROBE_MIN_STEP_BYTES: u64 = 4096;
 /// unavoidable (the key hashes the whole object); the k-way merge keeps
 /// everything *else* bounded. The records are buffered here rather than pushed
 /// into one long-lived [`RlogWriter`] so the part can be encoded to measure its
-/// real size ([`Self::encode_clone`]) without being consumed.
+/// real size ([`Self::encode_clone_job`]) without being consumed.
 struct PartBuilder {
     /// The compaction identity every encode stamps into the footer. Combined
     /// with the caller's `input_set_hash` and `part_index` it makes each encode
@@ -1965,24 +1987,25 @@ impl PartBuilder {
         Ok(w)
     }
 
-    /// Encode this part WITHOUT consuming the builder, by cloning its records.
-    /// Used by the stored-target probe to measure the object's real encoded
-    /// size; when the probe decides to close, the caller reuses the returned
-    /// bytes as the closing object (they are byte-identical to what
-    /// [`Self::into_encoded`] would produce for the same `part_index`, the encode
-    /// being deterministic).
-    fn encode_clone(
+    /// An encode of this part that does NOT consume the builder: the returned
+    /// job owns a clone of its records. Used by the stored-target probe to
+    /// measure the object's real encoded size; when the probe decides to close,
+    /// the caller reuses the job's bytes as the closing object (they are
+    /// byte-identical to what [`Self::into_encoded`] would produce for the same
+    /// `part_index`, the encode being deterministic).
+    fn encode_clone_job(
         &self,
-        input_set_hash: &[u8; 32],
+        input_set_hash: [u8; 32],
         part_index: u32,
-    ) -> Result<(Vec<u8>, WriteStats)> {
-        let w = Self::build_writer(
-            &self.identity,
-            &self.indexed_fields,
-            &self.writer,
-            self.records.clone(),
-        )?;
-        Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
+    ) -> impl FnOnce() -> Result<(Vec<u8>, WriteStats)> + Send + 'static {
+        let identity = self.identity;
+        let indexed_fields = self.indexed_fields.clone();
+        let writer = Arc::clone(&self.writer);
+        let records = self.records.clone();
+        move || {
+            let w = Self::build_writer(&identity, &indexed_fields, &writer, records)?;
+            Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
+        }
     }
 
     /// Encode this part, consuming the builder (no clone). Used to close a part
@@ -3157,7 +3180,7 @@ async fn open_cursor<'a>(
 
 /// Turn one part's already-encoded L1 object bytes into a [`BuiltPart`] and PUT
 /// it `CreateIfAbsent`. The object was produced by
-/// [`PartBuilder::into_encoded`]/[`PartBuilder::encode_clone`] via the shared
+/// [`PartBuilder::into_encoded`]/[`PartBuilder::encode_clone_job`] via the shared
 /// [`RlogWriter::finish_compacted_with_stats`] pipeline (stamping `level = 1`,
 /// the `input_set_hash`, and `part_index`); the part's summary stats are read
 /// back from the object's own footer, so they describe exactly what was
@@ -3181,6 +3204,7 @@ async fn open_cursor<'a>(
 async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
+    read_gate: &MaintainReadGate,
     object: Vec<u8>,
     stats: WriteStats,
     first_stream_id: Option<LogStreamId>,
@@ -3201,9 +3225,17 @@ async fn finalize_part(
     }
     let object = bytes::Bytes::from(object);
 
-    // Authoritative summary from the object we just wrote.
-    let ftr = footer::open(&object)?;
-    let content_hash: [u8; 32] = *blake3::hash(&object).as_bytes();
+    // Authoritative summary from the object we just wrote. The footer
+    // read-back and the content hash run on the read gate (ADR-1702) as one
+    // job owning the object, which it hands back.
+    let size = object.len() as u64;
+    let (object, ftr, content_hash) = read_gate
+        .run(ReadSite::Compaction, size, move || {
+            let ftr = footer::open(&object)?;
+            let content_hash: [u8; 32] = *blake3::hash(&object).as_bytes();
+            Ok::<_, MaintainError>((object, ftr, content_hash))
+        })
+        .await??;
 
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
     let hash16 = hex::encode(&content_hash[..8]);
@@ -3392,7 +3424,7 @@ const STORED_RECORD_FIXED_BYTES: u64 = 16;
 /// A cheap upper bound on the encoded/on-object bytes one merged [`LogRecord`]
 /// adds to a part. It does NOT close the part on `max_l1_part_bytes` (the
 /// stored-size target): the part closes on its object's ACTUAL encoded size,
-/// measured by an exact-encode probe ([`PartBuilder::encode_clone`]). This
+/// measured by an exact-encode probe ([`PartBuilder::encode_clone_job`]). This
 /// figure's only job is to SCHEDULE that probe -- summed per record into
 /// [`PartBuilder::stored_estimate`], it says when the object is plausibly large
 /// enough to be worth encoding to check (issue #872).
@@ -5722,7 +5754,7 @@ mod tests {
     /// the tracker, so a stored-target-bound run's peak is the real peak instead
     /// of the writer buffer alone.
     ///
-    /// [`PartBuilder::encode_clone`] clones the part's buffered records and
+    /// [`PartBuilder::encode_clone_job`] clones the part's buffered records and
     /// encodes the clone, so at the instant the probe returns the run holds the
     /// writer's records, a second copy of them inside the writer the probe built,
     /// and the encoded object those records produced. That is roughly
