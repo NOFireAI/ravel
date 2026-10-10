@@ -98,13 +98,12 @@ pub const MSG_INTERNAL: &str = "internal query engine error";
 /// rewrites it from the pool's own occupancy at the moment of refusal.
 pub const MSG_SPILL_DISABLED_MARKER: &str = "DiskManager is disabled";
 
-/// Substring DataFusion embeds in the `ResourcesExhausted` its disk manager
-/// raises when a spill file's growth pushes the query's scratch past
-/// `max_temp_directory_size` (`RefCountedTempFile::update_disk_usage`,
-/// datafusion-execution 54.1.0). Ravel sets that ceiling from
-/// [`SpillConfig::max_bytes`](crate::SpillConfig), so this marker is how the
-/// per-query scratch quota's own trip is told apart from a memory-pool
-/// exhaustion that happens to reach the same DataFusion variant.
+/// Substring DataFusion embeds in the IO error its spill writer raises when a
+/// write would push the query's scratch past `max_temp_directory_size`
+/// (`FileSpillWriter::write`, datafusion-execution 55.2.0). Ravel sets that
+/// ceiling from [`SpillConfig::max_bytes`](crate::SpillConfig), so this marker
+/// is how the per-query scratch quota's own trip is told apart from a scratch
+/// volume that could not be written, which reaches the same error variants.
 ///
 /// The upstream text ends by suggesting the caller raise
 /// `datafusion.runtime.max_temp_directory_size`, a knob no Ravel client can
@@ -463,11 +462,13 @@ impl SqlError {
     /// The typed per-query scratch-quota error, built from the query's own
     /// figures rather than DataFusion's text (ADR-0954).
     ///
-    /// `written` is the bytes this query had written to its spill files when
-    /// the disk manager refused the next write, read from the disk manager's
-    /// own `used_disk_space` gauge: bytes as they sit in the spill files (Arrow
+    /// `written` is the bytes this query's live spill files held when the
+    /// refusal reached the stream, read from the disk manager's own
+    /// `used_disk_space` gauge: bytes as they sit in the spill files (Arrow
     /// IPC, after whatever spill compression the session configured), not
-    /// decoded Arrow bytes and not bytes moved over the network. `quota` is
+    /// decoded Arrow bytes and not bytes moved over the network. The gauge
+    /// excludes the refused write, and the file that write was for has been
+    /// released by then, so the figure is below the quota and can be zero. `quota` is
     /// [`SpillConfig::max_bytes`](crate::SpillConfig::max_bytes), the same
     /// figure that ceiling was configured from.
     pub fn spill_budget_exhausted(written: u64, quota: u64) -> Self {

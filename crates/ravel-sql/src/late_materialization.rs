@@ -126,6 +126,7 @@ use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, 
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -135,6 +136,7 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -409,7 +411,10 @@ impl TopKLateMaterialization {
                         .with_fetch(filter.fetch())
                         .build()?,
                 ),
-                PassThrough::Opaque(plan) => Arc::clone(plan).with_new_children(vec![phase1])?,
+                PassThrough::Opaque(plan) => Arc::clone(plan).replace_children(
+                    vec![phase1],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?,
             };
         }
 
@@ -452,19 +457,19 @@ fn classify(plan: &Arc<dyn ExecutionPlan>) -> Option<PassThrough> {
         return Some(PassThrough::Filter(Arc::new(filter.clone())));
     }
     // `CoalescePartitionsExec` merges the scan's partitions under the TopK;
-    // `CooperativeExec` is the yield wrapper DataFusion 54 puts directly above
+    // `CooperativeExec` is the yield wrapper DataFusion 55 puts directly above
     // a leaf. Neither reads a column or changes a schema.
     if plan.is::<CoalescePartitionsExec>() || plan.is::<CooperativeExec>() {
         return Some(PassThrough::Opaque(Arc::clone(plan)));
     }
     if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
-        // A hash repartition's expressions carry column indices that would need
-        // the same remap; round-robin and unknown carry none.
+        // A hash or range repartition's expressions carry column indices that
+        // would need the same remap; round-robin and unknown carry none.
         return match repartition.partitioning() {
             Partitioning::RoundRobinBatch(_) | Partitioning::UnknownPartitioning(_) => {
                 Some(PassThrough::Opaque(Arc::clone(plan)))
             }
-            Partitioning::Hash(_, _) => None,
+            Partitioning::Hash(_, _) | Partitioning::Range(_) => None,
         };
     }
     None
@@ -642,6 +647,13 @@ impl ExecutionPlan for LogsRowFetchExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -670,7 +682,11 @@ impl ExecutionPlan for LogsRowFetchExec {
     /// Nothing is known: the row count is whatever the TopK kept, which is at
     /// most its fetch but can be fewer, and no column statistic survives the
     /// re-read.
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 

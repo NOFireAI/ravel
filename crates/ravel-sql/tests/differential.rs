@@ -19,9 +19,10 @@
 //! # Why the reference is not "naive"
 //!
 //! The whole point is that "DataFusion == naive scalar arithmetic" is
-//! false. Everything in [`util::gate`] was verified against the pinned
-//! datafusion 54.1.0 and arrow 58.4.0 in the workspace lockfile, reading the
-//! accumulators rather than guessing:
+//! false. Everything in [`util::gate`] was verified against datafusion 54.1.0
+//! and arrow 58.4.0, reading the accumulators rather than guessing, and the
+//! golden cases below pass unchanged on the pinned datafusion 55.2.0 and arrow
+//! 59.3.0:
 //!
 //! - **Comparisons are total-order, not IEEE.** arrow's compare kernels
 //!   (`arrow_ord::cmp`) use `f64::total_cmp`, so in SQL `value > 5.0` is
@@ -452,7 +453,7 @@ async fn ts_literal_predicates_are_lossless() {
 }
 
 // ---------------------------------------------------------------------------
-// Golden cases pinned against the workspace's datafusion 54.1.0 / arrow 58.4.0
+// Golden cases pinned against the workspace's datafusion 55.2.0 / arrow 59.3.0
 // ---------------------------------------------------------------------------
 //
 // These encode DataFusion's *observed* NaN and signed-zero behavior as
@@ -532,7 +533,7 @@ async fn golden_ungrouped_min_max_use_total_order_nan_semantics() {
 }
 
 /// Grouped MIN/MAX use the `f64::total_cmp` total order (ADR-0023), pinned by
-/// bits against datafusion 54.1.0. Each series is one group, so a grouped
+/// bits against datafusion 55.2.0. Each series is one group, so a grouped
 /// query filtered to that series returns a single `[min, max]` row. The bits
 /// are literal, not derived from the reference folds, so this pins both the
 /// UDAF (crate::minmax) and, transitively, the reference the proptests trust.
