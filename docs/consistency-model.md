@@ -495,7 +495,9 @@ query sees. Guarantees:
   entry or replaced by a compaction or rewrite whose parts the snapshot
   holds. It exits non-zero naming the hours, the count of missing commits
   and up to ten of them when one is not (for example because another fold
-  sealed its hour while the load was writing), and also when that HEAD or
+  sealed its hour while the load was writing, or because a rewrite with no
+  output parts or a retention tombstone removed it, which leaves no level-1
+  entry to cover it), and also when that HEAD or
   one of its parts cannot be read, since coverage was then not checked. Any other writer that publishes into the
   asserted hours, whether a live server or a load run without the flag, is
   not refused: its commit succeeds and is invisible to non-token queries the

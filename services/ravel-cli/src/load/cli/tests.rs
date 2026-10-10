@@ -402,17 +402,21 @@ fn fold_summary_names_the_outcome() {
         watermark_hour: Some(472_222),
         seal_through_hour: Some(472_222),
         no_op: false,
+        parts_read: 2,
+        buckets_listed: 1,
+        records_read: 3,
     };
     assert_eq!(
         fold_summary(&folded, true),
         "  fold after load  : sealed, seal_through_hour 472222, watermark_hour 472222, \
-         entries 7, elapsed 1.250s (included in elapsed)\n"
+         entries 7, parts read 2, buckets listed 1, records read 3, elapsed 1.250s (included \
+         in elapsed)\n"
     );
     assert_eq!(
         fold_summary(&folded, false),
         "  fold after load  : folded, commits not confirmed in the snapshot (see the error \
-         below), seal_through_hour 472222, watermark_hour 472222, entries 7, elapsed 1.250s \
-         (included in elapsed)\n"
+         below), seal_through_hour 472222, watermark_hour 472222, entries 7, parts read 2, \
+         buckets listed 1, records read 3, elapsed 1.250s (included in elapsed)\n"
     );
 
     let empty = fold_summary(&LoadFold::default(), true);
@@ -424,16 +428,21 @@ fn fold_summary_names_the_outcome() {
         watermark_hour: Some(472_222),
         seal_through_hour: Some(472_222),
         no_op: true,
+        parts_read: 1,
+        buckets_listed: 0,
+        records_read: 0,
     };
     assert_eq!(
         fold_summary(&no_op, true),
         "  fold after load  : no-op, HEAD already sealed, seal_through_hour 472222, \
-         watermark_hour 472222, entries 0, elapsed 0.000s (included in elapsed)\n"
+         watermark_hour 472222, entries 0, parts read 1, buckets listed 0, records read 0, \
+         elapsed 0.000s (included in elapsed)\n"
     );
     assert_eq!(
         fold_summary(&no_op, false),
         "  fold after load  : no-op, HEAD already sealed, commits not confirmed in the snapshot \
          (see the error below), seal_through_hour 472222, watermark_hour 472222, entries 0, \
-         elapsed 0.000s (included in elapsed)\n"
+         parts read 1, buckets listed 0, records read 0, elapsed 0.000s (included in \
+         elapsed)\n"
     );
 }

@@ -1095,13 +1095,23 @@ fn uncovered_commits<E: std::fmt::Display>(
                     missing.len() - UNCOVERED_COMMITS_NAMED
                 ));
             }
-            let finding = format!(
-                "{} of the {} commits it published are not in the snapshot of the catalog HEAD \
-                 its fold left, in ingest hour(s) {}: {named}",
-                missing.len(),
-                tokens.len(),
-                joined(&hours)
-            );
+            let finding = if coverage.watermark_hour.is_none() {
+                format!(
+                    "{} of the {} commits it published are in no snapshot: the fold left no \
+                     catalog HEAD, in ingest hour(s) {}: {named}",
+                    missing.len(),
+                    tokens.len(),
+                    joined(&hours)
+                )
+            } else {
+                format!(
+                    "{} of the {} commits it published are not in the snapshot of the catalog \
+                     HEAD its fold left, in ingest hour(s) {}: {named}",
+                    missing.len(),
+                    tokens.len(),
+                    joined(&hours)
+                )
+            };
             Some((hours, finding))
         }
         Err(err) => {
@@ -1185,12 +1195,18 @@ async fn fold_after_load_through(
         &identities,
     )
     .await;
+    let (parts_read, buckets_listed, records_read) = coverage.as_ref().map_or((0, 0, 0), |c| {
+        (c.parts_read, c.buckets_listed, c.records_read)
+    });
     let load_fold = LoadFold {
         elapsed: started.elapsed(),
         entry_count: fold.entry_count,
         watermark_hour: fold.watermark_hour,
         seal_through_hour: Some(seal_through_hour),
         no_op: fold.no_op,
+        parts_read,
+        buckets_listed,
+        records_read,
     };
     match uncovered_commits(tokens, coverage) {
         None => Ok(load_fold),

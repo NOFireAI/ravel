@@ -431,6 +431,15 @@ pub struct LoadFold {
     /// commit it wrote, and fails with [`LoadError::FoldLeftCommitsUncovered`]
     /// otherwise; `false` when no fold ran.
     pub no_op: bool,
+    /// Snapshot part GETs the coverage check made. `0` when no fold ran or
+    /// the check could not read the snapshot.
+    pub parts_read: usize,
+    /// `(shard, hour)` buckets the coverage check listed, for commits it found
+    /// in no level-0 entry.
+    pub buckets_listed: usize,
+    /// Compaction and rewrite records the coverage check fetched from those
+    /// buckets.
+    pub records_read: usize,
 }
 
 /// Flush counts split by trigger cause: how many flushes each of the three

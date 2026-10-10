@@ -358,6 +358,8 @@ struct SnapshotEntries {
     level1_records: HashSet<(u32, u32, Vec<u8>)>,
     /// Entries across every part, all levels.
     entry_count: usize,
+    /// Part GETs that returned an object.
+    parts_read: usize,
 }
 
 /// GET and decode every part `head` references. A part that cannot be fetched
@@ -371,6 +373,7 @@ async fn read_snapshot_entries(
         level0: BTreeMap::new(),
         level1_records: HashSet::new(),
         entry_count: 0,
+        parts_read: 0,
     };
     for part_ref in &head.parts {
         let got = store
@@ -380,6 +383,7 @@ async fn read_snapshot_entries(
                 key: part_ref.key.clone(),
                 source,
             })?;
+        entries.parts_read += 1;
         let decoded =
             decode_part(&got.data, &limits).map_err(|source| SealDivergenceError::PartCorrupt {
                 key: part_ref.key.clone(),
@@ -492,7 +496,7 @@ pub struct SnapshotCoverage {
     /// The identities asked about that the snapshot does not cover, in the
     /// order given, each listed once.
     pub missing: Vec<EntryIdentity>,
-    /// Snapshot parts fetched: every part the HEAD references.
+    /// Part GETs made: one per part the HEAD references, `0` with no HEAD.
     pub parts_read: usize,
     /// `(shard, hour)` buckets listed: only those holding an identity that is
     /// not a level-0 entry of the snapshot.
@@ -510,7 +514,9 @@ pub struct SnapshotCoverage {
 /// naming it among its `inputs`, a rewrite record by its own `inputs` or
 /// through the predecessor chain [`crate::resolve_rewrite_supersession`]
 /// chases, the same rule the fold applies. A superseding record on the store
-/// whose parts the snapshot does not hold covers nothing.
+/// whose parts the snapshot does not hold covers nothing. A rewrite with no
+/// output parts, and a retention tombstone, remove their inputs from the
+/// snapshot without a level-1 entry, so those inputs are reported missing.
 ///
 /// Cost: one HEAD GET and one GET per part the HEAD references. Only for an
 /// identity found in no level-0 entry is its `(shard, hour)` bucket listed and
@@ -541,7 +547,7 @@ pub async fn snapshot_coverage(
     let snapshot = read_snapshot_entries(store, &head).await?;
     let mut coverage = SnapshotCoverage {
         watermark_hour: Some(head.watermark_hour),
-        parts_read: head.parts.len(),
+        parts_read: snapshot.parts_read,
         ..SnapshotCoverage::default()
     };
 
@@ -1477,7 +1483,9 @@ mod tests {
     }
 
     /// A compaction record on the store whose parts the snapshot does not
-    /// hold covers nothing: the snapshot is what queries read.
+    /// hold covers nothing, even beside a held compaction in the same
+    /// `(shard, hour)`: a level-1 entry covers only the record whose
+    /// `input_set_hash` it carries.
     #[tokio::test]
     async fn coverage_ignores_a_compaction_the_snapshot_does_not_hold() {
         let store = Arc::new(MemoryStore::new());
@@ -1485,16 +1493,26 @@ mod tests {
         let now = 600_000 * NS_PER_HOUR;
         let created = now - SEALED_AGE_NS;
         let hour = u32::try_from(created / NS_PER_HOUR).expect("fits u32");
-        publish_segment(store.as_ref(), tenant, 1, created).await;
+        let compacted = publish_segment(store.as_ref(), tenant, 1, created).await;
+        publish_compaction(store.as_ref(), tenant, hour, &[&compacted], created).await;
         fold(store.clone(), tenant, now).await;
         let late = publish_segment(store.as_ref(), tenant, 2, created).await;
         publish_compaction(store.as_ref(), tenant, hour, &[&late], created).await;
 
-        let found = coverage(store.as_ref(), tenant, &[identity(&late)])
-            .await
-            .expect("readable");
-        assert_eq!(found.missing, vec![identity(&late)]);
-        assert_eq!(found.records_read, 1, "the compaction record was read");
+        let found = coverage(
+            store.as_ref(),
+            tenant,
+            &[identity(&compacted), identity(&late)],
+        )
+        .await
+        .expect("readable");
+        assert_eq!(
+            found.missing,
+            vec![identity(&late)],
+            "only the compaction the snapshot holds covers its input: {found:?}"
+        );
+        assert_eq!(found.buckets_listed, 1);
+        assert_eq!(found.records_read, 2, "both compaction records were read");
     }
 
     /// No HEAD: nothing is covered.

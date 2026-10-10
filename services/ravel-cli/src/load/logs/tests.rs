@@ -3789,6 +3789,7 @@ fn uncovered_commits_names_the_missing_commits() {
     assert_eq!(uncovered_commits::<String>(&tokens, Ok(covered)), None);
 
     let missing = ravel_catalog::SnapshotCoverage {
+        watermark_hour: Some(H + 1),
         missing: tokens[1..].iter().map(token_identity).collect(),
         ..ravel_catalog::SnapshotCoverage::default()
     };
@@ -3806,6 +3807,21 @@ fn uncovered_commits_names_the_missing_commits() {
     assert_eq!(finding.matches(" writer ").count(), 10, "{finding}");
     assert!(finding.contains("seq 10; and 1 more"), "{finding}");
     assert!(!finding.contains("seq 11"), "{finding}");
+
+    // No HEAD after the fold: there is no snapshot it left to name.
+    let no_head = ravel_catalog::SnapshotCoverage {
+        missing: tokens[..1].iter().map(token_identity).collect(),
+        ..ravel_catalog::SnapshotCoverage::default()
+    };
+    let (hours, finding) =
+        uncovered_commits::<String>(&tokens[..1], Ok(no_head)).expect("one is missing");
+    assert_eq!(hours, vec![H]);
+    assert_eq!(
+        finding,
+        "1 of the 1 commits it published are in no snapshot: the fold left no catalog HEAD, \
+         in ingest hour(s) 472222: shard 0 hour 472222 writer \
+         6c3f3102-5da4-454b-b826-aa47f78cac09 epoch 7 seq 0"
+    );
 
     let (hours, finding) =
         uncovered_commits(&tokens, Err("part t/x/p.part: not found")).expect("unchecked");

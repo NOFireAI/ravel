@@ -983,10 +983,14 @@ pub(super) fn fold_summary(fold: &LoadFold, covered: bool) -> String {
     };
     format!(
         "  fold after load  : {outcome}, seal_through_hour {}, watermark_hour {}, entries {}, \
-         elapsed {:.3}s (included in elapsed)\n",
+         parts read {}, buckets listed {}, records read {}, elapsed {:.3}s (included in \
+         elapsed)\n",
         hour(fold.seal_through_hour),
         hour(fold.watermark_hour),
         fold.entry_count,
+        fold.parts_read,
+        fold.buckets_listed,
+        fold.records_read,
         fold.elapsed.as_secs_f64(),
     )
 }
