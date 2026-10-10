@@ -405,6 +405,24 @@ check "classifier: B aborts rose (1 against 0), B published still fails" "1" \
   "$(cons "${LOG_SILENT}" "${LOG_PUBLISHED}" 0)"
 check "classifier: unreadable aborts counter fails even when A finished" "1" \
   "$(CURL_MODE=unreachable cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
+
+# Both workers run before the kill: B's publish counts only past its line
+# count at the kill. Args: A's log, B's log, B's line count at the kill.
+cons_from() { rc_of oracle_conservation_or_unmeasured "$1" http://stub 1 "$2" "$3"; }
+LOG_B_PRE_KILL="${SCRATCH}/b-pre-kill.log"
+{ printf '%s\n' "${PUB_LINE}"; printf '2026-10-10T05:31:00Z  INFO ravel_server: other work\n'; } >"${LOG_B_PRE_KILL}"
+LOG_B_POST_KILL="${SCRATCH}/b-post-kill.log"
+{ printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n'; printf '%s\n' "${PUB_LINE}"; } >"${LOG_B_POST_KILL}"
+check "classifier: B published only before the kill, A unfinished fails conservation" "1" \
+  "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_PRE_KILL}" 1)"
+check "classifier: B published only before the kill, A finished is could-not-measure" "3" \
+  "$(cons_from "${LOG_A_FINISHED}" "${LOG_B_PRE_KILL}" 1)"
+check "classifier: B published after the kill passes" "0" \
+  "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_POST_KILL}" 1)"
+check "classifier: a non-integer line count fails conservation" "1" \
+  "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_POST_KILL}" x)"
+check "chaos_line_count counts lines" "2" "$(chaos_line_count "${LOG_B_PRE_KILL}")"
+check "chaos_line_count of a missing file is 0" "0" "$(chaos_line_count "${SCRATCH}/no-such.log")"
 scenario2_summary() {
   # Args: A's log, B's log, aborts baseline, an extra failure or "".
   ORACLE_PASS=(other)
@@ -434,6 +452,11 @@ inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight')"
 first_a_kill_line="$(scenario2_line 'sigkill_pid "$WORKER_A_PID"')"
 check "scenario 2 checks the universe before the wait, and kills right after it" "yes" \
   "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_a_kill_line:-0}" -eq $(( inflight_wait_line + 2 )) ]] && echo yes || echo no)"
+b_count_line="$(scenario2_line 'B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"')"
+last_a_kill_line="$(grep -n -F 'sigkill_pid "$WORKER_A_PID"' "${CHAOS_DIR}/kill-maintain-worker.sh" | tail -1 | cut -d: -f1)"
+cons_call_line="$(scenario2_line '"$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" || true')"
+check "scenario 2 counts B's log after the last kill and passes it to the conservation oracle" "yes" \
+  "$([[ -n "${b_count_line}" && -n "${cons_call_line}" && "${b_count_line}" -gt "${last_a_kill_line:-999999}" && "${b_count_line}" -lt "${cons_call_line}" ]] && echo yes || echo no)"
 check "scenario 2 headers make no 'provably' claim" "no" \
   "$([[ "${scenario2_body}" == *provabl* ]] && echo yes || echo no)"
 

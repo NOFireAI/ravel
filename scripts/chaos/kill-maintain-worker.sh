@@ -290,6 +290,7 @@ else
   echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
 fi
 WORKER_A_PID=""
+B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"
 
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
@@ -298,7 +299,7 @@ oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
 # unfinished compaction work decides whether a survivor that published
 # nothing is a failure or could not be measured.
 oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
-  "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" || true
+  "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
 oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
 
