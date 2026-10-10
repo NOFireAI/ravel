@@ -349,7 +349,7 @@ merged value, so they differ wherever a row takes its value from the resource
 or scope, and no figure they carry tells that difference apart from a defect.
 
 A per-query coverage figure (segments stamped over segments touched, per
-carrier) is not built.
+carrier, under phase accounting) is not built.
 
 ## Predicate-free full-window logs scan: request count
 

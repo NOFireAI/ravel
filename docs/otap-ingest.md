@@ -179,8 +179,8 @@ them out would diverge from an OTLP-fronted one on the same overload input.
 
 `EXP_HISTOGRAM_DP_EXEMPLARS` rows are counted as dropped, never carried.
 The reason is structural, not a missing decode: `EXP_HISTOGRAM_DATA_POINTS`
-is rejected as an unsupported metric type on this path, so the series an
-exemplar would attach to is never built.
+is rejected as an unsupported metric type on this path (ADR-0017), so the
+series an exemplar would attach to is never built.
 When that changes, the attachment rule is the data point's own series, the
 same as a gauge or sum: Ravel stores a native histogram as one series with
 one native-histogram sample per timestamp rather than a set of exploded

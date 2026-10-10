@@ -1462,13 +1462,13 @@ is, before `PostingsSection::parse` touches the header. This is the only
 protection an out-of-bounds or garbage `first_term`, offset, or count in
 the header gets: the structural checks alone (ascending order, cap checks,
 exact block tiling) would let a header byte flip route `probe` to the wrong
-block as long as ordering and per-block checksums still passed. `probe` adds a second, independent check for a future reader
-that fetches one block via a range read instead of the whole section: it
-requires the decompressed block's first term to equal the sparse
-entry's `first_term`, and every term in the block to sort below the next
-entry's `first_term`. The `enc`/`comp` bytes of a page are covered by the
-enclosing block's crc, so a flipped tag fails the crc rather than causing
-a silent misdecode. Pad bytes between sections are never interpreted and
+block as long as ordering and per-block checksums still passed. `probe` adds
+a second, independent check for a future reader that fetches one block via
+a range read instead of the whole section: it requires the decompressed
+block's first term to equal the sparse entry's `first_term`, and every term
+in the block to sort below the next entry's `first_term`. The `enc`/`comp`
+bytes of a page are covered by the enclosing block's crc, so a flipped tag
+fails the crc rather than causing a silent misdecode. Pad bytes between sections are never interpreted and
 fall under the whole-object BLAKE3 in the commit record.
 
 ## Pruning soundness (invariant)
