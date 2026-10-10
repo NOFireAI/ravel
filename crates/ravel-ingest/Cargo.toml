@@ -31,6 +31,8 @@ ravel-logseg = { workspace = true }
 # provisioning module, so ravel-catalog is a build-time dependency, not only a
 # dev one. ravel-catalog does not depend on ravel-ingest, so this is acyclic.
 ravel-catalog = { workspace = true }
+# The ADR-1702 write gate the shard flushes encode on.
+ravel-cpu-gate = { workspace = true }
 # ravel-rspan (ADR-0041) is new and not yet listed in the workspace
 # [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
 # this is a version-pinned path dependency (the pin keeps cargo-deny from
