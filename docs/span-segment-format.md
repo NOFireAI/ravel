@@ -563,8 +563,8 @@ own framing carries the access-path checksums docs/log-segment-format.md's
 coverage map lists: a header crc32c over every header byte, a directory
 crc32c per field, and a per-bucket crc32c over each bucket's stored bytes,
 each verified before the bytes under it are interpreted; the `Section`
-entry's offset, length and `uncompressed_len` are under `footer_crc32c` as
-for every other section.
+entry's offset, length, `uncompressed_len` and `prefix_len` are under
+`footer_crc32c` as for every other section.
 
 ## Compaction (L0 → L1)
 

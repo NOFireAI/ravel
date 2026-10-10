@@ -363,16 +363,29 @@ flowchart LR
     fold --rebuild-key-index [--field <name>]` re-encodes every part in
     HEAD that lacks a `key_index` ref for a declared field (every part,
     for spans), builds the leaf from the sections as a regular fold would,
-    and reports parts rebuilt, section bytes read and leaves written; it
-    runs under the fold's claim, is resumable from the durable cursor, and
-    refuses while a writer is live, like `--max-flush-lifetime`. Detection
-    is the sweeper's own counter: `ravel_maintain_objects_deleted_total`
-    gains `kind="kidx"` beside its existing kinds (T9), and that series
+    and reports parts rebuilt, leaves written, section bytes read and
+    section GETs issued. Like the CLI fold it extends, it holds no claim
+    and keeps no cursor (`services/ravel-cli/src/catalog.rs` has neither;
+    a rebuild that stops is rerun and skips the parts that now carry a
+    ref, which is what makes it restartable), and it takes
+    `--writers-stopped` as the same assertion the plain fold takes, since
+    nothing in the CLI can detect a live writer. Detection: the
+    unreferenced-catalog-object sweep reports `CatalogSweepOutcome
+    { deleted, kept }` with no per-kind split today and no metric of its
+    own (`ravel_maintain_objects_deleted_total` counts the per-shard data
+    sweep's four `SweepReport` fields and nothing under `catalog/`), so T9
+    adds `deleted_kidx` to the outcome and renders it as
+    `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
     rising while HEAD carries no `key_index` refs is the signature the
-    operator acts on. The cost of a bad rollout is one `--rebuild-key-index`
-    run, which reads the affected parts' sections once (about 2% of logs
-    bytes, about 6% of span bytes), and scans until it has run; nothing is
-    retained and nothing is silent. The mixed-version combinations (old
+    operator acts on. The cost of a bad rollout is one rebuild run over the
+    affected parts: per part entry, one footer suffix GET and one section
+    range GET, so `2 x entries` ranged GETs (about 160,000 on the Stage 0
+    spans load as written, about 1,600 at the decision 9 geometry) and the
+    sections' bytes (about 2% of logs bytes, about 6% of span bytes); the
+    request figure is the one that decides viability, as the Context's
+    566 s resolve shows, and both figures are banded in the acceptance
+    table. Scans until it has run; nothing is retained and nothing is
+    silent. The mixed-version combinations (old
     folder then new sweeper, old sweeper against a new HEAD, new folder
     after an old folder, then the rebuild) are a
     required test, not an intention.
@@ -568,11 +581,12 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   section: Class A, converged by retention, rewrite-on-touch (compaction
   re-encodes every input), and `maintain migrate` once a reader window
   exists. The `.kidx` leaf and the `SnapshotPartRef` field: Class B, rebuilt
-  by the fold. `TypedAttrColumn.key_index` and
-  `Section.prefix_len = 7` on both footers: additive, read by the KEY_IDX
-  probe only, ignored by any reader that does not know it, and bumping no
-  trailer version (the footer protos are additive-only by the frozen-field
-  rule). `TypedAttrColumn.key_index` and
+  by the fold. `Section.prefix_len = 7` on both footers: an additive field
+  on a Class A object's footer, set only on a KEY_IDX entry, read by the
+  KEY_IDX probe only, ignored by any reader that does not know it, bumping
+  no trailer version (the footer protos take additive fields without one,
+  by the frozen-field rule), and converging with the object it sits in.
+  `TypedAttrColumn.key_index` and
   `TypedAttrColumnConfig.index_trace_id`: Class C under the R1 amendment,
   additive with a `format_version` bump, readers first.
 - **Version regime.** Pre-v1.0 single version (ADR-0027, dated to v1.0 by
@@ -711,7 +725,7 @@ cache state) and stamped into the report.
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
-| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry | over 2x the signal's tier-1 figure |
+| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry), both figures on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` GETs, or either figure missing from the report |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 
@@ -727,7 +741,7 @@ cache state) and stamped into the report.
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
 | T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), inspector | 3 | ravel-logseg, ravel-catalog (config), ravel-cli | yes |
-| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set and `kind="kidx"` on `ravel_maintain_objects_deleted_total`, `catalog fold --rebuild-key-index`, `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
+| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index`, `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
 | T10 spans read path: routing, tier 2, tier 1, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T12 Stage 1: the Stage 0 arms re-run against the table above, acceptance amendment | all | docs | no |

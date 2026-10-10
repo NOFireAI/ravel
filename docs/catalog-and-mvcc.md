@@ -893,9 +893,10 @@ scanning. A part whose slices do not tile is `Corrupted` for that field.
 For each covered part, in the one slice that holds the lookup's `key8`:
 GET 1 is `[0, prefix_len)` (header and directory,
 verified by their crcs). The ref's copies of `field`, `key_type`, `key8_lo`,
-`key8_hi`, `bucket_bits`, `entry_count` and `part_blake3` serve only to
-pick the slice and size GET 1; the header is authoritative, being under the
-leaf's blake3, and after GET 1 the reader compares the two and rejects the
+`key8_hi`, `bucket_bits`, `entry_count`, `part_blake3` and `prefix_len`
+serve only to pick the slice and size GET 1; the header is authoritative,
+being under the leaf's blake3, and after GET 1 the reader compares the two
+and rejects the
 leaf as `Corrupted` on any disagreement (the part reads as uncovered),
 never selecting a bucket from the ref's `bucket_bits`. GET 2 is the one
 bucket the header's `bucket_bits` and the mix select (verified by its frame
@@ -969,14 +970,20 @@ the regular fold, so the repair is explicit: `ravel-cli catalog fold
 --rebuild-key-index [--field <name>]`, the one sanctioned exception to the
 scope rule above, re-encodes every part in HEAD that lacks a `key_index`
 ref for a declared field (every part, for spans), builds each leaf from
-the sections as the regular fold does, and reports parts rebuilt, section
-bytes read and leaves written. It runs under the fold's claim, resumes
-from the durable cursor, and refuses while a writer is live. Detection is
-the sweeper's counter: `ravel_maintain_objects_deleted_total` gains
-`kind="kidx"` beside its existing kinds, and that series rising while HEAD
-carries no `key_index` refs is the signature an operator acts on. The cost
-of a bad rollout is one rebuild run over the affected parts' sections and
-scans until it has run; nothing is retained and nothing is silent. The
+the sections as the regular fold does, and reports parts rebuilt, leaves
+written, section bytes read and section GETs issued. Like the plain CLI
+fold it holds no claim and keeps no cursor: a run that stops is rerun and
+skips the parts that now carry a ref, and it takes `--writers-stopped` as
+the same assertion the plain fold takes. Detection: this sweep reports
+`CatalogSweepOutcome { deleted, kept }` with no per-kind split and no
+metric of its own today, so the leaf writer's change adds `deleted_kidx` to
+the outcome and renders it as
+`ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
+rising while HEAD carries no `key_index` refs is the signature an operator
+acts on. The cost of a bad rollout is one rebuild run over the affected
+parts, `2 x entries` ranged GETs (a footer suffix and a section range per
+entry) plus the sections' bytes, and scans until it has run; nothing is
+retained and nothing is silent. The
 mixed-version combinations (old folder then new sweeper, old sweeper
 against a new HEAD, new folder after an old folder, then the rebuild) are
 tested, not assumed (ADR-0849 section 1a).
