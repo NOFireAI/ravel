@@ -4979,6 +4979,9 @@ dependencies = [
 [[package]]
 name = "ravel-memory"
 version = "0.23.0"
+dependencies = [
+ "criterion",
+]
 
 [[package]]
 name = "ravel-object-store"
