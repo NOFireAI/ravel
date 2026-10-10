@@ -2380,8 +2380,8 @@ const PRUNING_KEYS: &[&str] = &[
 /// resolve stamp is a real nonzero measurement, and `auditMs` is the audit
 /// await itself: present with the no-op sink and at least the configured
 /// sink's hold when that sink is slow, which a stamp around anything after the
-/// await cannot reach. A metrics statement has no logs scan, so `scans` is 0
-/// and the three single-scan fields are absent.
+/// await cannot reach. A metrics statement has no logs scan, so `scans` is 0,
+/// the three single-scan fields are absent and the three scan maxima read 0.
 #[tokio::test]
 async fn sql_response_carries_timings_and_pruning_stats() {
     let query = "SELECT ts, value FROM samples ORDER BY ts";
@@ -2396,6 +2396,13 @@ async fn sql_response_carries_timings_and_pruning_stats() {
         timings["scans"], 0,
         "a metrics plan has no logs scan: {value}"
     );
+    for key in ["planningWaitMaxMs", "openMaxMs", "decodeBuildMaxMs"] {
+        assert_eq!(
+            timings[key].as_f64(),
+            Some(0.0),
+            "{key} is 0 with no logs scan: {value}"
+        );
+    }
     let resolve_ms = timings["resolveMs"].as_f64().expect("resolveMs");
     assert!(resolve_ms > 0.0, "resolve took measurable time: {value}");
     for key in TIMINGS_KEYS {

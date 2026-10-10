@@ -470,7 +470,11 @@ async fn scan_timing_counts_logs_scans_in_the_plan() {
         .await
         .expect("predicate-free logs count");
     assert_eq!(outcome.output.num_rows(), 1);
-    assert_eq!(outcome.stats.scan_timing.scans, 999, "{:?}", outcome.stats);
+    assert_eq!(
+        outcome.stats.scan_timing.scans, 0,
+        "answered from segment statistics, with no LogsScanExec: {:?}",
+        outcome.stats
+    );
 
     let multi = [
         (
@@ -492,18 +496,18 @@ async fn scan_timing_counts_logs_scans_in_the_plan() {
             999,
         ),
     ];
+    let mut expected = Vec::new();
+    let mut reported = Vec::new();
     for (shape, sql, scans) in multi {
         let outcome = fixture
             .executor
             .execute(tenant.hash(), &request(sql))
             .await
             .unwrap_or_else(|err| panic!("{shape}: {err}"));
-        assert_eq!(
-            outcome.stats.scan_timing.scans, scans,
-            "{shape}: {:?}",
-            outcome.stats
-        );
+        expected.push((shape, scans));
+        reported.push((shape, outcome.stats.scan_timing.scans));
     }
+    assert_eq!(reported, expected);
 }
 
 fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> {

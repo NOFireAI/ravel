@@ -163,13 +163,13 @@ async fn not_found_before_the_first_batch_retries_exactly_once_and_succeeds() {
 }
 
 /// The same retry on the logs path: a `NotFound` on the only RLOG object's
-/// first GET re-resolves once and succeeds, and the reported stamps exclude
+/// first GET (logs data objects share the `.rseg` key suffix) re-resolves once and succeeds, and the reported stamps exclude
 /// the discarded attempt's held resolve.
 #[tokio::test]
 async fn a_logs_not_found_before_the_first_batch_retries_once_and_excludes_the_first_attempt() {
     let plan = FaultPlan::empty().with_rule(
         Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
-            .with_key_contains(".rlog")
+            .with_key_contains(".rseg")
             .with_occurrence(Occurrence::Nth(1)),
     );
     let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
