@@ -411,8 +411,10 @@ async fn a_logs_query_with_an_indexed_predicate_prunes_blocks_by_postings() {
 /// `scan_timing.scans` counts `LogsScanExec` nodes, not plan nodes and not
 /// row reads: a late-materialized `SELECT * ... ORDER BY ts LIMIT k` holds
 /// one scan (phase 2's `LogsRowFetchExec` re-reads rows without a second
-/// scan), a `UNION ALL` of two logs branches holds two, and a metrics
-/// statement holds none.
+/// scan); a `UNION ALL` of two logs branches, a self-join, an
+/// `IN (SELECT ... FROM logs)` and a CTE read twice each hold two; a metrics
+/// statement holds none, and so does a predicate-free `count(*)` over logs,
+/// answered from segment statistics without a `LogsScanExec`.
 #[tokio::test]
 async fn scan_timing_counts_logs_scans_in_the_plan() {
     let tenant = tenant_id("logs-scan-count");
@@ -481,19 +483,19 @@ async fn scan_timing_counts_logs_scans_in_the_plan() {
             "self-join",
             "SELECT a.ts FROM logs a JOIN logs b ON a.ts = b.ts \
              WHERE a.attrs['region'] = 'region-0'",
-            999,
+            2,
         ),
         (
             "IN subquery",
             "SELECT ts FROM logs WHERE ts IN \
              (SELECT ts FROM logs WHERE attrs['region'] = 'region-0')",
-            999,
+            2,
         ),
         (
             "CTE read twice",
             "WITH r AS (SELECT ts FROM logs WHERE attrs['region'] = 'region-0') \
              SELECT ts FROM r UNION ALL SELECT ts FROM r",
-            999,
+            2,
         ),
     ];
     let mut expected = Vec::new();
