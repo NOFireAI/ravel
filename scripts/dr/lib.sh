@@ -65,7 +65,8 @@
 #   DR_AUDIT_TOKEN_KEY_FILE   Required when DR_TENANT_HASH_MODE=unkeyed. File
 #                        holding the 64-hex-character audit token key. An
 #                        unkeyed deployment has no deployment key to derive it
-#                        from, and ravel-server refuses to start under its
+#                        from, and ravel-server, launched here with
+#                        RAVEL_AUDIT_MODE=required, refuses to start under its
 #                        default `--audit-text redacted` without one. The key
 #                        reaches the server, and only the server, as
 #                        RAVEL_AUDIT_TOKEN_KEY on its launch line; it is never

@@ -44,9 +44,11 @@ Every published port binds loopback (`127.0.0.1`) only, and every credential
 is a fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret`
 for RustFS). None of it is for a network-reachable deployment.
 
-The compose file also sets `RAVEL_AUDIT_TOKEN_KEY` to a fixed development key
-so that the audit trail can tokenize query text. For anything beyond a laptop,
-set your own 64-hex-character value with that same variable.
+The query audit is off by default, and the compose file turns it on with
+`RAVEL_AUDIT_MODE: required`. With the audit on, the server needs a key to
+tokenize query text, so the compose file also sets `RAVEL_AUDIT_TOKEN_KEY` to a
+fixed development key. For anything beyond a laptop, set your own
+64-hex-character value with that same variable.
 
 The server is usually ready a few seconds after `up -d` returns, because the
 bucket creation and the store-qualify one-shot must finish first. Until the
@@ -341,8 +343,11 @@ tenant `acme`.
 - The environment variables stand in for the `--s3-*` flags, and both binaries
   read them the same way.
 - `RAVEL_AUDIT_TOKEN_KEY` is the same development key that the compose stack
-  uses. It is needed here for the same reason: this bucket is unkeyed, so
-  there is no deployment key to derive one from.
+  uses. The server reads it only when the query audit is on, which this
+  command leaves at its default, off, so here the key is accepted and unused.
+  Add `--audit-mode required` to turn the audit on as the compose stack does;
+  the key is then needed, because this bucket is unkeyed and there is no
+  deployment key to derive one from.
 - `store qualify` is idempotent: on an already-qualified bucket it reports the
   existing record and exits 0.
 - To get the PromQL and ingest surfaces without the SQL endpoint, drop

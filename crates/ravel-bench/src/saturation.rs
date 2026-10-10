@@ -9,6 +9,11 @@
 //!
 //! The bands were published on the tracking issue before either scenario ran.
 //! They are constants here, not flags, so a run cannot move one to fit.
+//! They were published against a server with the query audit on. Since
+//! #2791 the harness starts the server with the audit off (`saturation_run`
+//! sets `audit_pipeline: None`), so each query no longer awaits two audit
+//! PUTs; a run on this basis is easier on the bands than the runs that set
+//! them, and a comparison across that commit must say so.
 //!
 //! This module also holds the Prometheus text parsing the bins scrape
 //! `/metrics` with, and the host stamp each run prints.

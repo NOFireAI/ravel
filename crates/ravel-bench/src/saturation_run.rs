@@ -274,7 +274,10 @@ pub async fn start_server(
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let loopback: SocketAddr = "127.0.0.1:0".parse()?;
     let config = ServerConfig {
-        audit_pipeline: Default::default(),
+        // The query audit is off (#2791): no audit PUT and no flush await per
+        // query. The ADR-1702 task 11 bands in `saturation` were published
+        // against an audited server; see the note there.
+        audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,

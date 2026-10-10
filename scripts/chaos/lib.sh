@@ -85,10 +85,14 @@ CHAOS_TENANT_NAME="${CHAOS_TENANT_NAME:-chaos-tenant}"
 CHAOS_TENANT_HASH_MODE="${CHAOS_TENANT_HASH_MODE:-unkeyed}"
 CHAOS_TENANT_HASH_KEY_FILE="${CHAOS_TENANT_HASH_KEY_FILE:-}"
 
-# `--audit-text redacted`, the default, refuses to start an `all`-mode server
-# with no tokenization key, and an unkeyed bucket has no deployment key to
-# derive one from. This is the dev-only key deploy/docker-compose/ravel.yml
-# also defaults to; a keyed run derives its key from the key file instead.
+# With the query audit enabled, `--audit-text redacted`, the default, refuses
+# to start an `all`-mode server with no tokenization key, and an unkeyed bucket
+# has no deployment key to derive one from. The chaos lanes read no audit
+# record and leave `--audit-mode` at its default, `off` since #2791, so the
+# server never reads this key; it stays exported for a run that sets
+# RAVEL_AUDIT_MODE itself. This is the dev-only key
+# deploy/docker-compose/ravel.yml also defaults to; a keyed run derives its key
+# from the key file instead.
 if [[ "${CHAOS_TENANT_HASH_MODE}" == "unkeyed" ]]; then
   export RAVEL_AUDIT_TOKEN_KEY="${RAVEL_AUDIT_TOKEN_KEY:-998626405d16aeca71f4fac7673b55213a774ba40401709022e81a27f050ffd8}"
 fi

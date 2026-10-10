@@ -793,8 +793,9 @@ for s in kill-ingest-flush.sh kill-maintain-worker.sh; do
     "$(CHAOS_TENANT_HASH_MODE=bogus rc_of bash "${CHAOS_DIR}/${s}" --check)"
 done
 
-# `--audit-text redacted` refuses an `all`-mode server with no tokenization
-# key, and an unkeyed bucket has no deployment key to derive one from.
+# With the audit enabled, `--audit-text redacted` refuses an `all`-mode server
+# with no tokenization key, and an unkeyed bucket has no deployment key to
+# derive one from.
 audit_key() {
   env -u CHAOS_TENANT_HASH_MODE -u CHAOS_TENANT_HASH_KEY_FILE -u RAVEL_AUDIT_TOKEN_KEY "$@" \
     bash -c 'source "$1" && printf "%s" "${RAVEL_AUDIT_TOKEN_KEY:-unset}"' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null
@@ -809,6 +810,10 @@ compose_audit_key="$(sed -n 's/.*RAVEL_AUDIT_TOKEN_KEY: \${RAVEL_AUDIT_TOKEN_KEY
   "${REPO_ROOT}/deploy/docker-compose/ravel.yml")"
 check "audit key: unkeyed mode uses the compose file's dev-only key" "${compose_audit_key:-<no key in ravel.yml>}" \
   "$(audit_key)"
+# The query audit is off by default since #2791, so the compose key is read
+# only because the compose file turns the audit on beside it.
+check "audit mode: the compose file's query-serving service sets RAVEL_AUDIT_MODE: required" "1" \
+  "$(grep -c '^ *RAVEL_AUDIT_MODE: required$' "${REPO_ROOT}/deploy/docker-compose/ravel.yml")"
 
 # ravel_cli takes the same tenant-hash flags as the server, ahead of the
 # subcommand (they are top-level flags of ravel-cli). A stub ravel-cli on PATH

@@ -332,6 +332,11 @@ for pair in seed.sh:1 start.sh:2; do
   keyed_launches="$(grep -c 'RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" \(exec \)\{0,1\}"${SERVER_ARGV\[@\]}"' "${DR_DIR}/${launcher}")"
   check "custody: ${launcher} has ${expected} ravel-server launch(es), each passing the audit key" \
     "${expected}:${expected}" "${launches}:${keyed_launches}"
+  # The query audit is off by default (#2791), so a launch without the mode
+  # would carry a key the server never reads and write no audit record.
+  audited_launches="$(grep -c 'RAVEL_AUDIT_MODE=required RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" \(exec \)\{0,1\}"${SERVER_ARGV\[@\]}"' "${DR_DIR}/${launcher}")"
+  check "custody: ${launcher} has ${expected} ravel-server launch(es), each with RAVEL_AUDIT_MODE=required" \
+    "${expected}:${expected}" "${launches}:${audited_launches}"
 done
 
 # --- finding 1: the buckets are named, never guessed -----------------------

@@ -2131,7 +2131,7 @@
       "id": 36,
       "type": "timeseries",
       "title": "Durable auth and audit",
-      "description": "The durable token cache's refresh health, and audit write failures. Failing closed on stale state rejects live traffic; a failing audit write means a request was served with no durable record of it.",
+      "description": "The durable token cache's refresh health, and audit write failures. Failing closed on stale state rejects live traffic; a failing audit write means a request was served with no durable record of it. The audit series render only under --audit-mode required or best-effort, and are absent on a default deployment, where the query audit is off.",
       "gridPos": {
         "h": 8,
         "w": 12,
