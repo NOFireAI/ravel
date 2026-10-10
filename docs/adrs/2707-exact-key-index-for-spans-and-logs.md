@@ -110,8 +110,10 @@ publishes packs, and it left that carrier to the first implementing ADR. This
 ADR picks the carrier: a per-object section inside the data object, read by
 the fold with ranged GETs. The fold already reads data objects to build
 column statistics (`crates/ravel-catalog/src/column_stats_build.rs`), but
-whole; this reads about 1-2% of each object (Stage 0's tier-1 figure for
-logs, and about 1 B/span for spans, derived).
+whole; this reads the section alone: about 2% of each logs object (Stage
+0, measured from the distinct pair counts) and about 6% of each spans
+object (one 12 B entry per trace per object against 21 B/span stored,
+derived; the measured section size is a T7 acceptance figure).
 
 ## Decision
 
@@ -295,7 +297,9 @@ flowchart LR
     magic "RKI1"; u32 LE header_len
     KeyIndexLeafHeader: format_version (1), tenant_hash, signal,
       part_blake3, field, key_type, key8_lo, key8_hi, bucket_bits,
-      entry_count, covered_entry_count, uncovered_entry_ordinals[], body_len
+      entry_count (index entries in this leaf),
+      part_entry_count (SnapshotEntry count of the covered part),
+      uncovered_entry_ordinals[], body_len
     u32 LE header_crc32c
     u32 LE ends[2^bucket_bits]; u32 LE dir_crc32c
     body: frames tiling [0, body_len):
@@ -326,15 +330,21 @@ flowchart LR
   error. `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field 7
   precedent (ADR-0063, ADR-1413): an older reader ignores the field and
   scans. A new message `SnapshotKeyIndexLeafRef` and a `KeyIndexLeafHeader`
-  are added to proto/ravel/catalog.proto by the implementing task, together
-  with `SnapshotHead.fold_min_format` (additive): the lowest folder format
-  allowed to re-encode this HEAD, stamped by the first leaf-writing folder
-  and checked by every folder before it re-encodes (see Lifecycle).
+  are added to proto/ravel/catalog.proto by the implementing task. The ref
+  carries the same fields as the leaf header so a reader can pick the slice
+  and size its first GET without opening the leaf; **the leaf header is
+  authoritative**, since it is under the leaf's blake3 and the ref is not.
+  After GET 1 the reader compares `field`, `key_type`, `key8_lo`, `key8_hi`,
+  `bucket_bits`, `entry_count` and `part_blake3` between the two, and any
+  disagreement rejects the leaf as `Corrupted` for that part (uncovered,
+  never a wrong-slot lookup); the reader never selects a bucket from the
+  ref's `bucket_bits`.
 - **Build.** The fold builds leaves for exactly the parts it re-encodes this
   fold (a part carried forward keeps its refs), from the tier-1 sections and
   never from rows and never from whole-object reads: per entry, a suffix GET
-  for the footer and a ranged GET of the KEY_IDX section (about 1-2% of the
-  object, Stage 0), merged across the part's entries, sorted, bucketed, and
+  for the footer and a ranged GET of the KEY_IDX section (about 2% of a
+  logs object, about 6% of a spans object; the Storage consequence has the
+  arithmetic), merged across the part's entries, sorted, bucketed, and
   written before the part PUT, so a refusal writes no object (the ADR-1413
   order). `bucket_bits` is chosen so that the directory and the mean bucket
   are about equal in bytes, clamped to 12..=16: at 20 M entries of about
@@ -353,14 +363,24 @@ flowchart LR
   sweeper then reaps the live leaves past the protection horizon; the
   lookup stays correct (the parts read as uncovered and are scanned) and
   the next fold pays a full section-read rebuild, so the cost is silent.
-  Two mechanisms replace the operational rule "do not run an old folder":
-  the HEAD carries a `fold_min_format` field the new folder stamps, and a
-  folder that reads a HEAD whose `fold_min_format` is above its own refuses
-  to fold that tenant with a typed error (the same shape as
-  `UnsupportedVersion` on a trailer); and the fold report counts leaves
-  rebuilt from scratch, so a rebuild the previous fold did not need shows
-  as a figure outside its band. The mixed-version folder-and-sweeper
-  combinations are a required test of both mechanisms.
+  No field in HEAD can constrain that folder: it predates every field this
+  ADR adds, and the fold builds HEAD as a fresh struct
+  (`crates/ravel-catalog/src/fold.rs`, prost keeps no unknown fields), so
+  its first CAS would drop any stamp for good. The guard therefore sits in
+  the process that would do the damage, the sweeper, which is in the same
+  change as the first leaf writer: before deleting an `idx/*.kidx` object
+  past the protection horizon, it reads the leaf header's `part_blake3`,
+  and if HEAD still names a part with that hash and no `key_index` ref for
+  that field, the leaf is live and orphaned by an old folder; the sweeper
+  keeps it, counts it in `ravel_catalog_sweep_orphaned_leaves_total`, and
+  the next new-format fold re-attaches it by hash instead of rebuilding
+  (the ref is reconstructed from the header, which carries every field the
+  ref holds). A leaf whose `part_blake3` names no live part is swept as
+  before. The fold report also counts leaves rebuilt from scratch, so a
+  rebuild the previous fold did not need shows as a figure outside its
+  band. The mixed-version combinations (old folder then new sweeper, old
+  sweeper against a new HEAD, new folder after an old folder) are a required
+  test of the guard, not an intention.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
   an unsupported version treating the leaf as absent (ADR-0849 section 4).
@@ -387,10 +407,13 @@ flowchart LR
   probed in the object: the footer, the KEY_IDX directory, one bucket. A
   present key names the blocks; an absent key drops the object without a
   block read. A tail object in RLOG costs the tail probe it already pays,
-  plus two small ranged GETs; in RSPAN the fetcher sizes its suffix to cover
-  the footer, BLOOM, SKIP_IDX and the KEY_IDX directory in the common case
-  (a reader choice, as RLOG's probe length is), so the usual cost is one
-  bucket GET.
+  plus two small ranged GETs; in RSPAN the fetcher's suffix covers the
+  footer, BLOOM and SKIP_IDX (a reader choice, as RLOG's probe length is)
+  and stops there, since KEY_IDX sits below SKIP_IDX and its bucket frames
+  lie between its directory and the tail. A trace lookup then issues one
+  ranged GET for the KEY_IDX header and directory (about 1 KB) and one for
+  its bucket, both addressed from the footer's section entry; the suffix is
+  never sized to reach the directory.
 - **Blocks.** Spans read the trace's block run by range
   (`RspanRangeReader::trace_block_span` then `decode_trace`,
   `crates/ravel-rspan/src/ranged.rs`), never `GetRange::Full`. Logs read the
@@ -430,8 +453,9 @@ flowchart LR
   L1 alike (`RspanWriter::finish_compacted` and `RlogWriter::finish_compacted`
   share the flush pipeline). When the compaction record lands, the fold
   re-encodes the part and rebuilds its leaves from the new entry set.
-  Rebuilding reads the sections again (about 1-2% of the part's bytes per
-  rebuild, derived); merging the previous leaf incrementally is left to the
+  Rebuilding reads the sections again (about 2% of a logs part's bytes and
+  about 6% of a spans part's per rebuild, derived); merging the previous
+  leaf incrementally is left to the
   implementing task if measured necessary, since ordinals shift on every
   re-encode.
 - **Resharding.** A trace whose spans straddle an activation sits in two
@@ -613,8 +637,8 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
 6. **Building the leaf from rows at fold.** The fold reads commit records
    and, for column statistics, whole objects; decoding every row of every
    re-encoded part per fold is the cost ADR-0849 section 1a forbids assuming
-   away. The tier-1 section is the carrier: about 1-2% of each object, by
-   ranged GET.
+   away. The tier-1 section is the carrier: about 2% of a logs object and
+   about 6% of a spans object, by ranged GET.
 7. **Per-object index sidecars.** Rejected by construction in ADR-0849
    section 2: a probe per object relocates the floor instead of removing
    it. Tier 1 is probed only for uncovered candidates, a set bounded by the
@@ -650,9 +674,10 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   1% an earlier draft of this document stated. Leaves are protected by the
   same 25 h 05 m horizon as parts and inherit the delayed-reclamation
   behaviour.
-- **Fold cost grows** by the section reads: about 1-2% of the bytes of every
-  part re-encoded in that fold, as ranged GETs. The fold report carries the
-  count and bytes per fold, asserted in the acceptance run.
+- **Fold cost grows** by the section reads: about 2% of the bytes of every
+  logs part and about 6% of every spans part re-encoded in that fold, as
+  ranged GETs. The fold report carries the count and bytes per fold,
+  asserted in the acceptance run.
 - **Writers pay the section:** one sorted pass over keys per object at
   flush and at compaction, measured in the loader's report.
 - **A new failure mode, bounded by construction.** A corrupt or stale leaf
@@ -684,8 +709,8 @@ cache state) and stamped into the report.
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages | a whole-object GET |
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
-| tier-1 section size | spans about 1 B/span; logs about 2% of object bytes | over 2x either |
-| fold section reads | about 1-2% of re-encoded part bytes per fold | over 5% |
+| tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
+| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry | over 2x the signal's tier-1 figure |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 

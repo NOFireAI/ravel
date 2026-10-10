@@ -152,7 +152,7 @@ Writers emit the sections physically in kind order today (1..3). Under v5
 the order is BLOCKS, KEY_IDX, SKIP_IDX, BLOOM: KEY_IDX sits between BLOCKS
 and SKIP_IDX, the placement RLOG uses for the same kind, so a suffix probe
 that covers the footer, BLOOM and SKIP_IDX does not have to span KEY_IDX's
-bucket frames (about 1-2% of the object) to reach them. Readers rely only on
+bucket frames (about 6% of the object) to reach them. Readers rely only on
 the footer's section offsets, never on adjacency. Bytes between sections are
 permitted and MUST be `0x00`; readers never interpret them. All three sections
 are mandatory: the reader rejects an object missing any of them as `Corrupted`.
@@ -490,17 +490,26 @@ before any block is read: an absent key proves the trace absent from every
 block, so the object is dropped with no block read (the SKIP_IDX
 `[min_trace_id, max_trace_id]` test is an interval, and with random ids
 nearly every object passes it); a present key names the blocks that hold
-any trace whose id shares the 8-byte prefix. The reader reads the
-intersection of that block set with the SKIP_IDX candidate run
-(`RspanRangeReader::trace_block_span`): a block in the KEY_IDX set that the
-`[min_trace_id, max_trace_id]` test excludes holds only a colliding trace
-and is skipped, and a block the range test admits that KEY_IDX does not
-name holds no span of either trace and is skipped. Neither disagreement is
-an error: both are the two indexes pruning on different evidence. A prefix
-collision (two traces sharing 8 leading bytes) is therefore at most one
-extra block read, and the per-row `trace_id` equality the reader already
-applies removes it from the result. An empty intersection with a present
-key is also legal and yields no rows. `Corrupted` is reserved for the
+any trace whose id shares the 8-byte prefix. The reader takes the
+intersection of that block set with the SKIP_IDX candidate set (the blocks
+whose `[min_trace_id, max_trace_id]` admit the id): a block in the KEY_IDX
+set that the range test excludes holds only a colliding trace and is
+skipped, and a block the range test admits that KEY_IDX does not name holds
+no span of either trace and is skipped. Neither disagreement is an error:
+both are the two indexes pruning on different evidence. The intersection is
+read as its contiguous runs: `RspanRangeReader::trace_block_span` takes one
+contiguous run and returns its byte range, so the reader issues one ranged
+GET per run of the intersection and decodes each run with `decode_trace`.
+Spans of one trace sort contiguously (the object sorts by `(trace_id,
+start_ts)`), so the intersection is one run in every case but a prefix
+collision whose other trace sits between this trace's blocks, which yields
+two runs and two GETs; a non-contiguous candidate set is therefore not
+`Corrupted` on this path, and `trace_block_span` is called per run rather
+than over the whole set. A prefix collision (two traces sharing 8 leading
+bytes) is thus at most one extra block read and at most one extra GET, and
+the per-row `trace_id` equality the reader already applies removes it from
+the result. An empty intersection with a present key is also legal and
+yields no rows. `Corrupted` is reserved for the
 section's own checks (checksums, a block ordinal at or past the SKIP_IDX
 block count, unsorted or duplicate entries). The section
 is the source the catalog fold reads, by ranged GET, to build the per-part

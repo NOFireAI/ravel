@@ -841,9 +841,12 @@ first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
   u32 LE      header_len
   header      KeyIndexLeafHeader protobuf (ravel.catalog.v1): format_version
               (1), tenant_hash (16), signal, part_blake3 (32), field,
-              key_type, key8_lo, key8_hi, bucket_bits, entry_count,
-              covered_entry_count (the part's entry count), repeated
-              uncovered_entry_ordinals, body_len
+              key_type, key8_lo, key8_hi, bucket_bits,
+              entry_count (index entries in this leaf's body),
+              part_entry_count (the covered part's SnapshotEntry count;
+              coverage = part_entry_count minus the uncovered ordinals),
+              repeated uncovered_entry_ordinals (each below
+              part_entry_count), body_len
   u32 LE      header_crc32c       (over magic, header_len and header)
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
   u32 LE      dir_crc32c
@@ -883,9 +886,15 @@ current declaration.
 to the window as `load_snapshot` does; a lookup with no time bound covers
 every part. For each covered part with a ref for the field whose slice holds
 the lookup's `key8`: GET 1 is `[0, prefix_len)` (header and directory,
-verified by their crcs), GET 2 is the one bucket the mix selects (verified
-by its frame crc and decompressed length), a binary search yields the
-`(entry_ordinal, block set)` matches. Exactly two ranged GETs per covering
+verified by their crcs). The ref's copies of `field`, `key_type`, `key8_lo`,
+`key8_hi`, `bucket_bits`, `entry_count` and `part_blake3` serve only to
+pick the slice and size GET 1; the header is authoritative, being under the
+leaf's blake3, and after GET 1 the reader compares the two and rejects the
+leaf as `Corrupted` on any disagreement (the part reads as uncovered),
+never selecting a bucket from the ref's `bucket_bits`. GET 2 is the one
+bucket the header's `bucket_bits` and the mix select (verified by its frame
+crc and decompressed length), a binary search yields the `(entry_ordinal,
+block set)` matches. Exactly two ranged GETs per covering
 part, issued concurrently across parts, under a per-query ceiling of 2,048
 leaf GETs; parts beyond the ceiling are scanned, not probed. Candidates are
 the matches over covered entries plus every uncovered segment: the entries a
@@ -901,8 +910,9 @@ fold (a part carried forward by reference keeps its refs, as for field 7),
 for every field the tenant's key-index set names at fold time plus every
 field any entry's section header names, from the tier-1 sections and never
 from rows: per entry, a suffix GET for the footer and a ranged GET of the
-KEY_IDX section (about 1-2% of the object on the ADR-2707 Stage 0
-corpora), merged across the part's entries, sorted, bucketed and written
+KEY_IDX section (about 2% of a logs object and about 6% of a spans object
+on the ADR-2707 Stage 0 corpora), merged across the part's entries, sorted,
+bucketed and written
 before the part PUT, so a refusal writes no object. The object is
 content-addressed by its own bytes (`hash16` is the blake3 of the leaf),
 not by the part's hash, for the reason the column-statistics section gives:
@@ -941,16 +951,21 @@ filtering rows after the index until the rewrite lands.
 **Rollout.** A fold process that predates field 8 would re-encode HEAD
 without it for every part it carries forward, after which the sweeper reaps
 the live leaves and the next fold rebuilds them from the sections; the
-lookup stays correct throughout, and the cost is silent. Two mechanisms
-stop that rather than an operational rule: HEAD carries `fold_min_format`
-(the lowest folder format allowed to re-encode it), which the first
-leaf-writing folder stamps, and a folder whose own format is below it
-refuses the tenant with a typed error instead of folding; and the fold
-report counts leaves rebuilt from scratch, so a rebuild the previous fold
-did not need is a figure outside its band. The mixed-version combinations
-(old sweeper against a new HEAD, an old folder against a stamped HEAD, new
-sweeper against a HEAD without the field) are tested, not assumed
-(ADR-0849 section 1a).
+lookup stays correct throughout, and the cost is silent. No HEAD field can
+constrain such a folder (it predates every field here, and the fold builds
+HEAD as a fresh struct, so an unknown field does not survive its CAS), so
+the guard sits in the sweeper, which ships in the same change as the first
+leaf writer: before deleting an `idx/*.kidx` object past the protection
+horizon it reads the leaf header's `part_blake3`; if HEAD names a live part
+with that hash and no `key_index` ref for the leaf's field, the leaf is
+orphaned by an old folder, is kept, and is counted in
+`ravel_catalog_sweep_orphaned_leaves_total`, and the next new-format fold
+re-attaches it from its header instead of rebuilding it. A leaf whose
+`part_blake3` names no live part is swept as before. The fold report also
+counts leaves rebuilt from scratch, so a rebuild the previous fold did not
+need is a figure outside its band. The mixed-version combinations (old
+folder then new sweeper, old sweeper against a new HEAD, new folder after
+an old folder) are tested, not assumed (ADR-0849 section 1a).
 
 ### Idempotency marker body layout
 
