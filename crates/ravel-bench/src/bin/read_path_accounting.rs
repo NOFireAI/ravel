@@ -58,6 +58,10 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderOptions, RowFilter};
+// parquet 59 deprecates ParquetObjectReader in favour of an AsyncFileReader
+// implementation. This is the parquet baseline bench, not a product path, and
+// the reader still works; it moves off the type when the lane is next touched.
+#[allow(deprecated)]
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::PageIndexPolicy;
@@ -788,6 +792,7 @@ async fn parquet_scan(
     filter: Option<Filter>,
     output_cols: &[usize],
 ) -> usize {
+    #[allow(deprecated)]
     let reader = ParquetObjectReader::new(store, path.clone());
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
     let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
