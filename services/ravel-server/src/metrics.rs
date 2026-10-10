@@ -155,11 +155,11 @@ impl Level {
 }
 
 /// The `reason` label on `ravel_admission_rejected_total` (ADR-0051 section
-/// 6, extended by the 2026-08-13 amendment). ADR-0051 named a closed set of
-/// six reasons `{body_size, byte_rate, series_rate, series_cap, skew,
-/// structural}`; the amendment adds a seventh, `clock`, for the receiver-clock
-/// floor, and ADR-2708 D2 an eighth, `resolved_label_bytes`. Seven of the
-/// eight are here. Four come from
+/// 6 and its amendments). ADR-0051 named a closed set of six reasons
+/// `{body_size, byte_rate, series_rate, series_cap, skew, structural}`; its
+/// 2026-08-13 amendment adds `clock`, for the receiver-clock floor, and its
+/// resolved-label bytes amendment (ADR-2708 D2) adds `resolved_label_bytes`,
+/// eight reasons in all. Seven are variants here. Four come from
 /// `AdmissionController::usage_snapshot` (`ravel_ingest::TenantUsage`), which
 /// covers the byte-rate and active-cap layers plus the receiver-clock floor.
 /// The other three, `skew`, `structural` and `resolved_label_bytes`, come from
@@ -167,10 +167,10 @@ impl Level {
 /// normalization layer keeps no row in that snapshot, so the ingest surfaces
 /// count its decisions where they observe them.
 ///
-/// The eighth, `body_size`, is enforced at the transport and still keeps no
-/// per-tenant counter, so a variant for it would render samples no data source
-/// can fill. It joins this enum when its counter does, additively, the same
-/// way a new `Signal` variant joins `signal_name`.
+/// `body_size` is not a variant: it is enforced at the transport and still
+/// keeps no per-tenant counter, so a variant for it would render samples no
+/// data source can fill. It joins this enum when its counter does,
+/// additively, the same way a new `Signal` variant joins `signal_name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     ByteRate,

@@ -1282,7 +1282,10 @@ and released just before the router takes its own buffered charge, so the two
 never coexist. A budget that cannot admit it sheds the request with HTTP 429
 and `Retry-After` (gRPC `RESOURCE_EXHAUSTED`) before normalization runs. A
 projection over the bound takes no charge, so an over-bound request is always
-the whole-request rejection above and never a 429 that a retry cannot clear.
+the whole-request rejection above, never a 429. That leaves no 429 a retry
+cannot clear only while `--max-ingest-buffer-bytes` is at least the 256 MiB
+bound, as its 512 MiB default is: with a smaller budget, a projection between
+the budget and the bound is shed with 429 on every retry.
 OTAP and Remote Write do not take this charge.
 
 ### Worst-case resident memory

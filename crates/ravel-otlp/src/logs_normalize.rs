@@ -3172,21 +3172,24 @@ mod tests {
         assert!(out.records.iter().all(|r| r.stream_attrs.len() == 1_015));
     }
 
+    /// Heap bytes a converted value actually allocated: string and byte
+    /// capacities, and each nested `Vec`'s element capacity.
     fn attr_value_heap_bytes(value: &AttrValue) -> usize {
         match value {
-            AttrValue::Str(s) => s.len(),
-            AttrValue::Bytes(b) => b.len(),
+            AttrValue::Str(s) => s.capacity(),
+            AttrValue::Bytes(b) => b.capacity(),
             AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 0,
-            AttrValue::List(items) => items
-                .iter()
-                .map(|v| std::mem::size_of::<AttrValue>() + attr_value_heap_bytes(v))
-                .sum(),
-            AttrValue::Map(entries) => entries
-                .iter()
-                .map(|(k, v)| {
-                    std::mem::size_of::<(String, AttrValue)>() + k.len() + attr_value_heap_bytes(v)
-                })
-                .sum(),
+            AttrValue::List(items) => {
+                items.capacity() * std::mem::size_of::<AttrValue>()
+                    + items.iter().map(attr_value_heap_bytes).sum::<usize>()
+            }
+            AttrValue::Map(entries) => {
+                entries.capacity() * std::mem::size_of::<(String, AttrValue)>()
+                    + entries
+                        .iter()
+                        .map(|(k, v)| k.capacity() + attr_value_heap_bytes(v))
+                        .sum::<usize>()
+            }
         }
     }
 
@@ -3212,7 +3215,10 @@ mod tests {
                     record(
                         Some(any(AnyValueVariant::StringValue("body".into()))),
                         vec![
-                            string_kv("http.route", &format!("/r/{i}")),
+                            // Repeated for two records, then a change.
+                            string_kv("http.route", &format!("/r/{}", i / 2)),
+                            string_kv("empty", ""),
+                            string_kv("alt", if i % 2 == 0 { "x" } else { "yy" }),
                             kv("code", AnyValueVariant::IntValue(200)),
                             kv("ok", AnyValueVariant::BoolValue(true)),
                             kv("raw", AnyValueVariant::BytesValue(vec![1, 2, 3])),
@@ -3242,18 +3248,17 @@ mod tests {
         let out = normalize_logs(req, &limits, 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 15);
+        // What each record actually allocated: its stream-attribute copy, its
+        // attribute `Vec`'s element capacity, and every key and value.
         let built: usize = out
             .records
             .iter()
             .map(|r| {
-                r.stream_attrs.len()
+                r.stream_attrs.capacity()
+                    + r.attrs.capacity() * std::mem::size_of::<(String, AttrValue)>()
                     + r.attrs
                         .iter()
-                        .map(|(k, v)| {
-                            std::mem::size_of::<(String, AttrValue)>()
-                                + k.len()
-                                + attr_value_heap_bytes(v)
-                        })
+                        .map(|(k, v)| k.capacity() + attr_value_heap_bytes(v))
                         .sum::<usize>()
             })
             .sum();

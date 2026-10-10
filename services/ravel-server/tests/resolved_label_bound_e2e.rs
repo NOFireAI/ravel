@@ -196,6 +196,62 @@ fn wide_resource_span_request() -> ExportTraceServiceRequest {
     }
 }
 
+/// Points in the measured gauge shape: the default per-request point cap.
+const GAUGE_POINTS: usize = 100_000;
+
+/// The `--max-ingest-buffer-bytes` default (512 MiB).
+const DEFAULT_INGEST_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The shape issue #2710 measured: one resource with nine resource labels of
+/// maximum-size values (`job`, `instance` and the seven default allowlisted
+/// keys), and one gauge of `GAUGE_POINTS` points whose single attribute
+/// alternates between two values, so no two neighbours share a label set.
+fn measured_gauge_request() -> ExportMetricsServiceRequest {
+    let limits = ravel_otlp::IngestLimits::default();
+    let wide = "r".repeat(limits.max_label_value_len);
+    let mut attributes = vec![
+        string_kv("service.name".to_string(), wide.clone()),
+        string_kv("service.instance.id".to_string(), wide.clone()),
+    ];
+    assert_eq!(limits.resource_attribute_allowlist.len(), 7);
+    attributes.extend(
+        limits
+            .resource_attribute_allowlist
+            .iter()
+            .map(|key| string_kv(key.clone(), wide.clone())),
+    );
+    let ts = now_ns() as u64;
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes,
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "g".to_string(),
+                    data: Some(MetricData::Gauge(Gauge {
+                        data_points: (0..GAUGE_POINTS)
+                            .map(|i| NumberDataPoint {
+                                attributes: vec![string_kv(
+                                    "k".to_string(),
+                                    if i % 2 == 0 { "a" } else { "b" }.to_string(),
+                                )],
+                                time_unix_nano: ts + i as u64,
+                                value: Some(NumberValue::AsDouble(i as f64)),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
 /// Two gauge points three hours old (past the 2h default lag, so every point
 /// is a skew rejection if normalization runs), with a 1 KiB attribute so the
 /// projection is well above a 512-byte budget and far below the bound.
@@ -458,6 +514,47 @@ async fn traces_over_the_bound_are_rejected_whole_and_counted() {
     assert_eq!(stored_data_keys(&store).await, Vec::<String>::new());
 }
 
+/// The measured gauge shape at the server's default limits and the default
+/// ingest buffer budget: a body of a few megabytes that would build gigabytes
+/// of label sets is refused whole, and nothing is written.
+#[tokio::test]
+async fn the_measured_gauge_shape_is_rejected_at_default_limits() {
+    let request = measured_gauge_request();
+    let projected =
+        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default());
+    assert!(
+        projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
+        "fixture must project past the default bound: {projected}"
+    );
+    let body = request.encode_to_vec();
+    assert!(
+        (2_000_000..4_000_000).contains(&body.len()),
+        "encoded body: {} bytes",
+        body.len()
+    );
+
+    let (running, store) =
+        start_server(IngestByteBudgetLimit::Bounded(DEFAULT_INGEST_BUFFER_BYTES)).await;
+    let base = format!("http://{}", running.http_addr);
+    let response = post_protobuf(&base, "/v1/metrics", body).await;
+    assert_eq!(response.status(), 200);
+    let decoded = ExportMetricsServiceResponse::decode(
+        response.bytes().await.expect("response body").as_ref(),
+    )
+    .expect("metrics response");
+    let partial = decoded
+        .partial_success
+        .expect("the over-bound request is a partial success");
+    assert_eq!(partial.rejected_data_points, GAUGE_POINTS as i64);
+    assert_eq!(
+        rejected_sample(&base, "metrics", "resolved_label_bytes").await,
+        Some(GAUGE_POINTS as u64)
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+    assert_eq!(stored_data_keys(&store).await, Vec::<String>::new());
+}
+
 /// The gRPC surface reaches the same handler: an over-bound metrics export is
 /// an OK response carrying the partial success, not a status error.
 #[tokio::test]
@@ -483,6 +580,66 @@ async fn grpc_metrics_over_the_bound_are_a_partial_success() {
         .partial_success
         .expect("the over-bound request is a partial success");
     assert_eq!(partial.rejected_data_points, HISTOGRAM_POINTS as i64);
+
+    running.shutdown().await.expect("graceful shutdown");
+    assert_eq!(stored_data_keys(&store).await, Vec::<String>::new());
+}
+
+/// An over-bound logs export over gRPC is an OK response carrying the partial
+/// success.
+#[tokio::test]
+async fn grpc_logs_over_the_bound_are_a_partial_success() {
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+    let (running, store) = start_server(IngestByteBudgetLimit::Unlimited).await;
+    let grpc_addr = running.grpc_addr.expect("Mode::All binds gRPC");
+    let mut client = LogsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    let mut request = tonic::Request::new(wide_stream_log_request());
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+    let response = client
+        .export(request)
+        .await
+        .expect("an over-bound export is OK with a partial success")
+        .into_inner();
+    let partial = response
+        .partial_success
+        .expect("the over-bound request is a partial success");
+    assert_eq!(partial.rejected_log_records, STREAM_COPIES as i64);
+
+    running.shutdown().await.expect("graceful shutdown");
+    assert_eq!(stored_data_keys(&store).await, Vec::<String>::new());
+}
+
+/// An over-bound traces export over gRPC is an OK response carrying the
+/// partial success.
+#[tokio::test]
+async fn grpc_traces_over_the_bound_are_a_partial_success() {
+    use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+
+    let (running, store) = start_server(IngestByteBudgetLimit::Unlimited).await;
+    let grpc_addr = running.grpc_addr.expect("Mode::All binds gRPC");
+    let mut client = TraceServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    let mut request = tonic::Request::new(wide_resource_span_request());
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+    let response = client
+        .export(request)
+        .await
+        .expect("an over-bound export is OK with a partial success")
+        .into_inner();
+    let partial = response
+        .partial_success
+        .expect("the over-bound request is a partial success");
+    assert_eq!(partial.rejected_spans, STREAM_COPIES as i64);
 
     running.shutdown().await.expect("graceful shutdown");
     assert_eq!(stored_data_keys(&store).await, Vec::<String>::new());
