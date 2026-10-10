@@ -371,7 +371,6 @@ The query coordinator answers a log selector directly against object storage.
 A log selector does not fan out over `--distributed-query` federation the way a
 metrics selector does. A federated deployment still answers a log selector,
 from the local view of the coordinator and without a cluster-wide merge.
-Federation of log selectors is unscheduled follow-up work.
 
 ### Examples
 
@@ -793,13 +792,10 @@ Resolution is per tenant hash, so a tenant reads only its own records.
 The maintenance process writes legal-hold and reshard records, so any
 deployment that took those actions has them.
 
-Query-audit records are absent on a stock build. Every query surface submits
-one record per executed statement through a sink, and no shipped startup path
-replaces that sink with the real pipeline. On a stock build
-`attrs['kind'] = 'query'` therefore selects nothing. The handler behavior and
-the record shape are in place, and only the install is missing. After a
-deployment attaches the pipeline, a query over `audit` is itself audited and
-appears in the trail that a later query reads.
+In the query-serving modes (`all` and `query`), every query surface writes a
+query-audit record for each query that it executes. [The audit guide](audit.md)
+describes when a record is written and what it carries. A query over `audit`
+is itself audited and appears in the trail that a later query reads.
 
 ### Typed attribute columns
 

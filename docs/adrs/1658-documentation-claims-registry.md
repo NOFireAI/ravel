@@ -70,6 +70,8 @@ capability.
    `README.md`, `docs/guides/**`, hand-written `docs/reference/**` and
    `PROGRESS.md`. Decision records are history (ADR-1040 decision 7) and
    `docs/internal/` is exempt; a claim in either is never registered.
+   `PROGRESS.md` no longer exists; see the PROGRESS.md removal amendment
+   below.
 
 3. **`scripts/check-doc-claims.py` is the gate, with four rules.**
    - QUOTE: every `quote` occurs verbatim in its `doc`, exactly once. A
@@ -218,3 +220,16 @@ deliberate deviations. Both are accepted as the rules.
   resolves. An entry with `binds: []` records an absence with no would-be
   symbol to name yet (the registry header says so), and it never trips
   STATUS; it goes stale only through QUOTE, when its sentence is edited.
+
+## Amendment (2026-10-09): the PROGRESS.md removal amendment, decision 2 without PROGRESS.md
+
+<!-- amendment-applies: sections="Decision" pointer="PROGRESS.md removal amendment" -->
+
+`PROGRESS.md` was deleted. It recorded only two delivered epics, nothing
+kept it up to date, and `CHANGELOG.md`, the ADRs and the guides already
+hold what it said. Normative docs are now the doc map's specs and the user
+pages: every `docs/*.md` the doc map names, `README.md`, `docs/guides/**`
+and hand-written `docs/reference/**`. The two registry entries whose `doc`
+was `PROGRESS.md` moved to the guides that now state the same facts
+(`docs/guides/query.md` and `docs/guides/audit.md`), with the same binds,
+and `scripts/check-doc-claims.py` no longer scans `PROGRESS.md`.

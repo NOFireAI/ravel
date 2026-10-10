@@ -43,7 +43,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # Lets a docs-only change (README, PROGRESS, ADRs, guides, diagrams) skip
+  # Lets a docs-only change (README, ADRs, guides, diagrams) skip
   # the whole cargo-loop straight to green instead of waiting on six
   # compiling jobs that touch none of the changed files. Diffs against the
   # merge-base rather than the base branch tip, so commits landing on main
