@@ -565,10 +565,13 @@ chaos_gen_fixture() {
 }
 
 # ---------------------------------------------------------------------------
-# Seal wait (scenario 2). An ingest hour becomes compactable only once it is
-# sealed: the end of the hour plus the catalog's seal margin. The margin is
-# CatalogConfig::default(), compiled in, so it is read from the server's own
-# startup log rather than restated here.
+# Seal wait (scenario 2). Compaction of an ingest hour is gated by the
+# compactor's seal margin (CompactorConfig::seal_margin_ns, max flush lifetime
+# plus clock skew allowance, 3900 s at the defaults). That figure is not
+# logged. The wait instead uses the catalog fold's margin, which the server
+# logs as `seal_margin_secs` (4800 s): the same two terms plus the fold safety
+# margin, so an upper bound on the compactor's while --gc-max-flush-lifetime is
+# at its default. The scripts pass no margin flag.
 # ---------------------------------------------------------------------------
 
 # Extra seconds past the computed seal, so a worker's first pass after the
@@ -898,12 +901,6 @@ flush_attempts() {
   flush_attempts_from_body "$body"
 }
 
-# Wait until the flush-attempt count has risen past `baseline`, i.e. a flush
-# of any trigger has started since the baseline was read. This is the
-# scenario-1 "mid-flush" trigger. Args: base_url baseline deadline_seconds.
-# Returns 0 on the rise, with the count that poll read in
-# CHAOS_FLUSH_ATTEMPTS_SEEN, so the caller can kill without another scrape;
-# 1 when the deadline passes first.
 # Run drive_one_export in the background with its stdout in a file, and set
 # CHAOS_BG_EXPORT_PID. The subshell drops the caller's ERR trap and errexit:
 # under the scenarios' `set -eE` and `trap 'exit 3' ERR`, a failing export
@@ -914,6 +911,12 @@ chaos_start_background_export() {
   CHAOS_BG_EXPORT_PID=$!
 }
 
+# Wait until the flush-attempt count has risen past `baseline`, i.e. a flush
+# of any trigger has started since the baseline was read. This is the
+# scenario-1 "mid-flush" trigger. Args: base_url baseline deadline_seconds.
+# Returns 0 on the rise, with the count that poll read in
+# CHAOS_FLUSH_ATTEMPTS_SEEN, so the caller can kill without another scrape;
+# 1 when the deadline passes first.
 wait_for_flush_started() {
   local base_url="$1"
   local baseline="$2"

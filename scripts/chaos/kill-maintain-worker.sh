@@ -35,9 +35,12 @@
 # published nothing before the kill and the survivor publishes nothing after
 # it, conservation reports could-not-measure rather than a failure.
 #
-# SEAL WAIT: an ingest hour is compactable only once sealed, at the end of
-# the hour plus the catalog's seal margin (CatalogConfig::default(), logged
-# by the server as `seal_margin_secs=N`; 4800 s today). After the exports the
+# SEAL WAIT: an ingest hour is compactable once the compactor's seal margin
+# has passed the end of the hour (CompactorConfig::seal_margin_ns, 3900 s at
+# the defaults, not logged). The wait uses the catalog fold's larger margin,
+# which the server logs as `seal_margin_secs=N` (4800 s), an upper bound while
+# --gc-max-flush-lifetime is at its default; see the seal-wait block in
+# lib.sh. After the exports the
 # ingest server is stopped with SIGTERM, so nothing writes into a later hour.
 # A write can still land after the last successful ack (a strict write
 # answered 503 `Abandoned` is stored by a later flush, see
