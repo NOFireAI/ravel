@@ -289,8 +289,8 @@ demo/kill-and-recover.sh
 
 Nothing crosses the kill except what is in RustFS. The script asserts every
 step and exits non-zero if the sample is absent or the token comes back
-unsatisfiable. CI runs it against a live stack on every change to the
-quickstart.
+unsatisfiable. Run it against your own stack to check a change to the
+quickstart; no CI lane runs it.
 
 ### Beyond the demo stack
 
