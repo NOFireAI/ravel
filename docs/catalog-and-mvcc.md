@@ -968,15 +968,22 @@ first twenty minutes of the hour and two after that, falling to one and then
 none as the margin catches up. A fold therefore issues at most that many
 LISTs per shard beyond what a fold over the same HEAD without held-open
 hours issues (twelve on a four-shard tenant). It also GETs each snapshot
-part covering those hours whenever their listing names any commit record at
-all, which is the common case in the window, not only when a late commit
-landed. When a held-open hour was compacted before the seal (the
-compact-then-seal order), its listing still names the compacted level-0
-records until garbage collection removes them, so each fold in the window
-also reads that bucket's compaction and level-0 records before concluding
-there is nothing new: correct, and more reads than the uncompacted case. A
-fold whose margin hour is at or above HEAD's watermark issues no extra
-request. The query resolve path is unchanged. Once the margin passes an hour
+part covering those hours, once, whenever their listing names any commit
+record at all, which is the common case in the window, not only when a late
+commit landed; when HEAD holds every commit listed and no targeted re-fold
+request is queued, the fold is a no-op and reads nothing more. It loads the
+whole snapshot instead, reading each part once (a part the check above
+already read is not read again), when a held-open listing names a commit
+HEAD does not hold, when a held-open hour was compacted before the seal,
+and when a targeted re-fold request is queued for the pair (see Targeted
+re-fold requests below). That is the snapshot load an advancing fold pays.
+It then reads the commit records of each bucket it reconciles: the late
+records, or a compacted bucket's compaction and level-0 records, since in
+the compact-then-seal order the listing still names the compacted level-0
+records until garbage collection removes them. A compacted held-open hour
+and a queued request each cost that load on every fold while hours are held
+open, and both still end in a no-op when nothing changed. A fold whose
+margin hour is at or above HEAD's watermark issues no extra request. The query resolve path is unchanged. Once the margin passes an hour
 it is sealed by
 the lemma like any other, and a commit published into it after that is not
 folded by a later fold, because the reconcile window re-lists hours below the
@@ -985,11 +992,12 @@ invisible to a read without a commit token until HEAD is rebuilt from the
 commit records. The assertion is therefore
 still unsafe under a live writer whose commit lands after the natural seal,
 or when no fold runs between that commit and the natural seal. A fold that
-does not advance the watermark reconciles only the held-open hours, and only
-when one lists a commit HEAD does not hold, so a compaction record or
+does not advance the watermark reconciles the held-open hours, and the hours
+of a queued targeted re-fold request outside them, so a compaction record or
 tombstone landing in a sealed hour after the asserted seal may wait for the
-first later fold that advances the watermark: compact before sealing, not
-after. `FoldReport.seal_through_hour` carries S when S was above
+first later fold that advances the watermark (a compaction record, earlier
+if a sweep held its inputs and requested the hour): compact before sealing,
+not after. `FoldReport.seal_through_hour` carries S when S was above
 the margin hour and so set the target, including on such a no-op, and is absent
 when no S was given or the margin already sealed it.
 
@@ -1255,16 +1263,18 @@ those hours, after the fixed window and the frontier band:
   identical `Catalog::classify_bucket` diff, mark their covering parts dirty
   the same way, and land in the same single HEAD CAS. A re-fold can
   therefore only ever make the snapshot agree with the commit layout.
-- **Skipped when redundant.** The pass sits inside the same reconcile block
-  as the other two, so a first fold, a rebuilt fold and a no-op fold (the
-  watermark did not advance) ignore a request entirely: a rebuild already
-  re-derives every hour from the commit layout, and a no-op fold returns
-  before the reconcile block. A request passed to a no-op fold reconciles
-  nothing; the requester below keeps it queued for the next fold of the pair
-  that is not a no-op. A first fold and a rebuild are not no-ops, so the
-  requester removes the hours it passed to one, which reconciles none of
-  them from the request because it derives every hour from the commit
-  layout.
+- **Skipped when redundant.** A first fold and a rebuilt fold ignore a
+  request: both re-derive every hour from the commit layout. Neither is a
+  no-op, so the requester below removes the hours it passed to one, which
+  reconciles none of them from the request. A fold that does not advance the
+  watermark runs the pass only while HEAD holds hours open (see the
+  held-open hours above). It then loads the whole snapshot even when the
+  held-open range is quiet, re-lists the held-open hours as usual, and runs
+  the pass over the requested hours outside them, so a quiet pair whose
+  watermark sits above its margin is not starved of the pass. Such a fold
+  can be a no-op and still report the hours it reconciled. Every other fold
+  that does not advance the watermark returns before the reconcile block
+  and reconciles nothing from the request.
 - **A hint, never a durability dependency.** An hour nobody requests
   degrades to the behaviour above (it keeps naming its pre-rewrite inputs
   until the frontier band reaches it), and the sweep's HEAD-reachability
@@ -1277,12 +1287,17 @@ to an in-process queue shared with the same process's fold loop. The queue
 keeps one entry per pair and merges a later send's hours into it. Each fold
 tick passes a tenant at most `frontier_reconcile_max_hours` of its oldest
 pending hours as its `RefoldRequest`, the most the fold reconciles, and
-removes those hours only after a fold that returned successfully and was not
-a no-op, so they survive a no-op fold, a tick that skips the tenant because
-its HEAD is fresh, and a failed fold, and reach the first successful fold of
-the pair that advances the watermark without waiting for another sweep. The
-hours past that cap stay queued for the pair's next fold that advances the
-watermark, so a request larger than the cap takes more than one such fold.
+removes those hours only after a fold that returned successfully and either
+was not a no-op or reported a nonzero `refold_hours_reconciled`. They
+survive a no-op fold that re-listed none of them, a tick that skips the
+tenant because its HEAD is fresh, and a failed fold, and reach the first
+successful fold of the pair that advances the watermark or re-lists one of
+them, without waiting for another sweep. A request whose hours all lie in
+HEAD's held-open range counts none of them, so it stays queued, and each
+fold while hours are held open pays the whole snapshot load for it, until
+the margin passes the watermark and the advancing fold removes it. The
+hours past the cap stay queued for the pair's next such fold, so a request
+larger than the cap takes more than one.
 Hours a sweep sends while a fold runs stay queued after it. The queue holds
 at most 256 pairs. An entry leaves it without a fold in three cases: the
 fold tick removes it, uncounted, when its process does not own shard 0 of
