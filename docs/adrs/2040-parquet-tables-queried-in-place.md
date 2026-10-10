@@ -1302,8 +1302,9 @@ every non-ASCII byte and ``\ { ^ } % ` ] " > [ ~ < # | * ?``; a key that
 changes under it (`keys::is_store_path`) is marked undeletable by Ravel,
 since its delete would go to a different key, report success and leave it.
 The listing shows such a key only when no key the encoding changes sits at
-a list page boundary (no longer so, see the counted skip amendment below): the adapter also sends a page's continuation, the last
-key of the page, through `Path::from`, so when that key changes the next
+a list page boundary (no longer so, see the counted skip amendment below):
+the adapter also sends a page's continuation, the last key of the page,
+through `Path::from`, so when that key changes the next
 page starts somewhere else and either returns keys again, failing the
 listing with `ListOrderViolation`, or skips the keys after it. That is the
 same adapter defect, issue #2637.
@@ -1323,10 +1324,10 @@ prints what it deleted, lists the tenant's `pq/t/` prefix again and exits
 non-zero naming every such key still listed, skipped ones included, or
 exits non-zero with the error of that listing if it fails. Every such key
 still there is named only when no key the encoding changes sits at a page
-boundary, as above (every one, since the counted skip amendment below). An operator removes an undeletable
-key, which no request Ravel sends reaches unchanged, by deleting the exact
-key with the Maintain credential through an S3 tool. With nothing listed it says so and
-deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
+boundary, as above (every one, since the counted skip amendment below).
+An operator removes an undeletable key, which no request Ravel sends
+reaches unchanged, by deleting the exact key with the Maintain credential
+through an S3 tool. With nothing listed it says so and deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
 (`repair::delete_flagged`) applies the same store-path check to the keys it
 flags: a flagged key under the table's own `v/` prefix that changes under
 `Path::from`, such as a slot of 20 tildes, or `hits/v//<20 digits>.pqm`,
