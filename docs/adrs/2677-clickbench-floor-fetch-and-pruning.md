@@ -104,13 +104,15 @@ then start the server, then live ingest in the same hour) is exactly that
 case. So the fold keeps an operator-sealed hour open to late commits until
 its natural seal: for an hour above `sealed_watermark_hour(now)` the
 reconcile pass does not skip buckets holding only level-0 records, and the
-fold does not take its no-op return. A commit into an operator-sealed hour
+fold does not take its no-op return (narrowed by the held-open amendment
+below: it still reports a no-op when it finds nothing new). A commit into an operator-sealed hour
 is then visible at the next fold tick, not refused and not lost; the
 "Catalog snapshot staleness" bound in `docs/consistency-model.md` gains
 that clause. This is task T8 (#2691), and the release that ships
 `--fold-after-load` waits for it. A seal-through hour below the natural watermark changes
 nothing, and the scheduled fold no-ops on the sealed hours until the
-natural seal time passes, as it does today (`fold.rs:1182-1186`).
+natural seal time passes, as it does today (no longer exactly: see the
+held-open amendment below) (`fold.rs:1182-1186`).
 
 The loader must not write into an hour that is already sealed: those rows
 would be acknowledged, durable, and absent from every non-token query until
@@ -422,7 +424,9 @@ and its result stays separate from stock.
 - Load time grows by one fold of the loaded hours, reported inside it; on the
   reference corpus that is one HEAD and a handful of parts.
 - An operator who passes either new flag under a live writer can make a
-  late commit invisible until a HEAD rebuild. The flags say so, and
+  late commit invisible until a HEAD rebuild (narrowed by the held-open
+  amendment below to a commit no fold picks up before the hour's natural
+  seal). The flags say so, and
   `docs/internal/clickbench.md` and the AWS runbook change their fold step to
   the loader flag.
 - `stats.timings` is a documented field of the JSON SQL response
@@ -570,3 +574,28 @@ server geometry with mixed sizes.
 The correction decision 3 assigned to T3 in `docs/guides/caching.md`,
 which calls both cache caps "LRU", is unowned with this deferral and is
 tracked on #2738.
+
+## Amendment (2026-10-10): held-open hours and the no-op report
+
+<!-- amendment-applies: sections="1. The loader seals what it wrote|Consequences" pointer="held-open amendment" -->
+
+Refs: #2691.
+
+Task T8 implemented decision 1's late-commit guard as follows. An hour
+above the natural seal at a fold's own clock and at or below HEAD's
+watermark is held open; which hours those are comes from HEAD's
+`watermark_hour` and the real clock only, so every later fold holds them
+open whoever wrote the HEAD. Every fold, the scheduled one included,
+re-lists each held-open hour, one LIST per shard, and folds any level-0
+commit HEAD lacks. A fold that finds nothing new still reports a no-op, so
+the report stays honest; decision 1's "does not take its no-op return"
+means only that it does not return before re-listing. Right after a seal of
+the current hour that is three held-open hours in the first twenty minutes
+of the hour and two after, falling to none as the margin passes them: at
+most twelve LISTs per fold on a four-shard tenant, and none for a HEAD no
+assertion raised. The query resolve path is unchanged.
+
+What stays exposed: a commit that lands after its hour's natural seal, or
+with no fold running between its publish and that seal, is not folded and
+stays invisible to non-token queries until a HEAD rebuild. The flags' help
+text and the consistency model say so in those terms.
