@@ -38,7 +38,9 @@ pub enum LogWriteError {
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RLOG object failed (a deterministic input problem, e.g.
-    /// an oversized batch); retrying identical input will fail again.
+    /// an oversized batch); retrying identical input will fail again. Also the
+    /// answer when the ADR-1702 write gate returns no result for the encode:
+    /// the job panicked, or the runtime cancelled it while shutting down.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
     /// Two records in one flush's batch carried the same `stream_id` but

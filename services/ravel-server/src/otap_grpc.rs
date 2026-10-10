@@ -28,7 +28,7 @@ use ravel_ingest::{IngestPoint, WriteMode, plausible_ingest_clock};
 use ravel_otap::normalize::normalize_decoded_with_metadata;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
-use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamState};
+use ravel_otap::stream::{BatchError, DecodeError, DecodedBatch, StreamConfig, StreamState};
 use ravel_otlp::NormalizeRejectCounts;
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, Signal, TenantId};
 use tonic::{Request, Response, Status, Streaming};
@@ -96,7 +96,8 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
 
         let ctx = StreamCtx {
             inbound: request.into_inner(),
-            decoder: StreamState::new(StreamConfig::default()),
+            decoder: StreamState::new(StreamConfig::default())
+                .with_write_gate(self.state.write_gate.clone()),
             state: self.state.clone(),
             tenant,
             mode,
@@ -218,7 +219,7 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
         );
     }
 
-    match ctx.decoder.decode(batch) {
+    match ctx.decoder.decode_gated(batch).await {
         Ok(decoded) => {
             match write_batch(&ctx.state.ingest, &ctx.tenant, ctx.mode, &decoded, now_ns()).await {
                 Ok(outcome) => (
@@ -265,6 +266,16 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                     (nack(batch_id, code, err.to_string()), false)
                 }
             }
+        }
+        // The write gate returned no decompression result. The batch is not
+        // malformed and the decoder never saw it, so only this batch is nacked:
+        // a panicked job as the server's fault, a cancelled one as transient.
+        Err(DecodeError::Batch(BatchError::Gate(err))) => {
+            let code = match err {
+                ravel_cpu_gate::CpuGateError::Panicked => StatusCode::Internal,
+                _ => StatusCode::Unavailable,
+            };
+            (nack(batch_id, code, err.to_string()), false)
         }
         // A malformed batch nacks only itself; the decoder is unharmed and the
         // stream continues (stream.rs `BatchError` contract).
