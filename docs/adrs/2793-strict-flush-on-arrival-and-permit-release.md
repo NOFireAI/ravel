@@ -41,7 +41,7 @@ from where that wait sits:
    held across `next.run(request).await`). Its stated purpose is transient
    decode memory: "it bounds request COUNT, so the transient decode memory
    it caps is this ceiling times the largest per-request decoded body"
-   (`config.rs:1559`). Held for 2.2 s per strict request, it caps the
+   (`config.rs:1555-1559`). Held for 2.2 s per strict request, it caps the
    process at about 465 strict requests per second regardless of CPU.
 
 The shard actor already has a flush path that runs with no tick: the size
@@ -133,8 +133,11 @@ answer. It is exempt from the queued-flush cap and from decision 3's
 per-tenant share by construction, not by a new rule: it opens only when
 the tenant has zero flushes in flight on the shard, and decision 3 states
 that "a tenant with no flush in flight is never refused by the queued-flush
-cap", with a share of at least one. So no deferral path exists for an
-arrival flush, and an implementer must not add one. The memory argument is
+cap", with a share of at least one. So no queued-flush-cap or
+per-tenant-share deferral path exists for an arrival flush, and an
+implementer must not add one; the flush deferral cap and
+`LagCheck::Enforced` are a different mechanism and stay exactly as the
+size path has them. The memory argument is
 decision 3's: the exemption adds at most one window per active tenant on
 the shard, charged to the byte budget. A buffer whose arrival flush is
 pending behind an in-flight one still holds a strict waiter, so it stays
@@ -199,7 +202,7 @@ and the layer's clone releases the permit when the request ends, as today.
   middleware, strict-only by construction and so the surface that holds
   its permit across every ack today) clone the handle out, call `submit`,
   empty the slot, then await `acks()`.
-- gRPC: the layer (`ingest_admission.rs:444-452`) stops moving the bare
+- gRPC: the layer (`ingest_admission.rs:449-455`) stops moving the bare
   permit into its own future (`let _permit = permit;`) and holds a clone
   of the handle there instead, with another clone in the extensions. The
   handler reads it from the extensions before `request.into_inner()`, the
@@ -214,11 +217,18 @@ and the layer's clone releases the permit when the request ends, as today.
 - OTAP: the batch handler already holds its permit locally and drops it
   after `submit`.
 
-Decoded bodies are freed before `submit` returns in every handler today
-(`drop(decode_charge)` precedes the router call), and the rows a strict
-request holds in a shard buffer are charged to the byte budget, so
-releasing the permit at enqueue leaves the permit's stated purpose, decode
-memory, fully covered.
+Why releasing at enqueue keeps the permit's stated purpose, decode
+memory, covered: on the HTTP and gRPC paths the decoded request is moved
+into normalization (`ingest.rs:149-205` and the log and span
+equivalents), which consumes it before the router is called, and the
+rows a strict request then holds in a shard buffer are charged to the
+byte budget. OTAP is the exception: `process_batch` keeps the decoded
+batch alive across `write_batch` by reference (`otap_grpc.rs:220-223`,
+`306-312`), so it would stay resident through the ack wait. The OTAP
+handler therefore narrows the batch's scope so the decoded batch is
+dropped once `submit` has returned, then drops its permit, then awaits
+`acks()`; until the batch is dropped the permit is held. A test pins
+that order on OTAP.
 
 What the permit covered by accident, the count of held response contexts,
 gets an explicit bound: `--max-pending-strict-acks` (default 8,192, 0 =
@@ -323,14 +333,19 @@ flowchart LR
   arrival flush takes the same permit and queue cap; the sizing table and
   the metrics section gain the new flag, counters and gauge; the admission
   text at lines 56-61 says the in-flight permit covers decode through
-  enqueue and names the pending-ack bound. Two in-tree sentences become
+  enqueue and names the pending-ack bound. Four in-tree sentences become
   false the moment the permit is released at enqueue and change in the
   same commit as that behavior: the middleware comment at
   `services/ravel-server/src/ingest_admission.rs:235-241`, which loses
-  "and the durable write" from what the permit covers, and the
-  `--max-inflight-ingest-requests` help at
-  `services/ravel-server/src/config.rs:1550-1565`, which keeps its
-  head-shed sentence and gains one saying the permit is released at
+  "and the durable write" from what the permit covers; the marker comment
+  at `ingest_admission.rs:89-95`, whose "the permit instead lives in the
+  layer's own future, whose lifetime is exactly the request's" becomes
+  "the layer holds a clone of the release handle"; the gRPC layer comment
+  at `ingest_admission.rs:450-452`, "held for the whole inner call: the
+  body read, tonic's decode, and the handler's durable write", which the
+  early release contradicts; and the `--max-inflight-ingest-requests`
+  help at `services/ravel-server/src/config.rs:1550-1565`, which keeps
+  its head-shed sentence and gains one saying the permit is released at
   enqueue, so the count bounds decodes in flight and no longer covers the
   ack wait. `docs/reference/ravel-server-flags.md`,
   `docs/reference/http-api.md`, `docs/guides/ingest.md` and `docs/concepts.md`
