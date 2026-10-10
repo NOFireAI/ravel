@@ -253,6 +253,11 @@ pub enum MaintainError {
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
+    /// The ADR-1702 read gate returned no result for a maintenance decode or
+    /// encode: the job panicked, or the runtime cancelled it while shutting
+    /// down. Nothing was written for that unit.
+    #[error("maintenance job on the CPU read gate failed: {0}")]
+    GateJob(ravel_cpu_gate::CpuGateError),
     #[error(
         "erasure rewrite record-count conservation violated for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: live set carries {input_sample_count} records, {output_sample_count} survived plus {dropped_sample_count} were dropped, which do not sum to the input (fatal invariant breach, ADR-0064 decision 3); publish aborted, nothing written"
     )]

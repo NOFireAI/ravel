@@ -13,6 +13,7 @@ use std::time::Duration;
 use ravel_types::{TenantHash, TenantId};
 use uuid::Uuid;
 
+use crate::read_gate::MaintainReadGate;
 use crate::request_ledger::RequestLedger;
 
 /// A test-injectable accounting hook for the RLOG and RSPAN compaction
@@ -1799,6 +1800,13 @@ pub struct CompactorConfig {
     /// `..CompactorConfig::default()` call sites are unaffected. Default
     /// `None`.
     pub merge_memory_tracker: Option<MergeMemoryTracker>,
+    /// The ADR-1702 read gate compaction's decode and re-encode run on under
+    /// the `compaction` site (the erasure rewrite and the format migration
+    /// share that code), and reachability's snapshot reads under
+    /// `reachability`. The server installs its read gate; the default runs
+    /// every unit inline. Carried in the config so `..CompactorConfig::default()`
+    /// call sites are unaffected.
+    pub read_gate: MaintainReadGate,
     /// Optional test-injectable ledger of the run's store requests and wire
     /// bytes, split by the phase that issued them (ADR-0996 task 996-8).
     /// `None` in production (every hook is skipped); a test or an operator
@@ -1898,6 +1906,7 @@ impl Default for CompactorConfig {
             dry_run: false,
             merge_memory_tracker: None,
             request_ledger: None,
+            read_gate: MaintainReadGate::default(),
             interior_reverify_ns: DEFAULT_INTERIOR_REVERIFY_NS,
             coordination: Coordination::On,
             claim_min_input_bytes: DEFAULT_CLAIM_MIN_INPUT_BYTES,

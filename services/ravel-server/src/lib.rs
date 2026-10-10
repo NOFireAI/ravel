@@ -2787,6 +2787,13 @@ pub async fn start_with_heartbeat(
         config.maintain.compactor.merge_memory_tracker = Some(tracker.clone());
         tracker
     });
+    // ADR-1702 task 10: compaction's decode and re-encode, and the snapshot
+    // reachability reads of retention and the sweep, run on the read gate.
+    // Assigned in place for the same reason as the tracker above; every
+    // compactor config the maintenance supervisor derives is a clone of this
+    // one.
+    config.maintain.compactor.read_gate =
+        ravel_maintain::read_gate::MaintainReadGate::new(cpu_gates.read.clone());
 
     // ADR-1195: the single process-owned GET concurrency limiter. Every
     // fetcher this process constructs (RSEG, RLOG, RSPAN, in-process or
@@ -3313,6 +3320,7 @@ pub async fn start_with_heartbeat(
                 retention: on_demand_fold_retention.clone(),
                 in_flight: on_demand_fold_in_flight.clone(),
                 fold_interval: config.fold.fold_interval,
+                read_gate: Some(cpu_gates.read.clone()),
             };
             http_router = http_router.merge(fold_on_demand::router(on_demand_fold_state));
             if let Some(mtls) = &config.mtls_listener {
@@ -3325,6 +3333,7 @@ pub async fn start_with_heartbeat(
                     retention: on_demand_fold_retention,
                     in_flight: on_demand_fold_in_flight,
                     fold_interval: config.fold.fold_interval,
+                    read_gate: Some(cpu_gates.read.clone()),
                 };
                 mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
             }
@@ -4180,6 +4189,8 @@ pub async fn start_with_heartbeat(
             Arc::new(config.maintain.retention.clone()),
             // The same wall clock the maintenance and fold loops read.
             maintain_clock.clone(),
+            // Each verified object's full-object hash runs on the read gate.
+            ravel_maintain::read_gate::MaintainReadGate::new(cpu_gates.read.clone()),
         )?,
         _ => scrub::ScrubTask::none(),
     };
