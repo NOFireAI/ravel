@@ -168,6 +168,10 @@ partial delivery.
 **4. Expose the flush cadence as a bounded operator setting, moving all three
 knobs together, and amend the sub-second visibility target.**
 
+(A strict write may now opt out of this delay per request without changing
+what its ack means; see the ADR-2793 amendment below. The aged flush this
+decision describes stays the default.)
+
 `max_flush_delay`, `max_flush_delay_idle` and `min_flush_bytes` become operator
 settings that move as a set. Moving one alone does little: raising only
 `max_flush_delay` leaves buffered tenants at the 10 s idle threshold, and
@@ -350,3 +354,19 @@ the worst buffer age at flush open one tick past the figure
 `FLUSH_BOUND_SLACK_HOURS` is derived from. The tier's behaviour is otherwise as
 stated, and the default of 0 still leaves it off.
 
+
+## Amendment (2026-10-10, #2793): a per-request strict flush-on-arrival policy
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-2793 amendment" -->
+
+Decision 4 names strict-mode acknowledgement latency as its real price and
+leaves one lever to shorten it, `max_flush_delay`, which is process-wide and
+linear in PUT cost. ADR-2793 adds a second axis: a strict write may select
+`x-ravel-ingest-mode: strict-arrival` (or a deployment may set
+`--strict-flush-policy arrival`), and the shard flushes it from inside the
+write handler, with no age tick, bounded to one in-flight flush per (shard,
+tenant). The ack contract is unchanged, and so is decision 4's default: a
+strict write that does not ask still waits the aged flush. The cost that
+decision 4 weighed moves with the choice: a tenant on the arrival policy pays
+up to one flush per flush duration per shard instead of one per
+`max_flush_delay`.
