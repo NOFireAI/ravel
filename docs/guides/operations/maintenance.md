@@ -190,8 +190,9 @@ ravel-cli catalog fold --tenant <name> --shards <n> --signal <signal> \
 ```
 
 **Do not use this command while a writer for that tenant is live.** A commit
-record published into a bucket that this fold already sealed is never picked
-up by a later incremental fold, which re-lists only hours after the watermark.
+record published into a bucket that this fold already sealed is not picked up
+by a later fold, whose reconcile window re-lists hours below the watermark but
+skips a bucket holding only level-0 commit records.
 The repair is the HEAD-deletion rebuild in
 [troubleshooting](troubleshooting.md#queries-are-missing-recently-written-data).
 
