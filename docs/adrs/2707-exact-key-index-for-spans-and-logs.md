@@ -310,8 +310,12 @@ flowchart LR
   does not name the field, a failed or refused GET, a corrupt section). A
   reader subtracts exactly those from coverage (ADR-0849 section 3, "a leaf
   that fails validation subtracts its own coverage"), and treats a leaf whose
-  header `blake3` differs from the part's, whose tenant hash differs, or whose
-  version it does not support as absent for the whole part. Same
+  header `blake3` differs from the part's, or whose version it does not
+  support, as absent for the whole part. A leaf whose `tenant_hash` differs
+  from the requesting tenant's is not a degrade: it is the hard
+  `CatalogError::FieldMismatch` ADR-0050 decision 2 assigns to every
+  tenant-hash mismatch on the resolve path, counted in
+  `ravel_catalog_isolation_breach_total`, with no fallback to scanning. Same
   `watermark_hour`, different part bytes, leaf rejected: the regression test
   ADR-0849 names.
 - **Reference.** `SnapshotPartRef` gains `repeated SnapshotKeyIndexLeafRef
@@ -322,7 +326,10 @@ flowchart LR
   error. `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field 7
   precedent (ADR-0063, ADR-1413): an older reader ignores the field and
   scans. A new message `SnapshotKeyIndexLeafRef` and a `KeyIndexLeafHeader`
-  are added to proto/ravel/catalog.proto by the implementing task.
+  are added to proto/ravel/catalog.proto by the implementing task, together
+  with `SnapshotHead.fold_min_format` (additive): the lowest folder format
+  allowed to re-encode this HEAD, stamped by the first leaf-writing folder
+  and checked by every folder before it re-encodes (see Lifecycle).
 - **Build.** The fold builds leaves for exactly the parts it re-encodes this
   fold (a part carried forward keeps its refs), from the tier-1 sections and
   never from rows and never from whole-object reads: per entry, a suffix GET
@@ -342,10 +349,18 @@ flowchart LR
   deletes what HEAD does not name past the protection horizon, so
   `parts[].key_index[].key` joins its reference set in the same change as
   the first leaf writer (ADR-0849 section 1a). A fold process that predates
-  this change strips field 8 from every part it carries forward and the
-  sweeper then reaps live leaves; such a folder must not run against a
-  tenant once leaves exist, and the mixed-version folder-and-sweeper
-  combinations are a required test, not an intention.
+  this change strips field 8 from every part it carries forward, and the
+  sweeper then reaps the live leaves past the protection horizon; the
+  lookup stays correct (the parts read as uncovered and are scanned) and
+  the next fold pays a full section-read rebuild, so the cost is silent.
+  Two mechanisms replace the operational rule "do not run an old folder":
+  the HEAD carries a `fold_min_format` field the new folder stamps, and a
+  folder that reads a HEAD whose `fold_min_format` is above its own refuses
+  to fold that tenant with a typed error (the same shape as
+  `UnsupportedVersion` on a trailer); and the fold report counts leaves
+  rebuilt from scratch, so a rebuild the previous fold did not need shows
+  as a figure outside its band. The mixed-version folder-and-sweeper
+  combinations are a required test of both mechanisms.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
   an unsupported version treating the leaf as absent (ADR-0849 section 4).
@@ -612,14 +627,29 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
 
 ## Consequences
 
-- **A lookup reads bytes proportional to its matches**, not to its window:
-  index buckets plus one or two blocks. The folded Stage 0 tenant goes from
-  4.35 GB and 60 GETs per lookup to a few hundred KB (target, below); the
-  trillion-span extrapolation goes from 22 TB to 2 GETs per covering part.
-- **Storage.** About 1 B/span for spans and about 2% of object bytes for
-  logs at tier 1 (Stage 0); about 12 B per (key, object) pair at tier 2
-  (derived), about 1% of span data. Leaves are protected by the same
-  25 h 05 m horizon as parts and inherit the delayed-reclamation behaviour.
+- **A windowed lookup reads bytes proportional to its matches**, not to
+  its window: index buckets plus one or two blocks. The folded Stage 0
+  tenant goes from 4.35 GB and 60 GETs per lookup to a few hundred KB
+  (target, below). A lookup with no range still grows with the number of
+  covering parts, by one directory and one bucket per part (tens to a few
+  hundred KB each): the trillion-span extrapolation goes from 22 TB of
+  data to at most about 512 KB of index per covering part, and the
+  acceptance table bands that figure rather than the count alone.
+- **Storage.** Tier 1 holds one `(key8, block)` entry per distinct pair,
+  about 12 B before the bucket's zstd. On the Stage 0 spans corpus that is
+  one entry per trace per object: 20 M entries, about 240 MB raw against
+  4.17 GB of span data, about 6% before compression (derived; the
+  measured section size is a T7 acceptance figure, pre-registered below).
+  On logs it is the measured 2% of object bytes (p50 49,899 pairs per
+  25 MB object). Tier 2 holds one `(key8, entry ordinal, block set)` entry
+  per (key, object) pair, about 12 B each: for the Stage 0 spans corpus
+  that is again about 20 M entries and about 240 MB, about 6% of the span
+  data, and about 2% for the logs corpus (derived). Both tiers therefore
+  cost about the same order as each other, and an operator sizes the
+  catalog prefix at about 6% of span data and 2% of logs data, not the
+  1% an earlier draft of this document stated. Leaves are protected by the
+  same 25 h 05 m horizon as parts and inherit the delayed-reclamation
+  behaviour.
 - **Fold cost grows** by the section reads: about 1-2% of the bytes of every
   part re-encoded in that fold, as ranged GETs. The fold report carries the
   count and bytes per fold, asserted in the acceptance run.
@@ -648,7 +678,7 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only | more than 2 per part, or index GETs in any other phase |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes at most `parts x (directory + one bucket)`, where the directory is `4 x 2^bucket_bits` bytes (16 KB to 256 KB) and the bucket about equals it by the balance rule, so at most about 512 KB per covering part and about 500 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 512 KB per covering part |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages | a whole-object GET |

@@ -865,12 +865,13 @@ ADR-0849 section 1b requires, in the encoding that is small for the sets
 measured (p50 one object per key on the ClickBench corpus).
 
 **Binding and coverage.** A leaf binds the covered part's exact `blake3`,
-never its `watermark_hour` (ADR-0849 section 1): the reader rejects a leaf
-whose header `part_blake3` differs from the part's hash in the HEAD it
-resolved, whose `tenant_hash` differs from the requesting tenant's (a hard
-`FieldMismatch`, ADR-0050 section 2, never a degrade), or whose
-`format_version` it does not support, and treats the part as uncovered for
-that field. `uncovered_entry_ordinals` lists the entries the fold could not
+never its `watermark_hour` (ADR-0849 section 1). Three checks, with two
+outcomes. A leaf whose header `tenant_hash` differs from the requesting
+tenant's is a hard `CatalogError::FieldMismatch` (ADR-0050 section 2),
+counted in `ravel_catalog_isolation_breach_total`, with no fallback: the
+lookup fails. A leaf whose header `part_blake3` differs from the part's hash
+in the HEAD it resolved, or whose `format_version` it does not support, is
+rejected and the reader treats the part as uncovered for that field. `uncovered_entry_ordinals` lists the entries the fold could not
 index for this field: a segment with no KEY_IDX section, a section whose
 header does not name the field (declared after the flush opened, or
 de-declared), a failed or refused GET, a corrupt section. The reader
@@ -907,7 +908,19 @@ content-addressed by its own bytes (`hash16` is the blake3 of the leaf),
 not by the part's hash, for the reason the column-statistics section gives:
 two folds whose per-entry degrade differed would otherwise collide under
 `AlreadyExists`. `bucket_bits` is chosen so that the directory and the mean
-bucket are about equal in bytes, clamped to 12..=16. The body ceiling is
+bucket are about equal in bytes, clamped to 12..=16 at the writer; the
+reader accepts 1..=16 and rejects any other value before allocating the
+directory. The leaf's corruption conditions, each a typed `Corrupted` that
+makes the reader treat the part as uncovered for that field (never a panic,
+never wrong data): a magic other than `RKI1`; a `header_len` past the
+object; a header, directory or frame crc32c mismatch; `bucket_bits` outside
+1..=16; a directory whose ends are not non-decreasing or whose last end
+differs from `body_len`; a frame whose decompressed length is not the sum of
+its entries' encodings or whose `entry_count` disagrees; an entry ordinal at
+or past the part's `entry_count`; a `key8` outside the leaf's slice; a
+`key8` that does not mix to the bucket it sits in; unsorted or duplicate
+`(key8, entry ordinal)` pairs; a block delta list that is empty or that
+overflows `u32`. The body ceiling is
 `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB); a (part, field) whose body
 would exceed it is split by key range into several leaves under the
 ceiling, each with its own ref and slice, so a lookup opens exactly one leaf
@@ -925,11 +938,18 @@ erasure completion rule for stale catalog objects is settled together with
 the column-statistics case, and the pending-erasure predicate keeps
 filtering rows after the index until the rewrite lands.
 
-**Rollout.** A fold process that predates field 8 re-encodes HEAD without
-it for every part it carries forward, after which the sweeper reaps live
-leaves; such a folder must not run against a tenant once leaves exist. The
-mixed-version combinations (old sweeper against a new HEAD, new sweeper
-against a folder that strips the field) are tested, not assumed
+**Rollout.** A fold process that predates field 8 would re-encode HEAD
+without it for every part it carries forward, after which the sweeper reaps
+the live leaves and the next fold rebuilds them from the sections; the
+lookup stays correct throughout, and the cost is silent. Two mechanisms
+stop that rather than an operational rule: HEAD carries `fold_min_format`
+(the lowest folder format allowed to re-encode it), which the first
+leaf-writing folder stamps, and a folder whose own format is below it
+refuses the tenant with a typed error instead of folding; and the fold
+report counts leaves rebuilt from scratch, so a rebuild the previous fold
+did not need is a figure outside its band. The mixed-version combinations
+(old sweeper against a new HEAD, an old folder against a stamped HEAD, new
+sweeper against a HEAD without the field) are tested, not assumed
 (ADR-0849 section 1a).
 
 ### Idempotency marker body layout

@@ -134,9 +134,9 @@ attribute, a named gap, not an oversight).
 ```
 +---------------------------------------------------+
 | BLOCKS       row blocks (column pages)            |  kind 1
+| KEY_IDX      exact (trace_id prefix, block) index |  kind 4 (v5, ADR-2707 proposed)
 | SKIP_IDX     interval + trace_id min/max index    |  kind 2
 | BLOOM        per-block service/name token bloom   |  kind 3
-| KEY_IDX      exact (trace_id prefix, block) index |  kind 4 (v5, ADR-2707 proposed)
 | footer: SpanFooter protobuf bytes                 |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
@@ -148,8 +148,11 @@ attribute, a named gap, not an oversight).
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in kind order (1..3 today; 1..4 under
-v5, so KEY_IDX sits last, directly before the footer); readers rely only on
+Writers emit the sections physically in kind order today (1..3). Under v5
+the order is BLOCKS, KEY_IDX, SKIP_IDX, BLOOM: KEY_IDX sits between BLOCKS
+and SKIP_IDX, the placement RLOG uses for the same kind, so a suffix probe
+that covers the footer, BLOOM and SKIP_IDX does not have to span KEY_IDX's
+bucket frames (about 1-2% of the object) to reach them. Readers rely only on
 the footer's section offsets, never on adjacency. Bytes between sections are
 permitted and MUST be `0x00`; readers never interpret them. All three sections
 are mandatory: the reader rejects an object missing any of them as `Corrupted`.
@@ -473,22 +476,33 @@ writer:
 - exactly one field, named `trace_id`, key type `Id16` (1); a header naming
   any other field set is `Corrupted`;
 - `bucket_bits = 8` at the writer, 1 to 16 accepted by the reader;
-- the section is mandatory (v5) and physically last, directly before the
-  footer, so a suffix probe sized to cover the footer, BLOOM, SKIP_IDX and
-  the KEY_IDX header and directory reads them in one GET in the common
-  case. The probe length is a reader choice, as RLOG's is; a reader whose
-  suffix fell short issues one ranged GET for the directory and one for the
-  bucket it needs.
+- the section is mandatory (v5) and sits between BLOCKS and SKIP_IDX, the
+  RLOG placement, so the suffix probe that covers the footer, BLOOM and
+  SKIP_IDX (a reader choice, as RLOG's probe length is) never has to span
+  the bucket frames. A `trace_id =` lookup then issues one ranged GET for the
+  KEY_IDX header and directory (about 1 KB at `bucket_bits = 8`) and one for
+  the bucket it needs; the footer's section entry gives the offsets, so
+  neither GET depends on adjacency. A read that is not a `trace_id` lookup
+  never touches the section.
 
 A `trace_id =` lookup probes KEY_IDX after the SKIP_IDX range test and
 before any block is read: an absent key proves the trace absent from every
 block, so the object is dropped with no block read (the SKIP_IDX
 `[min_trace_id, max_trace_id]` test is an interval, and with random ids
-nearly every object passes it); a present key names the blocks, which must
-be the contiguous run `RspanRangeReader::trace_block_span` derives from
-SKIP_IDX, and a disagreement between the two is `Corrupted`. A prefix
-collision (two traces sharing 8 leading bytes) is a false positive removed
-by the per-row `trace_id` equality the reader already applies. The section
+nearly every object passes it); a present key names the blocks that hold
+any trace whose id shares the 8-byte prefix. The reader reads the
+intersection of that block set with the SKIP_IDX candidate run
+(`RspanRangeReader::trace_block_span`): a block in the KEY_IDX set that the
+`[min_trace_id, max_trace_id]` test excludes holds only a colliding trace
+and is skipped, and a block the range test admits that KEY_IDX does not
+name holds no span of either trace and is skipped. Neither disagreement is
+an error: both are the two indexes pruning on different evidence. A prefix
+collision (two traces sharing 8 leading bytes) is therefore at most one
+extra block read, and the per-row `trace_id` equality the reader already
+applies removes it from the result. An empty intersection with a present
+key is also legal and yields no rows. `Corrupted` is reserved for the
+section's own checks (checksums, a block ordinal at or past the SKIP_IDX
+block count, unsorted or duplicate entries). The section
 is the source the catalog fold reads, by ranged GET, to build the per-part
 `.kidx` leaf (docs/catalog-and-mvcc.md, "Per-part key-index leaves"); it is
 never rebuilt from rows.
