@@ -1018,10 +1018,11 @@ enum ParquetCommand {
     /// undeletable one, prints it as skipped, and then fails naming the keys
     /// left in place. A delete that fails part way
     /// prints the keys deleted before it, then the store error, and fails.
-    /// On S3 a key holding a control character, an empty
-    /// segment or a `.` or `..` segment fails this listing and every read of
-    /// the table; delete those with the Maintain credential through an S3
-    /// tool. A forged version at
+    /// A key holding a control character, an empty segment or a `.` or `..`
+    /// segment is no exception: the store lists it as unaddressable, and it
+    /// is marked undeletable and skipped the same way; delete such a key by
+    /// its exact name with the Maintain credential through an S3 tool. A
+    /// forged version at
     /// or below the bound is not flagged: as the newest it serves as the
     /// table, and exactly at the bound it blocks every later DDL. Remove one
     /// with `--delete-version` once the DDL audit log shows no statement wrote
@@ -1039,17 +1040,13 @@ enum ParquetCommand {
     /// any still there. A key the S3 adapter would send a delete of to a
     /// different key (one holding a character its path encoding escapes, such
     /// as `~` or `%`) is listed escaped with the key a request reaches, marked
-    /// undeletable, and skipped. Both listings name every such key unless a
-    /// whole list page holds nothing else: the adapter then resumes after the
-    /// encoded form of that page's last key, so the next page repeats keys,
-    /// failing the listing, or skips the keys after it. A key under a name
-    /// reserved
-    /// after tables could be created (such as `l0`) is marked as possibly a
-    /// table created before the reservation and skipped unless
-    /// `--include-reserved-names` is passed. On S3 a key holding a control
-    /// character, an empty segment or a `.` or `..` segment fails this listing
-    /// and the tenant-wide ones; delete that exact key with the Maintain
-    /// credential through an S3 tool.
+    /// undeletable, and skipped. Both listings name every such key. A key
+    /// under a name reserved after tables could be created (such as `l0`) is
+    /// marked as possibly a table created before the reservation and skipped
+    /// unless `--include-reserved-names` is passed. A key holding a control
+    /// character, an empty segment or a `.` or `..` segment is listed as
+    /// unaddressable and marked undeletable the same way; delete that exact
+    /// key with the Maintain credential through an S3 tool.
     Repair {
         /// The tenant that owns the table.
         #[arg(long)]
