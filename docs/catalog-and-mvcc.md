@@ -981,9 +981,14 @@ reconcile, no column-stats baseline, no part or `.csnap` PUT, no window
 LIST. It publishes in batches bounded in entries: a batch is the longest
 run of the remaining unindexed parts whose entry total stays at or below
 `--batch-entries`, and at least one part, so an attempt costs at most
-`2 x max(batch_entries, largest part's entries)` ranged GETs, which is
-`2 x batch_entries` at the default of 250,000
-(`DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`). Each batch is one HEAD CAS, bounded
+`2 x max(batch_entries, largest part's entries)` ranged GETs. The default
+is 250,000, the fold's `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, which is a seal
+threshold rather than a cap (`partition_parts` splits only at hour
+boundaries, so one ingest hour larger than it yields one part above it),
+so the ceiling is `2 x batch_entries` only while no unindexed part exceeds
+the setting and `2 x` the largest part otherwise; the report states the
+largest unindexed part's entries up front. Each batch is one HEAD CAS,
+bounded
 like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt
 re-reads HEAD, keeps the refs for the batch parts whose blake3 the new
 HEAD still names (a leaf is keyed by `part_blake3`) and drops the rest,
@@ -1007,7 +1012,8 @@ rising while HEAD carries no `key_index` refs is the signature an operator
 acts on. The cost of a bad rollout is one rebuild run over the affected
 parts, `2 x entries` ranged GETs in total (a footer suffix and a section
 range per entry, at most `2 x max(batch_entries, largest part's entries)`
-per attempt, 500,000 at the default) plus the sections' bytes, and that
+per attempt, 500,000 at the default while no part exceeds the seal
+threshold) plus the sections' bytes, and that
 run scans until it has run; nothing is retained
 and nothing is silent. The mixed-version combinations (old folder then new
 sweeper, old sweeper against a new HEAD, new folder after an old folder,

@@ -375,9 +375,16 @@ flowchart LR
     cost has: a batch is the longest run of the remaining unindexed parts
     whose entry total stays at or below `--batch-entries`, and at least
     one part, so an attempt costs at most `2 x max(batch_entries, largest
-    part's entries)` ranged GETs, which is `2 x batch_entries` at the
-    default of 250,000 (`DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, so no single
-    part exceeds it). Each batch is one HEAD CAS, bounded like the fold's
+    part's entries)` ranged GETs. The default is 250,000, the fold's
+    `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, and that is a seal threshold, not
+    a cap: `partition_parts` splits only at hour boundaries, so one ingest
+    hour larger than it yields one part above it, and the Stage 0 load
+    (24 h of event time in one ingest hour) is such an input. The ceiling
+    is therefore `2 x batch_entries` only while no unindexed part exceeds
+    the setting, and `2 x` the largest part otherwise; the report states
+    the largest unindexed part's entries up front so the operator can
+    compute the ceiling before the run. Each batch is one HEAD CAS,
+    bounded like the fold's
     at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD,
     keeps the refs for the batch parts whose blake3 the new HEAD still
     names (a leaf is keyed by `part_blake3`, so it is still that part's)
@@ -410,9 +417,11 @@ flowchart LR
     affected parts: per part entry, one footer suffix GET and one section
     range GET, so `2 x entries` ranged GETs in total, at most
     `2 x max(batch_entries, largest part's entries)` per attempt, which
-    is 500,000 at the default (about 160,000 on the Stage 0 spans load as
-    written, about 1,600 at the decision 9 geometry, one batch in either
-    case) and the sections' bytes (about 2% of logs bytes, about
+    is 500,000 at the default while no part exceeds the seal threshold
+    and `2 x` the largest part otherwise (about 160,000 on the Stage 0
+    spans load as written, about 1,600 at the decision 9 geometry, one
+    batch in either case) and the sections' bytes (about 2% of logs
+    bytes, about
     6% of span bytes); the request figure is the one that decides
     viability, as the Context's 566 s resolve shows, and both figures are
     banded in the acceptance table. That run scans until it has run;
@@ -693,7 +702,8 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
 8. **One leaf per (part, field, shard).** It would let a routed lookup read a
    4x smaller bucket at 4 shards, at 64 refs per part in HEAD and 64 small
    objects per fold. Shard filtering after the bucket read costs bytes
-   proportional to one bucket and nothing in HEAD; the balance rule keeps the
+   proportional to one bucket and nothing more in HEAD than the one ref per
+   (part, field, slice) the Consequences price; the balance rule keeps the
    bucket at tens of KB.
 
 ## Consequences
@@ -736,6 +746,17 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   objects for the Stage 0 spans load instead of 80,000, 160 k fewer PUTs,
   and no 3.5 h compaction of small objects. Operators who want today's
   layout pass the overrides.
+- **HEAD grows.** `SnapshotHead.parts` is inline, and field 8 adds one
+  `SnapshotKeyIndexLeafRef` per (part, declared field, key slice): a key,
+  two blake3s, the slice bounds and six scalars, about 200 B, against
+  about 250 B for the `SnapshotPartRef` it hangs off. One-field spans
+  with one slice per part therefore grow HEAD by about 80%, four
+  declared logs fields by about 3x, read in the one HEAD GET every
+  resolve already issues (the `records + 3` band); no second GET and no
+  new object. That is the price of decision 4's "the publish is the HEAD
+  CAS alone" and of rejected alternative 8's "nothing more in HEAD" (64
+  refs per part would be 20x this). The acceptance table bands the bytes
+  per (part, field, slice).
 - **Cost accounting** gains a phase; the per-phase rule holds: an index GET
   never lands in a scan counter.
 
@@ -757,7 +778,8 @@ cache state) and stamped into the report.
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
-| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports its attempt count (at least `ceil(entries / batch_entries)`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and one HEAD CAS; no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object GET, or any figure missing from the report |
+| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports the largest unindexed part's entries, its attempt count (at least `ceil(entries / max(batch_entries, largest part's entries))`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and one HEAD CAS; no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object data GET, or any figure missing from the report |
+| HEAD bytes added by field 8 | at most 256 B per (covering part, declared field, key slice), where slices per (part, field) = `ceil(leaf entries x 12 B / 256 MiB)` (one for any part whose leaf body stays under the ceiling, two on a Stage 0-sized spans part); under 256 KB over 1,024 one-field, one-slice parts, read in the one HEAD GET the resolve already issues; HEAD bytes and leaf-ref count on the resolve report | over 512 B per (part, field, slice), more than one HEAD GET per resolve, or either figure missing |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 
