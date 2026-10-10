@@ -807,24 +807,25 @@ async fn a_second_load_into_a_sealed_hour_is_refused_before_anything_is_written(
 
 /// The crossing case: another writers-stopped fold seals hour `H` after the
 /// preflight passed, just before this load's first commit record lands, and
-/// the load's clock then moves into `H + 1`. The load's own fold seals
-/// through `H + 1`, so it is not a no-op and its watermark is not below any
-/// token hour, but the commits published into `H` after the other seal are
-/// outside the snapshot. The load fails with `FoldLeftCommitsUncovered` naming
-/// `H`, after every row is durable, and a token-less query misses those rows.
+/// the load's clock then moves into `H + 1`. The load's own fold runs at
+/// `H + 1:00:30`, before `H`'s natural seal, so `H` is still held open to
+/// late commits: the fold re-lists it and picks up the commits published
+/// after the other seal. The load succeeds, every token is in the snapshot,
+/// and a token-less query counts every row.
 #[tokio::test]
-async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
+async fn a_seal_landing_mid_load_is_folded_by_the_loads_own_fold() {
     let (_dir, parquet_path, mapping) = write_fixture();
     // Half a minute either side of the H + 1 boundary, so no flush open
     // across the move outlives its flush lifetime.
     let next_hour_ns = (i64::from(HOUR) + 1) * NS_PER_HOUR;
     let clock = Arc::new(AtomicI64::new(next_hour_ns - 30_000_000_000));
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let store = RecordingStore::sealing_mid_load(
-        Arc::new(MemoryStore::new()),
+        Arc::clone(&inner),
         Arc::clone(&clock),
         next_hour_ns + 30_000_000_000,
     );
-    let err = try_run_load(
+    let report = try_run_load(
         Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
         &parquet_path,
         &mapping,
@@ -832,17 +833,7 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
         clock,
     )
     .await
-    .expect_err("the load fails");
-    let load::LoadError::FoldLeftCommitsUncovered {
-        durable,
-        hours,
-        report,
-        verify,
-        ..
-    } = &err
-    else {
-        panic!("expected FoldLeftCommitsUncovered, got {err:?}");
-    };
+    .expect("the load's fold picks up the commits after the other seal");
     assert!(
         store
             .seal_mid_load
@@ -853,9 +844,9 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
         "the mid-load seal ran"
     );
     assert_eq!(report.rows_processed, ROWS as u64, "every row was written");
-    assert_eq!(durable.len(), report.objects_written());
+    assert_eq!(report.tokens.len(), report.objects_written());
     let token_hours: std::collections::BTreeSet<u32> =
-        durable.iter().map(|t| t.ingest_hour_bucket).collect();
+        report.tokens.iter().map(|t| t.ingest_hour_bucket).collect();
     assert_eq!(
         token_hours,
         [HOUR, HOUR + 1].into_iter().collect(),
@@ -865,27 +856,89 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
     assert!(!fold.no_op, "this fold sealed something: {fold:?}");
     assert_eq!(fold.seal_through_hour, Some(HOUR + 1), "{fold:?}");
     assert_eq!(fold.watermark_hour, Some(HOUR + 1), "{fold:?}");
-    assert_eq!(hours, &HOUR.to_string());
-    assert_eq!(
-        verify,
-        "ravel-cli catalog verify --tenant acme --signal logs"
-    );
-    let message = err.to_string();
-    for needle in [
-        "every object this load wrote is durable",
-        "are not in the snapshot of the catalog HEAD its fold left, in ingest hour(s) ",
-        "ravel-cli catalog verify --tenant acme --signal logs",
-        "Rebuild the snapshot",
-    ] {
-        assert!(message.contains(needle), "{needle:?} in {message}");
-    }
-    assert!(!message.contains("--skip-rows"), "{message}");
-    assert!(!message.contains("partial"), "{message}");
+    assert_eq!(fold.entry_count, report.tokens.len() as u64, "{fold:?}");
+
+    let coverage = ravel_catalog::snapshot_coverage(
+        inner.as_ref(),
+        &TenantId::new(TENANT).hash(),
+        ravel_types::Signal::Logs,
+        &identities(&report.tokens),
+    )
+    .await
+    .expect("readable");
+    assert_eq!(coverage.watermark_hour, Some(HOUR + 1));
+    assert!(coverage.missing.is_empty(), "{coverage:?}");
 
     let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
-    assert!(
-        count_of(&value) < ROWS as i64,
-        "the rows committed into hour {HOUR} after the other seal are invisible: {value}"
+    assert_eq!(
+        count_of(&value),
+        ROWS as i64,
+        "every row is visible: {value}"
+    );
+    assert_eq!(
+        unfolded_segments(&value),
+        0,
+        "every segment resolves from the snapshot: {value}"
+    );
+}
+
+/// Another process's writers-stopped fold seals the current hour `H` between
+/// the load's first and second commit, and the load stays inside `H`. The
+/// load's own fold seals through `H` as well, so it does not advance the
+/// watermark; `H` is held open, so the fold re-lists it, folds the seven
+/// commits the other seal missed, and the load succeeds.
+#[tokio::test]
+async fn a_seal_landing_mid_load_inside_one_hour_is_folded_by_the_loads_own_fold() {
+    let (_dir, parquet_path, mapping) = write_fixture();
+    let clock = Arc::new(AtomicI64::new(CLOCK_NS));
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let store = RecordingStore::scripted(
+        Arc::clone(&inner),
+        Arc::clone(&clock),
+        vec![ScriptStep {
+            at_commit: 2,
+            fold: Some(Some(HOUR)),
+            clock_after: CLOCK_NS,
+        }],
+    );
+    let report = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        clock,
+    )
+    .await
+    .expect("the load's fold picks up the commits after the other seal");
+    let hours = commit_hours(&store);
+    assert_eq!(hours, vec![HOUR; 8], "eight commits into H");
+    assert_eq!(fold_watermarks(&store), vec![Some(HOUR)], "the other seal");
+    let fold = report.fold.clone().expect("the fold ran");
+    assert!(!fold.no_op, "the fold found the late commits: {fold:?}");
+    assert_eq!(fold.seal_through_hour, Some(HOUR), "{fold:?}");
+    assert_eq!(fold.watermark_hour, Some(HOUR), "{fold:?}");
+    assert_eq!(fold.entry_count, 8, "{fold:?}");
+
+    let coverage = ravel_catalog::snapshot_coverage(
+        inner.as_ref(),
+        &TenantId::new(TENANT).hash(),
+        ravel_types::Signal::Logs,
+        &identities(&report.tokens),
+    )
+    .await
+    .expect("readable");
+    assert!(coverage.missing.is_empty(), "{coverage:?}");
+
+    let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
+    assert_eq!(
+        count_of(&value),
+        ROWS as i64,
+        "every row is visible: {value}"
+    );
+    assert_eq!(
+        unfolded_segments(&value),
+        0,
+        "every segment resolves from the snapshot: {value}"
     );
 }
 
@@ -1062,8 +1115,9 @@ fn fold_watermarks(store: &RecordingStore) -> Vec<Option<u32>> {
 /// process's writers-stopped fold seals `H` between the load's first and
 /// second commit into `H`, and the load's own fold runs at `H + 2:45`, past
 /// the full seal margin for `H`, so the margin alone would seal `H` at that
-/// time as well. The second commit into `H` is outside the snapshot all the
-/// same, and the load fails naming `H`.
+/// time as well. `H` was held open to late commits only until its natural
+/// seal at `H + 2:20`, and no fold ran before then, so the second commit into
+/// `H` is outside the snapshot and the load fails naming `H`.
 #[tokio::test]
 async fn a_seal_landing_mid_load_is_caught_after_the_margin_has_passed() {
     let (_dir, parquet_path, mapping) = write_fixture();

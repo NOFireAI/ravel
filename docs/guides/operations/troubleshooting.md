@@ -311,7 +311,13 @@ them.
 before every writer's flush for it had landed. A commit published into the
 already-sealed bucket is invisible to snapshot-reading queries. A hand fold
 with `--max-flush-lifetime 0s` or `--writers-stopped`, or a `ravel-cli load
---fold-after-load`, run while another writer was live, has the same effect.
+--fold-after-load`, run while another writer was live, has the same effect
+for a commit no fold picked up before the hour's natural seal margin passed.
+Every fold whose own seal margin has not yet passed an hour sealed early
+re-lists it and folds what it finds (see
+[Sealed hours](../../catalog-and-mvcc.md#sealed-hours)), so this needs a
+commit published after that margin, or no such fold running between the
+commit and the margin.
 
 **Confirm.** `ravel-cli catalog verify --tenant <name> --signal <signal>`
 exits nonzero with a nonempty "missing from snapshot" count.
