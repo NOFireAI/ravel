@@ -946,9 +946,10 @@ stopped may pass it. The loader also refuses to write into a sealed hour: with
 when the watermark is at or above the current hour. The seal lemma then rests on that
 assertion rather than on `max_flush_lifetime`, and it is unsafe under a live
 writer: a commit published into a bucket at or below the sealed watermark is
-never folded incrementally (the next fold's watermark is already at or past
-it), so it is invisible to a read without a commit token until HEAD is rebuilt
-from the commit records. A later fold that is not given S, including the
+not folded by a later fold, because the reconcile window re-lists hours below
+the watermark but skips a bucket holding only level-0 commit records, so it is
+invisible to a read without a commit token until HEAD is rebuilt from the
+commit records. A later fold that is not given S, including the
 scheduled fold, computes a target at or below the asserted watermark and
 no-ops until the natural margin passes it; a fold given an S at or below the
 watermark no-ops too. A no-op fold also skips the reconcile window below, so a

@@ -460,48 +460,18 @@ pub(crate) async fn run_fold_warning_to(
     {
         Ok(report) => {
             print_summary(&report, true);
-            if let Some(warning) = &report.load_memory_warning {
-                let _ = writeln!(warnings, "{warning}");
-            }
-            // A requested offset past the end of the file is always an operator
-            // error: resuming an already-complete file needs
-            // `--skip-rows == total rows` exactly, and anything larger is a
-            // typo or an offset carried over from a different file. The run
-            // still succeeds (it has nothing left to do), but the clamped
-            // `rows_skipped` in the summary above cannot show that the request
-            // exceeded the file, so a resume script reading only the exit code
-            // would record the load as done.
-            if let Some(warning) =
-                skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
-            {
-                let _ = writeln!(warnings, "{warning}");
-            }
-            // Early, so an operator watching a long load sees it as soon as it is
-            // known, ahead of the end-of-load dynamic-column pressure warnings.
-            if let Some(skew) = &report.skew_warning {
-                let _ = writeln!(warnings, "{skew}");
-            }
-            // A `--target-bytes` above the default that laid the objects out
-            // exactly as the default would have is reported rather than left
-            // silent (issue #971): the flag's threshold is a footprint estimate
-            // the operator cannot see, so the only honest place to state that
-            // the value did nothing is after the load that proves it.
-            if let Some(warning) =
-                target_bytes_no_effect_warning(target_bytes, &report, batch_rows, shards)
-            {
-                let _ = writeln!(warnings, "{warning}");
-            }
-            // The loader's writer uses `RlogConfig::default()` apart from its zstd
-            // level (log_shard.rs), so its per-object dynamic-column budget is
-            // that default.
-            let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
-            for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
-                let _ = writeln!(warnings, "{warning}");
-            }
+            write_report_warnings(warnings, &report, target_bytes, batch_rows, shards);
             Ok(())
         }
         Err(err) => {
             print_durable_tokens(&err, LOGS_RESUMABLE_SETTINGS);
+            // A --fold-after-load failure keeps the finished report: every
+            // object landed, so its end-of-load warnings still describe the
+            // run, and re-running the load is not the remedy that would show
+            // them again.
+            if let Some(report) = err.finished_report() {
+                write_report_warnings(warnings, report, target_bytes, batch_rows, shards);
+            }
             // The failed load dropped the report that carried this warning, and
             // it still explains the run: the load went one batch at a time.
             if let Some(warning) = one_batch_warning.get() {
@@ -516,6 +486,57 @@ pub(crate) async fn run_fold_warning_to(
             }
             Err(anyhow::Error::new(err))
         }
+    }
+}
+
+/// The end-of-load warnings a finished report carries: the load-memory note,
+/// a `--skip-rows` past the end of the file, shard skew, a `--target-bytes`
+/// that changed nothing, and dynamic-column pressure. Printed after a
+/// successful logs load, and after a `--fold-after-load` failure whose
+/// objects all landed.
+fn write_report_warnings(
+    warnings: &mut dyn std::io::Write,
+    report: &LoadReport,
+    target_bytes: usize,
+    batch_rows: usize,
+    shards: u32,
+) {
+    if let Some(warning) = &report.load_memory_warning {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    // A requested offset past the end of the file is always an operator
+    // error: resuming an already-complete file needs
+    // `--skip-rows == total rows` exactly, and anything larger is a
+    // typo or an offset carried over from a different file. The run
+    // still succeeds (it has nothing left to do), but the clamped
+    // `rows_skipped` in the summary above cannot show that the request
+    // exceeded the file, so a resume script reading only the exit code
+    // would record the load as done.
+    if let Some(warning) =
+        skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
+    {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    // Early, so an operator watching a long load sees it as soon as it is
+    // known, ahead of the end-of-load dynamic-column pressure warnings.
+    if let Some(skew) = &report.skew_warning {
+        let _ = writeln!(warnings, "{skew}");
+    }
+    // A `--target-bytes` above the default that laid the objects out
+    // exactly as the default would have is reported rather than left
+    // silent (issue #971): the flag's threshold is a footprint estimate
+    // the operator cannot see, so the only honest place to state that
+    // the value did nothing is after the load that proves it.
+    if let Some(warning) = target_bytes_no_effect_warning(target_bytes, report, batch_rows, shards)
+    {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    // The loader's writer uses `RlogConfig::default()` apart from its zstd
+    // level (log_shard.rs), so its per-object dynamic-column budget is
+    // that default.
+    let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
+    for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
+        let _ = writeln!(warnings, "{warning}");
     }
 }
 
