@@ -250,9 +250,13 @@ struct RefoldPending {
 /// per-fold cap (`frontier_reconcile_max_hours`) of a pair's oldest hours with
 /// [`Self::peek`], passes them to [`Catalog::fold_with_refold_request`], and
 /// removes those hours with [`Self::remove_hours`] only after a fold that
-/// returned `Ok` and was not a no-op, so a request survives a no-op fold, a
-/// fresh skip, and a failed fold, and the hours past the cap stay queued for
-/// the pair's next fold that advances the watermark.
+/// returned `Ok` and either was not a no-op or reported
+/// `refold_hours_reconciled > 0`. A fold over a HEAD whose watermark sits
+/// above its seal margin runs the targeted re-fold pass without advancing the
+/// watermark, and is a no-op when nothing changed, so a no-op fold can still
+/// have reconciled the request. A fresh skip, a failed fold, and a no-op fold
+/// that re-listed none of the hours leave the request queued, and the hours
+/// past the cap stay queued for a later fold.
 ///
 /// A queued hour is a hint, never a durability dependency. The queue lives in
 /// memory and is bounded at `capacity` pairs: a send for a new pair that finds
@@ -823,11 +827,15 @@ async fn run_loop(
 /// with [`RefoldQueue::peek`] and left queued (empty when none is pending),
 /// since the catalog reconciles no more than that per fold. Those hours are
 /// removed with [`RefoldQueue::remove_hours`] only after a fold that returned
-/// `Ok` and was not a no-op; a no-op fold, a fresh skip, or a failed fold
-/// leaves them for the next tick, and the hours past the cap stay queued for
-/// the pair's next fold that is not a no-op. A first fold and a rebuild are
-/// not no-ops and reconcile none of the request's hours, yet the hours passed
-/// to them are removed too: both derive every hour from the commit layout.
+/// `Ok` and either was not a no-op or reported `refold_hours_reconciled > 0`.
+/// A first fold and a rebuild are not no-ops and reconcile none of the
+/// request's hours, yet the hours passed to them are removed too: both derive
+/// every hour from the commit layout. A fold that only re-lists the hours
+/// held open above its seal margin runs the targeted re-fold pass too and is
+/// a no-op when nothing changed, so a nonzero count is what says it acted on
+/// the request. A failed fold, a fresh skip, or a no-op fold with
+/// `refold_hours_reconciled == 0` leaves the request for the next tick, and
+/// the hours past the cap stay queued for a later fold.
 ///
 /// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
 /// one deterministic cycle with an injected clock and an explicit live set,
@@ -913,8 +921,13 @@ pub async fn run_tick(
                 no_op,
                 refold_hours_reconciled,
             } => {
+                // A no-op fold acted on the request only when its targeted
+                // re-fold pass re-listed one of the hours.
                 if no_op {
                     report.no_op.push(tenant);
+                    if refold_hours_reconciled > 0 && !refold_request.is_empty() {
+                        refold.remove_hours(&tenant, signal, &refold_request);
+                    }
                 } else if !refold_request.is_empty() {
                     refold.remove_hours(&tenant, signal, &refold_request);
                 }
@@ -1080,11 +1093,15 @@ mod tests {
 
     use bytes::Bytes;
     use ravel_catalog::CatalogConfig;
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
     use ravel_maintain::FixedClock;
     use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY};
     use ravel_object_store::PutOptions;
     use ravel_object_store::memory::MemoryStore;
-    use ravel_types::TenantId;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
 
     use super::*;
 
@@ -1760,6 +1777,258 @@ mod tests {
         queue.remove_hours(&tenant, Signal::Metrics, &RefoldRequest::from_hours([12]));
         assert_eq!(queue.pending_len(), 0);
         assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// Publishes one L0 metric segment at `ingest_hour_bucket`, real enough for
+    /// a fold to fold it: a real `SegmentWriter` object plus a real published
+    /// commit record, the same two puts production ingest performs.
+    async fn publish_metric_segment(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "refold_probe".to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, "refold_probe", &labels).expect("series id"),
+            labels,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(0x9_000 + u128::from(writer_seq));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: i64::from(ingest_hour_bucket) * NS_PER_HOUR + 10 + writer_seq as i64,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// The first `now_ns` at which the default seal margin alone seals hour
+    /// `hour`.
+    fn margin_seals(hour: u32) -> i64 {
+        let config = CatalogConfig::default();
+        let margin = config.max_flush_lifetime_ns
+            + config.clock_skew_allowance_ns
+            + config.fold_safety_margin_ns;
+        (i64::from(hour) + 1) * NS_PER_HOUR + margin + 1
+    }
+
+    /// A clock five minutes into hour 1000, where a seal through hour 1000 is
+    /// allowed, at which the default margin hour is still 997.
+    fn held_clock() -> i64 {
+        1000 * NS_PER_HOUR + 5 * 60 * 1_000_000_000
+    }
+
+    /// A one-shard tenant with one metric segment in hour 995 and one in hour
+    /// 1000, folded with an operator seal through hour 1000 at
+    /// `held_clock()`. At that clock the margin hour is 997, so a later
+    /// fold at the same clock holds hours 998..=1000 open.
+    async fn held_open_tick_fixture(
+        name: &str,
+    ) -> (Arc<dyn ObjectStoreBackend>, Catalog, TenantHash) {
+        let inner = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new(name);
+        let tenant = tenant_id.hash();
+        inner
+            .put(
+                &format!("t/{}/marker", tenant.to_hex()),
+                Bytes::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the tenant prefix discovery lists");
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+
+        publish_metric_segment(store.as_ref(), &tenant_id, 1, 995).await;
+        publish_metric_segment(store.as_ref(), &tenant_id, 2, 1000).await;
+
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog builds");
+
+        let now = held_clock();
+        assert_eq!(catalog.margin_watermark_hour(now), Some(997));
+        let first = catalog
+            .fold_with_seal_through(
+                &tenant,
+                Signal::Metrics,
+                Uuid::from_u128(1),
+                now,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                Some(1000),
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.watermark_hour, Some(1000), "{first:?}");
+        (store, catalog, tenant)
+    }
+
+    /// One scheduled fold tick for `tenant` alone at `now_ns`.
+    async fn tick_at(
+        catalog: &Catalog,
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+        refold: &RefoldQueue,
+        now_ns: i64,
+    ) -> FoldTickReport {
+        let worker = WorkerSet::new(
+            NOW_NS,
+            HEARTBEAT,
+            DEFAULT_LIVENESS_FACTOR,
+            DEFAULT_UNIT_CONCURRENCY,
+        );
+        let live_set: Vec<Uuid> = worker.solo_live_set();
+        run_tick(
+            catalog,
+            store,
+            Signal::Metrics,
+            Some(&[tenant]),
+            Uuid::from_u128(2),
+            Duration::ZERO,
+            &RetentionConfig::default(),
+            &worker,
+            &live_set,
+            &FixedClock::new(now_ns),
+            refold,
+        )
+        .await
+        .expect("run_tick")
+    }
+
+    /// A held-open fold whose held range is quiet stays a no-op, but its
+    /// targeted re-fold pass reconciles a requested hour below that range
+    /// (995, outside 998..=1000, already clean), and the tick dequeues it. A
+    /// tick that removes a request only after a fold that is not a no-op
+    /// leaves hour 995 queued.
+    #[tokio::test]
+    async fn run_tick_dequeues_a_refold_request_a_no_op_held_open_fold_reconciled() {
+        let (store, catalog, tenant) = held_open_tick_fixture("run-tick-refold-dequeue").await;
+        let refold = RefoldQueue::default();
+        refold.send(tenant, Signal::Metrics, BTreeSet::from([995]));
+
+        let report = tick_at(&catalog, store.as_ref(), tenant, &refold, held_clock()).await;
+
+        assert_eq!(
+            report.no_op,
+            vec![tenant],
+            "the held range itself was quiet: {report:?}"
+        );
+        assert_eq!(
+            report.refold_hours_reconciled, 1,
+            "the targeted pass reconciled the out-of-range requested hour: {report:?}"
+        );
+        assert!(
+            pending_hours(&refold, tenant, Signal::Metrics).is_empty(),
+            "a reconciled request is dequeued"
+        );
+    }
+
+    /// A request whose only hour lies inside the held range (999 of
+    /// 998..=1000) is excluded from the targeted pass, so a quiet held-open
+    /// fold reconciles 0 requested hours and the request stays queued. That
+    /// ends: once the margin reaches the watermark no hour is held open, and
+    /// the first fold whose margin passes it advances the watermark and
+    /// dequeues the request. A tick that removes on every no-op fold loses it
+    /// at the first tick.
+    #[tokio::test]
+    async fn run_tick_keeps_a_held_range_request_until_an_advancing_fold() {
+        let (store, catalog, tenant) = held_open_tick_fixture("run-tick-refold-held").await;
+        let refold = RefoldQueue::default();
+        refold.send(tenant, Signal::Metrics, BTreeSet::from([999]));
+
+        let held = tick_at(&catalog, store.as_ref(), tenant, &refold, held_clock()).await;
+        assert_eq!(held.no_op, vec![tenant], "{held:?}");
+        assert_eq!(held.refold_hours_reconciled, 0, "{held:?}");
+        assert_eq!(pending_hours(&refold, tenant, Signal::Metrics), vec![999]);
+
+        // The margin hour equals the watermark: nothing is held open and
+        // nothing advances.
+        assert_eq!(
+            catalog.margin_watermark_hour(margin_seals(1000)),
+            Some(1000)
+        );
+        let caught_up = tick_at(
+            &catalog,
+            store.as_ref(),
+            tenant,
+            &refold,
+            margin_seals(1000),
+        )
+        .await;
+        assert_eq!(caught_up.no_op, vec![tenant], "{caught_up:?}");
+        assert_eq!(pending_hours(&refold, tenant, Signal::Metrics), vec![999]);
+
+        let advanced = tick_at(
+            &catalog,
+            store.as_ref(),
+            tenant,
+            &refold,
+            margin_seals(1001),
+        )
+        .await;
+        assert!(
+            advanced.no_op.is_empty(),
+            "the watermark advanced: {advanced:?}"
+        );
+        assert_eq!(advanced.folded, vec![tenant], "{advanced:?}");
+        assert!(
+            pending_hours(&refold, tenant, Signal::Metrics).is_empty(),
+            "the advancing fold dequeues it"
+        );
     }
 
     /// The maintain loop gets the queue only in a process whose scheduled fold
