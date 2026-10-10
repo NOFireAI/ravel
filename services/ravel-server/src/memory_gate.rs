@@ -168,6 +168,15 @@ pub fn resolve(
     let high_water_bytes = percent_of(performance.memory_budget_bytes, high_water_percent);
     let ingest_buffer_bytes = match (mode, ingest_buffer) {
         (Mode::All, IngestByteBudgetLimit::Bounded(bytes)) => bytes,
+        (Mode::All, IngestByteBudgetLimit::Unlimited) => {
+            tracing::warn!(
+                high_water_bytes,
+                "memory gate: --max-ingest-buffer-bytes is unlimited, so the mark was checked \
+                 against the cache caps alone; an ingest buffer that grows to the mark keeps the \
+                 gate closed"
+            );
+            0
+        }
         _ => 0,
     };
     let held = performance
@@ -400,10 +409,19 @@ fn run_sampler(budget: &MemoryBudget, high_water: u64, interval: Duration) {
                  until a reading succeeds"
             );
         }
-        // A pass that outruns the interval (a long purge at the 10 ms
-        // minimum) still sleeps half an interval, so purges never run back
-        // to back and the duty cycle ADR-2633 section 2 budgets holds.
-        std::thread::sleep(interval.saturating_sub(started.elapsed()).max(interval / 2));
+        std::thread::sleep(next_sleep(interval, started.elapsed()));
+    }
+}
+
+/// How long the sampler sleeps after a pass that took `elapsed`: the rest of
+/// the interval, or half an interval when the pass used it all (a long purge
+/// at the 10 ms minimum), so purges never run back to back and the duty
+/// cycle ADR-2633 section 2 budgets holds.
+fn next_sleep(interval: Duration, elapsed: Duration) -> Duration {
+    if elapsed >= interval {
+        interval / 2
+    } else {
+        interval - elapsed
     }
 }
 
@@ -627,6 +645,34 @@ mod tests {
         assert_eq!(snapshot.purges, 2);
         assert_eq!(snapshot.purge_buckets.iter().sum::<u64>(), 2);
         assert_eq!(snapshot.samples, 3);
+    }
+
+    #[test]
+    fn a_short_pass_sleeps_the_rest_of_the_interval() {
+        let interval = Duration::from_millis(100);
+        assert_eq!(
+            next_sleep(interval, Duration::from_millis(10)),
+            Duration::from_millis(90)
+        );
+        // Past half the interval the sleep is still the remainder, not a
+        // floor: a 99 ms pass keeps the 100 ms period.
+        assert_eq!(
+            next_sleep(interval, Duration::from_millis(99)),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn a_pass_that_uses_the_whole_interval_still_sleeps_half_of_it() {
+        let interval = Duration::from_millis(10);
+        assert_eq!(
+            next_sleep(interval, Duration::from_millis(10)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            next_sleep(interval, Duration::from_millis(15)),
+            Duration::from_millis(5)
+        );
     }
 
     #[test]
