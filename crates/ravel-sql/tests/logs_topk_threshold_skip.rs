@@ -448,7 +448,9 @@ fn session(provider: LogsTableProvider, setup: Setup) -> SessionContext {
         let mut state = state.write();
         let options = state.config_mut().options_mut();
         options.optimizer.enable_topk_dynamic_filter_pushdown = setup.skip;
-        options.execution.batch_size = RECORDS_PER_BLOCK;
+        options.execution.batch_size =
+            datafusion::common::config::ConfigNonZeroUsize::try_new(RECORDS_PER_BLOCK)
+                .expect("the block size is nonzero");
     }
     ctx
 }
