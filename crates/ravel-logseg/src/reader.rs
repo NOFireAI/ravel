@@ -67,6 +67,11 @@ pub struct ScanStats {
     /// their column. Zero for an all-columns scan; the observable proof that
     /// column projection reached the page level (ADR-0087 decision 3).
     pub pages_skipped: u64,
+    /// Block-length integer value buffers this scan's decodes built: one per
+    /// integer column decoded from its own value page, per block. A
+    /// column-reference column shares its target's buffer and adds nothing.
+    /// Grows as blocks are decoded, like [`Self::pages_decoded`].
+    pub int_values_buffers: u64,
     /// Stored bytes of pages present in the blocks this scan decoded,
     /// regardless of the [`ColumnSelection`]. A decode-time column-filtering
     /// measurement, distinct from any wire-byte count. Grows as blocks are
@@ -1218,23 +1223,19 @@ impl BlockScan {
         // Resolve stream_ref and ts once for the whole block, not once per
         // surviving row (#875): the per-row body then only indexes the resolved
         // slices, and the error text stays identical to the per-cell `i64_at`.
-        let stream_refs = decoded.i64_col(COL_STREAM_REF);
-        let ts = decoded.i64_col(COL_TS);
+        let stream_refs = decoded.i64_column(COL_STREAM_REF);
+        let ts = decoded.i64_column(COL_TS);
         let entries = self.stream_dir.entries();
         for &row in &self.surviving {
-            let raw = stream_refs
-                .and_then(|c| c.get(row).copied())
-                .flatten()
-                .ok_or_else(|| {
-                    LogSegError::Corrupted(format!("missing i64 col {COL_STREAM_REF}"))
-                })?;
+            let raw = stream_refs.and_then(|c| c.get(row)).ok_or_else(|| {
+                LogSegError::Corrupted(format!("missing i64 col {COL_STREAM_REF}"))
+            })?;
             let sref = u32::try_from(raw)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
             if entries.get(sref as usize).is_none() {
                 return Err(LogSegError::Corrupted("stream_ref out of range".into()));
             }
-            ts.and_then(|c| c.get(row).copied())
-                .flatten()
+            ts.and_then(|c| c.get(row))
                 .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {COL_TS}")))?;
         }
         Ok(Some(ColumnarBlockView::new(
@@ -1293,6 +1294,7 @@ impl BlockScan {
         )?;
         self.stats.blocks_scanned += 1;
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
+        self.stats.int_values_buffers += decoded.int_values_buffers() as u64;
         self.stats.pages_skipped += decoded.pages_skipped() as u64;
         self.stats.page_bytes_fetched = self
             .stats
@@ -1804,7 +1806,7 @@ fn i64_projected(
     row: usize,
     strict: bool,
 ) -> Result<i64, LogSegError> {
-    match block.i64_col(col) {
+    match block.i64_column(col) {
         Some(_) => i64_at(block, col, row),
         None if strict => i64_at(block, col, row),
         None => Ok(0),
@@ -1973,9 +1975,8 @@ fn flatten<'p>(pred: &'p Predicate, out: &mut Vec<&'p Predicate>) {
 
 pub(crate) fn i64_at(block: &DecodedBlock, col: u32, row: usize) -> Result<i64, LogSegError> {
     block
-        .i64_col(col)
-        .and_then(|c| c.get(row).copied())
-        .flatten()
+        .i64_column(col)
+        .and_then(|c| c.get(row))
         .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {col}")))
 }
 
@@ -2002,9 +2003,8 @@ fn get_attr_value(block: &DecodedBlock, cid: u32, ty: FieldType, row: usize) -> 
             .map(AttrValue::Str),
         FieldType::Bytes => str_at(block, cid, row).map(AttrValue::Bytes),
         FieldType::I64 => block
-            .i64_col(cid)
-            .and_then(|c| c.get(row).copied())
-            .flatten()
+            .i64_column(cid)
+            .and_then(|c| c.get(row))
             .map(AttrValue::I64),
         FieldType::F64 => block
             .f64_col(cid)

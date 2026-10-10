@@ -20,6 +20,12 @@
 //! either block that change or force it to materialize exactly the allocations
 //! it exists to delete.
 //!
+//! Integer columns are the one exception (ADR-2773 decision 1): their decoded
+//! form is already the value buffer and validity bitmap an Arrow array is built
+//! from, and [`I64Values`] hands those out so a consumer can slice them rather
+//! than append cell by cell. String, f64, bool and fixed-width columns stay
+//! behind per-cell accessors.
+//!
 //! # Row addressing
 //!
 //! Every `_at`/per-row accessor takes an index into the *surviving* rows,
@@ -31,7 +37,7 @@
 //! cell whose column is absent from the block or was projected away by the
 //! scan's [`ColumnSelection`](crate::ColumnSelection).
 
-use crate::block::{BytesColRef, DecodedBlock};
+use crate::block::{BytesColRef, DecodedBlock, I64Column};
 use crate::field_dir::FieldDir;
 use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
@@ -128,12 +134,12 @@ impl<'a> StrDictColumn<'a> {
 /// [`is_column_present`](I64Cursor::is_column_present) exposes which case it is
 /// for a caller that needs to tell them apart.
 macro_rules! value_cursor {
-    ($name:ident, $val:ty, $doc:literal) => {
+    ($name:ident, $store:ty, $val:ty, $doc:literal) => {
         #[doc = $doc]
         pub struct $name<'a> {
-            /// The resolved column slice, one entry per block row, or `None` when
-            /// the block carries no such column (absent or projected away).
-            col: Option<&'a [Option<$val>]>,
+            /// The resolved column, one entry per block row, or `None` when the
+            /// block carries no such column (absent or projected away).
+            col: Option<&'a $store>,
             /// Block row positions of the surviving rows (the view's `rows`).
             rows: &'a [usize],
         }
@@ -144,7 +150,7 @@ macro_rules! value_cursor {
             #[inline]
             pub fn at(&self, i: usize) -> Option<$val> {
                 let row = *self.rows.get(i)?;
-                self.col?.get(row).copied().flatten()
+                self.col?.cell(row)
             }
 
             /// Whether the block carries this column at all, distinct from a
@@ -167,19 +173,106 @@ macro_rules! value_cursor {
     };
 }
 
+/// Per-row read of a resolved column's storage, so one cursor macro covers both
+/// the per-row `Option` vectors and the integer value buffer.
+trait CellAt<T> {
+    fn cell(&self, row: usize) -> Option<T>;
+}
+
+impl<T: Copy> CellAt<T> for [Option<T>] {
+    #[inline]
+    fn cell(&self, row: usize) -> Option<T> {
+        self.get(row).copied().flatten()
+    }
+}
+
+impl CellAt<i64> for I64Column {
+    #[inline]
+    fn cell(&self, row: usize) -> Option<i64> {
+        self.get(row)
+    }
+}
+
 value_cursor!(
     I64Cursor,
+    I64Column,
     i64,
     "An i64 column resolved once per block (a fixed i64 column or an I64 attribute)."
 );
 value_cursor!(
     F64BitsCursor,
+    [Option<u64>],
     u64,
     "An f64 column resolved once per block, yielding `to_bits` patterns so NaN \
      payloads and `-0.0` stay bit-exact (see \
      [`ColumnarBlockView::f64_bits_at`])."
 );
-value_cursor!(BoolCursor, bool, "A bool column resolved once per block.");
+value_cursor!(
+    BoolCursor,
+    [Option<bool>],
+    bool,
+    "A bool column resolved once per block."
+);
+
+/// An integer column resolved once per block as the buffers it was decoded
+/// into: one value slot per block row and an LSB-first validity bitmap
+/// (ADR-2773 decision 1). A consumer building an Arrow array slices or takes
+/// these by the surviving rows' block positions ([`rows`](Self::rows)) instead
+/// of appending cell by cell. An absent row's slot holds 0 and its validity
+/// bit is clear; [`at`](Self::at) reads it as `None`, exactly as
+/// [`I64Cursor::at`] does.
+pub struct I64Values<'a> {
+    col: Option<&'a I64Column>,
+    rows: &'a [usize],
+}
+
+impl<'a> I64Values<'a> {
+    /// Whether the block carries this column at all (see
+    /// [`I64Cursor::is_column_present`]).
+    pub fn is_column_present(&self) -> bool {
+        self.col.is_some()
+    }
+
+    /// One value per block row, `None` when the column is absent. Index it by
+    /// block row position, i.e. by an entry of [`rows`](Self::rows).
+    pub fn values(&self) -> Option<&'a [i64]> {
+        self.col.map(I64Column::values)
+    }
+
+    /// The validity bitmap over block rows (bit `r` of byte `r / 8`, LSB
+    /// first), `None` when the column is absent or has no absent row.
+    pub fn validity(&self) -> Option<&'a [u8]> {
+        self.col.and_then(I64Column::validity)
+    }
+
+    /// Absent rows in the whole block column (not only the surviving rows); 0
+    /// when the column itself is absent.
+    pub fn null_count(&self) -> usize {
+        self.col.map_or(0, I64Column::null_count)
+    }
+
+    /// Block row positions of the surviving rows, strictly ascending.
+    pub fn rows(&self) -> &'a [usize] {
+        self.rows
+    }
+
+    /// The cell at surviving row `i`, the same value [`I64Cursor::at`] reads.
+    #[inline]
+    pub fn at(&self, i: usize) -> Option<i64> {
+        let row = *self.rows.get(i)?;
+        self.col?.get(row)
+    }
+
+    /// Number of surviving rows.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether no row survives.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
 
 /// A byte-valued column (string or fixed-width id) resolved once per block,
 /// walked per surviving row. Yields cell bytes through [`BytesColRef`], never the
@@ -467,9 +560,38 @@ impl<'a> ColumnarBlockView<'a> {
     /// every cell.
     pub fn i64_cursor(&self, column_id: u32) -> I64Cursor<'a> {
         I64Cursor {
-            col: self.block.i64_col(column_id),
+            col: self.block.i64_column(column_id),
             rows: self.rows,
         }
+    }
+
+    /// Resolve column `column_id` as an integer column once, as its value
+    /// buffer and validity rather than a per-row cursor.
+    pub fn i64_values(&self, column_id: u32) -> I64Values<'a> {
+        I64Values {
+            col: self.block.i64_column(column_id),
+            rows: self.rows,
+        }
+    }
+
+    /// The event-timestamp column's value buffer and validity.
+    pub fn ts_values(&self) -> I64Values<'a> {
+        self.i64_values(COL_TS)
+    }
+
+    /// The observed-timestamp column's value buffer and validity.
+    pub fn observed_ts_values(&self) -> I64Values<'a> {
+        self.i64_values(COL_OBSERVED_TS)
+    }
+
+    /// The severity-number column's value buffer and validity.
+    pub fn severity_num_values(&self) -> I64Values<'a> {
+        self.i64_values(COL_SEVERITY_NUM)
+    }
+
+    /// The flags column's value buffer and validity.
+    pub fn flags_values(&self) -> I64Values<'a> {
+        self.i64_values(COL_FLAGS)
     }
 
     /// Resolve column `column_id` as an f64 column once (bits form, see
@@ -560,7 +682,7 @@ impl<'a> ColumnarBlockView<'a> {
     /// The i64 cell at surviving row `i` of column `column_id`.
     pub fn i64_at(&self, column_id: u32, i: usize) -> Option<i64> {
         let row = self.row(i)?;
-        self.block.i64_col(column_id)?.get(row).copied().flatten()
+        self.block.i64_column(column_id)?.get(row)
     }
 
     /// The f64 cell at surviving row `i` of column `column_id`, as its

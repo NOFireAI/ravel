@@ -123,6 +123,22 @@ pub(crate) fn unpack_bits(
     count: usize,
     bit_width: u32,
 ) -> Result<Vec<u64>, CodecError> {
+    let mut out = Vec::with_capacity(cap(count));
+    unpack_bits_each(buf, count, bit_width, &mut |v| {
+        out.push(v);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// [`unpack_bits`], handing each value to `emit` in order instead of
+/// collecting them, so a caller can store them wherever they belong.
+fn unpack_bits_each(
+    buf: &[u8],
+    count: usize,
+    bit_width: u32,
+    emit: &mut impl FnMut(u64) -> Result<(), CodecError>,
+) -> Result<(), CodecError> {
     if bit_width > 64 {
         return Err(CodecError::Corrupted(format!("bit_width {bit_width} > 64")));
     }
@@ -130,7 +146,10 @@ pub(crate) fn unpack_bits(
         if !buf.is_empty() {
             return Err(CodecError::Corrupted("bit_width 0 with payload".into()));
         }
-        return Ok(vec![0u64; count]);
+        for _ in 0..count {
+            emit(0)?;
+        }
+        return Ok(());
     }
     let need_bits = (count as u64)
         .checked_mul(u64::from(bit_width))
@@ -147,7 +166,6 @@ pub(crate) fn unpack_bits(
     } else {
         (1u64 << bit_width) - 1
     };
-    let mut out = Vec::with_capacity(cap(count));
     let mut acc: u128 = 0;
     let mut nbits: u32 = 0;
     let mut idx = 0usize;
@@ -157,11 +175,11 @@ pub(crate) fn unpack_bits(
             idx += 1;
             nbits += 8;
         }
-        out.push((acc & u128::from(mask)) as u64);
+        emit((acc & u128::from(mask)) as u64)?;
         acc >>= bit_width;
         nbits -= bit_width;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Minimum bit width needed to hold `range` as an unsigned value.
@@ -290,22 +308,108 @@ pub fn encode_i64(values: &[i64]) -> (Enc, Vec<u8>) {
 
 /// Decodes `count` i64 values encoded with `enc`.
 pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, CodecError> {
+    let mut out = Vec::with_capacity(cap(count));
+    decode_i64_each(enc, bytes, count, &mut |v| {
+        out.push(v);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Decodes the present values of an i64 page straight into a block-length
+/// buffer, in the same pass that reads the varints.
+///
+/// `out` holds one slot per block row. `presence` is the column's LSB-first
+/// presence bitmap (`None` when every row is present); it must be exactly
+/// `ceil(out.len() / 8)` bytes. The page carries one value per present row;
+/// each decoded value passes through `map` and is stored at the next present
+/// row. Absent rows are written as 0. Returns the number of present rows.
+pub fn decode_i64_into(
+    enc: Enc,
+    bytes: &[u8],
+    presence: Option<&[u8]>,
+    out: &mut [i64],
+    mut map: impl FnMut(i64) -> Result<i64, CodecError>,
+) -> Result<usize, CodecError> {
+    let rows = out.len();
+    let Some(bits) = presence else {
+        let mut row = 0usize;
+        decode_i64_each(enc, bytes, rows, &mut |v| {
+            let slot = out
+                .get_mut(row)
+                .ok_or_else(|| CodecError::Corrupted("value page longer than block".into()))?;
+            *slot = map(v)?;
+            row += 1;
+            Ok(())
+        })?;
+        return Ok(rows);
+    };
+    let count = count_present(bits, rows)?;
+    let mut row = 0usize;
+    decode_i64_each(enc, bytes, count, &mut |v| {
+        while row < rows && !bit_is_set(bits, row) {
+            out[row] = 0;
+            row += 1;
+        }
+        let slot = out
+            .get_mut(row)
+            .ok_or_else(|| CodecError::Corrupted("value page longer than presence".into()))?;
+        *slot = map(v)?;
+        row += 1;
+        Ok(())
+    })?;
+    for slot in out.iter_mut().skip(row) {
+        *slot = 0;
+    }
+    Ok(count)
+}
+
+/// Number of set bits among the first `rows` bits of an LSB-first bitmap,
+/// which must be exactly `ceil(rows / 8)` bytes long.
+pub fn count_present(bits: &[u8], rows: usize) -> Result<usize, CodecError> {
+    if bits.len() != rows.div_ceil(8) {
+        return Err(CodecError::Corrupted(format!(
+            "bitmap length {} != {}",
+            bits.len(),
+            rows.div_ceil(8)
+        )));
+    }
+    let full = rows / 8;
+    let mut n: usize = bits[..full].iter().map(|b| b.count_ones() as usize).sum();
+    let tail = rows % 8;
+    if tail > 0 {
+        n += (bits[full] & ((1u8 << tail) - 1)).count_ones() as usize;
+    }
+    Ok(n)
+}
+
+fn bit_is_set(bits: &[u8], i: usize) -> bool {
+    bits[i / 8] & (1 << (i % 8)) != 0
+}
+
+/// Core of [`decode_i64`]: hands each of the `count` decoded values to `emit`
+/// in order, then checks the page was consumed exactly.
+fn decode_i64_each(
+    enc: Enc,
+    bytes: &[u8],
+    count: usize,
+    emit: &mut impl FnMut(i64) -> Result<(), CodecError>,
+) -> Result<(), CodecError> {
     let mut pos = 0usize;
-    let out = match enc {
+    match enc {
         Enc::Plain => {
-            let mut out = Vec::with_capacity(cap(count));
             for _ in 0..count {
-                out.push(get_ivarint(bytes, &mut pos)?);
+                emit(get_ivarint(bytes, &mut pos)?)?;
             }
-            out
         }
         Enc::Constant => {
             let v = get_ivarint(bytes, &mut pos)?;
-            vec![v; count]
+            for _ in 0..count {
+                emit(v)?;
+            }
         }
         Enc::Rle => {
             let run_count = get_uvarint(bytes, &mut pos)?;
-            let mut out = Vec::with_capacity(cap(count));
             let mut total: u64 = 0;
             for _ in 0..run_count {
                 let v = get_ivarint(bytes, &mut pos)?;
@@ -317,40 +421,36 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, Code
                     return Err(CodecError::Corrupted("rle exceeds count".into()));
                 }
                 for _ in 0..run {
-                    out.push(v);
+                    emit(v)?;
                 }
             }
             if total != count as u64 {
                 return Err(CodecError::Corrupted("rle short of count".into()));
             }
-            out
         }
         Enc::DeltaZigzag => {
-            let mut out = Vec::with_capacity(cap(count));
             if count > 0 {
                 let mut acc = get_ivarint(bytes, &mut pos)?;
-                out.push(acc);
+                emit(acc)?;
                 for _ in 1..count {
                     let delta = get_ivarint(bytes, &mut pos)?;
                     acc = acc
                         .checked_add(delta)
                         .ok_or_else(|| CodecError::Corrupted("delta overflow".into()))?;
-                    out.push(acc);
+                    emit(acc)?;
                 }
             }
-            out
         }
         Enc::DoubleDelta => {
-            let mut out = Vec::with_capacity(cap(count));
             if count > 0 {
                 let mut value = get_ivarint(bytes, &mut pos)?;
-                out.push(value);
+                emit(value)?;
                 if count > 1 {
                     let mut prev_delta = get_ivarint(bytes, &mut pos)?;
                     value = value
                         .checked_add(prev_delta)
                         .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
-                    out.push(value);
+                    emit(value)?;
                     for _ in 2..count {
                         let dod = get_ivarint(bytes, &mut pos)?;
                         prev_delta = prev_delta
@@ -359,11 +459,10 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, Code
                         value = value
                             .checked_add(prev_delta)
                             .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
-                        out.push(value);
+                        emit(value)?;
                     }
                 }
             }
-            out
         }
         Enc::ForBitpack => {
             let min = get_ivarint(bytes, &mut pos)?;
@@ -373,23 +472,19 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, Code
                     .ok_or_else(|| CodecError::Corrupted("for truncated".into()))?,
             );
             pos += 1;
-            let offsets = unpack_bits(&bytes[pos..], count, bit_width)?;
+            unpack_bits_each(&bytes[pos..], count, bit_width, &mut |o| {
+                emit((min as u64).wrapping_add(o) as i64)
+            })?;
             pos = bytes.len();
-            offsets
-                .into_iter()
-                .map(|o| (min as u64).wrapping_add(o) as i64)
-                .collect()
         }
         other => {
             return Err(CodecError::Corrupted(format!(
                 "enc {other:?} is not an integer codec"
             )));
         }
-    };
-    expect_consumed(pos, bytes.len())?;
-    Ok(out)
+    }
+    expect_consumed(pos, bytes.len())
 }
-
 // ---------------------------------------------------------------------------
 // Bitmap codec (bool columns and presence bitmaps)
 // ---------------------------------------------------------------------------

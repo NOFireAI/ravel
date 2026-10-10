@@ -12,9 +12,10 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
 
 use crate::encoding::{
-    DecodedStrings, Enc, decode_bitmap, decode_f64, decode_fixed, decode_i64,
+    DecodedStrings, Enc, count_present, decode_bitmap, decode_f64, decode_fixed, decode_i64_into,
     decode_strings_columnar, encode_bitmap, encode_f64, encode_fixed,
 };
 use crate::error::LogSegError;
@@ -25,7 +26,7 @@ use crate::record::{
     SPAN_ID_WIDTH, TRACE_ID_WIDTH,
 };
 use crate::rlog_codec::{
-    StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64, encode_column_ref,
+    StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64_into, encode_column_ref,
     i64_candidates, shape_candidates, string_dict_shape, string_shape,
 };
 
@@ -858,6 +859,160 @@ impl<T> ColMap<T> {
     }
 }
 
+/// A decoded integer column: one value slot per block row plus an LSB-first
+/// validity bitmap, the two buffers an Arrow `PrimitiveArray` is built from
+/// (ADR-2773 decision 1). The page decoder writes both in one pass, so there is
+/// no per-row `Option` vector and no scatter. An absent row holds 0 in
+/// `values` and a clear bit in the validity; every reader that goes through
+/// [`I64Column::get`] sees it as `None`.
+///
+/// Both buffers are reference counted, so a column-reference page (tag 11)
+/// shares its target's buffers instead of copying them.
+#[derive(Clone, Debug)]
+pub struct I64Column {
+    values: Arc<[i64]>,
+    /// `None` when every row is present. Otherwise exactly
+    /// `ceil(values.len() / 8)` bytes, with the bits past `values.len()` clear.
+    validity: Option<Arc<[u8]>>,
+    null_count: usize,
+}
+
+impl I64Column {
+    /// Builds a column from per-row cells, for tests and for callers that hold
+    /// rows rather than pages.
+    pub fn from_options(cells: &[Option<i64>]) -> Self {
+        let values: Arc<[i64]> = cells.iter().map(|c| c.unwrap_or(0)).collect();
+        let null_count = cells.iter().filter(|c| c.is_none()).count();
+        let validity = (null_count > 0).then(|| {
+            let mut bits = vec![0u8; cells.len().div_ceil(8)];
+            for (i, c) in cells.iter().enumerate() {
+                if c.is_some() {
+                    bits[i / 8] |= 1 << (i % 8);
+                }
+            }
+            Arc::from(bits)
+        });
+        I64Column {
+            values,
+            validity,
+            null_count,
+        }
+    }
+
+    /// Row count: the block's `record_count`.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// One slot per block row; an absent row's slot is 0.
+    pub fn values(&self) -> &[i64] {
+        &self.values
+    }
+
+    /// The LSB-first validity bitmap, `None` when no row is absent.
+    pub fn validity(&self) -> Option<&[u8]> {
+        self.validity.as_deref()
+    }
+
+    /// Rows whose value is absent.
+    pub fn null_count(&self) -> usize {
+        self.null_count
+    }
+
+    /// Whether block row `row` carries a value. False past the end.
+    #[inline]
+    pub fn is_valid(&self, row: usize) -> bool {
+        if row >= self.values.len() {
+            return false;
+        }
+        match &self.validity {
+            None => true,
+            Some(bits) => bits[row / 8] & (1 << (row % 8)) != 0,
+        }
+    }
+
+    /// The value at block row `row`, or `None` for an absent row or a row past
+    /// the end.
+    #[inline]
+    pub fn get(&self, row: usize) -> Option<i64> {
+        if self.is_valid(row) {
+            self.values.get(row).copied()
+        } else {
+            None
+        }
+    }
+
+    /// The column as per-row cells, `None` for an absent row.
+    pub fn to_options(&self) -> Vec<Option<i64>> {
+        (0..self.values.len()).map(|row| self.get(row)).collect()
+    }
+
+    fn shares_buffer_with(&self, other: &I64Column) -> bool {
+        Arc::ptr_eq(&self.values, &other.values)
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.values.len() * std::mem::size_of::<i64>()
+            + self.validity.as_ref().map_or(0, |v| v.len())
+    }
+}
+
+/// Decodes an integer value page into a fresh block-length buffer with its
+/// validity, in one pass. `presence` is the column's presence bitmap page, or
+/// `None` when the column has a value in every row.
+fn decode_i64_column(
+    record_count: usize,
+    enc: Enc,
+    encoded: &[u8],
+    presence: Option<&[u8]>,
+) -> Result<I64Column, LogSegError> {
+    let mut values: Arc<[i64]> = std::iter::repeat_n(0i64, record_count).collect();
+    let out = Arc::get_mut(&mut values)
+        .ok_or_else(|| LogSegError::Corrupted("integer buffer is shared before decode".into()))?;
+    let present = match enc {
+        Enc::GcdI64 => decode_gcd_i64_into(encoded, presence, out)?,
+        _ => decode_i64_into(enc, encoded, presence, out, Ok)?,
+    };
+    Ok(I64Column {
+        values,
+        validity: normalized_validity(presence, record_count, present),
+        null_count: record_count - present,
+    })
+}
+
+/// The presence bitmap as a validity buffer: `None` when every row is present,
+/// otherwise a copy with the padding bits past `record_count` cleared, so two
+/// columns with equal presence hold equal bytes. The caller has already
+/// checked its length against `record_count`.
+fn normalized_validity(
+    presence: Option<&[u8]>,
+    record_count: usize,
+    present: usize,
+) -> Option<Arc<[u8]>> {
+    let bits = presence?;
+    if present == record_count {
+        return None;
+    }
+    let tail = record_count % 8;
+    let full = record_count / 8;
+    Some(
+        bits.iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                if i == full && tail > 0 {
+                    b & ((1u8 << tail) - 1)
+                } else {
+                    b
+                }
+            })
+            .collect(),
+    )
+}
+
 /// A byte-valued column resolved once by id: a string column (plain or
 /// dictionary) or a fixed-width id column. A given column id is only ever one of
 /// the two, so [`DecodedBlock::bytes_col`] resolves it with a single lookup and
@@ -892,7 +1047,7 @@ impl<'a> BytesColRef<'a> {
 /// the same nothing).
 pub struct DecodedBlock {
     record_count: usize,
-    i64_cols: ColMap<Vec<Option<i64>>>,
+    i64_cols: ColMap<I64Column>,
     f64_cols: ColMap<Vec<Option<u64>>>,
     bool_cols: ColMap<Vec<Option<bool>>>,
     str_cols: ColMap<StrColumn>,
@@ -913,6 +1068,7 @@ pub struct DecodedBlock {
     page_bytes_fetched: u64,
     page_bytes_decoded: u64,
     decompressed_bytes: u64,
+    int_values_buffers: usize,
 }
 
 impl DecodedBlock {
@@ -963,6 +1119,13 @@ impl DecodedBlock {
         self.decompressed_bytes
     }
 
+    /// Block-length integer value buffers this decode built, one per integer
+    /// column decoded from its own value page. A column-reference column
+    /// (tag 11) shares its target's buffer and builds none.
+    pub fn int_values_buffers(&self) -> usize {
+        self.int_values_buffers
+    }
+
     /// Whether this block carries any page for the `attrs_raw` overflow column.
     ///
     /// Read off the page descriptors in the block header, so it is true for a
@@ -998,8 +1161,14 @@ impl DecodedBlock {
         total += self.bool_cols.slot_bytes();
         total += self.str_cols.slot_bytes();
         total += self.fixed_cols.slot_bytes();
-        for v in self.i64_cols.values() {
-            total += v.capacity() * std::mem::size_of::<Option<i64>>();
+        // A column-reference column shares its target's buffers; they are
+        // resident once.
+        let mut counted: Vec<&I64Column> = Vec::new();
+        for c in self.i64_cols.values() {
+            if !counted.iter().any(|seen| seen.shares_buffer_with(c)) {
+                total += c.heap_bytes();
+                counted.push(c);
+            }
         }
         for v in self.f64_cols.values() {
             total += v.capacity() * std::mem::size_of::<Option<u64>>();
@@ -1047,9 +1216,17 @@ impl DecodedBlock {
         self.col_lookups.set(self.col_lookups.get() + 1);
     }
 
-    pub fn i64_col(&self, column_id: u32) -> Option<&[Option<i64>]> {
+    /// Integer column `column_id` as its value buffer and validity, `None` when
+    /// the block carries no such column (absent or projected away).
+    pub fn i64_column(&self, column_id: u32) -> Option<&I64Column> {
         self.bump_lookup();
-        self.i64_cols.get(column_id).map(Vec::as_slice)
+        self.i64_cols.get(column_id)
+    }
+
+    /// Integer column `column_id` materialized as per-row cells. Allocates;
+    /// readers on a scan path use [`Self::i64_column`].
+    pub fn i64_col(&self, column_id: u32) -> Option<Vec<Option<i64>>> {
+        self.i64_column(column_id).map(I64Column::to_options)
     }
     pub fn f64_col(&self, column_id: u32) -> Option<&[Option<u64>]> {
         self.bump_lookup();
@@ -1156,6 +1333,14 @@ fn page(pages: &[Option<Vec<u8>>], idx: usize) -> Result<&[u8], LogSegError> {
         .ok_or_else(|| LogSegError::Corrupted("page not decoded".into()))
 }
 
+/// A presence bitmap page as one flag per row; every row when there is none.
+fn present_rows(presence: Option<&[u8]>, record_count: usize) -> Result<Vec<bool>, LogSegError> {
+    Ok(match presence {
+        None => vec![true; record_count],
+        Some(bits) => decode_bitmap(bits, record_count)?,
+    })
+}
+
 /// Scatters `present`-length-`record_count` values into a per-row vector.
 /// `values` holds only the present entries, in row order.
 fn scatter<T: Clone>(present: &[bool], values: Vec<T>) -> Result<Vec<Option<T>>, LogSegError> {
@@ -1255,27 +1440,31 @@ pub struct PageCounters {
     pub decompressed_bytes: u64,
 }
 
-/// The values of a tag-11 column: a copy of `target`'s already-decoded values.
-/// Column ids ascend in PAGE_DIR, so `ts` is decoded before `observed_ts`; a
-/// target that was not decoded, or whose presence differs from the referencing
-/// column's, is `Corrupted`.
+/// The values of a tag-11 column: `target`'s already-decoded buffers, shared
+/// rather than copied. Column ids ascend in PAGE_DIR, so `ts` is decoded before
+/// `observed_ts`; a target that was not decoded, or whose presence differs from
+/// the referencing column's, is `Corrupted`.
 fn referenced_i64(
     out: &DecodedBlock,
     target: u32,
     column_id: u32,
-    present: &[bool],
-) -> Result<Vec<Option<i64>>, LogSegError> {
-    let values = out.i64_cols.get(target).ok_or_else(|| {
+    record_count: usize,
+    presence: Option<&[u8]>,
+    present: usize,
+) -> Result<I64Column, LogSegError> {
+    let col = out.i64_cols.get(target).ok_or_else(|| {
         LogSegError::Corrupted(format!(
             "column {column_id} references column {target}, which was not decoded before it"
         ))
     })?;
-    if values.len() != present.len() || values.iter().zip(present).any(|(v, &p)| v.is_some() != p) {
+    if col.len() != record_count
+        || col.validity() != normalized_validity(presence, record_count, present).as_deref()
+    {
         return Err(LogSegError::Corrupted(format!(
             "column {column_id} references column {target} but their presence differs"
         )));
     }
-    Ok(values.clone())
+    Ok(col.clone())
 }
 
 /// Narrows a row group dictionary to the entries one block's `ids` reference,
@@ -1349,17 +1538,18 @@ fn decode_columns(
         page_bytes_fetched: counters.bytes_fetched,
         page_bytes_decoded: counters.bytes_decoded,
         decompressed_bytes: counters.decompressed_bytes,
+        int_values_buffers: 0,
     };
 
     for column_id in order {
         let idxs = &groups[&column_id];
-        let (present, value_idx): (Vec<bool>, usize) = match idxs.as_slice() {
-            [v] => (vec![true; record_count], *v),
+        let (presence, value_idx): (Option<&[u8]>, usize) = match idxs.as_slice() {
+            [v] => (None, *v),
             [p, v] => {
                 if descs[*p].enc != Enc::Bitmap {
                     return Err(LogSegError::Corrupted("presence page not a bitmap".into()));
                 }
-                (decode_bitmap(page(page_bytes, *p)?, record_count)?, *v)
+                (Some(page(page_bytes, *p)?), *v)
             }
             _ => {
                 return Err(LogSegError::Corrupted(format!(
@@ -1368,22 +1558,32 @@ fn decode_columns(
                 )));
             }
         };
-        let present_count = present.iter().filter(|&&b| b).count();
+        let present_count = match presence {
+            None => record_count,
+            Some(bits) => count_present(bits, record_count)?,
+        };
         let enc = descs[value_idx].enc;
         let encoded = page(page_bytes, value_idx)?;
         match column_kind(column_id, plans)? {
             ColKind::I64 => {
-                let col = match enc {
-                    Enc::GcdI64 => scatter(&present, decode_gcd_i64(encoded, present_count)?)?,
-                    Enc::ColumnRef => {
-                        let target = decode_column_ref(column_id, encoded)?;
-                        referenced_i64(&out, target, column_id, &present)?
-                    }
-                    _ => scatter(&present, decode_i64(enc, encoded, present_count)?)?,
+                let col = if enc == Enc::ColumnRef {
+                    let target = decode_column_ref(column_id, encoded)?;
+                    referenced_i64(
+                        &out,
+                        target,
+                        column_id,
+                        record_count,
+                        presence,
+                        present_count,
+                    )?
+                } else {
+                    out.int_values_buffers += 1;
+                    decode_i64_column(record_count, enc, encoded, presence)?
                 };
                 out.i64_cols.insert(column_id, col);
             }
             ColKind::F64 => {
+                let present = present_rows(presence, record_count)?;
                 let vals = decode_f64(enc, encoded, present_count)?;
                 out.f64_cols.insert(column_id, scatter(&present, vals)?);
             }
@@ -1393,10 +1593,12 @@ fn decode_columns(
                         "bool value page not a bitmap".into(),
                     ));
                 }
+                let present = present_rows(presence, record_count)?;
                 let vals = decode_bitmap(encoded, present_count)?;
                 out.bool_cols.insert(column_id, scatter(&present, vals)?);
             }
             ColKind::Str => {
+                let present = present_rows(presence, record_count)?;
                 // Presence is applied by scattering against the block's presence
                 // bitmap; the page's ids are per present row, so an absent row
                 // gets a `None` slot rather than a sentinel id (ADR-0099
@@ -1429,6 +1631,7 @@ fn decode_columns(
                 out.str_cols.insert(column_id, col);
             }
             ColKind::Fixed(width) => {
+                let present = present_rows(presence, record_count)?;
                 let vals = decode_fixed(enc, encoded, present_count, width)?;
                 out.fixed_cols.insert(column_id, scatter(&present, vals)?);
             }
@@ -1536,9 +1739,9 @@ mod tests {
     #[test]
     fn decoded_heap_bytes_charges_the_slot_vector() {
         fn block_with(ids: [u32; 2]) -> DecodedBlock {
-            let mut i64_cols: ColMap<Vec<Option<i64>>> = ColMap::new();
-            i64_cols.insert(ids[0], vec![Some(1i64); 4]);
-            i64_cols.insert(ids[1], vec![Some(2i64); 4]);
+            let mut i64_cols: ColMap<I64Column> = ColMap::new();
+            i64_cols.insert(ids[0], I64Column::from_options(&[Some(1i64); 4]));
+            i64_cols.insert(ids[1], I64Column::from_options(&[Some(2i64); 4]));
             DecodedBlock {
                 record_count: 4,
                 i64_cols,
@@ -1553,6 +1756,7 @@ mod tests {
                 page_bytes_fetched: 0,
                 page_bytes_decoded: 0,
                 decompressed_bytes: 0,
+                int_values_buffers: 0,
             }
         }
 
@@ -1566,7 +1770,7 @@ mod tests {
         // gap. 900 still pins the magnitude: an implementation that charged
         // only the two columns actually present would show a difference of
         // roughly zero here, not of 900 slots.
-        let slot = std::mem::size_of::<Option<Vec<Option<i64>>>>();
+        let slot = std::mem::size_of::<Option<I64Column>>();
         let forced = 900 * slot;
         assert!(
             sparse >= dense + forced,

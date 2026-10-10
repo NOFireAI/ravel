@@ -45,7 +45,8 @@ mod bloom_coverage_tests;
 // decoded block, so decision 4 can change how columns are stored without
 // touching a caller.
 pub use columnar::{
-    AttrColumn, BoolCursor, BytesCursor, ColumnarBlockView, F64BitsCursor, I64Cursor, StrDictColumn,
+    AttrColumn, BoolCursor, BytesCursor, ColumnarBlockView, F64BitsCursor, I64Cursor, I64Values,
+    StrDictColumn,
 };
 pub use columnar_batch::{
     Bitmap, BytesCells, ColumnarLogBatch, DynCells, DynColumn, StrColumnDict, VAR_BYTES_MAX,

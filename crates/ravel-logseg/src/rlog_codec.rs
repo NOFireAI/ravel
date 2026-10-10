@@ -15,10 +15,11 @@
 //! decoder here treats its input as untrusted and returns
 //! [`LogSegError::Corrupted`] on any violation.
 
-use crate::encoding::{Enc, decode_i64, encode_i64};
+use crate::encoding::{Enc, decode_i64, decode_i64_into, encode_i64};
 use crate::error::LogSegError;
 use crate::record::{COL_OBSERVED_TS, COL_TS};
 use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
+use ravel_codec::error::CodecError;
 
 // ---------------------------------------------------------------------------
 // Integer candidates (tags 1 to 6, as `ravel-codec` lays them out)
@@ -171,6 +172,33 @@ pub fn encode_gcd_i64(values: &[i64]) -> Option<Vec<u8>> {
 /// bytes are all `Corrupted`. The product is added to `base` with a wrapping
 /// add, which inverts the encoder's wrapping subtraction exactly.
 pub fn decode_gcd_i64(bytes: &[u8], count: usize) -> Result<Vec<i64>, LogSegError> {
+    let (g, base, inner, pos) = gcd_header(bytes)?;
+    let quotients = decode_i64(inner, &bytes[pos..], count)?;
+    let mut out = Vec::with_capacity(quotients.len());
+    for q in quotients {
+        out.push(gcd_value(g, base, q)?);
+    }
+    Ok(out)
+}
+
+/// [`decode_gcd_i64`] written straight into a block-length buffer, with the
+/// same contract as [`decode_i64_into`]: `presence` is the column's presence
+/// bitmap (`None` when every row is present), absent rows read 0, and the
+/// return value is the present count. Every check of [`decode_gcd_i64`]
+/// applies unchanged.
+pub fn decode_gcd_i64_into(
+    bytes: &[u8],
+    presence: Option<&[u8]>,
+    out: &mut [i64],
+) -> Result<usize, LogSegError> {
+    let (g, base, inner, pos) = gcd_header(bytes)?;
+    Ok(decode_i64_into(inner, &bytes[pos..], presence, out, |q| {
+        gcd_value(g, base, q)
+    })?)
+}
+
+/// Parses a tag-10 page's header: `(gcd, base, inner codec, payload offset)`.
+fn gcd_header(bytes: &[u8]) -> Result<(u64, i64, Enc, usize), LogSegError> {
     let mut pos = 0usize;
     let g = get_uvarint(bytes, &mut pos)?;
     if g < 2 {
@@ -195,17 +223,16 @@ pub fn decode_gcd_i64(bytes: &[u8], count: usize) -> Result<Vec<i64>, LogSegErro
             "gcd page inner tag {tag} is not an integer codec"
         )));
     }
-    let quotients = decode_i64(inner, &bytes[pos..], count)?;
-    let mut out = Vec::with_capacity(quotients.len());
-    for q in quotients {
-        let q = u64::try_from(q)
-            .map_err(|_| LogSegError::Corrupted(format!("gcd page quotient {q} is negative")))?;
-        let product = q.checked_mul(g).ok_or_else(|| {
-            LogSegError::Corrupted(format!("gcd page quotient {q} times {g} overflows u64"))
-        })?;
-        out.push((base as u64).wrapping_add(product) as i64);
-    }
-    Ok(out)
+    Ok((g, base, inner, pos))
+}
+
+fn gcd_value(g: u64, base: i64, q: i64) -> Result<i64, CodecError> {
+    let q = u64::try_from(q)
+        .map_err(|_| CodecError::Corrupted(format!("gcd page quotient {q} is negative")))?;
+    let product = q.checked_mul(g).ok_or_else(|| {
+        CodecError::Corrupted(format!("gcd page quotient {q} times {g} overflows u64"))
+    })?;
+    Ok((base as u64).wrapping_add(product) as i64)
 }
 
 /// Every integer candidate for one page, in tie-break priority order:
