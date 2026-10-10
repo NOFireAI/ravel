@@ -2399,9 +2399,10 @@ pub struct Cli {
     /// A remote cluster this coordinator federates a query out to (ADR-0071
     /// cross-cluster federation). Repeatable: one flag per remote. Its
     /// credential belongs to one local tenant, named by the `tenant` key; a
-    /// spec that names none is refused on a coordinator that runs queries for
-    /// more than one local tenant. A keyed bucket in all, gateway or query mode
-    /// counts as one: durable sys/auth bearer tokens can onboard a tenant there
+    /// spec that names none is refused on a process that can serve more than
+    /// one local tenant. A bucket keyed with `--tenant-hash-key-file` (the
+    /// default for a fresh bucket) in all, gateway or query mode is such a
+    /// process: durable sys/auth bearer tokens can onboard a tenant there
     /// without a restart, so `tenant` is required.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
@@ -2441,15 +2442,15 @@ pub struct Cli {
     ///
     /// Omitting `tenant` leaves the remote reachable by every local tenant,
     /// which is correct only where the coordinator runs queries for one. A
-    /// coordinator that runs queries for more than one (two or more
-    /// `--tenant-token` tenants, an `--alert-rules-file` naming a tenant no
-    /// token does, or any of `--dev-insecure-tenant-header`, `--oidc-issuer`,
-    /// or `--mtls-enabled`) refuses to start with such a spec, rather than
-    /// fanning every local tenant's selectors and discovery out under the same
-    /// credential and returning another tenant's series. A `tenant` named by
-    /// neither a `--tenant-token` nor an `--alert-rules-file` rule is also
-    /// refused where the tenant set is fully known: it can never fire. A
-    /// tenant that only alert rules name is a valid target.
+    /// process that can serve more than one (two or more `--tenant-token`
+    /// tenants, an `--alert-rules-file` naming a tenant no token does, any of
+    /// `--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`, or
+    /// a keyed bucket in all, gateway or query mode) refuses to start with such
+    /// a spec, rather than fanning every local tenant's selectors and discovery
+    /// out under the same credential and returning another tenant's series. A
+    /// `tenant` named by neither a `--tenant-token` nor an `--alert-rules-file`
+    /// rule is also refused where the tenant set is fully known: it can never
+    /// fire. A tenant that only alert rules name is a valid target.
     ///
     /// Example:
     /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme,skip-unavailable=true`

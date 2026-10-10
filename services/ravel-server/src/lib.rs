@@ -282,8 +282,9 @@ fn dynamic_resolver_reason(
     }
     if durable_auth {
         return Some(
-            "a deployment key enables durable sys/auth bearer tokens, so a tenant can be \
-             onboarded without a restart"
+            "--tenant-hash-key-file keys this bucket, and in all, gateway and query mode a \
+             keyed bucket enables durable sys/auth bearer tokens, so a tenant can be onboarded \
+             without a restart"
                 .to_string(),
         );
     }
@@ -410,8 +411,8 @@ pub fn ensure_federation_tenant_mapping(
             .collect();
         if !unkeyed.is_empty() {
             anyhow::bail!(
-                "--remote-cluster {} names no local tenant on a coordinator that runs queries for \
-                 more than one local tenant ({reason}). A remote cluster holds one remote credential \
+                "--remote-cluster {} names no local tenant on a process that can serve more than \
+                 one local tenant ({reason}). A remote cluster holds one remote credential \
                  and cannot express one credential per local tenant, so every local tenant's \
                  federated metric selectors and discovery calls would fan out under that single \
                  credential and receive another tenant's series. Add tenant=<local tenant> to \
@@ -455,8 +456,8 @@ pub fn ensure_federation_tenant_mapping(
                      --alert-rules-file adds {} more, matched by hash). Nothing on this \
                      coordinator can ever run a query for that tenant, so this remote would answer \
                      nothing at all. Fix the tenant name, configure a --tenant-token for it, \
-                     give it an alert rule, or provision it through sys/auth on a keyed bucket \
-                     (a deployment key in all, gateway or query mode).",
+                     give it an alert rule, or, on a bucket keyed with --tenant-hash-key-file \
+                     (an existing unkeyed bucket cannot be re-keyed), provision it through sys/auth.",
                     rc.name,
                     tenant.as_str(),
                     if names.is_empty() {

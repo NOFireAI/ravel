@@ -918,13 +918,15 @@ spec:
 
 ```
 ravel-server --mode query \
-  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token \
-  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tls-ca-file=/etc/ravel/apac-ca.pem,soft-timeout=15s
+  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme \
+  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tenant=acme,tls-ca-file=/etc/ravel/apac-ca.pem,soft-timeout=15s
 ```
 
-`name`, `endpoint` and `credential-file` are required. `tenant`, `tls` (default
-`true`), `tls-ca-file`, `skip-unavailable` (default `false`) and `soft-timeout`
-are optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
+`name`, `endpoint` and `credential-file` are required. `tenant` is required on
+a keyed bucket, which is the default for a fresh bucket; see [One credential per
+local tenant](#one-credential-per-local-tenant). `tls` (default `true`),
+`tls-ca-file`, `skip-unavailable` (default `false`) and `soft-timeout` are
+optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
 every remote that does not name its own. A remote that does not answer within
 its bound is treated as unavailable. That fails the query unless the remote
 has `skip-unavailable`.
@@ -980,11 +982,12 @@ its query and is not missing from it. No warning and no `partial: true`
 appear.
 
 A spec without `tenant` leaves the remote reachable by every local tenant.
-That is correct only where the coordinator runs queries for one local tenant.
-A coordinator that runs queries for more than one **refuses to start** with
-such a spec. It does not fan every local tenant's selectors and discovery out
-under the one credential and return another tenant's series. A coordinator
-runs queries for more than one local tenant in four cases:
+That is correct only where the coordinator runs queries for one local tenant,
+on a bucket created with `--tenant-hash-unkeyed`. A process that can serve
+more than one local tenant **refuses to start** with such a spec. It does not
+fan every local tenant's selectors and discovery out under the one credential
+and return another tenant's series. A process can serve more than one local
+tenant in four cases:
 
 - Two or more `--tenant-token` values or `--tenant-token-file` lines name
   different tenants.
@@ -995,18 +998,19 @@ runs queries for more than one local tenant in four cases:
 - Any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
   `--oidc-issuer`, or `--mtls-enabled`. Each of them derives the tenant from a
   request header or a token claim.
-- A deployment key is set in All, Gateway or Query mode (a keyed bucket). The
-  server then also resolves bearer tokens against the durable `sys/auth` map,
-  so a tenant can be onboarded without a restart. On a keyed bucket every
-  `--remote-cluster` needs `tenant=`, even with a single `--tenant-token`.
+- `--tenant-hash-key-file` is set (a keyed bucket, which is the default for a
+  fresh bucket) in All, Gateway or Query mode. Those three modes install the
+  durable `sys/auth` bearer resolver, so a tenant can be onboarded without a
+  restart, and the guard applies in all three; of them, only All and Query
+  serve queries. On a keyed bucket every `--remote-cluster` needs `tenant=`,
+  even with a single `--tenant-token`.
 
 The startup error names every spec that needs a `tenant` and what makes the
 deployment multi-tenant:
 
 ```
---remote-cluster 'eu' names no local tenant on a coordinator that runs queries
-for more than one local tenant (2 distinct static bearer tenants are
-configured). A remote cluster holds one remote credential and cannot express one
+--remote-cluster 'eu' names no local tenant on a process that can serve more
+than one local tenant (2 distinct static bearer tenants are configured). A remote cluster holds one remote credential and cannot express one
 credential per local tenant ... Add tenant=<local tenant> to each of those specs
 ...
 ```

@@ -86,7 +86,7 @@ fn refusing_unmapped_remote_clusters_when_multiple_tenants_resolve() {
     .expect_err("two distinct tenants plus an unmapped remote cluster must refuse startup");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("runs queries for more than one local tenant"),
+        msg.contains("can serve more than one local tenant"),
         "error must name the multi-tenant exposure, got: {msg:?}"
     );
     assert!(
@@ -395,7 +395,7 @@ fn an_alert_rules_tenant_makes_the_coordinator_multi_tenant() {
     .expect_err("a tenant named only in --alert-rules-file is still a second local tenant");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("runs queries for more than one local tenant"),
+        msg.contains("can serve more than one local tenant"),
         "error must name the multi-tenant exposure, got: {msg:?}"
     );
     assert!(
@@ -497,7 +497,7 @@ fn a_keyed_bucket_refuses_an_unmapped_remote_with_one_static_tenant() {
     .expect_err("durable sys/auth tokens make the coordinator multi-tenant");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("runs queries for more than one local tenant"),
+        msg.contains("can serve more than one local tenant"),
         "error must name the multi-tenant exposure, got: {msg:?}"
     );
     assert!(
