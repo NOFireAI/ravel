@@ -920,10 +920,11 @@ mod tests {
         "u/v/00000000000000000007.pqm",
     ];
 
-    /// Stray keys the S3 adapter cannot address, because `Path::from`
-    /// rewrites them: control characters, an empty segment, a `.` and a `..`
-    /// segment, and an empty table segment.
-    const UNLISTABLE: [&str; 5] = [
+    /// Stray keys no request reaches unchanged, because `Path::from` rewrites
+    /// them: control characters, an empty segment, a `.` and a `..` segment,
+    /// and an empty table segment. A listing reports them unaddressable, never
+    /// as objects.
+    const UNADDRESSABLE_SHAPES: [&str; 5] = [
         "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
         "hits//v/00000000000000000003.pqm",
         "./v/00000000000000000001.pqm",
@@ -1377,12 +1378,12 @@ mod tests {
     }
 
     /// A stray key with a control character, an empty segment or a `.` or
-    /// `..` segment is listed unaddressable, as the S3 adapter lists it, so
-    /// [`list_stray`] names it as undeletable beside the other strays, and
-    /// [`delete_stray`] refuses it.
+    /// `..` segment is listed unaddressable, as `MemoryStore` and the S3
+    /// adapter both list it, so [`list_stray`] names it as undeletable beside
+    /// the other strays, and [`delete_stray`] refuses it.
     #[tokio::test]
     async fn an_unaddressable_stray_key_is_listed_as_undeletable() {
-        for rest in UNLISTABLE {
+        for rest in UNADDRESSABLE_SHAPES {
             let store = stray_store().await;
             let key = stray_key(&TENANT_A, rest);
             memory(&store).insert_foreign(&key, Bytes::from_static(b"x"));

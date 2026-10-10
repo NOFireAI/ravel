@@ -285,7 +285,9 @@ pub(crate) fn note_unaddressable(tenant: &TenantHash, skipped: &Unaddressable) {
 /// resolve, a tenant-wide listing or a sweep, skipped a key because the store
 /// reported it unaddressable ([`ravel_object_store::is_addressable_key`]).
 /// Zero for a tenant first seen after [`ABOVE_BOUND_TABLES_MAX`] others were
-/// recorded.
+/// recorded. It exists for tests and for a future per-tenant metric; nothing
+/// reports it yet. An operator sees such keys through the store's warning,
+/// which names each one, and `ravel-cli parquet ls`.
 pub fn unaddressable_listings(tenant: &TenantHash) -> u64 {
     let state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
     state
@@ -863,10 +865,11 @@ pub(crate) mod tests {
         "a/b/v/00000000000000000001.pqm",
     ];
 
-    /// Keys of the same kind that the S3 adapter cannot address, because
-    /// `object_store`'s path encoding rewrites them: control characters, an
-    /// empty segment, a `.` and a `..` segment, and an empty table segment.
-    pub(crate) const UNLISTABLE_SHAPES: [&str; 5] = [
+    /// Keys of the same kind that no request reaches unchanged, because
+    /// `Path::from` rewrites them: control characters, an empty segment, a
+    /// `.` and a `..` segment, and an empty table segment. A listing reports
+    /// them unaddressable, never as objects.
+    pub(crate) const UNADDRESSABLE_SHAPES: [&str; 5] = [
         "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
         "hits//v/00000000000000000003.pqm",
         "./v/00000000000000000001.pqm",
@@ -1000,7 +1003,7 @@ pub(crate) mod tests {
     /// counted in [`unaddressable_listings`].
     #[tokio::test]
     async fn an_unaddressable_stray_key_is_skipped_and_counted() {
-        for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
+        for (i, rest) in UNADDRESSABLE_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x70 + i as u8; 16]);
             let store = MemoryStore::with_page_size(2);
             for v in [1, 2] {
