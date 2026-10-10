@@ -676,7 +676,7 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   test over random key sets per key type, and corrupt and truncated inputs
   (a flipped byte in the header, the directory, a frame; a bucket whose keys
   do not mix to that bucket; unsorted or duplicate entries; a frame whose
-  frame `entry_count` over `KEY_IDX_BUCKET_MAX_ENTRIES` (2^20) or over the
+  `entry_count` is over `KEY_IDX_BUCKET_MAX_ENTRIES` (2^20) or over the
   field's total, refused before the buffer is allocated; a decompressed
   length that is not `entry_count x 12`), each a typed `Corrupted`.
   The RSPAN v5 and RLOG object fuzz harnesses are extended to the new
