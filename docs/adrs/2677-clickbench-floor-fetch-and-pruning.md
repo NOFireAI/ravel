@@ -1,6 +1,7 @@
 # ADR-2677: the ClickBench ranking gap: seal at load end, plan once, serve a stable subset, prove the pruning
 
-Status: Accepted (2026-10-09). Issue #2677 (epic). Stage 0 is the measured record on
+Status: Accepted (2026-10-09); decision 3 deferred (see the decision 3 deferral
+amendment). Issue #2677 (epic). Stage 0 is the measured record on
 #2639, #2615, #2592 and #2121; no new profile run preceded this ADR.
 No persistent format changes: every RLOG object, catalog part, HEAD and
 commit record keeps its bytes and its layout. The three levers that would
@@ -62,7 +63,7 @@ flowchart LR
     P -->|yes| PL[plan: tail probe, ranged scan]
     P -->|no| S1["scan: one whole GET,<br/>blocks pruned from the directory"]
     PL --> S2[scan: ranges]
-    S1 --> C[(read cache)]
+    S1 --> C[(read cache:<br/>stable subset under a loop,<br/>deferred)]
     S2 --> C
     C --> T["stats.timings: resolveMs, planMs,<br/>startMs, firstBatchMs, drainMs, auditMs"]
   end
@@ -360,7 +361,7 @@ because decision 2 acts only on objects under the bound; its row says so.
 | `unfoldedSegmentsResolved` after the fold | 0 | any |
 | load time with `--fold-after-load` | at most 1.05x the same load without it | over 1.1x |
 | q20 GETs per object / wire bytes over corpus bytes, loader-default corpus (3.8 MB objects, not the entry recipe) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
-| q2 hot on 16 GB with the cache at about half the corpus | not measured in this epic: decision 3 is deferred (see the decision 3 deferral amendment) | |
+| q2 hot on 16 GB with the cache at about half the corpus | cache-served bytes at least 40% of wire bytes (deferred with decision 3 and not measured in this epic: see the decision 3 deferral amendment) | under 25% |
 | hot geomean ratio to VictoriaLogs, 42 statements, +0.01 s | reported; the plan's eight-week figure (1.1) is not this epic's target | |
 | statements answered on the reference box | 43 of 43 | fewer |
 | c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal |
@@ -394,7 +395,9 @@ and its result stays separate from stock.
   measured as a loss on loopback under cost-based fetch.
 - **Bypass the read cache for one-pass scans, or refuse whole objects.** The
   hot run is a repeated scan; refusing it is the 0.01 GB result. **Plain
-  LRU** serves nothing on a loop larger than itself either.
+  LRU** serves nothing on a loop larger than itself either. (Decision 3 is deferred, so the
+  shipped cache serves nothing on such a loop as well: see the decision 3
+  deferral amendment.)
 - **Fetch concurrency paid for by a smaller query pool.** q33 fails at the
   smaller pool (#2639 W1's pairing); the stock derivation stays.
 - **W1 as an entry flag, with the per-query pool held at stock as the
@@ -429,9 +432,9 @@ and its result stays separate from stock.
   `plan` bucket drops to the probe-and-stats cost for those segments, and
   `docs/query-engine.md`'s description of the planned route says which
   segments it covers.
-- ADR-0046 decision 6 was to get an amendment for the loop case; it does
-  not, because decision 3 is deferred (see the decision 3 deferral
-  amendment).
+- ADR-0046 decision 6 gets an amendment for the loop case; the memory tier
+  and the disk tier may size their ghost lists differently. (Not while
+  decision 3 is deferred: see the decision 3 deferral amendment.)
 - ADR-2023 decision 1 gets an amendment: `latency-first` on a loopback
   endpoint, `cost-based` elsewhere, with the permits derived from memory.
   The tuned entry's `RAVEL_HOLD_STOCK_QUERY_BYTES` probe becomes
@@ -514,7 +517,7 @@ closed. Every other part of decision 1 stands.
 
 ## Amendment (2026-10-09): decision 3 is deferred
 
-<!-- amendment-applies: sections="Decision|3. The memory read cache serves a stable subset under a repeated scan|8. Measurement protocol and targets|Consequences|Plan" pointer="decision 3 deferral amendment" -->
+<!-- amendment-applies: sections="Decision|3. The memory read cache serves a stable subset under a repeated scan|8. Measurement protocol and targets|Rejected alternatives|Consequences|Plan" pointer="decision 3 deferral amendment" -->
 
 Decision 3 is deferred, by the owner's decision after three blocked review
 rounds on task T3 (#2681). Nothing from those rounds lands. That includes
@@ -553,7 +556,7 @@ hot column collapsing with it (q30 0.69 to 32.4 s). If that recurs on the
 reference box, today's policy serves nothing for the duration, and the
 deferred decision is what would have recovered part of it. It leaves the repeated
 scan larger than the cache served at zero, as today, on the 16 GB and 8 GB
-hosts and on real S3 at the 25% share (a 7.47 GB cache).
+hosts and on real S3 at the 25% share (a 7.46 GB cache).
 
 Candidate shapes for a later decision, none chosen: the disk tier keeps
 today's policy while the memory tier alone opts into a loop policy through
