@@ -1248,6 +1248,17 @@ oracle_no_orphaned_lease() {
   return 0
 }
 
+# Prints the number of lines in a log file, or 0 when it is not readable.
+chaos_line_count() {
+  if [[ -r "$1" ]]; then
+    local n
+    n="$(wc -l <"$1")"
+    printf '%s\n' "${n//[[:space:]]/}"
+  else
+    printf '0\n'
+  fi
+}
+
 # 4. conservation-holds, with a could-not-measure outcome.
 #    The conservation-abort counter on the survivor did not advance across
 #    the interruption (the gate never had to reject a record-dropping
@@ -1256,7 +1267,9 @@ oracle_no_orphaned_lease() {
 #
 #    Args: worker_a_log_file (read after the SIGKILL, so it is A's state at
 #    the kill), survivor_base_url, conservation_aborts_baseline,
-#    survivor_log_file.
+#    survivor_log_file, survivor_log_lines_at_kill (default 0). Both workers
+#    run before the kill, so only survivor log lines past that count are a
+#    publish after takeover; one B wrote before the kill does not pass.
 #
 #    The abort counter is checked first, and an unreadable or risen counter
 #    is a FAIL whatever A's log shows. Only a missing survivor publish
@@ -1268,7 +1281,12 @@ oracle_conservation_or_unmeasured() {
   local survivor_url="$2"
   local aborts_baseline="$3"
   local survivor_log="$4"
+  local survivor_from="${5:-0}"
   local name="conservation-holds"
+  if [[ ! "$survivor_from" =~ ^[0-9]+$ ]]; then
+    oracle_bad "$name" "survivor log line count at the kill is not an integer: '${survivor_from}'"
+    return 1
+  fi
 
   local aborts_now
   aborts_now="$(metric_value "$survivor_url" ravel_maintain_conservation_aborts_total)" \
@@ -1286,7 +1304,7 @@ oracle_conservation_or_unmeasured() {
   # Logs are captured into variables and tested from the variables.
   local survivor_body="" a_body=""
   if [[ -r "$survivor_log" ]]; then
-    survivor_body="$(cat "$survivor_log")"
+    survivor_body="$(tail -n "+$(( survivor_from + 1 ))" "$survivor_log")"
   fi
   if [[ "$survivor_body" == *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
     oracle_ok "$name"
