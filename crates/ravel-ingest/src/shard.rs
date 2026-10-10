@@ -5211,6 +5211,407 @@ mod tests {
         rig.task.await.expect("actor ends");
     }
 
+    /// One permit, so tenant `parked`'s held flush leaves tenant `late`'s
+    /// flush queued on the shard semaphore (`late` has nothing in flight, so
+    /// neither its share nor the queue cap refuses it). Every flush opens in
+    /// the hour that ends at `BOUNDARY_NS`.
+    struct GrantRig {
+        fault: Arc<FaultStore<MemoryStore>>,
+        router: Arc<IngestRouter>,
+        clock: Arc<TestClock>,
+        budget: Arc<IngestByteBudget>,
+        parked: TenantId,
+        late: TenantId,
+        parked_gate: GateHandle,
+        late_gate: GateHandle,
+    }
+
+    impl GrantRig {
+        /// `late`'s every PUT is held, so `held_for(late_gate, late)` counts
+        /// the PUTs it attempted.
+        async fn new(lifetime: Duration) -> (Self, ParkedWrites) {
+            let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+            let clock = TestClock::new(BASE_NS);
+            let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30));
+            let router = Arc::new(
+                IngestRouter::new(
+                    IngestConfig {
+                        max_queued_flushes: 4,
+                        ..one_permit_one_queue(lifetime)
+                    },
+                    store,
+                    Signal::Metrics,
+                    clock.clone(),
+                )
+                .with_budget(Arc::clone(&budget)),
+            );
+            let parked = TenantId::new("parked");
+            let late = TenantId::new("late");
+            let parked_gate = hold_first_put(&fault, &parked);
+            let late_gate = fault.hold(
+                Op::Put,
+                Some(format!("t/{}/", late.hash().to_hex())),
+                Occurrence::Always,
+            );
+            let rig = GrantRig {
+                fault,
+                router,
+                clock,
+                budget,
+                parked,
+                late,
+                parked_gate,
+                late_gate,
+            };
+
+            let first = rig.write(&rig.parked.clone(), WriteMode::Strict);
+            until(|| rig.router.metrics().snapshot().buffered_points_total >= 1).await;
+            rig.clock.advance_ns(TICK_ADVANCE_NS);
+            until(|| in_flight(&rig.router) == 1).await;
+            rig.parked_gate.wait_until_held(1).await;
+
+            let queued = rig.write(&rig.late.clone(), WriteMode::Strict);
+            until(|| rig.router.metrics().snapshot().buffered_points_total >= 2).await;
+            rig.clock.advance_ns(TICK_ADVANCE_NS);
+            until(|| in_flight(&rig.router) == 2).await;
+            assert!(
+                rig.clock.now_ns() < BOUNDARY_NS,
+                "both flushes open, and pin, in the hour ending at BOUNDARY_NS"
+            );
+            (rig, ParkedWrites { first, queued })
+        }
+
+        fn write(
+            &self,
+            tenant: &TenantId,
+            mode: WriteMode,
+        ) -> tokio::task::JoinHandle<Result<crate::router::WriteReceipt, WriteError>> {
+            let router = Arc::clone(&self.router);
+            let tenant = tenant.clone();
+            tokio::spawn(async move {
+                let points = vec![point(&tenant, "h")];
+                router
+                    .write(tenant, points, mode, Duration::from_secs(60))
+                    .await
+            })
+        }
+
+        /// Releases every held call, now and from now on, and drains.
+        async fn drain(self) {
+            let gates = [self.parked_gate.clone(), self.late_gate.clone()];
+            let releaser = tokio::spawn(async move {
+                loop {
+                    for gate in &gates {
+                        for id in gate.held() {
+                            gate.release(id);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            self.router.flush_all().await;
+            releaser.abort();
+            drop(self.fault);
+        }
+    }
+
+    /// Held calls under `tenant`'s prefix. A gate's view is the whole store's
+    /// held set, and an abandoned call stays in it.
+    fn held_for(gate: &GateHandle, tenant: &TenantId) -> usize {
+        let hex = tenant.hash().to_hex();
+        gate.held_details()
+            .into_iter()
+            .filter(|(_, _, key)| key.contains(&hex))
+            .count()
+    }
+
+    struct ParkedWrites {
+        first: tokio::task::JoinHandle<Result<crate::router::WriteReceipt, WriteError>>,
+        queued: tokio::task::JoinHandle<Result<crate::router::WriteReceipt, WriteError>>,
+    }
+
+    /// A flush whose permit is granted at or past `end(hour) +
+    /// max_flush_lifetime` for the hour it pinned at flush-open is abandoned
+    /// before any PUT and counted under `abandoned_hour_bound` (ADR-2708 D3).
+    /// Re-pinning it to the grant's hour instead would PUT it into that later
+    /// hour, which `late`'s held-PUT count and the store both show.
+    #[tokio::test]
+    async fn a_flush_granted_past_its_pinned_hours_lifetime_is_abandoned_without_a_put() {
+        let lifetime = Duration::from_secs(3600);
+        let (rig, writes) = GrantRig::new(lifetime).await;
+        let objects_before = list_all(rig.fault.as_ref(), "t/")
+            .await
+            .expect("list")
+            .len();
+
+        // Past the hour bound. `parked`'s own deadline passes too, so its held
+        // PUT is abandoned and the permit goes to `late`, too late.
+        let hour_bound_ns = BOUNDARY_NS + lifetime.as_nanos() as i64;
+        rig.clock
+            .advance_ns(hour_bound_ns + 1_000_000_000 - rig.clock.now_ns());
+        until(|| writes.queued.is_finished()).await;
+
+        let snap = rig.router.metrics().snapshot();
+        assert_eq!(snap.abandoned_hour_bound, 1);
+        assert_eq!(
+            held_for(&rig.late_gate, &rig.late),
+            0,
+            "the flush granted past its hour's bound attempted no PUT"
+        );
+        assert_eq!(
+            list_all(rig.fault.as_ref(), "t/")
+                .await
+                .expect("list")
+                .len(),
+            objects_before,
+            "no object was written into the sealed hour or a later one"
+        );
+        let answer = writes.queued.await.expect("write task");
+        assert!(
+            matches!(answer, Err(WriteError::Abandoned(_))),
+            "the strict waiter is answered Abandoned: {answer:?}"
+        );
+        let _ = writes.first.await;
+        rig.drain().await;
+    }
+
+    /// A flush granted after its pinned hour ends but before that hour's bound
+    /// runs until the bound, not for a full `max_flush_lifetime` from the
+    /// grant: its held PUT is abandoned one second past `end(hour) +
+    /// max_flush_lifetime`, ten minutes before `grant + max_flush_lifetime`.
+    #[tokio::test]
+    async fn a_flush_granted_inside_the_hour_is_clamped_to_the_hour_end() {
+        let lifetime = Duration::from_secs(7200);
+        let (rig, writes) = GrantRig::new(lifetime).await;
+
+        // Grant `late` its permit 600 s past the hour's end, well inside
+        // `parked`'s own deadline, by releasing `parked`'s PUT there.
+        let grant_ns = BOUNDARY_NS + 600 * 1_000_000_000;
+        rig.clock.advance_ns(grant_ns - rig.clock.now_ns());
+        release_tenant(&rig.parked_gate, &rig.parked);
+        until(|| held_for(&rig.late_gate, &rig.late) == 1).await;
+        assert!(
+            !writes.queued.is_finished(),
+            "late's PUT is held, inside its deadline"
+        );
+
+        let hour_bound_ns = BOUNDARY_NS + lifetime.as_nanos() as i64;
+        rig.clock
+            .advance_ns(hour_bound_ns + 1_000_000_000 - rig.clock.now_ns());
+        assert!(rig.clock.now_ns() < grant_ns + lifetime.as_nanos() as i64);
+        assert!(
+            settles(|| writes.queued.is_finished()).await,
+            "the held PUT is abandoned at the hour bound, not at grant + lifetime"
+        );
+        let answer = writes.queued.await.expect("write task");
+        assert!(
+            answer.is_err(),
+            "late's strict write is not acked: {answer:?}"
+        );
+        assert_eq!(
+            rig.router.metrics().snapshot().abandoned_hour_bound,
+            0,
+            "granted inside the bound, so not abandoned at the grant"
+        );
+        writes
+            .first
+            .await
+            .expect("write task")
+            .expect("parked's flush lands once released");
+        rig.drain().await;
+    }
+
+    /// A flush queued on the permit still holds its buffer's byte charge: the
+    /// budget is released when the flush finishes, not when it is spawned.
+    #[tokio::test]
+    async fn a_flush_parked_on_the_permit_still_holds_its_charge() {
+        let (rig, writes) = GrantRig::new(Duration::from_secs(3600)).await;
+        let charged = rig.budget.in_flight_bytes();
+        assert!(charged > 0);
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            charged,
+            "late's flush is parked on the permit and its charge is still held"
+        );
+        assert_eq!(in_flight(&rig.router), 2);
+
+        release_tenant(&rig.parked_gate, &rig.parked);
+        until(|| held_for(&rig.late_gate, &rig.late) == 1).await;
+        assert!(
+            rig.budget.in_flight_bytes() > 0,
+            "late's charge outlives the grant"
+        );
+        let budget = Arc::clone(&rig.budget);
+        rig.drain().await;
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "every charge is refunded once drained"
+        );
+        let _ = writes.first.await;
+        let _ = writes.queued.await;
+    }
+
+    fn histogram_point(tenant: &TenantId, metric: &str, ts_ns: i64) -> IngestPoint {
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("one label");
+        let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
+        IngestPoint {
+            series_id,
+            labels: Arc::new(labels),
+            value: IngestValue::Histogram(ravel_segment::HistogramSample {
+                ts_ns,
+                value: ravel_segment::HistogramValue {
+                    scale: 2,
+                    zero_threshold: 1e-9,
+                    sum: Some(42.5),
+                    custom_values: None,
+                    positive_spans: vec![ravel_segment::HistogramSpan {
+                        offset: 0,
+                        length: 3,
+                    }],
+                    negative_spans: vec![],
+                    counts: ravel_segment::HistogramCounts::Int {
+                        zero_count: 1,
+                        count: 7,
+                        positive: vec![2, 3, 1],
+                        negative: vec![],
+                    },
+                    reset_hint: ravel_segment::ResetHint::Yes,
+                },
+            }),
+        }
+    }
+
+    /// The object estimate a batch adds to an empty buffer: every sample,
+    /// plus each series once.
+    fn batch_object_bytes(points: &[IngestPoint]) -> usize {
+        let mut seen = HashSet::new();
+        points
+            .iter()
+            .map(|p| {
+                let series = if seen.insert(p.series_id) {
+                    p.est_object_series_bytes()
+                } else {
+                    0
+                };
+                p.est_object_sample_bytes() + series
+            })
+            .sum()
+    }
+
+    /// A native histogram is charged 16 bytes of buffered memory per sample
+    /// but carries several times that in the object, so a buffer deferred at
+    /// its flush share never reaches the memory backstop while its object
+    /// estimate grows. The object backstop spawns it, past the share, once
+    /// the estimate reaches four times `target_bytes`.
+    #[tokio::test]
+    async fn a_deferred_native_histogram_buffer_spawns_at_the_object_backstop() {
+        const TARGET: usize = 4096;
+        const BATCH: usize = 20;
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let clock = TestClock::new(BASE_NS);
+        let config = IngestConfig {
+            shard_count: 1,
+            target_bytes: TARGET,
+            max_flush_delay: Duration::from_millis(50),
+            max_flush_delay_idle: Duration::from_millis(50),
+            flush_tick: Duration::from_millis(10),
+            max_inflight_flushes: 1,
+            max_queued_flushes: 8,
+            ..IngestConfig::default()
+        };
+        assert_eq!(config.flush_share_per_tenant(), 1);
+        let router = Arc::new(
+            IngestRouter::new(config, store, Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let tenant = TenantId::new("histograms");
+        let gate = fault.hold(
+            Op::Put,
+            Some(format!("t/{}/", tenant.hash().to_hex())),
+            Occurrence::Always,
+        );
+        let write = |points: Vec<IngestPoint>| {
+            let router = Arc::clone(&router);
+            let tenant = tenant.clone();
+            tokio::spawn(async move {
+                router
+                    .write_values(tenant, points, WriteMode::Buffered, Duration::from_secs(60))
+                    .await
+            })
+        };
+
+        // A size-triggered first flush fills the tenant's share and parks.
+        let first: Vec<_> = (0..100)
+            .map(|i| histogram_point(&tenant, "first", 1_000 + i))
+            .collect();
+        let first_bytes = batch_object_bytes(&first);
+        assert!((TARGET..4 * TARGET).contains(&first_bytes));
+        write(first)
+            .await
+            .expect("write task")
+            .expect("buffered ack");
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        // Batches of the same size, each over `target_bytes` together with
+        // what is already buffered, until the second flush spawns.
+        let mut buffered = 0;
+        let mut batch_bytes = 0;
+        let mut spawned = false;
+        for b in 0..200 {
+            let batch: Vec<_> = (0..BATCH)
+                .map(|i| histogram_point(&tenant, &format!("s{b}"), 1_000 + i as i64))
+                .collect();
+            batch_bytes = batch_object_bytes(&batch);
+            buffered += batch_bytes;
+            write(batch)
+                .await
+                .expect("write task")
+                .expect("buffered ack");
+            clock.advance_ns(TICK_ADVANCE_NS);
+            if settles(|| in_flight(&router) == 2).await {
+                spawned = true;
+                break;
+            }
+        }
+        assert!(
+            spawned,
+            "the deferred buffer never spawned; it holds {buffered} object bytes"
+        );
+        assert!(
+            buffered >= 4 * TARGET && buffered <= 4 * TARGET + batch_bytes,
+            "spawned at {buffered} object bytes, want [{}, {}]",
+            4 * TARGET,
+            4 * TARGET + batch_bytes
+        );
+        assert!(
+            deferred_triggers(&router) >= 1,
+            "the size trigger was deferred at the share before the backstop"
+        );
+
+        let releaser = tokio::spawn(async move {
+            loop {
+                for id in gate.held() {
+                    gate.release(id);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        router.flush_all().await;
+        releaser.abort();
+    }
+
     /// Advances the clock `n` 10 ms ticks, yielding after each.
     async fn ticks(clock: &TestClock, n: usize) {
         for _ in 0..n {

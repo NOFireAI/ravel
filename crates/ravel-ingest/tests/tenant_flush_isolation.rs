@@ -1240,6 +1240,161 @@ macro_rules! fill_share {
     }};
 }
 
+// ---------------------------------------------------------------------------
+// Grant deadline bounded by the pinned hour (ADR-2708 D3), log and span
+// actors. The metrics actor's copies are unit tests in `shard.rs`.
+// ---------------------------------------------------------------------------
+
+/// An exact ingest-hour boundary, and a base one second before it, so every
+/// flush below opens and pins in the hour ending at `GRANT_BOUNDARY_NS`.
+const GRANT_BOUNDARY_NS: i64 = 472_223 * 3_600_000_000_000;
+const GRANT_BASE_NS: i64 = GRANT_BOUNDARY_NS - 1_000_000_000;
+
+/// One permit, so `parked`'s held flush leaves `late`'s queued on the shard
+/// semaphore; `late` has nothing in flight, so neither its share nor the queue
+/// cap refuses it.
+fn grant_config(lifetime: Duration) -> IngestConfig {
+    IngestConfig {
+        shard_count: 1,
+        target_bytes: 8 * 1024 * 1024,
+        max_flush_delay: Duration::from_millis(50),
+        flush_tick: Duration::from_millis(10),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 4,
+        max_flush_lifetime: lifetime,
+        put_retry_base_delay: Duration::from_millis(1),
+        put_retry_max_delay: Duration::from_millis(5),
+        ..IngestConfig::default()
+    }
+}
+
+/// The clamp and abandon tests, once per pipeline.
+macro_rules! grant_deadline_tests {
+    ($new:ident, $spawn:ident, $buffered:ident) => {
+        /// Opens `parked`'s flush and parks it at its first PUT, then opens
+        /// `late`'s behind it on the one permit. `late`'s every PUT is held.
+        macro_rules! grant_rig {
+            ($lifetime:expr) => {{
+                let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+                let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+                let clock = TestClock::new(GRANT_BASE_NS);
+                let router = Arc::new($new(grant_config($lifetime), store, clock.clone()));
+                let (parked, late) = (tenant("parked"), tenant("late"));
+                let parked_gate = fault.hold(
+                    Op::Put,
+                    Some(format!("t/{}/", parked.hash().to_hex())),
+                    Occurrence::Nth(1),
+                );
+                let late_gate = hold_tenant(&fault, &late);
+                let first = $spawn(&router, &parked, 0);
+                assert!(settles(|| router.metrics().snapshot().$buffered >= 1).await);
+                clock.advance_ns(SHARE_TICK_NS);
+                assert!(settles(|| in_flight_of!(router) == 1).await);
+                assert!(settles(|| held_for(&parked_gate, &parked) == 1).await);
+                let queued = $spawn(&router, &late, 1);
+                assert!(settles(|| router.metrics().snapshot().$buffered >= 2).await);
+                clock.advance_ns(SHARE_TICK_NS);
+                assert!(
+                    settles(|| in_flight_of!(router) == 2).await,
+                    "late's flush opens behind parked's on the one permit"
+                );
+                assert!(clock.now_ns() < GRANT_BOUNDARY_NS);
+                (
+                    fault,
+                    router,
+                    clock,
+                    parked,
+                    late,
+                    parked_gate,
+                    late_gate,
+                    first,
+                    queued,
+                )
+            }};
+        }
+
+        /// See the metrics actor's copy in `shard.rs`.
+        #[tokio::test]
+        async fn a_flush_granted_past_its_pinned_hours_lifetime_is_abandoned_without_a_put() {
+            let lifetime = Duration::from_secs(3600);
+            let (fault, router, clock, _parked, late, parked_gate, late_gate, first, queued) =
+                grant_rig!(lifetime);
+            let objects_before = list_all(fault.as_ref(), "t/").await.expect("list").len();
+
+            let hour_bound_ns = GRANT_BOUNDARY_NS + lifetime.as_nanos() as i64;
+            clock.advance_ns(hour_bound_ns + 1_000_000_000 - clock.now_ns());
+            assert!(
+                settles(|| queued.is_finished()).await,
+                "late's flush reaches a terminal outcome once granted"
+            );
+            assert_eq!(router.metrics().snapshot().abandoned_hour_bound, 1);
+            assert_eq!(
+                held_for(&late_gate, &late),
+                0,
+                "the flush granted past its hour's bound attempted no PUT"
+            );
+            assert_eq!(
+                list_all(fault.as_ref(), "t/").await.expect("list").len(),
+                objects_before,
+                "no object was written into the sealed hour or a later one"
+            );
+            let answer = queued.await.expect("write task");
+            assert!(
+                answer.is_err(),
+                "late's strict write is not acked: {answer:?}"
+            );
+
+            let _releaser = release_all_from_now(parked_gate);
+            drain(&clock, std::slice::from_ref(&first)).await;
+            router.flush_all().await;
+        }
+
+        /// See the metrics actor's copy in `shard.rs`.
+        #[tokio::test]
+        async fn a_flush_granted_inside_the_hour_is_clamped_to_the_hour_end() {
+            let lifetime = Duration::from_secs(7200);
+            let (_fault, router, clock, parked, late, parked_gate, late_gate, first, queued) =
+                grant_rig!(lifetime);
+
+            let grant_ns = GRANT_BOUNDARY_NS + 600 * 1_000_000_000;
+            clock.advance_ns(grant_ns - clock.now_ns());
+            let hex = parked.hash().to_hex();
+            let (id, _, _) = parked_gate
+                .held_details()
+                .into_iter()
+                .find(|(_, _, key)| key.contains(&hex))
+                .expect("parked's PUT is held");
+            assert!(parked_gate.release(id));
+            assert!(
+                settles(|| held_for(&late_gate, &late) == 1).await,
+                "late is granted the permit and parks at its own PUT"
+            );
+            assert!(!queued.is_finished());
+
+            let hour_bound_ns = GRANT_BOUNDARY_NS + lifetime.as_nanos() as i64;
+            clock.advance_ns(hour_bound_ns + 1_000_000_000 - clock.now_ns());
+            assert!(clock.now_ns() < grant_ns + lifetime.as_nanos() as i64);
+            assert!(
+                settles(|| queued.is_finished()).await,
+                "the held PUT is abandoned at the hour bound, not at grant + lifetime"
+            );
+            let answer = queued.await.expect("write task");
+            assert!(
+                answer.is_err(),
+                "late's strict write is not acked: {answer:?}"
+            );
+            assert_eq!(router.metrics().snapshot().abandoned_hour_bound, 0);
+            first
+                .await
+                .expect("write task")
+                .expect("parked's flush lands once released");
+
+            let _releaser = release_all_from_now(late_gate);
+            router.flush_all().await;
+        }
+    };
+}
+
 flush_share_tests!(
     coresident_strict_write_acks_within_its_deadline_while_a_tenants_puts_are_held,
     a_tenant_at_its_share_leaves_a_permit_free,
@@ -1260,6 +1415,8 @@ mod logs {
         spawn_log_write,
         buffered_records_total
     );
+
+    grant_deadline_tests!(new_log_router, spawn_log_write, buffered_records_total);
 }
 
 mod spans {
@@ -1273,4 +1430,6 @@ mod spans {
         spawn_span_write,
         buffered_spans_total
     );
+
+    grant_deadline_tests!(new_span_router, spawn_span_write, buffered_spans_total);
 }
