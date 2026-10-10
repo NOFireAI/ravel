@@ -17,6 +17,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
+use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 use ravel_ingest::{
     AdmissionController, IngestByteBudget, IngestByteCharge, LogWriteError, RequestRejection,
     SpanWriteError, WriteError, WriteMode,
@@ -323,6 +324,17 @@ fn decompress_gzip_capped_charged(
     Ok((chunks, charges))
 }
 
+/// The write gate produced no inflate result: the job panicked, or the runtime
+/// dropped it while shutting down. Nothing was decoded or written, so a retry
+/// is safe; a panic is the server's fault, a cancelled job a transient one.
+fn gate_failure_response(err: CpuGateError) -> Response {
+    let status = match err {
+        CpuGateError::Panicked => StatusCode::INTERNAL_SERVER_ERROR,
+        CpuGateError::Cancelled | CpuGateError::Closed => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, format!("gzip inflate failed: {err}")).into_response()
+}
+
 /// HTTP 415 for an unsupported `Content-Encoding`, naming what is supported so
 /// the gap is legible rather than a mystery (ADR-0084 decision 1).
 fn unsupported_encoding_response() -> Response {
@@ -357,7 +369,7 @@ fn unsupported_encoding_response() -> Response {
 /// structs, before the router takes its own buffered charge, so the two never
 /// coexist. The identity path allocates no transient inflate buffer, so it
 /// returns no guards.
-fn admit_and_decode_body(
+async fn admit_and_decode_body(
     state: &GatewayState,
     headers: &HeaderMap,
     tenant: &TenantId,
@@ -403,11 +415,29 @@ fn admit_and_decode_body(
             // not just by --max-inflight-ingest-requests. A body whose inflate
             // would cross the ceiling is shed mid-inflate (429), before the
             // process grows by the full expansion.
-            let (chunks, decode_charge) = match decompress_gzip_capped_charged(
-                &body,
-                MAX_DECOMPRESSED_OTLP_BODY_BYTES,
-                &state.budget,
-            ) {
+            //
+            // The inflate runs on the write gate when one is attached
+            // (ADR-1702), sized by the compressed body. The job takes each
+            // chunk's charge as it inflates and returns the charges with the
+            // chunks, so nothing is charged while it waits for a permit and a
+            // dropped request releases the charges only when the job returns.
+            let budget = Arc::clone(&state.budget);
+            let inflate = move || {
+                decompress_gzip_capped_charged(&body, MAX_DECOMPRESSED_OTLP_BODY_BYTES, &budget)
+            };
+            let inflated = match &state.write_gate {
+                Some(gate) => {
+                    match gate
+                        .run(WriteSite::OtlpHttpGzip, JobSize::Bytes(wire_len), inflate)
+                        .await
+                    {
+                        Ok(inflated) => inflated,
+                        Err(err) => return Err(Box::new(gate_failure_response(err))),
+                    }
+                }
+                None => inflate(),
+            };
+            let (chunks, decode_charge) = match inflated {
                 Ok(result) => result,
                 Err(GzipDecodeError::Shed) => {
                     return Err(Box::new(ingest_buffer_budget_shed_response()));
@@ -495,6 +525,11 @@ pub struct GatewayState {
     /// and the layer-2 byte-rate check, so a shed request does none of that
     /// work.
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
+    /// The ADR-1702 write gate. A gzip body's inflate runs on it under the
+    /// `otlp_http_gzip` site, and an OTAP stream's payload decompression
+    /// under `otap_decode`, each sized by its compressed bytes. `None` runs
+    /// both inline on the request task.
+    pub write_gate: Option<Arc<WriteGate>>,
 }
 
 impl crate::ingest_admission::IngestAdmissionState for GatewayState {
@@ -715,7 +750,7 @@ async fn export_metrics(
     // inflate chunks (empty on the identity path); it is released once prost has
     // decoded and freed them, just below (ADR-0069 as amended by issue #1297).
     let (body, decode_charge) =
-        match admit_and_decode_body(&state, &headers, &tenant, Signal::Metrics, body) {
+        match admit_and_decode_body(&state, &headers, &tenant, Signal::Metrics, body).await {
             Ok(decoded) => decoded,
             Err(response) => return *response,
         };
@@ -794,7 +829,7 @@ async fn export_logs(
     // `decode_charge`: see `export_metrics`. Released once decode has consumed
     // and freed the inflate chunks, before the log write below.
     let (body, decode_charge) =
-        match admit_and_decode_body(&state, &headers, &tenant, Signal::Logs, body) {
+        match admit_and_decode_body(&state, &headers, &tenant, Signal::Logs, body).await {
             Ok(decoded) => decoded,
             Err(response) => return *response,
         };
@@ -878,7 +913,7 @@ async fn export_traces(
     // `decode_charge`: see `export_metrics`. Released once decode has consumed
     // and freed the inflate chunks, before the span write below.
     let (body, decode_charge) =
-        match admit_and_decode_body(&state, &headers, &tenant, Signal::Spans, body) {
+        match admit_and_decode_body(&state, &headers, &tenant, Signal::Spans, body).await {
             Ok(decoded) => decoded,
             Err(response) => return *response,
         };
@@ -1065,6 +1100,7 @@ pub(crate) mod tests {
                 IngestConcurrencyLimit::Unlimited,
             ),
             ingest_byte_metrics: Arc::new(IngestByteMetrics::new()),
+            write_gate: None,
         })
     }
 
@@ -1812,6 +1848,7 @@ pub(crate) mod tests {
             Signal::Metrics,
             Bytes::from(compressed.clone()),
         )
+        .await
         .expect("gzip body admitted under a generous budget");
 
         assert_eq!(
@@ -1910,6 +1947,7 @@ pub(crate) mod tests {
             Signal::Metrics,
             Bytes::from(compressed),
         )
+        .await
         .expect_err("the inflate crosses the ceiling and is shed");
         assert_eq!(
             response.status(),

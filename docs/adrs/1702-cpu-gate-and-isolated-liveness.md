@@ -154,7 +154,9 @@ rule on thread placement.
    in `ravel_cpu_gate_jobs_total`, so a test can tell the two apart. The codec
    crates (`ravel-segment`, `ravel-logseg`, `ravel-rspan`,
    `ravel-catalog::snapshot_format`) stay synchronous and runtime-free. The
-   gate is applied at the async caller.
+   gate is applied at the async caller. (Qualified by the #2669 amendment
+   below: the three ingest decompressions are sized by their compressed
+   length.)
 
 5. **Cancellation.** A waiter dropped before it holds a permit never runs.
    A decode that has started runs to completion, because a `zstd::bulk`
@@ -482,7 +484,8 @@ change, shown by reverting the change under test.
    an `Arc` budget, so it moves into a closure unchanged. Acceptance test
    `flush_encode_runs_through_the_write_gate`: with the floor at 0, a
    flush moves the write gate's per-site counter by exactly one, and an
-   ingest acknowledgement still waits for the flush it depends on.
+   ingest acknowledgement still waits for the flush it depends on. Done in
+   issue #2669; see the #2669 amendment below.
 10. **Maintenance on the read gate** (`ravel-maintain`,
     `services/ravel-server/src/fold_on_demand.rs`): compaction decode and
     re-encode, fold, scrub and reachability reads. Acceptance test: the
@@ -656,3 +659,56 @@ documents. The alert evaluator's alert-state fold, which decodes each alert
 commit's RLOG object with `RlogReader::new` and `scan` in
 `services/ravel-server/src/alerting.rs`, runs inline too; it reads through
 the store directly, not through a fetcher.
+
+## Amendment (2026-10-10): the write path on the write gate (issue #2669)
+
+<!-- amendment-applies: sections="Decision|Follow-up tasks, in order" pointer="#2669 amendment" -->
+
+Issue #2669 landed follow-up task 9. Six units run on the write gate, each
+under its own site label, and `ravel-server` attaches its write gate to every
+production instance of each:
+
+- `metrics_flush`, `log_flush`, `span_flush`: one shard flush's encode, sized
+  by the flushed buffer's estimated bytes. The job builds the object and, for
+  RLOG and RSPAN, its blake3 content hash; RSEG's writer computes that hash
+  itself. The data object PUT and the commit publish stay on the flush task.
+  The three routers take the gate through `with_write_gate`.
+- `otap_decode`: one OTAP payload's zstd decompression, in
+  `StreamState::decode_gated`. The IPC decode after it stays on the stream's
+  task, which feeds the stateful decoders in payload order.
+- `otlp_http_gzip`: one OTLP-HTTP gzip body's inflate.
+- `remote_write_snappy`: one Remote Write body's snappy inflate and protobuf
+  decode, as one job, since `ravel-remote-write` does both in one call.
+
+Decision 4 sizes a unit by its uncompressed length. The three decompressions
+are sized by their compressed length instead, since a gzip body declares no
+trustworthy uncompressed length before it is inflated, and a zstd frame need
+not. A body under the floor therefore runs inline however far it inflates, up
+to its path's decompression cap: 64 MiB for an OTLP-HTTP or Remote Write body,
+16 MiB for an OTAP payload by default.
+
+Decision 6 holds at each site. A job owns the byte charge its output needs and
+returns it with that output, so a charge is held while the job waits for a
+permit and, if the waiter is dropped, until the job returns:
+
+- A flush's ADR-0069 buffer charges move into the encode job with the buffer
+  and come back with the object. The flush task holds them until its terminal
+  outcome, after the commit publish, as before.
+- The gzip job takes each inflated chunk's charge as it produces the chunk,
+  and returns the charges with the chunks. The handler holds them through
+  protobuf decode, as before. Nothing is charged while the job waits.
+- The snappy inflate's charge, the declared inflated length, is taken before
+  submission and moves into the job, which returns it with the decoded
+  request. The handler holds it through normalization, as before.
+- The OTAP path charges no bytes for a payload's decompression, before this
+  change or after it. The batch's in-flight ingest permit is held across the
+  decode.
+
+A gate result error fails the unit and drops nothing: a flush answers its
+waiters with the typed build error and counts in
+`ravel_ingest_abandoned_input_rejected_total`, an HTTP request answers 500 for
+a panicked job and 503 for a cancelled one, and an OTAP batch is nacked with
+INTERNAL or UNAVAILABLE on a stream that stays open.
+
+No write-gate job submits another one. A flush encode, a decompression and a
+Remote Write decode are each a synchronous codec call with no gate in reach.

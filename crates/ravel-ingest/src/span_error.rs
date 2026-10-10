@@ -44,7 +44,9 @@ pub enum SpanWriteError {
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RSPAN object failed (a deterministic input problem);
-    /// retrying identical input will fail again.
+    /// retrying identical input will fail again. Also the answer when the
+    /// ADR-1702 write gate returns no result for the encode: the job panicked,
+    /// or the runtime cancelled it while shutting down.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
     /// The router's cached provisioning-record view for this tenant is older

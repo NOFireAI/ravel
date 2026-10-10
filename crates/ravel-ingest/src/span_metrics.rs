@@ -68,7 +68,8 @@ pub struct SpanIngestMetrics {
     abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RSPAN build, data-key derivation, or commit-record
-    /// build failed ([`crate::SpanWriteError::SegmentBuild`]). A client
+    /// build failed, or the write gate returned no encode result
+    /// ([`crate::SpanWriteError::SegmentBuild`]). A client
     /// signal: identical input will fail again.
     abandoned_input_rejected: AtomicU64,
     /// Cumulative bytes admitted into shard buffers at enqueue time.

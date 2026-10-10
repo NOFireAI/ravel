@@ -64,6 +64,8 @@ use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint, IngestValue, ValueKind};
+use crate::write_gate::WriteGateSlot;
+use ravel_cpu_gate::WriteSite;
 
 pub(crate) type Ack = oneshot::Sender<Result<CommitToken, WriteError>>;
 
@@ -515,6 +517,17 @@ struct FlushCtx {
     /// the `stage-timing` feature.
     #[cfg(feature = "stage-timing")]
     stage_timings: Arc<MetricStageTimings>,
+    /// The ADR-1702 write gate the encode runs on, shared with the router.
+    write_gate: WriteGateSlot,
+}
+
+/// What a flush's encode job hands back to the flush task: the segment, and
+/// the byte charges the job held while it waited and ran.
+struct EncodedFlush {
+    written: Result<ravel_segment::WrittenSegment, ravel_segment::WriteError>,
+    charges: Vec<Arc<IngestByteCharge>>,
+    #[cfg(feature = "stage-timing")]
+    encode_elapsed: std::time::Duration,
 }
 
 /// One flush's identity and payload, pinned by the actor before the flush
@@ -534,6 +547,9 @@ struct PinnedFlush {
     max_ingest_ts_ns: i64,
     series: HashMap<SeriesId, SeriesAccum>,
     exemplars: Vec<IngestExemplar>,
+    /// The buffer's `est_bytes`, which sizes the encode against the write
+    /// gate's inline floor.
+    input_bytes: u64,
     waiters: Vec<Ack>,
     /// The global ingest-byte-budget charges this flush's buffer held (ADR-0069).
     /// Carried into the flush task purely so they are dropped -- and the bytes
@@ -563,49 +579,80 @@ impl FlushCtx {
             max_ingest_ts_ns,
             series,
             exemplars,
+            input_bytes,
             waiters,
             charges,
         } = pinned;
-        // Held to this flush's terminal outcome (every early `return` below is
-        // still inside this scope), then dropped here: that drop is the
-        // ADR-0069 budget refund for exactly the bytes this buffer held.
-        let _charges = charges;
 
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
-        // Encode: the SeriesInputV3 build plus the RSEG serialization only,
-        // excluding the exemplar admission above and the object-store PUT below
-        // (decision 5 measures the PUT separately).
-        #[cfg(feature = "stage-timing")]
-        let encode_start = std::time::Instant::now();
         // ADR-0027: every flush emits v5, scalar and histogram batches alike.
         // The raw-sample adapter frames each series into a single run, so the
         // writer choice is no longer version- or content-driven; the buffer's
         // per-series value kind (scalar or histogram) is carried through
         // `into_series_values` and the writer picks the VAL/HIST page per
         // series.
-        let series_inputs: Vec<SeriesInputV3> = series
-            .into_iter()
-            .map(|(series_id, accum)| SeriesInputV3 {
-                series_id,
-                // ADR-0098: the accumulator holds the last reference to the
-                // run's shared label set by flush time (the points that shared
-                // it were consumed into `values`), so this unwraps the `Arc`
-                // by move on the common path; a surviving clone (none today,
-                // but a future cross-request memo could keep one) degrades to a
-                // deep copy rather than aliasing.
-                labels: Arc::try_unwrap(accum.labels).unwrap_or_else(|arc| (*arc).clone()),
-                values: accum.values.into_series_values(),
-            })
-            .collect();
         let segment_version = SEGMENT_FORMAT_VERSION;
-        let written = SegmentWriter::write_histograms_with_exemplars(
-            series_inputs,
-            identity,
-            ingest_bounds,
-            exemplar_inputs,
-        );
-        let written = match written {
+        // The encode runs on the write gate when one is attached (ADR-1702).
+        // The job takes the byte charges with the buffer and returns them with
+        // the segment, so they stay held through the permit wait and the encode
+        // whether or not this task is still waiting.
+        let encoded = self
+            .write_gate
+            .encode(WriteSite::MetricsFlush, input_bytes, move || {
+                // Encode: the SeriesInputV3 build plus the RSEG serialization
+                // only, excluding the exemplar admission above, the permit wait
+                // and the object-store PUT below (decision 5 measures the PUT
+                // separately).
+                #[cfg(feature = "stage-timing")]
+                let encode_start = std::time::Instant::now();
+                let series_inputs: Vec<SeriesInputV3> = series
+                    .into_iter()
+                    .map(|(series_id, accum)| SeriesInputV3 {
+                        series_id,
+                        // ADR-0098: the accumulator holds the last reference to
+                        // the run's shared label set by flush time (the points
+                        // that shared it were consumed into `values`), so this
+                        // unwraps the `Arc` by move on the common path; a
+                        // surviving clone (none today, but a future
+                        // cross-request memo could keep one) degrades to a deep
+                        // copy rather than aliasing.
+                        labels: Arc::try_unwrap(accum.labels).unwrap_or_else(|arc| (*arc).clone()),
+                        values: accum.values.into_series_values(),
+                    })
+                    .collect();
+                let written = SegmentWriter::write_histograms_with_exemplars(
+                    series_inputs,
+                    identity,
+                    ingest_bounds,
+                    exemplar_inputs,
+                );
+                EncodedFlush {
+                    written,
+                    charges,
+                    #[cfg(feature = "stage-timing")]
+                    encode_elapsed: encode_start.elapsed(),
+                }
+            })
+            .await;
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                // Nothing was written, and the job's charges dropped with its
+                // result. The encode produced no object, as a failed build does:
+                // a panicked job would panic again on the same input, and a job
+                // the gate cancelled or never ran means the runtime is shutting
+                // down.
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(WriteError::SegmentBuild(err.to_string())));
+                return;
+            }
+        };
+        // Held to this flush's terminal outcome (every early `return` below is
+        // still inside this scope), then dropped here: that drop is the
+        // ADR-0069 budget refund for exactly the bytes this buffer held.
+        let _charges = encoded.charges;
+        let written = match encoded.written {
             Ok(w) => w,
             Err(e) => {
                 self.metrics.record_abandoned_input_rejected();
@@ -615,7 +662,7 @@ impl FlushCtx {
         };
         #[cfg(feature = "stage-timing")]
         self.stage_timings
-            .record(MetricStage::Encode, encode_start.elapsed());
+            .record(MetricStage::Encode, encoded.encode_elapsed);
 
         let data_key = match keys::data_key(
             &tenant_hash,
@@ -1148,6 +1195,7 @@ impl ShardActor {
         backstop_ceiling: BufferBudgetCeiling,
         cap_flag: DeferralCapFlag,
         scope: Arc<dyn FlushScope<ShardMsg>>,
+        write_gate: WriteGateSlot,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<MetricStageTimings>,
     ) -> Self {
         // A fresh incarnation starts with no buffers, so nothing it inherits
@@ -1167,6 +1215,7 @@ impl ShardActor {
             rtt: Arc::clone(&rtt),
             #[cfg(feature = "stage-timing")]
             stage_timings,
+            write_gate,
         });
         ShardActor {
             shard,
@@ -2438,6 +2487,7 @@ impl ShardActor {
         let TenantBuf {
             series,
             exemplars,
+            est_bytes,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
@@ -2484,6 +2534,7 @@ impl ShardActor {
             max_ingest_ts_ns,
             series,
             exemplars,
+            input_bytes: est_bytes as u64,
             waiters,
             charges,
         };
@@ -4049,6 +4100,7 @@ mod tests {
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 scope,
+                WriteGateSlot::default(),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(MetricStageTimings::new()),
             )
