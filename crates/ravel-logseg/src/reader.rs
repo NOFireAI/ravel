@@ -5630,6 +5630,64 @@ mod tests {
         );
     }
 
+    /// ADR-2773 decision 5: a reader given the SKIP_IDX, PAGE_DIR and
+    /// FIELD_DIR its caller already decoded seeds its scans with the sections
+    /// it decoded itself and no others, and scans the same rows as a reader
+    /// that decoded everything.
+    #[test]
+    fn a_reader_reusing_fetched_directories_charges_only_its_own_decodes() {
+        let (_, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let all = Predicate::TsRange {
+            min_ns: i64::MIN,
+            max_ns: i64::MAX,
+        };
+        let scanned = |reader: &RlogReader<'_>| {
+            let mut scan = reader
+                .scan_blocks(&all, &[], &ColumnSelection::all())
+                .expect("scan");
+            let ts = drain_ts(&mut scan, &object);
+            (ts, scan.stats().decompressed_bytes)
+        };
+        let footer = open_source(&object[..]).expect("footer");
+        let decompressed = |id| {
+            let desc = *section(&footer, id).expect("section");
+            let raw = read_section_from(&object[..], &desc, &cfg).expect("read");
+            section_decompressed_len(&desc, &raw)
+        };
+        let stream = decompressed(kind::STREAM_DIR);
+        let field = decompressed(kind::FIELD_DIR);
+
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        assert!(
+            dirs.open_decompressed_bytes() > stream + field,
+            "SKIP_IDX or PAGE_DIR is zstd, so reusing them changes the figure"
+        );
+        let own = RlogReader::new(&object, &cfg).expect("open");
+        let (own_ts, own_total) = scanned(&own);
+        let pages = own_total - dirs.open_decompressed_bytes();
+
+        let reusing = |field_dir: Option<Arc<FieldDir>>| {
+            RlogReader::from_source_reusing(
+                &object[..],
+                &cfg,
+                Arc::clone(&dirs.skip),
+                Arc::clone(&dirs.page_dir),
+                field_dir,
+            )
+            .expect("open reusing")
+        };
+        let all_passed = reusing(Some(Arc::clone(&dirs.field_dir)));
+        assert_eq!(all_passed.directories().open_decompressed_bytes(), stream);
+        assert_eq!(scanned(&all_passed), (own_ts.clone(), pages + stream));
+        let field_decoded = reusing(None);
+        assert_eq!(
+            field_decoded.directories().open_decompressed_bytes(),
+            stream + field
+        );
+        assert_eq!(scanned(&field_decoded), (own_ts, pages + stream + field));
+    }
+
     /// `scan_blocks_raw_subset` names whole-object block indices, and the drain
     /// follows the scan's own block order.
     ///
