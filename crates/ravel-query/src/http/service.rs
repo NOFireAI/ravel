@@ -8,10 +8,11 @@
 //!
 //! The order every operation here follows is fixed:
 //!
-//! 1. acquire an admission permit from the fleet-global controller, before any
-//!    resolve or GET;
-//! 2. clamp the wall deadline and the request budgets against the server
+//! 1. clamp the wall deadline and the request budgets against the server
 //!    ceilings, lowering only;
+//! 2. acquire an admission permit from the fleet-global controller, before any
+//!    resolve or GET, after the memory admission wait (#2044), which spends
+//!    from the clamped deadline;
 //! 3. run the engine call;
 //! 4. finalize usage through [`UsageGuard`] on every exit path, the dropped
 //!    one included;
@@ -66,9 +67,14 @@ pub fn authenticate(
     Ok(resolver.resolve(headers)?.hash())
 }
 
-/// Client message for a query the fleet-global concurrency ceiling refused.
-/// One constant so every transport's 503 body is the same string.
-pub const MSG_CONCURRENCY: &str = "fleet query concurrency ceiling reached; retry";
+// `MSG_CONCURRENCY` is the client message for a query the fleet-global
+// concurrency ceiling refused: one constant so every transport's 503 body is the
+// same string. The memory admission wait (#2044) lives with the controller it
+// gates and is reachable from outside the crate through this module.
+pub use crate::query_admission::{
+    AdmissionRefused, Admitted, DEFAULT_MEMORY_ADMISSION_FRACTION, MEMORY_ADMISSION_MAX_WAIT,
+    MEMORY_ADMISSION_POLL_INTERVAL, MSG_CONCURRENCY, MemoryAdmissionGate,
+};
 
 /// How a query ended, for its usage record. Mirrors `ravel-server`'s
 /// `QueryOutcomeStatus`, which is the aggregator this feeds and which lives in
@@ -215,21 +221,27 @@ pub struct QueryControls {
 }
 
 impl QueryControls {
-    /// Step 1: a permit from the fleet-global ceiling (ADR-0061 decision 2),
+    /// Step 2: a permit from the fleet-global ceiling (ADR-0061 decision 2),
     /// taken before any resolve or GET and released by its `Drop` on every
-    /// exit, the dropped-future one included.
-    pub fn admit(&self) -> Result<QueryPermit, ApiError> {
+    /// exit, the dropped-future one included. Takes the clamped `deadline`
+    /// because admission first runs the memory admission wait (#2044), which
+    /// spends from it; returns the permit and the deadline left to run under.
+    /// The one refusal, the concurrency ceiling's, is a 503; the wait itself
+    /// never refuses.
+    pub async fn admit(&self, deadline: Duration) -> Result<(QueryPermit, Duration), ApiError> {
         self.admission
-            .try_admit()
-            .map_err(|_| ApiError::Unavailable(MSG_CONCURRENCY.to_string()))
+            .admit_within(deadline)
+            .await
+            .map(|admitted| (admitted.permit, admitted.remaining_deadline))
+            .map_err(|refused| ApiError::Unavailable(refused.client_message().to_string()))
     }
 
-    /// Step 2, deadlines: a caller may only lower the server's wall deadline.
+    /// Step 1, deadlines: a caller may only lower the server's wall deadline.
     pub fn clamp_deadline(&self, requested: Duration, ceiling: Duration) -> Duration {
         requested.min(ceiling)
     }
 
-    /// Step 2, budgets: a caller may only lower the server's per-request
+    /// Step 1, budgets: a caller may only lower the server's per-request
     /// budgets. The engine re-resolves the same clamp through
     /// [`RequestBudgets::clamp_optional`], which is idempotent, so clamping
     /// here makes the lowering visible at the service boundary without
@@ -454,8 +466,8 @@ pub async fn promql_instant(
     tenant_hash: TenantHash,
     request: &InstantRequest,
 ) -> Result<InstantOutcome, ApiError> {
-    let _permit = controls.admit()?;
     let deadline = controls.clamp_deadline(request.deadline, engine.config().deadline);
+    let (_permit, deadline) = controls.admit(deadline).await?;
     let budgets = controls.clamp_budgets(request.budgets.as_ref(), engine.config());
     let live = LiveQueryAccounting::new();
     let guard = controls.usage_guard(tenant_hash, Arc::new(live.clone()));
@@ -514,8 +526,8 @@ pub async fn promql_range(
     tenant_hash: TenantHash,
     request: &RangeRequest,
 ) -> Result<RangeOutcome, ApiError> {
-    let _permit = controls.admit()?;
     let deadline = controls.clamp_deadline(request.deadline, engine.config().deadline);
+    let (_permit, deadline) = controls.admit(deadline).await?;
     let budgets = controls.clamp_budgets(request.budgets.as_ref(), engine.config());
     let live = LiveQueryAccounting::new();
     let guard = controls.usage_guard(tenant_hash, Arc::new(live.clone()));
@@ -640,8 +652,8 @@ async fn metadata(
     request: &MetadataRequest,
     language: &str,
 ) -> Result<MetadataOutcome, ApiError> {
-    let _permit = controls.admit()?;
     let deadline = controls.clamp_deadline(request.deadline, engine.config().deadline);
+    let (_permit, deadline) = controls.admit(deadline).await?;
     let budgets = controls.clamp_budgets(request.budgets.as_ref(), engine.config());
     let live = LiveQueryAccounting::new();
     let guard = controls.usage_guard(tenant_hash, Arc::new(live.clone()));

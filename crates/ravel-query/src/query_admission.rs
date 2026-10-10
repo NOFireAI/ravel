@@ -63,10 +63,25 @@
 //! it keeps its last-computed threshold rather than failing closed to zero
 //! admission, and increments a failure counter so a sustained fault is
 //! observable.
+//!
+//! ## Memory admission wait (#2044, ADR-1170 amendment of 2026-10-10)
+//!
+//! A controller may also carry a [`MemoryAdmissionGate`]: before taking a
+//! concurrency slot, [`QueryAdmissionController::admit_within`] waits while the
+//! process memory budget's `reserved` is at or above a fraction of its limit,
+//! re-reading it every [`MEMORY_ADMISSION_POLL_INTERVAL`]. After
+//! [`MEMORY_ADMISSION_MAX_WAIT`], or half the statement's deadline if that
+//! comes first, it admits the statement anyway: the wait delays and never
+//! refuses, and the statement's own reservations decide as before. The wait is at
+//! admission only: a reservation that grows mid-statement is still refused at
+//! once by `MemoryBudget::try_reserve`. A waiting statement holds neither a
+//! slot nor any reserved bytes.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ravel_memory::MemoryBudget;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -192,6 +207,9 @@ pub struct QueryAdmissionController {
     /// alone writes (ADR-0057 section 1). Generated once at construction.
     process_id: Uuid,
     state: Mutex<State>,
+    /// The memory admission wait [`Self::admit_within`] runs before taking a
+    /// slot. Disabled unless [`Self::with_memory_gate`] installs one.
+    memory_gate: Arc<MemoryAdmissionGate>,
 }
 
 impl QueryAdmissionController {
@@ -211,7 +229,40 @@ impl QueryAdmissionController {
                 fleet_threshold,
                 reconciliation_failures_total: 0,
             }),
+            memory_gate: Arc::new(MemoryAdmissionGate::disabled()),
         }
+    }
+
+    /// Install the memory admission wait every [`Self::admit_within`] runs.
+    pub fn with_memory_gate(mut self, gate: Arc<MemoryAdmissionGate>) -> Self {
+        self.memory_gate = gate;
+        self
+    }
+
+    /// Admission for a statement with `deadline` left to run: the memory
+    /// admission wait, then [`Self::try_admit`]. On success returns the permit
+    /// and the deadline that remains after the wait, which the caller runs the
+    /// statement under so the wait counts against the same deadline.
+    ///
+    /// A statement the concurrency ceiling would refuse is refused at once,
+    /// before the wait: parking it for memory it could not use only holds its
+    /// connection until the deadline. The slot itself is still taken after the
+    /// wait, so a waiter holds no slot.
+    pub async fn admit_within(
+        self: &Arc<Self>,
+        deadline: Duration,
+    ) -> Result<Admitted, AdmissionRefused> {
+        if self.at_ceiling() {
+            return Err(AdmissionRefused::Concurrency);
+        }
+        let waited = self.memory_gate.wait_for_headroom(deadline).await;
+        let permit = self
+            .try_admit()
+            .map_err(|QueryRejected| AdmissionRefused::Concurrency)?;
+        Ok(Admitted {
+            permit,
+            remaining_deadline: deadline.saturating_sub(waited),
+        })
     }
 
     /// Convenience for the common case: an `Arc` around [`Self::new`], since the
@@ -254,6 +305,15 @@ impl QueryAdmissionController {
         Ok(QueryPermit {
             controller: Arc::clone(self),
         })
+    }
+
+    /// Whether [`Self::try_admit`] would refuse now, without taking a slot.
+    fn at_ceiling(&self) -> bool {
+        let state = lock(&self.state);
+        match self.limit {
+            QueryConcurrencyLimit::Unlimited => false,
+            QueryConcurrencyLimit::Bounded(_) => state.in_flight >= state.fleet_threshold,
+        }
     }
 
     /// Release one held slot. Called only by [`QueryPermit`]'s [`Drop`]; not a
@@ -311,6 +371,152 @@ impl Drop for QueryPermit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("fleet query concurrency ceiling reached")]
 pub struct QueryRejected;
+
+/// Client message for [`AdmissionRefused::Concurrency`]; the same text
+/// `ravel_query::http::MSG_CONCURRENCY` re-exports.
+pub const MSG_CONCURRENCY: &str = "fleet query concurrency ceiling reached; retry";
+
+/// How often a waiting admission re-reads the process memory budget.
+pub const MEMORY_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The longest a statement waits for memory headroom at admission. The wait
+/// also never takes more than half the statement's deadline. Once either
+/// bound is reached the statement is admitted anyway and its reservations
+/// decide, as they do with no wait. The wait is still time taken from the
+/// deadline, so a statement that needed nearly all of it can time out where
+/// it would have finished.
+pub const MEMORY_ADMISSION_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// The default `--query-memory-admission-fraction`. Waiting starts once
+/// `reserved` reaches three quarters of the limit, which leaves a quarter of
+/// the budget as headroom for the statements already running to grow into.
+/// docs/adrs/1170-process-memory-budget.md (2026-10-10 amendment) derives it
+/// from the reference box's figures.
+pub const DEFAULT_MEMORY_ADMISSION_FRACTION: f64 = 0.75;
+
+/// An admitted statement: its concurrency slot and the deadline left after the
+/// memory admission wait.
+pub struct Admitted {
+    pub permit: QueryPermit,
+    pub remaining_deadline: Duration,
+}
+
+/// Why [`QueryAdmissionController::admit_within`] refused a statement. It is
+/// refused before any resolve or GET, in the retryable class. The memory
+/// admission wait never refuses: it only delays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AdmissionRefused {
+    #[error("fleet query concurrency ceiling reached")]
+    Concurrency,
+}
+
+impl AdmissionRefused {
+    /// The stable client message for this refusal.
+    pub fn client_message(self) -> &'static str {
+        match self {
+            AdmissionRefused::Concurrency => MSG_CONCURRENCY,
+        }
+    }
+}
+
+/// The bounded memory admission wait (#2044). Shared by every query surface's
+/// admission through the one [`QueryAdmissionController`], and read by
+/// `/metrics` for its two counters.
+pub struct MemoryAdmissionGate {
+    budget: Arc<MemoryBudget>,
+    /// `reserved` at or above this waits; `None` disables the wait.
+    threshold: Option<u64>,
+    poll: Duration,
+    max_wait: Duration,
+    waits_total: AtomicU64,
+    waits_expired_total: AtomicU64,
+}
+
+impl MemoryAdmissionGate {
+    /// A gate that waits while `budget.reserved()` is at or above
+    /// `fraction * budget.limit()`. A `fraction` of 0 (or not a positive
+    /// number) disables it, and so does an unlimited budget, which never
+    /// refuses a reservation; a fraction above 1 is treated as 1. The
+    /// threshold is at least 1 byte, so a tiny fraction waits only while
+    /// something is reserved instead of on every statement.
+    pub fn new(budget: Arc<MemoryBudget>, fraction: f64) -> Self {
+        let limit = budget.limit();
+        let threshold = if fraction > 0.0 && limit != u64::MAX {
+            Some(((limit as f64 * fraction.min(1.0)) as u64).max(1))
+        } else {
+            None
+        };
+        MemoryAdmissionGate {
+            budget,
+            threshold,
+            poll: MEMORY_ADMISSION_POLL_INTERVAL,
+            max_wait: MEMORY_ADMISSION_MAX_WAIT,
+            waits_total: AtomicU64::new(0),
+            waits_expired_total: AtomicU64::new(0),
+        }
+    }
+
+    /// A gate that never waits.
+    pub fn disabled() -> Self {
+        Self::new(Arc::new(MemoryBudget::unlimited()), 0.0)
+    }
+
+    /// Override [`MEMORY_ADMISSION_POLL_INTERVAL`].
+    pub fn with_poll_interval(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    /// Override [`MEMORY_ADMISSION_MAX_WAIT`].
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
+        self
+    }
+
+    /// The `reserved` byte count at or above which admission waits, `None`
+    /// when the wait is disabled.
+    pub fn threshold_bytes(&self) -> Option<u64> {
+        self.threshold
+    }
+
+    /// Statements that found the budget at or above the threshold and waited.
+    pub fn waits_total(&self) -> u64 {
+        self.waits_total.load(Ordering::Relaxed)
+    }
+
+    /// The waits that ended at the maximum wait, or at the statement's
+    /// deadline, with the budget still at or above the threshold. Those
+    /// statements were admitted anyway. A subset of [`Self::waits_total`].
+    pub fn waits_expired_total(&self) -> u64 {
+        self.waits_expired_total.load(Ordering::Relaxed)
+    }
+
+    /// Wait until `reserved` drops below the threshold, or until the next read
+    /// would pass the maximum wait or half of `deadline`, whichever is
+    /// sooner, and return how long it waited. It never refuses, and it leaves
+    /// at least half the deadline to run under.
+    async fn wait_for_headroom(&self, deadline: Duration) -> Duration {
+        let Some(threshold) = self.threshold else {
+            return Duration::ZERO;
+        };
+        if self.budget.reserved() < threshold {
+            return Duration::ZERO;
+        }
+        self.waits_total.fetch_add(1, Ordering::Relaxed);
+        let bound = self.max_wait.min(deadline / 2);
+        let start = tokio::time::Instant::now();
+        loop {
+            if start.elapsed().saturating_add(self.poll) >= bound {
+                self.waits_expired_total.fetch_add(1, Ordering::Relaxed);
+                return start.elapsed();
+            }
+            tokio::time::sleep(self.poll).await;
+            if self.budget.reserved() < threshold {
+                return start.elapsed();
+            }
+        }
+    }
+}
 
 /// Read and decode every sibling snapshot under the query-admission prefix,
 /// excluding this process's own key. A corrupt or future-version sibling is
@@ -699,5 +905,197 @@ mod tests {
         // Fleet already over cap: pins to own, never underflows.
         assert_eq!(local_soft_threshold(6, 6, 10), 6);
         assert_eq!(local_soft_threshold(20, 5, 10), 20);
+    }
+
+    #[test]
+    fn memory_gate_threshold_is_the_fraction_of_a_bounded_limit() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        assert_eq!(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.75).threshold_bytes(),
+            Some(750)
+        );
+        assert_eq!(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 1.5).threshold_bytes(),
+            Some(1_000)
+        );
+        assert_eq!(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.0).threshold_bytes(),
+            None
+        );
+        // A fraction that rounds to 0 bytes would wait on every statement.
+        assert_eq!(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 1e-12).threshold_bytes(),
+            Some(1)
+        );
+        assert_eq!(
+            MemoryAdmissionGate::new(Arc::new(MemoryBudget::unlimited()), 0.75).threshold_bytes(),
+            None
+        );
+        assert_eq!(MemoryAdmissionGate::disabled().threshold_bytes(), None);
+    }
+
+    #[tokio::test]
+    async fn admission_below_the_memory_threshold_does_not_wait() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        let _held = budget.reserve(749).expect("fits");
+        let gate = Arc::new(MemoryAdmissionGate::new(Arc::clone(&budget), 0.75));
+        let controller = Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Unlimited)
+                .with_memory_gate(Arc::clone(&gate)),
+        );
+        let admitted = controller
+            .admit_within(Duration::from_secs(5))
+            .await
+            .expect("admits");
+        assert_eq!(admitted.remaining_deadline, Duration::from_secs(5));
+        assert_eq!(gate.waits_total(), 0);
+        assert_eq!(controller.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_waits_until_reserved_drops_below_the_threshold() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        let held = budget.reserve(750).expect("fits");
+        let gate = Arc::new(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.75)
+                .with_poll_interval(Duration::from_millis(1))
+                .with_max_wait(Duration::from_secs(60)),
+        );
+        let controller = Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Unlimited)
+                .with_memory_gate(Arc::clone(&gate)),
+        );
+        let deadline = Duration::from_secs(60);
+        let waiter = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.admit_within(deadline).await })
+        };
+        while gate.waits_total() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Several poll intervals pass with the budget still held.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "admission waits at the threshold");
+        assert_eq!(controller.in_flight(), 0, "no permit while waiting");
+        drop(held);
+
+        let admitted = waiter.await.expect("task").expect("admits once freed");
+        assert!(
+            admitted.remaining_deadline <= deadline - Duration::from_millis(20),
+            "the wait is charged against the statement's deadline: {:?}",
+            admitted.remaining_deadline
+        );
+        assert_eq!(controller.in_flight(), 1);
+        assert_eq!(gate.waits_total(), 1);
+        assert_eq!(gate.waits_expired_total(), 0);
+    }
+
+    /// With the budget above the threshold the whole time, admission waits up
+    /// to the maximum wait and then admits anyway, never refusing. Half the
+    /// statement's deadline bounds the wait when it is shorter.
+    ///
+    /// FLIP: bound the wait in `wait_for_headroom` by half the deadline alone,
+    /// ignoring `max_wait`. The first call then waits 30 s and its timeout
+    /// fires. FLIP: bound it by `max_wait` and the whole deadline, not half.
+    /// The second call then keeps at most one re-check of its 400 ms and the
+    /// at-least-100 ms assertion fails.
+    #[tokio::test]
+    async fn admission_admits_after_the_max_wait_while_the_budget_stays_held() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        let _held = budget.reserve(900).expect("fits");
+        let gate = Arc::new(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.75)
+                .with_poll_interval(Duration::from_millis(1))
+                .with_max_wait(Duration::from_millis(20)),
+        );
+        let controller = Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Unlimited)
+                .with_memory_gate(Arc::clone(&gate)),
+        );
+        let deadline = Duration::from_secs(60);
+        // hygiene-allow: wall-clock -- a bound on a call that must end at the 20 ms cap; the assertions are on its result
+        let admitted =
+            tokio::time::timeout(Duration::from_secs(5), controller.admit_within(deadline))
+                .await
+                .expect("the cap ends the wait long before the deadline")
+                .expect("admitted once the cap passes");
+        assert!(
+            admitted.remaining_deadline < deadline,
+            "the wait is charged against the deadline: {:?}",
+            admitted.remaining_deadline
+        );
+        assert_eq!(gate.waits_total(), 1);
+        assert_eq!(gate.waits_expired_total(), 1);
+        assert_eq!(controller.in_flight(), 1);
+        drop(admitted);
+
+        // With a cap far past the deadline, half the deadline ends the wait,
+        // so the statement keeps the other half to run under. Without the
+        // halving it would wait out the whole 400 ms and keep at most one
+        // re-check of it.
+        let short = Arc::new(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.75)
+                .with_poll_interval(Duration::from_millis(1))
+                .with_max_wait(Duration::from_secs(60)),
+        );
+        let controller = Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Unlimited)
+                .with_memory_gate(Arc::clone(&short)),
+        );
+        let deadline = Duration::from_millis(400);
+        // hygiene-allow: wall-clock -- a bound on a call that must end at half its 400 ms deadline; the assertions are on its result
+        let admitted =
+            tokio::time::timeout(Duration::from_secs(5), controller.admit_within(deadline))
+                .await
+                .expect("half the deadline ends the wait")
+                .expect("admitted at half the deadline");
+        assert!(
+            admitted.remaining_deadline < deadline,
+            "the wait is charged against the deadline: {:?}",
+            admitted.remaining_deadline
+        );
+        assert!(
+            admitted.remaining_deadline >= Duration::from_millis(100),
+            "about half the deadline is left to run under: {:?}",
+            admitted.remaining_deadline
+        );
+        assert_eq!(short.waits_total(), 1);
+        assert_eq!(short.waits_expired_total(), 1);
+    }
+
+    /// A statement the full concurrency ceiling would refuse is refused at
+    /// once, even while the memory budget sits above the threshold, and never
+    /// waits.
+    ///
+    /// FLIP: drop the `at_ceiling` check from `admit_within`. The call then
+    /// waits the 2 s cap before `try_admit` refuses it, and the gate counts a
+    /// wait, so the `waits_total() == 0` assertion fails.
+    #[tokio::test]
+    async fn a_full_ceiling_refuses_before_the_memory_wait() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        let _held = budget.reserve(900).expect("fits");
+        let gate = Arc::new(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.75)
+                .with_poll_interval(Duration::from_millis(1)),
+        );
+        let controller = Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Bounded(1))
+                .with_memory_gate(Arc::clone(&gate)),
+        );
+        let _slot = controller.try_admit().expect("the first slot is free");
+        // hygiene-allow: wall-clock -- a bound on a call that must return at once; the assertion is on its result
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            controller.admit_within(Duration::from_secs(60)),
+        )
+        .await
+        .expect("a full ceiling refuses without waiting");
+        let Err(refused) = result else {
+            panic!("admission must refuse at a full ceiling");
+        };
+        assert_eq!(refused, AdmissionRefused::Concurrency);
+        assert_eq!(gate.waits_total(), 0);
+        assert_eq!(gate.waits_expired_total(), 0);
+        assert_eq!(controller.in_flight(), 1);
     }
 }

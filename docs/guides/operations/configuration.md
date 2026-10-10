@@ -1939,6 +1939,55 @@ Every mode except gateway (`all`, `query`, `maintain`) needs a derived budget
 of at least 256 MiB after the overhead reserve, plus room for what its two
 cache ceilings claim.
 
+### Memory admission wait
+
+A query that arrives while the shared accountant is nearly full waits at
+admission instead of starting and failing its first fetch reservation. The
+wait applies to PromQL, metadata, SQL and Flight SQL queries (both the
+`GetFlightInfo` and the `DoGet` call):
+
+- While the reserved bytes are at or above
+  `--query-memory-admission-fraction` times the accountant's limit, the
+  query waits and re-checks every 10 ms.
+- It is admitted as soon as the reserved bytes drop below that threshold.
+  The time it waited comes out of its deadline.
+- After 2 s of waiting, or after half its deadline if that comes first, it
+  is admitted anyway, and its own reservations decide as they would with no
+  wait. The wait never refuses a query, but a query that needed nearly all
+  of its deadline can time out after waiting.
+
+A query that is already running never waits: a reservation it makes while
+running is refused at once when it does not fit, as before. The internal
+slice fetches of a distributed scan do not wait either.
+
+Waiting queries are not queued. When the reserved bytes drop below the
+threshold, every waiting query whose re-check lands before the bytes rise
+again is admitted, so several can start together and still fail their
+first fetch with "query memory budget exhausted: the process could not
+reserve memory to fetch segment data; retry".
+
+The fixed 2 s cap and that fetch refusal's 503 status are interim: an
+accepted design makes the wait configurable and answers memory refusals
+with 422, and is not applied yet.
+
+The fraction defaults to `0.75` and accepts values from `0` to `1`. `0`
+disables the wait. An unlimited accountant (unreadable host memory) never
+waits. The default leaves a quarter of the budget for the queries already
+admitted to fetch into. The startup log reports the outcome on a `performance default resolved`
+line:
+
+```
+INFO performance default resolved setting="query_memory_admission_fraction" value=0.75 source="derived" threshold_bytes=11940000000 enabled=true
+```
+
+`threshold_bytes` is the reserved byte count at which queries start to
+wait, and is `0` with `enabled=false` when the wait is off.
+
+Raise the fraction when queries wait while plenty of the budget is free.
+Lower it when running queries still fail with "query memory budget
+exhausted" at their fetches: a lower threshold leaves each admitted query
+more headroom. Both counters below show which case applies.
+
 ### Gateway mode memory
 
 `--mode gateway` derives no budget. It builds no query surface and runs no
@@ -1979,6 +2028,8 @@ The current state is visible live at `/metrics`:
 | `ravel_memory_budget_bytes` | The ceiling of the shared accountant. It is the `memory_remainder_bytes` of the startup log: the budget MINUS the two cache ceilings. It is not the pre-carve `memory_budget_bytes` figure logged beside it. `u64::MAX` means unlimited, which is what any host with unreadable memory reports regardless of the caps set on it. |
 | `ravel_memory_reserved_bytes` | The reserved total, split by a `component` label. `fetch` is the bytes held by fetch reservations on the PromQL and SQL paths, including distributed fragment slices and the startup cache warm pass. `sql` is the rest of the reserved total: what the per-tenant accountants of the SQL executor hold. |
 | `ravel_memory_handoff_overlap_bytes` | The part of the `fetch` share whose bytes went through the read cache, hit or miss, whether or not the cache kept them. `0` when no read cache is configured. |
+| `ravel_memory_admission_waits_total` | Admissions that had to wait for the reserved bytes to drop below the [memory admission wait](#memory-admission-wait) threshold. A Flight SQL statement that waits at both `GetFlightInfo` and `DoGet` counts twice. |
+| `ravel_memory_admission_waits_expired_total` | The waits that reached 2 s, or half the query's deadline, with the reserved bytes still at or above the threshold. Those queries were admitted anyway. A subset of the waits counter. |
 
 `--cache-max-bytes` has a limited effect on how many times a logs statement
 moves the bytes of a given object. The plan-phase whole-object read of a

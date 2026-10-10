@@ -1389,6 +1389,53 @@ reservation drops; a cache eviction in between does not lower it.
 It is a subset of `component="fetch"`, not an addition to the reserved total,
 and it reads `0` when no read cache is configured.
 
+#### Memory admission wait and the fetch refusal message
+
+Admission checks the budget before a query takes its concurrency permit
+(ADR-1170's 2026-10-10 amendment). A query the concurrency ceiling would
+refuse is refused at once, before any wait. While the reserved total is at
+or above `--query-memory-admission-fraction` (default `0.75`, `0` disables)
+times the ceiling, the query waits, re-reading the counter every 10 ms. It
+is admitted once the total drops below that threshold, or after 2 s of
+waiting, or after half its deadline if that comes first. In the last two
+cases it is admitted anyway and its own reservations decide, as they would
+with no wait. The wait never refuses a query, but the time waited is taken
+from its deadline, so a query that needed nearly all of its deadline can
+time out where it would have finished. Every client admission site waits: `QueryControls::admit` for the
+PromQL, metadata and SQL HTTP endpoints, and Flight SQL's `GetFlightInfo` and
+statement `DoGet`. Reservation growth never waits, and neither does a slice
+fetch from a distributed scan's coordinator: the coordinator already holds
+its permit and reservations, so the slice takes a concurrency slot or is
+refused at once and the coordinator falls back. Waiters are not queued: every
+waiter whose re-check lands below the threshold is admitted, and a new arrival
+below it is admitted ahead of them.
+
+`ravel_memory_admission_waits_total` counts admissions that waited (a Flight
+SQL statement that waits at both calls counts twice) and
+`ravel_memory_admission_waits_expired_total` the waits that reached the cap
+or half the deadline with the budget still above the threshold.
+
+The fixed 2 s cap and the fetch refusal's 503 are interim: ADR-2633 adds a
+capped wait on resident memory at the same sites and moves every memory
+refusal to 422, and is not applied yet.
+
+A fetch the budget refuses after admission (`FetchError`, `LogFetchError` or
+`SpanFetchError::FetchMemoryExhausted`) answers SQL and PromQL clients with
+503 `unavailable` and the message:
+
+```
+query memory budget exhausted: the process could not reserve memory to fetch segment data; retry
+```
+
+Every other non-corrupt fetch error keeps "upstream storage temporarily
+unavailable"; a corrupt one answers "stored data failed integrity
+validation". The
+server's WARN line for a redacted SQL error carries a `variant` field naming
+the error (for example `variant="LogFetch::FetchMemoryExhausted"`), so the
+cause stays visible to the operator while the client message stays redacted.
+An error that reached the server through DataFusion's shared wrapper is named
+`Shared`.
+
 ### Catalog resolve GET concurrency
 
 Before a query can fetch a single segment, the catalog must resolve which

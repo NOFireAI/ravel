@@ -3065,6 +3065,31 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
         &[Label::Mode(mode)],
         budget.handoff_overlap,
     );
+
+    write_header(
+        out,
+        "ravel_memory_admission_waits_total",
+        "Admissions that found the process memory budget's reserved bytes at or above --query-memory-admission-fraction of its limit and waited, up to 2 s or half the deadline, for them to drop (#2044).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_memory_admission_waits_total",
+        &[Label::Mode(mode)],
+        budget.admission_waits_total,
+    );
+    write_header(
+        out,
+        "ravel_memory_admission_waits_expired_total",
+        "Admission waits that reached 2 s or half the deadline with the reserved bytes still at or above the threshold; the query was admitted anyway (#2044). A subset of ravel_memory_admission_waits_total.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_memory_admission_waits_expired_total",
+        &[Label::Mode(mode)],
+        budget.admission_waits_expired_total,
+    );
 }
 
 /// Both ADR-1702 CPU gates' counters, read once per scrape.
@@ -7659,6 +7684,10 @@ pub struct MemoryBudgetSnapshot {
     pub sql_reserved: u64,
     pub fetch_reserved: u64,
     pub handoff_overlap: u64,
+    /// `MemoryAdmissionGate::waits_total()` (#2044).
+    pub admission_waits_total: u64,
+    /// `MemoryAdmissionGate::waits_expired_total()` (#2044).
+    pub admission_waits_expired_total: u64,
 }
 
 /// Router state for `GET /metrics`. Every field is a handle already built by
@@ -7830,6 +7859,10 @@ pub struct MetricsState {
     /// rather than the raw near-miss remainder. See
     /// [`exposed_memory_budget_limit`].
     pub process_memory_budget_is_fallback: bool,
+    /// The memory admission wait (#2044) installed on the process's query
+    /// admission controller, read at scrape time for its two counters. A
+    /// disabled gate in a mode that serves no query; the counters then read 0.
+    pub memory_admission: Arc<ravel_query::http::service::MemoryAdmissionGate>,
     /// The ADR-1702 read and write CPU gates, the same handles every gated
     /// call site holds. Always present: `crate::start` builds both in every
     /// mode, so the `ravel_cpu_gate_*` families render in every mode.
@@ -8110,6 +8143,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         sql_reserved: state.process_memory_budget.sql_reserved(),
         fetch_reserved: state.process_memory_budget.fetch_reserved(),
         handoff_overlap: state.process_memory_budget.handoff_overlap(),
+        admission_waits_total: state.memory_admission.waits_total(),
+        admission_waits_expired_total: state.memory_admission.waits_expired_total(),
     };
 
     let mut body = render(
@@ -14168,6 +14203,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             audit_pipeline: None,
             process_memory_budget: Arc::new(MemoryBudget::unlimited()),
             process_memory_budget_is_fallback: false,
+            memory_admission: Arc::new(ravel_query::http::service::MemoryAdmissionGate::disabled()),
             cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
             can_fold: true,
             fold_loop: Default::default(),

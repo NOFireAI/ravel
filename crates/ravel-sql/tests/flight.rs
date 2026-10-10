@@ -310,6 +310,75 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
     assert!(!decoded.segments.is_empty());
 }
 
+/// A `GetFlightInfo` that waited for memory headroom mints its ticket from the
+/// deadline it arrived with. The wait comes out of the RPC's own resolve and
+/// plan budget once, not a second time out of the ticket. The clock is fixed,
+/// so the minted deadline must be exactly the arrival clock plus the 30 s
+/// deadline however long the wait took.
+///
+/// Prove-the-test: mint the ticket from `req.deadline` (what is left after the
+/// wait) in `get_flight_info_statement` (crates/ravel-sql/src/flight/service.rs).
+/// The ticket then ends at least one 10 ms re-check early and the deadline
+/// equality fails.
+#[tokio::test]
+async fn a_ticket_minted_after_a_memory_wait_keeps_the_arrival_deadline() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+    let gate = Arc::new(
+        ravel_query::http::service::MemoryAdmissionGate::new(
+            Arc::clone(&budget),
+            ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION,
+        )
+        .with_max_wait(Duration::from_secs(60)),
+    );
+    harness.service = RavelFlightSqlService::new(
+        Arc::clone(&harness.executor),
+        TestAuth::new(&[("acme", &tenant)]),
+        Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
+        FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            gc_protection_horizon: Duration::from_secs(600),
+            ..FlightSqlConfig::default()
+        },
+        Arc::new(NoopQueryCostRecorder),
+        Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Unlimited)
+                .with_memory_gate(Arc::clone(&gate)),
+        ),
+    );
+
+    let held = budget.reserve(1 << 20).expect("the empty budget admits");
+    let waiter = Arc::clone(&gate);
+    let release = async move {
+        let mut polls = 0;
+        while waiter.waits_total() == 0 {
+            polls += 1;
+            assert!(
+                polls <= 2000,
+                "timed out waiting for GetFlightInfo to park at admission"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Keep the budget held across at least one more re-check.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(held);
+    };
+    let (ticket, ()) = tokio::join!(harness.get_flight_info("acme", QUERY), release);
+    let ticket = ticket.expect("flight info once the budget frees");
+    assert_eq!(gate.waits_total(), 1);
+    assert_eq!(gate.waits_expired_total(), 0);
+
+    let decoded = FlightTicket::decode(
+        &statement_ticket(&ticket).statement_handle,
+        harness.service.ticket_key(),
+    )
+    .expect("ticket decodes");
+    assert_eq!(decoded.now_ns, NOW_NS);
+    assert_eq!(decoded.deadline_ns, NOW_NS + 30_000_000_000);
+}
+
 /// A ticket tampered with after minting -- here, its deadline
 /// extended -- and re-signed under a key an attacker does not have (they
 /// cannot have the server's in-process secret, so any key they pick stands

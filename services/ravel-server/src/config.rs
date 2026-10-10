@@ -1955,6 +1955,17 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES")]
     pub memory_budget_bytes: Option<u64>,
 
+    /// The memory admission wait (#2044, ADR-1170 amendment of 2026-10-10):
+    /// a query arriving while the process memory budget's reserved bytes are
+    /// at or above this fraction of its limit waits, re-checking every 10 ms,
+    /// until they drop below it, for at most 2 s or half its deadline; then it
+    /// is admitted anyway and its own reservations decide. The wait never
+    /// refuses, but its time comes out of the deadline. Applies at admission only; a running query's
+    /// reservation growth is still refused at once. Between 0 and 1; 0
+    /// disables the wait. Unset, 0.75.
+    #[arg(long, value_name = "FRACTION", value_parser = parse_query_memory_admission_fraction)]
+    pub query_memory_admission_fraction: Option<f64>,
+
     /// Maximum resident bytes for the query fetcher cache's RAM tier
     /// (`store::build_cache`), the ADR-0046 read cache that holds byte ranges
     /// of the data objects a query scans. This flag bounds the fetcher cache
@@ -2644,6 +2655,12 @@ pub struct QueryBudgets {
     /// `--sql-spill` and the memory budget a `--cache-dir`-derived spill
     /// ceiling is capped against (ADR-0954, amended by issue #2416).
     pub sql_spill: SqlSpillSettings,
+    /// `--query-memory-admission-fraction` (#2044): the share of the process
+    /// memory budget at or above which admission waits; 0 disables the wait.
+    pub memory_admission_fraction: MemoryAdmissionFraction,
+    /// Where [`Self::memory_admission_fraction`] came from:
+    /// [`PERF_SOURCE_FLAG`], or [`PERF_SOURCE_DERIVED`] for the default.
+    pub memory_admission_fraction_source: &'static str,
 }
 
 impl Default for QueryBudgets {
@@ -2666,7 +2683,52 @@ impl Default for QueryBudgets {
             mcp: McpConfig::default(),
             fold_lag_interval: None,
             sql_spill: SqlSpillSettings::default(),
+            memory_admission_fraction: MemoryAdmissionFraction(
+                ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION,
+            ),
+            memory_admission_fraction_source: PERF_SOURCE_DERIVED,
         }
+    }
+}
+
+impl QueryBudgets {
+    /// The `query_memory_admission_fraction` startup line, in the
+    /// `performance default resolved` layout. `threshold_bytes` is the
+    /// reserved byte count admission waits at, 0 when the wait is disabled
+    /// (a fraction of 0, or an unlimited budget).
+    pub fn emit_memory_admission(&self, threshold_bytes: Option<u64>) {
+        tracing::info!(
+            setting = "query_memory_admission_fraction",
+            value = self.memory_admission_fraction.0,
+            source = self.memory_admission_fraction_source,
+            threshold_bytes = threshold_bytes.unwrap_or(0),
+            enabled = threshold_bytes.is_some(),
+            "performance default resolved"
+        );
+    }
+}
+
+/// `--query-memory-admission-fraction`'s resolved value, between 0 and 1.
+/// Compared by bit pattern so [`QueryBudgets`] keeps its `Eq`.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryAdmissionFraction(pub f64);
+
+impl PartialEq for MemoryAdmissionFraction {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for MemoryAdmissionFraction {}
+
+/// Clap parser for `--query-memory-admission-fraction`: a number between 0
+/// and 1 inclusive.
+fn parse_query_memory_admission_fraction(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw.parse().map_err(|err| format!("not a number: {err}"))?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("must be between 0 and 1 inclusive, got {raw}"))
     }
 }
 
@@ -6043,6 +6105,15 @@ impl Cli {
                         .cache_max_bytes
                         .saturating_add(resolved.catalog_cache_max_bytes)
                 },
+            },
+            memory_admission_fraction: MemoryAdmissionFraction(
+                self.query_memory_admission_fraction
+                    .unwrap_or(ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION),
+            ),
+            memory_admission_fraction_source: if self.query_memory_admission_fraction.is_some() {
+                PERF_SOURCE_FLAG
+            } else {
+                PERF_SOURCE_DERIVED
             },
         })
     }
@@ -13478,6 +13549,80 @@ mod tests {
         let mut argv = vec!["ravel-server"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    /// #2044: `--query-memory-admission-fraction` defaults to 0.75, accepts
+    /// 0 (disabled) through 1, refuses anything else, and reaches
+    /// [`QueryBudgets`] with its source; its `performance default resolved`
+    /// line carries the value, source, threshold, and whether the wait is on.
+    ///
+    /// Prove-the-test: drop the flag branch in `Cli::query_budgets` and the
+    /// `0.5` row reads source `derived`, not `flag`.
+    #[test]
+    fn query_memory_admission_fraction_parses_resolves_and_logs() {
+        for word in ["-0.1", "1.5", "NaN", "inf", "abc", ""] {
+            assert!(
+                Cli::try_parse_from(["ravel-server", "--query-memory-admission-fraction", word])
+                    .is_err(),
+                "--query-memory-admission-fraction {word:?} must be refused"
+            );
+        }
+        for (args, fraction, source) in [
+            (
+                &[][..],
+                ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION,
+                PERF_SOURCE_DERIVED,
+            ),
+            (
+                &["--query-memory-admission-fraction", "0.5"][..],
+                0.5,
+                PERF_SOURCE_FLAG,
+            ),
+            (
+                &["--query-memory-admission-fraction", "0"][..],
+                0.0,
+                PERF_SOURCE_FLAG,
+            ),
+            (
+                &["--query-memory-admission-fraction", "1"][..],
+                1.0,
+                PERF_SOURCE_FLAG,
+            ),
+        ] {
+            let parsed = cli(args);
+            let budgets = parsed
+                .query_budgets(&resolved_from(&parsed))
+                .expect("budgets resolve");
+            assert_eq!(
+                budgets.memory_admission_fraction.0.to_bits(),
+                fraction.to_bits(),
+                "{args:?}"
+            );
+            assert_eq!(budgets.memory_admission_fraction_source, source, "{args:?}");
+        }
+
+        let parsed = cli(&[]);
+        let budgets = parsed
+            .query_budgets(&resolved_from(&parsed))
+            .expect("budgets resolve");
+        let (captured, guard) = capture_events(tracing::Level::INFO);
+        budgets.emit_memory_admission(Some(750));
+        budgets.emit_memory_admission(None);
+        drop(guard);
+        let lines = captured.lock();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, threshold, enabled) in [(&lines[0], 750, true), (&lines[1], 0, false)] {
+            for needle in [
+                "performance default resolved".to_string(),
+                "setting=\"query_memory_admission_fraction\"".to_string(),
+                "value=0.75".to_string(),
+                format!("source=\"{PERF_SOURCE_DERIVED}\""),
+                format!("threshold_bytes={threshold}"),
+                format!("enabled={enabled}"),
+            ] {
+                assert!(line.contains(&needle), "{needle} missing from {line}");
+            }
+        }
     }
 
     /// `--sql-spill` parses `auto` (the default) and `off`, refuses every

@@ -19,8 +19,8 @@ use ravel_maintain::{NoopQueryAuditSink, QueryAuditSink};
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 
 pub use error::{
-    ApiError, MSG_AUDIT_UNAVAILABLE, MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE,
-    QueryErrorResponse,
+    ApiError, MSG_AUDIT_UNAVAILABLE, MSG_CORRUPT, MSG_FETCH_MEMORY_EXHAUSTED, MSG_UNAVAILABLE,
+    MSG_UNSATISFIABLE, QueryErrorResponse,
 };
 pub use handlers::include_log_metric_names;
 pub use metadata_cache::{

@@ -29,6 +29,9 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreMetrics};
+use ravel_query::http::service::{
+    DEFAULT_MEMORY_ADMISSION_FRACTION, MEMORY_ADMISSION_MAX_WAIT, MemoryAdmissionGate,
+};
 use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{
     EngineConfig, FetchError, GetLimiter, LogFetchError, LogSegmentFetcher,
@@ -51,6 +54,11 @@ const NS_PER_SEC: i64 = 1_000_000_000;
 /// issues one LIST per (shard, ingest-hour) pair across the window, so a
 /// wall-clock value would fan out to hundreds of thousands of LISTs.
 const NOW_NS: i64 = 4 * NS_PER_HOUR;
+
+/// The SQL client message for a fetch refused by the process memory budget
+/// (`ravel_sql`'s `MSG_FETCH_MEMORY_EXHAUSTED`, which the crate does not
+/// re-export), spelled out as the wire contract a caller sees.
+const FETCH_MEMORY_EXHAUSTED_MESSAGE: &str = "query memory budget exhausted: the process could not reserve memory to fetch segment data; retry";
 
 struct FixedClock;
 
@@ -143,12 +151,30 @@ struct Harness {
     sql: Router,
     metrics: Router,
     executor: Arc<SqlExecutor>,
+    /// The memory admission wait installed on the SQL surface's admission
+    /// controller at the default fraction, as `crate::start` installs it.
+    memory_admission: Arc<MemoryAdmissionGate>,
 }
 
 fn harness(
     store: Arc<dyn ObjectStoreBackend>,
     configured: HashSet<TenantHash>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+) -> Harness {
+    harness_with_max_wait(
+        store,
+        configured,
+        process_memory_budget,
+        MEMORY_ADMISSION_MAX_WAIT,
+    )
+}
+
+/// [`harness`] with `max_wait` as the memory admission wait's cap.
+fn harness_with_max_wait(
+    store: Arc<dyn ObjectStoreBackend>,
+    configured: HashSet<TenantHash>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    max_wait: Duration,
 ) -> Harness {
     let query_accounting = Arc::new(QueryAccountingMetrics::new(configured));
     let catalog =
@@ -167,6 +193,13 @@ fn harness(
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
 
+    let memory_admission = Arc::new(
+        MemoryAdmissionGate::new(
+            Arc::clone(&process_memory_budget),
+            DEFAULT_MEMORY_ADMISSION_FRACTION,
+        )
+        .with_max_wait(max_wait),
+    );
     let sql = sql_router(SqlState {
         executor: Arc::clone(&executor),
         tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
@@ -174,8 +207,11 @@ fn harness(
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
         query_accounting: Arc::clone(&query_accounting),
-        query_admission: ravel_query::QueryAdmissionController::shared(
-            ravel_query::QueryConcurrencyLimit::Unlimited,
+        query_admission: Arc::new(
+            ravel_query::QueryAdmissionController::new(
+                ravel_query::QueryConcurrencyLimit::Unlimited,
+            )
+            .with_memory_gate(Arc::clone(&memory_admission)),
         ),
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     });
@@ -230,6 +266,7 @@ fn harness(
         audit_pipeline: None,
         process_memory_budget,
         process_memory_budget_is_fallback: false,
+        memory_admission: Arc::clone(&memory_admission),
         cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
@@ -241,6 +278,7 @@ fn harness(
         sql,
         metrics,
         executor,
+        memory_admission,
     }
 }
 
@@ -453,6 +491,7 @@ fn promql_harness(
         audit_pipeline: None,
         process_memory_budget,
         process_memory_budget_is_fallback: false,
+        memory_admission: Arc::new(MemoryAdmissionGate::disabled()),
         cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
@@ -575,12 +614,16 @@ fn sql_body(query: &str) -> String {
 }
 
 async fn post_sql(app: &Router, query: &str) -> (StatusCode, serde_json::Value) {
+    post_sql_body(app, sql_body(query)).await
+}
+
+async fn post_sql_body(app: &Router, body: String) -> (StatusCode, serde_json::Value) {
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/sql")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::AUTHORIZATION, "Bearer acme-token")
-        .body(Body::from(sql_body(query)))
+        .body(Body::from(body))
         .expect("build request");
     let response = app.clone().oneshot(request).await.expect("oneshot");
     let status = response.status();
@@ -772,6 +815,13 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
         StatusCode::UNPROCESSABLE_ENTITY,
         "a sort over 4,000 rows must outgrow a 256 KiB process budget: {body}"
     );
+    // Growth past the budget is refused at the reservation, never parked:
+    // the admission wait only runs before a statement starts.
+    assert_eq!(
+        h.memory_admission.waits_total(),
+        0,
+        "a statement admitted under the threshold must not wait at admission"
+    );
 
     // The refused query's charge rolled back off the SHARED process counter.
     // This is what makes the cross-tenant cascade survivable: the counter is
@@ -792,6 +842,152 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
     );
 }
 
+/// Polls `cond` on a 5 ms tick, at most 2000 times; panics with `what` if it
+/// never holds.
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    for _ in 0..2000 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// #2044 acceptance: statements that arrive while the shared process budget
+/// sits above the admission threshold wait at `POST /api/v1/sql` admission
+/// instead of starting into a refusal, and every one of them answers 200
+/// once the budget frees. This is the test proving the SQL HTTP path reaches
+/// the wait (`ServerService::sql_execute_timed` through `QueryControls::admit`).
+///
+/// Prove-the-test: skip the `wait_for_headroom` call in
+/// `QueryAdmissionController::admit_within`. The four statements then start
+/// into the held budget and are refused at their sort reservation, and
+/// `waits_total` never reaches 4 ("timed out waiting for every statement to
+/// park at admission").
+#[tokio::test]
+async fn concurrent_sql_statements_wait_for_memory_headroom_and_all_succeed() {
+    const STATEMENTS: u64 = 4;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples: Vec<(i64, f64)> = (0..4_000)
+        .map(|i| (i as i64 * 1_000_000, i as f64))
+        .collect();
+    publish_segment(store.as_ref(), &tenant, &samples).await;
+    let limit = 8 * 1024 * 1024;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+    // A cap well past how long parking takes, so no wait expires before the
+    // budget frees.
+    let h = harness_with_max_wait(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::clone(&budget),
+        Duration::from_secs(25),
+    );
+    let threshold = h
+        .memory_admission
+        .threshold_bytes()
+        .expect("a bounded budget at the default fraction enables the wait");
+    assert_eq!(
+        threshold,
+        (limit as f64 * DEFAULT_MEMORY_ADMISSION_FRACTION) as u64
+    );
+
+    // Another holder sits above the threshold, leaving less headroom than
+    // one sort needs.
+    let held = budget
+        .reserve(limit - 16 * 1024)
+        .expect("the empty budget admits the holder");
+    assert!(budget.reserved() >= threshold);
+
+    let mut tasks = Vec::new();
+    for _ in 0..STATEMENTS {
+        let sql = h.sql.clone();
+        tasks.push(tokio::spawn(async move {
+            post_sql(&sql, "SELECT ts, value FROM samples ORDER BY ts").await
+        }));
+    }
+    let gate = Arc::clone(&h.memory_admission);
+    wait_until("every statement to park at admission", || {
+        gate.waits_total() == STATEMENTS
+    })
+    .await;
+    assert_eq!(gate.waits_expired_total(), 0);
+    drop(held);
+
+    for task in tasks {
+        let (status, body) = task.await.expect("statement task");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a statement that waited for headroom must succeed: {body}"
+        );
+    }
+    assert_eq!(h.memory_admission.waits_total(), STATEMENTS);
+    assert_eq!(h.memory_admission.waits_expired_total(), 0);
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "every statement released its reservations"
+    );
+}
+
+/// #2044: a statement whose wait reaches the cap with the budget still above
+/// the threshold is admitted anyway, and its own reservation decides, as it
+/// would with no wait: here the sort does not fit the 16 KiB left and answers
+/// 422. The wait never answers with a refusal of its own, and the expiry
+/// counter moves on `/metrics`.
+///
+/// Prove-the-test: drop `max_wait` from the bound in
+/// `MemoryAdmissionGate::wait_for_headroom`, so only half the deadline ends
+/// the wait. The statement then waits 15 s of its 30 s deadline and the 5 s
+/// timeout around the request fires.
+#[tokio::test]
+async fn a_sql_statement_whose_wait_expires_is_admitted_and_its_reservation_decides() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples: Vec<(i64, f64)> = (0..4_000)
+        .map(|i| (i as i64 * 1_000_000, i as f64))
+        .collect();
+    publish_segment(store.as_ref(), &tenant, &samples).await;
+    let limit = 8 * 1024 * 1024;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+    let h = harness_with_max_wait(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::clone(&budget),
+        Duration::from_millis(50),
+    );
+    let _held = budget
+        .reserve(limit - 16 * 1024)
+        .expect("the empty budget admits the holder");
+
+    // hygiene-allow: wall-clock -- a bound proving the 50 ms cap ends the wait, far below half the 30 s deadline; the assertions are on the response
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        post_sql(&h.sql, "SELECT ts, value FROM samples ORDER BY ts"),
+    )
+    .await
+    .expect("the 50 ms cap, not the deadline, ends the wait");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the admitted statement's sort is refused by its own reservation: {body}"
+    );
+    assert_eq!(h.memory_admission.waits_total(), 1);
+    assert_eq!(h.memory_admission.waits_expired_total(), 1);
+
+    let scrape = scrape_metrics(&h.metrics).await;
+    assert!(
+        scrape.contains("ravel_memory_admission_waits_total{mode=\"all\"} 1\n"),
+        "{scrape}"
+    );
+    assert!(
+        scrape.contains("ravel_memory_admission_waits_expired_total{mode=\"all\"} 1\n"),
+        "{scrape}"
+    );
+}
+
 /// ACCEPTANCE TEST: a PromQL fetch whose real execution outgrows the
 /// ADR-1170 process-wide memory budget is refused typed
 /// (`FetchError::FetchMemoryExhausted`), and, through the real HTTP router,
@@ -801,13 +997,11 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
 /// `.with_memory_budget(process_memory_budget)` wiring, not a hand-built
 /// `QueryEngine`.
 ///
-/// Notable divergence from the SQL path: PromQL redacts every fetch failure
-/// (including `FetchMemoryExhausted`) to `MSG_UNAVAILABLE` / HTTP 503
-/// (`crates/ravel-query/src/http/error.rs`), while the SQL path above answers
-/// 422 for the same underlying condition. Both are correct for their own
-/// error-mapping tables, but a caller cannot tell "process memory exhausted"
-/// apart from "the object store is down" on the PromQL surface the way it can
-/// on the SQL surface.
+/// Divergence from the SQL path: PromQL answers a `FetchMemoryExhausted`
+/// with HTTP 503 and `MSG_FETCH_MEMORY_EXHAUSTED`
+/// (`crates/ravel-query/src/http/error.rs`), while the SQL test above is
+/// refused 422 at the SQL memory pool. The message still tells a PromQL
+/// caller that memory, not the object store, refused the query.
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
 /// `build_app_state` (services/ravel-server/src/query.rs). The typed check
@@ -1258,6 +1452,7 @@ fn sql_budget_harness(
         audit_pipeline: None,
         process_memory_budget,
         process_memory_budget_is_fallback: false,
+        memory_admission: Arc::new(MemoryAdmissionGate::disabled()),
         cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
@@ -1614,6 +1809,10 @@ async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_
         "a refused fetch must answer 503 unavailable: {body}"
     );
     assert_eq!(body["errorType"], "unavailable", "body: {body}");
+    assert_eq!(
+        body["error"], FETCH_MEMORY_EXHAUSTED_MESSAGE,
+        "a fetch memory refusal names memory, not storage: {body}"
+    );
 
     assert_eq!(budget.reserved(), 0);
     let (status, body) = post_sql(&sql, "SELECT 1").await;
@@ -1698,6 +1897,10 @@ async fn a_sql_logs_fetch_over_the_process_budget_is_refused_and_the_process_kee
         "a refused fetch must answer 503 unavailable: {body}"
     );
     assert_eq!(body["errorType"], "unavailable", "body: {body}");
+    assert_eq!(
+        body["error"], FETCH_MEMORY_EXHAUSTED_MESSAGE,
+        "a fetch memory refusal names memory, not storage: {body}"
+    );
 
     assert_eq!(budget.reserved(), 0);
     let (status, body) = post_sql(&sql, "SELECT 1").await;
@@ -1781,6 +1984,10 @@ async fn a_sql_spans_fetch_over_the_process_budget_is_refused_and_the_process_ke
         "a refused fetch must answer 503 unavailable: {body}"
     );
     assert_eq!(body["errorType"], "unavailable", "body: {body}");
+    assert_eq!(
+        body["error"], FETCH_MEMORY_EXHAUSTED_MESSAGE,
+        "a fetch memory refusal names memory, not storage: {body}"
+    );
 
     assert_eq!(budget.reserved(), 0);
     let (status, body) = post_sql(&sql, "SELECT 1").await;

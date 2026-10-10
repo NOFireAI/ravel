@@ -1488,6 +1488,7 @@ fn ddl_metrics_router(
         catalog_cache_max_bytes: 0,
         audit_pipeline: None,
         process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        memory_admission: Arc::new(ravel_query::http::service::MemoryAdmissionGate::disabled()),
         process_memory_budget_is_fallback: false,
         cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,

@@ -40,6 +40,12 @@ pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
 /// outage apart from a permanent data fault without the leaked detail.
 pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
 
+/// Stable client message for a segment fetch the process memory budget
+/// refused (`FetchMemoryExhausted`). Same class as [`MSG_UNAVAILABLE`] (503,
+/// retryable), worded in the memory family so a caller can tell memory
+/// pressure from a storage fault. The SQL surface renders the same string.
+pub const MSG_FETCH_MEMORY_EXHAUSTED: &str = "query memory budget exhausted: the process could not reserve memory to fetch segment data; retry";
+
 /// Stable client message for a query whose evaluation failed on the server:
 /// it panicked on the read CPU gate. Non-retryable, like a corruption fault.
 pub const MSG_INTERNAL: &str = "query evaluation failed on the server";
@@ -220,12 +226,10 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
                 source: StoreError::Corrupted(_),
                 ..
             } => MSG_CORRUPT,
-            // A memory-budget refusal is transient backpressure carrying only
-            // byte counts, not a storage fault; redacted to the retryable
-            // transient message alongside the other non-corrupt Store causes.
-            FetchError::Store { .. }
-            | FetchError::EtagChanged { .. }
-            | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE,
+            FetchError::Store { .. } | FetchError::EtagChanged { .. } => MSG_UNAVAILABLE,
+            // A memory-budget refusal is transient backpressure, not a storage
+            // fault: same retryable class, memory-family wording.
+            FetchError::FetchMemoryExhausted { .. } => MSG_FETCH_MEMORY_EXHAUSTED,
         }),
         // An over-wide-window refusal carries only counts and is
         // safe to show; like the budget errors it is not a storage fault, so
@@ -520,6 +524,25 @@ mod tests {
 
         // corrupt and unavailable are distinct client-visible classes.
         assert_ne!(MSG_CORRUPT, MSG_UNAVAILABLE);
+    }
+
+    /// A fetch the process memory budget refused keeps the retryable 503
+    /// `unavailable` class but says it is memory, not storage.
+    ///
+    /// FLIP: fold `FetchMemoryExhausted` back into the `MSG_UNAVAILABLE` arm
+    /// of `redacted_storage_message` and the message assertion fails.
+    #[test]
+    fn fetch_memory_refusal_is_503_with_the_memory_message() {
+        let p = ApiError::from(QueryError::Fetch(FetchError::FetchMemoryExhausted {
+            requested: 2,
+            reserved: 1,
+            limit: 2,
+        }))
+        .into_parts();
+        assert_eq!(p.status.as_u16(), 503);
+        assert_eq!(p.error_type, "unavailable");
+        assert_eq!(p.message, MSG_FETCH_MEMORY_EXHAUSTED);
+        assert_ne!(MSG_FETCH_MEMORY_EXHAUSTED, MSG_UNAVAILABLE);
     }
 
     #[test]
