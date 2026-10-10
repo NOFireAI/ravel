@@ -55,6 +55,7 @@ fn one_shard_config(max_inflight_flushes: u32) -> IngestConfig {
         shard_count: 1,
         target_bytes: 1,
         max_inflight_flushes,
+        max_inflight_flushes_per_tenant: Some(max_inflight_flushes as usize),
         max_flush_delay: Duration::from_secs(3600),
         max_flush_delay_idle: Duration::from_secs(3600),
         flush_tick: Duration::from_secs(3600),

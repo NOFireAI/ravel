@@ -682,16 +682,23 @@ fn is_loopback_authority(rest: &str) -> bool {
 ///
 /// **Retry interaction / worst case.** `object_store` runs its own internal
 /// retry loop per logical operation (`RetryConfig`, unchanged here: default
-/// `max_retries = 10`, `retry_timeout = 180 s`, jittered exponential backoff),
-/// and a request timeout is a *retryable* error. The loop checks its budget
-/// *before* each retry, so no new attempt starts once 180 s have elapsed since
-/// the first, but the final in-flight attempt still runs its full
-/// `request_timeout`. The worst-case wall time for one logical operation is
-/// therefore about `retry_timeout + request_timeout` = 180 s + 20 s ≈ 200 s of
-/// internal retrying. In practice every caller passes a deadline and the trait
-/// honors cancellation by drop (docs/object-store-contract.md, "Rules for
-/// callers"), so the query deadline — typically well under 180 s — bounds one
-/// operation first. Lowering `request_timeout` shortens each attempt but does
+/// `max_retries = 10`, `retry_timeout = 180 s`, jittered exponential backoff).
+/// What it retries depends on the failure. A retryable status (5xx, including
+/// `503 SlowDown`, and 429) is retried for every method. The loop checks its
+/// budget *before* each retry, so no new attempt starts once 180 s have
+/// elapsed since the first, but the final in-flight attempt still runs its
+/// full `request_timeout`: one logical operation takes up to about
+/// `retry_timeout + request_timeout` = 180 s + 20 s ≈ 200 s. A request
+/// timeout, by contrast, is retried only for a request `object_store` treats
+/// as idempotent, and a create-if-absent PUT is not one, so a hung
+/// conditional PUT returns after one 20 s `request_timeout`. The two stall
+/// modes therefore differ by an order of magnitude for an ingest flush, whose
+/// own loop makes up to five attempts: a hang holds its flush permit about
+/// 101 s (five 20 s attempts plus backoff), while a throttled prefix's five
+/// attempts approach 1000 s, bounded first by the flush deadline. In practice
+/// every caller passes a deadline and the trait honors cancellation by drop
+/// (docs/object-store-contract.md, "Rules for callers"), so the query deadline
+/// — typically well under 180 s — bounds one operation first. Lowering `request_timeout` shortens each attempt but does
 /// not change this 180 s ceiling; only `RetryConfig` would, and tuning it is
 /// out of this change's scope.
 #[derive(Debug, Clone)]

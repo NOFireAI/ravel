@@ -88,7 +88,8 @@ pub struct IngestBenchArgs {
     pub ack_timeout_secs: u64,
     /// Upper bound on concurrently in-flight flush tasks per shard
     /// (ADR-0067 decision 2). Passed straight through to
-    /// `IngestConfig::max_inflight_flushes`. Default 1 reproduces today's
+    /// `IngestConfig::max_inflight_flushes`, with the per-tenant share set to
+    /// match (one bench tenant). Default 1 reproduces the
     /// one-flush-at-a-time behavior; the measurement panel sweeps {1,2,3,4}.
     #[arg(long, default_value_t = 1)]
     pub max_inflight_flushes: u32,
@@ -467,6 +468,9 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
     let ingest_config = IngestConfig {
         shard_count: config.shards,
         max_inflight_flushes: config.max_inflight_flushes,
+        // One bench tenant: the ADR-2708 D3 share would cap the panel's
+        // sweep at N-1 flushes.
+        max_inflight_flushes_per_tenant: usize::try_from(config.max_inflight_flushes).ok(),
         adaptive_flush_delay: config.flush_delay_policy.adaptive(),
         max_flush_lifetime: config.max_flush_lifetime,
         ..IngestConfig::default()

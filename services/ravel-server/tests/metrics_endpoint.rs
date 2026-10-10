@@ -62,6 +62,7 @@ async fn start_test_server_with_store_metrics(
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),
@@ -286,6 +287,41 @@ async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
             }
         }
 
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// ADR-2708 D3: a flush granted its permit past its pinned hour's bound is
+/// abandoned and counted, and that count is only an operator signal if it
+/// reaches a scrape. One declaration and one zero sample per ingest signal
+/// wherever an ingest router exists, none elsewhere.
+#[tokio::test]
+async fn metrics_render_abandoned_hour_bound_family_per_signal() {
+    let family = "ravel_ingest_abandoned_hour_bound_total";
+    for (mode, mode_label, expect_ingest) in [
+        (Mode::All, "all", true),
+        (Mode::Gateway, "gateway", true),
+        (Mode::Query, "query", false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let body = scrape(&running).await;
+        let expected = usize::from(expect_ingest);
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter")).count(),
+            expected,
+            "mode {mode:?} must declare {family} exactly {expected} time(s):\n{body}"
+        );
+        for signal in ["metrics", "logs", "spans"] {
+            assert_eq!(
+                body.matches(&format!(
+                    "{family}{{mode=\"{mode_label}\",signal=\"{signal}\"}} 0\n"
+                ))
+                .count(),
+                expected,
+                "mode {mode:?} must render {family} for signal {signal} at 0 exactly \
+                 {expected} time(s):\n{body}"
+            );
+        }
         running.shutdown().await.expect("graceful shutdown");
     }
 }
@@ -1094,6 +1130,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),
@@ -1324,6 +1361,7 @@ async fn start_attribution_server() -> ravel_server::Running {
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),
