@@ -1328,7 +1328,7 @@ fn ascending_topk_filter_id(sort: &SortExec) -> Option<u64> {
     if options.descending || options.nulls_first {
         return None;
     }
-    sort.dynamic_filter_expr()?.expression_id()
+    sort.dynamic_expressions_produced().first()?.expression_id()
 }
 
 /// Confirms or drops each [`LogsScanExec`]'s kept TopK filter (ADR-2677
