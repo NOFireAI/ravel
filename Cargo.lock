@@ -4619,6 +4619,7 @@ dependencies = [
 name = "ravel-bench"
 version = "0.23.0"
 dependencies = [
+ "anyhow",
  "arrow 59.1.0",
  "arrow-flight",
  "async-trait",
@@ -4642,6 +4643,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-codec",
  "ravel-commit",
+ "ravel-cpu-gate",
  "ravel-ingest",
  "ravel-logseg",
  "ravel-maintain",
@@ -4656,6 +4658,7 @@ dependencies = [
  "ravel-remote-write",
  "ravel-rspan",
  "ravel-segment",
+ "ravel-server",
  "ravel-sql",
  "ravel-types",
  "reqwest 0.13.4",

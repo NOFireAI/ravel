@@ -48,6 +48,9 @@ pub mod query_latency;
 pub mod read_accounting;
 pub mod report;
 pub mod report_schema;
+pub mod saturation;
+#[cfg(feature = "saturation")]
+pub mod saturation_run;
 pub mod section_accounting;
 pub mod segment_support;
 #[cfg(feature = "sql-latency")]
