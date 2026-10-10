@@ -6723,12 +6723,15 @@ fn build_declared_columnar_array(
     Ok(match plan.dc.ty {
         DeclaredType::Str => build_declared_str_columnar(view, resolver, start, end, cache)?,
         DeclaredType::I64 => {
-            let single_column = match (single, plan.matching_idx) {
-                (Some(DeclaredCursor::I64(_)), Some(k)) => plan.cols.get(k).map(|c| c.column_id),
-                _ => None,
-            };
-            if let Some(column_id) = single_column {
-                return declared_i64_from_buffers(view, resolver, column_id, start, end, cache);
+            if let Some(DeclaredCursor::I64(cursor)) = single {
+                return declared_i64_from_buffers(
+                    view,
+                    resolver,
+                    &cursor.values(),
+                    start,
+                    end,
+                    cache,
+                );
             }
             let mut b = Int64Builder::with_capacity(end - start);
             for i in start..end {
@@ -6780,13 +6783,13 @@ fn build_declared_columnar_array(
 fn declared_i64_from_buffers(
     view: &ColumnarBlockView<'_>,
     resolver: &mut DeclaredResolver<'_, '_, '_>,
-    column_id: u32,
+    values: &ravel_logseg::I64Values<'_>,
     start: usize,
     end: usize,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     use datafusion::arrow::array::{Array, Int64Array};
-    let array: Int64Array = int_column_array(&view.i64_values(column_id), start, end, true)?;
+    let array: Int64Array = int_column_array(values, start, end, true)?;
     if array.null_count() == 0 {
         return Ok(Arc::new(array));
     }

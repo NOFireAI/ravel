@@ -199,6 +199,17 @@ value_cursor!(
     i64,
     "An i64 column resolved once per block (a fixed i64 column or an I64 attribute)."
 );
+impl<'a> I64Cursor<'a> {
+    /// The same resolved column as its value buffer and validity, without
+    /// resolving it again.
+    pub fn values(&self) -> I64Values<'a> {
+        I64Values {
+            col: self.col,
+            rows: self.rows,
+        }
+    }
+}
+
 value_cursor!(
     F64BitsCursor,
     [Option<u64>],
