@@ -105,3 +105,22 @@ jobs:
           name: bench-s3-report
           path: bench/reports/report-s3.json
           retention-days: 90
+      # ADR-0070 decision 3 as amended: advisory. continue-on-error keeps a
+      # refused pair (exit 2) from failing the job too; the ::warning:: lines
+      # surface as annotations and the full table goes to the run summary.
+      - name: Compare against the committed real-S3 envelope
+        if: steps.creds.outputs.have_creds == 'true'
+        continue-on-error: true
+        run: |
+          code=0
+          python3 scripts/bench-s3-compare.py \
+            --envelope bench/baselines/s3-envelope.json \
+            --report bench/reports/report-s3.json > bench/reports/compare-s3.txt 2>&1 || code=$?
+          cat bench/reports/compare-s3.txt
+          {
+            echo "### Real-S3 envelope compare (advisory, exit $code)"
+            echo '```'
+            sed 's/^::warning::/WARNING: /' bench/reports/compare-s3.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"

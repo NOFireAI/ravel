@@ -1,0 +1,247 @@
+{
+  "_meta": {
+    "workflow": "bench-s3",
+    "runs": [
+      {
+        "run_id": 34083418162,
+        "scheduled": "2026-09-07"
+      },
+      {
+        "run_id": 34806424715,
+        "scheduled": "2026-09-14"
+      },
+      {
+        "run_id": 35561402089,
+        "scheduled": "2026-09-21"
+      },
+      {
+        "run_id": 36378332523,
+        "scheduled": "2026-09-28"
+      },
+      {
+        "run_id": 37264895774,
+        "scheduled": "2026-10-05"
+      }
+    ],
+    "runs_on": "ubuntu-latest",
+    "region": "eu-central-1",
+    "max_flush_delay_ms": 500,
+    "load_point": "bench_report --store s3 --shards 4 --target-series 1000 --points-per-sec 50000 --duration-secs 10",
+    "scope": "This is the envelope at one load point on a shared hosted runner and is comparable only to runs of the same lane.",
+    "bands": "scripts/bench-s3-compare.py: latency figures warn past the max +25%, GET, LIST and bytes past the max +10%, PUT, accepted points and matched series must equal the envelope exactly.",
+    "unexplained": [
+      "About 50,135 LIST requests for 128 PUTs on every run: not explained, tracked as issue #2686. Not expected behaviour.",
+      "GET stepping from about 47,000 to about 78,000 between the 2026-09-21 and 2026-09-28 runs: not explained, tracked as issue #2686. Not expected behaviour.",
+      "matched_series is 506 against --target-series 1000 on every run: not explained, tracked as issue #2686. Not expected behaviour."
+    ]
+  },
+  "environment": {
+    "store_backend": "s3",
+    "region": "eu-central-1",
+    "shard_count": 4,
+    "max_flush_delay_ms": 500,
+    "workload": {
+      "target_series": 1000,
+      "points_per_sec": 50000,
+      "duration_secs": 10,
+      "batch_size": 200,
+      "query": "bench_gauge",
+      "warm_query_count": 20
+    }
+  },
+  "runs": [
+    {
+      "run_id": 34083418162,
+      "scheduled": "2026-09-07",
+      "git_commit": "d3a155c466758ad6fdf99baab800d4212961a3f6",
+      "strict_ack_latency_ms": {
+        "p50": 738.806175,
+        "p95": 1156.088213,
+        "p99": 1555.190248
+      },
+      "cold_latency_ms_p50": 1490.7948,
+      "warm_latency_ms": {
+        "p50": 1241.206841,
+        "p95": 1336.319829,
+        "p99": 1353.33846
+      },
+      "accepted_points": 500000,
+      "matched_series": 506,
+      "s3_requests": {
+        "put": 128,
+        "get": 47547,
+        "list": 50135
+      },
+      "bytes": {
+        "written": 4293368,
+        "read": 100799882
+      }
+    },
+    {
+      "run_id": 34806424715,
+      "scheduled": "2026-09-14",
+      "git_commit": "999d08739fd102e85fc351b7e48a72973f20c370",
+      "strict_ack_latency_ms": {
+        "p50": 892.297383,
+        "p95": 1419.510756,
+        "p99": 1626.425508
+      },
+      "cold_latency_ms_p50": 2094.273181,
+      "warm_latency_ms": {
+        "p50": 1532.233392,
+        "p95": 1750.111892,
+        "p99": 1832.69491
+      },
+      "accepted_points": 500000,
+      "matched_series": 506,
+      "s3_requests": {
+        "put": 128,
+        "get": 50285,
+        "list": 50135
+      },
+      "bytes": {
+        "written": 4291407,
+        "read": 101591983
+      }
+    },
+    {
+      "run_id": 35561402089,
+      "scheduled": "2026-09-21",
+      "git_commit": "efef9e6e44b940532186b478ba20e082c59396fb",
+      "strict_ack_latency_ms": {
+        "p50": 734.582249,
+        "p95": 1081.377503,
+        "p99": 1481.272068
+      },
+      "cold_latency_ms_p50": 1552.239741,
+      "warm_latency_ms": {
+        "p50": 1220.927925,
+        "p95": 1248.17221,
+        "p99": 1249.975029
+      },
+      "accepted_points": 500000,
+      "matched_series": 506,
+      "s3_requests": {
+        "put": 128,
+        "get": 47205,
+        "list": 50135
+      },
+      "bytes": {
+        "written": 4291133,
+        "read": 100649581
+      }
+    },
+    {
+      "run_id": 36378332523,
+      "scheduled": "2026-09-28",
+      "git_commit": "d6f71889f4bc8a69e1d320eb2e082995741090a3",
+      "strict_ack_latency_ms": {
+        "p50": 736.021217,
+        "p95": 1076.591219,
+        "p99": 1479.120439
+      },
+      "cold_latency_ms_p50": 1622.936274,
+      "warm_latency_ms": {
+        "p50": 1233.641656,
+        "p95": 1346.500823,
+        "p99": 1379.890539
+      },
+      "accepted_points": 500000,
+      "matched_series": 506,
+      "s3_requests": {
+        "put": 128,
+        "get": 78279,
+        "list": 50160
+      },
+      "bytes": {
+        "written": 4291981,
+        "read": 110192584
+      }
+    },
+    {
+      "run_id": 37264895774,
+      "scheduled": "2026-10-05",
+      "git_commit": "ce93df8159ee4a30a99928fc0039eb6e1cb32478",
+      "strict_ack_latency_ms": {
+        "p50": 1025.544628,
+        "p95": 1504.73791,
+        "p99": 1903.390166
+      },
+      "cold_latency_ms_p50": 2277.56908,
+      "warm_latency_ms": {
+        "p50": 1696.049268,
+        "p95": 1874.535628,
+        "p99": 1896.269036
+      },
+      "accepted_points": 500000,
+      "matched_series": 506,
+      "s3_requests": {
+        "put": 128,
+        "get": 70494,
+        "list": 50150
+      },
+      "bytes": {
+        "written": 4292828,
+        "read": 110790649
+      }
+    }
+  ],
+  "envelope": {
+    "ingest.strict_ack_latency_ms.p50": {
+      "min": 734.582249,
+      "max": 1025.544628
+    },
+    "ingest.strict_ack_latency_ms.p95": {
+      "min": 1076.591219,
+      "max": 1504.73791
+    },
+    "ingest.strict_ack_latency_ms.p99": {
+      "min": 1479.120439,
+      "max": 1903.390166
+    },
+    "query.warm_latency_ms.p50": {
+      "min": 1220.927925,
+      "max": 1696.049268
+    },
+    "query.warm_latency_ms.p95": {
+      "min": 1248.17221,
+      "max": 1874.535628
+    },
+    "query.warm_latency_ms.p99": {
+      "min": 1249.975029,
+      "max": 1896.269036
+    },
+    "query.cold_latency_ms.p50": {
+      "min": 1490.7948,
+      "max": 2277.56908
+    },
+    "s3_requests.put": {
+      "min": 128,
+      "max": 128
+    },
+    "s3_requests.get": {
+      "min": 47205,
+      "max": 78279
+    },
+    "s3_requests.list": {
+      "min": 50135,
+      "max": 50160
+    },
+    "bytes.read": {
+      "min": 100649581,
+      "max": 110790649
+    },
+    "bytes.written": {
+      "min": 4291133,
+      "max": 4293368
+    },
+    "ingest.accepted_points": {
+      "min": 500000,
+      "max": 500000
+    },
+    "query.matched_series": {
+      "min": 506,
+      "max": 506
+    }
+  }
+}
