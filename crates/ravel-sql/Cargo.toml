@@ -339,6 +339,12 @@ path = "tests/flight_span.rs"
 name = "logs_scan_read_gate"
 path = "tests/logs_scan_read_gate.rs"
 
+# Parks a block decode at the same `decode` span with a global subscriber,
+# for the same reason as logs_scan_read_gate.
+[[test]]
+name = "logs_scan_block_charge"
+path = "tests/logs_scan_block_charge.rs"
+
 # Its opt-in stress test replaces the process-wide panic hook, which would
 # swallow the panic output of every other test running in the process.
 [[test]]
