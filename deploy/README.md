@@ -117,7 +117,7 @@ pull the AWS CLI image: they create their bucket with the aws CLI the
 GitHub runner image ships (`scripts/ci-create-bucket.sh`), and the CI quickstart
 applies `docker-compose/ci-host-bucket.yml`, a CI-only override that turns
 `createbucket` into a no-op on the locally built server image after the job
-creates `ravel-dev` from the host (issue #2036). The documented quickstart
+creates `ravel-dev` from the host. The documented quickstart
 still runs `createbucket` from ECR Public; since the CI quickstart always
 applies the override, the scheduled `quickstart-published` workflow is now
 the only lane that runs that block, and it does not gate a merge. The same
@@ -125,11 +125,9 @@ image is also pulled by `docker-compose/rustfs.yml`,
 `deploy/k8s`, `scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, the
 MetricsBench compose file, and the interop-nightly Flight SQL test.
 
-The object store used to be MinIO on quay.io. MinIO withdrew anonymous
-access to its public images on 2026-09-24, from Docker Hub and quay.io
-alike, so a mirror is no longer the fix: the images cannot be pulled without
-credentials at all. RustFS replaced it, and the `mc` client was replaced by
-the AWS CLI at the same time.
+MinIO is not an option: its public images cannot be pulled without
+credentials from Docker Hub or quay.io, so the object store is RustFS and its
+client is the AWS CLI.
 
 An image left on Docker Hub in this directory (for example `grafana/grafana`
 in `docker-compose/ravel.yml`) carries its own comment naming the other
@@ -138,7 +136,7 @@ registries checked and why none of them had a usable copy.
 ## Pinned image digests (docker-compose/ravel.yml and docker-compose/rustfs.yml)
 
 Every third-party image in the two quickstart compose files is pinned to a
-release tag plus an immutable `@sha256:` manifest digest (issue #1720), the
+release tag plus an immutable `@sha256:` manifest digest, the
 same convention `deploy/metricsbench/` uses. `docker-compose/rustfs.yml` is
 `docker-compose/ravel.yml`'s standalone object-store-and-bucket mirror (same
 credentials, same `ravel-dev` bucket), so it carries the identical RustFS

@@ -50,10 +50,7 @@ cargo check --workspace           # only when the change is genuinely cross-crat
 Run the full fmt/clippy/test gate list once, right before you commit, not
 after every edit.
 
-This is a local development-loop cadence only. It changes nothing about what
-CI enforces. CI still runs the full fmt, clippy, and test gates on every
-push. This guidance affects only how you spend time between edits on your
-machine.
+CI still runs the full fmt, clippy, and test gates on every push.
 
 ## What CI does to keep those gates fast
 

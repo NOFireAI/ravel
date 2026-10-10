@@ -160,9 +160,7 @@ Field by field:
     place of the whole `SERIES_META`.
   - `kind=10` `EXEMPLARS`: the exemplars that samples in this object
     carried. The section is present only when at least one sample carried
-    one. The example above shows no `kind=10` line, because its samples
-    carried none. An absent `EXEMPLARS` section is normal and is not an
-    error.
+    one. An absent `EXEMPLARS` section is normal and is not an error.
 
   `comp` is the raw wire integer (`0` none, `1` lz4, `2` zstd).
 - `schema_count (derived)` / `schema[N]:`: SERIES_META groups series by

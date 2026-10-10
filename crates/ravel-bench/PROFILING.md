@@ -2,12 +2,9 @@
 
 A release build omits frame pointers. Without them `perf --call-graph dwarf`
 and pprof's unwinder cannot unwind inlined generic code, and Ravel's own hot
-path lands in `[unknown]`. This has cost the project twice: PR #847 read
-"only 178 of 20,310 SipHash samples resolved to a ravel_* frame" as evidence
-the hash was cheap when it was the unwinder failing, and the same profile put
-33.95% of samples in `[unknown]`. Rebuilding with `-C force-frame-pointers=yes`
-took that to 0.00% and resolved the dominant frame (`hash_one::<&u32>` at
-16.34% self), which shipped as #876/#881.
+path lands in `[unknown]`, where it reads as cheap. One profile put 33.95% of
+its samples there; the same workload rebuilt with
+`-C force-frame-pointers=yes` put 0.00% there.
 
 ## Build a profiling binary
 
@@ -84,8 +81,8 @@ build. Both are refused rather than silently produced:
    `MAX_UNATTRIBUTED_SHARE` (2%) the run refuses the profile -- exits non-zero
    without writing the SVG -- with a message naming the measured share, the
    threshold, and the likely cause. A frame-pointer build of this workload
-   measured 0.00%, so 2% is generous headroom; 33.95% -- the number that caused
-   the damage -- cannot reach it.
+   measured 0.00%, so 2% is generous headroom; the 33.95% profile above fails
+   it by a wide margin.
 
 Neither threshold is a bare number: each is a documented constant in
 `src/profiling.rs`, pinned by a test so a change is deliberate.

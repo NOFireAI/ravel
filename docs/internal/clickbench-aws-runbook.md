@@ -452,10 +452,9 @@ Flags that change what is measured:
 | `--continue-on-error` | One failing statement does not abandon the pass. |
 
 **The exit code is not the pass/fail signal.** It is non-zero whenever any
-statement fails. No statement fails by design on this corpus any more: the
-per-query pool above (16,451,897,344 bytes, the server's derived 50% share on
-the reference box) holds q33's 10,855,811,936-byte peak, where the earlier
-8 GiB pin did not. Assert the measured and failed identities instead, as step
+statement fails. No statement fails by design on this corpus: the per-query
+pool above (16,451,897,344 bytes, the server's derived 50% share on the
+reference box) holds q33's 10,855,811,936-byte peak. Assert the measured and failed identities instead, as step
 9 does; a non-zero exit is a statement to name, not a known cost.
 
 These flags go to `sql_latency_bench`, which runs the engine in process and
@@ -931,15 +930,10 @@ Rules that make a pass trustworthy:
   assert it, or the pass attributes to code that is not there.
 - **Run one thing at a time.** A concurrent build makes wall clock
   unattributable. Check for running `cargo`, `rustc`, or bench processes first.
-- **The Class-S object-count half is a stated gap, not a passed check.** Issue
-  #913 phrases the Class-S target as "<=5% of corpus bytes AND object count".
-  The script asserts the byte half and prints an explicit `SKIP` for the object
-  half: the report records object-store GET requests, and GETs are not distinct
-  objects (q37..q43 issue about 9,694 requests against a 3,469-object corpus,
-  2.8x more requests than objects exist), so comparing GETs to a fraction of the
-  object count compares two different quantities. Closing the gap needs a
-  distinct-objects-touched counter in the read path; until that counter exists,
-  the object half stays skipped rather than asserted on the wrong quantity.
+- **The Class-S object-count half is a stated gap, not a passed check.** The
+  script asserts the byte half and prints an explicit `SKIP` for the object
+  half, because the report counts GET requests, not distinct objects touched;
+  the comment above that `SKIP` in the script gives the figures.
 
 ## 10. Profiling a statement
 
@@ -947,10 +941,7 @@ The `profiling` feature emits a flamegraph. Use `--runs 1` so one execution
 maps to one profile, and profile only a binary built with frame pointers --
 `$PINNED` from step 8 is one, because that build carries
 `RUSTFLAGS="-C force-frame-pointers=yes"`. Without them the unwinder cannot walk
-out of inlined generic code and Ravel's own hot path lands in `[unknown]`: one
-such profile put 33.95% of samples there and sent a merge after the wrong call
-site, and the same workload rebuilt with the flag measured 0.00% and named the
-real hot frame (issue #884).
+out of inlined generic code and Ravel's own hot path lands in `[unknown]`.
 
 ```sh
 LD_PRELOAD="$TCMALLOC" RAVEL_BENCH_PROFILE_SVG=/root/profile/q35.svg \

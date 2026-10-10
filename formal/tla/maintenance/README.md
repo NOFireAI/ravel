@@ -7,8 +7,7 @@ Two specifications over the shared object-store contract
   (ADR-0065 decisions 1 to 3, ADR-0048 ownership and coverage).
 - **CompactionClaims** models a **proposed design** (ADR-1029) layered on a
   landed CreateIfAbsent/CasVersion claim primitive that nothing in the
-  repository calls yet; its first sentence, its module header, and every claim
-  in this file describe a proposal, not shipped behaviour.
+  repository calls yet.
 
 TLC checked these finite models under the bounds and assumptions recorded in
 `results.md`. This model verifies the protocol design; implementation
@@ -135,11 +134,7 @@ content-addressed key was tombstoned, so a `CreateIfAbsent` re-PUT is refused).
 - record present, winning part absent but re-PUTtable: the loser re-PUTs the
   identical part and converges (`Converged`, `winnerPartPresent` observed true).
 - record present, winning part absent and tombstoned (not re-PUTtable):
-  `ConvergedWinnerPartMissing`. The earlier `MergeAttemptsConverge` held only
-  because no part ever vanished; with `VanishPart`/`TombstonePart` present the
-  invariant now states the real contract, that a vanished, non-re-PUTtable
-  winning part yields `ConvergedWinnerPartMissing` and never a bare `Converged`.
-  This mirrors
+  `ConvergedWinnerPartMissing`, never a bare `Converged`. This mirrors
   `crates/ravel-maintain/tests/tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged`.
 - record present with a divergent input-set hash: `InputSetHashDivergence`, store
   unchanged.
@@ -172,8 +167,7 @@ live worker, every live worker defers to an owner no process embodies, and the
 unit is never attempted by discovery. This is the ADR-0065 asymmetric-view
 limitation: membership is process-level liveness, zero ownership under
 asymmetric views is possible and undetected, and correctness never depends on
-it (the ungated CLI path still publishes correctly). No invariant was weakened
-to make a run pass; the limitation is recorded, not hidden.
+it (the ungated CLI path still publishes correctly).
 
 ### Modeled state versus Ravel
 

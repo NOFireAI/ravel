@@ -32,8 +32,7 @@ COPY . .
 # ravel-server with every opt-in surface the workspace ships: `sql` (POST
 # /api/v1/sql), `flight-sql` (Flight SQL on the gRPC listener), and `otap`
 # (OpenTelemetry Arrow metrics ingest, registered only when the process is
-# started with `--otap`). ADR-0034 decision 5 kept `flight-sql` off while the
-# service was unimplemented; it serves ad-hoc statements now. The README
+# started with `--otap`). The README
 # support matrix names this feature set, and the CI lanes that assemble images
 # from host-built binaries (ci.yml k8s-integration and quickstart-verify,
 # k8s-nightly.yml) build the same one. ravel-cli has no feature flags and is

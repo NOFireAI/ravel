@@ -537,10 +537,7 @@ matches, not zero:
 Both matches are the literal string appearing inside an explicit denial, not
 a claim. There is no sentence anywhere in the suite that asserts Ravel, or
 any part of it, is formally verified; the two hits above are the suite
-disclaiming that exact claim by name. This report states the raw grep count
-precisely (two) rather than rounding it to the zero the drafting instruction
-expected, because the instruction's premise — that the string would not
-appear at all — does not match what the phrase-level denials actually do.
+disclaiming that exact claim by name.
 
 This suite establishes that seven finite models, across the six areas, of
 Ravel's coordination protocols hold their stated safety invariants under the

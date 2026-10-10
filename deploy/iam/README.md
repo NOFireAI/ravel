@@ -34,16 +34,13 @@ deletes a Parquet location grants record, and a deleted one reads as a tenant
 with no grants, so every query over that tenant's Parquet tables is refused
 until each location is granted again.
 
-Catalog snapshot and index objects (`t/*/catalog/*/snap/*`,
-`t/*/catalog/*/idx/*`) used to be caught by the same `t/*/catalog/*/*`
-pattern that also covers `HEAD`, which put them behind this deny too. That
-was a bug (issue #1847): the unreferenced-catalog sweep runs under the
-Maintain role and deletes exactly those superseded snapshot and index
-objects, so the shipped templates refused every sweep delete outright
-rather than merely delaying it, and catalog garbage was never reclaimed.
-The deny above is narrowed to the `HEAD` pointer alone -- the object the
-sweep never deletes -- and `MaintainDelete` below now grants delete on
-`snap/` and `idx/` to match what the sweep already does.
+Maintain's deny names the catalog `HEAD` pointer alone, the object the sweep
+never deletes, rather than the whole `t/*/catalog/*/*` family: the
+unreferenced-catalog sweep runs under the Maintain role and deletes superseded
+snapshot and index objects (`t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`), so
+a deny over the family would refuse every sweep delete and catalog garbage
+would never be reclaimed. `MaintainDelete` below grants delete on `snap/` and
+`idx/`.
 
 This is a separate list from the Object Lock compliance-mode prefixes in
 `docs/object-store-contract.md`'s "Required bucket configuration" section,
@@ -150,8 +147,7 @@ past the post-completion protection horizon, and no longer held by a legal
 hold or a still-resolvable superseded input. The lifecycle makes six
 object-store calls on the `del/` prefix, across two roles, and each needs its
 own grant. The set is derived from every call site that touches the prefix,
-not from the sweep alone: scoping it to one function is how an earlier draft
-shipped a delete grant whose own listing was refused.
+not from the sweep alone.
 
 | Call | S3 operation | Grant |
 |---|---|---|
@@ -202,8 +198,7 @@ not the list is refused at the `ListBucket`, and one carrying list, read and
 delete but not the `.done` write leaves every request looking still-pending, so
 the sweep deletes none of them.
 
-One known gap remains open and is NOT closed by the grants above. It is
-tracked separately and is not created by this change.
+One known gap remains open and is NOT closed by the grants above.
 
 - `query.json` grants no list or read under `del/`, while the resolver LISTs
   `t/<tenant_hash>/<signal>/del/` per resolve to attach pending predicates
@@ -243,22 +238,20 @@ lease, not the object).
 `docs/guides/operations/troubleshooting.md` step 2 has an operator list
 `quarantine/t/<tenant_hash>/` recursively, GET each object, and copy it back
 to the live key stripped of the `quarantine/` prefix and the `/q<ns>` suffix.
-It is a documented human procedure rather than a `ravel-cli` command -- the
-runbook says so outright ("There is no `ravel-cli` command for this yet") --
-which is exactly why deriving grants from code call sites alone missed it. A
-runbook is a call site.
+It is a documented human procedure rather than a `ravel-cli` command, so
+deriving grants from code call sites alone misses it: a runbook is a call
+site too.
 
-That grant is deliberately NOT added here. It belongs in `admin.json`, it
+That grant is deliberately NOT added here. It belongs in `admin.json`, and it
 widens an operator role's reach over a keyspace holding data that was
-quarantined rather than deleted, and it deserves its own review rather than
-riding along with the Maintain fix. Until it lands, an operator following
+quarantined rather than deleted, so it needs its own review. Until it lands, an operator following
 that runbook must use credentials outside these templates. Tracked in
 issue #1978.
 
 IAM is default-deny, so no grant here is useful on its own. Without the write
-the copy is refused and the sweep quarantines nothing, which is where a
-template predating this change stops; the original is deleted only after the
-copy succeeds, so nothing is lost, but nothing is reclaimed either. Without the
+the copy is refused and the sweep quarantines nothing; the original is
+deleted only after the copy succeeds, so nothing is lost, but nothing is
+reclaimed either. Without the
 list the reaper is refused at its first `ListBucket` and never sees a copy,
 which makes the delete unreachable. Without the delete the reaper lists copies
 it can never remove, and the quarantine grows for the life of the deployment.
@@ -269,10 +262,9 @@ template's **Allow** patterns, with witness keys built from the same key
 constructors the calls use rather than from hand-written strings. It also pins
 the top-level premise (no pattern outside `quarantine/` reaches a quarantined
 copy, and no other role's template reaches one at all) and the tightness of the
-three new patterns.
+three quarantine patterns.
 
-It does not subtract the Deny statements, and that distinction is not
-academic. Row 3 asserts the live-orphan delete over every witness
+It does not subtract the Deny statements. Row 3 asserts the live-orphan delete over every witness
 `l0_data_keys()` produces, including the legal-hold audit key
 `t/<hash>/u/l0/0000/<writer>...rseg`, which `DenyDeleteProtected`'s
 `t/*/u/*/0000/*` matches: an Allow reaches that key and the effective policy
@@ -364,9 +356,9 @@ buckets, and publishes per signal:
 | `postings_object_key`: PUT `t/<tenant_hash>/catalog/<signal>/idx/<hour>.<hash16>.npost` (`CreateIfAbsent`; a refusal is logged and the HEAD is published without postings) | `maintain`, `all` | `s3:PutObject` | `MaintainWrite` `t/*/catalog/*/idx/*` |
 | `head_object_key`: PUT `t/<tenant_hash>/catalog/<signal>/HEAD` (`CasVersion`, or `CreateIfAbsent` when no HEAD exists) | `maintain`, `all` | `s3:PutObject` | `MaintainWrite` `t/*/catalog/*/HEAD` |
 
-Until issue #2382 `MaintainWrite` named none of the three catalog patterns,
-so on a per-role deployment every scheduled fold with something to publish
-was refused at its first catalog write and the catalog stopped advancing.
+Without the three catalog patterns in `MaintainWrite`, every scheduled fold
+with something to publish on a per-role deployment is refused at its first
+catalog write and the catalog stops advancing.
 `t/*/catalog/*/HEAD` stays in `maintain.json`'s `DenyDeleteProtected`; that
 statement denies deletes only, so it does not cancel the HEAD write.
 `maintain_template_covers_the_scheduled_fold_catalog_writes` in
@@ -435,8 +427,7 @@ grant names the one key or prefix the calls use:
 The maintain `get` and `put` on the three `sys/maintain/` prefixes are the one
 `sys/maintain/*` grant in `MaintainRead` and `MaintainWrite`. The other rows
 were derived from the data path or are covered in the sections above, except
-the call groups below, which the templates missed until issues #1995, #2340
-and #2350:
+the call groups below:
 
 | Call | Mode | S3 operation | Grant |
 |---|---|---|---|
@@ -857,7 +848,7 @@ keys that role reads this way:
 
 They are two statements because IAM requires every operator in one `Condition`
 block to match, so `StringEquals` and `StringLike` together in one statement
-would admit nothing. The existing list statements are unchanged.
+would admit nothing.
 
 | Key | Gateway | Query | Maintain | Read by, and what absence means |
 |---|---|---|---|---|
@@ -917,9 +908,8 @@ re-resolve and retry once, and only on `NotFound`:
 |---|---|---|---|
 | The PromQL engine's segment fetch (`crates/ravel-query/src/engine.rs`) and the SQL executor's (`crates/ravel-sql/src/executor.rs`, `SqlError::is_segment_not_found`) GET each pinned L0 and L1 segment, and re-resolve once when a GET reports `NotFound` | `query`, `all` | `s3:GetObject`; the 404 needs `s3:ListBucket` | `QueryRead` `t/*/*/l0/*` and `t/*/*/l1/*`; `QueryList` `s3:prefix` `t/*/*/l0/*` and `t/*/*/l1/*` |
 
-Until issue #2462 `QueryList` named neither prefix, so on AWS S3 a query
-whose read raced such a delete was refused with `AccessDenied` and failed
-instead of retrying. The list grant lets Query list the data prefixes,
+Without that list grant, on AWS S3 a query whose read raced such a delete is
+refused with `AccessDenied` and fails instead of retrying. The list grant lets Query list the data prefixes,
 including objects no commit record names (an L0 object from an ingest that
 died before its commit, an L1 part from a crashed compaction, a legal-hold
 audit object). Query could already enumerate those through the bare `t/`
