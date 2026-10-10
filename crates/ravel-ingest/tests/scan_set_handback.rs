@@ -65,8 +65,8 @@ const TICK_NS: i64 = 10_000_000;
 /// Event time of row `i` is `ROW_TS_NS + i`, so a decoded row names its key.
 const ROW_TS_NS: i64 = 1_000;
 
-/// Four shards, one permit and one queue slot so one parked flush defers the
-/// next flush on its shard, and both age clocks at 50 ms so every buffer is
+/// Four shards, one permit and one queue slot so one parked flush defers its
+/// tenant's next flush on its shard (the tenant's flush share is one), and both age clocks at 50 ms so every buffer is
 /// due on the tick after it is written.
 fn config() -> IngestConfig {
     IngestConfig {
@@ -708,34 +708,36 @@ impl<P: Pipe> World<P> {
         }
     }
 
-    /// Parks one flush of the `parked` tenant on `shard` behind a held data
-    /// PUT, then buffers `keys` for the `deferred` tenant on the same shard
-    /// and lets its age trigger be refused at the queued-flush cap. The
-    /// parked flush is abandoned at its lifetime once the clock jumps, which
-    /// frees the slot. Returns the bytes the deferred rows are charged.
+    /// Parks one flush of the `deferred` tenant on `shard` behind a held data
+    /// PUT, then buffers `keys` for that tenant on the same shard and lets
+    /// their age trigger be refused at the tenant's flush share (one, with one
+    /// permit; ADR-2708 D3). The parked flush is abandoned at its lifetime
+    /// once the clock jumps, which frees the share. Returns the bytes the
+    /// deferred rows are charged.
     async fn defer(&self, shard: u32, keys: &[usize]) -> u64 {
-        // Scoped to the parked tenant's data objects: the first gate matching
-        // a call governs it, so a later gate on other tenants' PUTs still
-        // sees theirs.
+        // Scoped to the tenant's data objects on `shard`: the first gate
+        // matching a call governs it, so a later gate on other shards' PUTs
+        // still sees them, and `Nth(1)` lets this shard's later PUTs through.
         let parked_data = format!(
-            "t/{}/{}/l0/",
-            self.parked.hash().to_hex(),
+            "t/{}/{}/l0/{shard:04}/",
+            self.deferred.hash().to_hex(),
             P::SIGNAL.key_prefix()
         );
         let gate = self
             .fault
             .hold(Op::Put, Some(parked_data), Occurrence::Nth(1));
-        let parked_key = rows_on_count::<P>(&self.parked, self.initial, shard, 0, 1)[0];
+        // Far past any case's keys, so the parked row is never one of them.
+        let parked_key = rows_on_count::<P>(&self.deferred, self.initial, shard, 50, 1)[0];
         let parked = self
             .router
-            .send_row(&self.parked, parked_key, WriteMode::Buffered);
+            .send_row(&self.deferred, parked_key, WriteMode::Buffered);
         assert_eq!(parked.await.expect("parked write task"), "ok");
         assert!(
             drive(&self.clock, || self.router.counters().in_flight == 1).await,
             "the parked flush opens"
         );
         // Never released: the parked flush is abandoned at its lifetime when
-        // a case jumps the clock, which frees the queue slot.
+        // a case jumps the clock, which frees the share.
         gate.wait_until_held(1).await;
 
         let charged_before = self.budget.in_flight_bytes();
@@ -749,7 +751,7 @@ impl<P: Pipe> World<P> {
             drive(&self.clock, || self.router.counters().deferred
                 > deferred_before)
             .await,
-            "the deferred tenant's trigger is refused at the queued-flush cap"
+            "the deferred tenant's trigger is refused at its flush share"
         );
         deferred_bytes
     }

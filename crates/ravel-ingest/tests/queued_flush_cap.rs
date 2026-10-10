@@ -7,8 +7,9 @@
 //! `IngestByteBudgetLimit::Unlimited` neither does anything else, so a shard
 //! whose PUTs are stalled spawns one more flush window per age tick forever.
 //!
-//! Each test here parks the store's data PUT with a `FaultStore` gate, gives
-//! the shard exactly one flush permit, and drives `CAP + DEFERRED` age ticks
+//! Each test here parks the store's data PUTs with a `FaultStore` gate, gives
+//! the shard and the tenant's flush share one permit more than `CAP` (so the
+//! share, ADR-2708 D3, never binds first), and drives `CAP + DEFERRED` age ticks
 //! on the injected clock. The shard must stop at `CAP` spawned flushes
 //! exactly, refuse the remaining `DEFERRED` triggers, and leave those rows in
 //! the tenant buffer with their arrival bookkeeping intact. Releasing the gate
@@ -32,7 +33,7 @@ use ravel_ingest::{
     SpanIngestRouter, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
-use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -52,7 +53,9 @@ const CAP: usize = 3;
 /// the buffer, since each deferred write contributes exactly one row.
 const DEFERRED: usize = 2;
 
-/// One flush permit, a huge `target_bytes` so only the age trigger can ever
+/// `CAP + 1` flush permits and a per-tenant share of the same, so a tenant
+/// with `CAP` flushes in flight is still under its share and the queued-flush
+/// cap is what refuses its next trigger. A huge `target_bytes` so only the age trigger can ever
 /// fire, and `max_flush_delay` far below the per-tick advance below. Retry
 /// delays are irrelevant here (no PUT ever fails) but kept short so a future
 /// fault in this fixture fails fast rather than idling.
@@ -62,7 +65,8 @@ fn capped_config() -> IngestConfig {
         target_bytes: 8 * 1024 * 1024,
         max_flush_delay: Duration::from_millis(50),
         flush_tick: Duration::from_millis(10),
-        max_inflight_flushes: 1,
+        max_inflight_flushes: (CAP + 1) as u32,
+        max_inflight_flushes_per_tenant: Some(CAP + 1),
         max_queued_flushes: CAP,
         ..IngestConfig::default()
     }
@@ -78,6 +82,20 @@ const TICK_ADVANCE_NS: i64 = 100_000_000;
 /// sheds, so the queued-flush cap is the only bound left.
 fn unlimited() -> Arc<IngestByteBudget> {
     IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)
+}
+
+/// Releases every call `gate` holds from now on. The tests gate with
+/// `Occurrence::Always`, which would otherwise re-hold the deferred flush's
+/// PUT after the capped prefix drains.
+fn release_all_from_now(gate: GateHandle) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            gate.wait_until_held(1).await;
+            for id in gate.held() {
+                gate.release(id);
+            }
+        }
+    })
 }
 
 /// Yields until `probe` is true. Every caller's `probe` reads a metric the
@@ -98,7 +116,7 @@ async fn until(mut probe: impl FnMut() -> bool) {
 
 /// Acceptance test for issue #1740 on the metrics shard actor.
 ///
-/// Unlimited byte budget, one flush permit, the data PUT parked, and
+/// Unlimited byte budget, `CAP + 1` flush permits, the data PUTs parked, and
 /// `CAP + DEFERRED` age ticks driven on the injected clock. Without the cap the
 /// shard spawns a flush on every one of those ticks and the in-flight gauge
 /// reaches `CAP + DEFERRED`; with it, the gauge stops at `CAP` exactly and the
@@ -123,13 +141,9 @@ async fn unlimited_budget_with_stalled_put_stops_spawning_at_the_cap() {
 
     let acme = tenant("acme");
 
-    // Held at the first data-object PUT only. That first flush parks here
-    // holding the single permit; every later flush parks on the semaphore
-    // instead and never reaches a PUT at all. That parked set is the queue
-    // ADR-1642 left unbounded. `Nth(1)` rather than `Always` so releasing this
-    // one call lets the whole capped prefix drain: with one permit the flushes
-    // serialize, and an always-armed gate would re-hold each in turn.
-    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+    // Every data-object PUT is held, so each capped flush parks at its PUT
+    // holding a permit. That parked set is the queue ADR-1642 left unbounded.
+    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
 
     // Drive CAP age ticks, each with its own strict write, so each tick finds a
     // non-empty buffer and spawns one flush.
@@ -143,9 +157,8 @@ async fn unlimited_budget_with_stalled_put_stops_spawning_at_the_cap() {
     }
     assert_eq!(
         gate.held_count(),
-        1,
-        "exactly one flush holds the single permit and reaches the PUT; the \
-         rest are parked on the semaphore"
+        CAP,
+        "every capped flush holds its own permit and parks at the PUT"
     );
 
     // Now drive DEFERRED more ticks against a shard that is already at its cap.
@@ -212,9 +225,7 @@ async fn unlimited_budget_with_stalled_put_stops_spawning_at_the_cap() {
     // Release the stalled prefix. Each completion frees the permit for the next
     // parked flush and is reaped by the actor's join arm, which brings the
     // queued count back below the cap.
-    for id in gate.held() {
-        assert!(gate.release(id));
-    }
+    let _releaser = release_all_from_now(gate.clone());
     for (i, write) in capped_writes.into_iter().enumerate() {
         let receipt = write
             .await
@@ -501,7 +512,7 @@ async fn a_backstop_crossing_flush_spawns_even_at_the_queue_cap() {
     );
 
     let acme = tenant("acme");
-    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
 
     // Fill the queue to the cap exactly as the acceptance test above does: one
     // small write per age tick, each spawning a flush that parks.
@@ -597,9 +608,7 @@ async fn a_backstop_crossing_flush_spawns_even_at_the_queue_cap() {
     assert_eq!(snapshot.acks_err, 0);
 
     // Release the parked prefix so every flush, the exempt one last, completes.
-    for id in gate.held() {
-        assert!(gate.release(id));
-    }
+    let _releaser = release_all_from_now(gate.clone());
     for (i, write) in capped_writes.into_iter().enumerate() {
         write
             .await
@@ -754,7 +763,7 @@ async fn log_shard_stops_spawning_at_the_cap() {
     );
 
     let acme = tenant("acme");
-    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
 
     let buffered = |r: &LogIngestRouter| r.metrics().snapshot().buffered_records_total;
     let in_flight = |r: &LogIngestRouter| -> u64 {
@@ -812,9 +821,7 @@ async fn log_shard_stops_spawning_at_the_cap() {
         );
     }
 
-    for id in gate.held() {
-        assert!(gate.release(id));
-    }
+    let _releaser = release_all_from_now(gate.clone());
     for (i, write) in capped_writes.into_iter().enumerate() {
         let receipt = write
             .await
@@ -924,7 +931,7 @@ async fn span_shard_stops_spawning_at_the_cap() {
     );
 
     let acme = tenant("acme");
-    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
 
     let buffered = |r: &SpanIngestRouter| r.metrics().snapshot().buffered_spans_total;
     let in_flight = |r: &SpanIngestRouter| -> u64 {
@@ -982,9 +989,7 @@ async fn span_shard_stops_spawning_at_the_cap() {
         );
     }
 
-    for id in gate.held() {
-        assert!(gate.release(id));
-    }
+    let _releaser = release_all_from_now(gate.clone());
     for (i, write) in capped_writes.into_iter().enumerate() {
         let receipt = write
             .await

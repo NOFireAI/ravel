@@ -23,15 +23,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{StallingStore, TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
+use ravel_ingest::{
+    Clock, IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, SpanIngestRouter,
+    SpanWriteError, WriteError, WriteMode,
+};
 use ravel_logseg::stream_attrs_bytes;
+use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_rspan::StatusCode;
-use ravel_types::Signal;
 use ravel_types::logstream::{AttrValue, log_stream_id};
+use ravel_types::{Signal, TenantId};
 
 fn in_flight(router: &IngestRouter, shard: u32) -> u64 {
     router
@@ -355,6 +359,129 @@ async fn buffered_flush_queued_behind_a_stall_reaches_the_store_past_lifetime() 
         !b_objects.is_empty(),
         "B's acked buffered rows must reach the store, not be dropped when its \
          queued flush outran a lifetime it spent waiting for the permit: {b_objects:?}"
+    );
+}
+
+/// The sibling of the test above, past the other bound (issue #1921, ADR-2708
+/// D3). A flush granted its permit gets `min(grant + max_flush_lifetime,
+/// end(hour) + max_flush_lifetime)`, measured from the hour it was pinned to at
+/// flush-open. Maintain seals that hour once its bound passes, so a flush
+/// whose queue wait crosses it must not publish into the sealed hour: it is
+/// abandoned before any PUT and counted under its own reason, and the hour is
+/// not re-pinned to a later one.
+///
+/// Same rig: A's data PUT stalls on the one permit, B's buffered flush queues
+/// behind it. `start_ns` sits 800 s into its hour, so B's pinned hour ends 2800
+/// s after it and the bound is 6400 s after it. The clock jumps past that bound
+/// while B is queued, so the permit B is granted comes too late.
+#[tokio::test]
+async fn buffered_flush_queued_past_its_hours_bound_is_abandoned_and_counted() {
+    let start_ns: i64 = 1_700_000_000_000_000_000;
+    const NS: i64 = 1_000_000_000;
+    let hour_ns = 3600 * NS;
+    let hour_end_ns = (start_ns / hour_ns + 1) * hour_ns;
+    assert_eq!(hour_end_ns - start_ns, 2800 * NS);
+    let clock = TestClock::new(start_ns);
+
+    let tenant_a = tenant("throttled-prefix-tenant");
+    let tenant_b = tenant("healthy-tenant");
+    let a_hash_hex = tenant_a.hash().to_hex();
+    let b_hash_hex = tenant_b.hash().to_hex();
+
+    let stalling = Arc::new(StallingStore::new(MemoryStore::new(), a_hash_hex, 1));
+    let store: Arc<dyn ObjectStoreBackend> = stalling.clone();
+
+    let max_flush_delay_idle = Duration::from_secs(40);
+    let max_flush_lifetime = Duration::from_secs(3600);
+    let config = IngestConfig {
+        shard_count: 1,
+        target_bytes: 4096,
+        max_flush_delay: Duration::from_secs(2),
+        max_flush_delay_idle,
+        max_flush_lifetime,
+        flush_tick: Duration::from_millis(50),
+        max_inflight_flushes: 1,
+        ..IngestConfig::default()
+    };
+    let router = Arc::new(IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    ));
+
+    let a_points: Vec<_> = (0..400u32)
+        .map(|i| {
+            make_point(
+                &tenant_a,
+                "m",
+                &[("series", &i.to_string())],
+                start_ns,
+                i as f64,
+            )
+        })
+        .collect();
+    let router_a = Arc::clone(&router);
+    let tenant_a_moved = tenant_a.clone();
+    let _a = tokio::spawn(async move {
+        let _ = router_a
+            .write(
+                tenant_a_moved,
+                a_points,
+                WriteMode::Strict,
+                Duration::from_secs(60),
+            )
+            .await;
+    });
+    stalling.wait_until_stalled().await;
+    assert_eq!(in_flight(&router, 0), 1, "A's flush holds the one permit");
+
+    router
+        .write(
+            tenant_b.clone(),
+            vec![make_point(&tenant_b, "m", &[("h", "1")], start_ns, 1.0)],
+            WriteMode::Buffered,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a buffered write acks at enqueue");
+    assert_eq!(poll_until(|| processed(&router, 0), 2).await, 2);
+
+    // B's flush opens and pins the hour `start_ns` is in.
+    clock.advance_ns(max_flush_delay_idle.as_nanos() as i64 + 1);
+    assert_eq!(
+        poll_until(|| in_flight(&router, 0), 2).await,
+        2,
+        "B's age trigger must spawn its flush task while A holds the permit"
+    );
+
+    // Past end(hour) + max_flush_lifetime while B is still queued. A's own
+    // deadline is long past too, so its stalled PUT is abandoned and the
+    // permit goes to B, granted past B's hour bound.
+    let hour_bound_ns = hour_end_ns + max_flush_lifetime.as_nanos() as i64;
+    clock.advance_ns(hour_bound_ns + NS - clock.now_ns());
+    assert!(clock.now_ns() > hour_bound_ns);
+
+    stalling.release();
+    router.flush_all().await;
+
+    assert_eq!(
+        stalling.stall_hits(),
+        1,
+        "exactly one PUT stalled, and it was on tenant A's prefix"
+    );
+    assert_eq!(
+        router.metrics().snapshot().abandoned_hour_bound,
+        1,
+        "B's flush is abandoned under the hour-bound reason, once"
+    );
+    let b_objects = list_all(store.as_ref(), &format!("t/{b_hash_hex}/"))
+        .await
+        .expect("list B's objects");
+    assert!(
+        b_objects.is_empty(),
+        "a flush granted past its pinned hour's bound must not PUT anything, \
+         into that hour or a re-pinned later one: {b_objects:?}"
     );
 }
 
@@ -722,4 +849,428 @@ async fn stalled_span_flush_does_not_stop_a_coresident_tenants_age_trigger() {
 
     stalling.release();
     router.flush_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant flush shares (issue #1921, ADR-2708 D3)
+// ---------------------------------------------------------------------------
+//
+// The tests above pin that a stalled flush does not park the actor. These pin
+// that it does not take every flush permit either: with the default four
+// permits a tenant owns a share of three, so one tenant whose PUTs are all held
+// leaves a permit for its neighbours on the same shard.
+
+/// The default permit count, and the share it resolves to (`N - 1`).
+const DEFAULT_PERMITS: u32 = 4;
+const SHARE: usize = 3;
+
+/// Past `max_flush_delay` (50 ms) on every tick.
+const SHARE_TICK_NS: i64 = 100_000_000;
+
+const SHARE_BASE_NS: i64 = 1_700_000_000_000_000_000;
+
+/// Bound on every cooperative wait below, so a defect the tests exist to
+/// catch fails an assertion instead of hanging.
+const YIELD_LIMIT: usize = 10_000;
+
+async fn settles(mut probe: impl FnMut() -> bool) -> bool {
+    for _ in 0..YIELD_LIMIT {
+        if probe() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    probe()
+}
+
+/// One shard, the default permit count and share, and only the age trigger.
+fn share_config(max_queued_flushes: usize) -> IngestConfig {
+    let config = IngestConfig {
+        shard_count: 1,
+        target_bytes: 8 * 1024 * 1024,
+        max_flush_delay: Duration::from_millis(50),
+        flush_tick: Duration::from_millis(10),
+        max_queued_flushes,
+        ..IngestConfig::default()
+    };
+    assert_eq!(config.max_inflight_flushes, DEFAULT_PERMITS);
+    assert_eq!(config.max_inflight_flushes_per_tenant, None);
+    config
+}
+
+/// Holds every PUT under `tenant`'s prefix until released.
+fn hold_tenant(store: &FaultStore<MemoryStore>, tenant: &TenantId) -> GateHandle {
+    store.hold(
+        Op::Put,
+        Some(format!("t/{}/", tenant.hash().to_hex())),
+        Occurrence::Always,
+    )
+}
+
+fn held_for(gate: &GateHandle, tenant: &TenantId) -> usize {
+    let hex = tenant.hash().to_hex();
+    gate.held_details()
+        .into_iter()
+        .filter(|(_, _, key)| key.contains(&hex))
+        .count()
+}
+
+/// Ticks the injected clock, which is what drives the actor's age trigger,
+/// until every handle has finished, so a deferred trigger re-fires.
+async fn drain<T>(clock: &TestClock, writes: &[tokio::task::JoinHandle<T>]) {
+    for _ in 0..400 {
+        if writes.iter().all(|w| w.is_finished()) {
+            return;
+        }
+        clock.advance_ns(SHARE_TICK_NS);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+    panic!("writes did not finish after their PUTs were released");
+}
+
+/// Releases every call `gate` holds from now on, so the tests can drain.
+fn release_all_from_now(gate: GateHandle) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            gate.wait_until_held(1).await;
+            for id in gate.held() {
+                gate.release(id);
+            }
+        }
+    })
+}
+
+fn spawn_metric_write(
+    router: &Arc<IngestRouter>,
+    tenant: &TenantId,
+    i: usize,
+) -> tokio::task::JoinHandle<Result<ravel_ingest::WriteReceipt, WriteError>> {
+    let router = Arc::clone(router);
+    let tenant = tenant.clone();
+    tokio::spawn(async move {
+        let host = format!("h{i}");
+        let point = make_point(
+            &tenant,
+            "cpu_usage",
+            &[("host", &host)],
+            1_000 + i as i64,
+            1.0,
+        );
+        router
+            .write(
+                tenant,
+                vec![point],
+                WriteMode::Strict,
+                Duration::from_secs(60),
+            )
+            .await
+    })
+}
+
+fn spawn_log_write(
+    router: &Arc<LogIngestRouter>,
+    tenant: &TenantId,
+    i: usize,
+) -> tokio::task::JoinHandle<Result<ravel_ingest::LogWriteReceipt, LogWriteError>> {
+    let router = Arc::clone(router);
+    let tenant = tenant.clone();
+    tokio::spawn(async move {
+        router
+            .write(
+                tenant,
+                vec![norm_record(&format!("h{i}"), 1_000 + i as i64)],
+                WriteMode::Strict,
+                Duration::from_secs(60),
+            )
+            .await
+    })
+}
+
+fn spawn_span_write(
+    router: &Arc<SpanIngestRouter>,
+    tenant: &TenantId,
+    i: usize,
+) -> tokio::task::JoinHandle<Result<ravel_ingest::SpanWriteReceipt, SpanWriteError>> {
+    let router = Arc::clone(router);
+    let tenant = tenant.clone();
+    tokio::spawn(async move {
+        router
+            .write(
+                tenant,
+                vec![norm_span(i as u32 + 1, 1_000 + i as i64)],
+                WriteMode::Strict,
+                Duration::from_secs(60),
+            )
+            .await
+    })
+}
+
+fn new_metrics_router(
+    config: IngestConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    clock: Arc<TestClock>,
+) -> IngestRouter {
+    IngestRouter::new(config, store, Signal::Metrics, clock)
+}
+
+fn new_log_router(
+    config: IngestConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    clock: Arc<TestClock>,
+) -> LogIngestRouter {
+    LogIngestRouter::new(config, store, clock)
+}
+
+fn new_span_router(
+    config: IngestConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    clock: Arc<TestClock>,
+) -> SpanIngestRouter {
+    SpanIngestRouter::new(config, store, clock)
+}
+
+/// The three share tests, once per pipeline. `$new` builds the router,
+/// `$spawn` issues one strict single-item write, `$buffered` is the snapshot's
+/// cumulative buffered-item counter.
+macro_rules! flush_share_tests {
+    ($coresident:ident, $at_share:ident, $nothing_in_flight:ident, $new:ident, $spawn:ident, $buffered:ident) => {
+        /// Tenant A's PUTs are all held; A fills its share of three flushes
+        /// and its fourth trigger is deferred. Tenant B's strict write on the
+        /// same shard takes the fourth permit and acks within its write
+        /// deadline.
+        #[tokio::test]
+        async fn $coresident() {
+            let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+            let clock = TestClock::new(SHARE_BASE_NS);
+            let router = Arc::new($new(share_config(8), store, clock.clone()));
+            let (a, b) = (tenant("held-tenant"), tenant("strict-tenant"));
+            let gate = hold_tenant(&fault, &a);
+            let a_writes = fill_share!(router, clock, gate, a, $spawn, $buffered);
+
+            let b_write = $spawn(&router, &b, 100);
+            let want = (SHARE + 2) as u64;
+            assert!(settles(|| router.metrics().snapshot().$buffered >= want).await);
+            clock.advance_ns(SHARE_TICK_NS);
+            assert!(
+                settles(|| b_write.is_finished()).await,
+                "B's strict write must ack while A's flushes hold every PUT \
+                 they reached; A in flight {}",
+                in_flight_of!(router)
+            );
+            let receipt = b_write
+                .await
+                .expect("B's write task")
+                .expect("B's strict write acks within its deadline");
+            assert_eq!(receipt.tokens.len(), 1);
+            assert_eq!(
+                held_for(&gate, &a),
+                SHARE,
+                "the hold fired on A's data PUTs, one per flush in A's share"
+            );
+            assert!(a_writes.iter().all(|w| !w.is_finished()));
+
+            let _releaser = release_all_from_now(gate.clone());
+            drain(&clock, &a_writes).await;
+            for w in a_writes {
+                w.await
+                    .expect("A's write task")
+                    .expect("A acks once released");
+            }
+            router.flush_all().await;
+        }
+
+        /// The permit A leaves free is B's to take: with B's PUTs held too,
+        /// B's flush reaches its PUT beside A's three, and A's own next
+        /// trigger stays deferred. Counting the share per shard instead of
+        /// per (shard, tenant) refuses B's trigger as well.
+        #[tokio::test]
+        async fn $at_share() {
+            let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+            let clock = TestClock::new(SHARE_BASE_NS);
+            let router = Arc::new($new(share_config(8), store, clock.clone()));
+            let (a, b) = (tenant("held-tenant"), tenant("second-tenant"));
+            let gate = hold_tenant(&fault, &a);
+            let _b_gate = hold_tenant(&fault, &b);
+            let a_writes = fill_share!(router, clock, gate, a, $spawn, $buffered);
+            let deferred_before = deferred_of!(router);
+
+            let b_write = $spawn(&router, &b, 100);
+            let want = (SHARE + 2) as u64;
+            assert!(settles(|| router.metrics().snapshot().$buffered >= want).await);
+            clock.advance_ns(SHARE_TICK_NS);
+            assert!(
+                settles(|| held_for(&gate, &b) == 1).await,
+                "B's flush must take the permit A's share leaves free and reach \
+                 its PUT; in flight {}",
+                in_flight_of!(router)
+            );
+            assert_eq!(in_flight_of!(router), (SHARE + 1) as u64);
+            assert_eq!(held_for(&gate, &a), SHARE);
+            assert!(
+                deferred_of!(router) > deferred_before,
+                "A's deferred trigger is refused again on the tick B's opens"
+            );
+
+            let _releaser = release_all_from_now(gate.clone());
+            drain(&clock, &a_writes).await;
+            drain(&clock, std::slice::from_ref(&b_write)).await;
+            b_write
+                .await
+                .expect("B's write task")
+                .expect("B acks once released");
+            for w in a_writes {
+                w.await
+                    .expect("A's write task")
+                    .expect("A acks once released");
+            }
+            router.flush_all().await;
+        }
+
+        /// A queued-flush cap of three is full with A's three held flushes.
+        /// B has nothing in flight, so its trigger is not refused at the cap:
+        /// it spawns, past the cap, and acks.
+        #[tokio::test]
+        async fn $nothing_in_flight() {
+            let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+            let clock = TestClock::new(SHARE_BASE_NS);
+            let router = Arc::new($new(share_config(SHARE), store, clock.clone()));
+            let (a, b) = (tenant("held-tenant"), tenant("idle-tenant"));
+            let gate = hold_tenant(&fault, &a);
+            let a_writes = fill_share!(router, clock, gate, a, $spawn, $buffered);
+            assert_eq!(queued_of!(router), SHARE as u64, "the queue is at its cap");
+
+            let b_write = $spawn(&router, &b, 100);
+            let want = (SHARE + 2) as u64;
+            assert!(settles(|| router.metrics().snapshot().$buffered >= want).await);
+            clock.advance_ns(SHARE_TICK_NS);
+            assert!(
+                settles(|| b_write.is_finished()).await,
+                "B, with nothing in flight, must not be refused at the queued-flush \
+                 cap; in flight {}",
+                in_flight_of!(router)
+            );
+            let receipt = b_write
+                .await
+                .expect("B's write task")
+                .expect("B's strict write acks past the cap");
+            assert_eq!(receipt.tokens.len(), 1);
+            assert_eq!(held_for(&gate, &a), SHARE);
+
+            let _releaser = release_all_from_now(gate.clone());
+            drain(&clock, &a_writes).await;
+            for w in a_writes {
+                w.await
+                    .expect("A's write task")
+                    .expect("A acks once released");
+            }
+            router.flush_all().await;
+        }
+    };
+}
+
+macro_rules! in_flight_of {
+    ($router:expr) => {
+        $router
+            .metrics()
+            .in_flight_flushes_by_shard()
+            .into_iter()
+            .map(|(_, n)| n)
+            .sum::<u64>()
+    };
+}
+
+macro_rules! queued_of {
+    ($router:expr) => {
+        $router
+            .metrics()
+            .shard_skew_by_shard()
+            .into_iter()
+            .map(|(_, s)| s.flushes_queued)
+            .sum::<u64>()
+    };
+}
+
+macro_rules! deferred_of {
+    ($router:expr) => {
+        $router
+            .metrics()
+            .shard_skew_by_shard()
+            .into_iter()
+            .map(|(_, s)| s.flush_trigger_deferred)
+            .sum::<u64>()
+    };
+}
+
+/// Drives tenant `$a` to its share: `SHARE` strict writes, one age tick each,
+/// every flush held at its PUT, then one more write whose trigger must be
+/// deferred rather than spawned. Returns the `SHARE + 1` write handles.
+macro_rules! fill_share {
+    ($router:ident, $clock:ident, $gate:ident, $a:ident, $spawn:ident, $buffered:ident) => {{
+        let mut writes = Vec::new();
+        for i in 0..SHARE {
+            writes.push($spawn(&$router, &$a, i));
+            let want = (i + 1) as u64;
+            assert!(settles(|| $router.metrics().snapshot().$buffered >= want).await);
+            $clock.advance_ns(SHARE_TICK_NS);
+            assert!(
+                settles(|| in_flight_of!($router) == want).await,
+                "A's flush {i} spawns under its share; in flight {}",
+                in_flight_of!($router)
+            );
+        }
+        assert!(settles(|| held_for(&$gate, &$a) == SHARE).await);
+        writes.push($spawn(&$router, &$a, SHARE));
+        let want = (SHARE + 1) as u64;
+        assert!(settles(|| $router.metrics().snapshot().$buffered >= want).await);
+        $clock.advance_ns(SHARE_TICK_NS);
+        assert!(
+            settles(|| deferred_of!($router) >= 1 || in_flight_of!($router) > SHARE as u64).await
+        );
+        assert_eq!(
+            in_flight_of!($router),
+            SHARE as u64,
+            "A's trigger at its share of {SHARE} is deferred, not spawned"
+        );
+        writes
+    }};
+}
+
+flush_share_tests!(
+    coresident_strict_write_acks_within_its_deadline_while_a_tenants_puts_are_held,
+    a_tenant_at_its_share_leaves_a_permit_free,
+    a_tenant_with_nothing_in_flight_is_not_refused_at_the_queue_cap,
+    new_metrics_router,
+    spawn_metric_write,
+    buffered_points_total
+);
+
+mod logs {
+    use super::*;
+
+    flush_share_tests!(
+        coresident_strict_write_acks_within_its_deadline_while_a_tenants_puts_are_held,
+        a_tenant_at_its_share_leaves_a_permit_free,
+        a_tenant_with_nothing_in_flight_is_not_refused_at_the_queue_cap,
+        new_log_router,
+        spawn_log_write,
+        buffered_records_total
+    );
+}
+
+mod spans {
+    use super::*;
+
+    flush_share_tests!(
+        coresident_strict_write_acks_within_its_deadline_while_a_tenants_puts_are_held,
+        a_tenant_at_its_share_leaves_a_permit_free,
+        a_tenant_with_nothing_in_flight_is_not_refused_at_the_queue_cap,
+        new_span_router,
+        spawn_span_write,
+        buffered_spans_total
+    );
 }

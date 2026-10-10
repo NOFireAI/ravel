@@ -66,6 +66,11 @@ pub struct SpanIngestMetrics {
     /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
     /// queue is not read as the store failing to accept a PUT.
     abandoned_queue_deadline: AtomicU64,
+    /// Flushes abandoned without a PUT because they were granted a
+    /// `max_inflight_flushes` permit at or past their pinned ingest hour's end
+    /// plus `max_flush_lifetime` ([`crate::SpanWriteError::Abandoned`],
+    /// ADR-2708 D3), where publishing could land spans in a sealed hour.
+    abandoned_hour_bound: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RSPAN build, data-key derivation, or commit-record
     /// build failed ([`crate::SpanWriteError::SegmentBuild`]). A client
@@ -234,6 +239,9 @@ pub struct SpanIngestMetricsSnapshot {
     /// before any store call (issue #1739). Distinct from
     /// `abandoned_retry_exhausted` (a store failure).
     pub abandoned_queue_deadline: u64,
+    /// Flushes abandoned without a PUT because their permit was granted past
+    /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
+    pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_spans_total: u64,
@@ -458,6 +466,13 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A flush abandoned without a PUT because its permit was granted past its
+    /// pinned hour's end plus `max_flush_lifetime`
+    /// ([`crate::SpanWriteError::Abandoned`], ADR-2708 D3): retryable.
+    pub(crate) fn record_abandoned_hour_bound(&self) {
+        self.abandoned_hour_bound.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A flush abandoned because the input could not be built into a durable
     /// object ([`crate::SpanWriteError::SegmentBuild`]): a client signal, not
     /// retryable.
@@ -652,6 +667,7 @@ impl SpanIngestMetrics {
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
+            abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_spans_total: self.buffered_spans_total.load(Ordering::Relaxed),
@@ -767,6 +783,13 @@ mod tests {
             SpanIngestMetrics::record_abandoned_queue_deadline,
             SpanIngestMetricsSnapshot {
                 abandoned_queue_deadline: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_abandoned_hour_bound,
+            SpanIngestMetricsSnapshot {
+                abandoned_hour_bound: 1,
                 ..Default::default()
             },
         );

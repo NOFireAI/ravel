@@ -51,11 +51,12 @@ use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket,
-    duration_nanos_saturating, idle_age_threshold, memory_backstop_crossed, size_trigger_fires,
-    store_clock_lag,
+    duration_nanos_saturating, grant_deadline_ns, idle_age_threshold, memory_backstop_crossed,
+    object_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
+use crate::flush_share::TenantFlushShares;
 use crate::generation::{
     FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck, mismatch_retry_spent,
     reread_and_check, send_hand_back,
@@ -779,6 +780,24 @@ impl FlushCtx {
         drop(charges);
     }
 
+    /// Abandons a flush granted its permit at or past its pinned ingest hour's
+    /// end plus `max_flush_lifetime`, before any store call (ADR-2708 D3). Its
+    /// waiters are acked with a retryable `Abandoned` error and its byte
+    /// charges are dropped.
+    fn abandon_hour_bound(&self, pinned: PinnedFlush) {
+        let PinnedFlush {
+            waiters, charges, ..
+        } = pinned;
+        self.metrics.record_abandoned_hour_bound();
+        self.ack_waiters(
+            waiters,
+            Err(WriteError::Abandoned(
+                "flush permit granted past its ingest hour's flush bound".into(),
+            )),
+        );
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the
     /// injected `Clock`, returning `None` if the deadline is already past or
     /// elapses while `fut` is still in flight. This is what stops a store
@@ -1081,8 +1100,11 @@ pub(crate) struct ShardActor {
     /// Immutable bundle handed by `Arc::clone` to every spawned flush task
     /// (ADR-0067 decision 1).
     ctx: Arc<FlushCtx>,
-    /// Bounds concurrently in-flight flush tasks (ADR-0067 decision 2).
+    /// Bounds concurrently in-flight flush tasks (ADR-0067 decision 2). The
+    /// shard's one FIFO flush semaphore.
     semaphore: Arc<Semaphore>,
+    /// Each tenant's flush share on this shard (ADR-2708 D3).
+    shares: TenantFlushShares,
     /// Tracks spawned flush tasks so `join_all_flushes` can await durability
     /// before `FlushNow`/`Shutdown`/the channel-close drain return, and so
     /// the actor loop can opportunistically reap finished ones (the `select!`
@@ -1180,6 +1202,7 @@ impl ShardActor {
             rtt,
             ctx,
             semaphore: Arc::new(Semaphore::new(config.max_inflight_flushes as usize)),
+            shares: TenantFlushShares::new(config.flush_share_per_tenant()),
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
@@ -1288,6 +1311,7 @@ impl ShardActor {
                 }
                 Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
                     handle_flush_join_result(self.shard, result);
+                    self.shares.prune();
                     self.record_queued_flushes();
                 }
             }
@@ -1897,6 +1921,7 @@ impl ShardActor {
             handle_flush_join_result(self.shard, result);
             self.record_queued_flushes();
         }
+        self.shares.prune();
     }
 
     /// The flush-open stamp for this flush: `raw_ns` (the single flush-open
@@ -2034,11 +2059,32 @@ impl ShardActor {
     /// a refusal is always counted on `flush_trigger_deferred`, so a queue
     /// reading above the cap with no deferral behind it is the exemption at
     /// work.
-    fn queued_flush_cap_reached(&self, trigger: FlushTrigger, buf: &TenantBuf) -> bool {
+    ///
+    /// ADR-2708 D3 adds the per-tenant share on top. A buffer that has crossed
+    /// the object backstop ([`object_backstop_crossed`]) is exempt like a
+    /// memory-backstop crossing. Otherwise a tenant already holding its
+    /// [`IngestConfig::flush_share_per_tenant`] of spawned flushes is refused
+    /// whatever the queue length, and a tenant with none spawned is never
+    /// refused by the queue cap, so a neighbour's stalled windows cannot fill
+    /// the queue against it. Both refusals take the same deferral path.
+    fn queued_flush_cap_reached(
+        &self,
+        trigger: FlushTrigger,
+        tenant_hash: TenantHash,
+        buf: &TenantBuf,
+    ) -> bool {
         if matches!(trigger, FlushTrigger::Manual) {
             return false;
         }
-        if memory_backstop_crossed(buf.est_bytes, &self.config, self.backstop_ceiling.get()) {
+        if memory_backstop_crossed(buf.est_bytes, &self.config, self.backstop_ceiling.get())
+            || object_backstop_crossed(buf.flush_est_bytes, &self.config)
+        {
+            return false;
+        }
+        if self.shares.at_share(tenant_hash) {
+            return true;
+        }
+        if self.shares.in_flight(tenant_hash) == 0 {
             return false;
         }
         self.flushes.len() >= self.config.queued_flush_cap()
@@ -2138,7 +2184,8 @@ impl ShardActor {
             return;
         }
         let raw_ns = self.clock.now_ns();
-        let refused = self.queued_flush_cap_reached(trigger, &buf);
+        let tenant_hash = tenant.hash();
+        let refused = self.queued_flush_cap_reached(trigger, tenant_hash, &buf);
         if refused {
             buf.deferred_since_ns.get_or_insert(raw_ns);
         }
@@ -2256,7 +2303,6 @@ impl ShardActor {
                 return;
             }
         };
-        let tenant_hash = tenant.hash();
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
@@ -2509,6 +2555,7 @@ impl ShardActor {
         // still waiting for a permit counts as in flight, because it is holding
         // a flush window of memory.
         let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
+        let slot = self.shares.enter(tenant_hash);
         let semaphore = Arc::clone(&self.semaphore);
         let ctx = Arc::clone(&self.ctx);
         // Per-shard skew (issue #865): time the whole flush, which runs here off
@@ -2522,6 +2569,7 @@ impl ShardActor {
         let shard = self.shard;
         self.flushes.spawn(async move {
             let _guard = guard;
+            let slot = slot;
             let mut pinned = pinned;
             // Issue #1739 part 2: a flush whose flush-open deadline already
             // elapsed while it sat in the spawn queue must not take a permit
@@ -2543,9 +2591,11 @@ impl ShardActor {
             // parks; the actor does not. The wait is this shard's
             // `flush_permit_wait_ns` (issue #865), measured on the injected clock
             // and no longer subtracted from any on-actor figure because it is no
-            // longer on-actor time.
+            // longer on-actor time. The tenant's share permit is taken first
+            // (ADR-2708 D3), so a backstop flush over the share waits on its own
+            // tenant rather than on the shard's last permit.
             let permit_wait_start_ns = clock.now_ns();
-            let permit = match semaphore.acquire_owned().await {
+            let permit = match slot.acquire(&semaphore).await {
                 Ok(permit) => permit,
                 Err(_) => {
                     panic!("ravel-ingest: flush semaphore closed unexpectedly on shard {shard}")
@@ -2562,9 +2612,22 @@ impl ShardActor {
             // rows with no PUT. The re-derived value only ever moves the deadline
             // later (grant is at or after open), so it never shortens a flush's
             // store budget.
-            pinned.deadline_ns = clock
-                .now_ns()
-                .saturating_add(duration_nanos_saturating(ctx.config.max_flush_lifetime));
+            //
+            // ADR-2708 D3 clamps it to the pinned hour's end plus
+            // `max_flush_lifetime`, the bound maintain seals behind, and abandons
+            // a flush granted past that bound without a PUT. The hour is not
+            // re-pinned: the rows keep the bucket their flush opened in.
+            pinned.deadline_ns = match grant_deadline_ns(
+                clock.now_ns(),
+                pinned.ingest_hour_bucket,
+                ctx.config.max_flush_lifetime,
+            ) {
+                Some(deadline_ns) => deadline_ns,
+                None => {
+                    ctx.abandon_hour_bound(pinned);
+                    return;
+                }
+            };
             let started_ns = clock.now_ns();
             ctx.run_flush(pinned).await;
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
@@ -2925,7 +2988,7 @@ mod tests {
     use std::pin::Pin;
 
     use ravel_commit::record;
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, list_all};
     use ravel_otlp::normalize::NormalizedPoint;
@@ -3041,6 +3104,39 @@ mod tests {
             put_retry_max_delay: Duration::from_millis(5),
             ..IngestConfig::default()
         }
+    }
+
+    /// Room for `tenants + 1` parked flushes and one more, a flush share of
+    /// two so a tenant with one flush parked is under its share, and a
+    /// queued-flush cap the parked flushes fill exactly: the cap, not the
+    /// share, then decides which deferred buffer a freed slot goes to.
+    fn queue_order(tenants: usize) -> IngestConfig {
+        IngestConfig {
+            max_inflight_flushes: (tenants + 2) as u32,
+            max_inflight_flushes_per_tenant: Some(2),
+            max_queued_flushes: tenants + 1,
+            ..one_permit_one_queue(Duration::from_secs(3600))
+        }
+    }
+
+    /// Holds `tenant`'s first PUT, which is its first flush's data object.
+    fn hold_first_put(store: &FaultStore<MemoryStore>, tenant: &TenantId) -> GateHandle {
+        store.hold(
+            Op::Put,
+            Some(format!("t/{}/", tenant.hash().to_hex())),
+            Occurrence::Nth(1),
+        )
+    }
+
+    /// Releases `tenant`'s held PUT, leaving every other held call parked.
+    fn release_tenant(gate: &GateHandle, tenant: &TenantId) {
+        let hex = tenant.hash().to_hex();
+        let (id, _, _) = gate
+            .held_details()
+            .into_iter()
+            .find(|(_, _, key)| key.contains(&hex))
+            .expect("the tenant's PUT is held");
+        assert!(gate.release(id));
     }
 
     fn point(tenant: &TenantId, host: &str) -> NormalizedPoint {
@@ -3556,7 +3652,9 @@ mod tests {
         };
         let buffered = || router.metrics().snapshot().buffered_points_total;
 
-        let parked = write("parked");
+        // acme parks its own first flush, so its next trigger is deferred at
+        // its flush share (ADR-2708 D3).
+        let parked = write("acme");
         until(|| buffered() >= 1).await;
         clock.advance_ns(TICK_ADVANCE_NS);
         until(|| in_flight(&router) == 1).await;
@@ -3632,9 +3730,18 @@ mod tests {
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         let clock = TestClock::new(BASE_NS);
+        // Every write fires the size trigger, well under min_flush_bytes and
+        // under the object backstop's four targets, which would exempt it.
+        let probe = point(&TenantId::new("idle"), "h");
+        let one_point_object_bytes = crate::value::SCALAR_SAMPLE_OBJECT_BYTES
+            + crate::value::SERIES_OBJECT_OVERHEAD_BYTES
+            + probe
+                .labels
+                .iter()
+                .map(|l| l.name.len() + l.value.len())
+                .sum::<usize>();
         let config = IngestConfig {
-            // Every write fires the size trigger, well under min_flush_bytes.
-            target_bytes: 1,
+            target_bytes: one_point_object_bytes / 2,
             ..one_permit_one_queue(Duration::from_secs(3600))
         };
         assert!(config.max_flush_delay_idle >= Duration::from_secs(40));
@@ -3646,7 +3753,9 @@ mod tests {
         let parked = {
             let router = Arc::clone(&router);
             tokio::spawn(async move {
-                let tenant = TenantId::new("parked");
+                // The same tenant as the buffered write below, so the share
+                // (ADR-2708 D3) refuses that write's trigger.
+                let tenant = TenantId::new("idle");
                 let points = vec![point(&tenant, "h")];
                 router
                     .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
@@ -3687,25 +3796,24 @@ mod tests {
     /// arrival order disagree. Tenant `early` buffers a row first, in buffered
     /// mode, so it waits for the 40 s idle clock; tenant `late` arrives after
     /// it with a strict waiter, so its trigger fires and is refused first. Once
-    /// the queue drains, the single slot must go to `late`, the older
+    /// `parked` drains, the single slot must go to `late`, the older
     /// deferral, which sorting by oldest row would give to `early`.
     #[tokio::test]
     async fn deferred_flushes_retry_by_deferral_age_not_row_age() {
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         let clock = TestClock::new(BASE_NS);
-        let config = one_permit_one_queue(Duration::from_secs(3600));
+        let config = queue_order(2);
         let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
         let router = Arc::new(
             IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
                 .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
-        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
-        let write = |tenant: &'static str, mode: WriteMode| {
+        let write = |tenant: &'static str, host: &'static str, mode: WriteMode| {
             let router = Arc::clone(&router);
             let tenant = TenantId::new(tenant);
             tokio::spawn(async move {
-                let points = vec![point(&tenant, "h")];
+                let points = vec![point(&tenant, host)];
                 router
                     .write(tenant, points, mode, Duration::from_secs(60))
                     .await
@@ -3713,22 +3821,34 @@ mod tests {
         };
         let buffered = || router.metrics().snapshot().buffered_points_total;
 
-        let parked = write("parked", WriteMode::Strict);
-        until(|| buffered() >= 1).await;
+        // `parked`, `early` and `late` each park one flush, filling the
+        // queued-flush cap with `early` and `late` under their share.
+        let parked_tenant = TenantId::new("parked");
+        let gate = hold_first_put(&fault_store, &parked_tenant);
+        let _gates = [
+            hold_first_put(&fault_store, &TenantId::new("early")),
+            hold_first_put(&fault_store, &TenantId::new("late")),
+        ];
+        let parked = write("parked", "h", WriteMode::Strict);
+        let firsts = [
+            write("early", "first", WriteMode::Strict),
+            write("late", "first", WriteMode::Strict),
+        ];
+        until(|| buffered() >= 3).await;
         clock.advance_ns(TICK_ADVANCE_NS);
-        until(|| in_flight(&router) == 1).await;
-        gate.wait_until_held(1).await;
+        until(|| in_flight(&router) == 3).await;
+        gate.wait_until_held(3).await;
 
         // `early`'s row arrives first; `late`'s one millisecond after it,
         // short of the next tick.
-        write("early", WriteMode::Buffered)
+        write("early", "h", WriteMode::Buffered)
             .await
             .expect("early write task")
             .expect("buffered write acks at enqueue");
-        until(|| buffered() >= 2).await;
+        until(|| buffered() >= 4).await;
         clock.advance_ns(1_000_000);
-        let late = write("late", WriteMode::Strict);
-        until(|| buffered() >= 3).await;
+        let late = write("late", "h", WriteMode::Strict);
+        until(|| buffered() >= 5).await;
 
         // `late` is past its 50 ms strict threshold and is refused first.
         clock.advance_ns(TICK_ADVANCE_NS);
@@ -3737,14 +3857,12 @@ mod tests {
         clock.advance_ns(idle_ns);
         until(|| deferred_triggers(&router) >= 3).await;
 
-        for id in gate.held() {
-            assert!(gate.release(id));
-        }
+        release_tenant(&gate, &parked_tenant);
         parked
             .await
             .expect("parked write task")
             .expect("parked write acks once the gate is released");
-        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+        until(|| in_flight(&router) == 2).await;
 
         clock.advance_ns(TICK_ADVANCE_NS);
         assert!(
@@ -3755,11 +3873,19 @@ mod tests {
         late.await
             .expect("late write task")
             .expect("late acks from the flush it got the slot for");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        for w in firsts {
+            w.await
+                .expect("first write task")
+                .expect("first write acks");
+        }
         router.flush_all().await;
     }
 
     /// Deferred flushes retry oldest deferral first. Eight tenants are
-    /// deferred one tick apart behind a single parked flush; once it drains,
+    /// deferred one tick apart at the queued-flush cap; once `parked` drains,
     /// each tick frees exactly one slot, and the tenant that gets it must be
     /// the one deferred earliest. `HashMap` order would match this sequence
     /// by chance once in 8! runs.
@@ -3771,18 +3897,17 @@ mod tests {
         let clock = TestClock::new(BASE_NS);
         let router = Arc::new(
             IngestRouter::new(
-                one_permit_one_queue(Duration::from_secs(3600)),
+                queue_order(TENANTS),
                 Arc::clone(&store),
                 Signal::Metrics,
                 clock.clone(),
             )
             .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
-        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
-        let write = |tenant: TenantId| {
+        let write = |tenant: TenantId, host: &'static str| {
             let router = Arc::clone(&router);
             tokio::spawn(async move {
-                let points = vec![point(&tenant, "h")];
+                let points = vec![point(&tenant, host)];
                 router
                     .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
                     .await
@@ -3790,19 +3915,31 @@ mod tests {
         };
         let buffered = || router.metrics().snapshot().buffered_points_total;
 
-        let parked = write(TenantId::new("parked"));
-        until(|| buffered() >= 1).await;
+        // `parked` and every t_i park one flush, filling the queued-flush cap
+        // with every t_i under its share, so the cap orders the retries.
+        let parked_tenant = TenantId::new("parked");
+        let tenants: Vec<TenantId> = (0..TENANTS)
+            .map(|i| TenantId::new(format!("t{i}")))
+            .collect();
+        let gate = hold_first_put(&fault_store, &parked_tenant);
+        let _gates: Vec<GateHandle> = tenants
+            .iter()
+            .map(|t| hold_first_put(&fault_store, t))
+            .collect();
+        let parked = write(parked_tenant.clone(), "h");
+        let firsts: Vec<_> = tenants.iter().map(|t| write(t.clone(), "first")).collect();
+        until(|| buffered() >= (TENANTS + 1) as u64).await;
         clock.advance_ns(TICK_ADVANCE_NS);
-        until(|| in_flight(&router) == 1).await;
-        gate.wait_until_held(1).await;
+        until(|| in_flight(&router) == (TENANTS + 1) as u64).await;
+        gate.wait_until_held(TENANTS + 1).await;
 
         // Tenant i is first refused on tick i, so tick i refuses i + 1
         // buffers and the deferral start times are strictly increasing in i.
         let mut writes = Vec::new();
         let mut refusals = 0u64;
-        for i in 0..TENANTS {
-            writes.push(write(TenantId::new(format!("t{i}"))));
-            let want = (i + 2) as u64;
+        for (i, t) in tenants.iter().enumerate() {
+            writes.push(write(t.clone(), "h"));
+            let want = (TENANTS + 2 + i) as u64;
             until(|| buffered() >= want).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             refusals += (i + 1) as u64;
@@ -3810,14 +3947,14 @@ mod tests {
         }
         assert!(writes.iter().all(|w| !w.is_finished()));
 
-        for id in gate.held() {
-            assert!(gate.release(id));
-        }
+        // Freeing the slot `parked` holds lets one deferred flush open per
+        // tick; each opened flush acks and frees it again.
+        release_tenant(&gate, &parked_tenant);
         parked
             .await
             .expect("parked write task")
             .expect("parked write acks once the gate is released");
-        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+        until(|| in_flight(&router) == TENANTS as u64).await;
 
         for step in 0..TENANTS {
             clock.advance_ns(TICK_ADVANCE_NS);
@@ -3829,12 +3966,20 @@ mod tests {
                 "tick {step} after the drain must open tenant t{step}, the oldest \
                  deferral left"
             );
-            until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+            until(|| in_flight(&router) == TENANTS as u64).await;
         }
         for (i, w) in writes.into_iter().enumerate() {
             w.await
                 .expect("write task")
                 .unwrap_or_else(|e| panic!("t{i} acks: {e}"));
+        }
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        for (i, w) in firsts.into_iter().enumerate() {
+            w.await
+                .expect("first write task")
+                .unwrap_or_else(|e| panic!("t{i}'s first write acks: {e}"));
         }
         router.flush_all().await;
     }
