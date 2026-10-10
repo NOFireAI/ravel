@@ -256,8 +256,13 @@ check "unanswered curl codes" "7 18 28 52 55 56" "${CHAOS_CURL_UNANSWERED_CODES[
 scenario1_line() { grep -n -m1 -F -- "$1" "${CHAOS_DIR}/kill-ingest-flush.sh" | cut -d: -f1; }
 detect_line="$(scenario1_line 'if wait_for_flush_started')"
 first_kill_line="$(scenario1_line 'sigkill_pid "$SERVER_PID"')"
-check "scenario 1 sends the SIGKILL on the line after the detecting poll" "yes" \
-  "$([[ -n "${detect_line}" && "${first_kill_line:-0}" -eq $(( detect_line + 2 )) ]] && echo yes || echo no)"
+# Between the detecting poll and the kill: nothing but comments, blank lines
+# and the flag or epoch the branch records.
+only_bookkeeping_between() { # file from to
+  awk -v a="$2" -v b="$3" 'NR > a && NR < b && $0 !~ /^[[:space:]]*(#.*)?$/ && $0 !~ /^[[:space:]]*(FLUSH_OBSERVED=1|KILL_EPOCH="\$\(date \+%s\)")[[:space:]]*$/ { n++ } END { print n + 0 }' "$1"
+}
+check "scenario 1 sends the SIGKILL with nothing but bookkeeping after the detecting poll" "0" \
+  "$([[ -n "${detect_line}" && "${first_kill_line:-0}" -gt "${detect_line}" ]] && only_bookkeeping_between "${CHAOS_DIR}/kill-ingest-flush.sh" "${detect_line}" "${first_kill_line}" || echo missing)"
 check "scenario 1 scrapes no flush count after the detection" "0" \
   "$(awk -v d="${detect_line:-0}" 'NR > d && index($0, "flush_attempts \"$BASE_URL\"") { n++ } END { print n + 0 }' \
     "${CHAOS_DIR}/kill-ingest-flush.sh")"
@@ -508,7 +513,7 @@ universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"
 inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight')"
 first_a_kill_line="$(scenario2_line 'sigkill_pid "$WORKER_A_PID"')"
 check "scenario 2 checks the universe before the wait, and kills right after it" "yes" \
-  "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_a_kill_line:-0}" -eq $(( inflight_wait_line + 2 )) ]] && echo yes || echo no)"
+  "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_a_kill_line:-0}" -gt "${inflight_wait_line:-0}" && "$(only_bookkeeping_between "${CHAOS_DIR}/kill-maintain-worker.sh" "${inflight_wait_line}" "${first_a_kill_line}")" == 0 ]] && echo yes || echo no)"
 b_count_line="$(scenario2_line 'B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"')"
 last_a_kill_line="$(grep -n -F 'sigkill_pid "$WORKER_A_PID"' "${CHAOS_DIR}/kill-maintain-worker.sh" | tail -1 | cut -d: -f1)"
 cons_call_line="$(scenario2_line '"$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" || true')"
