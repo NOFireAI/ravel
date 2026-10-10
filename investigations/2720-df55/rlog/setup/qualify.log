@@ -1,0 +1,17 @@
+conditional_write_create_if_absent       PASS losing writer correctly rejected with AlreadyExists, winner's bytes intact
+conditional_write_cas_version            PASS stale-version writer correctly rejected with PreconditionFailed, current version's bytes intact
+consistent_read_after_write              PASS 5 put-then-get cycles all returned the just-written bytes
+consistent_list_after_write              PASS 5 put-then-list cycles all observed the just-written key
+concurrent_create_if_absent_single_winner PASS exactly 1 of 8 concurrent CreateIfAbsent writers won, the other 7 were rejected with AlreadyExists, and the surviving object holds the winner's bytes
+lexicographic_listing_order              PASS 1002 distinct keys written out of order were listed in lexicographic order, and start_after=sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/order/0001 resumed at sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/order/0002 with exactly 1000 distinct keys
+cross_page_listing                       PASS 1002 distinct keys across 2 pages (2 carrying keys), none lost (1002 deliveries; the cross-page guarantee allows repeats)
+delete_visibility                        PASS after deleting sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/delete/gone, a get returned NotFound and both list and list_after held exactly 1 key (sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/delete/kept); a second delete of the absent key succeeded and changed nothing
+operations_refuse_unaddressable_keys     PASS get, get_pinned, pin_of, head, put and delete of ["sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/refuse/a\u{1}b", "sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/refuse/a*b"] (absent) each returned UnaddressableKey naming the key a request would reach
+listed_keys_round_trip_plus_and_space    PASS ["sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/plus-space/a b", "sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/plus-space/a+b", "sys/qualify/1d095a2d-9f4c-4078-98c7-74001d432879/plus-space/a+b c"] each listed back verbatim, none reported unaddressable
+object_lock/versioning                   disabled (informational, non-blocking) Object Lock is not enabled on the bucket (ObjectLockConfigurationNotFoundError)
+bucket/versioning                        off (informational, non-blocking) derived from the ADR-1727 bucket-protection control plane (?versioning, ?lifecycle over signed read-only GETs)
+lifecycle/abort_incomplete_multipart     absent (informational, non-blocking)
+lifecycle/noncurrent_version_expiration  absent (informational, non-blocking)
+bucket/config                            NOTE: the REQUIRED AbortIncompleteMultipartUpload lifecycle rule (7 days or less) is not configured (ADR-0064 §7 point 3). Its absence violates the bucket configuration contract: nothing in Ravel reaps abandoned multipart uploads, so their parts stay billable indefinitely. The NOTE prefix reflects the probe's limits, not an optional requirement.
+checksum/stored_echo                     verified: the whole-object read of the crc64nvme probe PUT returned a stored checksum (crc64nvme or crc32c), and the same algorithm computed over the body read matched it
+wrote sys/qualification: s3://ravel-rlog@http://127.0.0.1:39200 qualified (suite v3)

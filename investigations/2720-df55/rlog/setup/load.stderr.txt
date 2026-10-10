@@ -1,0 +1,3 @@
+warning: bulk load writes directly to the log ingest router. The per-tenant AdmissionController (active-stream cap, stream-creation rate, byte rate) that guards the HTTP ingest path is NOT applied to loaded data. There is no deduplication: re-running after a failure re-ingests every row it is given. --skip-rows can resume a failed load positionally, but only one started with --read-cursors 1 --pipeline-depth 1 (see docs/guides/ingest.md). Retention is measured from load time, not from the records' event times.
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 18:42.11
+	Maximum resident set size (kbytes): 2492308

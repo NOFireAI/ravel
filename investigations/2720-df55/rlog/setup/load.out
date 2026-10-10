@@ -1,0 +1,13 @@
+bulk load complete
+  rows_skipped     : 0
+  rows_written     : 99997497
+  rows/sec         : 89142
+  objects written  : 7363
+  elapsed          : 1121.772s
+  fold after load  : sealed, seal_through_hour 497675, watermark_hour 497675, entries 7363, parts read 1, buckets listed 0, records read 0, elapsed 3.803s (included in elapsed)
+  load memory      : budget 31427399680 bytes (host memory 32903794688 bytes less the floor), floor 1476395008 bytes, peak 438598923 bytes, largest batch 63292497 bytes, decoder waits 0
+  flush triggers   : size 7363, age 0, final 0 (total 7363)
+    shard   0      : size 2064, age 0, final 0 (total 2064)
+    shard   1      : size 2082, age 0, final 0 (total 2082)
+    shard   2      : size 2040, age 0, final 0 (total 2040)
+    shard   3      : size 1177, age 0, final 0 (total 1177)
