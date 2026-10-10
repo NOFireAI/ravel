@@ -618,8 +618,9 @@ impl MapChild {
     /// builds a key vector the size of the whole child, so a row's entries
     /// would cost O(entries^2); it is called once here instead. A child whose
     /// dictionary is empty is left plain, so arrow's assertion in
-    /// `normalized_keys` is never reached: every key of such a child is null,
-    /// and its row is refused as holding a null key.
+    /// `normalized_keys` is never reached. Every key of such a child would be
+    /// null, and Arrow 59 refuses a map with nullable keys when the batch is
+    /// built, so no valid batch reaches that branch; it stays as a guard.
     fn new(child: &ArrayRef) -> Self {
         if matches!(child.data_type(), DataType::Dictionary(_, _)) {
             let dict = child.as_any_dictionary();
