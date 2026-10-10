@@ -830,8 +830,9 @@ error, and `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field
 `key` (the object key), `blake3` (32, of the leaf's full bytes), `size`,
 `field`, `key_type`, `key8_lo` and `key8_hi` (the inclusive key slice this
 leaf covers), `prefix_len` (the bytes through the directory crc, so the
-first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
-(32, the one covered part).
+first GET needs no probe), `bucket_bits`, `entry_count`, `uncovered_count`
+(the length of the header's `uncovered_entry_ordinals`, identical on every
+slice of the pair) and `part_blake3` (32, the one covered part).
 
 **Object layout (RKI1 envelope).**
 
@@ -890,8 +891,15 @@ in the HEAD it resolved, or whose `format_version` it does not support, is
 rejected and the reader treats the part as uncovered for that field. `uncovered_entry_ordinals` lists the entries the fold could not
 index for this field: a segment with no KEY_IDX section, a section whose
 header does not name the field (declared after the flush opened, or
-de-declared), a failed or refused GET, a corrupt section. The reader
-subtracts exactly those from coverage and scans them (ADR-0849 section 3).
+de-declared), a failed or refused GET, a corrupt section. An uncovered entry
+has no indexed `key8`, so it belongs to no key slice: every slice of a
+(part, field) carries the identical, full list for that pair, the ref's
+`uncovered_count` is its length and is compared with the opened header's
+list like the other ref copies, and `inspect kidx` checks that the slices of
+one pair agree (slices whose lists differ are `Corrupted` for the pair). A
+lookup that opens any one slice therefore sees every uncovered entry of
+the part. The reader subtracts exactly those from coverage and scans them
+(ADR-0849 section 3).
 Coverage is read from the leaf header and never inferred from the tenant's
 current declaration.
 
@@ -909,8 +917,8 @@ leaf as `Corrupted` before any GET is issued (tier 1's zero-or-past-`len`
 rule), so GET 1 never exceeds the object's size; GET 1 is then
 `[0, prefix_len)` (header and directory, verified by their crcs). The
 ref's copies of `field`, `key_type`, `key8_lo`,
-`key8_hi`, `bucket_bits`, `entry_count`, `part_blake3` and `prefix_len`
-serve only to pick the slice and size GET 1; the header is authoritative,
+`key8_hi`, `bucket_bits`, `entry_count`, `uncovered_count`, `part_blake3`
+and `prefix_len` serve only to pick the slice and size GET 1; the header is authoritative,
 being under the leaf's blake3, and after GET 1 the reader compares the two
 and rejects the leaf as `Corrupted` on any disagreement (the part reads as
 uncovered), never selecting a bucket from the ref's `bucket_bits`; a GET 1
@@ -969,7 +977,9 @@ header's `entry_count` (a single-bucket probe cannot check the sum and
 treats the header total as advisory, used for `bucket_bits` sizing and the
 report); a header `tenant_hash` or `signal` that disagrees with the
 request, which is the hard `FieldMismatch` above rather than an uncovered
-part; an entry ordinal at or past
+part; an `uncovered_entry_ordinals` list whose length differs from the
+ref's `uncovered_count`, or, for a whole-object reader, slices of one
+(part, field) whose lists differ; an entry ordinal at or past
 the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `key8` that does not mix to the bucket it sits in; unsorted or duplicate
 `(key8, entry ordinal)` pairs; a block delta list that is empty or that

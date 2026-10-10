@@ -83,7 +83,7 @@ v0.23 entry recipe), unfolded tenant, stock server.
 
 | figure | measured |
 |---|---|
-| distinct (UserID, 8,192-row block) pairs per object (offline, 411 objects of about 243,896 rows) | p50 49,899, max 165,431 |
+| distinct (UserID, 8,192-row block) pairs per object (offline, 410 objects of about 243,896 rows) | p50 49,899, max 165,431 |
 | implied tier-1 KEY_IDX size at 12 B per entry (`key8` plus a `u32` block ordinal, before directories and header) | about 0.6 MB per 25 MB object (49,899 x 12 B), about 2.4%, cited as about 2% elsewhere in this ADR |
 | objects per UserID, p50 / p99 / max | 1 / 3 / 213 |
 | the q20 key | 4 rows, 1 object, 1 block |
@@ -152,8 +152,10 @@ POSTINGS carries one.
 - **Key types** (`key_type` byte): `Id16` (1; a 16-byte id, `key8` = its
   first 8 bytes), `I64` (2; `key8` = the big-endian bytes of the sign-flipped
   bit pattern `(v as u64) ^ (1 << 63)`, the `NumRange` ordering convention),
-  `Str` (3) and `Bytes` (4; `key8` = the first 8 bytes of the unkeyed blake3
-  of the value). `Bool` is never indexed: two values prune nothing.
+  `Str` (3; `key8` = the first 8 bytes of the unkeyed blake3 of the UTF-8
+  bytes) and `Bytes` (4; `key8` = the first 8 bytes of the unkeyed blake3
+  of the value), each as docs/log-segment-format.md's key table defines it.
+  `Bool` is never indexed: two values prune nothing.
 - **Buckets.** A field's entries are split into `2^bucket_bits` buckets by
   `(u64::from_be_bytes(key8) * 0x9E3779B97F4A7C15) >> (64 - bucket_bits)`,
   a fixed multiplicative mix. The top bits of the key itself (the advisory
@@ -165,8 +167,9 @@ POSTINGS carries one.
   offsets under their own crc32c. The writer uses `bucket_bits = 8` (256
   buckets, a 1 KB directory); the reader accepts 1 to 16. At Stage 0's
   tier-1 sizes (p50 49,899 entries per logs object; 25,000 to 50,000 per
-  250,000-span object, derived) a bucket is 200 to 650 entries, 2 to 8 KB
-  before compression (derived). The advisory 4,096 buckets would make the
+  250,000-span object, derived) a bucket is 100 to 650 entries (100 to 200
+  for spans, 200 to 650 for logs), 1 to 8 KB before compression (derived).
+  The advisory 4,096 buckets would make the
   directory 16 KB against sections of 250 to 500 KB and buy nothing at this
   grain; 4,096 is the right count one tier up (decision 4).
 - **Bucket frames.** Each bucket is `u32 entry_count`, `u32 crc32c` over the
@@ -316,8 +319,11 @@ flowchart LR
     no fallback. A `part_blake3` mismatch or an unsupported version rejects
     the leaf and the part reads as uncovered for that field only. The
     header lists `uncovered_entry_ordinals`, the entries the fold could not
-    index, and a reader subtracts exactly those from coverage (ADR-0849
-    section 3). Same `watermark_hour`, different part bytes, leaf rejected:
+    index, identical on every key slice of the (part, field) since an
+    uncovered entry has no key to slice by (the ref's `uncovered_count`
+    checks the opened slice's list), and a reader subtracts exactly those
+    from coverage (ADR-0849 section 3). Same `watermark_hour`, different
+    part bytes, leaf rejected:
     the regression test ADR-0849 names.
   - **Reference.** `SnapshotPartRef` gains `repeated SnapshotKeyIndexLeafRef
     key_index = 8` beside `column_stats = 7`, carrying the header's slice
@@ -497,10 +503,17 @@ flowchart LR
   Among 20 M random 16-byte ids, 8-byte prefix collisions are about
   1 in 10^5 per corpus; at 10^11 traces about 270 pairs, each costing one
   extra block read (derived).
-- **Budget.** `L_point` is 2 leaf GETs per covering part, under a per-query
-  ceiling of 2,048 leaf GETs (1,024 covering parts; a chosen constant of the
-  layout, not a measurement). Beyond the ceiling the remaining parts are
-  scanned, not probed, and the shape lint reports it (ADR-0849 section 2). A
+- **Budget.** `L_point` is `2 x min(p, P_max)` leaf GETs for `p` covering
+  parts, with `P_max` = 1,024 a constant of the layout fixed in root
+  validation (a ceiling of 2,048 leaf GETs, not a measurement). Beyond
+  `P_max` the remaining parts are scanned, not probed, and the shape lint
+  reports it. A probe count that follows the covering part count is a
+  second root shape under ADR-0849 section 2, which this ADR amends (the
+  part-bound point root amendment there): root validation requires
+  `parallelism >= 2 x P_window` with `P_window` = 32 parts by default, so
+  the two-round-trip bound holds for any lookup covering up to a day of
+  hour-ranged parts, and a lookup over more parts runs
+  `ceil(2p / parallelism)` leaf waves, reported by the lint. A
   windowed lookup covers one or a few parts, so cold routing is the two
   sequential round trips ADR-0849 states; a no-range lookup over `p` parts
   costs `1 + ceil(2p / parallelism)` rounds at the probe concurrency the
@@ -622,8 +635,9 @@ above the watermark, listed), bounded by retention. Cost is 2 leaf GETs per
 covering part under decision 5's ceiling plus tail probes, and the answer is
 the spans in view, with docs/guides/traces.md's incomplete-trace semantics
 unchanged: no waiting for a missing root or sibling. `ravel_get_trace`'s
-`start_ns` and `end_ns` become optional; the HTTP endpoint returns the SQL
-row shape as JSON. A SQL statement that pins `trace_id = X` and whose
+`time_range` (`GetTraceInput.time_range`, `crates/ravel-mcp/src/catalog.rs`,
+required today) becomes optional; the HTTP endpoint returns the SQL row
+shape as JSON. A SQL statement that pins `trace_id = X` and whose
 request gave no explicit window resolves the same way instead of the
 one-hour request default; a statement with time bounds keeps them.
 

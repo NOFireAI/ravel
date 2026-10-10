@@ -287,7 +287,11 @@ it changes the pack layout and therefore its version.
 ### 2. Routing must never be per-object
 
 A point lookup resolves through a small cached root to one or a few leaves.
-Packs are sharded by field, index type, and value or hash range.
+Packs are sharded by field, index type, and value or hash range. A pack
+bound to one snapshot part (ADR-2707's `.kidx` leaf) is the one shape whose
+probe count follows the covering part count rather than a layout constant
+alone; its budget and round-trip rule are stated in the part-bound point
+root amendment below.
 
 **A design that probes one index sidecar per data object is rejected by
 construction**: it replaces 3,469 data GETs with 3,469 index GETs and moves
@@ -752,3 +756,41 @@ results are to be published as distinct numbers rather than blended.
 
 Refs: #849, #680, #815, #835, #843
 Supersedes in part: ADR-0049 (the global-inverted-index rejection only)
+
+## Amendment (2026-10-10, ADR-2707): a part-bound point root
+
+<!-- amendment-applies: sections="2. Routing must never be per-object" pointer="part-bound point root amendment" -->
+
+ADR-2707 adds a point index whose leaf is bound to one snapshot part (the
+`.kidx` leaf, one per (part, field, key slice)), so a lookup probes two
+leaf GETs per covering part. That count follows HEAD's part count, not the
+object count: a part holds up to 250,000 objects, the covering set is
+bounded by the window and by retention, and section 2's rejection of
+per-object probing stands untouched. Section 2's other rules are kept for
+this shape as follows, and this amendment is where they are restated, since
+the per-type cap there is "a function of pack layout, never of object
+count" and the round-trip bound assumed one leaf wave.
+
+- The cap is `L_point = 2 x min(p, P_max)` leaf GETs, where `p` is the
+  covering part count and `P_max = 1,024` is a constant of the layout fixed
+  in root validation; parts beyond `P_max` are scanned, not probed, and the
+  shape lint reports the scanned remainder. `L_point` therefore has the
+  finite maximum section 2 requires (2,048) and the one per-query total
+  still holds.
+- The two-round-trip bound is promised for a windowed lookup and stated as
+  a formula for the rest: root validation requires
+  `parallelism >= 2 x P_window`, with `P_window` the declared covering-part
+  count up to which the bound holds (default 32 parts, a day of hour-ranged
+  parts, so `parallelism >= 64`), and a lookup covering more parts than
+  `P_window` (a rangeless `trace_id` lookup over a month-scale tenant)
+  resolves its leaves in `ceil(2p / parallelism)` waves, costing
+  `1 + ceil(2p / parallelism)` sequential round trips. The shape lint
+  reports the wave count beside the request count for every such lookup,
+  so the exception is visible per query rather than assumed away, and the
+  ADR-2707 acceptance table bands the rangeless arm by its covering-part
+  count.
+- Root validation rejects a part-bound root declaring `P_max` above 1,024,
+  `P_window` above `P_max`, or `parallelism < 2 x P_window`, each a
+  rejected input with a test, as section 2's `L > parallelism` case is.
+
+Refs: #2707
