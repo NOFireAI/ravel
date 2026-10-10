@@ -164,10 +164,10 @@ removes the job.
 
 The per-PR job proves the README matches `HEAD` (until A6 in the Amendments
 section below removes it, leaving this lane as the only one). It cannot prove
-the README matches what a reader actually pulls, because a merged doc change ships before
-the next release tag does. A scheduled run of the same script with `RAVEL_IMAGE`
-set to `ghcr.io/nofireai/ravel-server:latest` closes that window, plus the
-unmodified-default run from decision 1.
+the README matches what a reader actually pulls, because a merged doc change
+ships before the next release tag does. A scheduled run of the same script
+with `RAVEL_IMAGE` set to `ghcr.io/nofireai/ravel-server:latest` closes that
+window, plus the unmodified-default run from decision 1.
 
 That window is also the lane's one legitimate red state, and the lane cannot
 tell it apart from a real defect: between merging a README that documents
@@ -198,10 +198,11 @@ step, not a CI step — CI runs the assertions.
 
 The job that runs it is the per-PR `quickstart` job from decision 6, as a step
 after the marked README blocks (removed by A6 in the Amendments section
-below). Its path filter already covers `demo/**`, it already has the stack up, and it is the only lane that both has docker and gates
-a merge. Naming it here is not a formality: the fleet executors that write this
-script cannot run docker, so without an explicit job attachment the script would
-merge unproven, which is precisely the failure mode this ADR exists to close for
+below). Its path filter already covers `demo/**`, it already has the stack
+up, and it is the only lane that both has docker and gates a merge. Naming it
+here is not a formality: the fleet executors that write this script cannot
+run docker, so without an explicit job attachment the script would merge
+unproven, which is precisely the failure mode this ADR exists to close for
 the README.
 
 ![Two paths from a clone to first data: the documented path today compiles the whole workspace before anything runs, while the container-first path pulls one already-built, already-signed image and starts serving in under a minute.](assets/0081-quickstart-paths.svg)
@@ -357,7 +358,8 @@ the same way. Reported, not fixed here.
   The reader's first payoff becomes a Grafana screen rather than two lines of
   JSON.
 - The README acquires a gate. A wrong port, table, or header in a marked block
-  now fails CI instead of failing a stranger.
+  now fails CI instead of failing a stranger. Since A6 in the Amendments
+  section, only the weekly lane runs it, after a release.
 - New per-PR CI cost: two release builds (`ravel-server --features sql` and
   `ravel-cli`) against a warm cache, plus a compose bring-up and the assertions.
   The job lands advisory and is promoted to required once its warm-cache budget
@@ -372,7 +374,8 @@ the same way. Reported, not fixed here.
   required, a README-touching docs PR carries two release builds and a compose
   bring-up on its merge path. That is the intended trade and the whole point of
   decision 7, but it is a real latency cost on the most common PR shape in a
-  docs-heavy repository, and it is stated here rather than discovered.
+  docs-heavy repository, and it is stated here rather than discovered. The
+  job was never made required, and A6 in the Amendments section removes it.
 - The quickstart's SQL surface exists because the image carries `--features
   sql`; the from-source `make demo` still does not. The guides must state which
   path gives which capability rather than describing one surface.
