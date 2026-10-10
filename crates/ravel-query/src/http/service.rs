@@ -72,8 +72,8 @@ pub fn authenticate(
 // same string. The memory admission wait (#2044) lives with the controller it
 // gates and is reachable from outside the crate through this module.
 pub use crate::query_admission::{
-    AdmissionRefused, Admitted, DEFAULT_MEMORY_ADMISSION_FRACTION, MEMORY_ADMISSION_POLL_INTERVAL,
-    MSG_CONCURRENCY, MSG_MEMORY_ADMISSION, MemoryAdmissionGate,
+    AdmissionRefused, Admitted, DEFAULT_MEMORY_ADMISSION_FRACTION, MEMORY_ADMISSION_MAX_WAIT,
+    MEMORY_ADMISSION_POLL_INTERVAL, MSG_CONCURRENCY, MemoryAdmissionGate,
 };
 
 /// How a query ended, for its usage record. Mirrors `ravel-server`'s
@@ -226,7 +226,8 @@ impl QueryControls {
     /// exit, the dropped-future one included. Takes the clamped `deadline`
     /// because admission first runs the memory admission wait (#2044), which
     /// spends from it; returns the permit and the deadline left to run under.
-    /// Both refusals are a 503.
+    /// The one refusal, the concurrency ceiling's, is a 503; the wait itself
+    /// never refuses.
     pub async fn admit(&self, deadline: Duration) -> Result<(QueryPermit, Duration), ApiError> {
         self.admission
             .admit_within(deadline)

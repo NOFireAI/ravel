@@ -30,7 +30,7 @@ use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreMetrics};
 use ravel_query::http::service::{
-    DEFAULT_MEMORY_ADMISSION_FRACTION, MSG_MEMORY_ADMISSION, MemoryAdmissionGate,
+    DEFAULT_MEMORY_ADMISSION_FRACTION, MEMORY_ADMISSION_MAX_WAIT, MemoryAdmissionGate,
 };
 use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{
@@ -161,6 +161,21 @@ fn harness(
     configured: HashSet<TenantHash>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
 ) -> Harness {
+    harness_with_max_wait(
+        store,
+        configured,
+        process_memory_budget,
+        MEMORY_ADMISSION_MAX_WAIT,
+    )
+}
+
+/// [`harness`] with `max_wait` as the memory admission wait's cap.
+fn harness_with_max_wait(
+    store: Arc<dyn ObjectStoreBackend>,
+    configured: HashSet<TenantHash>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    max_wait: Duration,
+) -> Harness {
     let query_accounting = Arc::new(QueryAccountingMetrics::new(configured));
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
@@ -178,10 +193,13 @@ fn harness(
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
 
-    let memory_admission = Arc::new(MemoryAdmissionGate::new(
-        Arc::clone(&process_memory_budget),
-        DEFAULT_MEMORY_ADMISSION_FRACTION,
-    ));
+    let memory_admission = Arc::new(
+        MemoryAdmissionGate::new(
+            Arc::clone(&process_memory_budget),
+            DEFAULT_MEMORY_ADMISSION_FRACTION,
+        )
+        .with_max_wait(max_wait),
+    );
     let sql = sql_router(SqlState {
         executor: Arc::clone(&executor),
         tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
@@ -858,7 +876,14 @@ async fn concurrent_sql_statements_wait_for_memory_headroom_and_all_succeed() {
     publish_segment(store.as_ref(), &tenant, &samples).await;
     let limit = 8 * 1024 * 1024;
     let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
-    let h = harness(Arc::clone(&store), HashSet::new(), Arc::clone(&budget));
+    // A cap well past how long parking takes, so no wait expires before the
+    // budget frees.
+    let h = harness_with_max_wait(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::clone(&budget),
+        Duration::from_secs(25),
+    );
     let threshold = h
         .memory_admission
         .threshold_bytes()
@@ -887,7 +912,7 @@ async fn concurrent_sql_statements_wait_for_memory_headroom_and_all_succeed() {
         gate.waits_total() == STATEMENTS
     })
     .await;
-    assert_eq!(gate.wait_refusals_total(), 0);
+    assert_eq!(gate.waits_expired_total(), 0);
     drop(held);
 
     for task in tasks {
@@ -899,7 +924,7 @@ async fn concurrent_sql_statements_wait_for_memory_headroom_and_all_succeed() {
         );
     }
     assert_eq!(h.memory_admission.waits_total(), STATEMENTS);
-    assert_eq!(h.memory_admission.wait_refusals_total(), 0);
+    assert_eq!(h.memory_admission.waits_expired_total(), 0);
     assert_eq!(
         budget.reserved(),
         0,
@@ -907,16 +932,18 @@ async fn concurrent_sql_statements_wait_for_memory_headroom_and_all_succeed() {
     );
 }
 
-/// #2044: a statement whose deadline would pass while it waits for memory
-/// headroom is refused at admission with the memory-class message and the
-/// existing 503 class, and the refusal counter moves on `/metrics`.
+/// #2044: a statement whose wait reaches the cap with the budget still above
+/// the threshold is admitted anyway, and its own reservation decides, as it
+/// would with no wait: here the sort does not fit the 16 KiB left and answers
+/// 422. The wait never answers with a refusal of its own, and the expiry
+/// counter moves on `/metrics`.
 ///
-/// Prove-the-test: make `MemoryAdmissionGate::wait_for_headroom` return
-/// `Ok` instead of `MemoryWait` when the deadline would pass. The statement
-/// then starts into the held budget and answers 422 from its sort, not 503,
-/// and `wait_refusals_total` stays 0.
+/// Prove-the-test: drop `max_wait` from the bound in
+/// `MemoryAdmissionGate::wait_for_headroom`, so only half the deadline ends
+/// the wait. The statement then waits 15 s of its 30 s deadline and the 5 s
+/// timeout around the request fires.
 #[tokio::test]
-async fn a_sql_statement_whose_deadline_passes_while_waiting_is_refused() {
+async fn a_sql_statement_whose_wait_expires_is_admitted_and_its_reservation_decides() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     let samples: Vec<(i64, f64)> = (0..4_000)
@@ -925,24 +952,30 @@ async fn a_sql_statement_whose_deadline_passes_while_waiting_is_refused() {
     publish_segment(store.as_ref(), &tenant, &samples).await;
     let limit = 8 * 1024 * 1024;
     let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
-    let h = harness(Arc::clone(&store), HashSet::new(), Arc::clone(&budget));
+    let h = harness_with_max_wait(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::clone(&budget),
+        Duration::from_millis(50),
+    );
     let _held = budget
         .reserve(limit - 16 * 1024)
         .expect("the empty budget admits the holder");
 
-    let body = serde_json::json!({
-        "query": "SELECT ts, value FROM samples ORDER BY ts",
-        "start": 0.0,
-        "end": NOW_NS as f64 / 1_000_000_000.0,
-        "timeout": 0.1,
-    })
-    .to_string();
-    let (status, body) = post_sql_body(&h.sql, body).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["errorType"], "unavailable", "{body}");
-    assert_eq!(body["error"], MSG_MEMORY_ADMISSION, "{body}");
+    // hygiene-allow: wall-clock -- a bound proving the 50 ms cap ends the wait, far below half the 30 s deadline; the assertions are on the response
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        post_sql(&h.sql, "SELECT ts, value FROM samples ORDER BY ts"),
+    )
+    .await
+    .expect("the 50 ms cap, not the deadline, ends the wait");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the admitted statement's sort is refused by its own reservation: {body}"
+    );
     assert_eq!(h.memory_admission.waits_total(), 1);
-    assert_eq!(h.memory_admission.wait_refusals_total(), 1);
+    assert_eq!(h.memory_admission.waits_expired_total(), 1);
 
     let scrape = scrape_metrics(&h.metrics).await;
     assert!(
@@ -950,7 +983,7 @@ async fn a_sql_statement_whose_deadline_passes_while_waiting_is_refused() {
         "{scrape}"
     );
     assert!(
-        scrape.contains("ravel_memory_admission_wait_refusals_total{mode=\"all\"} 1\n"),
+        scrape.contains("ravel_memory_admission_waits_expired_total{mode=\"all\"} 1\n"),
         "{scrape}"
     );
 }

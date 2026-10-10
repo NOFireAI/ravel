@@ -1958,10 +1958,11 @@ pub struct Cli {
     /// The memory admission wait (#2044, ADR-1170 amendment of 2026-10-10):
     /// a query arriving while the process memory budget's reserved bytes are
     /// at or above this fraction of its limit waits, re-checking every 10 ms,
-    /// until they drop below it, and is refused with a 503 (Flight:
-    /// `RESOURCE_EXHAUSTED`) once its deadline would pass first. Applies at
-    /// admission only; a running query's reservation growth is still refused
-    /// at once. Between 0 and 1; 0 disables the wait. Unset, 0.75.
+    /// until they drop below it, for at most 2 s or half its deadline; then it
+    /// is admitted anyway and its own reservations decide. The wait never
+    /// refuses, but its time comes out of the deadline. Applies at admission only; a running query's
+    /// reservation growth is still refused at once. Between 0 and 1; 0
+    /// disables the wait. Unset, 0.75.
     #[arg(long, value_name = "FRACTION", value_parser = parse_query_memory_admission_fraction)]
     pub query_memory_admission_fraction: Option<f64>,
 

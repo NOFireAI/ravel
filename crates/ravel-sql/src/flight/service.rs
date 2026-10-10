@@ -39,7 +39,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use prost::Message;
 use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
-use ravel_query::http::service::MSG_CONCURRENCY;
+use ravel_query::http::service::{MEMORY_ADMISSION_POLL_INTERVAL, MSG_CONCURRENCY};
 use ravel_query::{QueryAdmissionController, QueryPermit};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
@@ -303,9 +303,10 @@ impl RavelFlightSqlService {
         self.auth.tenant(metadata)
     }
 
-    /// Admission for one RPC (ADR-0061 decision 2): the memory admission wait
-    /// bounded by `deadline` (#2044), then a concurrency slot. Either refusal
-    /// is `RESOURCE_EXHAUSTED`, before any store work.
+    /// Admission for one RPC (ADR-0061 decision 2): the memory admission wait,
+    /// at most 2 s or half of `deadline` (#2044), then a concurrency slot.
+    /// The wait only delays; the one refusal is the concurrency ceiling's
+    /// `RESOURCE_EXHAUSTED`, before any store work.
     async fn admit(&self, deadline: Duration) -> Result<QueryPermit, Status> {
         self.query_admission
             .admit_within(deadline)
@@ -694,11 +695,12 @@ impl FlightSqlService for RavelFlightSqlService {
         // `GetFlightInfo`. That is admission back-pressure, not a ticket problem:
         // the minted ticket stays valid and redeemable later within its deadline,
         // so the client should simply retry the DoGet. This rejection is emitted
-        // before any store work, mirroring `get_flight_info_statement`. An
-        // expired ticket skips the memory wait, so the stream refuses it as
-        // invalidated rather than as a retryable memory refusal.
+        // before any store work, mirroring `get_flight_info_statement`. A
+        // ticket with at most one re-check left skips the memory wait, so
+        // the stream answers an expired one as invalidated and the wait
+        // counters do not move for it.
         let budget = self.ticket_budget(decoded.deadline_ns);
-        let permit = if budget.is_zero() {
+        let permit = if budget <= MEMORY_ADMISSION_POLL_INTERVAL {
             self.query_admission
                 .try_admit()
                 .map_err(|_| Status::resource_exhausted(MSG_CONCURRENCY))?

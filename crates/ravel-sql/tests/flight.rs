@@ -326,10 +326,13 @@ async fn a_ticket_minted_after_a_memory_wait_keeps_the_arrival_deadline() {
     let seg_specs = specs();
     let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
     let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
-    let gate = Arc::new(ravel_query::http::service::MemoryAdmissionGate::new(
-        Arc::clone(&budget),
-        ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION,
-    ));
+    let gate = Arc::new(
+        ravel_query::http::service::MemoryAdmissionGate::new(
+            Arc::clone(&budget),
+            ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION,
+        )
+        .with_max_wait(Duration::from_secs(60)),
+    );
     harness.service = RavelFlightSqlService::new(
         Arc::clone(&harness.executor),
         TestAuth::new(&[("acme", &tenant)]),
@@ -365,7 +368,7 @@ async fn a_ticket_minted_after_a_memory_wait_keeps_the_arrival_deadline() {
     let (ticket, ()) = tokio::join!(harness.get_flight_info("acme", QUERY), release);
     let ticket = ticket.expect("flight info once the budget frees");
     assert_eq!(gate.waits_total(), 1);
-    assert_eq!(gate.wait_refusals_total(), 0);
+    assert_eq!(gate.waits_expired_total(), 0);
 
     let decoded = FlightTicket::decode(
         &statement_ticket(&ticket).statement_handle,

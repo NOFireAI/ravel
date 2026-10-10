@@ -3069,7 +3069,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_admission_waits_total",
-        "Queries that found the process memory budget's reserved bytes at or above --query-memory-admission-fraction of its limit at admission and waited for them to drop (#2044).",
+        "Admissions that found the process memory budget's reserved bytes at or above --query-memory-admission-fraction of its limit and waited, up to 2 s or half the deadline, for them to drop (#2044).",
         "counter",
     );
     write_sample(
@@ -3080,15 +3080,15 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     );
     write_header(
         out,
-        "ravel_memory_admission_wait_refusals_total",
-        "Queries refused at admission because their deadline would pass before the process memory budget's reserved bytes dropped below --query-memory-admission-fraction of its limit (#2044). A subset of ravel_memory_admission_waits_total.",
+        "ravel_memory_admission_waits_expired_total",
+        "Admission waits that reached 2 s or half the deadline with the reserved bytes still at or above the threshold; the query was admitted anyway (#2044). A subset of ravel_memory_admission_waits_total.",
         "counter",
     );
     write_sample(
         out,
-        "ravel_memory_admission_wait_refusals_total",
+        "ravel_memory_admission_waits_expired_total",
         &[Label::Mode(mode)],
-        budget.admission_wait_refusals_total,
+        budget.admission_waits_expired_total,
     );
 }
 
@@ -7686,8 +7686,8 @@ pub struct MemoryBudgetSnapshot {
     pub handoff_overlap: u64,
     /// `MemoryAdmissionGate::waits_total()` (#2044).
     pub admission_waits_total: u64,
-    /// `MemoryAdmissionGate::wait_refusals_total()` (#2044).
-    pub admission_wait_refusals_total: u64,
+    /// `MemoryAdmissionGate::waits_expired_total()` (#2044).
+    pub admission_waits_expired_total: u64,
 }
 
 /// Router state for `GET /metrics`. Every field is a handle already built by
@@ -8144,7 +8144,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         fetch_reserved: state.process_memory_budget.fetch_reserved(),
         handoff_overlap: state.process_memory_budget.handoff_overlap(),
         admission_waits_total: state.memory_admission.waits_total(),
-        admission_wait_refusals_total: state.memory_admission.wait_refusals_total(),
+        admission_waits_expired_total: state.memory_admission.waits_expired_total(),
     };
 
     let mut body = render(

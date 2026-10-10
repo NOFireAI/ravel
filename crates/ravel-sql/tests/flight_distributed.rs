@@ -1244,10 +1244,10 @@ async fn fragment_do_get_serves_internal_schema() {
 ///
 /// Prove-the-test: admit the slice in `slice_do_get`
 /// (crates/ravel-sql/src/flight/service.rs) through the memory admission wait
-/// instead of `try_admit`. The slice then waits out its 1 s ticket and is
-/// refused `RESOURCE_EXHAUSTED`, so `expect("do_get slice")` fails. The
-/// armed-gate assertion first proves the held budget sits above the
-/// threshold, so the zero-wait assertions cannot pass on a disabled gate.
+/// instead of `try_admit`. The slice then waits out its 1 s ticket before it
+/// is admitted, and `waits_total` reads 1. The armed-gate assertion first
+/// proves the held budget sits above the threshold, so the zero-wait
+/// assertions cannot pass on a disabled gate.
 #[tokio::test]
 async fn slice_do_get_never_waits_for_memory_headroom() {
     let (store, snapshot) = two_shard_snapshot().await;
@@ -1287,7 +1287,7 @@ async fn slice_do_get_never_waits_for_memory_headroom() {
 
     assert!(!batches.is_empty(), "the slice yields rows");
     assert_eq!(gate.waits_total(), 0, "a slice fetch must not wait");
-    assert_eq!(gate.wait_refusals_total(), 0);
+    assert_eq!(gate.waits_expired_total(), 0);
 }
 
 // ---------------------------------------------------------------------------

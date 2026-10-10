@@ -1176,13 +1176,25 @@ use would only hold its connection until its deadline. The permit is taken
 after the wait rather than before it, so a waiter never occupies a slot a
 running query could use. While `reserved >= fraction * limit` it re-reads
 the counter every 10 ms. It admits once `reserved` falls below the
-threshold, and refuses with the existing admission class (HTTP 503
-`unavailable` for PromQL, metadata and SQL; gRPC `RESOURCE_EXHAUSTED` for
-Flight SQL) once the next re-check would pass the statement's deadline.
-The refusal message is "query memory budget exhausted: no headroom freed
-before the statement deadline; retry". The time spent waiting comes out of
-the statement's deadline, so a statement that waited has that much less
-time to run. Every admission site goes through the wait:
+threshold, or once the next re-check would pass 2 s of waiting or half the
+statement's deadline, whichever is sooner. In that second case the
+statement is admitted anyway, and its own reservations decide as they would
+with no wait: a statement that fits in the free part of the budget runs,
+and one that does not is refused at its reservation, as before. The wait
+never refuses. A refusing wait was the first design and was rejected in
+review: with the budget above the threshold for long, a small query that
+needs a few megabytes, or a metadata request that needs none, would wait
+its whole deadline and then be refused, although the free quarter of the
+budget would have served it at once. The cap bounds the delay at 2 s at
+each wait site (Flight SQL has two, so a statement can lose up to 4 s), and
+bounds the number of parked statements at a site by the arrival rate times
+2 s with no other mechanism. The time spent waiting comes out of the
+statement's deadline, so a statement that waited has that much less time to
+run, and one that needed nearly all of its deadline can time out where it
+would have finished. Halving the deadline for the bound keeps at least half
+of it to run under: a statement whose deadline would otherwise end its wait
+would be admitted with no time left and fail on its timeout, not on its
+memory. Every admission site goes through the wait:
 `QueryControls::admit` for the HTTP endpoints, and the Flight SQL
 `get_flight_info` and `do_get` sites. Reservation growth never waits: a
 fetch or SQL reservation that does not fit is refused at once, as decision 2
@@ -1207,7 +1219,7 @@ the threshold is admitted before any of them has reserved, so with 10
 connections up to 10 can pass on one dip while the headroom covers about
 2.8 at the mean peak. A new arrival that finds the budget below the
 threshold is admitted at once, ahead of statements already waiting, so a
-waiter can lose every race until its deadline. The wait narrows the window
+waiter can lose every race until its cap. The wait narrows the window
 in which a fresh statement fails its first fetch; it does not serialize
 admission, and the concurrent ClickBench pass measures what is left.
 Admitting one waiter per re-check, or counting admitted statements that
@@ -1215,24 +1227,25 @@ have not reserved yet against the threshold, would bound the burst. The
 fraction is calibrated on one workload and one host size and is a starting
 value, not a measured optimum.
 
-The refusal class and the bound on the wait are interim. ADR-2633, accepted
-after this design was dispatched, adds its own wait at the same admission
-sites, comparing resident memory to a high-water mark and capped at
-`--memory-gate-wait-ms` (decision 3), and answers every fetch-memory refusal
-with 422 (decision 5). Neither is applied here. Its decision 3 lists
+The fixed 2 s cap and the fetch refusal's status are interim. ADR-2633,
+accepted after this design was dispatched, adds its own wait at the same
+admission sites, comparing resident memory to a high-water mark and capped
+at `--memory-gate-wait-ms` (decision 3), and answers every fetch-memory
+refusal with 422 (decision 5). Neither is applied here. When it lands, its
+flag is the natural home for this cap too. Its decision 3 lists
 `slice_do_get` among the sites that wait; the slice exemption above must
-carry over when it lands, or the hold-and-wait returns. Until ADR-2633's tasks land,
-this wait is bounded only by the statement's deadline, and a client sees a
-memory refusal as a 503 from the wait or a fetch, or a 422 from the sort or
-SQL memory pool.
+carry over when it lands, or the hold-and-wait returns. Until then a client
+sees a memory refusal as a 503 from a fetch reservation, or a 422 from the
+sort or SQL memory pool, and never from the wait.
 
 `--query-memory-admission-fraction` sets it, from 0 to 1; 0 disables the
 wait. The resolved value, its source and the threshold in bytes are logged on the `performance default resolved`
 line. An unlimited budget never waits. Two counters report the wait:
 `ravel_memory_admission_waits_total` counts admissions that had to
 wait (a Flight SQL statement that waits at both `GetFlightInfo` and
-`DoGet` counts twice), and `ravel_memory_admission_wait_refusals_total` counts the
-waits that ended in a refusal.
+`DoGet` counts twice), and `ravel_memory_admission_waits_expired_total`
+counts the waits that reached the cap or half the deadline with the budget
+still above the threshold, whose statements were admitted anyway.
 
 Separately, a fetch refused by the budget (`FetchMemoryExhausted` from the
 metric, log and span fetchers) now answers SQL and PromQL clients with "query memory

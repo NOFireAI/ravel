@@ -43,9 +43,7 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::http::StaticBearerTokenResolver;
-use ravel_query::http::service::{
-    DEFAULT_MEMORY_ADMISSION_FRACTION, MSG_MEMORY_ADMISSION, MemoryAdmissionGate,
-};
+use ravel_query::http::service::{DEFAULT_MEMORY_ADMISSION_FRACTION, MemoryAdmissionGate};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::alerting::ALERT_SHARD;
@@ -593,15 +591,18 @@ async fn a_flight_sql_query_returns_the_published_rows() {
 }
 
 /// Install a #2044 memory admission wait at the default fraction over
-/// `budget` on `state`'s admission controller, as `ravel_server::start` does.
+/// `budget` on `state`'s admission controller, as `ravel_server::start` does
+/// but with a longer cap.
 fn with_memory_admission(
     state: &mut SqlState,
     budget: &Arc<ravel_memory::MemoryBudget>,
 ) -> Arc<MemoryAdmissionGate> {
-    let gate = Arc::new(MemoryAdmissionGate::new(
-        Arc::clone(budget),
-        DEFAULT_MEMORY_ADMISSION_FRACTION,
-    ));
+    // A cap well past how long these tests hold the budget, so a wait ends on
+    // headroom or the statement's own deadline, never on the cap.
+    let gate = Arc::new(
+        MemoryAdmissionGate::new(Arc::clone(budget), DEFAULT_MEMORY_ADMISSION_FRACTION)
+            .with_max_wait(Duration::from_secs(25)),
+    );
     state.query_admission = Arc::new(
         ravel_query::QueryAdmissionController::new(ravel_query::QueryConcurrencyLimit::Unlimited)
             .with_memory_gate(Arc::clone(&gate)),
@@ -609,17 +610,17 @@ fn with_memory_admission(
     gate
 }
 
-/// #2044, Flight SQL: `GetFlightInfo` reaches the memory admission wait, and a
-/// statement whose deadline would pass while the process budget stays above
-/// the threshold is refused `RESOURCE_EXHAUSTED` (the existing admission
-/// class) with the memory-class message. This is the test proving the Flight
-/// planning path reaches the wait.
+/// #2044, Flight SQL: `GetFlightInfo` reaches the memory admission wait. With
+/// the process budget held above the threshold the whole time, the wait ends
+/// at half the statement's 100 ms deadline and the statement is admitted anyway
+/// and planned: the wait delays, it never refuses. This is the test proving
+/// the Flight planning path reaches the wait.
 ///
 /// Prove-the-test: replace `admit_within` in `get_flight_info_statement`
 /// (crates/ravel-sql/src/flight/service.rs) with a bare `try_admit`. The
-/// statement then plans and answers OK, and `waits_total` stays 0.
+/// statement still plans and answers OK, but `waits_total` stays 0.
 #[tokio::test]
-async fn flight_get_flight_info_waits_for_memory_headroom_and_refuses_at_the_deadline() {
+async fn flight_get_flight_info_waits_for_memory_headroom_then_admits_at_half_the_deadline() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, "cpu", &[(100i64, 1.5f64)]).await;
@@ -640,14 +641,14 @@ async fn flight_get_flight_info_waits_for_memory_headroom_and_refuses_at_the_dea
     request
         .metadata_mut()
         .insert("x-ravel-timeout", "0.1".parse().expect("ascii"));
-    let status = client
+    let info = client
         .get_flight_info(request)
         .await
-        .expect_err("refused while the budget stays held");
-    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
-    assert_eq!(status.message(), MSG_MEMORY_ADMISSION);
+        .expect("admitted at the deadline while the budget stays held")
+        .into_inner();
+    assert!(!info.endpoint.is_empty(), "the statement was planned");
     assert_eq!(gate.waits_total(), 1);
-    assert_eq!(gate.wait_refusals_total(), 1);
+    assert_eq!(gate.waits_expired_total(), 1);
 
     server.stop().await;
 }
@@ -718,7 +719,7 @@ async fn flight_do_get_waits_for_memory_headroom_then_streams_the_rows() {
     let (rows, _columns) = fetch.await.expect("task").expect("rows once freed");
     assert_eq!(rows, samples.len());
     assert_eq!(gate.waits_total(), 1);
-    assert_eq!(gate.wait_refusals_total(), 0);
+    assert_eq!(gate.waits_expired_total(), 0);
 
     server.stop().await;
 }
