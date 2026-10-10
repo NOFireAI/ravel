@@ -1723,8 +1723,8 @@ isolating retries specifically would need a separate counter this does not
 add. The connector wraps the default reqwest client and delegates unchanged,
 so `RetryConfig` and every retry behavior above stay exactly as documented:
 this observes the loop, it does not alter it. A backend that issues no HTTP
-(`MemoryStore`) leaves `attempts` at zero. `ravel-server` exports it as `ravel_store_attempts_total`
-beside `ravel_store_calls_total`.
+(`MemoryStore`) leaves `attempts` at zero. `ravel-server` exports it as
+`ravel_store_attempts_total` beside `ravel_store_calls_total`.
 
 The decorator also counts, store-wide, every unaddressable key and common
 prefix a successful listing skipped: `page.unaddressable` for `list` and
