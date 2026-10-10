@@ -23,6 +23,7 @@ _SUMMARISER = os.path.join(_HERE, "bench", "s3-envelope.py")
 _ENVELOPE = os.path.join(_ROOT, "bench", "baselines", "s3-envelope.json")
 _GUIDE = os.path.join(_ROOT, "docs", "guides", "cost-model.md")
 _WORKFLOW = os.path.join(_ROOT, ".github", "workflows", "bench-s3.yml")
+_REPORT_RS = os.path.join(_ROOT, "crates", "ravel-bench", "src", "report.rs")
 
 
 def _load_module(name, path):
@@ -146,6 +147,15 @@ class CommittedEnvelope(unittest.TestCase):
             sorted(n for n, _r, _p, k in bench_s3_compare.FIGURES if k == "exact"),
             ["ingest.accepted_points", "query.matched_series", "s3_requests.put"],
         )
+
+    def test_envelope_workload_keys_match_the_report_struct(self):
+        # The compare refuses on any workload key one side has and the other
+        # lacks, so a field added to WorkloadShape must re-record the envelope.
+        with open(_REPORT_RS, encoding="utf-8") as fh:
+            body = re.search(r"pub struct WorkloadShape \{(.*?)\n\}", fh.read(), re.S).group(1)
+        fields = re.findall(r"^\s*pub (\w+):", body, re.M)
+        self.assertEqual(len(fields), 6)
+        self.assertEqual(sorted(fields), sorted(_envelope_doc()["environment"]["workload"]))
 
     def test_meta_stamps(self):
         doc = _envelope_doc()
@@ -298,6 +308,8 @@ class Compare(unittest.TestCase):
         self.assertEqual(res.returncode, 2)
         self.assertIn("not a comparison", res.stderr)
         self.assertIn("`region`", res.stderr)
+        self.assertIn("::warning::bench-s3-compare: not a comparison", res.stdout)
+        self.assertIn("`region`", res.stdout)
 
     def test_a_different_workload_field_refuses_naming_it(self):
         report = _latest_report()

@@ -173,6 +173,12 @@ for name in volume_gb max_minutes sample_size warmup measure max_series; do
   [[ "$(value "$name")" =~ ^[0-9]+$ ]] || die64 "--${name//_/-} must be a whole number, got $(value "$name")"
 done
 [ "$V_max_minutes" -gt 0 ] || die64 "--max-minutes must be at least 1, got $V_max_minutes"
+# Both paths are first used after the launch, so a bad one would cost a paid run.
+{ [ -f "$V_identity_file" ] && [ -r "$V_identity_file" ]; } \
+  || die64 "--identity-file is not a readable file: $V_identity_file"
+out_dir="$(dirname -- "$V_out")"
+{ [ -d "$out_dir" ] && [ -w "$out_dir" ]; } \
+  || die64 "--out directory does not exist or is not writable: $out_dir"
 
 REGION="$V_region"
 CONFIRM_ATTEMPTS="${FRESH_BOX_CONFIRM_ATTEMPTS:-20}"

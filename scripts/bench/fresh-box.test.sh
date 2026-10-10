@@ -11,6 +11,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="${FRESH_BOX_SCRIPT:-$HERE/fresh-box.sh}"
 TEST_BASH="${FRESH_BOX_TEST_BASH:-bash}"
 TMP="$(mktemp -d)"
+: >"$TMP/key.pem"
 trap 'rm -rf "$TMP"' EXIT
 
 fails=0
@@ -70,7 +71,7 @@ case "$*" in
     echo "LABEL: ${label[0]}" >>"$STUB_LOG"
     [ -n "${STUB_FAIL_BENCH:-}" ] && exit 1
     ;;
-  *" nproc") echo 8 ;;
+  *" nproc") if [ -n "${STUB_BAD_NPROC:-}" ]; then echo "Welcome to the instance"; else echo 8; fi ;;
   *" uname -m") echo x86_64 ;;
 esac
 exit 0
@@ -106,6 +107,7 @@ fresh_box() {
   out="$(env -i PATH="$STUBS:/usr/bin:/bin" HOME="$TMP" STUB_LOG="$log" \
     STUB_STATE="${STUB_STATE:-}" STUB_FAIL_BENCH="${STUB_FAIL_BENCH:-}" \
     STUB_LAUNCH="${STUB_LAUNCH:-}" STUB_LOOKUP_FAIL="${STUB_LOOKUP_FAIL:-}" \
+    STUB_BAD_NPROC="${STUB_BAD_NPROC:-}" \
     FRESH_BOX_CONFIRM_ATTEMPTS=2 FRESH_BOX_CONFIRM_SLEEP=0 FRESH_BOX_LOOKUP_ATTEMPTS=2 \
     FRESH_BOX_REACH_ATTEMPTS=2 FRESH_BOX_REACH_SLEEP=0 \
     "$TEST_BASH" "$SCRIPT" "$@" 2>&1)"
@@ -286,6 +288,48 @@ fi
 # --- a failing step's own exit code is reported as 1 ---
 STUB_FAIL_BENCH=1 fresh_box midfail-code "${ARGS[@]}"
 if [ "$code" -ne 1 ]; then fail failure-code "exit $code, want 1"; else pass failure-code; fi
+
+# --- unusable --identity-file or --out directory exits 64 before any launch ---
+with_arg() { # with_arg FLAG VALUE: ARGS with FLAG's value replaced
+  local out=() i
+  for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    out+=("${ARGS[$i]}")
+    if [ "${ARGS[$i]}" = "$1" ]; then out+=("$2"); i=$((i + 1)); fi
+  done
+  WITH=("${out[@]}")
+}
+with_arg --identity-file "$TMP/no-such-key.pem"
+fresh_box bad-key "${WITH[@]}"
+if [ "$code" -ne 64 ] || [ -s "$log" ] || ! printf '%s\n' "$out" | grep -q -- '--identity-file is not a readable file'; then
+  fail bad-identity-file "exit $code, stubs: $(cat "$log"), out: $out"
+else
+  pass bad-identity-file
+fi
+with_arg --out "$TMP/no/such/dir/out.json"
+fresh_box bad-out "${WITH[@]}"
+if [ "$code" -ne 64 ] || [ -s "$log" ] || ! printf '%s\n' "$out" | grep -q -- '--out directory does not exist or is not writable'; then
+  fail bad-out-dir "exit $code, stubs: $(cat "$log"), out: $out"
+else
+  pass bad-out-dir
+fi
+
+# --- remote nproc that is not a core count fails the run and still terminates ---
+STUB_BAD_NPROC=1 fresh_box bad-nproc "${ARGS[@]}"
+if [ "$code" -ne 1 ] || ! printf '%s\n' "$out" | grep -q "remote nproc printed 'Welcome to the instance'"; then
+  fail bad-nproc "exit $code, out: $out"
+elif ! grep -q '^aws ec2 terminate-instances' "$log"; then
+  fail bad-nproc "no terminate call"
+else
+  pass bad-nproc
+fi
+
+# --- ssh never writes the instance's host key into the operator's known_hosts ---
+fresh_box known-hosts "${ARGS[@]}"
+if ! grep -q '^ssh ' "$log" || grep '^ssh ' "$log" | grep -v -q 'UserKnownHostsFile=/dev/null'; then
+  fail known-hosts "an ssh call without UserKnownHostsFile=/dev/null"
+else
+  pass known-hosts
+fi
 
 # --- each run gets a fresh run id ---
 fresh_box dry-a --dry-run "${ARGS[@]}"

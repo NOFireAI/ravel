@@ -187,6 +187,8 @@ def main(argv=None):
         lines, warnings = compare(envelope_doc, report)
     except NotAComparison as exc:
         print(f"bench-s3-compare: not a comparison: {exc}", file=sys.stderr)
+        # On stdout too, as an annotation, so a refused pair is visible in the run.
+        print(f"::warning::bench-s3-compare: not a comparison: {exc}")
         return 2
     mode = "enforcing" if args.enforce else "advisory"
     print(f"bench-s3-compare ({mode}): {args.report} against {args.envelope}")
