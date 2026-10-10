@@ -767,10 +767,11 @@ enum Command {
         /// (ADR-2677 decision 1), so the next query resolves the loaded hours
         /// from the snapshot instead of listing them. UNSAFE under a live
         /// writer: the loader asserts that it is the tenant's only writer and
-        /// seals through the latest ingest hour it wrote, so a commit another
-        /// writer publishes into a sealed hour is not picked up by a later
-        /// incremental fold and stays invisible to queries without a commit
-        /// token until the HEAD is rebuilt. Logs only: a metrics or spans load
+        /// seals through the latest ingest hour it wrote. Later folds keep those
+        /// hours open to late commits only until the seal margin passes each
+        /// one, so a commit another writer publishes into a sealed hour after
+        /// that, or with no fold running before then, stays invisible to
+        /// queries without a commit token until the HEAD is rebuilt. Logs only: a metrics or spans load
         /// with this flag is refused before any row is read or written.
         ///
         /// Before it reads any row, the load is refused when the logs catalog
@@ -785,7 +786,8 @@ enum Command {
         /// the HEAD it left and checks that every commit it wrote is in it, as
         /// a level-0 entry or replaced by a compaction or rewrite whose parts
         /// the snapshot holds. A commit missing from it (for example because
-        /// another fold sealed its hour while the load was writing), or a HEAD
+        /// another fold sealed its hour while the load was writing and the
+        /// seal margin passed that hour before the load's own fold), or a HEAD
         /// or part that cannot be read for the check, also fails the load,
         /// naming the hours and up to ten of the missing commits, or saying
         /// the check could not be made. The check's time is part of the
@@ -1966,12 +1968,14 @@ enum CatalogCommand {
         /// be folded completely now instead of once the margin has passed its
         /// last hour. The fold's clock is not moved; the report's
         /// `seal_through_hour` names the hour applied. Combines with
-        /// `--max-flush-lifetime`. UNSAFE under a live writer: a commit record
-        /// published into a bucket this fold already sealed is not picked up
-        /// by a later incremental fold, whose reconcile window re-lists hours
-        /// below the watermark but skips a bucket holding only level-0 commit
-        /// records, and stays invisible to queries that carry no commit token
-        /// until the HEAD is rebuilt. Use this only for a tenant known
+        /// `--max-flush-lifetime`. UNSAFE under a live writer: later folds keep
+        /// each sealed hour open to late commits only until the seal margin
+        /// passes it, so a commit record published into a sealed bucket after
+        /// that, or with no fold running before then, is not picked up by a
+        /// later fold, whose reconcile window re-lists hours below the
+        /// watermark but skips a bucket holding only level-0 commit records,
+        /// and stays invisible to queries that carry no commit token until
+        /// the HEAD is rebuilt. Use this only for a tenant known
         /// quiescent, such as one whose bulk load has finished and whose
         /// writer process has exited.
         #[arg(long)]
