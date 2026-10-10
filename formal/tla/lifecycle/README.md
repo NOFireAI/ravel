@@ -202,10 +202,7 @@ predecessor, only for a raw-input one: it matters for a predecessor that is
 itself a published record set, whose content an earlier publish wrote. That
 case is now reachable (issue #1221). `Predecessors("rwB")` is the compaction
 output, so a compaction followed by a rewrite over the resulting set reads a
-body no `Init` wrote. Before the compaction action existed, `RewriteOut`
-named exactly one object whose predecessors were fixed to `RawInputs`, and
-the read had no reachable witness in `smoke.cfg`, `exhaustive.cfg`, or any
-other configuration in this area. The read is written the way
+body no `Init` wrote. The read is written the way
 `resolve_live_inputs` actually behaves (re-list and read current content)
 rather than the narrower thing this finite model happens to be able to
 observe.
@@ -514,9 +511,7 @@ exactly at `MaxClock` can never clear, because `Tick`'s own guard requires
 Both properties are now stated as explicit antecedents grounded in the real
 enabling condition of the action each is waiting on, instead of a quiescence
 hypothesis. Neither antecedent includes the condition its own awaited action
-negates as a side effect (a later review, issue #1122, found the first
-attempt at this restatement still included that condition, making the
-leads-to trivially true regardless of whether the action ever fired):
+negates as a side effect:
 
 - `EventuallySwept`: for each object a publish can supersede (the raw inputs
   and the compaction output), if `SupersededSweep`'s own guard,
@@ -534,20 +529,13 @@ leads-to trivially true regardless of whether the action ever fired):
   point on, `.done` eventually exists. `.done`'s absence is excluded for the
   same reason: writing `.done` is `CompleteErasure`'s own effect.
 
-An earlier round did not run the exhaustive configuration, which is why the
-per-property runs below exist; that configuration is now run directly and its
-figures are in `results.md`. Those runs took each property alone against the real, non-quiescent `Next` (all
-four environment actions present and still unfair), in a cfg scoped to
-`TypeOK` plus that one property: both `EventuallySwept` and
-`EventuallyCompleted` pass at `MaxClock = 2` under this reduced configuration
-(exact TLC output recorded in `results.md`). `EventuallySwept`'s restated form
-was additionally confirmed at `MaxClock = 4` against a quiescent diagnostic
-variant (see `results.md`); the full non-quiescent model was not re-run at
-`MaxClock = 4` in this task because its state space grew past what this task's
-reduced-configuration budget and host memory should spend, and doing so would
-edge into the exhaustive-scale run this task is forbidden from running. The
-README claims only what the smoke, negative, traceability, and these reduced
-liveness runs actually showed.
+`results.md` records per-property runs that took each property alone
+against the real, non-quiescent `Next` (all four environment actions present
+and still unfair), in a cfg scoped to `TypeOK` plus that one property: both
+`EventuallySwept` and `EventuallyCompleted` pass at `MaxClock = 2` under this
+reduced configuration. `EventuallySwept`'s restated form was additionally
+confirmed at `MaxClock = 4` against a quiescent diagnostic variant; the full
+non-quiescent model has not been run to completion at `MaxClock = 4`.
 
 ## Running
 
@@ -564,17 +552,8 @@ scripts/check-tla.sh traceability -a lifecycle   # every source ref resolves
 `FairSpec`. It is run by the `all` lane, not by `ci`, and its measured figures
 are in `results.md` and `bands.tsv`.
 
-Its clock bound moved from `MaxClock = 3` to `MaxClock = 2` in round eight.
-Adding the compaction pass and the second rewrite identity grew the reachable
-graph by about a factor of 75 at a fixed bound, and `MaxClock = 3` no longer
-completes inside the lane's 3600 second budget. `MaxClock = 2` completes the
-full graph. Round eight reached depth 31 at this bound; round nine's
-first-supersession-stamp fix let the states after a sweep be reached in fewer
-steps and brought the complete search to depth 30, still deeper than the depth
-22 the previous bound reached, because the two-step passes and the lease expiry
-add steps to every behaviour. That is the same clock bound `smoke.cfg` uses, so
-the two lanes now explore the same state graph and what `exhaustive.cfg` adds is
-the liveness lane alone.
+It uses the same clock bound as `smoke.cfg`, so the two lanes explore the same
+state graph and what `exhaustive.cfg` adds is the liveness lane alone.
 
 Round thirteen moved both lanes from `MaxClock = 2` to `MaxClock = 1`. The open
 ingest bucket (issue #1411) added three variables, which multiplied the reachable

@@ -1,7 +1,7 @@
 # MetricsBench comparator deployments
 
 Checked-in, digest-pinned deployments of the cross-engine comparators for the
-MetricsBench metrics benchmark (ADR-0927, issue #934). These are the systems the
+MetricsBench metrics benchmark (ADR-0927). These are the systems the
 MetricsBench harness (`crates/ravel-bench`) measures Ravel against in the
 **portable lane**: Prometheus Remote Write 1.0 for ingest, the Prometheus HTTP
 query API for reads. Every system here receives the same logical samples and the
@@ -73,14 +73,9 @@ docker compose -f deploy/metricsbench/docker-compose.yml down -v
 deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
 ```
 
-Originally scoped to this directory's compose file alone (issue #934), the
-script now also checks the two repo-wide supply-chain pins issue #1310 added,
-plus the quickstart compose files issue #1720 added: every `FROM`/`ARG` base
-image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
-reference under `.github/workflows/` and `.github/actions/`, and every
-`image:` reference in `deploy/docker-compose/ravel.yml` and
-`deploy/docker-compose/rustfs.yml`. All six categories run in one invocation
-and each is checked against its own expected count:
+Besides this directory's compose file, the script checks image and action
+pins across the repository. All six categories run in one invocation and each
+is checked against its own expected count:
 
 - **Compose images** (this directory): every image reference carries an
   `@sha256:` digest, every ADR-0927-required comparator is present, and the
@@ -181,30 +176,9 @@ curl -sI -H "Authorization: Bearer <TOKEN>" \
 The tag is kept in each `image:` reference alongside the digest for human
 readability; the digest is what pins the run.
 
-### Pins shared with deploy/docker-compose/ravel.yml and rustfs.yml (issue #1720)
+### Pins shared with deploy/docker-compose/ravel.yml and rustfs.yml
 
-The two quickstart compose files (`deploy/docker-compose/ravel.yml` and
-`deploy/docker-compose/rustfs.yml`) are scanned by the same script as its
-fourth category (see above), so their pins are recorded here too. The RustFS
-and AWS CLI pair is the exact same tag and digest this directory already uses
-above, and is identical across both quickstart files (`rustfs.yml` is
-`ravel.yml`'s standalone object-store mirror); the other two are
-`ravel.yml`-only.
-
-| Image | Tag | Digest |
-|---|---|---|
-| `ghcr.io/rustfs/rustfs` | `1.0.0` | `sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff` |
-| `public.ecr.aws/aws-cli/aws-cli` | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
-| `ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib` | `0.160.0` | `sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6` |
-| `grafana/grafana` | `13.2.2` | `sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0` |
-
-See `deploy/README.md` for why these four registries were chosen.
-
-## Note on the acceptance check name
-
-Issue #934 names the acceptance test
-`metricsbench::deploy::tests::every_comparator_pins_an_image_digest`, a Rust test
-path. That contradicts the issue's own scope line ("touches no crate"), and the
-crate it would live in is being edited by a parallel task. The check is therefore
-implemented as the dependency-free script
-`tests/every_comparator_pins_an_image_digest.sh`, preserving the name exactly.
+The two quickstart compose files are scanned by the same script as its fourth
+category (see above). Their RustFS and AWS CLI pins are the same tag and digest
+as the ones above. `deploy/README.md` lists all four of their pins and why
+these registries were chosen.

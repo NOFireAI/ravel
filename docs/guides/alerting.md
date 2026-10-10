@@ -613,8 +613,7 @@ lists each reason and where to look for its remedy.
 To change the window, set `--alert-retention`:
 
 - If you need more history, set a longer window before you upgrade.
-- To keep every transition forever, set `--alert-retention 0`. Deployments
-  did this before the sweep existed.
+- To keep every transition forever, set `--alert-retention 0`.
 - Startup refuses a nonzero window shorter than one hour plus the seal margin
   of the memo. The seal margin is three evaluation intervals plus the query
   deadline, so the minimum is 1 h 3 m 30 s at the defaults. Under a shorter

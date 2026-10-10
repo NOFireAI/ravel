@@ -1222,10 +1222,6 @@ ravel-cli load ... --batch-rows 100000 --target-bytes 1850000000 \
   --max-flush-delay 30s --pipeline-depth 32 --load-memory-bytes 6500000000
 ```
 
-For comparison, an earlier loader without the memory budget, at
-`--batch-rows 1000000` and the default `--target-bytes`, took 1,461 s at a
-26.3 GB peak loader RSS for objects of about 25 MB.
-
 Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
@@ -1318,17 +1314,10 @@ roughly the budget plus the floor, plus whatever the object store holds:
 `--store memory` keeps every written object in the process, so a
 memory-store load grows past the budget with the data it writes.
 
-Measured on ClickBench `hits.parquet` with the
-[measured recipe](#measured-recipe-for-large-objects) above
-(`--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s`)
-into S3-compatible storage, the peak loader RSS was 7.03 GB under a
-6,500,000,000-byte budget at `--pipeline-depth 32`, and 1.95 GB under a
-1,200,000,000-byte budget at `--pipeline-depth 16` on a 4 GB host, where
-the peak charge reached 1,198,284,910 bytes and the decoder waited 187
-times. Under the 6,500,000,000-byte budget at depth 32, a 1,650,000,000
-target peaked at 6.42 GB, so size a host from the run whose target you
-use. The recipe
-section has the other runs.
+The [measured recipe](#measured-recipe-for-large-objects) above gives the
+peak loader RSS of each run against its budget. On the 4 GB host, under a
+1,200,000,000-byte budget, the peak charge reached 1,198,284,910 bytes.
+Size a host from the run whose target and depth you use.
 
 A metrics or spans load ignores `--load-memory-bytes` and warns when it is
 set.

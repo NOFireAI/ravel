@@ -8,8 +8,7 @@
 # test path, but its own scope line says the task touches no crate, and the
 # crate that path would live in (crates/ravel-bench) was edited by a parallel
 # task. This is that check implemented instead as a dependency-free script
-# under deploy/metricsbench/, preserving the name exactly. The deviation is
-# recorded in README.md.
+# under deploy/metricsbench/, preserving the name exactly.
 #
 # Issue #1310 generalised it into a repo-wide pin check, on the same rationale:
 # a moving tag or a mutable action ref is unreproducible and unauditable

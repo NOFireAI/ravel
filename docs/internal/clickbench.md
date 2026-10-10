@@ -499,15 +499,9 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 - `--sql-parallel-final-aggregation` lets an exact-typed query repartition its
   final aggregation (ADR-0094, amended by issue #741), the same knob as the
   server flag of that name. On by default; a `GROUP BY` or `COUNT(DISTINCT)`
-  over a high-cardinality key is where it shows. With the flag off, nine such
-  statements failed with a pool-exhausted error; with it on, **five of those
-  nine** (`COUNT(DISTINCT UserID)` and four more) moved to 44-50 s, while the
-  other **four (q29, q33, q34, q35) still exhausted the pool** at that time
-  for a separate reason (see the ADR-0094 2026-08-26 amendment and its "still
-  excluded" note); since the per-query pool derives at the tenant's share
-  (ADR-2414 B1) all four run in the stock configuration on the reference box.
-  Pass `--sql-parallel-final-aggregation=false` to measure the pre-amendment
-  single-partition final; the bare flag stays accepted and still means on. This
+  over a high-cardinality key is where it shows. Pass
+  `--sql-parallel-final-aggregation=false` to measure the single-partition
+  final; the bare flag stays accepted and still means on. This
   local value is recorded in the report's provenance as
   `parallel_final_aggregation_requested`; for an in-process (`--tenant`) run it
   is also the effective value (`parallel_final_aggregation_effective`), but a
@@ -556,11 +550,9 @@ cargo run --release -p ravel-bench --features sql-latency,profiling --bin sql_la
   --runs 1 --compaction pre --window-hours 200000
 ```
 
-The `RUSTFLAGS` is not optional decoration. A release build omits frame
-pointers, and without them the unwinder cannot walk out of inlined generic code:
-Ravel's own hot path lands in `[unknown]`. One such profile put 33.95% of
-samples there and sent a merge after the wrong call site; the same workload
-rebuilt with the flag measured 0.00% and named the real hot frame (issue #884).
+The `RUSTFLAGS` is required. A release build omits frame pointers, and
+without them the unwinder cannot walk out of inlined generic code: Ravel's own
+hot path lands in `[unknown]`.
 From `crates/ravel-bench/` the cargo alias `cargo profile-build` sets the flag
 for you; from the workspace root, as above, pass it yourself.
 
@@ -892,23 +884,13 @@ holds **all 43** statements; the gap list is empty (enforced by
 `crates/ravel-bench/tests/clickbench_corpus.rs`, which fails if any of the 43 is
 neither in the corpus nor listed as a gap).
 
-There are currently no known gaps.
-
-**`LIKE` / SQL pattern matching** used to block Q21-Q24 and is now supported
-(issue #479): `col LIKE 'pattern'` / `NOT LIKE` with `%`/`_` wildcards is
+**`LIKE` / SQL pattern matching** (Q21-Q24): `col LIKE 'pattern'` / `NOT LIKE` with `%`/`_` wildcards is
 evaluated by the Ravel `like` UDF (`crates/ravel-sql/src/like_udf.rs`), which
 matches a declared `Str` column's dictionary once per distinct value and leaves
 `body` (plain `Utf8`) on a row-wise path. It is case-sensitive and pushes down
 nothing: substring `LIKE` is not a sound superset of the RLOG reader's exact
 `HasWord`/`Equals` predicates, so it is evaluated exactly over the scanned rows.
 Ravel also offers token search (`has_word`) and `regexp_replace`.
-
-Q28/Q29 (`AVG(length(...))`) were also blocked, but that gap was bookkeeping,
-not capability: `length` was already admitted by the SQL engine, just not
-enumerated as a named construct in `ravel_sql::conformance::registry()` (the
-registry attests scalar functions by family representative and did not yet
-have an individual row for `length`). Issue #480 added that row; Q28 and Q29
-now run as ordinary corpus entries.
 
 ## Modified statements
 

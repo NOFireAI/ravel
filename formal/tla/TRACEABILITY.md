@@ -20,9 +20,7 @@ Total: 137 traceability rows across the suite.
 
 Every row still lacking a test, gathered from each area's `traceability.md`
 and tagged by area, the Rust path the row cites, and the reason no test
-covers it. Wave R6 (crates/ravel-object-store, ravel-failure-tests,
-ravel-catalog, ravel-maintain, ravel-ingest, ravel-fleet, services/ravel-cli
-regression tests) closed every other row that previously appeared here.
+covers it.
 
 ### lifecycle (1 row, test gap)
 

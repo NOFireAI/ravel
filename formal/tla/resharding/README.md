@@ -81,8 +81,8 @@ true ratio simultaneously: `C = 1` (minute), `MinLeadHours = L = 120`
 (minutes), `AppenderSkew = 60` (minutes). This is the only config in the repo
 where none of those three is rounded onto another's scale.
 
-That config was run this session and found **intractable within the
-executor's probe budget** (killed at depth 14 by an internal 280 s timeout,
+That config was found **intractable within the probe budget** (killed
+at depth 14 by an internal 280 s timeout,
 14.1M distinct states found and still growing, 10M+ states left on queue —
 see results.md for the full figures). It is checked in as a real, runnable
 config for a longer-budget run, not as a passing or failing check: no
@@ -99,7 +99,7 @@ at the same non-decaying growth rate before being stopped, with no sign of
 converging. This rules out the specific 60-unit encoding, or the two-writer
 dimension, as the cause: the blow-up is structural to modeling any nonzero
 `AppenderSkew` at all, at any sub-hour granularity. Every `AppenderSkew > 0`
-config tried this session, regardless of purpose or dimensions, showed the
+config tried, regardless of purpose or dimensions, showed the
 same shape (see results.md's Finding B for two more instances, from the
 `FlushBound` mutant search). **No gated configuration exercises
 `TOLERATED_CLOCK_SKEW_HOURS` at the shipped refresh interval; this is stated
@@ -161,8 +161,8 @@ scripts/check-tla.sh traceability -a resharding
 
 The smoke run is a symmetry-reduced safety check sized to finish in well under
 a minute. The negative run confirms each control in `negative/` breaks the
-property its `.expect` names. `exhaustive.cfg` is written for the orchestrator
-and is deliberately not run by the executor; see results.md.
+property its `.expect` names. `exhaustive.cfg` runs in the nightly exhaustive
+lane (`scripts/check-tla.sh exhaustive`); see results.md.
 
 ## What a green run does and does not claim
 

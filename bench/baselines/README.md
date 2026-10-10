@@ -43,10 +43,7 @@ Each baseline file carries a `_meta.label` naming the environment it was
 recorded on. A criterion timing number only means something relative to a
 baseline taken on the same hardware under the same load. This repository has
 no self-hosted reference runner and will not get one, so every baseline is
-recorded by hand on a machine the recorder names. What makes one usable is
-not which machine it came from but whether the machine and the rest of the
-provenance are stamped into it, and whether the comparison run uses the same
-machine.
+recorded by hand on a machine the recorder names.
 
 A hand-recorded baseline is only usable for a comparison once five things are
 stamped into it, in the `_meta.label` text or a `_meta` field:

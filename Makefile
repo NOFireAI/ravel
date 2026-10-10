@@ -11,9 +11,9 @@ clippy:
 test:
 	cargo test --workspace
 
-# Unit tests for scripts/process_metrics.py (SP0), which had no runner at all
-# (ADR-0053 decision 6). stdlib unittest rather than pytest: the script and its
-# tests deliberately take no third-party dependency, and CI has no Python
+# Unit tests for the Python scripts under scripts/ (ADR-0053 decision 6).
+# stdlib unittest rather than pytest: the scripts and their tests
+# deliberately take no third-party dependency, and CI has no Python
 # environment beyond the interpreter. Run from scripts/ so the tests'
 # `from process_metrics import ...` resolves without a package layout.
 # Supported interpreter floor: Python 3.9 or newer (fleet executors run
@@ -29,15 +29,15 @@ test-hygiene:
 	bash scripts/guards/check-test-hygiene.test.sh
 	./scripts/guards/check-test-hygiene.sh
 
-# Derived counts in docs/query-engine.md's generated conformance block
-# (ADR-0053 decision 6). No build, so it is cheap enough to run before a
-# commit; the full regeneration lives in ravel-promql-difftest's
-# conformance_table test.
 # Regenerate docs/explorer/stats.js (per-crate counts and the dependency
 # graph the explorer page aggregates); commit it with any docs/explorer change.
 archmap:
 	python3 scripts/archmap/gen_stats.py
 
+# Derived counts in docs/query-engine.md's generated conformance block
+# (ADR-0053 decision 6). No build, so it is cheap enough to run before a
+# commit; the full regeneration lives in ravel-promql-difftest's
+# conformance_table test.
 doc-drift:
 	./scripts/check-doc-drift.sh
 

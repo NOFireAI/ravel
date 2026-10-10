@@ -1,9 +1,8 @@
-# Frame-pointer profiling build for ravel-bench (issue #884).
+# Frame-pointer profiling build for ravel-bench.
 #
 # A release build omits frame pointers, so `perf --call-graph dwarf` (and
 # pprof's unwinder) fail to unwind inlined generic code and attribute Ravel's
-# own hot path to `[unknown]`. That produced a false negative (#847) and then
-# hid the true positive (#876/#881). This alias makes a profiling build carry
+# own hot path to `[unknown]`. This alias makes a profiling build carry
 # `-C force-frame-pointers=yes` so an operator does not have to remember the
 # RUSTFLAGS incantation.
 #

@@ -137,13 +137,6 @@ stop changing. They also require the retention windows of the fold and of
 the sweep to agree. A permanently wedged hold or a disagreeing window makes
 both properties false. That result is by design and is not a defect.
 
-Three follow-ups stay open:
-
-- Issue 1221 tracks the unreached rewrite-of-rewrite case.
-- Issue 1243 tracks extending the traceability checker to accept more than
-  one Rust reference per row.
-- Issue 1244 tracks two wording fixes to the suite report.
-
 ## Run the suite
 
 Install a Java 17 or later runtime before you run the smoke, negative, or

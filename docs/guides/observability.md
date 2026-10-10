@@ -1107,7 +1107,7 @@ Labels: `mode`.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_shutdown_drain_overrun_total` | Graceful shutdowns this process ran past `--shutdown-timeout`, monotonic. Set only on the branch where the drain's outer timeout elapsed, never unconditionally after the timeout call. The same overrun also logs an ERROR (`main.rs`'s `graceful shutdown did not complete cleanly`, logged when `Running::shutdown` returns `Err`). See [Reachability during shutdown](#reachability-during-shutdown) below for when a scrape can see this change. |
+| `ravel_shutdown_drain_overrun_total` | Graceful shutdowns this process ran past `--shutdown-timeout`, monotonic. The same overrun also logs an ERROR, `graceful shutdown did not complete cleanly`. See [Reachability during shutdown](#reachability-during-shutdown) below for when a scrape can see this change. |
 
 #### Reachability during shutdown
 

@@ -1449,8 +1449,8 @@ including a loopback one.
 | Cold time | 52% less, with a per-rep range of 50.3% to 54.2% |
 
 That ratio is a measurement of two code paths on one build, not a property of
-the policy. It has already moved once as the cost-based side changed. The
-decision record for the fetch objective names the build that it was taken on.
+the policy. The decision record for the fetch objective names the build that
+it was taken on.
 Measure again on the build that you run, and do not treat the ratio as a
 constant.
 
