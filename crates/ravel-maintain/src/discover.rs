@@ -9,14 +9,8 @@
 //! source of truth to drift from what is actually durable (ADR-0048 rejected
 //! alternative 2).
 //!
-//! The store adapter classifies the tenant prefixes it lists (ADR-2637): a
-//! prefix no request reaches unchanged is reported in the listing's
-//! `unaddressable_prefixes`, warned about by the store and, through
-//! `InstrumentedStore`, counted in `ravel_store_list_unaddressable_total`,
-//! before [`discover_tenants`] sees
-//! it, so it is skipped rather than failing discovery.
-//! [`MaintainError::InvalidTenantPrefix`] covers only an addressable prefix
-//! that is not 32 hex characters.
+//! The store adapter classifies the tenant prefixes it lists (ADR-2637);
+//! [`discover_tenants`] says what that leaves for discovery to refuse.
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
