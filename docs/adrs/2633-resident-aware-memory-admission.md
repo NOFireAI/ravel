@@ -141,13 +141,14 @@ the mechanism:
 ```mermaid
 flowchart TD
     S["Sampler thread wakes every --memory-gate-interval-ms"] --> E["epoch::advance, read stats.resident"]
-    E --> G["Set ravel_memory_gate_resident_bytes"]
-    G --> C{"resident at or above the mark?"}
-    C -- no --> O["Gate OPEN"]
+    E --> C{"resident at or above the mark?"}
+    C -- no --> G["Set ravel_memory_gate_resident_bytes to the reading"]
+    G --> O["Gate OPEN"]
     C -- yes --> P["Forced purge: each arena's decay_ms set to 0, then restored"]
     P --> PC["ravel_memory_gate_purges_total plus 1"]
     PC --> R["epoch::advance, re-read stats.resident"]
-    R --> C2{"still at or above the mark?"}
+    R --> G2["Set ravel_memory_gate_resident_bytes to the re-read"]
+    G2 --> C2{"still at or above the mark?"}
     C2 -- no --> O
     C2 -- yes --> X["Gate CLOSED"]
     O --> S
@@ -194,8 +195,10 @@ returns its own typed refusal, and owns the count behind
 The 100 ms default is set by the burst slope: at the measured 0.4 GB/s, one
 interval lets about 40 MB of growth go unseen, small against the slack in
 section 2. An epoch refresh merges per-arena statistics and costs tens of
-microseconds on this host's arena count, so the sampler costs well under
-0.1 % of one core; the implementation measures and stamps it (task 2).
+microseconds on this host's arena count, so the epoch refresh costs well
+under 0.1 % of one core. That figure excludes the purge, which runs on the
+same thread and is bounded separately (section 2 and the acceptance test);
+the implementation measures and stamps both (task 2).
 
 ### 2. A forced purge at the high-water mark, and the default mark
 
@@ -239,7 +242,11 @@ Accounted growth stops when the gate closes: `try_reserve` refuses, and an
 infallible `grow` trips a breach that ends its query on the next poll. G is
 the part no ledger sees. The acceptance band is B + S with S = 512 MiB
 (0.54 GB), the `NON_BUDGET_BASELINE_BYTES` baseline plus as much again for
-sampling and measurement error. For the 8 GB run:
+sampling and measurement error. O and S both include that baseline, so the
+bound counts it twice; that lowers the mark, which is the safe direction.
+The bound also assumes no reservation is charged ahead of the pages that back
+it; in every measured run `allocated` stays above the accounted total. For
+the 8 GB run:
 
 ```text
 M <= B + S - D - G - O = 8.00 + 0.54 - 0.06 - 2.48 - 0.27 = 5.73 GB = 0.716 B
@@ -252,8 +259,10 @@ takes the conservative figure, because the serial pass is a state the
 process really reaches: the largest whole-five-percent fraction under 0.716
 is 70 %, a mark of 5.6 GB, which leaves 0.13 GB for an O or G larger than
 estimated. 75 % (6.0 GB) overshoots the band by 0.27 GB in the same bound.
-The derivation assumes the hold is in the binary: with the baseline's
-4.46 GB maximum from before it, the same bound gives 3.75 GB.
+The derivation assumes the hold is in the binary, or a DataFusion whose
+default aggregation keeps the emitted batch reserved (55.x does; see
+apache/datafusion#26165): with the baseline's 4.46 GB maximum from before
+the hold, the same bound gives 3.75 GB.
 
 The mark costs little concurrency on the measured workload. Taking O at
 0.27 GB, the peak allocated figure (VmRSS − O − retention) is at most about
@@ -302,9 +311,17 @@ atomics:
    refuses at once with `MemoryExhausted`, which gains a cause:
    accounted, or resident with the reading and the mark. The existing
    rollbacks run unchanged. A zero-byte reservation is always admitted.
+   The catalog decode charge answers an accounted refusal today with an
+   eviction pass and one retry; a resident-cause refusal skips both, since
+   eviction frees no `resident` before the next sample and the retry would
+   meet the same closed gate, and `decode_reserve_retries` keeps counting
+   eviction passes only.
 3. **`TenantDelegatingPool::grow`.** The infallible path cannot refuse, so a
    closed gate trips its `CeilingBreach`, and the query fails with the 422 on
-   its next poll and releases what it holds.
+   its next poll and releases what it holds. A gate-caused breach carries the
+   resident cause (the reading and the mark), not the "bytes reserved exceeds
+   limit" wording of the ledger breaches, since the ledger is usually far
+   from its limit when the gate closes.
 
 The growth sites refuse rather than wait. `try_grow` is synchronous and runs
 on a tokio worker: blocking there parks the threads whose progress and drops
@@ -381,7 +398,10 @@ Task 4 covers both.
 ADR-1170 is Proposed, so it is not edited by this draft. The implementing
 change (task 5) adds the amendment below at the end of ADR-1170 and the
 inline pointer "see the resident-gate amendment below" to each named section,
-following the "Amending an ADR" convention in the decision-record index. The
+and beside each of the four retired 503 sentences (items 4, 5, 7 and 8) on
+the line before or after it, since `check-amendment-integrity.sh` accepts a
+retired phrase only with the pointer in that window. This follows the
+"Amending an ADR" convention in the decision-record index. The
 sentences it changes, quoted from ADR-1170:
 
 1. Constraints, constraint 4: "The ceiling cannot be RSS. MemTotal and
@@ -511,11 +531,22 @@ connections, 32 GB host, gate at its defaults, three runs.
 - Expected, and a miss to investigate if not met: `ravel_memory_gate_purges_total`
   above 0 in every run; `ravel_memory_gate_refusals_total` at 0, with at most
   1 % of statements refused before the miss counts; p99 purge duration at or
-  below 50 ms; sampler CPU below 0.1 % of one core; O (peak VmRSS minus peak
-  `resident`) at or below 0.27 GB.
+  below 50 ms; epoch-refresh CPU below 0.1 % of one core; purge CPU (p99
+  purge duration times the observed purge rate) at or below 25 % of one
+  core; O (peak VmRSS minus peak `resident`) at or below 0.27 GB. The stamp
+  reports the two CPU figures separately.
+- Throughput, pre-registered against a gate-off arm: on one box with one
+  binary and `--memory-budget-bytes` pinned, three interleaved pairs (ABABAB)
+  of `--disable-memory-gate` against the defaults. The gate-on median qps
+  must be within 5 % of the gate-off median; a larger loss is a miss even
+  when every other criterion passes. The purge is expected to fire on most
+  samples (section 2), and it is more aggressive than the 1 s decay, whose
+  measured 10.9 % qps loss could not be told from noise, so this figure is
+  asserted, not assumed.
 - On a miss, check in this order: the run used the stated budget and the gate
   stamp read enabled at 70 %; O and G as measured against the 0.27 and
-  2.48 GB used to derive the mark; only then the mark itself.
+  2.48 GB used to derive the mark; for a throughput miss, the purge rate and
+  duration; only then the mark itself.
 
 M1-shaped run: 30 GB host, 27 GB budget, the workload that was OOM-killed in
 3 of 3 attempts.
@@ -574,7 +605,8 @@ ravel-server)
   resident reading at or above the mark closes the gate and one below opens
   it; the purge counter counts; the stamp reports each `source`; a
   configuration whose caps reach the mark is refused with a message naming
-  both figures; the gate is off in gateway mode and on a fallback budget.
+  both figures; the gate is off in gateway mode and on a fallback budget;
+  the resident gauge after a purging sample holds the post-purge re-read.
 
 **Task 3: the check sites** (crates: ravel-sql, ravel-query, ravel-server)
 
@@ -593,8 +625,8 @@ ravel-server)
   refusal status after the wait, and runs once the gate opens; a
   spill-capable query that meets a closed gate mid-run spills and returns
   the exact result; an infallible `grow` while closed fails the query with
-  422 and releases its reservations; each site's refusal counter moves by
-  one.
+  422, its message names the resident reading and the mark, and it releases
+  its reservations; each site's refusal counter moves by one.
 
 **Task 4: the fetch and catalog-decode refusals answer 422** (crates:
 ravel-sql, ravel-query, ravel-catalog, ravel-server)
@@ -605,12 +637,14 @@ ravel-sql, ravel-query, ravel-catalog, ravel-server)
   `a_sql_{metrics,logs,spans}_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving`
   tests assert 422 and the new message; a PromQL fetch over the budget
   answers 422; a PromQL query whose catalog decode charge is refused answers
-  422; the server's status-mapping test pins the change; the changelog
-  records the status change.
+  422; a resident-cause decode refusal runs no eviction pass and leaves
+  `decode_reserve_retries` unchanged; the server's status-mapping test pins
+  the change; the changelog records the status change.
 
 **Task 5: documentation** (docs only)
 
-- The ADR-1170 amendment and inline pointers in section 6; the five metrics
+- The ADR-1170 amendment, the inline pointer in each named section and beside
+  each retired 503 sentence (section 6); the five metrics
   in the metrics reference; the four flags in the generated configuration
   page.
 - Acceptance: `scripts/guards/check-amendment-integrity.sh` passes with the
