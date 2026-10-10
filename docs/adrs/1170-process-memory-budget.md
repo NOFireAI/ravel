@@ -150,7 +150,8 @@ counter, because its two consumers account differently:
   (`memory.rs:105-130`) and `TenantDelegatingPool` already forwards every
   DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
   refusal (`memory.rs:264-348`; a held aggregate's shrink is the one
-  exception, see the aggregate hold amendment below); the adapter forwards
+  exception, see the aggregate hold amendment below, until the
+  hold-removal amendment below removes it); the adapter forwards
   each of those to the
   process counter with the same delta, in the same order, so process-level
   bytes track SQL bytes exactly: tenant then process on the way up, process
@@ -1136,4 +1137,18 @@ every query, tenant and process figure the whole time, so the budgets never
 read lower than what is live; they can read higher, by at most the
 aggregate's own peak reservation, from its first shrink until its stream is
 dropped. ADR-0102's aggregate hold amendment records why `can_spill`
-selects it.
+selects it. The hold-removal amendment below removes this hold.
+
+## Amendment (2026-10-10, #2720): the aggregate hold is removed
+
+<!-- amendment-applies: sections="1. `MemoryBudget`, a process-wide accountant|Amendment (2026-10-09, #2633): an aggregate's shrink can be held" pointer="hold-removal amendment" -->
+
+`TenantDelegatingPool` forwards every DataFusion `grow`, `try_grow` and
+`shrink` to the counters 1:1 again, as decision 1 states. DataFusion 55's
+grouped aggregation keeps an emitted batch reserved until the last
+`batch_size` slice is cut from it, so the shrink the hold existed for no
+longer arrives while the output is live, and the budgets no longer read
+above what is reserved. ADR-0102's hold-removal amendment records the one
+exception that remains: a shape DataFusion 55 still runs on its legacy
+`GroupedHashAggregateStream` releases its output's bytes before handing the
+output out.
