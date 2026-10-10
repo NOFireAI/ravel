@@ -285,7 +285,10 @@ assert_single_tenant_universe || true
 log "waiting for worker A to be mid-compaction"
 # Timestamp the kill so the takeover oracle can measure wall-clock against the
 # 3*H + tick bound. `date +%s` is the real clock ADR-0077 section 4 requires.
-if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" 120; then
+# One maintenance tick plus two minutes, so worker A runs at least one pass
+# after its startup pass inside the window.
+INFLIGHT_BUDGET_SECONDS=$(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))
+if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" "$INFLIGHT_BUDGET_SECONDS"; then
   KILL_EPOCH="$(date +%s)"
   sigkill_pid "$WORKER_A_PID"
   log "worker A observed mid-compaction -- SIGKILL issued"

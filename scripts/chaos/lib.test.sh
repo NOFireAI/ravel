@@ -472,6 +472,14 @@ check "classifier: a non-integer line count fails conservation" "1" \
   "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_POST_KILL}" x)"
 check "chaos_line_count counts lines" "2" "$(chaos_line_count "${LOG_B_PRE_KILL}")"
 check "chaos_line_count of a missing file is 0" "0" "$(chaos_line_count "${SCRATCH}/no-such.log")"
+printf 'a\nb' >"${SCRATCH}/no-final-newline.log"
+check "chaos_line_count counts a last line with no newline, as tail -n +N reads it" "2" \
+  "$(chaos_line_count "${SCRATCH}/no-final-newline.log")"
+scenario1_body="$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")"
+check "scenario 1 refuses an unreadable flush baseline rather than reading it as 0" "yes" \
+  "$([[ "${scenario1_body}" != *'FLUSH_BASELINE=0'* && "${scenario1_body}" == *'could not read the flush-attempt baseline'* ]] && echo yes || echo no)"
+check "scenario 2 waits at least one maintenance tick for A to be mid-compaction" "yes" \
+  "$([[ "$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")" == *'INFLIGHT_BUDGET_SECONDS=$(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))'* ]] && echo yes || echo no)"
 scenario2_summary() {
   # Args: A's log, B's log, aborts baseline, an extra failure or "".
   ORACLE_PASS=(other)

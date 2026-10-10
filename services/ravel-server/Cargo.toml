@@ -255,6 +255,12 @@ mcp = [
 # `_RJEM_MALLOC_CONF=prof:true,...` is set at startup.
 heap-profiling = ["tikv-jemallocator/profiling"]
 
+# Examples default to `test = false`; this one carries a test module that
+# pins its no-argument output, which a test target is needed to run.
+[[example]]
+name = "gen_otlp_fixture"
+test = true
+
 [dev-dependencies]
 # Test-only: the MCP end-to-end tests drive the mounted route with a real MCP
 # client rather than a hand-rolled JSON-RPC body, so the negotiation the

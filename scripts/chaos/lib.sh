@@ -1295,9 +1295,9 @@ oracle_no_orphaned_lease() {
 # Prints the number of lines in a log file, or 0 when it is not readable.
 chaos_line_count() {
   if [[ -r "$1" ]]; then
-    local n
-    n="$(wc -l <"$1")"
-    printf '%s\n' "${n//[[:space:]]/}"
+    # awk counts a last line with no newline yet, as `tail -n +N` reads it;
+    # wc -l would not, and the boundary would land one line early.
+    awk 'END { print NR }' "$1"
   else
     printf '0\n'
   fi
