@@ -1148,6 +1148,10 @@ target on-object format version. One invocation:
    the default, is unlimited. Run the command again to resume.
 3. Once the walk drains, re-audits fresh. It raises the floor only if that
    re-audit finds zero records below the target.
+   The raised floor records that re-audit as its basis: the live entries it
+   counted (live L0 commit records plus every compaction and rewrite part),
+   the newest creation time among its records, and the shard range it
+   scanned.
 
 The budget counts records, not requests, so it does not bound how many
 requests one invocation makes. The walk reads the compaction and rewrite
@@ -1483,7 +1487,12 @@ basis and a classification against the records that it just read:
 - `contradicted`: a live record below the floor. The command also exits
   nonzero when any floor is `contradicted`.
 - `unknown`: the floor records no basis, which is true of every floor raised
-  so far.
+  by v0.23.0 or earlier, before `migrate` began recording one.
+
+A floor that `migrate` just raised is `current` until a record newer than its
+basis lands or the shard range grows. A `migrate` run at the version a floor
+already holds writes nothing, so an `unknown` floor stays `unknown` until a
+later run raises that family to a higher version.
 
 Each format supports one version and carries no reader for the previous one.
 Any live object at another version is therefore an anomaly to re-ingest, not a
