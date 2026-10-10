@@ -44,18 +44,22 @@ that replica. Affinity therefore does not isolate a tenant from a per-shard
 object-store stall.
 
 The store applies `503 SlowDown` per key prefix. When the key prefix of one
-tenant is throttled, its stalled flush holds a permit on that shard. The
-flushes of co-resident tenants queue behind it on every replica in the
-subset. A smaller or different subset does not change that. The shard actor
+tenant is throttled, its stalled flushes hold up to
+`--max-inflight-flushes-per-tenant` of the permits on that shard (default 3 of
+4). Once stalled tenants hold every permit, the flushes of co-resident tenants
+queue behind them on every replica in the subset. A smaller or different
+subset does not change that. The shard actor
 keeps running, so the writes of those tenants are still accepted and their
 age triggers still fire. They wait for a permit to flush on.
 
 The control for cross-tenant flush isolation on a shard is
-`max_inflight_flushes` (see [Shard actor](../ingest.md#shard-actor)). The
-subset size and the shard count do not control it. Under the operator, set
-`spec.gateway.maxInflightFlushes` on the `RavelCluster` (see
-[kubernetes.md](kubernetes.md)). It renders `--max-inflight-flushes` onto
-the gateway Deployment and defaults to 1.
+`max_inflight_flushes` together with its per-tenant share (see
+[Shard actor](../ingest.md#shard-actor)). The subset size and the shard count
+do not control it. Under the operator, set `spec.gateway.maxInflightFlushes`
+and `spec.gateway.maxInflightFlushesPerTenant` on the `RavelCluster` (see
+[kubernetes.md](kubernetes.md)). They render `--max-inflight-flushes` and
+`--max-inflight-flushes-per-tenant` onto the gateway Deployment; the server
+defaults are 4 and `max(1, N - 1)`.
 
 ## What it costs
 

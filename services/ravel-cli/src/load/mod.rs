@@ -172,9 +172,9 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// this does not change.)
 ///
 /// This deliberately no longer tracks [`IngestConfig::max_inflight_flushes`]'s
-/// own default of 1: that default governs the client-facing serving path, whose
-/// Strict ack contract ADR-0067 froze, and the bulk loader is a different
-/// workload with a different memory owner.
+/// own default (4, ADR-2708 D3): that default governs the client-facing
+/// serving path, whose Strict ack contract ADR-0067 froze, and the bulk loader
+/// is a different workload with a different memory owner.
 pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = DEFAULT_PIPELINE_DEPTH as u32;
 
 /// Build the router [`IngestConfig`] a load drives, given the three
@@ -203,6 +203,9 @@ pub(crate) fn build_ingest_config(
         shard_count: shards,
         target_bytes,
         max_inflight_flushes,
+        // A load drives one tenant, so the ADR-2708 D3 share (N-1 by
+        // default) would only take a permit away from `--max-inflight-flushes`.
+        max_inflight_flushes_per_tenant: usize::try_from(max_inflight_flushes).ok(),
         max_flush_delay: delay,
         // ADR-0076 decision 4: follows the actually-configured
         // `max_flush_delay`, not just its default, so the adaptive corridor

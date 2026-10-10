@@ -12,6 +12,7 @@ mod clock;
 mod config;
 mod deferral;
 mod error;
+mod flush_share;
 mod generation;
 mod idempotency;
 mod indexed_fields;

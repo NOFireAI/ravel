@@ -31,7 +31,7 @@ use ravel_ingest::{
 };
 use ravel_logseg::{ColumnarLogBatch, LogRecord, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_otlp::traces_normalize::NormalizedSpan;
@@ -60,6 +60,27 @@ fn one_slot_config() -> IngestConfig {
         max_flush_lifetime: Duration::from_secs(4000),
         ..IngestConfig::default()
     }
+}
+
+/// Room for `tenants + 1` parked flushes and one more, a share of two so a
+/// tenant with one flush parked is under its share, and a queued-flush cap
+/// the parked flushes fill exactly.
+fn queue_order_config(tenants: usize) -> IngestConfig {
+    IngestConfig {
+        max_inflight_flushes: (tenants + 2) as u32,
+        max_inflight_flushes_per_tenant: Some(2),
+        max_queued_flushes: tenants + 1,
+        ..one_slot_config()
+    }
+}
+
+/// Holds `tenant`'s first PUT, which is its first flush's data object.
+fn hold_first_put(store: &FaultStore<MemoryStore>, tenant: &TenantId) -> GateHandle {
+    store.hold(
+        Op::Put,
+        Some(format!("t/{}/", tenant.hash().to_hex())),
+        Occurrence::Nth(1),
+    )
 }
 
 fn unlimited() -> Arc<IngestByteBudget> {
@@ -222,25 +243,17 @@ macro_rules! deferral_cap_tests {
             let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
             let clock = TestClock::new(BASE_NS);
             let router = Arc::new(
-                <$router>::new(one_slot_config(), Arc::clone(&store), clock.clone())
+                <$router>::new(queue_order_config(TENANTS), Arc::clone(&store), clock.clone())
                     .with_budget(unlimited()),
             );
-            let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
             let buffered = || router.metrics().snapshot().$buffered;
-            let idle = || -> bool {
-                let in_flight: u64 = router
+            let in_flight = || -> u64 {
+                router
                     .metrics()
                     .in_flight_flushes_by_shard()
                     .into_iter()
                     .map(|(_, n)| n)
-                    .sum();
-                let queued: u64 = router
-                    .metrics()
-                    .shard_skew_by_shard()
-                    .into_iter()
-                    .map(|(_, s)| s.flushes_queued)
-                    .sum();
-                in_flight == 0 && queued == 0
+                    .sum()
             };
             let deferred_triggers = || -> u64 {
                 router
@@ -251,39 +264,54 @@ macro_rules! deferral_cap_tests {
                     .sum()
             };
 
-            let parked = $spawn(&router, &tenant("parked"), 0, WriteMode::Strict);
-            until(|| buffered() >= 1).await;
+            // Each tenant's first data PUT is held, so `parked` and every
+            // t_i keep one flush in flight. That fills the queued-flush cap
+            // with every t_i under its share, so the cap, not the share, is
+            // what refuses their second triggers and orders the retries.
+            let parked_tenant = tenant("parked");
+            let tenants: Vec<TenantId> = (0..TENANTS).map(|i| tenant(&format!("t{i}"))).collect();
+            let parked_gate = hold_first_put(&fault_store, &parked_tenant);
+            let _gates: Vec<_> = tenants.iter().map(|t| hold_first_put(&fault_store, t)).collect();
+
+            let parked = $spawn(&router, &parked_tenant, 0, WriteMode::Strict);
+            let mut firsts = Vec::new();
+            for (i, t) in tenants.iter().enumerate() {
+                firsts.push($spawn(&router, t, 100 + i, WriteMode::Strict));
+            }
+            until(|| buffered() >= (TENANTS + 1) as u64).await;
             clock.advance_ns(TICK_ADVANCE_NS);
-            until(|| !idle()).await;
-            gate.wait_until_held(1).await;
+            until(|| in_flight() == (TENANTS + 1) as u64).await;
+            parked_gate.wait_until_held(TENANTS + 1).await;
+            assert_eq!(deferred_triggers(), 0, "the first flushes all spawn");
 
             // Tenant i is first refused on tick i, so tick i refuses i + 1
             // buffers and the deferral start times increase with i.
             let mut writes = Vec::new();
             let mut refusals = 0u64;
-            for i in 0..TENANTS {
-                writes.push($spawn(
-                    &router,
-                    &tenant(&format!("t{i}")),
-                    i + 1,
-                    WriteMode::Strict,
-                ));
-                let want = (i + 2) as u64;
+            for (i, t) in tenants.iter().enumerate() {
+                writes.push($spawn(&router, t, i + 1, WriteMode::Strict));
+                let want = (TENANTS + 2 + i) as u64;
                 until(|| buffered() >= want).await;
                 clock.advance_ns(TICK_ADVANCE_NS);
                 refusals += (i + 1) as u64;
                 until(|| deferred_triggers() >= refusals).await;
             }
             assert!(writes.iter().all(|w| !w.is_finished()));
+            assert_eq!(in_flight(), (TENANTS + 1) as u64);
 
-            for id in gate.held() {
-                assert!(gate.release(id));
-            }
+            // Freeing the one slot `parked` holds lets exactly one deferred
+            // flush open per tick; each opened flush acks and frees it again.
+            let (id, _, _) = parked_gate
+                .held_details()
+                .into_iter()
+                .find(|(_, _, key)| key.contains(&parked_tenant.hash().to_hex()))
+                .expect("parked tenant's PUT is held");
+            assert!(parked_gate.release(id));
             parked
                 .await
                 .expect("parked write task")
                 .expect("parked write acks once the gate is released");
-            until(|| idle()).await;
+            until(|| in_flight() == TENANTS as u64).await;
 
             for step in 0..TENANTS {
                 clock.advance_ns(TICK_ADVANCE_NS);
@@ -296,12 +324,20 @@ macro_rules! deferral_cap_tests {
                     "tick {step} after the drain must open tenant t{step}, the \
                      oldest deferral left"
                 );
-                until(|| idle()).await;
+                until(|| in_flight() == TENANTS as u64).await;
             }
             for (i, w) in writes.into_iter().enumerate() {
                 w.await
                     .expect("write task")
                     .unwrap_or_else(|e| panic!("t{i} acks: {e}"));
+            }
+            for id in parked_gate.held() {
+                assert!(parked_gate.release(id));
+            }
+            for (i, w) in firsts.into_iter().enumerate() {
+                w.await
+                    .expect("first write task")
+                    .unwrap_or_else(|e| panic!("t{i}'s first write acks: {e}"));
             }
             router.flush_all().await;
         }
@@ -421,28 +457,20 @@ macro_rules! deferral_cap_order_tests {
             let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
             let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
             let clock = TestClock::new(BASE_NS);
-            let config = one_slot_config();
+            let config = queue_order_config(2);
             let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
             let router = Arc::new(
                 <$router>::new(config, Arc::clone(&store), clock.clone()).with_budget(unlimited()),
             );
-            let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
             let buffered = || router.metrics().snapshot().$buffered;
             let flushes = || router.metrics().snapshot().flushes_by_age;
-            let idle = || -> bool {
-                let in_flight: u64 = router
+            let in_flight = || -> u64 {
+                router
                     .metrics()
                     .in_flight_flushes_by_shard()
                     .into_iter()
                     .map(|(_, n)| n)
-                    .sum();
-                let queued: u64 = router
-                    .metrics()
-                    .shard_skew_by_shard()
-                    .into_iter()
-                    .map(|(_, s)| s.flushes_queued)
-                    .sum();
-                in_flight == 0 && queued == 0
+                    .sum()
             };
             let deferred_triggers = || -> u64 {
                 router
@@ -453,20 +481,33 @@ macro_rules! deferral_cap_order_tests {
                     .sum()
             };
 
-            let parked = $spawn(&router, &tenant("parked"), 0, WriteMode::Strict);
-            until(|| buffered() >= 1).await;
+            // `parked`, `old` and `young` each park one flush, filling the
+            // queued-flush cap with `old` and `young` under their share.
+            let parked_tenant = tenant("parked");
+            let (old, young) = (tenant("old"), tenant("young"));
+            let gate = hold_first_put(&fault_store, &parked_tenant);
+            let _gates = [
+                hold_first_put(&fault_store, &old),
+                hold_first_put(&fault_store, &young),
+            ];
+            let parked = $spawn(&router, &parked_tenant, 0, WriteMode::Strict);
+            let firsts = [
+                $spawn(&router, &old, 10, WriteMode::Strict),
+                $spawn(&router, &young, 11, WriteMode::Strict),
+            ];
+            until(|| buffered() >= 3).await;
             clock.advance_ns(TICK_ADVANCE_NS);
-            gate.wait_until_held(1).await;
+            gate.wait_until_held(3).await;
 
-            $spawn(&router, &tenant("old"), 1, WriteMode::Buffered)
+            $spawn(&router, &old, 1, WriteMode::Buffered)
                 .await
                 .expect("old write task")
                 .expect("old buffered write accepted");
-            until(|| buffered() >= 2).await;
+            until(|| buffered() >= 4).await;
             clock.advance_ns(TICK_ADVANCE_NS);
 
-            let young = $spawn(&router, &tenant("young"), 2, WriteMode::Strict);
-            until(|| buffered() >= 3).await;
+            let young_write = $spawn(&router, &young, 2, WriteMode::Strict);
+            until(|| buffered() >= 5).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             until(|| deferred_triggers() >= 1).await;
             // `old` reaches the idle clock here and is deferred too, after
@@ -474,27 +515,38 @@ macro_rules! deferral_cap_order_tests {
             clock.advance_ns(idle_ns);
             until(|| deferred_triggers() >= 3).await;
 
-            for id in gate.held() {
-                assert!(gate.release(id));
-            }
+            let (id, _, _) = gate
+                .held_details()
+                .into_iter()
+                .find(|(_, _, key)| key.contains(&parked_tenant.hash().to_hex()))
+                .expect("parked tenant's PUT is held");
+            assert!(gate.release(id));
             parked
                 .await
                 .expect("parked write task")
                 .expect("parked write acks once the gate is released");
-            until(|| idle()).await;
+            until(|| in_flight() == 2).await;
 
             let before = flushes();
             clock.advance_ns(TICK_ADVANCE_NS);
-            until(|| flushes() > before && idle()).await;
+            until(|| flushes() > before && in_flight() == 2).await;
             assert!(
-                within_yields(|| young.is_finished()).await,
+                within_yields(|| young_write.is_finished()).await,
                 "the first tick after the drain must open the earliest deferral \
                  (young), not the oldest row (old)"
             );
-            young
+            young_write
                 .await
                 .expect("young write task")
                 .expect("young acks from its flush");
+            for id in gate.held() {
+                assert!(gate.release(id));
+            }
+            for w in firsts {
+                w.await
+                    .expect("first write task")
+                    .expect("first write acks");
+            }
             router.flush_all().await;
         }
     };
@@ -610,7 +662,9 @@ macro_rules! dead_shard_at_cap_test {
                     .sum()
             };
 
-            $spawn(&router, &tenant("parked"), 0, WriteMode::Buffered)
+            // acme parks its own first flush, so its next trigger is deferred
+            // at its flush share (ADR-2708 D3) with the shard's one permit held.
+            $spawn(&router, &tenant("acme"), 0, WriteMode::Buffered)
                 .await
                 .expect("parked write task")
                 .expect("parked buffered write accepted");

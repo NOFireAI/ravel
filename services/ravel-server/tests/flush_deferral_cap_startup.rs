@@ -46,6 +46,7 @@ fn config_with_cadence(
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,
         adaptive_flush_delay,
         max_flush_delay: fast,

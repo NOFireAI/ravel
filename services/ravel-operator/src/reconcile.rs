@@ -1279,11 +1279,16 @@ pub fn desired_gateway_deployment(
     args.extend(common_store_args(spec));
     args.extend(tenant_token_args(spec, ctx));
     // Ingest runs only in the gateway tier, so this per-shard flush-isolation
-    // bound is pushed here and nowhere else. Unset leaves the argv byte for byte
-    // as before, and ravel-server keeps its own default of 1.
+    // bound and its per-tenant share are pushed here and nowhere else. Unset
+    // leaves the argv byte for byte as before, and ravel-server keeps its own
+    // defaults.
     if let Some(max_inflight) = spec.gateway.max_inflight_flushes {
         args.push("--max-inflight-flushes".to_string());
         args.push(max_inflight.to_string());
+    }
+    if let Some(share) = spec.gateway.max_inflight_flushes_per_tenant {
+        args.push("--max-inflight-flushes-per-tenant".to_string());
+        args.push(share.to_string());
     }
 
     let tier_override = spec.gateway.credentials_secret_ref.as_ref();
@@ -3855,6 +3860,7 @@ mod tests {
                 ingest_affinity: None,
                 exposure: None,
                 max_inflight_flushes: None,
+                max_inflight_flushes_per_tenant: None,
             },
             query: QuerySpec {
                 replicas: 2,
@@ -4011,6 +4017,41 @@ mod tests {
                 args_of(dep)
             );
         }
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_renders_onto_the_gateway_only() {
+        // ADR-2708 D3: spec.gateway.maxInflightFlushesPerTenant renders
+        // --max-inflight-flushes-per-tenant on the gateway container only, and
+        // nowhere when unset.
+        let flag = "--max-inflight-flushes-per-tenant";
+        let mut spec = base_spec();
+        spec.gateway.max_inflight_flushes_per_tenant = Some(2);
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        assert_eq!(
+            arg_value(&args_of(&g), flag).as_deref(),
+            Some("2"),
+            "gateway must render the share verbatim: {:?}",
+            args_of(&g)
+        );
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        for (tier, dep) in [("query", &q), ("maintain", &m)] {
+            assert!(
+                !args_of(dep).iter().any(|a| a == flag),
+                "{tier} must not carry the share: {:?}",
+                args_of(dep)
+            );
+        }
+
+        let g = desired_gateway_deployment(&base_spec(), "prod", &ctx());
+        assert!(
+            !args_of(&g).iter().any(|a| a == flag),
+            "gateway must omit the share when unset: {:?}",
+            args_of(&g)
+        );
     }
 
     #[test]

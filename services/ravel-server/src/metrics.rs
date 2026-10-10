@@ -1059,6 +1059,9 @@ pub struct IngestPipelineSnapshot {
     /// `max_inflight_flushes` permit, before any store call (issue #1739).
     /// Distinct from `abandoned_retry_exhausted`, which is a store failure.
     pub abandoned_queue_deadline: u64,
+    /// Flushes abandoned without a PUT because their permit was granted past
+    /// `end(pinned hour) + max_flush_lifetime` (ADR-2708 D3).
+    pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_items_total: u64,
@@ -1266,6 +1269,7 @@ impl IngestPipelineSnapshot {
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
+            abandoned_hour_bound: snapshot.abandoned_hour_bound,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_points_total,
@@ -1321,6 +1325,7 @@ impl IngestPipelineSnapshot {
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
+            abandoned_hour_bound: snapshot.abandoned_hour_bound,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_records_total,
@@ -1375,6 +1380,7 @@ impl IngestPipelineSnapshot {
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
+            abandoned_hour_bound: snapshot.abandoned_hour_bound,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_spans_total,
@@ -1546,6 +1552,22 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_abandoned_queue_deadline_total",
             &labels(mode, pipeline.signal),
             pipeline.abandoned_queue_deadline,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_abandoned_hour_bound_total",
+        "Flushes abandoned without a PUT because their permit was granted past \
+         the pinned hour's end plus the flush lifetime, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_abandoned_hour_bound_total",
+            &labels(mode, pipeline.signal),
+            pipeline.abandoned_hour_bound,
         );
     }
 
@@ -2052,7 +2074,8 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         out,
         "ravel_ingest_flush_trigger_deferred_total",
         "Size and age flush triggers refused because their shard was already holding \
-         --max-queued-flushes spawned flush tasks (issue #1740), summed across shards, by \
+         --max-queued-flushes spawned flush tasks (issue #1740) or their tenant already held \
+         its --max-inflight-flushes-per-tenant share (ADR-2708 D3), summed across shards, by \
          signal. A refusal is a deferral, not a shed: the buffer rides back untouched and the \
          next tick re-fires once a flush has been reaped, so a rise means flush latency slipped \
          past --max-flush-delay and nothing was dropped.",
@@ -15560,6 +15583,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             max_flush_delay: Duration::from_millis(50),
             flush_tick: Duration::from_millis(10),
             max_inflight_flushes: 1,
+            max_inflight_flushes_per_tenant: None,
             max_queued_flushes: 1,
             ..IngestConfig::default()
         };

@@ -325,11 +325,22 @@ pub struct GatewaySpec {
     /// stalled flush cannot block co-resident tenants beyond this many permits.
     /// Ingest runs only in the gateway tier (the query and maintain modes never
     /// enter the ingest path), so this is a gateway-only field.
-    /// Omit to keep `ravel-server`'s own default of 1 (today's non-pipelined
-    /// behavior). The CRD schema enforces a minimum of 1 at admission:
-    /// `ravel-server` rejects 0 as a flush deadlock.
+    /// Omit to keep `ravel-server`'s own default of 4 (ADR-2708 D3). The CRD
+    /// schema enforces a minimum of 1 at admission: `ravel-server` rejects 0
+    /// as a flush deadlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inflight_flushes: Option<u32>,
+
+    /// How many of a shard's flush permits one tenant may hold or wait on at
+    /// once (`--max-inflight-flushes-per-tenant`, ADR-2708 D3). Omit to keep
+    /// `ravel-server`'s own default of `max(1, maxInflightFlushes - 1)`, which
+    /// leaves a permit for co-resident tenants whenever there is more than
+    /// one. Gateway-only, like `maxInflightFlushes`. The CRD schema enforces a
+    /// minimum of 1 at admission, and a CEL rule on `gateway` refuses a value
+    /// above `maxInflightFlushes` (4 when that is omitted), which
+    /// `ravel-server` would otherwise reject at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_flushes_per_tenant: Option<u32>,
 }
 
 impl Default for GatewaySpec {
@@ -342,6 +353,7 @@ impl Default for GatewaySpec {
             ingest_affinity: None,
             exposure: None,
             max_inflight_flushes: None,
+            max_inflight_flushes_per_tenant: None,
         }
     }
 }
@@ -1095,6 +1107,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_ingest_affinity_constraints(&mut crd);
     inject_gateway_exposure_affinity_guard(&mut crd);
     inject_canonical_tenant_backend_guard(&mut crd);
+    inject_flush_share_guard(&mut crd);
     crd
 }
 
@@ -1143,7 +1156,8 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
 /// Attach OpenAPI `minimum: 1` bounds to the count and interval fields that
 /// must be positive: `spec.shards`, `spec.gateway.replicas`,
 /// `spec.query.replicas`, `spec.maintain.replicas`,
-/// `spec.gateway.maxInflightFlushes`, `spec.maintain.intervalSecs`, and
+/// `spec.gateway.maxInflightFlushes`,
+/// `spec.gateway.maxInflightFlushesPerTenant`, `spec.maintain.intervalSecs`, and
 /// `spec.maintain.fold.intervalSecs`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
@@ -1188,12 +1202,17 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
         // floor. ravel-server rejects `--max-inflight-flushes 0` as a flush
         // deadlock, so the CRD must refuse it at admission rather than let the
         // pod crashloop.
-        if let Some(max_inflight) = spec_props
+        // A zero per-tenant share would defer every flush trigger, which
+        // ravel-server refuses at startup.
+        if let Some(gateway_props) = spec_props
             .get_mut("gateway")
             .and_then(|g| g.properties.as_mut())
-            .and_then(|p| p.get_mut("maxInflightFlushes"))
         {
-            max_inflight.minimum = Some(1.0);
+            for field in ["maxInflightFlushes", "maxInflightFlushesPerTenant"] {
+                if let Some(bound) = gateway_props.get_mut(field) {
+                    bound.minimum = Some(1.0);
+                }
+            }
         }
         // ravel-server refuses a zero `--maintain-interval-secs` and a zero
         // `--fold-interval-secs` at startup, since either would run its loop
@@ -1426,6 +1445,55 @@ fn inject_canonical_tenant_backend_guard(crd: &mut CustomResourceDefinition) {
         // Append rather than replace: the exposure guard is already on `gateway`
         // and dropping it would silently re-admit the exposure+ingressNginx
         // combination.
+        let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced to a user whose per-tenant flush share exceeds the
+/// shard's permit count (ADR-2708 D3).
+const FLUSH_SHARE_ABOVE_PERMITS_MESSAGE: &str = "gateway.maxInflightFlushesPerTenant \
+    must not exceed gateway.maxInflightFlushes (ravel-server's default of 4 when unset); \
+    ravel-server refuses the pair at startup";
+
+/// The CEL rule refusing a per-tenant flush share above the permit count, kept
+/// as a constant so the injected rule and the logic unit test cannot drift.
+/// The `4` is `ravel-server`'s `--max-inflight-flushes` default, which applies
+/// when `maxInflightFlushes` is omitted.
+const FLUSH_SHARE_ABOVE_PERMITS_RULE: &str = "!has(self.maxInflightFlushesPerTenant) || \
+    self.maxInflightFlushesPerTenant <= \
+    (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 4)";
+
+/// Attach the flush-share guard to the `gateway` property, appended like the
+/// other gateway guards. `ravel-server` rejects a share above its permit count
+/// with `FlushShareAboveMaxInflightFlushes`, so without this rule such a CR is
+/// admitted and every gateway pod crash-loops.
+fn inject_flush_share_guard(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: FLUSH_SHARE_ABOVE_PERMITS_RULE.to_string(),
+        message: Some(FLUSH_SHARE_ABOVE_PERMITS_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(gateway) = spec_props.get_mut("gateway") else {
+            continue;
+        };
         let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
         rules.push(rule.clone());
         gateway.x_kubernetes_validations = Some(rules);
@@ -2354,6 +2422,7 @@ mod tests {
         let spec: RavelClusterSpec =
             serde_json::from_value(with_field).expect("deserialize with field");
         assert_eq!(spec.gateway.max_inflight_flushes, Some(4));
+        assert_eq!(spec.gateway.max_inflight_flushes_per_tenant, None);
 
         // Gateway only: the query and maintain schemas carry no such property,
         // so a field added to another tier without a renderer cannot hide here.
@@ -2375,7 +2444,88 @@ mod tests {
                 !props.contains_key("maxInflightFlushes"),
                 "{tier} must not carry maxInflightFlushes"
             );
+            assert!(
+                !props.contains_key("maxInflightFlushesPerTenant"),
+                "{tier} must not carry maxInflightFlushesPerTenant"
+            );
         }
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_is_optional_and_carries_a_minimum_one_bound() {
+        let props = gateway_schema_props();
+        assert_eq!(
+            props
+                .get("maxInflightFlushesPerTenant")
+                .expect("maxInflightFlushesPerTenant prop")
+                .minimum,
+            Some(1.0),
+            "maxInflightFlushesPerTenant must reject 0 at admission"
+        );
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } },
+            "gateway": { "maxInflightFlushesPerTenant": 2 }
+        }))
+        .expect("deserialize with field");
+        assert_eq!(spec.gateway.max_inflight_flushes_per_tenant, Some(2));
+    }
+
+    /// Rust mirror of [`FLUSH_SHARE_ABOVE_PERMITS_RULE`]: whether a gateway
+    /// with these optional fields is admitted. No CEL evaluator runs here, so
+    /// the schema test below pins the exact expression this mirrors.
+    fn flush_share_cel_admits(permits: Option<u32>, share: Option<u32>) -> bool {
+        match share {
+            None => true,
+            Some(share) => share <= permits.unwrap_or(4),
+        }
+    }
+
+    #[test]
+    fn flush_share_above_permits_is_refused_at_admission() {
+        let crd = ravel_cluster_crd();
+        let gateway = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("gateway"))
+            .expect("gateway prop");
+        let rules = gateway
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("gateway must carry CEL rules");
+        let guard = rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "!has(self.maxInflightFlushesPerTenant) || \
+                        self.maxInflightFlushesPerTenant <= \
+                        (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 4)"
+            })
+            .expect("gateway must carry the exact flush-share rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(FLUSH_SHARE_ABOVE_PERMITS_MESSAGE)
+        );
+        // Appending keeps the guards already on `gateway`.
+        for other in [
+            GATEWAY_EXPOSURE_AFFINITY_RULE,
+            CANONICAL_TENANT_BACKEND_RULE,
+        ] {
+            assert!(rules.iter().any(|r| r.rule == other), "dropped {other}");
+        }
+
+        assert!(!flush_share_cel_admits(Some(2), Some(4)), "2/4 refused");
+        assert!(flush_share_cel_admits(Some(4), Some(3)), "4/3 admitted");
+        assert!(flush_share_cel_admits(Some(4), Some(4)), "4/4 admitted");
+        assert!(!flush_share_cel_admits(None, Some(5)), "unset/5 refused");
+        assert!(flush_share_cel_admits(None, Some(3)), "unset/3 admitted");
+        assert!(flush_share_cel_admits(Some(2), None), "2/unset admitted");
+        assert!(flush_share_cel_admits(None, None), "unset/unset admitted");
     }
 
     #[test]
