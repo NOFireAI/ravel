@@ -395,10 +395,9 @@ flowchart LR
     operator can compute the ceiling before the run. Each batch is one
     HEAD CAS, bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a
     lost CAS the attempt re-reads HEAD, keeps the refs for the batch parts
-    whose blake3 the new HEAD still names (a leaf is keyed by
-    `part_blake3`, so it is
-    still that part's) and drops the rest, whose leaves the catalog sweep
-    deletes. The report carries the largest unindexed part's entries,
+    whose blake3 the new HEAD still names (a leaf is keyed by `part_blake3`,
+    so it is still that part's) and drops the rest, whose leaves the catalog
+    sweep deletes. The report carries the largest unindexed part's entries,
     parts rebuilt, leaves written, section bytes read, ranged GETs issued
     (footer suffix and section together, the figure the acceptance band
     counts), the attempt count, and per attempt the part GETs, leaf PUTs
