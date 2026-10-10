@@ -66,7 +66,7 @@ const EXPLODE_SUFFIX_MAX_LEN: usize = "_bucket".len();
 const EXPLODE_UNFILLED_SLOT_BYTES: usize = 2 * RESOLVED_LABEL_OVERHEAD_BYTES;
 
 /// `le="+Inf"`, the bucket label every classic histogram adds.
-const INF_LE_LABEL_BYTES: usize = "le".len() + "+Inf".len() + RESOLVED_LABEL_OVERHEAD_BYTES;
+const INF_LE_LABEL_BYTES: usize = label_bytes("le".len(), "+Inf".len());
 
 /// Counts the bytes a `Display` value would format to without allocating.
 struct LenCounter(usize);
@@ -92,10 +92,23 @@ fn format_float_len(v: f64) -> usize {
     if v.is_infinite() { 4 } else { display_len(v) }
 }
 
-fn label_bytes(name_len: usize, value_len: usize) -> usize {
+/// The per-label charge, the one formula every projection here uses: the
+/// element slot ([`RESOLVED_LABEL_OVERHEAD_BYTES`]) plus the name and value
+/// lengths. Lengths suffice because every name and value a normalizer keeps
+/// goes through [`exact_capacity`], so its heap allocation is its length.
+pub(crate) const fn label_bytes(name_len: usize, value_len: usize) -> usize {
     name_len
         .saturating_add(value_len)
         .saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES)
+}
+
+/// Drop any spare capacity from a string a normalizer is about to keep in a
+/// label or attribute, so it allocates exactly the length [`label_bytes`]
+/// charges. `to_string()` on an integer or float, `format!`, sanitising and
+/// prost decoding all leave capacity beyond the length.
+pub(crate) fn exact_capacity(mut s: String) -> String {
+    s.shrink_to_fit();
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -762,5 +775,113 @@ mod tests {
             }
             assert_eq!(uvarint_len(v), expected, "{v}");
         }
+    }
+}
+
+/// Attribute sets for the property tests that hold each normalizer to
+/// [`label_bytes`]: every kept name and value at exact capacity, and the
+/// projection at or above what normalization allocates.
+#[cfg(test)]
+pub(crate) mod capacity_cases {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use proptest::prelude::*;
+
+    /// A 17-byte key that sanitising rewrites (`.` and `-` become `_`).
+    pub(crate) const SANITISED_17: &str = "http.request-path";
+
+    pub(crate) fn kv(key: &str, value: Option<AnyValueVariant>) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: value.map(|v| AnyValue { value: Some(v) }),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn int(v: i64) -> Option<AnyValueVariant> {
+        Some(AnyValueVariant::IntValue(v))
+    }
+
+    pub(crate) fn double(v: f64) -> Option<AnyValueVariant> {
+        Some(AnyValueVariant::DoubleValue(v))
+    }
+
+    /// Doubles whose formatted length or growth pattern stresses a string's
+    /// capacity: `1e260` formats to 261 bytes in a buffer grown to 520.
+    pub(crate) const SPECIAL_DOUBLES: [f64; 11] = [
+        0.0,
+        -0.0,
+        5e-324,
+        1e-310,
+        1e260,
+        -1e-300,
+        0.1,
+        f64::MAX,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+
+    pub(crate) fn special_double() -> impl Strategy<Value = f64> {
+        prop::sample::select(SPECIAL_DOUBLES.to_vec())
+    }
+
+    pub(crate) fn key() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("k".to_string()),
+            Just(SANITISED_17.to_string()),
+            "[a-z][a-z0-9_]{0,15}",
+            "[a-z.\\-/]{1,24}",
+            "[a-z]{60,90}",
+        ]
+    }
+
+    /// Every value shape an attribute can carry: `None` is an attribute with
+    /// no value, which metrics treat as empty and logs and traces drop.
+    pub(crate) fn value() -> impl Strategy<Value = Option<AnyValueVariant>> {
+        prop_oneof![
+            any::<i64>().prop_map(int),
+            prop::sample::select(vec![0i64, 7, -200, i64::MIN, i64::MAX]).prop_map(int),
+            special_double().prop_map(double),
+            any::<f64>().prop_map(double),
+            "[a-z]{0,3}".prop_map(|s| Some(AnyValueVariant::StringValue(s))),
+            "[ -~]{40,300}".prop_map(|s| Some(AnyValueVariant::StringValue(s))),
+            any::<bool>().prop_map(|b| Some(AnyValueVariant::BoolValue(b))),
+            Just(None),
+        ]
+    }
+
+    /// Up to `max` attributes with distinct sanitised keys, so a set is never
+    /// rejected for a duplicate label name.
+    pub(crate) fn attributes(max: usize) -> impl Strategy<Value = Vec<KeyValue>> {
+        prop::collection::vec((key(), value()), 0..=max).prop_map(|pairs| {
+            let mut seen = std::collections::HashSet::new();
+            pairs
+                .into_iter()
+                .filter(|(k, _)| seen.insert(crate::normalize::sanitize_label_name(k.clone())))
+                .map(|(k, v)| kv(&k, v))
+                .collect()
+        })
+    }
+
+    /// The fixed cases each property test also runs: one attribute alone in
+    /// an otherwise empty resource, where the projection has no other label
+    /// to borrow slack from.
+    pub(crate) fn fixed_single_attributes() -> Vec<KeyValue> {
+        vec![
+            kv("k", int(0)),
+            kv("k", double(1e260)),
+            kv("k", int(-200)),
+            kv(SANITISED_17, int(7)),
+            kv(SANITISED_17, Some(AnyValueVariant::StringValue("v".into()))),
+        ]
+    }
+
+    /// [`attributes`], with each of [`fixed_single_attributes`] alone mixed in.
+    pub(crate) fn attribute_sets(max: usize) -> impl Strategy<Value = Vec<KeyValue>> {
+        prop_oneof![
+            1 => prop::sample::select(fixed_single_attributes()).prop_map(|kv| vec![kv]),
+            4 => attributes(max),
+        ]
     }
 }

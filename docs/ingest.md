@@ -1257,7 +1257,14 @@ megabytes. Before any OTLP normalizer allocates, a read-only pass in
 `ravel-otlp` (`project_resolved_label_bytes`,
 `project_log_resolved_label_bytes`, `project_span_resolved_label_bytes`)
 computes the bytes it would build, charging each label its name and value
-bytes plus 64 bytes of struct overhead (`RESOLVED_LABEL_OVERHEAD_BYTES`):
+bytes plus 64 bytes of struct overhead (`RESOLVED_LABEL_OVERHEAD_BYTES`).
+Lengths are enough because every name and value a normalizer keeps is held
+at exact capacity (`exact_capacity`), so its heap allocation is its length.
+On the gauge, sum and exponential-histogram paths an empty-valued attribute
+is dropped but still occupies a label slot, and is charged the 64 bytes;
+each exploded histogram or summary point is charged two more slots, since
+its `_count` and `_sum` series each reserve an `le` or `quantile` slot and
+never fill it:
 
 | Signal | Projection unit |
 |---|---|
@@ -1283,8 +1290,8 @@ never coexist. A budget that cannot admit it sheds the request with HTTP 429
 and `Retry-After` (gRPC `RESOURCE_EXHAUSTED`) before normalization runs. A
 projection over the bound takes no charge, so an over-bound request is always
 the whole-request rejection above, never a 429. That leaves no 429 a retry
-cannot clear only while `--max-ingest-buffer-bytes` is at least the 256 MiB
-bound, as its 512 MiB default is: with a smaller budget, a projection between
+cannot clear only while `--max-ingest-buffer-bytes` is at least
+`max_resolved_label_bytes_per_request` (256 MiB), as its 512 MiB default is: with a smaller budget, a projection between
 the budget and the bound is shed with 429 on every retry.
 OTAP and Remote Write do not take this charge.
 

@@ -44,6 +44,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use ravel_logseg::{MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
+use crate::label_projection::exact_capacity;
 use crate::logs_limits::{LogIngestLimits, LogRejection};
 use crate::promcompat::format_float;
 
@@ -712,10 +713,14 @@ fn convert_attrs(
     attributes: &[KeyValue],
     limits: &LogIngestLimits,
 ) -> Result<Vec<(String, AttrValue)>, LogRejection> {
-    attributes
+    // Kept for every record in the group and charged once by the projection
+    // at the per-attribute rate; collecting through `Result` grows the `Vec`.
+    let mut attrs = attributes
         .iter()
         .map(|kv| convert_attr(kv, limits))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    attrs.shrink_to_fit();
+    Ok(attrs)
 }
 
 fn convert_attr(
@@ -746,7 +751,7 @@ fn convert_attr(
             max: limits.max_attribute_value_len,
         });
     }
-    Ok((kv.key.clone(), value))
+    Ok((exact_capacity(kv.key.clone()), value))
 }
 
 /// Maximum nesting depth `convert_value` will follow through array and
@@ -853,27 +858,32 @@ fn convert_value(
         None => Err(LogRejection::MissingAttributeValue {
             key: key.to_string(),
         }),
-        Some(AnyValueVariant::StringValue(s)) => Ok(AttrValue::Str(s.clone())),
+        Some(AnyValueVariant::StringValue(s)) => Ok(AttrValue::Str(exact_capacity(s.clone()))),
         Some(AnyValueVariant::BoolValue(b)) => Ok(AttrValue::Bool(*b)),
         Some(AnyValueVariant::IntValue(i)) => Ok(AttrValue::I64(*i)),
         Some(AnyValueVariant::DoubleValue(d)) => Ok(AttrValue::F64(*d)),
         Some(AnyValueVariant::BytesValue(b)) => Ok(AttrValue::Bytes(b.clone())),
+        // Collecting through `Result` grows the `Vec`; the projection charges
+        // each element one slot, so the spare ones are dropped.
         Some(AnyValueVariant::ArrayValue(array)) => {
-            let items = array
+            let mut items = array
                 .values
                 .iter()
                 .map(|v| convert_value(key, Some(v), depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
+            items.shrink_to_fit();
             Ok(AttrValue::List(items))
         }
         Some(AnyValueVariant::KvlistValue(kvlist)) => {
-            let entries = kvlist
+            let mut entries = kvlist
                 .values
                 .iter()
                 .map(|kv| {
-                    convert_value(key, kv.value.as_ref(), depth + 1).map(|v| (kv.key.clone(), v))
+                    convert_value(key, kv.value.as_ref(), depth + 1)
+                        .map(|v| (exact_capacity(kv.key.clone()), v))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            entries.shrink_to_fit();
             Ok(AttrValue::Map(entries))
         }
         Some(AnyValueVariant::StringValueStrindex(_)) => {
@@ -3263,5 +3273,119 @@ mod tests {
             })
             .sum();
         assert!(projected >= built, "projected {projected} < built {built}");
+    }
+
+    /// Whether every string a converted value holds, map keys included, sits
+    /// at exact capacity.
+    fn attr_value_is_exact(value: &AttrValue) -> bool {
+        match value {
+            AttrValue::Str(s) => s.capacity() == s.len(),
+            AttrValue::Bytes(_) | AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => {
+                true
+            }
+            AttrValue::List(items) => items.iter().all(attr_value_is_exact),
+            AttrValue::Map(entries) => entries
+                .iter()
+                .all(|(k, v)| k.capacity() == k.len() && attr_value_is_exact(v)),
+        }
+    }
+
+    /// Normalize one record carrying `attributes` under `resource`, check that
+    /// every kept key and value sits at exact capacity, and that the
+    /// projection's per-record term (two records less one, so the
+    /// once-per-resource and once-per-scope copies give no slack) is at least
+    /// what the record allocated. Returns the number of kept records.
+    fn check_record_capacity(
+        resource: &[KeyValue],
+        attributes: &[KeyValue],
+    ) -> Result<usize, proptest::test_runner::TestCaseError> {
+        let limits = LogIngestLimits::default();
+        let req = |n: u64| {
+            request(vec![resource_logs(
+                resource.to_vec(),
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    (0..n)
+                        .map(|i| {
+                            record(
+                                Some(any(AnyValueVariant::StringValue("m".into()))),
+                                attributes.to_vec(),
+                                1_000 + i,
+                            )
+                        })
+                        .collect(),
+                )],
+            )])
+        };
+        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits)
+            - crate::project_log_resolved_label_bytes(&req(1), &limits);
+        let out = normalize_logs(req(1), &limits, 5_000);
+        for r in &out.records {
+            for (k, v) in &r.attrs {
+                proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);
+                proptest::prop_assert!(attr_value_is_exact(v), "{}: {:?}", k, v);
+            }
+            let built = r.stream_attrs.capacity()
+                + r.attrs.capacity() * std::mem::size_of::<(String, AttrValue)>()
+                + r.attrs
+                    .iter()
+                    .map(|(k, v)| k.capacity() + attr_value_heap_bytes(v))
+                    .sum::<usize>();
+            proptest::prop_assert!(
+                per_record >= built,
+                "per-record projection {} < built {}",
+                per_record,
+                built
+            );
+        }
+        Ok(out.records.len())
+    }
+
+    /// Scalar attributes plus, now and then, a list or a one-entry map, whose
+    /// converted `Vec`s are collected through `Result`.
+    fn log_attribute_sets() -> impl proptest::strategy::Strategy<Value = Vec<KeyValue>> {
+        use crate::label_projection::capacity_cases;
+        use proptest::prelude::*;
+        let nested = prop_oneof![
+            prop::collection::vec(capacity_cases::value(), 0..3).prop_map(|values| {
+                AnyValueVariant::ArrayValue(ArrayValue {
+                    values: values.into_iter().map(|value| AnyValue { value }).collect(),
+                })
+            }),
+            (capacity_cases::key(), capacity_cases::value()).prop_map(|(k, v)| {
+                AnyValueVariant::KvlistValue(KeyValueList {
+                    values: vec![capacity_cases::kv(&k, v)],
+                })
+            }),
+        ];
+        (capacity_cases::attribute_sets(6), prop::option::of(nested)).prop_map(
+            |(mut attributes, nested)| {
+                if let Some(nested) = nested {
+                    attributes.push(capacity_cases::kv("nested_attr", Some(nested)));
+                }
+                attributes
+            },
+        )
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn kept_attributes_are_exact_and_projected(
+            resource in crate::label_projection::capacity_cases::attributes(4),
+            attributes in log_attribute_sets(),
+        ) {
+            check_record_capacity(&resource, &attributes)?;
+        }
+    }
+
+    #[test]
+    fn kept_attributes_are_exact_and_projected_on_fixed_cases() {
+        use crate::label_projection::capacity_cases::{double, int, kv};
+        for attribute in [kv("k", int(0)), kv("k", double(1e260))] {
+            let kept = check_record_capacity(&[], std::slice::from_ref(&attribute))
+                .expect("fixed case holds");
+            assert_eq!(kept, 1, "{attribute:?}");
+        }
     }
 }

@@ -52,6 +52,7 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use ravel_rspan::{StatusCode, merge_attrs};
 
+use crate::label_projection::exact_capacity;
 use crate::promcompat::format_float;
 use crate::traces_limits::{SpanIngestLimits, SpanRejection};
 
@@ -250,6 +251,9 @@ fn normalize_scope(
             scope_attrs.push(("otel.scope.version".to_string(), scope.version.clone()));
         }
     }
+    // Kept for every span under the scope and charged once by the projection
+    // at the per-attribute rate, which the pushes above could have outgrown.
+    scope_attrs.shrink_to_fit();
 
     for span in &ss.spans {
         match normalize_span(span, resource_attrs, &scope_attrs, limits, ingest_ts_ns) {
@@ -565,7 +569,7 @@ fn convert_attr(
             max: limits.max_attribute_value_len,
         });
     }
-    Ok((kv.key.clone(), value))
+    Ok((exact_capacity(kv.key.clone()), exact_capacity(value)))
 }
 
 /// Map one OTLP `AnyValue` to the `Utf8` string RSPAN stores. Scalars take
@@ -1666,5 +1670,70 @@ mod tests {
             .sum();
         assert!(built > 0);
         assert!(projected >= built, "projected {projected} < built {built}");
+    }
+
+    /// Normalize one span carrying `attributes` under `resource`, check that
+    /// every kept key and value sits at exact capacity, and that the
+    /// projection's per-span term (two spans less one, so the
+    /// once-per-resource and once-per-scope copies give no slack) is at least
+    /// what the span allocated. Returns the number of kept spans.
+    fn check_span_capacity(
+        resource: &[KeyValue],
+        attributes: &[KeyValue],
+    ) -> Result<usize, proptest::test_runner::TestCaseError> {
+        let limits = SpanIngestLimits::default();
+        let req = |n: u64| {
+            request(vec![resource_spans(
+                resource.to_vec(),
+                vec![scope_spans(
+                    "lib",
+                    "1",
+                    (0..n)
+                        .map(|i| span("op", 1_000 + i, 2_000, attributes.to_vec()))
+                        .collect(),
+                )],
+            )])
+        };
+        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits)
+            - crate::project_span_resolved_label_bytes(&req(1), &limits);
+        let out = normalize_traces(req(1), &limits, 5_000);
+        for s in &out.spans {
+            for (k, v) in &s.attrs {
+                proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);
+                proptest::prop_assert_eq!(v.capacity(), v.len(), "{}: {:?}", k, v);
+            }
+            let built = s.attrs.capacity() * std::mem::size_of::<(String, String)>()
+                + s.attrs
+                    .iter()
+                    .map(|(k, v)| k.capacity() + v.capacity())
+                    .sum::<usize>();
+            proptest::prop_assert!(
+                per_span >= built,
+                "per-span projection {} < built {}",
+                per_span,
+                built
+            );
+        }
+        Ok(out.spans.len())
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn kept_attributes_are_exact_and_projected(
+            resource in crate::label_projection::capacity_cases::attributes(4),
+            attributes in crate::label_projection::capacity_cases::attribute_sets(6),
+        ) {
+            check_span_capacity(&resource, &attributes)?;
+        }
+    }
+
+    #[test]
+    fn kept_attributes_are_exact_and_projected_on_fixed_cases() {
+        use crate::label_projection::capacity_cases::{double, int, kv};
+        for attribute in [kv("k", int(-200)), kv("k", double(1e260))] {
+            let kept = check_span_capacity(&[], std::slice::from_ref(&attribute))
+                .expect("fixed case holds");
+            assert_eq!(kept, 1, "{attribute:?}");
+        }
     }
 }
