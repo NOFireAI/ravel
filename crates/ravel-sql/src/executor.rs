@@ -3646,33 +3646,35 @@ impl PinnedStream {
         if let Some(spill) = self.spill.as_ref()
             && let Some(failure) = spill_failure_kind(&err)
         {
-            return match failure {
-                // DataFusion raises the scratch-quota trip as an IO error from
-                // its spill writer, which the Arrow IPC writer wraps, with text
-                // telling the caller to raise a DataFusion option no Ravel
-                // client can reach. The memory and scratch
-                // budgets are independently enforced, so they stay
-                // independently reportable: re-typed here, with the figures
-                // restated from the disk manager's own gauge.
-                SpillFailure::Quota => SqlError::spill_budget_exhausted(
-                    spill.disk_manager.used_disk_space(),
-                    spill.quota,
-                ),
-                // A filesystem error reaching this stream while spill is
-                // enabled is a scratch failure: every read of durable data
-                // goes through this crate's own fetchers, which surface as
-                // `SqlError::Fetch`/`LogFetch`/`SpanFetch`, never as a bare
-                // DataFusion IO error. The commonest cause is the scratch
-                // volume filling mid-write.
-                SpillFailure::Io(detail) => SqlError::SpillUnavailable(format!(
-                    "spill file write failed while the query held \
-                     {} of {} scratch bytes: {detail}",
-                    spill.disk_manager.used_disk_space(),
-                    spill.quota
-                )),
-            };
+            return spill_error(failure, spill.disk_manager.used_disk_space(), spill.quota);
         }
         execution_error(err, &self.pool)
+    }
+}
+
+/// The typed error for a spill failure, its figures restated from the
+/// query's disk manager: `used` bytes of scratch held when the failure
+/// arrived, of a `quota`.
+fn spill_error(failure: SpillFailure, used: u64, quota: u64) -> SqlError {
+    match failure {
+        // DataFusion raises the scratch-quota trip as an IO error from
+        // its spill writer, which the Arrow IPC writer wraps, with text
+        // telling the caller to raise a DataFusion option no Ravel
+        // client can reach. The memory and scratch
+        // budgets are independently enforced, so they stay
+        // independently reportable: re-typed here, with the figures
+        // restated from the disk manager's own gauge.
+        SpillFailure::Quota => SqlError::spill_budget_exhausted(used, quota),
+        // A filesystem error reaching this stream while spill is
+        // enabled is a scratch failure: every read of durable data
+        // goes through this crate's own fetchers, which surface as
+        // `SqlError::Fetch`/`LogFetch`/`SpanFetch`, never as a bare
+        // DataFusion IO error. The commonest cause is the scratch
+        // volume filling mid-write.
+        SpillFailure::Io(detail) => SqlError::SpillUnavailable(format!(
+            "spill file write failed while the query held \
+             {used} of {quota} scratch bytes: {detail}"
+        )),
     }
 }
 
@@ -3698,6 +3700,9 @@ fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
         {
             Some(SpillFailure::Quota)
         }
+        // DataFusion 55 raises a failed spill-file write inside the Arrow IPC
+        // writer, so it arrives through the `ArrowError::IoError` arm below;
+        // this arm is reached by spill file creation and read-back.
         DataFusionError::IoError(io) => Some(SpillFailure::Io(io.to_string())),
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
             spill_failure_kind(inner)
@@ -3710,6 +3715,7 @@ fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
             ArrowError::IoError(desc, _) if desc.contains(crate::error::MSG_SPILL_QUOTA_MARKER) => {
                 Some(SpillFailure::Quota)
             }
+            ArrowError::IoError(desc, _) => Some(SpillFailure::Io(desc.clone())),
             ArrowError::ExternalError(boxed) => boxed
                 .downcast_ref::<DataFusionError>()
                 .and_then(spill_failure_kind),
@@ -5154,6 +5160,31 @@ mod tests {
     use crate::declared::{DeclaredType, StaticDeclaredColumns};
 
     use super::*;
+
+    /// A spill-file write that fails for a reason other than the quota is
+    /// `SpillUnavailable`. DataFusion 55's spill writer raises the write
+    /// error inside the Arrow IPC writer, which wraps it as
+    /// `ArrowError::IoError`; this builds that exact chain, the disk-full
+    /// error converted the way `FileSpillWriter::write` and Arrow convert it.
+    #[test]
+    fn a_failed_spill_write_through_the_arrow_writer_is_spill_unavailable() {
+        let disk_full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let from_spill_writer = std::io::Error::from(DataFusionError::IoError(disk_full));
+        let detail = from_spill_writer.to_string();
+        let err = DataFusionError::from(ArrowError::from(from_spill_writer));
+
+        let failure = spill_failure_kind(&err).expect("a failed spill write is a spill failure");
+        match spill_error(failure, 4096, 65_536) {
+            SqlError::SpillUnavailable(message) => assert_eq!(
+                message,
+                format!(
+                    "spill file write failed while the query held 4096 of 65536 \
+                     scratch bytes: {detail}"
+                )
+            ),
+            other => panic!("expected SpillUnavailable, got {other:?}"),
+        }
+    }
 
     fn empty_store() -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
         Arc::new(InstrumentedStore::new(FaultStore::new(
