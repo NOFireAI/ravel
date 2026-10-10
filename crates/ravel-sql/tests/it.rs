@@ -16,6 +16,8 @@ mod util;
 
 #[path = "admission_parity.rs"]
 mod admission_parity;
+#[path = "aggregate_emit_reservation.rs"]
+mod aggregate_emit_reservation;
 #[path = "alerts_provider.rs"]
 mod alerts_provider;
 #[path = "attrs_map_vs_declared.rs"]
