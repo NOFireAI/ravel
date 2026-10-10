@@ -380,6 +380,13 @@ pub enum AuditTextArg {
 /// `--tenant-hash-key-file` form an operator already handles.
 pub const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
 
+/// Whether [`AUDIT_TOKEN_KEY_ENV`] is present in this process's environment,
+/// whatever its value. Under `--audit-mode off` the key is never read, so a
+/// deployment that sets it expecting the audit to run is told at startup.
+pub fn audit_token_key_env_present() -> bool {
+    std::env::var_os(AUDIT_TOKEN_KEY_ENV).is_some()
+}
+
 /// Context string for deriving the audit token key from the deployment key.
 /// Key separation: the deployment key already keys the tenant hash and the
 /// recovery manifest's AEAD, so the audit tokenizer takes a distinct derived

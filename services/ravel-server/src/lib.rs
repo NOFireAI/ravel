@@ -3077,10 +3077,17 @@ pub async fn start_with_heartbeat(
             }
             None => Arc::new(ravel_maintain::NoopQueryAuditSink),
         };
-        tracing::info!(
-            audit_mode = query_audit_mode_label(config.audit_pipeline.as_ref()),
-            "query audit resolved"
-        );
+        let audit_mode = query_audit_mode_label(config.audit_pipeline.as_ref());
+        if config.audit_pipeline.is_none() && config::audit_token_key_env_present() {
+            tracing::warn!(
+                audit_mode,
+                "query audit resolved: the query audit is off, so {} is set but unused; \
+                 pass --audit-mode required to enable the audit",
+                config::AUDIT_TOKEN_KEY_ENV
+            );
+        } else {
+            tracing::info!(audit_mode, "query audit resolved");
+        }
 
         // The provenance stamp of the resolved policy (ADR-0996 decision 2).
         // The server exposes no config endpoint, so this startup line is where
