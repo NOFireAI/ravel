@@ -82,6 +82,8 @@ mod logs_stats_load;
 mod logs_striped_directory_accounting;
 #[path = "logs_topk_late_materialization.rs"]
 mod logs_topk_late_materialization;
+#[path = "logs_topk_threshold_skip.rs"]
+mod logs_topk_threshold_skip;
 #[path = "logs_trace_id_hex_literal.rs"]
 mod logs_trace_id_hex_literal;
 #[path = "logs_uncached_assignment.rs"]

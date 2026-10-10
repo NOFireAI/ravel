@@ -2373,6 +2373,8 @@ const PRUNING_KEYS: &[&str] = &[
     "blocksTotal",
     "blocksScanned",
     "blocksPrunedByPostings",
+    "blocksSkippedByThreshold",
+    "segmentsSkippedByThreshold",
 ];
 
 /// ADR-2677 decision 4: the JSON response carries `stats.timings` and

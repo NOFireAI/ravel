@@ -825,11 +825,14 @@ async fn has_word_reaches_the_same_rows_through_the_striped_path() {
     report("has_word rule=off", &without);
 
     assert!(with.has_fetch_node(), "the rule fires:\n{}", with.explain);
-    // The content arm is bloom-pruned at decode: only the blocks holding a
-    // matching record are scanned, one per matching record.
+    // The content arm is bloom-pruned at decode, so only the ten blocks
+    // holding a match can be scanned. The first four of them fill the TopK
+    // (indices 0, 7, 14, 21), and its threshold then skips the other six
+    // (ADR-2677 decision 6): the remaining block of segment 1 starts at index
+    // 28, and segments 2 and 3 start at 32 and 48.
     assert_eq!(
-        with.blocks_scanned, MATCHES,
-        "bloom keeps the ten blocks holding a match"
+        with.blocks_scanned, 4,
+        "the four winners' blocks are scanned, the six later matches skipped"
     );
     assert_eq!(with.blocks_total, TOTAL_BLOCKS);
     assert_eq!(with.row_count(), 4);
@@ -861,9 +864,12 @@ async fn whole_segments_dealt_to_partitions_return_the_same_rows() {
     report("striped rule=off", &without);
 
     assert!(with.has_fetch_node(), "the rule fires:\n{}", with.explain);
-    assert_eq!(
-        with.blocks_scanned, MATCHES,
-        "the striped partitions between them decode the ten surviving blocks"
+    // At most the ten surviving blocks, at least the four winners' blocks; how
+    // many the TopK threshold skips in between depends on the scheduler.
+    assert!(
+        (4..=MATCHES).contains(&with.blocks_scanned),
+        "the striped partitions between them decode at most the ten surviving blocks: {}",
+        with.blocks_scanned
     );
     assert_eq!(with.row_count(), 4);
     assert_eq!(
