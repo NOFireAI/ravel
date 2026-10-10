@@ -13,6 +13,11 @@
 //! `--alert-rules-file`, under no request at all, so those tenants count on
 //! both sides of the check.
 //!
+//! A keyed bucket in all, gateway or query mode resolves bearer tokens against
+//! the durable `sys/auth` map too, so a tenant can be onboarded there without a
+//! restart: the static configuration does not bound the tenant set, and the
+//! check treats that like any other dynamic resolver (ADR-2708 D1).
+//!
 //! Every case that was refused before the `tenant` key existed is still refused
 //! here, unchanged: those specs carry no mapping, which is exactly the shape the
 //! refusal covers. What is new is that a mapped spec now starts on a
@@ -75,6 +80,7 @@ fn refusing_unmapped_remote_clusters_when_multiple_tenants_resolve() {
         &two_tenants,
         &[],
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect_err("two distinct tenants plus an unmapped remote cluster must refuse startup");
@@ -117,6 +123,7 @@ fn refusal_names_every_unmapped_cluster() {
         &two_tenants,
         &[],
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect_err("any unmapped remote on a multi-tenant coordinator must refuse");
@@ -143,6 +150,7 @@ fn mapped_remotes_start_on_a_multi_tenant_coordinator() {
         &two_tenants,
         &[],
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect("one remote credential per local tenant is the supported multi-tenant model");
@@ -156,36 +164,53 @@ fn mapped_remotes_start_under_every_dynamic_resolver() {
     let one_tenant = tokens(&[("token-a", "acme")]);
     let mapped = [remote("east", Some("acme"))];
 
-    ravel_server::ensure_federation_tenant_mapping(&mapped, &one_tenant, &[], false, &oidc_auth())
-        .expect("OIDC plus a mapped remote is expressible");
+    ravel_server::ensure_federation_tenant_mapping(
+        &mapped,
+        &one_tenant,
+        &[],
+        false,
+        false,
+        &oidc_auth(),
+    )
+    .expect("OIDC plus a mapped remote is expressible");
 
     let mtls_auth = AuthResolverSettings {
         oidc: None,
         mtls_header: Some("x-client-tenant".to_string()),
     };
-    ravel_server::ensure_federation_tenant_mapping(&mapped, &one_tenant, &[], false, &mtls_auth)
-        .expect("mTLS plus a mapped remote is expressible");
+    ravel_server::ensure_federation_tenant_mapping(
+        &mapped,
+        &one_tenant,
+        &[],
+        false,
+        false,
+        &mtls_auth,
+    )
+    .expect("mTLS plus a mapped remote is expressible");
 
     ravel_server::ensure_federation_tenant_mapping(
         &mapped,
         &one_tenant,
         &[],
         true,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect("the dev header plus a mapped remote is expressible");
 }
 
 /// The supported pre-mapping configuration -- exactly one static bearer tenant,
-/// no dynamic resolver -- with an UNMAPPED remote cluster still starts, exactly
-/// as before. Without this the refusal could refuse everything and look correct.
+/// no dynamic resolver, an UNKEYED bucket (no durable sys/auth tokens) -- with
+/// an UNMAPPED remote cluster still starts, exactly as before. Without this the
+/// refusal could refuse everything and look correct.
 #[test]
-fn single_tenant_unmapped_federation_still_starts() {
+fn an_unkeyed_bucket_keeps_the_single_tenant_unmapped_shape() {
     let one_tenant = tokens(&[("token-a", "acme"), ("token-a-alt", "acme")]);
     ravel_server::ensure_federation_tenant_mapping(
         &[remote("east", None)],
         &one_tenant,
         &[],
+        false,
         false,
         &AuthResolverSettings::default(),
     )
@@ -197,8 +222,15 @@ fn single_tenant_unmapped_federation_still_starts() {
 #[test]
 fn no_remote_cluster_never_refuses() {
     let two_tenants = tokens(&[("token-a", "acme"), ("token-b", "beta")]);
-    ravel_server::ensure_federation_tenant_mapping(&[], &two_tenants, &[], true, &oidc_auth())
-        .expect("without a remote cluster there is no federation exposure to refuse");
+    ravel_server::ensure_federation_tenant_mapping(
+        &[],
+        &two_tenants,
+        &[],
+        true,
+        false,
+        &oidc_auth(),
+    )
+    .expect("without a remote cluster there is no federation exposure to refuse");
 }
 
 /// Every dynamic resolver derives the tenant from a request header or token
@@ -215,6 +247,7 @@ fn each_dynamic_resolver_refuses_an_unmapped_remote_cluster() {
         &unmapped,
         &one_tenant,
         &[],
+        false,
         false,
         &oidc_auth(),
     )
@@ -234,6 +267,7 @@ fn each_dynamic_resolver_refuses_an_unmapped_remote_cluster() {
         &one_tenant,
         &[],
         false,
+        false,
         &mtls_auth,
     )
     .expect_err("mTLS resolves an arbitrary tenant, so an unmapped remote must refuse");
@@ -248,6 +282,7 @@ fn each_dynamic_resolver_refuses_an_unmapped_remote_cluster() {
         &one_tenant,
         &[],
         true,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect_err("the dev header resolves an arbitrary tenant, so an unmapped remote must refuse");
@@ -275,6 +310,7 @@ fn refusing_a_mapping_to_an_unconfigured_tenant() {
         &two_tenants,
         &[],
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect_err("a mapping no request can ever resolve to must refuse startup");
@@ -293,6 +329,7 @@ fn refusing_a_mapping_to_an_unconfigured_tenant() {
         &[remote("east", Some("acme-typo"))],
         &one_tenant,
         &[],
+        false,
         false,
         &AuthResolverSettings::default(),
     )
@@ -313,6 +350,7 @@ fn a_dynamic_resolver_does_not_bound_the_mapping() {
         &[remote("east", Some("tenant-known-only-to-the-idp"))],
         &one_tenant,
         &[],
+        false,
         false,
         &oidc_auth(),
     )
@@ -351,6 +389,7 @@ fn an_alert_rules_tenant_makes_the_coordinator_multi_tenant() {
         &one_tenant,
         &alert_tenants(&["beta"]),
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect_err("a tenant named only in --alert-rules-file is still a second local tenant");
@@ -377,6 +416,7 @@ fn an_alert_rules_tenant_makes_the_coordinator_multi_tenant() {
         &one_tenant,
         &[],
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect("one local tenant and an unmapped remote is the supported pre-mapping shape");
@@ -399,6 +439,7 @@ fn a_mapping_to_an_alert_rules_only_tenant_starts() {
         &one_tenant,
         &alert_tenants(&["beta"]),
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect("beta is a local tenant this coordinator queries for, so the mapping can fire");
@@ -415,6 +456,7 @@ fn an_alert_rules_tenant_does_not_admit_every_mapping() {
         &one_tenant,
         &alert_tenants(&["beta"]),
         false,
+        false,
         &AuthResolverSettings::default(),
     )
     .expect_err("gamma is named by neither source, so its mapping can never fire");
@@ -428,4 +470,90 @@ fn an_alert_rules_tenant_does_not_admit_every_mapping() {
         "error must say the alert-rules tenants were consulted too, so an operator who \
          configured one does not read this as the check ignoring it, got: {msg:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Durable sys/auth tenancy (ADR-2708 D1). On a keyed bucket in a
+// tenant-resolving mode, `ravel_server::start` appends the durable sys/auth
+// bearer resolver, so a tenant provisioned there resolves without a restart and
+// without any `--tenant-token`. `durable_auth = true` below is what main.rs
+// passes in that case (`ravel_server::durable_auth_enabled`).
+// ---------------------------------------------------------------------------
+
+/// One static tenant on a keyed bucket is not a single-tenant coordinator: a
+/// second tenant can appear in sys/auth at any moment and its queries would fan
+/// out under the unkeyed remote's credential.
+#[test]
+fn a_keyed_bucket_refuses_an_unmapped_remote_with_one_static_tenant() {
+    let one_tenant = tokens(&[("token-a", "acme")]);
+    let err = ravel_server::ensure_federation_tenant_mapping(
+        &[remote("east", None)],
+        &one_tenant,
+        &[],
+        false,
+        true,
+        &AuthResolverSettings::default(),
+    )
+    .expect_err("durable sys/auth tokens make the coordinator multi-tenant");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("runs queries for more than one local tenant"),
+        "error must name the multi-tenant exposure, got: {msg:?}"
+    );
+    assert!(
+        msg.contains("durable sys/auth bearer tokens"),
+        "error must name durable sys/auth as the reason, got: {msg:?}"
+    );
+    assert!(
+        msg.contains("'east'"),
+        "error must name the unmapped cluster, got: {msg:?}"
+    );
+}
+
+/// No static tenant at all: every tenant comes from sys/auth, so the unkeyed
+/// remote would serve whichever tenants get provisioned there.
+#[test]
+fn a_keyed_bucket_refuses_an_unmapped_remote_with_no_static_tenant() {
+    let err = ravel_server::ensure_federation_tenant_mapping(
+        &[remote("east", None)],
+        &HashMap::new(),
+        &[],
+        false,
+        true,
+        &AuthResolverSettings::default(),
+    )
+    .expect_err("a sys/auth-only coordinator is multi-tenant");
+    assert!(
+        format!("{err:#}").contains("durable sys/auth bearer tokens"),
+        "error must name durable sys/auth as the reason, got: {err:#}"
+    );
+}
+
+/// Review id O-R1: `tenant=beta` where beta is known only through sys/auth is a
+/// mapping that fires, so it must start. With durable auth off the same spec is
+/// the unfirable typo the check refuses, which is the control that this test
+/// turns on `durable_auth` and nothing else.
+#[test]
+fn a_keyed_bucket_admits_a_mapping_to_a_durable_only_tenant() {
+    let one_tenant = tokens(&[("token-a", "acme")]);
+    ravel_server::ensure_federation_tenant_mapping(
+        &[remote("east", Some("beta"))],
+        &one_tenant,
+        &[],
+        false,
+        true,
+        &AuthResolverSettings::default(),
+    )
+    .expect("a tenant provisioned through sys/auth can run queries, so the mapping can fire");
+
+    let err = ravel_server::ensure_federation_tenant_mapping(
+        &[remote("east", Some("beta"))],
+        &one_tenant,
+        &[],
+        false,
+        false,
+        &AuthResolverSettings::default(),
+    )
+    .expect_err("without durable auth beta is configured nowhere");
+    assert!(format!("{err:#}").contains("'beta'"), "got: {err:#}");
 }

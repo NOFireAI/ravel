@@ -237,12 +237,23 @@ pub fn warn_plaintext_federation(clusters: &[config::RemoteClusterConfig]) {
     }
 }
 
-/// The reason a resolver derives the tenant from a request header or a token
-/// claim, or `None` when the static bearer map is the whole tenant set. Under
-/// any of these, a tenant that appears in no `--tenant-token` can still resolve,
-/// so the token map bounds neither how many tenants there are nor which.
+/// Whether [`start`] installs the durable `sys/auth` bearer resolver
+/// (ADR-0066 decision 6): a tenant-resolving mode on a keyed bucket. The
+/// federation startup guard asks the same question through this function, so
+/// the two cannot disagree about whether a tenant can be onboarded without a
+/// restart.
+pub fn durable_auth_enabled(mode: Mode, deployment_key_present: bool) -> bool {
+    deployment_key_present && matches!(mode, Mode::All | Mode::Gateway | Mode::Query)
+}
+
+/// The reason a resolver derives the tenant from a request header, a token
+/// claim, or the durable `sys/auth` token map, or `None` when the static
+/// configuration is the whole tenant set. Under any of these, a tenant that
+/// appears in no `--tenant-token` can still resolve, so the token map bounds
+/// neither how many tenants there are nor which.
 fn dynamic_resolver_reason(
     dev_insecure_tenant_header: bool,
+    durable_auth: bool,
     auth: &config::AuthResolverSettings,
 ) -> Option<String> {
     if auth.oidc.is_some() {
@@ -266,6 +277,13 @@ fn dynamic_resolver_reason(
         return Some(
             "--dev-insecure-tenant-header resolves the tenant from a request header, so any \
              tenant can resolve"
+                .to_string(),
+        );
+    }
+    if durable_auth {
+        return Some(
+            "a deployment key enables durable sys/auth bearer tokens, so a tenant can be \
+             onboarded without a restart"
                 .to_string(),
         );
     }
@@ -306,9 +324,10 @@ fn multi_tenant_resolver_reason(
     tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
     alert_rule_tenants: &[ravel_types::TenantHash],
     dev_insecure_tenant_header: bool,
+    durable_auth: bool,
     auth: &config::AuthResolverSettings,
 ) -> Option<String> {
-    if let Some(reason) = dynamic_resolver_reason(dev_insecure_tenant_header, auth) {
+    if let Some(reason) = dynamic_resolver_reason(dev_insecure_tenant_header, durable_auth, auth) {
         return Some(reason);
     }
     let from_tokens: std::collections::HashSet<ravel_types::TenantHash> =
@@ -346,8 +365,16 @@ fn multi_tenant_resolver_reason(
 ///
 /// Also refuses a mapping that can never fire: when the tenant set is fully
 /// known (static configuration only, no resolver that derives a tenant from a
-/// request), a `tenant` naming a tenant outside it is a typo whose only symptom
-/// would be a remote that silently answers nobody.
+/// request, and no durable `sys/auth` token map), a `tenant` naming a tenant
+/// outside it is a typo whose only symptom would be a remote that silently
+/// answers nobody.
+///
+/// `durable_auth` is [`durable_auth_enabled`] for this process: whether
+/// [`start`] appends the durable `sys/auth` bearer resolver. When it does, a
+/// tenant can be onboarded through `sys/auth` without a restart, so the
+/// coordinator counts as multi-tenant (an unkeyed spec is refused even with
+/// at most one static tenant) and a `tenant` key naming a tenant known only
+/// through `sys/auth` is accepted.
 ///
 /// `alert_rule_tenants` is the tenant set of `--alert-rules-file`
 /// (`alerting::parse_rules`'s map keys). It counts on both sides: the alert
@@ -363,6 +390,7 @@ pub fn ensure_federation_tenant_mapping(
     tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
     alert_rule_tenants: &[ravel_types::TenantHash],
     dev_insecure_tenant_header: bool,
+    durable_auth: bool,
     auth: &config::AuthResolverSettings,
 ) -> anyhow::Result<()> {
     if remote_clusters.is_empty() {
@@ -372,6 +400,7 @@ pub fn ensure_federation_tenant_mapping(
         tenant_tokens,
         alert_rule_tenants,
         dev_insecure_tenant_header,
+        durable_auth,
         auth,
     ) {
         let unkeyed: Vec<&str> = remote_clusters
@@ -389,7 +418,9 @@ pub fn ensure_federation_tenant_mapping(
                  each of those specs, naming the one local tenant whose queries may use that \
                  remote's credential (write one --remote-cluster per local tenant that needs the \
                  same remote, each with its own name and credential-file), or run one local \
-                 tenant, or remove --remote-cluster.",
+                 tenant on an unkeyed bucket, or remove --remote-cluster. On a keyed bucket \
+                 durable sys/auth tokens can onboard a tenant at any time, so tenant= is \
+                 required there even with one --tenant-token.",
                 unkeyed
                     .iter()
                     .map(|n| format!("'{n}'"))
@@ -399,14 +430,16 @@ pub fn ensure_federation_tenant_mapping(
         }
     }
     // The static configuration is the whole tenant set only when no resolver
-    // derives a tenant from a request, and an empty set configures no tenants at
+    // derives a tenant from a request or from the durable sys/auth map, and an empty set configures no tenants at
     // all rather than asserting there are none. Outside those two cases a
     // `tenant` value that is absent here may still resolve at request time, so
     // there is nothing to check. Note this is NOT gated on the coordinator being
     // single-tenant: two static tenants are two tenants and still a fully known
     // set, which is exactly the multi-tenant deployment the mapping is for.
     let known = local_tenant_hashes(tenant_tokens, alert_rule_tenants);
-    if dynamic_resolver_reason(dev_insecure_tenant_header, auth).is_none() && !known.is_empty() {
+    if dynamic_resolver_reason(dev_insecure_tenant_header, durable_auth, auth).is_none()
+        && !known.is_empty()
+    {
         for rc in remote_clusters {
             if let Some(tenant) = &rc.tenant
                 && !known.contains(&tenant.hash())
@@ -421,8 +454,9 @@ pub fn ensure_federation_tenant_mapping(
                      configures and no --alert-rules-file rule names (--tenant-token tenants: {}; \
                      --alert-rules-file adds {} more, matched by hash). Nothing on this \
                      coordinator can ever run a query for that tenant, so this remote would answer \
-                     nothing at all. Fix the tenant name, configure a --tenant-token for it, or \
-                     give it an alert rule.",
+                     nothing at all. Fix the tenant name, configure a --tenant-token for it, \
+                     give it an alert rule, or provision it through sys/auth on a keyed bucket \
+                     (a deployment key in all, gateway or query mode).",
                     rc.name,
                     tenant.as_str(),
                     if names.is_empty() {
@@ -2462,7 +2496,7 @@ pub async fn start_with_heartbeat(
     // bucket has no keyed-hash token map, so durable auth is unavailable there.
     let now_ns = <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock);
     let durable_auth: Option<Arc<lifecycle_refresh::DurableAuthState>> =
-        if matches!(config.mode, Mode::All | Mode::Gateway | Mode::Query) {
+        if durable_auth_enabled(config.mode, config.deployment_key.is_some()) {
             config.deployment_key.as_ref().map(|key| {
                 Arc::new(lifecycle_refresh::DurableAuthState::with_defaults(
                     store.clone(),
@@ -4232,6 +4266,31 @@ pub async fn start_with_heartbeat(
         #[cfg(feature = "sql")]
         sql_spill_owner,
     })
+}
+
+#[cfg(test)]
+mod durable_auth_predicate_tests {
+    use super::{Mode, durable_auth_enabled};
+
+    #[test]
+    fn durable_auth_is_off_in_maintain_mode_and_without_a_key() {
+        for (mode, keyed, expected) in [
+            (Mode::All, true, true),
+            (Mode::Gateway, true, true),
+            (Mode::Query, true, true),
+            (Mode::Maintain, true, false),
+            (Mode::All, false, false),
+            (Mode::Gateway, false, false),
+            (Mode::Query, false, false),
+            (Mode::Maintain, false, false),
+        ] {
+            assert_eq!(
+                durable_auth_enabled(mode, keyed),
+                expected,
+                "mode {mode:?}, deployment key present: {keyed}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

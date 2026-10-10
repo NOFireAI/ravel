@@ -636,9 +636,9 @@ a tenant, add a spec with its `tenant`.
 
 A spec without `tenant` makes a remote reachable by **every** local tenant.
 That is correct on a coordinator that runs queries for only one local tenant,
-and it is what a single-tenant deployment writes. **A coordinator that runs
-queries for more than one local tenant refuses to start with an unmapped
-remote cluster.** The error names every spec that needs a `tenant`.
+and it is what a single-tenant deployment on an unkeyed bucket writes. **A
+coordinator that runs queries for more than one local tenant refuses to start
+with an unmapped remote cluster.** The error names every spec that needs a `tenant`.
 
 A coordinator runs queries for more than one local tenant in each of these
 cases:
@@ -651,13 +651,20 @@ cases:
 - Any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
   `--oidc-issuer`, or `--mtls-enabled`. Each of them derives the tenant from a
   request header or a token claim.
+- A deployment key is set in All, Gateway or Query mode (a keyed bucket). The
+  server then also resolves bearer tokens against the durable `sys/auth` map,
+  so a tenant can be onboarded without a restart. On a keyed bucket every
+  `--remote-cluster` needs `tenant=`, even with a single `--tenant-token`.
 
 Startup also refuses a `tenant` that no `--tenant-token`,
 `--tenant-token-file`, or `--alert-rules-file` names. This check applies where
-the tenant set is fully known: static configuration and no dynamic resolver.
+the tenant set is fully known: static configuration, no dynamic resolver, and
+no durable `sys/auth` map.
 Such a mapping can never fire, and its only symptom is a remote that answers
-nobody. Under a dynamic resolver the static configuration is not the
-tenant set, so the check does not apply.
+nobody. Under a dynamic resolver, or on a keyed bucket where a tenant can be
+provisioned only in `sys/auth`, the static configuration is not the tenant
+set, so the check does not apply and a mapping to a `sys/auth`-only tenant
+starts.
 
 You can map a remote to a tenant that only `--alert-rules-file` names. That is
 a real deployment: alert rules for a tenant whose data lives partly on a
