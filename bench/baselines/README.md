@@ -4,9 +4,12 @@ This directory is the one path under `bench/` that is tracked; all other bench
 output stays gitignored. It holds two kinds of baseline:
 
 - `tier-b.json`: the criterion baseline that the tier B regression compare
-  (ADR-0070 decision 3) diffs a bench run against. The committed file is a
-  demonstration of the machinery (below); a usable baseline is recorded on a
-  fresh EC2 instance with `scripts/bench/fresh-box.sh`.
+  (ADR-0070 decision 3) diffs a bench run against. It was recorded on a fresh
+  c6a.4xlarge (16 cores, x86_64, us-east-1) with `scripts/bench/fresh-box.sh`,
+  at the commit and knobs its `_meta` stamps, and the instance was terminated
+  after the run. Compare a run against it only when that run also comes from a
+  fresh c6a.4xlarge at the same knobs; another host class measures the host,
+  not the change.
 - `s3-envelope.json`: the real-S3 envelope of the weekly `bench-s3` lane, the
   min and max of each compared figure over five of its runs. Summarised from
   the lane's own reports with `scripts/bench/s3-envelope.py` (below).
@@ -82,9 +85,9 @@ stamped into it, in the `_meta.label` text or a `_meta` field:
 A baseline missing the fields that do apply to it (host, binary SHA, knobs)
 is not usable for a comparison, the same way `bench-tier-b.sh compare`
 already refuses a pair with no `_meta.knobs` (below). The committed
-`tier-b.json` is exactly this case: it carries a host label but no binary
-SHA, so treat it as a demonstration of the machinery only, never as a
-regression reference.
+`tier-b.json` carries all of them: its label names the instance type, cores,
+architecture, binary commit and knobs, and `_meta.knobs` holds the four
+sampling knobs.
 
 The sampling knobs are load-bearing in the same way. `RAVEL_BENCH_MAX_SERIES`
 is part of the `segment_encode` bench id, so a re-record at a different
@@ -95,13 +98,9 @@ without failing anything. A re-record must use the same `BENCH_SAMPLE_SIZE`,
 `bench-compare` workflow pins, or the workflow's pins must move with it.
 
 `bench-tier-b.sh record` stamps them, so a baseline recorded through it is
-checkable. `tier-b.json` as committed predates the stamping and carries no
-`_meta.knobs`: the compare reports `NOT RECORDED` for it and an enforcing run
-refuses the pair. That is deliberate. The knobs it was recorded at are not
-fully recoverable from the file, and writing values nobody observed is the
-drift this check exists to catch. Re-recording it with
-`scripts/bench/fresh-box.sh`, which runs `bench-tier-b.sh record` on a fresh
-instance with the host, the binary commit and the knobs stamped, fixes it.
+checkable. The committed `tier-b.json` was recorded through it at
+`BENCH_SAMPLE_SIZE=30`, `BENCH_WARMUP=2`, `BENCH_MEASURE=5` and
+`RAVEL_BENCH_MAX_SERIES=2000`, the values the `bench-compare` workflow pins.
 
 ## Recording a tier B baseline on a fresh instance
 

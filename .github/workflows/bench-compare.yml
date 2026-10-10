@@ -73,8 +73,8 @@ jobs:
           # ignored extra on the other, and drops out of the comparison without
           # failing anything. These must equal the values in the baseline's
           # _meta.knobs.
-          BENCH_SAMPLE_SIZE: "10"
-          BENCH_WARMUP: "1"
-          BENCH_MEASURE: "3"
+          BENCH_SAMPLE_SIZE: "30"
+          BENCH_WARMUP: "2"
+          BENCH_MEASURE: "5"
           RAVEL_BENCH_MAX_SERIES: "2000"
         run: scripts/bench-tier-b.sh compare bench/baselines/tier-b.json

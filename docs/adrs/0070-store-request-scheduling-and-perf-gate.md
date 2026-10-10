@@ -242,5 +242,25 @@ and the committed baseline needs re-recording with knobs recorded before
 any enforcing comparison would trust it.
 
 The committed baseline under `bench/baselines/` remains a demonstration
-recorded on a fleet executor box, not a reference measurement; see its
-`_meta` block and `bench/baselines/README.md`.
+(superseded by the 2026-10-10 baseline amendment below) recorded on a fleet
+executor box, not a reference measurement; see its `_meta` block and
+`bench/baselines/README.md`.
+
+## Amendment (2026-10-10): the tier B baseline is re-recorded on a fresh instance
+
+<!-- amendment-supersedes: phrase="remains a demonstration" pointer="2026-10-10 baseline amendment" -->
+
+`bench/baselines/tier-b.json` is now a reference measurement, not a
+demonstration. It was recorded with `scripts/bench/fresh-box.sh` (issue
+#2673) on a c6a.4xlarge launched for the run and terminated after it, per the
+owner's 2026-10-08 decision that a timing baseline is never taken on a shared
+or long-lived box. The owner chose to keep it as the baseline on 2026-10-10.
+Its label stamps the instance type, cores, architecture, binary commit and
+sampling knobs, and `_meta.knobs` records the knobs, so an enforcing compare
+no longer refuses the pair for missing knobs.
+
+The `bench-compare` workflow's pinned knobs move to the recorded values, and
+the job stays disabled: decision 3 remains advisory, and nothing here adds a
+runner. A comparison against this baseline is meaningful only for a run on
+the same instance type at the same knobs, which `fresh-box.sh` provides.
+
