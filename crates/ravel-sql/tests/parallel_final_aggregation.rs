@@ -7,7 +7,7 @@
 //! flip (decision 2), and the `SqlConfig::parallel_final_aggregation` gate
 //! (decision 4).
 //!
-//! The four tests mirror decision 5:
+//! The first four tests mirror decision 5:
 //!
 //! - `exact_typed_group_by_is_bit_identical_across_partition_counts`: the
 //!   differential. The same exact-typed `GROUP BY` query and data at
@@ -27,6 +27,9 @@
 //!   post-merge fable-review case -- `count(DISTINCT float_col)` over -0.0/0.0
 //!   pairs and mixed-payload NaNs split across partitions, bit-identical across
 //!   partition counts.
+//! - `count_distinct_float_counts_both_zeros_beside_a_companion_aggregate`:
+//!   the same distinct count folds -0.0 into 0.0 only under DataFusion 55's
+//!   single-distinct rewrite; beside `count(*)` it counts them as two.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -347,5 +350,47 @@ async fn count_distinct_float_is_bit_identical_across_partition_counts() {
                  (run {run}) must equal the single-partition baseline"
             );
         }
+    }
+}
+
+/// `count(DISTINCT float_col)` folds `-0.0` into `0.0` only where DataFusion
+/// 55's single-distinct rewrite applies, which turns the distinct argument
+/// into a group key. A companion aggregate the rewrite does not admit (here
+/// `count(*)`) keeps the distinct count on `FloatDistinctCountAccumulator`,
+/// which compares bit patterns, so the same two zeros count as two. The
+/// `ts` filter keeps only the `floats` group's two zeros.
+#[tokio::test]
+async fn count_distinct_float_counts_both_zeros_beside_a_companion_aggregate() {
+    let zeros = "WHERE ts = arrow_cast(300, 'Timestamp(Nanosecond, None)') \
+                 OR ts = arrow_cast(310, 'Timestamp(Nanosecond, None)')";
+    let rewritten = format!(
+        "SELECT label(labels,'__name__') AS metric, \
+         count(DISTINCT value) AS d FROM samples {zeros} GROUP BY metric"
+    );
+    let companion = format!(
+        "SELECT label(labels,'__name__') AS metric, \
+         count(DISTINCT value) AS d, count(*) AS n FROM samples {zeros} GROUP BY metric"
+    );
+
+    for (fetch_concurrency, parallel) in [(1usize, false), (4, true)] {
+        let fixture = fixture_with(fetch_concurrency, parallel).await;
+        let rows = sorted_rows(&fixture, &rewritten).await;
+        assert_eq!(rows.len(), 1, "only the floats group has rows at those ts");
+        assert_eq!(group_key(&rows[0]), "floats");
+        assert_eq!(
+            rows[0][1],
+            Cell::Int(1),
+            "the rewrite groups by the value, and group keys fold -0.0 into 0.0 \
+             (fetch_concurrency={fetch_concurrency})"
+        );
+
+        let rows = sorted_rows(&fixture, &companion).await;
+        assert_eq!(rows.len(), 1, "only the floats group has rows at those ts");
+        assert_eq!(
+            rows[0][1..],
+            [Cell::Int(2), Cell::Int(2)],
+            "beside count(*) the distinct accumulator compares bit patterns, so \
+             -0.0 and 0.0 count as two (fetch_concurrency={fetch_concurrency})"
+        );
     }
 }
