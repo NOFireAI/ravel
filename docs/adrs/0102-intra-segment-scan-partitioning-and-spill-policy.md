@@ -285,8 +285,8 @@ propagates the pool's own `try_grow` error directly (Ravel's
 `TenantDelegatingPool::try_grow` already ignores `can_spill`, so this is
 not a new code path, just closing off the one DataFusion mode that used to
 route around it; the pool now reads `can_spill` for one purpose, see the
-aggregate hold amendment below, and DataFusion 55 changes both the stream
-names and that use, see the hold-removal amendment below).
+aggregate hold amendment below, and on DataFusion 55.2 this describes only
+the legacy stream, see the DataFusion 55.2 hold amendment below).
 
 This also changes `ORDER BY`: `SortExec`'s external sorter would today
 silently spill the same way; with the disk manager disabled it instead
@@ -698,32 +698,51 @@ not. With the disk manager disabled, as decision 3 sets it, a final
 aggregate is built in `ReportError` mode and so is held; a partial
 aggregate emits early under pressure, is spillable in DataFusion's sense,
 and is not held. docs/query-engine.md states the operator-visible
-consequence. The hold-removal amendment below removes this hold.
+consequence. The DataFusion 55.2 hold amendment below narrows the hold to the
+shapes DataFusion 55.2 still runs on that stream.
 
-## Amendment (2026-10-10, #2720): DataFusion 55 keeps aggregate output reserved, and the hold is removed
+## Amendment (2026-10-10, #2720): on DataFusion 55.2 the hold covers only the legacy aggregate stream
 
-<!-- amendment-applies: sections="3. Disable the disk manager explicitly; spill is a typed error, not silent degradation|Amendment (2026-10-09, #2633): the SQL pool holds a non-spillable aggregate's released bytes" pointer="hold-removal amendment" -->
+<!-- amendment-applies: sections="3. Disable the disk manager explicitly; spill is a typed error, not silent degradation|Amendment (2026-10-09, #2633): the SQL pool holds a non-spillable aggregate's released bytes" pointer="DataFusion 55.2 hold amendment" -->
 
-DataFusion 55.2 plans a grouped aggregate on new streams:
+DataFusion 55.2 plans most grouped aggregates on new streams:
 `PartialHashAggregateStream`, `FinalHashAggregateStream`,
-`SingleHashAggregateStream` and their ordered variants. Each materializes
-its output once and keeps the materialized batch in its own reservation
-until the last `batch_size` slice is cut from it, so its emit no longer
-hands live bytes back to the pool. `TenantDelegatingPool` therefore
-forwards every shrink at once again and no longer reads `can_spill`; the
-hold, its consumer-name prefix and `sql_memory_held_bytes` are gone.
-`crates/ravel-sql/tests/aggregate_emit_reservation.rs` pins the
-replacement: a real `GROUP BY` through the production pool has at least the
-first output batch's bytes reserved while that batch is held and more are
-to come, and the same statement on the legacy stream fails that bound.
+`SingleHashAggregateStream`, `PartialReduceHashAggregateStream` and the
+ordered partial and final streams. Each materializes its output once and
+keeps the materialized batch in its own reservation until the last
+`batch_size` slice is cut from it, so its emit hands no live bytes back to
+the pool. None registers a consumer named `GroupedHashAggregateStream[..]`,
+so the hold does not select them and their shrinks reach the budgets at
+once. With the disk manager disabled, `FinalHashAggregateStream` and
+`SingleHashAggregateStream` register a consumer that cannot spill and return
+the pool's refusal; `PartialHashAggregateStream` and the ordered final stream
+register as spillable in every case.
 
-Decision 3's `GroupedHashAggregateStream` sentence now describes a
-fallback. With the disk manager disabled the final and single-stage streams
-register a consumer that cannot spill and return the pool's refusal;
-`PartialHashAggregateStream` registers as spillable in every case. DataFusion 55 still
-runs the legacy `GroupedHashAggregateStream` for the shapes it has not
-migrated, among them a single-stage aggregate with a limit or over ordered
-input. That stream still releases its reservation before it hands out its
-output, and without the hold those bytes are no longer counted while a
-consumer holds them: a single-stage `SELECT DISTINCT ... LIMIT` was
-measured at 65,840 bytes reserved against a 2,490,480-byte first batch.
+`AggregateExec::execute_typed` still falls back to the legacy
+`GroupedHashAggregateStream` for every shape it has not migrated, with
+`enable_migration_aggregate` at its default: a single-stage aggregate that
+carries a limit, a single-stage aggregate over ordered input, the partial
+stage that expands a grouping set, and a partial-reduce stage whenever the
+pool reports a finite limit, which Ravel's always does. That stream keeps
+DataFusion 54.1's emit, its consumer name and its `can_spill` rule, so the
+#2633 amendment's hold and decision 3's `ReportError` sentence apply to it
+unchanged. A grouping set is planned in two stages even on one SQL
+partition, and only its partial stage is legacy: that stage emits early, is
+spillable, and is not held, while its final stage runs on
+`FinalHashAggregateStream`.
+
+`crates/ravel-sql/tests/aggregate_emit_reservation.rs` pins both halves
+through the production pool over 40,000 groups: a default `GROUP BY` has its
+first output batch's bytes reserved while that batch is held, with nothing
+held by the pool, and a single-stage `SELECT DISTINCT ... LIMIT` has them
+reserved only because the pool holds what the legacy stream shrank (65,840
+bytes reserved against a 3,014,768-byte first batch with the hold disabled).
+A `ROLLUP` over the same keys, measured once through the same harness and
+not pinned by a test, read 3,940,656 bytes reserved against a
+3,875,024-byte first batch with nothing held, at both the default partition
+count and one partition.
+
+The hold can be removed once Ravel runs a DataFusion release whose
+`execute_typed` no longer falls back to the legacy stream. Upstream tracks
+that removal as apache/datafusion#25902, under the stream-split epic
+apache/datafusion#22710.
