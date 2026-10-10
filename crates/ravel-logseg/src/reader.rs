@@ -646,6 +646,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                 record_count: entry.record_count as usize,
                 crc32c: entry.block_crc32c,
                 block_index,
+                min_ts: entry.min_ts,
+                max_ts: entry.max_ts,
             });
         }
 
@@ -1028,6 +1030,10 @@ struct BlockLoc {
     record_count: usize,
     crc32c: u32,
     block_index: u32,
+    /// The block's skip-index ts bounds, as stored: an empty block reads 0
+    /// for both, and nothing here checks `min_ts <= max_ts`.
+    min_ts: i64,
+    max_ts: i64,
 }
 
 /// A pruned scan that has not decoded anything yet: the surviving block list,
@@ -1117,6 +1123,27 @@ impl BlockScan {
     /// blocks in a list of its own that can drift from this cursor's order.
     pub fn next_block_index(&self) -> Option<usize> {
         self.blocks.get(self.next).map(|b| b.block_index as usize)
+    }
+
+    /// The skip index's `(min_ts, max_ts)` for the block the next decode call
+    /// would decode, or `None` once the cursor is exhausted. The bounds are
+    /// the stored ones: a caller must treat `min_ts > max_ts` as no bound.
+    pub fn next_block_ts_bounds(&self) -> Option<(i64, i64)> {
+        self.blocks.get(self.next).map(|b| (b.min_ts, b.max_ts))
+    }
+
+    /// Move the cursor past the next surviving block without reading or
+    /// decoding any of it, so it is not counted in `blocks_scanned`. Returns
+    /// `false`, and does nothing, once the cursor is exhausted.
+    ///
+    /// The previously decoded block, if any, stays held until the next decode
+    /// call releases it, exactly as if this block had not been there.
+    pub fn skip_next_block(&mut self) -> bool {
+        if self.next >= self.blocks.len() {
+            return false;
+        }
+        self.next += 1;
+        true
     }
 
     /// Decode the next surviving block and return the rows of it that match the
@@ -5675,5 +5702,74 @@ mod tests {
         .map(|k| footer.section(*k).expect("section").uncomp_len)
         .sum();
         assert_eq!(dirs.decoded_bytes(), want);
+    }
+
+    /// ADR-2677 decision 6: the cursor reports each surviving block's stored
+    /// `ts` bounds before decoding it, and a skipped block is neither decoded
+    /// nor counted in `blocks_scanned`, while the blocks after it still decode
+    /// their own rows. Two streams make the block minima non-monotone.
+    #[test]
+    fn block_ts_bounds_and_skip_leave_later_blocks_intact() {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        // Each stream holds a low block and a high block, so in either stream
+        // order the second block (the first stream's high one) is above the
+        // third (the second stream's low one).
+        let mut recs = Vec::new();
+        for (stream, base) in [(1u8, 0i64), (2, 10)] {
+            for i in 0..4 {
+                recs.push(rec(stream, base + i, &format!("s{stream}-lo{i}")));
+                recs.push(rec(stream, base + 100 + i, &format!("s{stream}-hi{i}")));
+            }
+        }
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+
+        let mut bounds = Vec::new();
+        let mut bodies = Vec::new();
+        while let Some(b) = cursor.next_block_ts_bounds() {
+            bounds.push(b);
+            if bounds.len() == 2 {
+                assert!(cursor.skip_next_block());
+                continue;
+            }
+            let rows = cursor.next_block(&obj).expect("next").expect("a block");
+            bodies.extend(rows.into_iter().map(|r| r.body));
+        }
+        assert_eq!(bounds.len(), 4);
+        assert!(
+            bounds[1].0 >= 100 && bounds[2].0 < 100,
+            "block minima are not monotone: {bounds:?}"
+        );
+        let mut sorted = bounds.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![(0, 3), (10, 13), (100, 103), (110, 113)]);
+        assert!(
+            !cursor.skip_next_block(),
+            "an exhausted cursor skips nothing"
+        );
+        assert_eq!(
+            cursor.stats().blocks_scanned,
+            3,
+            "the skipped block is not scanned"
+        );
+        assert_eq!(bodies.len(), 12);
+        let skipped_stream = if bounds[1].0 == 100 { 1 } else { 2 };
+        assert!(
+            bodies
+                .iter()
+                .all(|b| !b.starts_with(&format!("s{skipped_stream}-hi"))),
+            "the skipped block's rows are not returned: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("-lo")).count(),
+            8,
+            "both low blocks, the one after the skip included, decode whole"
+        );
     }
 }

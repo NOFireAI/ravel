@@ -2962,8 +2962,15 @@ and block-level reported independently:
 - `blocksTotal`: blocks a logs scan saw in the segments it read.
 - `blocksScanned`: of those, blocks it read.
 - `blocksPrunedByPostings`: blocks POSTINGS ruled out.
+- `blocksSkippedByThreshold`: blocks of opened segments a logs scan skipped
+  undecoded because their minimum `ts` was above an `ORDER BY ts ... LIMIT k`
+  TopK's threshold (see "Ordered block skip for `ORDER BY ts LIMIT k`").
+- `segmentsSkippedByThreshold`: segments a logs scan never opened for the
+  same reason; their blocks are not in `blocksSkippedByThreshold`. On the
+  striped scan path a segment is counted once per partition that owned a
+  share of its blocks.
 
-All four counts after `segments` are 0 for a statement with no logs scan.
+All six counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
 while `segments` counts the one snapshot all of them read. With one scan,
 `segmentsPrunedByStats` is a subset of `segments`; with two, each scan
@@ -4087,6 +4094,79 @@ consequences).
 its 16-block, 41-column fixture phase 1 decodes 3 pages per block against the
 single-phase plan's 39 over the same 16 blocks, and un-cached, a `k = 10`
 statement moves 103,606 bytes in 14 GETs against a single pass's 29,645 in 4.
+
+#### Ordered block skip for `ORDER BY ts LIMIT k` (ADR-2677 decision 6)
+
+A `SortExec` with a `fetch` (a TopK) publishes a dynamic filter that is
+`true` until its heap holds `k` rows and `ts < t` after that, where `t` is
+the `ts` of the heap's current worst row; with further sort keys it is
+`ts < t OR (ts = t AND ...)`, and it only ever tightens. DataFusion pushes
+that filter to the scan during its post-optimization filter pushdown.
+`LogsScanExec` keeps it when the sort's leading key is the bare `ts`
+column, ascending, and reports it unsupported, so the TopK above stays the
+exact evaluator and no row is ever dropped by the filter itself. The scan
+only reads `t` off the filter's current expression and uses it twice:
+
+- Segments are dealt to partitions in ascending `min_event_ts_ns` (ties by
+  snapshot index) instead of snapshot order, and a partition does not open
+  an owned segment whose `min_event_ts_ns` is strictly above `t`. A row
+  ref's segment ordinal is still the snapshot index.
+- Before decoding each block, the scan skips every block at the cursor
+  whose skip-index minimum `ts` is strictly above `t`. No column of a
+  skipped block is fetched for decode or decoded. Each candidate is
+  checked, not only up to the first survivor: several streams interleave in
+  one segment, so block minima are not ordered.
+
+The rule is exact because a row with `ts > t` can never enter the heap, and
+every row of a skipped block or segment has `ts >= min > t`. A minimum
+equal to `t` is read, since its rows can tie on `ts` and win on a second
+key (`ORDER BY ts, x`). Before the heap is full the filter is `true`, which
+bounds nothing, so nothing is skipped. Bounds that are inverted (`min >
+max`) prove nothing and are never skipped on; an empty block reads both
+bounds as 0 and has no rows to lose. A row that arrives late lowers its
+segment's `min_event_ts_ns`, so the min-ts dealing order visits that
+segment early, not last. Each partition reads the shared threshold on its
+own, before each segment open and each block decode. The whole-segment
+fast path's open pipelining (ADR-2414 decision A2) is off under a
+threshold, because a pipelined open would fetch a segment before the
+threshold that could skip it is read.
+
+Nothing is skipped for a descending `ts` key (its filter is a lower bound,
+`ts > t`, which this rule does not read), a leading key other than the bare
+`ts` column (a string key, an expression over `ts`), or the distributed
+plan, whose coordinator answers the statement with a fetch on the merge of
+the workers' sorted slices and so builds no TopK. Setting
+`datafusion.optimizer.enable_topk_dynamic_filter_pushdown` to `false` turns
+the skip off along with the filter.
+
+A residual `FilterExec` between the TopK and the scan (a `WHERE x <> ''`
+the scan cannot evaluate) coalesces its output up to
+`datafusion.execution.batch_size` rows before the TopK sees any of it, so
+the threshold appears only once that many rows have passed the filter. The
+writer's default block holds 8192 records, the same as the default batch
+size, so with the defaults a filtered TopK sees rows about once per block.
+
+`TopKLateMaterialization` runs after DataFusion's filter pushdown, so it
+hands its phase-1 TopK's filter to the narrow scan itself, under the same
+setting, and the residual filters it rebuilds keep their batch size. The
+block skip applies there too: a skipped block advances the scan's row-ref
+cursor with it, so every phase-1 row ref still names the block phase 2
+reopens.
+
+`stats.pruning.blocksSkippedByThreshold` and
+`segmentsSkippedByThreshold` report what was skipped, from the scan's
+`blocks_skipped_by_threshold` and `segments_skipped_by_threshold`
+counters. A skipped segment is never opened, so its blocks are not in
+`blocksTotal`; on the whole-segment fast path `blocksTotal -
+blocksScanned` equals `blocksSkippedByThreshold`. On the striped path a
+segment's row groups can be owned by several partitions, and each
+partition that skips its share counts one segment.
+`crates/ravel-sql/tests/logs_topk_threshold_skip.rs` pins the answers
+against the same statements with the skip off.
+`services/ravel-server/tests/sql_topk_threshold_skip.rs` checks the same
+through `POST /api/v1/sql`, against the fixture's own answer and the same
+statement led by `observed_ts` (equal to `ts` there), which the skip does
+not read.
 
 #### Bounded top-k grouped aggregation
 

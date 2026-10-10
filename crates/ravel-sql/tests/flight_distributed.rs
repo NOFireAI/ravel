@@ -2289,6 +2289,178 @@ async fn distributed_logs_preserves_duplicate_rows() {
     );
 }
 
+/// An [`RlogWorker`] for `logs` that keeps every fragment it ran, so a test can
+/// read the worker scans' metrics after the coordinator plan finishes.
+struct RecordingLogsWorker {
+    fetcher: LogSegmentFetcher,
+    ran: Mutex<Vec<Arc<dyn ExecutionPlan>>>,
+}
+
+impl std::fmt::Debug for RecordingLogsWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("RecordingLogsWorker")
+    }
+}
+
+impl WorkerSliceClient for RecordingLogsWorker {
+    fn fetch_slice(
+        &self,
+        _location: &str,
+        ticket: &FlightTicket,
+        _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let snapshot = ticket.snapshot();
+        let target_partitions = snapshot.segments.len().max(1);
+        let plan = logs_fragment(snapshot, self.fetcher.clone(), target_partitions)?;
+        self.ran
+            .lock()
+            .map_err(|_| DataFusionError::Internal("worker plan list poisoned".into()))?
+            .push(Arc::clone(&plan));
+        execute_stream(plan, Arc::new(TaskContext::default()))
+    }
+}
+
+fn sum_metric(plan: &Arc<dyn ExecutionPlan>, node: &str, name: &str) -> usize {
+    let own = if plan.name() == node {
+        plan.metrics().map_or(0, |set| {
+            set.iter()
+                .filter(|m| m.value().name() == name)
+                .map(|m| m.value().as_usize())
+                .sum()
+        })
+    } else {
+        0
+    };
+    own + plan
+        .children()
+        .into_iter()
+        .map(|child| sum_metric(child, node, name))
+        .sum::<usize>()
+}
+
+/// ADR-2677 decision 6 leaves the distributed path alone: the coordinator
+/// answers `ORDER BY ts LIMIT k` with a fetch on the merge of the workers'
+/// sorted slices, so no TopK filter exists, and each worker runs its fragment
+/// without a limit. A segment whose minimum `ts` is above the local threshold
+/// is still read there; locally the same statement never opens it.
+#[tokio::test]
+async fn distributed_logs_order_by_ts_limit_skips_nothing() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let late = write_rlog_segment(
+        backend.as_ref(),
+        "logs/topk-late.rlog",
+        0,
+        1,
+        10,
+        &[
+            log_record(&res, &[], 100, "b100"),
+            log_record(&res, &[], 101, "b101"),
+        ],
+    )
+    .await;
+    let early = write_rlog_segment(
+        backend.as_ref(),
+        "logs/topk-early.rlog",
+        1,
+        1,
+        20,
+        &[
+            log_record(&res, &[], 1, "b1"),
+            log_record(&res, &[], 2, "b2"),
+        ],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![late, early]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+    let endpoints = rlog_endpoints_for(&snapshot);
+    let slices = endpoints.len();
+    assert!(
+        slices >= 2,
+        "fixture must genuinely partition into more than one slice"
+    );
+    let sql = "SELECT ts, body FROM logs ORDER BY ts LIMIT 2";
+    let want = vec![(1, "b1".to_string()), (2, "b2".to_string())];
+
+    let local_ctx = SessionContext::new();
+    local_ctx
+        .register_table(
+            "logs",
+            Arc::new(LogsTableProvider::new(
+                snapshot.clone(),
+                TENANT,
+                fetcher.clone(),
+                PhaseAccounting::new(),
+            )),
+        )
+        .expect("register local logs");
+    let local_plan = local_ctx
+        .sql(sql)
+        .await
+        .expect("local statement plans")
+        .create_physical_plan()
+        .await
+        .expect("local physical plan");
+    let local = collect(Arc::clone(&local_plan), local_ctx.task_ctx())
+        .await
+        .expect("local statement runs");
+    assert_eq!(ts_and(&local, "ts", "body"), want);
+    assert_eq!(
+        sum_metric(&local_plan, "LogsScanExec", "segments_skipped_by_threshold"),
+        1,
+        "the local scan skips the late segment, so the fixture can show a skip"
+    );
+
+    let worker = Arc::new(RecordingLogsWorker {
+        fetcher: fetcher.clone(),
+        ran: Mutex::new(Vec::new()),
+    });
+    let client: Arc<dyn WorkerSliceClient> = Arc::clone(&worker) as Arc<dyn WorkerSliceClient>;
+    let dist_ctx = SessionContext::new();
+    dist_ctx
+        .register_table(
+            "logs",
+            Arc::new(
+                LogsTableProvider::new(snapshot, TENANT, fetcher, PhaseAccounting::new())
+                    .with_distributed_scan(endpoints, client),
+            ),
+        )
+        .expect("register distributed logs");
+    let dist_plan = dist_ctx
+        .sql(sql)
+        .await
+        .expect("distributed statement plans")
+        .create_physical_plan()
+        .await
+        .expect("distributed physical plan");
+    let shown = displayable(dist_plan.as_ref()).indent(true).to_string();
+    assert!(
+        shown.contains("DistributedSliceScanExec") && !shown.contains("TopK"),
+        "the coordinator merges the sorted slices with a fetch and builds no TopK: {shown}"
+    );
+    let got = collect(dist_plan, dist_ctx.task_ctx())
+        .await
+        .expect("distributed statement runs");
+    assert_eq!(ts_and(&got, "ts", "body"), want);
+
+    let ran = worker.ran.lock().expect("worker plan list").clone();
+    assert_eq!(ran.len(), slices, "one fragment per slice");
+    let total = |name: &str| -> usize {
+        ran.iter()
+            .map(|plan| sum_metric(plan, "LogsScanExec", name))
+            .sum()
+    };
+    assert_eq!(total("blocks_skipped_by_threshold"), 0);
+    assert_eq!(total("segments_skipped_by_threshold"), 0);
+    assert_eq!(
+        total("blocks_scanned"),
+        2,
+        "every worker reads its whole slice, the late segment's block included"
+    );
+}
+
 #[tokio::test]
 async fn distributed_logs_plan_merges_without_dedup() {
     let store = Arc::new(MemoryStore::new());
