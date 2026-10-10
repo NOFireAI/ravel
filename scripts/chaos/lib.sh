@@ -177,6 +177,12 @@ chaos_release_logs() {
     done
     return 0
   fi
+  # A passing run keeps its logs too when asked, so a scenario that passed
+  # without exercising its kill point can still be diagnosed.
+  if [[ "${CHAOS_KEEP_LOGS:-0}" == 1 && -n "${CHAOS_LOG_DIR}" ]]; then
+    log "exit ${code}: CHAOS_KEEP_LOGS=1, kept $*"
+    return 0
+  fi
   rm -f "$@"
 }
 
@@ -984,6 +990,31 @@ compaction_unfinished_in_log() {
   return 1
 }
 
+# One line summarising what a maintain worker did, from its log past line
+# `from` (0 for the whole log): compaction records published, compaction pass
+# lines, and the summed compacted= and not_sealed= figures of those lines.
+# Args: name log_file [from_line].
+chaos_worker_activity_line() {
+  local name="$1" file="$2" from="${3:-0}" body=""
+  if [[ -r "$file" ]]; then
+    body="$(tail -n "+$(( from + 1 ))" "$file")"
+  fi
+  CHAOS_PUB="$CHAOS_COMPACTION_PUBLISH_MARKER" CHAOS_PASS="$CHAOS_COMPACTION_PASS_MARKER" \
+    awk -v name="$name" '
+    BEGIN { pub = ENVIRON["CHAOS_PUB"]; pass = ENVIRON["CHAOS_PASS"]; p = 0; n = 0; c = 0; u = 0 }
+    {
+      line = $0
+      gsub(/\033\[[0-9;]*m/, "", line)
+      if (index(line, pub) > 0) p++
+      if (index(line, pass) > 0) {
+        n++
+        if (match(line, /[ \t]compacted=[0-9]+/)) c += substr(line, RSTART + 11, RLENGTH - 11) + 0
+        if (match(line, /[ \t]not_sealed=[0-9]+/)) u += substr(line, RSTART + 12, RLENGTH - 12) + 0
+      }
+    }
+    END { printf "WORKER-ACTIVITY: %s publishes=%d passes=%d compacted=%d not_sealed=%d\n", name, p, n, c, u }' <<<"$body"
+}
+
 # Wait until worker A owns at least one unit and its log shows unfinished
 # compaction work (compaction_unfinished_in_log). This is the scenario-2
 # "mid-compaction" trigger. Args: base_url log_file deadline_seconds. Returns
@@ -997,6 +1028,9 @@ wait_for_compaction_in_flight() {
   local body
   while [[ "$waited" -lt "$deadline_seconds" ]]; do
     owned="$(metric_value "$base_url" ravel_maintain_units_owned)" || owned=""
+    if [[ "${owned%.*}" =~ ^[0-9]+$ ]] && [[ "${owned%.*}" -gt "${CHAOS_A_MAX_UNITS_OWNED:-0}" ]]; then
+      CHAOS_A_MAX_UNITS_OWNED="${owned%.*}"
+    fi
     # Capture the log into a variable, then test it: no gate pipeline.
     body=""
     if [[ -r "$log_file" ]]; then

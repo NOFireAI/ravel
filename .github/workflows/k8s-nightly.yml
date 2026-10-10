@@ -205,9 +205,13 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      # Process logs the scenarios keep on failure; uploaded by the step below
-      # the scenarios. Inside the checkout, under the gitignored .gate-logs/.
+      # Process logs the scenarios keep; uploaded by the step below the
+      # scenarios. Inside the checkout, under the gitignored .gate-logs/.
       CHAOS_LOG_DIR: ${{ github.workspace }}/.gate-logs/chaos
+      # Keep them on a pass too: a scenario can pass without landing its kill
+      # where it is named for (it prints a ::warning:: when that happens), and
+      # only the worker and server logs say why.
+      CHAOS_KEEP_LOGS: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -282,11 +286,12 @@ jobs:
           esac
           exit "$code"
       # The artifact carries the whole process logs; the step log has only
-      # their tails. `cancelled()` too, because a scenario that hangs past the
-      # job's timeout-minutes is cancelled, not failed. Which logs are kept is
+      # their tails on failure. `always()`, because CHAOS_KEEP_LOGS keeps them
+      # on a pass as well, and a scenario that hangs past the job's
+      # timeout-minutes is cancelled, not failed. Which logs are kept is
       # `chaos_release_logs` in scripts/chaos/lib.sh.
-      - name: Upload the chaos process logs on failure
-        if: failure() || cancelled()
+      - name: Upload the chaos process logs
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: chaos-process-logs
