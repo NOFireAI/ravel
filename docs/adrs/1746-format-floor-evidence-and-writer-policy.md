@@ -151,7 +151,8 @@ change, and this ADR follows the same rule.
      basis fields on a raise. Until B no floor has a basis, and decisions 2 to
      5 treat every floor as `Unknown`. (Narrowed: a live record below the
      floor still makes it `Contradicted`; see the Contradicted-before-basis
-     amendment below.)
+     amendment below. Release A shipped in v0.20.0 and Release B in the
+     release after v0.23.0; see the Release B shipped amendment below.)
 
    No object is migrated; a version-1 or version-2 record stays readable.
    The strip hazard R1 names is why the bump exists: a release-2 binary
@@ -280,7 +281,8 @@ record a fresh basis. It cannot, and it will not be made to. A floor already
 at its target is not re-raised with a fresh basis. The remedy is to wait for
 the next version raise of that family, which appends a new floor entry
 (with its basis from the audit that justified it once Release B records
-one; `raise_format_floor` on main still writes no basis); until then the floor
+one; `raise_format_floor` on main still writes no basis, which the Release B
+shipped amendment below changes); until then the floor
 classifies from the basis it has (`Unknown` when it has none), or as
 `Contradicted` while a live record sits below it. `migrate` already behaves
 this way: when the current floor is at or past the target it reports the
@@ -305,3 +307,41 @@ are refused:
   appended under CAS and never rewritten. A basis that can be replaced after
   the fact also stops being the record of the audit that justified the raise,
   which is what decision 1 requires it to be.
+
+## Amendment (2026-10-10, #2674): Release B shipped, in the release after v0.23.0
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-10-03, #2222): the same-version re-raise amendment, a floor at its target waits for the next raise" pointer="Release B shipped amendment" -->
+
+Decision 6's Release A shipped in v0.20.0. Release B ships in the release
+after v0.23.0. From that release:
+
+- `PROVISIONING_FORMAT_VERSION` is 3 and `PROVISIONING_MAX_READ_VERSION`
+  stays 3. Every write of the record stamps 3: `validate_or_adopt`'s first
+  write, `append_generation` and `raise_format_floor`. The two rewrite paths
+  accept a version-3 record, re-stamp a version-1 or version-2 record they
+  extend as 3, and refuse a record above 3 with
+  `RefusingToRewriteNewerRecord`.
+- `raise_format_floor` takes a required `FloorBasis` and records it on the
+  entry it appends. It refuses a basis whose `observed_shards` is 0 with
+  `FloorBasisEmpty` before any store access, since an all-zero basis would
+  decode as no basis. Earlier entries keep their stored basis, so a floor
+  raised before Release B stays basis-less and classifies `Unknown` (or
+  `Contradicted`) until the next version raise of its family appends a new
+  entry, as the same-version re-raise amendment above says.
+- `migrate_family`'s verify step passes the basis of the re-audit that found
+  zero stragglers, taken from that same enumeration (`audit_below_target`,
+  which `count_below_target` now wraps): live L0 commit records plus the parts
+  of every compaction and rewrite record, the newest `created_unix_ns` among
+  those commit records and every compaction and rewrite record, and the shard
+  range it scanned. That is the population `census_family` reports as live,
+  so `audit-versions` classifies a floor `migrate` just raised as `Current`,
+  and as `Stale` once a newer record lands.
+
+The rollout rule is decision 6's: a binary before v0.20.0 reads only
+versions 1 and 2 and refuses a version-3 record on every read path,
+including `GenerationSwitch`'s flush-time read, so every node must run
+v0.20.0 or later before any node runs Release B.
+
+`StorageLayoutWrite` (ADR-2135, #2146) is unrelated to this flip: it governs
+`TenantConfigRecord`'s `format_version`, a separate field on a separate
+record, and Release B neither reads it nor makes it redundant.
