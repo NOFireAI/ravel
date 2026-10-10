@@ -463,6 +463,47 @@ async fn scan_timing_counts_logs_scans_in_the_plan() {
         .await
         .expect("metrics statement");
     assert_eq!(outcome.stats.scan_timing.scans, 0, "{:?}", outcome.stats);
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT count(*) FROM logs"))
+        .await
+        .expect("predicate-free logs count");
+    assert_eq!(outcome.output.num_rows(), 1);
+    assert_eq!(outcome.stats.scan_timing.scans, 999, "{:?}", outcome.stats);
+
+    let multi = [
+        (
+            "self-join",
+            "SELECT a.ts FROM logs a JOIN logs b ON a.ts = b.ts \
+             WHERE a.attrs['region'] = 'region-0'",
+            999,
+        ),
+        (
+            "IN subquery",
+            "SELECT ts FROM logs WHERE ts IN \
+             (SELECT ts FROM logs WHERE attrs['region'] = 'region-0')",
+            999,
+        ),
+        (
+            "CTE read twice",
+            "WITH r AS (SELECT ts FROM logs WHERE attrs['region'] = 'region-0') \
+             SELECT ts FROM r UNION ALL SELECT ts FROM r",
+            999,
+        ),
+    ];
+    for (shape, sql, scans) in multi {
+        let outcome = fixture
+            .executor
+            .execute(tenant.hash(), &request(sql))
+            .await
+            .unwrap_or_else(|err| panic!("{shape}: {err}"));
+        assert_eq!(
+            outcome.stats.scan_timing.scans, scans,
+            "{shape}: {:?}",
+            outcome.stats
+        );
+    }
 }
 
 fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> {
