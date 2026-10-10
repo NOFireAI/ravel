@@ -6715,18 +6715,16 @@ fn build_declared_columnar_array(
     Ok(match plan.dc.ty {
         DeclaredType::Str => build_declared_str_columnar(view, resolver, start, end, cache)?,
         DeclaredType::I64 => {
+            let single_column = match (single, plan.matching_idx) {
+                (Some(DeclaredCursor::I64(_)), Some(k)) => plan.cols.get(k).map(|c| c.column_id),
+                _ => None,
+            };
+            if let Some(column_id) = single_column {
+                return declared_i64_from_buffers(view, resolver, column_id, start, end, cache);
+            }
             let mut b = Int64Builder::with_capacity(end - start);
-            if let Some(DeclaredCursor::I64(c)) = single {
-                for i in start..end {
-                    match c.at(i) {
-                        Some(v) => b.append_value(v),
-                        None => append_i64(&mut b, resolver.fallback_at(view, i, cache)?),
-                    }
-                }
-            } else {
-                for i in start..end {
-                    append_i64(&mut b, resolver.merged_value(view, i, cache)?.as_ref());
-                }
+            for i in start..end {
+                append_i64(&mut b, resolver.merged_value(view, i, cache)?.as_ref());
             }
             Arc::new(b.finish())
         }
@@ -6763,6 +6761,48 @@ fn build_declared_columnar_array(
             Arc::new(b.finish())
         }
     })
+}
+
+/// The declared `I64` arm of [`build_declared_columnar_array`] when the key's
+/// only FIELD_DIR column is the `I64` one: the record's cells come from the
+/// column's buffers through [`int_column_array`], and only a row the record
+/// does not set reads the resource/scope fallback, the same order the
+/// per-cell build follows. The array is rebuilt only when a fallback supplies
+/// a value.
+fn declared_i64_from_buffers(
+    view: &ColumnarBlockView<'_>,
+    resolver: &mut DeclaredResolver<'_, '_, '_>,
+    column_id: u32,
+    start: usize,
+    end: usize,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+) -> DFResult<ArrayRef> {
+    use datafusion::arrow::array::{Array, Int64Array};
+    let array: Int64Array = int_column_array(&view.i64_values(column_id), start, end, true)?;
+    if array.null_count() == 0 {
+        return Ok(Arc::new(array));
+    }
+    let mut filled: Vec<(usize, i64)> = Vec::new();
+    for k in 0..array.len() {
+        if array.is_null(k) {
+            if let Some(AttrValue::I64(v)) = resolver.fallback_at(view, start + k, cache)? {
+                filled.push((k, *v));
+            }
+        }
+    }
+    if filled.is_empty() {
+        return Ok(Arc::new(array));
+    }
+    let mut b = Int64Builder::with_capacity(array.len());
+    let mut fill = filled.into_iter().peekable();
+    for k in 0..array.len() {
+        match fill.next_if(|&(at, _)| at == k) {
+            Some((_, v)) => b.append_value(v),
+            None if array.is_null(k) => b.append_null(),
+            None => b.append_value(array.value(k)),
+        }
+    }
+    Ok(Arc::new(b.finish()))
 }
 
 /// Build a declared `Str` column as an Arrow `Dictionary(Int32, Utf8)` for
@@ -7119,6 +7159,70 @@ fn build_columnar_batches(
     Ok(out)
 }
 
+/// Surviving rows `start..end` of a block's integer column as an Arrow array,
+/// built from the column's decoded value and validity buffers (ADR-2773
+/// decision 1): one copy of the block-row span the rows cover, then a `take`
+/// over their offsets in it unless every row of the span survives. With
+/// `keep_nulls` an absent cell is NULL; without it, it reads 0, the slot value
+/// the decoder writes there. A column the block does not carry reads all-NULL
+/// or all-0 the same way.
+fn int_column_array<T>(
+    col: &ravel_logseg::I64Values<'_>,
+    start: usize,
+    end: usize,
+    keep_nulls: bool,
+) -> DFResult<datafusion::arrow::array::PrimitiveArray<T>>
+where
+    T: datafusion::arrow::datatypes::ArrowPrimitiveType<Native = i64>,
+{
+    use datafusion::arrow::array::{AsArray, PrimitiveArray};
+    use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+    let out_of_range =
+        || DataFusionError::Internal("columnar integer column: row out of range".into());
+    let rows = col.rows().get(start..end).ok_or_else(out_of_range)?;
+    let n = rows.len();
+    let Some(values) = col.values() else {
+        return Ok(if keep_nulls {
+            PrimitiveArray::new_null(n)
+        } else {
+            PrimitiveArray::try_new(ScalarBuffer::from(vec![0i64; n]), None)?
+        });
+    };
+    let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+        return Ok(PrimitiveArray::try_new(ScalarBuffer::from(Vec::new()), None)?);
+    };
+    let span = values.get(first..=last).ok_or_else(out_of_range)?;
+    let nulls = match col.validity() {
+        Some(bits) if keep_nulls => {
+            if bits.len().saturating_mul(8) <= last {
+                return Err(out_of_range());
+            }
+            Some(NullBuffer::new(BooleanBuffer::new(
+                Buffer::from_slice_ref(bits),
+                first,
+                span.len(),
+            )))
+        }
+        _ => None,
+    };
+    let span_array = PrimitiveArray::<T>::try_new(ScalarBuffer::from(span.to_vec()), nulls)?;
+    // `rows` is strictly ascending, so a span as long as the row count is
+    // exactly the surviving rows.
+    if span.len() == n {
+        return Ok(span_array);
+    }
+    let offsets = rows
+        .iter()
+        .map(|&r| u32::try_from(r - first).map_err(|_| out_of_range()))
+        .collect::<DFResult<Vec<u32>>>()?;
+    let taken = datafusion::arrow::compute::take(
+        &span_array,
+        &datafusion::arrow::array::UInt32Array::from(offsets),
+        None,
+    )?;
+    Ok(taken.as_primitive::<T>().clone())
+}
+
 /// Build one output batch for surviving rows `start..end` from the view, one
 /// array per projected column. The column set is the same eligible set
 /// [`columnar_static_eligible`] admits: fixed columns and declared typed
@@ -7138,28 +7242,21 @@ fn build_columnar_batch(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
     for &idx in projection {
         let array: ArrayRef = match idx {
-            LOG_COL_TS => {
-                let cur = view.ts_cursor();
-                Arc::new(TimestampNanosecondArray::from(
-                    (start..end)
-                        .map(|i| cur.at(i).unwrap_or_default())
-                        .collect::<Vec<_>>(),
-                ))
-            }
-            LOG_COL_OBSERVED_TS => {
-                let cur = view.observed_ts_cursor();
-                Arc::new(TimestampNanosecondArray::from(
-                    (start..end)
-                        .map(|i| cur.at(i).unwrap_or_default())
-                        .collect::<Vec<_>>(),
-                ))
-            }
+            LOG_COL_TS => Arc::new(int_column_array::<
+                datafusion::arrow::datatypes::TimestampNanosecondType,
+            >(&view.ts_values(), start, end, false)?),
+            LOG_COL_OBSERVED_TS => Arc::new(int_column_array::<
+                datafusion::arrow::datatypes::TimestampNanosecondType,
+            >(&view.observed_ts_values(), start, end, false)?),
             LOG_COL_SEVERITY_NUM => {
-                let cur = view.severity_num_cursor();
-                Arc::new(UInt8Array::from(
-                    (start..end)
-                        .map(|i| cur.at(i).unwrap_or_default() as u8)
-                        .collect::<Vec<_>>(),
+                let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
+                    &view.severity_num_values(),
+                    start,
+                    end,
+                    false,
+                )?;
+                Arc::new(UInt8Array::from_iter_values(
+                    raw.values().iter().map(|&v| v as u8),
                 ))
             }
             LOG_COL_SEVERITY_TEXT => {
@@ -7211,11 +7308,14 @@ fn build_columnar_batch(
                 Arc::new(b.finish())
             }
             LOG_COL_FLAGS => {
-                let cur = view.flags_cursor();
-                Arc::new(UInt32Array::from(
-                    (start..end)
-                        .map(|i| cur.at(i).unwrap_or_default() as u32)
-                        .collect::<Vec<_>>(),
+                let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
+                    &view.flags_values(),
+                    start,
+                    end,
+                    false,
+                )?;
+                Arc::new(UInt32Array::from_iter_values(
+                    raw.values().iter().map(|&v| v as u32),
                 ))
             }
             // Ruled out by `columnar_static_eligible`; a projection reaching the
