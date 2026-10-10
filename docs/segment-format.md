@@ -515,7 +515,7 @@ Duplicate keys are legal because compaction copies exemplars verbatim and
 never drops a record. Two L0 objects can each hold an exemplar for the same
 series at the same timestamp, which is what a retried write produces, and
 both must reach the L1 output. Readers therefore reject only a descending
-key.
+key (ADR-0047, 2026-08-03 amendment).
 
 The writer sorts with a stable sort, so records that share a key keep the
 caller's order and the encoded bytes stay a function of the input order
