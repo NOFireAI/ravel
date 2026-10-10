@@ -27,9 +27,7 @@
 //! Query grant admits under a segment that is not a valid table name
 //! ([`ListedManifestKey::InvalidTable`]) belongs to no table; the listing
 //! skips and counts it as [`crate::resolve::tenant_listing`] does, and the
-//! sweep never deletes it. On S3 one such key holding a control character, an
-//! empty segment or a `.` or `..` segment fails the listing, and so the sweep,
-//! with [`SweepError::Store`]. A key the store lists but reports
+//! sweep never deletes it. A key the store lists but reports
 //! unaddressable is in no table's versions and is never deleted; the listing
 //! is counted as [`crate::resolve::unaddressable_listings`] describes.
 //!
