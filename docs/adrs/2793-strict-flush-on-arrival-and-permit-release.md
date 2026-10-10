@@ -72,16 +72,20 @@ contract is identical to `Strict`: the ack follows the commit-record PUT,
 carries one commit token per shard flushed, and is never answered from a
 flush the deferral cap abandoned. What changes is when the flush opens.
 
-Selection, in precedence order:
+Selection:
 
-- Header `x-ravel-ingest-mode: strict-arrival` on the OTLP HTTP, gRPC and
-  OTAP surfaces selects it per request, through the same parser that reads
-  `buffered`. `buffered` and `strict` keep their meaning; any other value
-  is strict, as today.
 - `--strict-flush-policy aged|arrival` (default `aged`) on `ravel-server`
-  sets what a request with no header, or with `strict`, gets. It applies
-  to every strict surface, Remote Write included, since Remote Write reads
-  no header and its ack contract is unchanged by the policy.
+  is the process default: what a strict request gets when it does not
+  name a policy. It applies to every strict surface, Remote Write
+  included, since Remote Write reads no header and its ack contract is
+  unchanged by the policy.
+- The header `x-ravel-ingest-mode` on the OTLP HTTP, gRPC and OTAP
+  surfaces, read by the same parser that reads `buffered` today, gains two
+  explicit values that override the process default for one request:
+  `strict-arrival` and `strict-aged`. `buffered` keeps its meaning. The
+  value `strict`, an absent header, and any unknown value all mean "strict
+  under the process default", so `strict` is not an opt-out of
+  `--strict-flush-policy arrival`; `strict-aged` is.
 
 A per-tenant setting is deliberately not part of this ADR. `TenantConfig`
 is a protobuf record whose field set is versioned (`proto/ravel/sys.proto`
@@ -123,21 +127,30 @@ is sequenced after #1921 lands, on top of its count, never beside it.
 
 Every other rule of the flush pipeline applies unchanged. The arrival flush
 acquires the shard's `max_inflight_flushes` permit inside the spawned task
-(ADR-1642), waits behind another tenant's flush if the permits are held,
-is deferred at the queued flush cap and at decision 3's per-tenant share
-exactly as a size flush is, and is abandoned past the deferral cap with the
-same `Abandoned` answer. A buffer with a pending arrival flush still holds
-a strict waiter, so it stays in the priority age tier: the `max_flush_delay`
-tick is the fallback floor, and the worst case under pressure is today's
-behavior.
+(ADR-1642) and waits behind another tenant's flush if the permits are
+held; past the deferral cap it is abandoned with the same `Abandoned`
+answer. It is exempt from the queued-flush cap and from decision 3's
+per-tenant share by construction, not by a new rule: it opens only when
+the tenant has zero flushes in flight on the shard, and decision 3 states
+that "a tenant with no flush in flight is never refused by the queued-flush
+cap", with a share of at least one. So no deferral path exists for an
+arrival flush, and an implementer must not add one. The memory argument is
+decision 3's: the exemption adds at most one window per active tenant on
+the shard, charged to the byte budget. A buffer whose arrival flush is
+pending behind an in-flight one still holds a strict waiter, so it stays
+in the priority age tier: the `max_flush_delay` tick is its fallback
+floor, and the worst case for that buffer is today's behavior.
 
 This is the PUT-rate bound. Per (shard, tenant) the arrival policy issues
 at most one flush per flush duration, two PUT round trips, about 60-70 ms
 on S3, so at most about 16 flushes per second per shard per tenant at
-saturation, against one per 2 s under the aged policy. A tenant sending
-one strict request per 2 s costs the same under both. A tenant sending ten
-per second on one shard costs up to 32x the PUTs it would under the aged
-policy, which is why the policy is opt-in and not the default. Per shard,
+saturation, against one per 2 s under the aged policy (`max_flush_delay`
+2 s). A tenant sending one strict request per 2 s costs the same under
+both. A tenant sending ten per second on one shard costs up to 20x the
+PUTs it would under the aged policy (each request's own flush is its
+upper bound, 10 against 0.5 per second); a tenant at or past 16 per
+second reaches the saturation ratio of 32x. That is why the policy is
+opt-in and not the default. Per shard,
 the `max_inflight_flushes` permits (1 in the tree today, 4 with a
 per-tenant share of 3 under ADR-2708 decision 3) bound the shard's total
 flushes in flight across tenants, so no tenant's choice can push a shard
@@ -150,9 +163,12 @@ three pipelines' metrics, exported beside `flushes_by_size` and
 `flushes_by_age`, never folded into `flushes_by_age`. A second counter,
 `arrival_coalesced`, increments once per strict-arrival write that found a
 flush in flight and waited for the reap. Both are what a test asserts to
-prove the bound fired: a run of eight concurrent arrival writes on one
-shard asserts `flushes_by_arrival <= 2` and `arrival_coalesced >= 6`, not
-only an ack latency.
+prove the bound fired: with every PUT held by a store gate so no flush can
+be reaped until all eight writes have landed, a run of eight concurrent
+arrival writes on one shard asserts `flushes_by_arrival <= 2` and
+`arrival_coalesced >= 6`, not only an ack latency. The held store is the
+band's precondition, stated in the test: against an ungated store a reap
+between two writes opens a third flush and the band does not hold.
 
 **4. The admission permit is released at enqueue; pending strict acks get
 their own bound.**
@@ -163,17 +179,35 @@ ADR-0069 byte budget, sends to every involved shard and returns a
 under the ack deadline and returns the receipt. `write` remains as the
 composition of the two for callers that do not care.
 
-The admission middleware stops holding the permit for the handler's
-lifetime. It places the permit in a cloneable slot in the request
-extensions (the gRPC layer already carries a cloneable marker there for
-the same tonic reason, `ingest_admission.rs:84-96`); the handler takes the
-permit out of the slot, calls `submit`, drops the permit, then awaits
-`acks()`. The OTAP batch handler, which already holds its permit locally,
-does the same. Decoded bodies are freed before `submit` returns in every
-handler today (`drop(decode_charge)` precedes the router call), and the
-rows a strict request holds in a shard buffer are charged to the byte
-budget, so releasing the permit at enqueue leaves the permit's stated
-purpose, decode memory, fully covered.
+The admission layers stop holding the permit for the handler's lifetime,
+with one mechanism per transport, because the two transports drop request
+extensions at different times:
+
+- HTTP: the middleware (`ingest_admission.rs:246`) keeps holding the
+  permit across `next.run(request)`, as today, and also hands the handler
+  a cloneable release handle through the request extensions, an
+  `Arc<Mutex<Option<IngestPermit>>>` that owns the permit. The handler
+  clones the handle out of the extensions, calls `submit`, then empties the
+  slot, which releases the permit; it then awaits `acks()`. A handler that
+  never reaches `submit` leaves the slot full and the layer's own clone
+  releases the permit when the request ends, as today.
+- gRPC: the layer keeps the permit in its own future
+  (`ingest_admission.rs:444-452`) and hands the handler the same kind of
+  handle. The handler reads it from the extensions before
+  `request.into_inner()`, the way it reads the admission marker today, so
+  tonic dropping the extensions mid-handler drops a clone of the handle,
+  never the permit. The existing marker is not precedent for this: its
+  comment (`ingest_admission.rs:84-96`) exists to forbid a bare permit in
+  extensions, and the handle design honors that reason because the layer
+  always holds a clone of its own.
+- OTAP: the batch handler already holds its permit locally and drops it
+  after `submit`.
+
+Decoded bodies are freed before `submit` returns in every handler today
+(`drop(decode_charge)` precedes the router call), and the rows a strict
+request holds in a shard buffer are charged to the byte budget, so
+releasing the permit at enqueue leaves the permit's stated purpose, decode
+memory, fully covered.
 
 What the permit covered by accident, the count of held response contexts,
 gets an explicit bound: `--max-pending-strict-acks` (default 8,192, 0 =
@@ -182,7 +216,12 @@ sending, and `Submitted` holds it until the acks resolve or the deadline
 passes. A strict request refused here gets the same 429 with `Retry-After`
 and gRPC `RESOURCE_EXHAUSTED` as the in-flight ceiling, with its own body
 text and counter `ravel_ingest_pending_ack_shed_total`, and the gauge
-`ravel_ingest_pending_strict_acks` shows the held count. Buffered writes
+`ravel_ingest_pending_strict_acks` shows the held count. The two refusals
+differ in where they shed: the in-flight ceiling decides at the request
+head and a shed request never buffers a body, while the pending-ack bound
+is taken inside `submit`, after decode and after the byte charge, so a
+refusal there has paid a full decode. It is a bound on held contexts, not
+a replacement for the head shed. Buffered writes
 return at enqueue and take none. The default is the in-flight ceiling
 times eight: at the aged policy's 2.2 s that is about 3,700 strict requests
 per second before refusal, at the arrival policy's 0.1 s about 80,000, and
@@ -226,8 +265,9 @@ flowchart LR
   once the in-flight count bounds the rate; the handler path is the one
   the loader has run in production.
 - **Make arrival the default.** At ten strict requests per second per shard
-  it costs up to 32x the PUTs of the aged policy. ADR-0076's whole point is
-  the request bill, and its decision 4 stands as the default.
+  it costs up to 20x the PUTs of the aged policy, and 32x at saturation.
+  ADR-0076's whole point is the request bill, and its decision 4 stands as
+  the default.
 - **A per-tenant policy field in this ADR.** `TenantConfig` is a versioned
   protobuf; adding a field is a format change with a reader-first rollout
   (sys.proto version 3 took one). The two callers this ADR serves are
@@ -272,7 +312,15 @@ flowchart LR
   arrival flush takes the same permit and queue cap; the sizing table and
   the metrics section gain the new flag, counters and gauge; the admission
   text at lines 56-61 says the in-flight permit covers decode through
-  enqueue and names the pending-ack bound. `docs/reference/ravel-server-flags.md`,
+  enqueue and names the pending-ack bound. Two in-tree sentences become
+  false the moment the permit is released at enqueue and change in the
+  same commit as that behavior: the middleware comment at
+  `services/ravel-server/src/ingest_admission.rs:235-241` ("covers the body
+  read, the decode, and the durable write") and the
+  `--max-inflight-ingest-requests` help at
+  `services/ravel-server/src/config.rs:1550-1565`, which keeps its
+  head-shed sentence and loses "durable write" from what the permit
+  spans. `docs/reference/ravel-server-flags.md`,
   `docs/reference/http-api.md`, `docs/guides/ingest.md` and `docs/concepts.md`
   gain the header value and flags. The flag doc test
   `ingest_flag_docs_name_the_inflate_term` keeps pinning the in-flight
