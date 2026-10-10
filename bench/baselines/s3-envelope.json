@@ -28,7 +28,7 @@
     "max_flush_delay_ms": 500,
     "load_point": "bench_report --store s3 --shards 4 --target-series 1000 --points-per-sec 50000 --duration-secs 10",
     "scope": "This is the envelope at one load point on a shared hosted runner and is comparable only to runs of the same lane.",
-    "bands": "scripts/bench-s3-compare.py: latency figures warn past the max +25%, GET, LIST and bytes past the max +10%, PUT, accepted points and matched series must equal the envelope exactly.",
+    "bands": "scripts/bench-s3-compare.py: latency figures warn past the max +25%, GET, LIST, the three billed attempt counts and bytes past the max +10%, PUT, accepted points and matched series must equal the envelope exactly.",
     "unexplained": [
       "About 50,135 LIST requests for 128 PUTs on every run: not explained, tracked as issue #2686. Not expected behaviour.",
       "GET stepping from about 47,000 to about 78,000 between the 2026-09-21 and 2026-09-28 runs: not explained, tracked as issue #2686. Not expected behaviour.",
@@ -54,6 +54,7 @@
       "run_id": 34083418162,
       "scheduled": "2026-09-07",
       "git_commit": "d3a155c466758ad6fdf99baab800d4212961a3f6",
+      "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
       "strict_ack_latency_ms": {
         "p50": 738.806175,
         "p95": 1156.088213,
@@ -70,7 +71,10 @@
       "s3_requests": {
         "put": 128,
         "get": 47547,
-        "list": 50135
+        "list": 50135,
+        "put_attempts": 128,
+        "get_attempts": 47548,
+        "list_attempts": 50135
       },
       "bytes": {
         "written": 4293368,
@@ -81,6 +85,7 @@
       "run_id": 34806424715,
       "scheduled": "2026-09-14",
       "git_commit": "999d08739fd102e85fc351b7e48a72973f20c370",
+      "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
       "strict_ack_latency_ms": {
         "p50": 892.297383,
         "p95": 1419.510756,
@@ -97,7 +102,10 @@
       "s3_requests": {
         "put": 128,
         "get": 50285,
-        "list": 50135
+        "list": 50135,
+        "put_attempts": 128,
+        "get_attempts": 50286,
+        "list_attempts": 50135
       },
       "bytes": {
         "written": 4291407,
@@ -108,6 +116,7 @@
       "run_id": 35561402089,
       "scheduled": "2026-09-21",
       "git_commit": "efef9e6e44b940532186b478ba20e082c59396fb",
+      "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
       "strict_ack_latency_ms": {
         "p50": 734.582249,
         "p95": 1081.377503,
@@ -124,7 +133,10 @@
       "s3_requests": {
         "put": 128,
         "get": 47205,
-        "list": 50135
+        "list": 50135,
+        "put_attempts": 128,
+        "get_attempts": 47206,
+        "list_attempts": 50135
       },
       "bytes": {
         "written": 4291133,
@@ -135,6 +147,7 @@
       "run_id": 36378332523,
       "scheduled": "2026-09-28",
       "git_commit": "d6f71889f4bc8a69e1d320eb2e082995741090a3",
+      "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
       "strict_ack_latency_ms": {
         "p50": 736.021217,
         "p95": 1076.591219,
@@ -151,7 +164,10 @@
       "s3_requests": {
         "put": 128,
         "get": 78279,
-        "list": 50160
+        "list": 50160,
+        "put_attempts": 128,
+        "get_attempts": 78280,
+        "list_attempts": 50160
       },
       "bytes": {
         "written": 4291981,
@@ -162,6 +178,7 @@
       "run_id": 37264895774,
       "scheduled": "2026-10-05",
       "git_commit": "ce93df8159ee4a30a99928fc0039eb6e1cb32478",
+      "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
       "strict_ack_latency_ms": {
         "p50": 1025.544628,
         "p95": 1504.73791,
@@ -178,7 +195,10 @@
       "s3_requests": {
         "put": 128,
         "get": 70494,
-        "list": 50150
+        "list": 50150,
+        "put_attempts": 128,
+        "get_attempts": 70494,
+        "list_attempts": 50152
       },
       "bytes": {
         "written": 4292828,
@@ -224,6 +244,18 @@
       "max": 78279
     },
     "s3_requests.list": {
+      "min": 50135,
+      "max": 50160
+    },
+    "s3_requests.put_attempts": {
+      "min": 128,
+      "max": 128
+    },
+    "s3_requests.get_attempts": {
+      "min": 47206,
+      "max": 78280
+    },
+    "s3_requests.list_attempts": {
       "min": 50135,
       "max": 50160
     },

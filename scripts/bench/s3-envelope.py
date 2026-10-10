@@ -75,12 +75,16 @@ def run_entry(run_id, date, report):
         "run_id": run_id,
         "scheduled": date,
         "git_commit": _dig(report, "environment", "git_commit"),
+        "toolchain": _dig(report, "environment", "toolchain"),
         "strict_ack_latency_ms": lat("ingest", "strict_ack_latency_ms"),
         "cold_latency_ms_p50": _dig(report, "query", "cold_latency_ms", "p50"),
         "warm_latency_ms": lat("query", "warm_latency_ms"),
         "accepted_points": _dig(report, "ingest", "accepted_points"),
         "matched_series": _dig(report, "query", "matched_series"),
-        "s3_requests": {k: _dig(report, "s3_requests", k) for k in ("put", "get", "list")},
+        "s3_requests": {
+            k: _dig(report, "s3_requests", k)
+            for k in ("put", "get", "list", "put_attempts", "get_attempts", "list_attempts")
+        },
         "bytes": {k: _dig(report, "bytes", k) for k in ("written", "read")},
     }
 
@@ -106,7 +110,8 @@ def build_document(environment, runs, runs_on, unexplained):
             "scope": SCOPE,
             "bands": (
                 "scripts/bench-s3-compare.py: latency figures warn past the max "
-                f"+{bench_s3_compare.LATENCY_BAND_PCT:g}%, GET, LIST and bytes past "
+                f"+{bench_s3_compare.LATENCY_BAND_PCT:g}%, GET, LIST, the three billed "
+                "attempt counts and bytes past "
                 f"the max +{bench_s3_compare.COUNT_BAND_PCT:g}%, PUT, accepted points "
                 "and matched series must equal the envelope exactly."
             ),

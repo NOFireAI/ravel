@@ -53,7 +53,8 @@ instance from an EXIT trap. Every input is required; none has a default.
 Each flag can also be given as the environment variable in brackets.
 
   --instance-type   EC2 instance type                    [FRESH_BOX_INSTANCE_TYPE]
-  --ami             AMI id (Linux with apt-get or dnf, and cloud-init
+  --ami             AMI id (Linux with apt-get or dnf, bash as the
+                    --ssh-user login shell, and cloud-init
                     running user-data scripts)            [FRESH_BOX_AMI]
   --subnet          subnet id                             [FRESH_BOX_SUBNET]
   --security-group  security group id                     [FRESH_BOX_SECURITY_GROUP]

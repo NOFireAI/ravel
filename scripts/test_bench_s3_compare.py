@@ -45,7 +45,7 @@ def _report_from_run(doc, run):
     """A bench_report-shaped document carrying one envelope run's figures."""
     env = copy.deepcopy(doc["environment"])
     env["git_commit"] = run["git_commit"]
-    env["toolchain"] = "rustc 1.97.1"
+    env["toolchain"] = run["toolchain"]
     lat = run["strict_ack_latency_ms"]
     warm = run["warm_latency_ms"]
     req = run["s3_requests"]
@@ -66,8 +66,8 @@ def _report_from_run(doc, run):
         "s3_requests": {
             "backend_bills_requests": True,
             "put": req["put"], "get": req["get"], "list": req["list"],
-            "put_attempts": req["put"], "get_attempts": req["get"],
-            "list_attempts": req["list"],
+            "put_attempts": req["put_attempts"], "get_attempts": req["get_attempts"],
+            "list_attempts": req["list_attempts"],
         },
         "bytes": dict(run["bytes"]),
     }
@@ -110,7 +110,7 @@ class CommittedEnvelope(unittest.TestCase):
                 values.append(v)
             recomputed[name] = {"min": min(values), "max": max(values)}
         self.assertEqual(doc["envelope"], recomputed)
-        self.assertEqual(len(doc["envelope"]), 14)
+        self.assertEqual(len(doc["envelope"]), 17)
 
     def test_summariser_check_agrees_and_catches_an_edit(self):
         ok = subprocess.run([sys.executable, _SUMMARISER, "check", _ENVELOPE],
@@ -255,6 +255,21 @@ class Compare(unittest.TestCase):
         res = _run(report)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(_warned_figures(res.stdout), ["s3_requests.get"])
+
+    def test_a_retry_regression_warns_on_the_billed_attempts(self):
+        report = _latest_report()
+        hi = _envelope_doc()["envelope"]["s3_requests.get_attempts"]["max"]
+        # Every GET retried: the call count stays in band, the billed count does not.
+        report["s3_requests"]["get_attempts"] = int(hi * 1.11)
+        res = _run(report)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(_warned_figures(res.stdout), ["s3_requests.get_attempts"])
+
+    def test_every_run_records_its_toolchain_and_attempts(self):
+        for run in _envelope_doc()["runs"]:
+            self.assertTrue(run["toolchain"].startswith("rustc "), run["run_id"])
+            for k in ("put_attempts", "get_attempts", "list_attempts"):
+                self.assertGreaterEqual(run["s3_requests"][k], run["s3_requests"][k[: -len("_attempts")]])
 
     def _assert_exact_off_by_one(self, section, key, name):
         report = _latest_report()

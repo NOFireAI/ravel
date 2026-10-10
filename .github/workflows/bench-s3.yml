@@ -109,7 +109,7 @@ jobs:
       # refused pair (exit 2) from failing the job too; the ::warning:: lines
       # surface as annotations and the full table goes to the run summary.
       - name: Compare against the committed real-S3 envelope
-        if: steps.creds.outputs.have_creds == 'true'
+        if: success() && steps.creds.outputs.have_creds == 'true'
         continue-on-error: true
         run: |
           code=0
