@@ -56,24 +56,24 @@
   status: verified
   note: "The other eight catalog names answer ToolError::NotShipped, which the adapter renders as the method_not_found protocol error the banner names."
 
-- id: progress-audit-pipeline-installed
-  doc: PROGRESS.md
-  quote: "now spawns a real `ravel_maintain::AuditPipeline` and wires every query surface's audit sink to it under `--mode all` and `--mode query`"
+- id: guide-query-audit-pipeline-installed
+  doc: docs/guides/query.md
+  quote: "every query surface writes a query-audit record for each query that it executes"
   kind: positive
   binds:
     - crates/ravel-maintain/src/audit_pipeline.rs::AuditPipeline
     - services/ravel-server/src/config.rs::Mode::installs_query_audit_pipeline
   status: verified
-  note: "Replaced the paragraph saying nothing constructs the real pipeline. services/ravel-server/src/lib.rs start spawns the pipeline when Mode::installs_query_audit_pipeline holds."
+  note: "services/ravel-server/src/lib.rs start spawns the real pipeline and wires every query surface's audit sink to it when Mode::installs_query_audit_pipeline holds (--mode all and --mode query)."
 
-- id: progress-audit-required-fails-closed
-  doc: PROGRESS.md
-  quote: "`audit_mode=required` (the default) does fail closed"
+- id: guide-audit-required-fails-closed
+  doc: docs/guides/audit.md
+  quote: "The query fails with a 503 (HTTP) or `Unavailable` (Flight)."
   kind: positive
   binds:
     - crates/ravel-maintain/src/audit_pipeline.rs::tests::every_submit_in_a_failed_batch_errors_in_required_mode
   status: verified
-  note: "The bound test fails every submit of a batch whose flush failed under AuditMode::Required."
+  note: "The bound test fails every submit of a batch whose flush failed under AuditMode::Required, the default."
 
 - id: query-engine-stamp-write-side
   doc: docs/query-engine.md

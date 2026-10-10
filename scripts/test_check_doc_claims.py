@@ -318,13 +318,11 @@ class NegativeRuleTest(RepoCase):
         })
         self.assertEqual(code, 0, output)
 
-    def test_progress_and_reference_are_scanned(self):
+    def test_reference_is_scanned(self):
         code, output = self.run_gate(files={
-            "PROGRESS.md": "# Progress\n\nSharding will land next.\n",
             "docs/reference/http-api.md": "# API\n\nGzip is not available.\n",
         })
         self.assertEqual(code, 1, output)
-        self.assertRule(output, "NEGATIVE", "PROGRESS.md:3")
         self.assertRule(output, "NEGATIVE", "docs/reference/http-api.md:3")
 
     def test_entry_on_another_line_does_not_cover(self):

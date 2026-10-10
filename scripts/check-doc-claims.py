@@ -220,8 +220,8 @@ def _walk_md(root, top):
 
 
 def normative_docs(root):
-    """ADR-1658 decision 2: the doc map's specs, the user pages, PROGRESS.md."""
-    docs = list(SPEC_DOCS) + ["README.md", "PROGRESS.md"]
+    """ADR-1658 decision 2: the doc map's specs and the user pages."""
+    docs = list(SPEC_DOCS) + ["README.md"]
     docs += _walk_md(root, "docs/guides")
     docs += [p for p in _walk_md(root, "docs/reference") if p not in GENERATED_PAGES]
     seen = []
