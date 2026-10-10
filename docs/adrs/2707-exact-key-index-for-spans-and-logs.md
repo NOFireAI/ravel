@@ -126,7 +126,7 @@ flowchart TD
   L2 --> C["candidates = leaf matches over covered parts<br/>+ every uncovered segment (ADR-0849 lemma)"]
   T --> C
   C --> L1["tier 1, per candidate without a block set:<br/>footer, KEY_IDX directory, one bucket"]
-  L1 --> B["ranged block read: RSPAN trace_block_span / decode_trace,<br/>RLOG page ranges for the named blocks"]
+  L1 --> B["ranged block read: RSPAN block_run_span / decode_trace,<br/>RLOG page ranges for the named blocks"]
   C -->|block set known| B
   B --> X["exact row check: trace_id / column equality,<br/>pending-erasure predicates, time bounds"]
 ```
@@ -338,10 +338,14 @@ flowchart LR
     (the ADR-1413 order). `bucket_bits` balances the directory against the
     mean bucket, clamped to 12..=16 (13 at the Stage 0 day as one part,
     derived: a 32 KB directory and a 29 KB mean bucket at that body, 32 KB
-    at the ceiling); the body ceiling reuses
-    `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB), and a larger (part, field)
-    is sliced by key range, one leaf per slice, so a lookup opens exactly
-    one leaf per (part, field).
+    at the ceiling); the body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
+    (256 MiB) in that constant's own meaning, a cap on the declared
+    decompressed body: every bucket frame declares its `uncompressed_len`,
+    the reader checks it against the ceiling before it allocates and
+    requires the decompressed length to equal it, and a (part, field)
+    whose decompressed body would exceed the ceiling is sliced by key
+    range, one leaf per slice, so a lookup opens exactly one leaf per
+    (part, field).
   - **Lifecycle.** `sweep_unreferenced_catalog_objects` names
     `parts[].key_index[].key` in its reference set in the same change as
     the first leaf writer (ADR-0849 section 1a). A fold process that
@@ -462,9 +466,13 @@ flowchart LR
   probe length is) and stops there, since KEY_IDX sits below SKIP_IDX and
   its bucket frames lie between its directory and the tail, and the suffix
   is never sized to reach the directory.
-- **Blocks.** Spans read the trace's block run by range
-  (`RspanRangeReader::trace_block_span` then `decode_trace`,
-  `crates/ravel-rspan/src/ranged.rs`), never `GetRange::Full`. Logs read the
+- **Blocks.** Spans read the trace's block run by range: the new
+  `RspanRangeReader::block_run_span(trace_id, blocks)` per contiguous run
+  of the intersected block set, then `decode_trace`
+  (`crates/ravel-rspan/src/ranged.rs`; the existing `trace_block_span`
+  derives its own SKIP_IDX candidates and refuses a non-contiguous set, so
+  it stays the SKIP_IDX-only convenience and cannot take the
+  intersection), never `GetRange::Full`. Logs read the
   named blocks' page ranges through PAGE_DIR
   (`PageDir::projected_page_ranges`).
 - **Exactness.** The existing row check removes prefix collisions
@@ -515,8 +523,9 @@ flowchart LR
 
 - **Spans.** `SpansTableProvider::pruned_segments` gains shard routing,
   then the tier-2 probe, then the tier-1 probe for uncovered candidates;
-  `SpanSegmentFetcher` reads a trace by `trace_block_span`/`decode_trace`
-  instead of `GetRange::Full`; the resolve window widens for a `trace_id`
+  `SpanSegmentFetcher` reads a trace by `block_run_span`/`decode_trace`
+  (`trace_block_span` only when no block set is known) instead of
+  `GetRange::Full`; the resolve window widens for a `trace_id`
   lookup that pins no time bound (decision 12).
 - **Logs.** `declared_comparison_predicate` gains a `KeyEquals` arm for an
   equality on an indexed `I64`, `Str` or `Bytes` column (and `trace_id`);
@@ -697,8 +706,10 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
    it. Tier 1 is probed only for uncovered candidates, a set bounded by the
    fold lag and by shard routing.
 8. **One leaf per (part, field, shard).** It would let a routed lookup read a
-   4x smaller bucket at 4 shards, at 64 refs per part in HEAD and 64 small
-   objects per fold. Shard filtering after the bucket read costs bytes
+   4x smaller bucket at the Stage 0 geometry's 4 shards, at 4 refs per
+   (part, field) in HEAD and 4 leaf objects per (part, field) per fold,
+   both growing with the shard count. Shard filtering after the bucket
+   read costs bytes
    proportional to one bucket and nothing more in HEAD than the one ref per
    (part, field, slice) the Consequences price; the balance rule keeps the
    bucket at tens of KB.
@@ -751,10 +762,10 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   declared logs fields by about 3x, read in the one HEAD GET every
   resolve already issues (the `records + 3` band); no second GET and no
   new object. That is the price of decision 4's "the publish is the HEAD
-  CAS alone" and of rejected alternative 8's "nothing more in HEAD" (64
-  refs per part would be 64x this for one-field spans, 16x at four
-  declared fields). The acceptance table bands the bytes per (part,
-  field, slice).
+  CAS alone" and of rejected alternative 8's "nothing more in HEAD" (one
+  ref per shard would be 4x this at the Stage 0 geometry's 4 shards, for
+  any field count, and more at more shards). The acceptance table bands
+  the bytes per (part, field, slice).
 - **Cost accounting** gains a phase; the per-phase rule holds: an index GET
   never lands in a scan counter.
 
@@ -777,7 +788,7 @@ cache state) and stamped into the report.
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
 | fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports the largest unindexed part's entries, its attempt count (at least `ceil(entries / max(batch_entries, largest part's entries))`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and one HEAD CAS; no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object data GET, or any figure missing from the report |
-| HEAD bytes added by field 8 | at most 256 B per (covering part, declared field, key slice), where the ceiling is tested after compression (`body_len`, the zstd bucket frames, against `DEFAULT_MAX_COLUMN_STATS_BYTES` = 256 MiB) so slices per (part, field) is at most `ceil(leaf entries x 12 B / 256 MiB)`, the raw-bytes upper bound: one for a Stage 0-sized spans part (about 20 M entries, about 240 MB raw, under the ceiling before compression), and decision 4's 13-bit sizing of that part as one body agrees; at most 256 KiB over 1,024 one-field, one-slice parts at the band, about 200 KiB at the predicted 200 B per ref, read in the one HEAD GET the resolve already issues; HEAD bytes and leaf-ref count on the resolve report | over 512 B per (part, field, slice), more than one HEAD GET per resolve, or either figure missing |
+| HEAD bytes added by field 8 | at most 256 B per (covering part, declared field, key slice), where the ceiling bounds the (part, field)'s declared decompressed body (the sum of its frames' `uncompressed_len`, the quantity `DEFAULT_MAX_COLUMN_STATS_BYTES` = 256 MiB caps for `.cstat` too), so slices per (part, field) = `ceil(decompressed body bytes / 256 MiB)` over the (part, field)'s entries before slicing: one for a Stage 0-sized spans part (about 20 M entries at about 12 B each with one block per trace per object, about 240 MB, under the ceiling), and decision 4's 13-bit sizing of that part as one body agrees; at most 256 KiB over 1,024 one-field, one-slice parts at the band, about 200 KiB at the predicted 200 B per ref, read in the one HEAD GET the resolve already issues; HEAD bytes and leaf-ref count on the resolve report | over 512 B per (part, field, slice), more than one HEAD GET per resolve, or either figure missing |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 

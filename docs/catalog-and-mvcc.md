@@ -851,7 +851,10 @@ first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
   u32 LE      dir_crc32c
   body:       bucket frames tiling [0, body_len) exactly, each
-              u32 LE entry_count, u32 LE frame_crc32c (over the zstd bytes),
+              u32 LE entry_count, u32 LE uncompressed_len (checked against
+              the body ceiling before the buffer is allocated; the
+              decompressed length must equal it exactly),
+              u32 LE frame_crc32c (over the zstd bytes),
               zstd entries[entry_count]:
                 key8 [8]
                 uvarint entry_ordinal      (part-local SnapshotEntry ordinal)
@@ -896,12 +899,13 @@ verified by their crcs). The ref's copies of `field`, `key_type`, `key8_lo`,
 `key8_hi`, `bucket_bits`, `entry_count`, `part_blake3` and `prefix_len`
 serve only to pick the slice and size GET 1; the header is authoritative,
 being under the leaf's blake3, and after GET 1 the reader compares the two
-and rejects the
-leaf as `Corrupted` on any disagreement (the part reads as uncovered),
-never selecting a bucket from the ref's `bucket_bits`. GET 2 is the one
-bucket the header's `bucket_bits` and the mix select (verified by its frame
-crc and decompressed length), a binary search yields the `(entry_ordinal,
-block set)` matches. Exactly two ranged GETs per covering
+and rejects the leaf as `Corrupted` on any disagreement (the part reads as
+uncovered), never selecting a bucket from the ref's `bucket_bits`. GET 2 is
+the one bucket the header's `bucket_bits` and the mix select: its declared
+`uncompressed_len` is checked against the body ceiling before any buffer
+is allocated, then the frame crc and the exact decompressed length are
+verified, and a binary search yields the `(entry_ordinal, block set)`
+matches. Exactly two ranged GETs per covering
 part, issued concurrently across parts, under a per-query ceiling of 2,048
 leaf GETs; parts beyond the ceiling are scanned, not probed. Candidates are
 the matches over covered entries plus every uncovered segment: the entries a
@@ -919,10 +923,10 @@ field any entry's section header names, from the tier-1 sections and never
 from rows: per entry, a suffix GET for the footer and a ranged GET of the
 KEY_IDX section (about 2% of a logs object and about 6% of a spans object
 on the ADR-2707 Stage 0 corpora), merged across the part's entries, sorted,
-bucketed and written
-before the part PUT, so a refusal writes no object. The object is
-content-addressed by its own bytes (`hash16` is the blake3 of the leaf),
-not by the part's hash, for the reason the column-statistics section gives:
+bucketed and written before the part PUT, so a refusal writes no object.
+The object is content-addressed by its own bytes (`hash16` is the blake3
+of the leaf), not by the part's hash, for the reason the
+column-statistics section gives:
 two folds whose per-entry degrade differed would otherwise collide under
 `AlreadyExists`. `bucket_bits` is chosen so that the directory and the mean
 bucket are about equal in bytes, clamped to 12..=16 at the writer; the
@@ -932,18 +936,23 @@ makes the reader treat the part as uncovered for that field (never a panic,
 never wrong data): a magic other than `RKI1`; a `header_len` past the
 object; a header, directory or frame crc32c mismatch; `bucket_bits` outside
 1..=16; a directory whose ends are not non-decreasing or whose last end
-differs from `body_len`; a frame whose decompressed length is not the sum of
-its entries' encodings or whose `entry_count` disagrees; an entry ordinal at
-or past the header's `part_entry_count`; a `key8` outside the leaf's slice; a
+differs from `body_len`; a frame whose declared `uncompressed_len` exceeds
+the body ceiling (refused before decompression allocates anything), or
+whose decompressed length differs from it, or whose decompressed bytes are
+not exactly `entry_count` entries' encodings; an entry ordinal at or past
+the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `key8` that does not mix to the bucket it sits in; unsorted or duplicate
 `(key8, entry ordinal)` pairs; a block delta list that is empty or that
-overflows `u32`. The body ceiling is
-`DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB); a (part, field) whose body
-would exceed it is split by key range into several leaves under the
-ceiling, each with its own ref and slice, so a lookup opens exactly one leaf
-per (part, field). A per-entry failure lands the entry in
-`uncovered_entry_ordinals` and never aborts the leaf; the fold report counts
-section reads, bytes, leaves written and uncovered entries per fold.
+overflows `u32`. The body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
+(256 MiB) in that constant's own meaning, a cap on declared decompressed
+size applied before allocation: it bounds the sum of a leaf's frames'
+`uncompressed_len`, not `body_len` (the stored bytes, which are smaller).
+A (part, field) whose decompressed body would exceed it is split by key
+range into several leaves under the ceiling, each with its own ref and
+slice, so a lookup opens exactly one leaf per (part, field). A per-entry
+failure lands the entry in `uncovered_entry_ordinals` and never aborts the
+leaf; the fold report counts section reads, bytes, leaves written and
+uncovered entries per fold.
 
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
