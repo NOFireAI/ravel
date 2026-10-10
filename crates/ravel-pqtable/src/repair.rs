@@ -566,7 +566,7 @@ mod tests {
     use super::*;
     use crate::keys::manifest_key;
     use crate::manifest::encode_manifest;
-    use crate::test_util::{S3KeyStore, SegmentAlignedStore, TENANT_A, TENANT_B, live_manifest};
+    use crate::test_util::{SegmentAlignedStore, TENANT_A, TENANT_B, live_manifest};
 
     async fn put_version(store: &dyn ObjectStoreBackend, tenant: &TenantHash, version: u64) {
         let key = manifest_key(tenant, "hits", version).expect("key");
@@ -886,23 +886,14 @@ mod tests {
         store
     }
 
-    /// [`SegmentAlignedStore`] behind the S3 adapter's key handling.
-    type S3Store = S3KeyStore<SegmentAlignedStore>;
-
-    /// The raw key space under an [`S3Store`], where a test puts what a
+    /// The raw key space under a [`SegmentAlignedStore`], where a test puts what a
     /// credential could put with any S3 client.
-    fn memory(store: &S3Store) -> &MemoryStore {
-        store.inner.inner.inner()
+    fn memory(store: &SegmentAlignedStore) -> &MemoryStore {
+        store.inner.inner()
     }
 
-    fn deletes_sent(store: &S3Store) -> u64 {
-        store
-            .inner
-            .inner
-            .metrics()
-            .snapshot()
-            .op(StoreOp::Delete)
-            .calls
+    fn deletes_sent(store: &SegmentAlignedStore) -> u64 {
+        store.inner.metrics().snapshot().op(StoreOp::Delete).calls
     }
 
     /// The text after `t/<tenant_hash>/pq/t/` of keys the Query grant admits
@@ -956,12 +947,9 @@ mod tests {
     /// [`forged_store`] with versions 2 and 3, every [`STRAYS`],
     /// [`UNDELETABLE`] and [`RESERVED`] key of tenant A written at store
     /// time 5_000, one stray key of tenant B, and a key under an invalid
-    /// table segment without the `.pqm` suffix, behind the S3 adapter's
-    /// listing and key handling.
-    async fn stray_store() -> S3Store {
-        let store = S3KeyStore {
-            inner: segment_aligned_forged_store().await,
-        };
+    /// table segment without the `.pqm` suffix.
+    async fn stray_store() -> SegmentAlignedStore {
+        let store = segment_aligned_forged_store().await;
         let memory = memory(&store);
         memory.set_clock_ms(5_000);
         for key in STRAYS
@@ -1074,7 +1062,7 @@ mod tests {
             .await
             .expect("delete");
         assert_eq!(deleted, sorted(&STRAYS));
-        assert_eq!(store.inner.deletes(), sorted(&STRAYS));
+        assert_eq!(store.deletes(), sorted(&STRAYS));
         let stray_keys = |entries: Vec<StrayEntry>| -> Vec<String> {
             entries.into_iter().map(|e| e.key).collect()
         };
@@ -1152,7 +1140,7 @@ mod tests {
             matches!(&got, Err(RepairError::Undeletable { key, .. }) if *key == keys[2]),
             "{got:?}"
         );
-        assert!(store.inner.deletes().is_empty());
+        assert!(store.deletes().is_empty());
         assert_eq!(deletes_sent(&store), 0);
         assert_eq!(list_stray(&store, &TENANT_A).await.expect("list").len(), 8);
         assert_eq!(
@@ -1197,9 +1185,7 @@ mod tests {
     /// deleted, each at its own key.
     #[tokio::test]
     async fn delete_flagged_skips_an_unaddressable_key_and_deletes_the_rest() {
-        let store = S3KeyStore {
-            inner: segment_aligned_forged_store().await,
-        };
+        let store = segment_aligned_forged_store().await;
         let tilde = invalid_key(TILDES);
         memory(&store).insert_foreign(&tilde, Bytes::from_static(b"x"));
         assert_ne!(store_path(&tilde), tilde);
@@ -1241,7 +1227,7 @@ mod tests {
                 undeletable: vec![tilde.clone()],
             }
         );
-        assert_eq!(store.inner.deletes(), rest);
+        assert_eq!(store.deletes(), rest);
         assert_eq!(deletes_sent(&store), 6);
         let after = list(&store, &TENANT_A, "hits").await.expect("list");
         let flagged_after: Vec<(&str, bool)> = after
@@ -1258,9 +1244,7 @@ mod tests {
     /// version 3. `delete_flagged` skips it, so version 3 is kept.
     #[tokio::test]
     async fn delete_flagged_skips_a_flagged_key_whose_delete_reaches_a_valid_version() {
-        let store = S3KeyStore {
-            inner: segment_aligned_forged_store().await,
-        };
+        let store = segment_aligned_forged_store().await;
         let doubled = invalid_key("/00000000000000000003");
         memory(&store).insert_foreign(&doubled, Bytes::from_static(b"x"));
         assert!(classify(&TENANT_A, "hits", &doubled).1);
@@ -1273,7 +1257,7 @@ mod tests {
                 undeletable: vec![doubled.clone()],
             }
         );
-        assert_eq!(store.inner.deletes(), Vec::<String>::new());
+        assert_eq!(store.deletes(), Vec::<String>::new());
         assert_eq!(deletes_sent(&store), 0);
         memory(&store).head(&mkey(3)).await.expect("version 3 kept");
         // `MemoryStore` lists every key and reports this one unaddressable,
@@ -1395,11 +1379,11 @@ mod tests {
     }
 
     /// A stray key with a control character, an empty segment or a `.` or
-    /// `..` segment is listed unaddressable by the S3 adapter, so
+    /// `..` segment is listed unaddressable, as the S3 adapter lists it, so
     /// [`list_stray`] names it as undeletable beside the other strays, and
     /// [`delete_stray`] refuses it.
     #[tokio::test]
-    async fn a_key_the_s3_adapter_cannot_address_is_listed_as_undeletable() {
+    async fn an_unaddressable_stray_key_is_listed_as_undeletable() {
         for rest in UNLISTABLE {
             let store = stray_store().await;
             let key = stray_key(&TENANT_A, rest);
