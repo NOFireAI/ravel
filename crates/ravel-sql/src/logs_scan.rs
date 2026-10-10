@@ -202,9 +202,12 @@
 //! downstream. The columnar path's `next_block_columnar` hands out a view
 //! *borrowing* the decoded block, which the reader releases only when the next
 //! block is decoded, so the block stays resident alongside the Arrow batches
-//! built from it: both terms are charged together
-//! ([`LogScanStream::hold_batches`]) and released together. Charging the
-//! batches alone would admit a query at a fraction of its resident footprint.
+//! built from it. The two are charged separately: the batches when they are
+//! held ([`LogScanStream::hold_batches`]) and released as they are emitted, the
+//! decoded block in `LogScanStream::resident` until the decode that replaces it
+//! has run, including any wait for a read-gate permit before that decode.
+//! Charging the batches alone would admit a query at a fraction of its
+//! resident footprint.
 //!
 //! # Column projection
 //!
@@ -4108,8 +4111,9 @@ fn log_block_gate_failed(key: &str, err: CpuGateError) -> DataFusionError {
 }
 
 /// The block currently being drained into output batches, and the form it is
-/// held in. The reservation charge tracked by [`LogScanStream::held`] covers
-/// whichever variant is live.
+/// held in. The charge tracked by [`LogScanStream::held`] covers the records or
+/// batches of whichever variant is live; on the columnar path the decoded block
+/// behind them is charged separately, in `LogScanStream::resident`.
 enum Pending {
     /// Nothing held.
     None,
@@ -4119,9 +4123,9 @@ enum Pending {
     /// Columnar fast path: the block's already-built output batches, emitted one
     /// per poll. Built whole from the [`ColumnarBlockView`] so the view (which
     /// borrows the scan) is dropped before the next block is decoded. The
-    /// decoded block itself is still resident behind the reader until then, so
-    /// the charge covering this variant includes it (see
-    /// [`LogScanStream::hold_batches`]).
+    /// decoded block itself is still resident behind the reader until then; it
+    /// is charged in `LogScanStream::resident`, not in the charge for these
+    /// batches.
     Batches(VecDeque<RecordBatch>),
 }
 
@@ -4218,15 +4222,17 @@ fn row_ref_array(range: RowRefRange, rows: usize) -> DFResult<ArrayRef> {
 /// Per-partition record-batch stream (ADR-0087 decisions 1 and 2).
 ///
 /// Holds at most one segment's decoded block plus the batch built from it, and
-/// charges the query's memory pool for exactly that: `held` is the reservation
-/// covering `pending`, `emitted` the reservation covering the batch handed
-/// downstream on the previous poll. Both are released as their data goes away,
-/// so the reservation tracks live resident memory rather than cumulative output
-/// and a pool overrun surfaces as `ResourcesExhausted` at the moment the scan
-/// genuinely holds too much.
+/// charges the query's memory pool for exactly that: `held` is the charge
+/// covering `pending`'s records or batches, `emitted` the charge covering the
+/// batch handed downstream on the previous poll, and `resident` the columnar
+/// path's decoded block, which travels into a read-gate job with the scan and
+/// back. Each is released as its data goes away, so the reservation tracks
+/// live resident memory rather than cumulative output and a pool overrun
+/// surfaces as `ResourcesExhausted` at the moment the scan genuinely holds too
+/// much.
 ///
-/// The reservation lives on the stream (not on the state) so it is the same one
-/// for the partition's lifetime and frees exactly once on drop.
+/// The reservations live on the stream (not on the state) so they are the same
+/// ones for the partition's lifetime, and each frees exactly once on drop.
 struct LogScanStream {
     schema: SchemaRef,
     /// Indices into the resolved full schema to emit, in output order.
