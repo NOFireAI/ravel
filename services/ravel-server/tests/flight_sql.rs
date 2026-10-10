@@ -43,6 +43,9 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::http::StaticBearerTokenResolver;
+use ravel_query::http::service::{
+    DEFAULT_MEMORY_ADMISSION_FRACTION, MSG_MEMORY_ADMISSION, MemoryAdmissionGate,
+};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::alerting::ALERT_SHARD;
@@ -585,6 +588,137 @@ async fn a_flight_sql_query_returns_the_published_rows() {
 
     assert_eq!(rows, samples.len(), "every published sample comes back");
     assert_eq!(columns, vec!["ts".to_string(), "value".to_string()]);
+
+    server.stop().await;
+}
+
+/// Install a #2044 memory admission wait at the default fraction over
+/// `budget` on `state`'s admission controller, as `ravel_server::start` does.
+fn with_memory_admission(
+    state: &mut SqlState,
+    budget: &Arc<ravel_memory::MemoryBudget>,
+) -> Arc<MemoryAdmissionGate> {
+    let gate = Arc::new(MemoryAdmissionGate::new(
+        Arc::clone(budget),
+        DEFAULT_MEMORY_ADMISSION_FRACTION,
+    ));
+    state.query_admission = Arc::new(
+        ravel_query::QueryAdmissionController::new(ravel_query::QueryConcurrencyLimit::Unlimited)
+            .with_memory_gate(Arc::clone(&gate)),
+    );
+    gate
+}
+
+/// #2044, Flight SQL: `GetFlightInfo` reaches the memory admission wait, and a
+/// statement whose deadline would pass while the process budget stays above
+/// the threshold is refused `RESOURCE_EXHAUSTED` (the existing admission
+/// class) with the memory-class message. This is the test proving the Flight
+/// planning path reaches the wait.
+///
+/// Prove-the-test: replace `admit_within` in `get_flight_info_statement`
+/// (crates/ravel-sql/src/flight/service.rs) with a bare `try_admit`. The
+/// statement then plans and answers OK, and `waits_total` stays 0.
+#[tokio::test]
+async fn flight_get_flight_info_waits_for_memory_headroom_and_refuses_at_the_deadline() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, "cpu", &[(100i64, 1.5f64)]).await;
+    let mut tokens = HashMap::new();
+    tokens.insert("acme-token".to_string(), tenant);
+    let mut state = sql_state(store, tokens);
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+    let gate = with_memory_admission(&mut state, &budget);
+    let _held = budget.reserve(1 << 20).expect("the empty budget admits");
+    let server = FlightServer::start(&state).await;
+    let mut client = server.client().await;
+
+    let command = CommandStatementQuery {
+        query: QUERY.to_string(),
+        transaction_id: None,
+    };
+    let mut request = authed(descriptor(&command), "acme-token");
+    request
+        .metadata_mut()
+        .insert("x-ravel-timeout", "0.1".parse().expect("ascii"));
+    let status = client
+        .get_flight_info(request)
+        .await
+        .expect_err("refused while the budget stays held");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+    assert_eq!(status.message(), MSG_MEMORY_ADMISSION);
+    assert_eq!(gate.waits_total(), 1);
+    assert_eq!(gate.wait_refusals_total(), 1);
+
+    server.stop().await;
+}
+
+/// #2044, Flight SQL: `DoGet` on a ticket minted while the budget was free
+/// waits at admission while it is held, then streams the rows once it frees.
+/// This is the test proving the Flight execution path reaches the wait.
+///
+/// Prove-the-test: replace `self.admit(...)` in `do_get_statement`
+/// (crates/ravel-sql/src/flight/service.rs) with a bare `try_admit`. The
+/// `DoGet` then never parks, so `waits_total` never reaches 1 and the test
+/// times out waiting for it.
+#[tokio::test]
+async fn flight_do_get_waits_for_memory_headroom_then_streams_the_rows() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples = [(100i64, 1.5f64), (200, 2.5), (300, -0.0)];
+    publish_segment(store.as_ref(), &tenant, "cpu", &samples).await;
+    let mut tokens = HashMap::new();
+    tokens.insert("acme-token".to_string(), tenant);
+    let mut state = sql_state(store, tokens);
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+    let gate = with_memory_admission(&mut state, &budget);
+    let server = FlightServer::start(&state).await;
+    let mut client = server.client().await;
+
+    let command = CommandStatementQuery {
+        query: QUERY.to_string(),
+        transaction_id: None,
+    };
+    let info = client
+        .get_flight_info(authed(descriptor(&command), "acme-token"))
+        .await
+        .expect("flight info under a free budget")
+        .into_inner();
+    let ticket = info
+        .endpoint
+        .first()
+        .expect("one endpoint")
+        .ticket
+        .clone()
+        .expect("a ticket");
+    assert_eq!(gate.waits_total(), 0);
+
+    let held = budget.reserve(1 << 20).expect("the empty budget admits");
+    let mut get_client = client.clone();
+    let fetch = tokio::spawn(async move {
+        let stream = get_client
+            .do_get(authed(ticket, "acme-token"))
+            .await?
+            .into_inner();
+        decode(stream)
+            .await
+            .map_err(|err| tonic::Status::internal(err.to_string()))
+    });
+    let mut polls = 0;
+    while gate.waits_total() == 0 {
+        polls += 1;
+        assert!(
+            polls <= 2000,
+            "timed out waiting for DoGet to park at admission"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!fetch.is_finished(), "DoGet waits while the budget is held");
+    drop(held);
+
+    let (rows, _columns) = fetch.await.expect("task").expect("rows once freed");
+    assert_eq!(rows, samples.len());
+    assert_eq!(gate.waits_total(), 1);
+    assert_eq!(gate.wait_refusals_total(), 0);
 
     server.stop().await;
 }

@@ -1270,7 +1270,7 @@ async fn unauthenticated_request_consumes_no_permit() {
 /// only holds if the selector was rejected ahead of `admit()`. Moving the
 /// selector-parsing loop in `metadata_request`
 /// (crates/ravel-query/src/http/handlers.rs) back to after
-/// `let _permit = controls.admit()?;` in `metadata()`
+/// `let (_permit, deadline) = controls.admit(deadline).await?;` in `metadata()`
 /// (crates/ravel-query/src/http/service.rs) reproduces the bug this test
 /// pins: the request then reaches `admit()` first, and with the one permit
 /// already held here it answers 503 SERVICE_UNAVAILABLE instead of 400 BAD

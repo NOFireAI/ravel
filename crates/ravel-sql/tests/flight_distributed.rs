@@ -412,6 +412,17 @@ impl FlightAuth for FixedAuth {
 /// re-resolves. That is exactly why the wire tests can mint tickets whose
 /// segments live in `store` under keys no catalog listing would return.
 fn wire_service(store: Arc<dyn ObjectStoreBackend>) -> Arc<RavelFlightSqlService> {
+    wire_service_with_admission(
+        store,
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+    )
+}
+
+/// [`wire_service`] with `admission` as the service's admission controller.
+fn wire_service_with_admission(
+    store: Arc<dyn ObjectStoreBackend>,
+    admission: Arc<QueryAdmissionController>,
+) -> Arc<RavelFlightSqlService> {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
@@ -433,7 +444,7 @@ fn wire_service(store: Arc<dyn ObjectStoreBackend>) -> Arc<RavelFlightSqlService
             ..FlightSqlConfig::default()
         },
         Arc::new(NoopQueryCostRecorder),
-        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        admission,
     ))
 }
 
@@ -1223,6 +1234,55 @@ async fn fragment_do_get_serves_internal_schema() {
         "a slice fragment serves the internal, provenance-carrying schema"
     );
     assert_eq!(batches[0].num_columns(), 8, "internal schema is 8 columns");
+}
+
+/// A slice fetch never waits for memory headroom. Its coordinator already
+/// holds a permit and reservations, so a wait there is hold-and-wait, and the
+/// coordinator's fallback needs a fast answer within its deadline. With the
+/// process budget held at its limit, far above the admission threshold, the
+/// slice is still served at once and the gate records no wait.
+///
+/// Prove-the-test: admit the slice in `slice_do_get`
+/// (crates/ravel-sql/src/flight/service.rs) through the memory admission wait
+/// instead of `try_admit`. The slice then waits out its 1 s ticket and is
+/// refused `RESOURCE_EXHAUSTED`, so `expect("do_get slice")` fails, and
+/// `waits_total` reads 1.
+#[tokio::test]
+async fn slice_do_get_never_waits_for_memory_headroom() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+    let gate = Arc::new(ravel_query::http::service::MemoryAdmissionGate::new(
+        Arc::clone(&budget),
+        ravel_query::http::service::DEFAULT_MEMORY_ADMISSION_FRACTION,
+    ));
+    let admission = Arc::new(
+        QueryAdmissionController::new(QueryConcurrencyLimit::Unlimited)
+            .with_memory_gate(Arc::clone(&gate)),
+    );
+    let service = wire_service_with_admission(Arc::clone(&backend), admission);
+    let _held = budget.reserve(1 << 20).expect("the empty budget admits");
+
+    let endpoints = endpoints_for(&snapshot);
+    let ticket = endpoints[0].ticket.clone();
+    assert_eq!(ticket.slice_count, 2, "a slice ticket, not the whole set");
+    let handle = ticket.encode(service.slice_ticket_key()).expect("encode");
+    let tsq = TicketStatementQuery {
+        statement_handle: handle.into(),
+    };
+    let req = Request::new(Ticket::new(tsq.as_any().encode_to_vec()));
+    let stream = service
+        .do_get_statement(tsq, req)
+        .await
+        .expect("do_get slice")
+        .into_inner();
+    let batches = util::flight_harness::collect(stream)
+        .await
+        .expect("decode slice fragment");
+
+    assert!(!batches.is_empty(), "the slice yields rows");
+    assert_eq!(gate.waits_total(), 0, "a slice fetch must not wait");
+    assert_eq!(gate.wait_refusals_total(), 0);
 }
 
 // ---------------------------------------------------------------------------
