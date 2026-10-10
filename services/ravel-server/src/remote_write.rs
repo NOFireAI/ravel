@@ -104,6 +104,21 @@ fn charge_snappy_inflate(
     }
 }
 
+/// The size the write gate compares against its inline floor for the decode of
+/// `body`: the inflated length the snappy header declares, capped at `cap`
+/// (ADR-1702 decision 4). The decoder writes into a buffer of exactly the
+/// declared length and fails a body that does not fill it, so the declared
+/// length bounds both the inflate and the protobuf decode after it. A header
+/// over `cap` is rejected before anything is inflated, so `cap` bounds the
+/// job however large the claim. A header that does not parse is rejected
+/// before any inflate too, and is sized by its compressed length.
+fn snappy_job_bytes(body: &[u8], cap: usize) -> u64 {
+    match snap::raw::decompress_len(body) {
+        Ok(declared) => declared.min(cap) as u64,
+        Err(_) => body.len() as u64,
+    }
+}
+
 /// Snappy-decompresses and protobuf-decodes `body` for `version`, holding a
 /// process-wide ingest byte budget charge for the inflated bytes across the
 /// whole call (ADR-0069 as amended by issue #1419).
@@ -114,7 +129,7 @@ fn charge_snappy_inflate(
 /// charges the normalized batch.
 ///
 /// With `write_gate` set, the snappy inflate and protobuf decode run on it as
-/// one job under the `remote_write_snappy` site, sized by the compressed body
+/// one job under the `remote_write_snappy` site, sized by [`snappy_job_bytes`]
 /// (ADR-1702). The charge moves into the job and comes back with the decoded
 /// request, so it is held while the job waits for a permit and, if the request
 /// is dropped meanwhile, released only when the job returns.
@@ -134,7 +149,7 @@ async fn decode_body_charged(
         Ok(charge) => charge,
         Err(SnappyChargeError::Shed) => return Err(DecodeChargeError::Shed),
     };
-    let input_bytes = body.len() as u64;
+    let input_bytes = snappy_job_bytes(body, MAX_DECOMPRESSED_PAYLOAD_BYTES);
     let body = body.clone();
     let decode = move || {
         let resolved = match version {
@@ -344,8 +359,8 @@ pub struct RemoteWriteState {
     /// a transient outside it (issue #1419).
     pub budget: Arc<IngestByteBudget>,
     /// The ADR-1702 write gate the body's snappy inflate and decode run on,
-    /// sized by the compressed body. `None` runs them inline on the request
-    /// task.
+    /// sized by the declared inflated length capped at the decompression cap.
+    /// `None` runs them inline on the request task.
     pub write_gate: Option<Arc<WriteGate>>,
 }
 
@@ -1140,5 +1155,133 @@ mod tests {
             0,
             "none of these paths reached the budget at all"
         );
+    }
+
+    fn snappy(data: &[u8]) -> Bytes {
+        Bytes::from(
+            snap::raw::Encoder::new()
+                .compress_vec(data)
+                .expect("compress"),
+        )
+    }
+
+    fn write_gate(inline_floor_bytes: u64) -> Arc<WriteGate> {
+        Arc::new(WriteGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ))
+    }
+
+    fn snappy_site(gate: &WriteGate) -> (u64, u64) {
+        gate.snapshot()
+            .sites
+            .iter()
+            .find(|s| s.site == WriteSite::RemoteWriteSnappy)
+            .map_or((0, 0), |s| (s.jobs, s.inline))
+    }
+
+    /// The decode job is sized by the declared inflated length, capped, not by
+    /// the compressed body: a body that compresses below the gate's default
+    /// floor but inflates above it runs on the gate.
+    #[tokio::test]
+    async fn the_snappy_job_is_sized_by_the_declared_inflated_length() {
+        let body = snappy(&vec![0u8; 1024 * 1024]);
+        assert!((body.len() as u64) < ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
+        assert_eq!(
+            snappy_job_bytes(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES),
+            1024 * 1024
+        );
+        assert_eq!(snappy_job_bytes(&body, 1000), 1000, "capped");
+        let malformed = [0xffu8, 0xff, 0xff];
+        assert_eq!(
+            snappy_job_bytes(&malformed, MAX_DECOMPRESSED_PAYLOAD_BYTES),
+            3
+        );
+
+        let gate = write_gate(ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        // A megabyte of zeros is not a valid request; the job still ran.
+        let _ = decode_body_charged(&body, RemoteWriteVersion::V1, &budget, Some(&gate)).await;
+        assert_eq!(snappy_site(&gate), (1, 0));
+        let small = snappy(&[0u8; 100]);
+        let _ = decode_body_charged(&small, RemoteWriteVersion::V1, &budget, Some(&gate)).await;
+        assert_eq!(snappy_site(&gate), (1, 1));
+    }
+
+    /// Decision 6: the inflate charge is taken before submission and held
+    /// while the job waits for a permit. A request dropped while it waits
+    /// refunds the charge, since the job that held it never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_snappy_charge_is_held_while_the_job_waits() {
+        let gate = write_gate(0);
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let blocker_gate = Arc::clone(&gate);
+        let blocker = tokio::spawn(async move {
+            blocker_gate
+                .run(WriteSite::OtapDecode, JobSize::Bytes(0), move || {
+                    let _ = parked.recv();
+                })
+                .await
+                .expect("the parked job runs");
+        });
+        while gate.running() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        let body = snappy(&[0u8; 1000]);
+        let waiter = tokio::spawn({
+            let (gate, budget) = (Arc::clone(&gate), Arc::clone(&budget));
+            async move {
+                decode_body_charged(&body, RemoteWriteVersion::V1, &budget, Some(&gate))
+                    .await
+                    .is_ok()
+            }
+        });
+        while gate.queued() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            budget.in_flight_bytes(),
+            1000,
+            "the declared inflated length is charged while the job waits"
+        );
+
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "a request dropped before its job ran refunds the charge"
+        );
+        release.send(()).expect("release the parked job");
+        blocker.await.expect("blocker task");
+        assert_eq!(snappy_site(&gate), (0, 0), "the dropped job never ran");
+    }
+
+    /// The gate's failures answer 500 for a panicked decode job and 503 for a
+    /// cancelled one, and a flush whose encode the gate failed answers the
+    /// retryable 503 its `ShardUnavailable` carries.
+    #[test]
+    fn gate_failures_answer_500_for_a_panic_and_503_for_a_cancel() {
+        let status = |err| DecodeChargeError::Gate(err).into_response().status();
+        assert_eq!(
+            status(CpuGateError::Panicked),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(CpuGateError::Cancelled),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(CpuGateError::Closed),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let flush = write_error_response(WriteError::ShardUnavailable);
+        assert_eq!(flush.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(flush.headers().contains_key(RETRY_AFTER_HEADER));
     }
 }

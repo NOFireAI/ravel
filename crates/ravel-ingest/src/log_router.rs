@@ -1706,51 +1706,66 @@ mod tests {
         assert_eq!((site.jobs, site.inline), (shards.len() as u64, 0));
     }
 
-    /// A gated encode that panics fails its flush: the strict write gets the
-    /// typed `SegmentBuild` error rather than the `ShardUnavailable` a dropped
-    /// ack would produce, nothing is stored, the shard stays alive, and the
-    /// next write commits.
+    /// A gated encode that panics, or that the gate cancels, fails its flush
+    /// with the retryable `ShardUnavailable` an encode panic gave before the
+    /// gate, not the client-fault `SegmentBuild`. Nothing is stored, no
+    /// abandoned_* counter moves, the shard stays alive, and the next write
+    /// commits.
     #[tokio::test]
-    async fn panicked_gated_log_encode_fails_the_strict_write() {
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let router = LogIngestRouter::new(
-            IngestConfig {
-                shard_count: 1,
-                target_bytes: 1,
-                ..IngestConfig::default()
-            },
-            Arc::clone(&store),
-            Arc::new(FixedClock(1_700_000_000_000_000_000)),
-        )
-        .with_write_gate(floor_zero_write_gate());
-        router.write_gate.panic_next_encode();
-        let record = diverse_records().remove(0);
-        let err = router
-            .write(
-                TenantId::new("acme"),
-                vec![record.clone()],
-                WriteMode::Strict,
-                Duration::from_secs(30),
+    async fn gate_failed_log_encode_fails_the_strict_write_retryably() {
+        for injected in [
+            ravel_cpu_gate::CpuGateError::Panicked,
+            ravel_cpu_gate::CpuGateError::Cancelled,
+        ] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let router = LogIngestRouter::new(
+                IngestConfig {
+                    shard_count: 1,
+                    target_bytes: 1,
+                    ..IngestConfig::default()
+                },
+                Arc::clone(&store),
+                Arc::new(FixedClock(1_700_000_000_000_000_000)),
             )
-            .await
-            .expect_err("a panicked encode fails the write");
-        assert!(
-            matches!(err, LogWriteError::SegmentBuild(_)),
-            "expected SegmentBuild, got {err:?}"
-        );
-        assert!(collect_objects(store.as_ref()).await.is_empty());
-        let snapshot = router.metrics.snapshot();
-        assert_eq!(snapshot.abandoned_input_rejected, 1);
-        assert_eq!(snapshot.shard_deaths, 0);
-        router
-            .write(
-                TenantId::new("acme"),
-                vec![record],
-                WriteMode::Strict,
-                Duration::from_secs(30),
-            )
-            .await
-            .expect("the shard survives and the next write commits");
+            .with_write_gate(floor_zero_write_gate());
+            router.write_gate.fail_next_encode(injected);
+            let record = diverse_records().remove(0);
+            let err = router
+                .write(
+                    TenantId::new("acme"),
+                    vec![record.clone()],
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect_err("a failed gate encode fails the write");
+            assert!(
+                matches!(err, LogWriteError::ShardUnavailable),
+                "{injected:?}: expected ShardUnavailable, got {err:?}"
+            );
+            assert!(err.is_retryable());
+            assert!(collect_objects(store.as_ref()).await.is_empty());
+            let snapshot = router.metrics.snapshot();
+            assert_eq!(
+                (
+                    snapshot.abandoned_input_rejected,
+                    snapshot.abandoned_retry_exhausted,
+                    snapshot.abandoned_queue_deadline,
+                ),
+                (0, 0, 0),
+                "{injected:?}: a gate failure is not an abandoned flush"
+            );
+            assert_eq!(snapshot.shard_deaths, 0);
+            router
+                .write(
+                    TenantId::new("acme"),
+                    vec![record],
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect("the shard survives and the next write commits");
+        }
     }
 
     /// The row/columnar byte-identity anchor above, for a keyed tenant: a

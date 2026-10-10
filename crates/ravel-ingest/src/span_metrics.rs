@@ -64,12 +64,13 @@ pub struct SpanIngestMetrics {
     /// queued for a `max_inflight_flushes` permit, before any store call
     /// ([`crate::SpanWriteError::Abandoned`], issue #1739). A contention signal,
     /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
-    /// queue is not read as the store failing to accept a PUT.
+    /// queue is not read as the store failing to accept a PUT. Also counts a
+    /// flush whose lifetime, re-derived at permit grant, elapsed before its
+    /// ADR-1702 write gate encode returned.
     abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RSPAN build, data-key derivation, or commit-record
-    /// build failed, or the write gate returned no encode result
-    /// ([`crate::SpanWriteError::SegmentBuild`]). A client
+    /// build failed ([`crate::SpanWriteError::SegmentBuild`]). A client
     /// signal: identical input will fail again.
     abandoned_input_rejected: AtomicU64,
     /// Cumulative bytes admitted into shard buffers at enqueue time.

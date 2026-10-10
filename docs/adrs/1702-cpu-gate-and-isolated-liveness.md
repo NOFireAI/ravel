@@ -155,8 +155,8 @@ rule on thread placement.
    crates (`ravel-segment`, `ravel-logseg`, `ravel-rspan`,
    `ravel-catalog::snapshot_format`) stay synchronous and runtime-free. The
    gate is applied at the async caller. (Qualified by the #2669 amendment
-   below: the three ingest decompressions are sized by their compressed
-   length.)
+   below: an ingest decompression whose format declares no uncompressed
+   length it can trust is sized by an upper bound on that length.)
 
 5. **Cancellation.** A waiter dropped before it holds a permit never runs.
    A decode that has started runs to completion, because a `zstd::bulk`
@@ -687,16 +687,35 @@ production instance of each:
 - `remote_write_snappy`: one Remote Write body's snappy inflate and protobuf
   decode, as one job, since `ravel-remote-write` does both in one call.
 
-Decision 4 sizes a unit by its uncompressed length. The three decompressions
-are sized by their compressed length instead, since a gzip body declares no
-trustworthy uncompressed length before it is inflated, and a zstd frame need
-not. A body under the floor therefore runs inline however far it inflates, up
-to its path's decompression cap: 64 MiB for an OTLP-HTTP or Remote Write body,
-16 MiB for an OTAP payload by default.
+Decision 4 sizes a unit by its uncompressed length. Each decompression is
+sized by that length where its format lets the server know it before
+inflating, and by an upper bound on it where the format does not, never above
+its path's decompression cap. A unit under the floor by that measure inflates
+to no more than the floor.
+
+- `remote_write_snappy`: the inflated length the snappy header declares,
+  capped at 64 MiB. The decoder writes into a buffer of exactly that length
+  and rejects a body that does not fill it, so the figure is exact for any
+  body that decodes, and a header over the cap is rejected before anything is
+  inflated. The format bounds the declared length too: its densest element, a
+  3-byte copy, emits 64 bytes, so a valid body inflates to at most about 21.3
+  times its compressed length.
+- `otlp_http_gzip`: the compressed length times 1032, deflate's maximum
+  expansion as zlib's technical notes give it, capped at 64 MiB. Gzip records
+  a member's inflated length, modulo 2^32, only in the trailer after that
+  member's deflate data, so there is nothing to trust beforehand. At the
+  default floor a body of 254 compressed bytes or fewer runs inline.
+- `otap_decode`: the sum of the content sizes the payload's zstd frames
+  declare, when every frame declares one; the decompression stops one byte
+  past that total, so a frame that understates its size cannot inflate past
+  it. Otherwise the compressed length times 32768, zstd's maximum expansion
+  (a 4-byte RLE block decodes to a whole 128 KiB block). The cap is 16 MiB by
+  default.
 
 Decision 6 holds at each site. A job owns the byte charge its output needs and
 returns it with that output, so a charge is held while the job waits for a
-permit and, if the waiter is dropped, until the job returns:
+permit and, if the waiter is dropped, until the job returns, or at once if it
+never started:
 
 - A flush's ADR-0069 buffer charges move into the encode job with the buffer
   and come back with the object. The flush task holds them until its terminal
@@ -711,11 +730,28 @@ permit and, if the waiter is dropped, until the job returns:
   change or after it. The batch's in-flight ingest permit is held across the
   decode.
 
-A gate result error fails the unit and drops nothing: a flush answers its
-waiters with the typed build error and counts in
-`ravel_ingest_abandoned_input_rejected_total`, an HTTP request answers 500 for
-a panicked job and 503 for a cancelled one, and an OTAP batch is nacked with
-INTERNAL or UNAVAILABLE on a stream that stays open.
+A gate result error fails the unit as a server fault, not as bad input:
+
+- A flush answers its strict waiters with the retryable `ShardUnavailable`
+  (503), the answer an encode panic gave before the encode moved onto the
+  gate, when the panic took the shard actor down. The actor now survives. The
+  flush makes no store call, is logged at ERROR, and counts in no
+  `ravel_ingest_abandoned_*` counter. Buffered rows it held are lost, as they
+  were when the actor died.
+- An HTTP request answers 500 for a panicked job and 503 for a cancelled one.
+- An OTAP batch is nacked INTERNAL for a panicked job and UNAVAILABLE for a
+  cancelled one, and the stream ends, as it does for a corrupted decoder. The
+  batch's earlier payloads have already fed their decoders and any schema or
+  dictionary messages in the failed payload never reach its decoder, so the
+  stream's decode state no longer matches what the client sent; a resend has
+  to start a fresh stream.
+
+A flush's wait for its encode on the write gate is bounded by the flush's
+lifetime, re-derived when the shard permit is granted, as its store calls are.
+A flush whose lifetime elapses before the encode returns is abandoned with the
+retryable `Abandoned` and counted in
+`ravel_ingest_abandoned_queue_deadline_total`; an encode that had not started
+never runs.
 
 No write-gate job submits another one. A flush encode, a decompression and a
 Remote Write decode are each a synchronous codec call with no gate in reach.

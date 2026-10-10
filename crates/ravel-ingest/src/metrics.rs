@@ -133,12 +133,14 @@ pub struct IngestMetrics {
     /// `abandoned_retry_exhausted` so a deadline reached in the queue is not
     /// read as the store failing to accept a PUT. With the deadline re-derived
     /// from permit grant this fires only when a flush's task is scheduled after
-    /// its flush-open deadline already passed.
+    /// its flush-open deadline already passed. Also counts a flush whose
+    /// lifetime, re-derived at permit grant, elapsed before its ADR-1702 write
+    /// gate encode returned, which a write gate queue longer than
+    /// `max_flush_lifetime` produces.
     abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the segment build, data-key derivation, or commit-record
-    /// build failed, or the write gate returned no encode result
-    /// (`WriteError::SegmentBuild`). A client signal: identical
+    /// build failed (`WriteError::SegmentBuild`). A client signal: identical
     /// input will fail again, so the write is not retryable. Split out from
     /// `abandoned_retry_exhausted` because `error.rs` already treats the two
     /// causes differently.

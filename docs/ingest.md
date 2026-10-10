@@ -1687,7 +1687,13 @@ Counters recorded today:
   incremented when a flush is opened, before the segment build or any PUT, so
   a later-abandoned flush is counted here as well as in an `abandoned_*`
   counter. Successful flushes = the five trigger counters minus the three
-  `abandoned_*` counters.
+  `abandoned_*` counters, minus any flush whose encode the ADR-1702 write
+  gate returned no result for: the job panicked, or the runtime cancelled it
+  while shutting down. Such a flush is a server fault rather than bad input,
+  so it counts in no `abandoned_*` counter; it is logged at ERROR and its
+  strict waiters get the retryable `ShardUnavailable` (503), the answer an
+  encode panic gave when it took the shard actor down. The actor now
+  survives, so `shard_deaths` does not move either.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
   budget or `max_flush_lifetime` elapsed while the flush's own store calls were
   in flight (`WriteError::Abandoned`). Object-store durability signal;
@@ -1696,8 +1702,11 @@ Counters recorded today:
   elapsed while it was queued for a `max_inflight_flushes` permit, before any
   store call (`WriteError::Abandoned`). Contention signal, not an
   object-store one; retryable. The abandonment deadline is re-derived from
-  permit grant, so this fires only when a flush task is scheduled after its
-  flush-open deadline already passed, never for a mere queue wait.
+  permit grant, so for the permit queue this fires only when a flush task is
+  scheduled after its flush-open deadline already passed, never for a mere
+  queue wait. It also counts a flush whose re-derived lifetime elapses before
+  its encode on the ADR-1702 write gate returns, which a gate queue longer
+  than `max_flush_lifetime` produces; that flush makes no store call.
 - `abandoned_input_rejected`: flush abandoned because the input could not be
   built into a durable object (`WriteError::SegmentBuild`). Client signal; not
   retryable. The three-way split keeps a store problem, permit contention, and
