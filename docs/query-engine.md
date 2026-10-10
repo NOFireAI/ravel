@@ -1392,7 +1392,8 @@ and it reads `0` when no read cache is configured.
 #### Memory admission wait and its refusal messages
 
 Admission checks the budget before a query takes its concurrency permit
-(ADR-1170's 2026-10-10 amendment). While the reserved total is at or above
+(ADR-1170's 2026-10-10 amendment). A query the concurrency ceiling would
+refuse is refused at once, before any wait. While the reserved total is at or above
 `--query-memory-admission-fraction` (default `0.75`, `0` disables) times the
 ceiling, the query waits, re-reading the counter every 10 ms, and is admitted
 once the total drops below that threshold; the time waited is taken from its

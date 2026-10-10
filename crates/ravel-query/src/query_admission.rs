@@ -246,10 +246,18 @@ impl QueryAdmissionController {
     /// admission wait, then [`Self::try_admit`]. On success returns the permit
     /// and the deadline that remains after the wait, which the caller runs the
     /// statement under so the wait counts against the same deadline.
+    ///
+    /// A statement the concurrency ceiling would refuse is refused at once,
+    /// before the wait: parking it for memory it could not use only holds its
+    /// connection until the deadline. The slot itself is still taken after the
+    /// wait, so a waiter holds no slot.
     pub async fn admit_within(
         self: &Arc<Self>,
         deadline: Duration,
     ) -> Result<Admitted, AdmissionRefused> {
+        if self.at_ceiling() {
+            return Err(AdmissionRefused::Concurrency);
+        }
         let waited = self.memory_gate.wait_for_headroom(deadline).await?;
         let permit = self
             .try_admit()
@@ -300,6 +308,15 @@ impl QueryAdmissionController {
         Ok(QueryPermit {
             controller: Arc::clone(self),
         })
+    }
+
+    /// Whether [`Self::try_admit`] would refuse now, without taking a slot.
+    fn at_ceiling(&self) -> bool {
+        let state = lock(&self.state);
+        match self.limit {
+            QueryConcurrencyLimit::Unlimited => false,
+            QueryConcurrencyLimit::Bounded(_) => state.in_flight >= state.fleet_threshold,
+        }
     }
 
     /// Release one held slot. Called only by [`QueryPermit`]'s [`Drop`]; not a
@@ -982,5 +999,41 @@ mod tests {
         assert_eq!(gate.waits_total(), 1);
         assert_eq!(gate.wait_refusals_total(), 1);
         assert_eq!(controller.in_flight(), 0);
+    }
+
+    /// A statement the full concurrency ceiling would refuse is refused at
+    /// once, even while the memory budget sits above the threshold, and never
+    /// waits.
+    ///
+    /// FLIP: drop the `at_ceiling` check from `admit_within`. The call then
+    /// waits out its 60 s deadline (the timeout below fires) and the gate
+    /// counts a wait.
+    #[tokio::test]
+    async fn a_full_ceiling_refuses_before_the_memory_wait() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        let _held = budget.reserve(900).expect("fits");
+        let gate = Arc::new(
+            MemoryAdmissionGate::new(Arc::clone(&budget), 0.75)
+                .with_poll_interval(Duration::from_millis(1)),
+        );
+        let controller = Arc::new(
+            QueryAdmissionController::new(QueryConcurrencyLimit::Bounded(1))
+                .with_memory_gate(Arc::clone(&gate)),
+        );
+        let _slot = controller.try_admit().expect("the first slot is free");
+        // hygiene-allow: wall-clock -- a bound on a call that must return at once; the assertion is on its result
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            controller.admit_within(Duration::from_secs(60)),
+        )
+        .await
+        .expect("a full ceiling refuses without waiting");
+        let Err(refused) = result else {
+            panic!("admission must refuse at a full ceiling");
+        };
+        assert_eq!(refused, AdmissionRefused::Concurrency);
+        assert_eq!(gate.waits_total(), 0);
+        assert_eq!(gate.wait_refusals_total(), 0);
+        assert_eq!(controller.in_flight(), 1);
     }
 }

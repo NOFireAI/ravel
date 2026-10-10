@@ -39,6 +39,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use prost::Message;
 use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
+use ravel_query::http::service::MSG_CONCURRENCY;
 use ravel_query::{QueryAdmissionController, QueryPermit};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
@@ -345,9 +346,10 @@ impl RavelFlightSqlService {
         // memory headroom: its coordinator already holds a permit and
         // reservations, and a fast refusal is what lets the coordinator fall
         // back to another worker or a local read within its deadline.
-        let permit = self.query_admission.try_admit().map_err(|_| {
-            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
-        })?;
+        let permit = self
+            .query_admission
+            .try_admit()
+            .map_err(|_| Status::resource_exhausted(MSG_CONCURRENCY))?;
         let span = tracing::info_span!(
             "flight_sql_slice_fragment",
             tenant_hash = %tenant.to_hex(),
@@ -692,8 +694,17 @@ impl FlightSqlService for RavelFlightSqlService {
         // `GetFlightInfo`. That is admission back-pressure, not a ticket problem:
         // the minted ticket stays valid and redeemable later within its deadline,
         // so the client should simply retry the DoGet. This rejection is emitted
-        // before any store work, mirroring `get_flight_info_statement`.
-        let permit = self.admit(self.ticket_budget(decoded.deadline_ns)).await?;
+        // before any store work, mirroring `get_flight_info_statement`. An
+        // expired ticket skips the memory wait, so the stream refuses it as
+        // invalidated rather than as a retryable memory refusal.
+        let budget = self.ticket_budget(decoded.deadline_ns);
+        let permit = if budget.is_zero() {
+            self.query_admission
+                .try_admit()
+                .map_err(|_| Status::resource_exhausted(MSG_CONCURRENCY))?
+        } else {
+            self.admit(budget).await?
+        };
 
         // The statement now reaches execution against its pinned snapshot for a
         // resolved tenant, so it is auditable (ADR-0042 decision 4, ADR-0062

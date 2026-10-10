@@ -1170,7 +1170,11 @@ prerequisite for subtracting it, and it is not done here.
 
 **Admission waits for headroom instead of refusing at once.** Before a
 query takes its concurrency permit, `QueryAdmissionController::admit_within`
-checks the process budget. While `reserved >= fraction * limit` it re-reads
+checks the process budget. A query the concurrency ceiling would refuse is
+refused first, at once, without waiting: parking it for memory it could not
+use would only hold its connection until its deadline. The permit is taken
+after the wait rather than before it, so a waiter never occupies a slot a
+running query could use. While `reserved >= fraction * limit` it re-reads
 the counter every 10 ms. It admits once `reserved` falls below the
 threshold, and refuses with the existing admission class (HTTP 503
 `unavailable` for PromQL, metadata and SQL; gRPC `RESOURCE_EXHAUSTED` for
