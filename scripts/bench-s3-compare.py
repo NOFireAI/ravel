@@ -5,12 +5,17 @@ Usage:
   scripts/bench-s3-compare.py --envelope bench/baselines/s3-envelope.json \\
       --report bench/reports/report-s3.json [--enforce]
 
-Band reasoning: the five runs the envelope summarises disagree by about 40
-percent on latency at the same load point because the hosted runner is shared,
-so a latency figure warns only past the envelope max plus 25 percent. Request
-and byte counts are not timings and carry no runner noise of that kind, so
-they warn past the max plus 10 percent, and PUTs, accepted points and matched
-series, identical across every run, must equal the envelope exactly.
+Band reasoning: the five runs the envelope summarises were taken at the same
+load point on a shared hosted runner, and their latency figures disagree. As
+how far the envelope max sits above its min: strict-ack p50 by 40 percent,
+strict-ack p99 by 29 percent, warm p50 by 39 percent and cold p50 by 53
+percent. A latency figure therefore warns only past the envelope max plus 25
+percent. Request and byte counts are not timings, but they move between runs
+too: GET spans 47,205 to 78,279, by 66 percent, stepping up between the
+2026-09-21 and 2026-09-28 runs (one of the envelope's unexplained items), and
+bytes read by 10 percent. They warn past the max plus 10 percent. PUTs,
+accepted points and matched series, identical across every run, must equal the
+envelope exactly.
 
 This is a separate script from bench-compare.py, not a mode of it: that tool
 compares criterion point estimates with one symmetric threshold, while this one

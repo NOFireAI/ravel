@@ -50,9 +50,11 @@ the numbers.
 Each baseline file carries a `_meta.label` naming the environment it was
 recorded on. A criterion timing number only means something relative to a
 baseline taken on the same hardware under the same load. This repository has
-no self-hosted reference runner and will not get one, so a timing baseline is
+no self-hosted reference runner and will not get one, so a tier B baseline is
 recorded on a fresh EC2 instance launched for the run and terminated after it,
-every time, and never on a shared or long-lived box.
+not on a shared or long-lived box. The real-S3 envelope below is a different
+kind of baseline: a range over runs of the `bench-s3` lane on a shared hosted
+runner, comparable only to runs of that same lane.
 
 A hand-recorded baseline is only usable for a comparison once five things are
 stamped into it, in the `_meta.label` text or a `_meta` field:
@@ -115,7 +117,7 @@ scripts/bench/fresh-box.sh --dry-run \
   --instance-type c7i.2xlarge --ami ami-... --subnet subnet-... \
   --security-group sg-... --region eu-central-1 \
   --access ssh --key-name KEY --identity-file ~/.ssh/KEY.pem --ssh-user ubuntu \
-  --volume-gb 120 --repo-url https://github.com/OWNER/ravel.git \
+  --volume-gb 120 --max-minutes 180 --repo-url https://github.com/OWNER/ravel.git \
   --commit <40-character sha> --out bench/baselines/tier-b.json \
   --sample-size 10 --warmup 1 --measure 3 --max-series 2000
 ```
@@ -127,15 +129,32 @@ bench generates its own input), the four knobs, and "No flush cadence:
 store-independent". Use the knob values the `bench-compare` workflow pins, or
 move its pins with the new baseline.
 
-An EXIT trap terminates the instance by id on every exit path, including a
-failure mid-run, and then polls until the instance reports `shutting-down` or
-`terminated`. When it cannot confirm that, it prints
-`COULD NOT CONFIRM TERMINATION of instance <id>` and exits 70: terminate that
-instance by hand. The instance is also launched with
-`--instance-initiated-shutdown-behavior terminate`.
+Each run generates one run id and prints it before launching. It is the
+`run-instances` `--client-token`, which EC2 uses to treat a retried launch
+call as the same launch rather than a second one, and the value of the instance tag
+`ravel-fresh-box-run`. An EXIT trap terminates the id `run-instances` returned
+together with every instance under that tag that is not terminated, which
+finds the instance when the launch call failed after AWS accepted it or
+printed no usable id, and then polls until each reports `shutting-down` or
+`terminated`. When it cannot confirm that, or has no id and the tag lookup
+fails, it prints `COULD NOT CONFIRM TERMINATION` with the ids or the run tag
+and exits 70: terminate that instance by hand.
+
+The trap cannot run when the launcher is killed with SIGKILL or the operator's
+machine goes away. For that the instance's user-data runs
+`shutdown -h +MAX_MINUTES` at boot, and the instance is launched with
+`--instance-initiated-shutdown-behavior terminate`, so it terminates itself
+`--max-minutes` after boot. That input is required: pick a value that covers
+the cold build and the bench run, since the instance ends at that point
+whether or not the run finished. It relies on the AMI's cloud-init running
+user-data scripts.
+
+The script avoids bash 4 features so that it runs under bash 3.2, the
+`/bin/bash` of macOS.
 
 The cases are in `scripts/bench/fresh-box.test.sh`, run with stub `aws`, `ssh`
-and `scp` commands in CI's doc-scripts job.
+and `scp` commands in CI's doc-scripts job. `FRESH_BOX_TEST_BASH=/bin/bash`
+runs every case under that bash instead of the first `bash` on `PATH`.
 
 ## The real-S3 envelope
 

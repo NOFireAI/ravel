@@ -341,5 +341,69 @@ class GuideQuotesTheEnvelope(unittest.TestCase):
         self.assertIn(f"up to {spread} percent on strict-ack p50", " ".join(section.split()))
 
 
+def _spread_pct(env, name):
+    """How far the envelope max sits above its min, in whole percent."""
+    band = env[name]
+    return round((band["max"] / band["min"] - 1.0) * 100)
+
+
+class PercentagesQuoteTheEnvelope(unittest.TestCase):
+    """Every percentage the compare tool's docstring and the baselines README
+    state is either a band constant or a spread computed here from the
+    committed envelope."""
+
+    # Docstring phrase -> envelope figure whose spread it quotes.
+    DOCSTRING_SPREADS = (
+        ("strict-ack p50 by {} percent", "ingest.strict_ack_latency_ms.p50"),
+        ("strict-ack p99 by {} percent", "ingest.strict_ack_latency_ms.p99"),
+        ("warm p50 by {} percent", "query.warm_latency_ms.p50"),
+        ("cold p50 by {} percent", "query.cold_latency_ms.p50"),
+        ("by {} percent, stepping up", "s3_requests.get"),
+        ("bytes read by {} percent", "bytes.read"),
+    )
+
+    @staticmethod
+    def _bands():
+        return [f"plus {pct:g} percent" for pct in
+                (bench_s3_compare.LATENCY_BAND_PCT, bench_s3_compare.COUNT_BAND_PCT)]
+
+    def _assert_only_known_percentages(self, flat, known):
+        stated = re.findall(r"\S+ \d+ percent", flat)
+        self.assertTrue(stated)
+        for phrase in stated:
+            self.assertTrue(any(phrase in k for k in known), phrase)
+
+    def test_docstring_spreads_are_computed_from_the_envelope(self):
+        env = _envelope_doc()["envelope"]
+        flat = " ".join(bench_s3_compare.__doc__.split())
+        known = list(self._bands())
+        for template, name in self.DOCSTRING_SPREADS:
+            phrase = template.format(_spread_pct(env, name))
+            self.assertIn(phrase, flat, name)
+            known.append(phrase)
+        get = env["s3_requests.get"]
+        self.assertIn(f"GET spans {get['min']:,} to {get['max']:,}", flat)
+        self._assert_only_known_percentages(flat, known)
+
+    def test_docstring_step_dates_are_where_get_steps(self):
+        doc = _envelope_doc()
+        flat = " ".join(bench_s3_compare.__doc__.split())
+        runs = doc["runs"]
+        jumps = [(runs[i + 1]["s3_requests"]["get"] - runs[i]["s3_requests"]["get"], i)
+                 for i in range(len(runs) - 1)]
+        _, i = max(jumps)
+        self.assertIn(f"between the {runs[i]['scheduled']} and {runs[i + 1]['scheduled']} runs",
+                      flat)
+
+    def test_readme_percentages_are_the_band_constants(self):
+        with open(os.path.join(_ROOT, "bench", "baselines", "README.md"),
+                  encoding="utf-8") as fh:
+            flat = " ".join(fh.read().split())
+        bands = list(self._bands())
+        for band in bands:
+            self.assertIn(band, flat)
+        self._assert_only_known_percentages(flat, bands)
+
+
 if __name__ == "__main__":
     unittest.main()
