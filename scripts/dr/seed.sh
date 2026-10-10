@@ -244,7 +244,9 @@ mapfile -d '' -t SERVER_ARGV < <(dr_ravel_server_argv \
   --listen-http "${DR_HTTP_ADDR}" \
   --listen-grpc "${DR_GRPC_ADDR}" \
   --tenant-token-file "${TOKEN_FILE}")
-RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" "${SERVER_ARGV[@]}" >"${SEED_LOG}" 2>&1 &
+# The query audit is opt-in since #2791; the drill turns it on so the audit
+# key it carries as a custody item is the one the restored records need.
+RAVEL_AUDIT_MODE=required RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" "${SERVER_ARGV[@]}" >"${SEED_LOG}" 2>&1 &
 SERVER_PID=$!
 
 server_ready() {

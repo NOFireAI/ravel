@@ -135,10 +135,20 @@ async fn publish_segment_for(
         .expect("publish");
 }
 
+/// The `--audit-mode required` pipeline config with the default batch and age.
+/// The query audit is off by default (ADR-0062 opt-in amendment), so every
+/// start here that expects a record names its mode rather than inheriting one.
+fn required() -> Option<ravel_maintain::AuditPipelineConfig> {
+    Some(ravel_maintain::AuditPipelineConfig {
+        audit_mode: ravel_maintain::AuditMode::Required,
+        ..Default::default()
+    })
+}
+
 fn server_config(
     tokens: HashMap<String, TenantId>,
     mode: Mode,
-    audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
     fold_tenants: Vec<TenantHash>,
     audit_text: ravel_maintain::AuditTextPolicy,
 ) -> ServerConfig {
@@ -204,11 +214,12 @@ fn server_config(
 
 /// Starts a real server (the binary's own `ravel_server::start` path) over
 /// `store`, in `mode`, with `audit_pipeline` as its resolved
-/// `--audit-mode`/`--audit-max-batch`/`--audit-max-age` config.
+/// `--audit-mode`/`--audit-max-batch`/`--audit-max-age` config (`None` is
+/// `--audit-mode off`).
 async fn start_server(
     store: Arc<dyn ObjectStoreBackend>,
     mode: Mode,
-    audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
 ) -> ravel_server::Running {
     start_server_with(
         store,
@@ -252,7 +263,7 @@ fn plaintext_text_policy() -> ravel_maintain::AuditTextPolicy {
 async fn start_server_with(
     store: Arc<dyn ObjectStoreBackend>,
     mode: Mode,
-    audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
     token_pairs: &[(&str, &str)],
     fold_tenants: Vec<TenantHash>,
     audit_text: ravel_maintain::AuditTextPolicy,
@@ -379,7 +390,7 @@ fn attr<'a>(row: &'a LogRecord, key: &str) -> Option<&'a str> {
 async fn sql_query_writes_one_query_audit_record() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
-    let running = start_server(store.clone(), Mode::All, Default::default()).await;
+    let running = start_server(store.clone(), Mode::All, required()).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -421,7 +432,7 @@ async fn sql_query_writes_one_query_audit_record() {
 async fn promql_query_writes_one_query_audit_record() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
-    let running = start_server(store.clone(), Mode::All, Default::default()).await;
+    let running = start_server(store.clone(), Mode::All, required()).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -453,7 +464,7 @@ async fn promql_query_writes_one_query_audit_record() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// `audit_mode=required` (the default): faulting every PUT into the audit
+/// `audit_mode=required`: faulting every PUT into the audit
 /// keyspace fails the query closed with 503, after usage was already
 /// recorded (T2a order) -- the query does not outlive its trail.
 #[tokio::test]
@@ -469,7 +480,7 @@ async fn required_mode_fails_closed_on_audit_write_fault() {
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
     // Metric segments live under "/m/", so setup is unaffected by the fault.
     publish_segment(backend.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
-    let running = start_server(backend.clone(), Mode::All, Default::default()).await;
+    let running = start_server(backend.clone(), Mode::All, required()).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -570,7 +581,7 @@ async fn best_effort_mode_serves_the_response_and_counts_the_failure() {
         audit_mode: ravel_maintain::AuditMode::BestEffort,
         ..Default::default()
     };
-    let running = start_server(backend.clone(), Mode::All, audit_pipeline).await;
+    let running = start_server(backend.clone(), Mode::All, Some(audit_pipeline)).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -638,7 +649,7 @@ async fn a_retried_audit_put_is_counted_on_metrics_and_the_query_still_succeeds(
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
     // Metric segments live under "/m/", so setup is unaffected by the fault.
     publish_segment(backend.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
-    let running = start_server(backend.clone(), Mode::All, Default::default()).await;
+    let running = start_server(backend.clone(), Mode::All, required()).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -698,8 +709,9 @@ async fn a_retried_audit_put_is_counted_on_metrics_and_the_query_still_succeeds(
 
 /// `Mode::Query` installs a pipeline and a real query route through it writes
 /// a record; `Mode::Maintain` and `Mode::Gateway` serve no query surface, so
-/// `start` installs no `AuditPipeline` for them and a request either mode does
-/// serve writes no object into the query-audit shard.
+/// `start` installs no `AuditPipeline` for them, even under
+/// `--audit-mode required`, and a request either mode does serve writes no
+/// object into the query-audit shard.
 ///
 /// Both directions are here on purpose. The negative cases alone pass on a
 /// process that installs a pipeline nowhere, which is exactly the regression
@@ -708,7 +720,7 @@ async fn a_retried_audit_put_is_counted_on_metrics_and_the_query_still_succeeds(
 async fn query_mode_installs_a_pipeline_and_maintain_and_gateway_do_not() {
     for mode in [Mode::Maintain, Mode::Gateway] {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let running = start_server(store.clone(), mode, Default::default()).await;
+        let running = start_server(store.clone(), mode, required()).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -766,7 +778,7 @@ async fn query_mode_installs_a_pipeline_and_maintain_and_gateway_do_not() {
     // route through its public listener writes a record through it.
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
-    let running = start_server(store.clone(), Mode::Query, Default::default()).await;
+    let running = start_server(store.clone(), Mode::Query, required()).await;
     assert!(
         running.has_audit_pipeline(),
         "Mode::Query serves query surfaces, so it must install a pipeline"
@@ -788,6 +800,212 @@ async fn query_mode_installs_a_pipeline_and_maintain_and_gateway_do_not() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// A `tracing` writer that appends every emitted byte to a shared buffer, so a
+/// test can read the startup line `start` logs.
+#[cfg(feature = "sql")]
+#[derive(Clone)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(feature = "sql")]
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Starts a `Mode::All` server with `audit_pipeline` and `audit_text`, runs one
+/// SQL and one PromQL request (each must return 200), and returns the startup
+/// log, whether a pipeline was installed, the number of commit keys on the
+/// query-audit shard, and the `kind=query` records read back.
+#[cfg(feature = "sql")]
+async fn one_sql_and_one_promql_request(
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
+    audit_text: ravel_maintain::AuditTextPolicy,
+) -> (String, bool, usize, Vec<LogRecord>) {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+
+    // While exactly one dispatcher is registered, tracing caches a callsite's
+    // interest from the registering thread's own default, so a parallel test's
+    // thread with no subscriber caches "never" for the line read here. A second
+    // dispatcher kept alive for the process keeps interest computed across all.
+    static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+        std::sync::OnceLock::new();
+    KEEP_TWO_DISPATCHERS
+        .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(CapturedLog(buffer.clone()))
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let running = start_server_with(
+        store.clone(),
+        Mode::All,
+        audit_pipeline,
+        &[(TOKEN, TENANT)],
+        vec![TenantId::new(TENANT).hash()],
+        audit_text,
+    )
+    .await;
+    drop(guard);
+    let log = String::from_utf8(buffer.lock().expect("log buffer lock").clone())
+        .expect("log bytes are utf-8");
+
+    let installed = running.has_audit_pipeline();
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+    let (sql_status, _) = run_sql(
+        &client,
+        &base,
+        TOKEN,
+        "SELECT ts, value FROM samples ORDER BY ts",
+        0,
+        NOW_S,
+    )
+    .await;
+    assert_eq!(sql_status, 200, "the sql request must succeed");
+    let promql_status = client
+        .get(format!("{base}/api/v1/query_range"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", "m".to_string()),
+            ("start", "0".to_string()),
+            ("end", NOW_S.to_string()),
+            ("step", "60s".to_string()),
+        ])
+        .send()
+        .await
+        .expect("query_range request sent")
+        .status();
+    assert_eq!(promql_status, 200, "the promql request must succeed");
+
+    let tenant = TenantId::new(TENANT);
+    let prefix = keys::commit_shard_prefix(&tenant.hash(), Signal::Audit, QUERY_AUDIT_SHARD)
+        .expect("audit commit prefix");
+    let commit_keys = list_all(store.as_ref(), &prefix)
+        .await
+        .expect("list audit commits")
+        .len();
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    running.shutdown().await.expect("graceful shutdown");
+    (log, installed, commit_keys, records)
+}
+
+/// The query audit is opt-in (ADR-0062 opt-in amendment): a server started
+/// from the default arguments, with no `RAVEL_AUDIT_TOKEN_KEY` and the default
+/// `redacted` text posture, starts, installs no pipeline, serves SQL and
+/// PromQL, and writes nothing into the query-audit shard. The same requests
+/// under `--audit-mode required` write exactly one record each, so the zero
+/// is the mode's doing and not a request that never reached the sink.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn audit_off_by_default_installs_no_pipeline_and_writes_no_record() {
+    let cli = ravel_server::config::Cli::parse_validated_from(["ravel-server"])
+        .expect("the default arguments parse");
+    assert_eq!(cli.mode, Mode::All);
+    assert_eq!(
+        cli.audit_text,
+        ravel_server::config::AuditTextArg::Redacted,
+        "the default text posture is redacted, the one that needs a key"
+    );
+    let audit_pipeline = cli
+        .resolve_audit_pipeline_config()
+        .expect("the default audit config resolves");
+    let audit_text = ravel_server::config::resolve_audit_text_policy_for_mode(
+        cli.mode,
+        cli.audit_mode,
+        cli.audit_text,
+        None,
+        None,
+    )
+    .expect("with the audit off, no token key is needed to start");
+
+    let (log, installed, commit_keys, records) =
+        one_sql_and_one_promql_request(audit_pipeline, audit_text).await;
+    assert!(
+        log.contains("query audit resolved") && log.contains("audit_mode=\"off\""),
+        "the startup log must stamp the audit mode as off: {log}"
+    );
+    assert!(!installed, "the default must install no audit pipeline");
+    assert_eq!(
+        commit_keys, 0,
+        "the default must write no object into the query-audit shard"
+    );
+    assert!(records.is_empty());
+
+    let (log, installed, commit_keys, records) =
+        one_sql_and_one_promql_request(required(), redacted_text_policy()).await;
+    assert!(
+        log.contains("query audit resolved") && log.contains("audit_mode=\"required\""),
+        "the startup log must stamp the audit mode as required: {log}"
+    );
+    assert!(installed, "--audit-mode required installs the pipeline");
+    assert_eq!(
+        commit_keys, 2,
+        "one audit commit per request under --audit-mode required"
+    );
+    let mut languages: Vec<&str> = records
+        .iter()
+        .map(|row| attr(row, "query.language").expect("query.language attr"))
+        .collect();
+    languages.sort_unstable();
+    assert_eq!(
+        languages,
+        vec!["promql", "sql"],
+        "exactly one record per request under --audit-mode required"
+    );
+}
+
+/// `/metrics` renders the `ravel_audit_*` families exactly when a pipeline runs:
+/// present under `--audit-mode required`, absent under the default `off`,
+/// where reporting a zero would claim a subsystem the process never ran.
+#[tokio::test]
+async fn metrics_render_the_audit_family_only_when_the_audit_is_enabled() {
+    for (audit_pipeline, expect_family) in [(required(), true), (None, false)] {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let running = start_server(store, Mode::All, audit_pipeline).await;
+        let metrics = reqwest::Client::new()
+            .get(format!("http://{}/metrics", running.http_addr))
+            .send()
+            .await
+            .expect("metrics request sent")
+            .text()
+            .await
+            .expect("metrics body readable");
+        for family in [
+            "ravel_audit_write_failures_total",
+            "ravel_audit_put_retries_total",
+        ] {
+            assert_eq!(
+                metrics.contains(family),
+                expect_family,
+                "{family} presence must follow the audit mode \
+                 (expected present: {expect_family})"
+            );
+        }
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
 /// The shared body of the two per-tenant routing tests: two tenants each run
 /// one SQL statement through one real server, and each reads its own
 /// query-audit trail back and only its own.
@@ -804,7 +1022,7 @@ async fn two_tenants_each_read_only_their_own_audit(fold_tenants: Vec<TenantHash
     let running = start_server_with(
         store.clone(),
         Mode::All,
-        Default::default(),
+        required(),
         &[(TOKEN, TENANT), (TOKEN_B, TENANT_B)],
         fold_tenants,
         Default::default(),
@@ -928,7 +1146,7 @@ async fn start_server_text(
     start_server_with(
         store,
         Mode::All,
-        Default::default(),
+        required(),
         &[(TOKEN, TENANT)],
         vec![TenantId::new(TENANT).hash()],
         audit_text,
@@ -1046,7 +1264,7 @@ async fn start_server_with_mtls(store: Arc<dyn ObjectStoreBackend>) -> ravel_ser
     let mut config = server_config(
         tokens,
         Mode::All,
-        Default::default(),
+        required(),
         vec![TenantId::new(TENANT).hash()],
         Default::default(),
     );
@@ -1362,13 +1580,13 @@ async fn shutdown_drain_is_bounded_when_the_store_never_answers() {
     });
     publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
 
-    let running = start_server(store.clone(), Mode::All, Default::default()).await;
+    let running = start_server(store.clone(), Mode::All, required()).await;
     let service = running
         .query_service
         .clone()
         .expect("Mode::All builds the query service");
 
-    // Through the in-process service rather than an HTTP route: in the default
+    // Through the in-process service rather than an HTTP route: in the
     // `Required` mode the query awaits its audit flush, which never completes
     // here, and an in-flight HTTP connection would hold the listener join in
     // `shutdown` before the drain is ever reached.

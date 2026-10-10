@@ -1095,13 +1095,16 @@ async fn audit_drain_is_bounded_by_the_overall_shutdown_timeout() {
 
     let running = start_server_configured(store.clone(), Mode::All, None, |config| {
         config.shutdown_timeout = SHUTDOWN_TIMEOUT;
-        config.audit_pipeline = ravel_maintain::AuditPipelineConfig {
+        // The audit is opt-in (`--audit-mode off` resolves to `None`), so
+        // this test names the mode it drains.
+        config.audit_pipeline = Some(ravel_maintain::AuditPipelineConfig {
             // One record per batch, so the single query below reaches the
             // data-object PUT rather than waiting for a batch to fill.
             max_batch: 1,
             max_age: AUDIT_MAX_AGE,
+            audit_mode: ravel_maintain::AuditMode::Required,
             ..Default::default()
-        };
+        });
     })
     .await;
     assert!(
@@ -1113,8 +1116,8 @@ async fn audit_drain_is_bounded_by_the_overall_shutdown_timeout() {
         .clone()
         .expect("Mode::All builds the query service");
 
-    // Through the in-process service rather than an HTTP route: in the default
-    // `Required` mode the query awaits its audit flush, which never completes
+    // Through the in-process service rather than an HTTP route: in the
+    // `Required` mode set above the query awaits its audit flush, which never completes
     // here, and an in-flight HTTP connection would instead be absorbed by the
     // listener join's own sub-budget before the audit drain is reached.
     let tenant_hash = TenantId::new(TENANT).hash();

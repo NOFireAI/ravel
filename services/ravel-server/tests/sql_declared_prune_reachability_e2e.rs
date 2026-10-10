@@ -290,7 +290,7 @@ impl Fixture {
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
-        audit_pipeline: ravel_maintain::AuditPipelineConfig::default(),
+        audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,

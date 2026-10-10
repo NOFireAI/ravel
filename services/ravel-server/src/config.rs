@@ -29,12 +29,14 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Whether [`crate::start`] installs a process-wide
-    /// `ravel_maintain::AuditPipeline` for this mode (ADR-0062 decision 2b):
-    /// true only for [`Mode::All`] and [`Mode::Query`], the modes that build a
-    /// query engine. [`Mode::Gateway`] and [`Mode::Maintain`] serve no query
-    /// surface and write no query-audit record, so they never need
-    /// `--audit-text`'s policy resolved. Shared by the resolve site
+    /// Whether this mode serves queries, and so whether [`crate::start`]
+    /// installs a process-wide `ravel_maintain::AuditPipeline` for it once
+    /// `--audit-mode` enables the audit (ADR-0062 decision 2b and its opt-in
+    /// amendment; [`Cli::query_audit_enabled`]): true only for [`Mode::All`]
+    /// and [`Mode::Query`], the modes that build a query engine.
+    /// [`Mode::Gateway`] and [`Mode::Maintain`] serve no query surface and
+    /// write no query-audit record, so they never need `--audit-text`'s
+    /// policy resolved. Shared by the resolve site
     /// ([`resolve_audit_text_policy_for_mode`]) and the install site
     /// (`start` in lib.rs) so the two cannot drift apart.
     pub fn installs_query_audit_pipeline(self) -> bool {
@@ -317,15 +319,19 @@ impl Default for SqlSpillSettings {
     }
 }
 
-/// The `--audit-mode` values (ADR-0062 decision 2b). The CLI-facing mirror of
+/// The `--audit-mode` values (ADR-0062 decision 2b, opt-in amendment). `off`
+/// installs no pipeline; the other two are the CLI-facing mirror of
 /// [`ravel_maintain::AuditMode`], which lives in a crate that does not depend
 /// on clap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum AuditModeArg {
+    /// No query-audit pipeline is installed and no query-audit record is
+    /// written. No audit token key is needed.
+    #[default]
+    Off,
     /// A failed audit-batch flush fails every query in the batch (HTTP 503,
     /// Flight `Unavailable`): during an object-store outage queries fail
     /// closed instead of running unaudited.
-    #[default]
     Required,
     /// A failed audit-batch flush is logged and counted
     /// (`ravel_audit_write_failures_total`); the query response proceeds.
@@ -335,11 +341,13 @@ pub enum AuditModeArg {
 }
 
 impl AuditModeArg {
-    /// The library-level mode this flag value selects.
-    pub fn mode(self) -> ravel_maintain::AuditMode {
+    /// The library-level pipeline posture this flag value selects, or `None`
+    /// under [`AuditModeArg::Off`], which spawns no pipeline at all.
+    pub fn mode(self) -> Option<ravel_maintain::AuditMode> {
         match self {
-            AuditModeArg::Required => ravel_maintain::AuditMode::Required,
-            AuditModeArg::BestEffort => ravel_maintain::AuditMode::BestEffort,
+            AuditModeArg::Off => None,
+            AuditModeArg::Required => Some(ravel_maintain::AuditMode::Required),
+            AuditModeArg::BestEffort => Some(ravel_maintain::AuditMode::BestEffort),
         }
     }
 }
@@ -488,22 +496,26 @@ pub fn resolve_audit_text_policy(
     ))
 }
 
-/// [`resolve_audit_text_policy`], gated to the modes that actually install
-/// the query-audit pipeline ([`Mode::installs_query_audit_pipeline`]).
+/// [`resolve_audit_text_policy`], gated to processes that actually install
+/// the query-audit pipeline: a query-serving mode
+/// ([`Mode::installs_query_audit_pipeline`]) with `--audit-mode` other than
+/// `off`.
 ///
-/// `gateway` and `maintain` write no query-audit record, so resolving the
-/// policy for them must not fail startup for a key those modes never read: a
-/// `redacted`-posture gateway or maintain process on a bucket with no
-/// deployment key would otherwise refuse to start over a subsystem it does
-/// not run. Those modes get [`ravel_maintain::AuditTextPolicy::default()`]
-/// (`Plaintext`), which is never installed anywhere and is inert.
+/// `gateway` and `maintain` write no query-audit record, and neither does any
+/// mode under `--audit-mode off`, so resolving the policy for them must not
+/// fail startup for a key they never read: a `redacted`-posture process on a
+/// bucket with no deployment key would otherwise refuse to start over a
+/// subsystem it does not run. Those processes get
+/// [`ravel_maintain::AuditTextPolicy::default()`] (`Plaintext`), which is
+/// never installed anywhere and is inert.
 pub fn resolve_audit_text_policy_for_mode(
     mode: Mode,
+    audit_mode: AuditModeArg,
     audit_text: AuditTextArg,
     raw_token_key: Option<&str>,
     deployment_key: Option<&[u8; 32]>,
 ) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
-    if !mode.installs_query_audit_pipeline() {
+    if !mode.installs_query_audit_pipeline() || audit_mode == AuditModeArg::Off {
         return Ok(ravel_maintain::AuditTextPolicy::default());
     }
     resolve_audit_text_policy(audit_text, raw_token_key, deployment_key)
@@ -623,16 +635,20 @@ pub struct Cli {
     #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
     pub require_bucket_protection: bool,
 
-    /// Failure posture of the query-audit pipeline (ADR-0062 decision 2b):
-    /// `required` (default) fails a query 503 when its audit record cannot be
-    /// made durable; `best-effort` logs and counts the failure and serves the
-    /// response anyway. Installed only in the query-serving modes (`all` and
+    /// Whether the query-audit pipeline runs, and its failure posture
+    /// (ADR-0062 decision 2b and its opt-in amendment): `off` (default)
+    /// installs no query-audit pipeline and writes no query-audit record;
+    /// `required` enables it and fails a query 503 when its audit record
+    /// cannot be made durable; `best-effort` enables it, logs and counts the
+    /// failure, and serves the response anyway. Under `off`, passing
+    /// `--audit-text`, `--audit-max-batch` or `--audit-max-age` is refused.
+    /// The pipeline is installed only in the query-serving modes (`all` and
     /// `query`); `maintain` and `gateway` serve no query surface and install
-    /// no pipeline.
+    /// none whatever this says.
     #[arg(
         long = "audit-mode",
         value_enum,
-        default_value = "required",
+        default_value = "off",
         env = "RAVEL_AUDIT_MODE"
     )]
     pub audit_mode: AuditModeArg,
@@ -642,8 +658,8 @@ pub struct Cli {
     /// value under the key in RAVEL_AUDIT_TOKEN_KEY, or one derived from the
     /// deployment key, and refuses to start with neither; `plaintext` is an
     /// explicit opt-in to storing verbatim text. Resolved only in the
-    /// query-serving modes (`all` and `query`); `maintain` and `gateway`
-    /// serve no query surface and never read the key.
+    /// query-serving modes (`all` and `query`) with `--audit-mode` set to
+    /// `required` or `best-effort`; otherwise the key is never read.
     #[arg(
         long = "audit-text",
         value_enum,
@@ -5152,6 +5168,11 @@ impl Cli {
     /// [`Mode::Maintain`] and [`Mode::Gateway`] serve no query, so classify
     /// nothing.
     ///
+    /// Under `--audit-mode off` it refuses `--audit-text`, `--audit-max-batch`
+    /// and `--audit-max-age` (ADR-0062 opt-in amendment): each configures a
+    /// pipeline that is not installed, so an operator who tuned the audit
+    /// without naming the mode learns here that the default is `off`.
+    ///
     /// The error is a [`clap::Error`] rather than an [`anyhow::Error`] so the
     /// binary reports it exactly as it reports an unknown flag, and so `--help`
     /// keeps going to stdout at exit 0 through the same path.
@@ -5193,6 +5214,25 @@ impl Cli {
                      fold lag against (ADR-1306 decision 6), and {why}"
                 ),
             ));
+        }
+        if !cli.query_audit_enabled() {
+            for (id, flag) in [
+                ("audit_text", "--audit-text"),
+                ("audit_max_batch", "--audit-max-batch"),
+                ("audit_max_age", "--audit-max-age"),
+            ] {
+                if passed(id) {
+                    return Err(Self::command().error(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        format!(
+                            "{flag} configures the query-audit pipeline, which --audit-mode off \
+                             (the default) never installs (ADR-0062 opt-in amendment). Pass \
+                             --audit-mode required (or best-effort) to enable the audit, or \
+                             drop the flag."
+                        ),
+                    ));
+                }
+            }
         }
         if !cli.mode.runs_scheduled_fold() {
             for (id, flag) in [
@@ -5719,8 +5759,17 @@ impl Cli {
         }
     }
 
+    /// Whether this process's `--audit-mode` enables the query audit:
+    /// anything but `off`. Separate from [`Mode::installs_query_audit_pipeline`],
+    /// which says whether the mode serves queries at all; `start` spawns a
+    /// pipeline only when both hold.
+    pub fn query_audit_enabled(&self) -> bool {
+        self.audit_mode != AuditModeArg::Off
+    }
+
     /// Resolve `--audit-mode`, `--audit-max-batch`, and `--audit-max-age` into
-    /// a pipeline config (ADR-0062 decision 2b). `--audit-max-batch`/
+    /// a pipeline config (ADR-0062 decision 2b), or `None` under
+    /// `--audit-mode off`, which spawns no pipeline. `--audit-max-batch`/
     /// `--audit-max-age` unset fall back to the pipeline's own compiled-in
     /// defaults, exactly as omitting `--store-probe-interval` does; a zero of
     /// either is rejected the same way (a zero batch size or age would flush
@@ -5730,7 +5779,10 @@ impl Cli {
     /// separately by [`Cli::resolve_audit_text_policy`].
     pub fn resolve_audit_pipeline_config(
         &self,
-    ) -> anyhow::Result<ravel_maintain::AuditPipelineConfig> {
+    ) -> anyhow::Result<Option<ravel_maintain::AuditPipelineConfig>> {
+        let Some(audit_mode) = self.audit_mode.mode() else {
+            return Ok(None);
+        };
         let max_batch = match self.audit_max_batch {
             None => ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH,
             Some(0) => anyhow::bail!(
@@ -5755,21 +5807,22 @@ impl Cli {
                 dur
             }
         };
-        Ok(ravel_maintain::AuditPipelineConfig {
+        Ok(Some(ravel_maintain::AuditPipelineConfig {
             max_batch,
             max_age,
-            audit_mode: self.audit_mode.mode(),
+            audit_mode,
             ..ravel_maintain::AuditPipelineConfig::default()
-        })
+        }))
     }
 
     /// Resolve `--audit-text` into the policy [`crate::start`] installs
     /// (ADR-0062 decision 2e), reading the token key from
     /// [`AUDIT_TOKEN_KEY_ENV`] and falling back to a key derived from
     /// `deployment_key`. Fails startup under `redacted` when neither is
-    /// available and `self.mode` installs the pipeline; see
-    /// [`resolve_audit_text_policy_for_mode`], which holds the mode gate and
-    /// the logic and takes every input explicitly.
+    /// available and this process installs the pipeline (a query-serving
+    /// `self.mode` and `--audit-mode` not `off`); see
+    /// [`resolve_audit_text_policy_for_mode`], which holds that gate and the
+    /// logic and takes every input explicitly.
     pub fn resolve_audit_text_policy(
         &self,
         deployment_key: Option<&[u8; 32]>,
@@ -5777,6 +5830,7 @@ impl Cli {
         let raw = std::env::var(AUDIT_TOKEN_KEY_ENV).ok();
         resolve_audit_text_policy_for_mode(
             self.mode,
+            self.audit_mode,
             self.audit_text,
             raw.as_deref(),
             deployment_key,
@@ -9467,7 +9521,7 @@ mod tests {
     /// commit (ADR-0062 decision 2b); both must be rejected at startup.
     #[test]
     fn zero_audit_batch_or_age_is_rejected() {
-        let batch_err = cli(&["--audit-max-batch", "0"])
+        let batch_err = cli(&["--audit-mode", "required", "--audit-max-batch", "0"])
             .resolve_audit_pipeline_config()
             .expect_err("--audit-max-batch 0 must be rejected");
         assert!(
@@ -9475,7 +9529,7 @@ mod tests {
             "expected an --audit-max-batch error, got: {batch_err}"
         );
 
-        let age_err = cli(&["--audit-max-age", "0s"])
+        let age_err = cli(&["--audit-mode", "required", "--audit-max-age", "0s"])
             .resolve_audit_pipeline_config()
             .expect_err("--audit-max-age 0s must be rejected");
         assert!(
@@ -9484,28 +9538,73 @@ mod tests {
         );
     }
 
-    /// Omitting `--audit-max-batch`/`--audit-max-age` resolves to the
-    /// pipeline's own compiled-in defaults, and `--audit-mode` defaults to
-    /// `required` (fail closed), matching `AuditPipelineConfig::default()`.
+    /// The query audit is opt-in (ADR-0062 opt-in amendment): with no
+    /// `--audit-mode`, the flag reads `off` and resolves to no pipeline.
     #[test]
-    fn default_audit_pipeline_config_matches_the_pipeline_defaults() {
-        let resolved = cli(&[])
-            .resolve_audit_pipeline_config()
-            .expect("defaults must resolve");
-        let default = ravel_maintain::AuditPipelineConfig::default();
-        assert_eq!(resolved.max_batch, default.max_batch);
-        assert_eq!(resolved.max_age, default.max_age);
-        assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::Required);
+    fn default_audit_mode_is_off_and_resolves_no_pipeline() {
+        let cli = Cli::parse_validated_from(["ravel-server"]).expect("no flags parse");
+        assert_eq!(cli.audit_mode, AuditModeArg::Off);
+        assert!(!cli.query_audit_enabled());
+        assert!(
+            cli.resolve_audit_pipeline_config()
+                .expect("the default resolves")
+                .is_none(),
+            "the default --audit-mode must spawn no pipeline"
+        );
     }
 
-    /// `--audit-mode best-effort` must select `AuditMode::BestEffort`, not
-    /// silently stay on the fail-closed default.
+    /// `--audit-mode required` and `best-effort` still resolve a pipeline,
+    /// each with its own posture, and with the pipeline's compiled-in batch
+    /// and age defaults when `--audit-max-batch`/`--audit-max-age` are unset.
     #[test]
-    fn audit_mode_best_effort_flag_selects_best_effort() {
-        let resolved = cli(&["--audit-mode", "best-effort"])
-            .resolve_audit_pipeline_config()
-            .expect("best-effort must resolve");
-        assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::BestEffort);
+    fn enabled_audit_modes_resolve_a_pipeline_with_their_posture() {
+        let default = ravel_maintain::AuditPipelineConfig::default();
+        for (flag, want) in [
+            ("required", ravel_maintain::AuditMode::Required),
+            ("best-effort", ravel_maintain::AuditMode::BestEffort),
+        ] {
+            let cli = Cli::parse_validated_from(["ravel-server", "--audit-mode", flag])
+                .unwrap_or_else(|e| panic!("--audit-mode {flag} parses: {e}"));
+            assert!(cli.query_audit_enabled());
+            let resolved = cli
+                .resolve_audit_pipeline_config()
+                .unwrap_or_else(|e| panic!("--audit-mode {flag} resolves: {e}"))
+                .unwrap_or_else(|| panic!("--audit-mode {flag} must spawn a pipeline"));
+            assert_eq!(resolved.audit_mode, want, "--audit-mode {flag}");
+            assert_eq!(resolved.max_batch, default.max_batch);
+            assert_eq!(resolved.max_age, default.max_age);
+        }
+    }
+
+    /// Under `--audit-mode off`, an explicitly passed audit tuning flag is
+    /// refused rather than silently ignored, and the message names the fix.
+    /// The same flags are accepted once the audit is enabled.
+    #[test]
+    fn audit_tuning_flags_are_refused_under_audit_mode_off() {
+        let cases: [&[&str]; 3] = [
+            &["--audit-max-batch", "8"],
+            &["--audit-max-age", "50ms"],
+            &["--audit-text", "plaintext"],
+        ];
+        for tuning in cases {
+            for mode in [&[][..], &["--audit-mode", "off"][..]] {
+                let mut argv = vec!["ravel-server"];
+                argv.extend_from_slice(mode);
+                argv.extend_from_slice(tuning);
+                let err = Cli::parse_validated_from(argv)
+                    .expect_err(&format!("{tuning:?} under {mode:?} must be refused"));
+                assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                let message = err.to_string();
+                assert!(
+                    message.contains(tuning[0]) && message.contains("--audit-mode required"),
+                    "the refusal names the flag and the fix, got: {message}"
+                );
+            }
+            let mut argv = vec!["ravel-server", "--audit-mode", "required"];
+            argv.extend_from_slice(tuning);
+            Cli::parse_validated_from(argv)
+                .unwrap_or_else(|e| panic!("{tuning:?} under required is accepted: {e}"));
+        }
     }
 
     /// `--audit-text redacted` (the default) with no tokenization key anywhere
@@ -9548,30 +9647,58 @@ mod tests {
     }
 
     /// With no `RAVEL_AUDIT_TOKEN_KEY`, no deployment key, and the default
-    /// `redacted` posture, `gateway` and `maintain` resolve because they
-    /// install no query-audit pipeline and never read the key; `all` and
-    /// `query` still refuse, still naming the variable, exactly as
+    /// `redacted` posture, `gateway` and `maintain` resolve under every
+    /// `--audit-mode` because they install no query-audit pipeline and never
+    /// read the key, and every mode resolves under `--audit-mode off`
+    /// (the default). `all` and `query` with the audit enabled still refuse,
+    /// still naming the variable, exactly as
     /// `redacted_without_a_key_fails_startup` pins for the ungated function.
     #[test]
-    fn audit_text_policy_is_gated_to_query_serving_modes() {
-        for mode in [Mode::Gateway, Mode::Maintain] {
-            let policy =
-                resolve_audit_text_policy_for_mode(mode, AuditTextArg::default(), None, None)
-                    .unwrap_or_else(|e| panic!("mode {mode:?} must not need a key: {e}"));
+    fn audit_text_policy_is_gated_to_processes_that_install_the_pipeline() {
+        let every_audit_mode = [
+            AuditModeArg::Off,
+            AuditModeArg::Required,
+            AuditModeArg::BestEffort,
+        ];
+        let inert = |mode: Mode, audit_mode: AuditModeArg| {
+            let policy = resolve_audit_text_policy_for_mode(
+                mode,
+                audit_mode,
+                AuditTextArg::default(),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{mode:?}/{audit_mode:?} must not need a key: {e}"));
             assert!(
                 matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext),
-                "mode {mode:?} installs no pipeline, so the resolved policy must be inert"
+                "{mode:?}/{audit_mode:?} installs no pipeline, so the resolved policy must be inert"
             );
+        };
+        for mode in [Mode::Gateway, Mode::Maintain] {
+            for audit_mode in every_audit_mode {
+                inert(mode, audit_mode);
+            }
+        }
+        for mode in [Mode::All, Mode::Query] {
+            inert(mode, AuditModeArg::default());
         }
 
         for mode in [Mode::All, Mode::Query] {
-            let err = resolve_audit_text_policy_for_mode(mode, AuditTextArg::default(), None, None)
-                .expect_err("a query-serving mode must still refuse without a key");
-            let message = err.to_string();
-            assert!(
-                message.contains(AUDIT_TOKEN_KEY_ENV),
-                "mode {mode:?} error must name {AUDIT_TOKEN_KEY_ENV}, got: {message}"
-            );
+            for audit_mode in [AuditModeArg::Required, AuditModeArg::BestEffort] {
+                let err = resolve_audit_text_policy_for_mode(
+                    mode,
+                    audit_mode,
+                    AuditTextArg::default(),
+                    None,
+                    None,
+                )
+                .expect_err("a query-serving mode with the audit on must still refuse");
+                let message = err.to_string();
+                assert!(
+                    message.contains(AUDIT_TOKEN_KEY_ENV),
+                    "{mode:?}/{audit_mode:?} error must name {AUDIT_TOKEN_KEY_ENV}, got: {message}"
+                );
+            }
         }
     }
 
@@ -13323,8 +13450,14 @@ mod tests {
     /// the flag-level rejection specifically.
     #[test]
     fn audit_max_batch_zero_is_rejected_at_startup() {
-        let cli = Cli::try_parse_from(["ravel-server", "--audit-max-batch", "0"])
-            .expect("flag parses at the CLI layer");
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--audit-mode",
+            "required",
+            "--audit-max-batch",
+            "0",
+        ])
+        .expect("flag parses at the CLI layer");
         let err = cli
             .validate()
             .expect_err("startup must reject --audit-max-batch 0");

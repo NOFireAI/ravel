@@ -941,7 +941,8 @@ fn shipped_dashboard() -> Dashboard {
 
 /// Mirrors `metrics_endpoint.rs`'s helper, with the three knobs this test
 /// needs: the fold task (the stamp-coverage families), a deployment key (the
-/// durable auth family) and an alert rule set (the alerting family).
+/// durable auth family) and an alert rule set (the alerting family). The query
+/// audit is always enabled, for the `ravel_audit_*` families.
 async fn start_test_server(
     mode: Mode,
     fold_enabled: bool,
@@ -964,7 +965,10 @@ async fn start_test_server(
         ravel_server::AlertEvalConfig::default()
     };
     let config = ServerConfig {
-        audit_pipeline: Default::default(),
+        audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        }),
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,

@@ -82,7 +82,9 @@ pub struct RavelClusterSpec {
     /// Secret with a single key `key` holding 64 hex characters, the
     /// query-audit token key the query tier reads as
     /// `RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and
-    /// maintain never read a query-audit token. Omit on a cluster with
+    /// maintain never read a query-audit token. The query tier reads the key
+    /// only when `RAVEL_AUDIT_MODE` is `required` or `best-effort`; the
+    /// query audit is off by default since #2791. Omit on a cluster with
     /// `deploymentKeySecretRef` set -- the server derives the key from the
     /// deployment key. Omitting both leaves the query tier unable to start
     /// audit tokenization: the operator does not generate this Secret
