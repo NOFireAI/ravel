@@ -133,6 +133,12 @@ chaos_tenant_hash_args() {
 # failed. print_oracle_summary renders both and sets the exit status.
 ORACLE_PASS=()
 ORACLE_FAIL=()
+# "name: reason" for assertions the run could not evaluate because the event
+# they judge did not happen (see oracle_conservation_or_unmeasured).
+ORACLE_UNMEASURED=()
+# Summary exit code for a run with no failure and at least one unmeasured
+# assertion: a setup result, not a verdict.
+CHAOS_UNMEASURED_EXIT=3
 
 log() {
   echo "[chaos] $*" >&2
@@ -200,6 +206,8 @@ run_capture() {
 # Scenario 2 failures are release-blocking (ADR-0077 section 4): the caller
 # passes `blocking` as $2 to make the distinction legible in output and exit
 # code (2 = release-blocking oracle failure, 1 = ordinary oracle failure).
+# With no failure and at least one ORACLE_UNMEASURED entry it returns
+# CHAOS_UNMEASURED_EXIT (3) instead of 0.
 print_oracle_summary() {
   local scenario="$1"
   local severity="${2:-normal}"
@@ -215,7 +223,20 @@ print_oracle_summary() {
       echo "  FAIL  ${name}"
     done
   fi
+  if [[ ${#ORACLE_UNMEASURED[@]} -gt 0 ]]; then
+    for name in "${ORACLE_UNMEASURED[@]}"; do
+      echo "  SKIP  ${name}"
+    done
+  fi
   echo "-----------------------------------------------------------"
+  if [[ ${#ORACLE_FAIL[@]} -eq 0 && ${#ORACLE_UNMEASURED[@]} -gt 0 ]]; then
+    echo "RESULT: COULD NOT MEASURE -- no assertion failed, but ${#ORACLE_UNMEASURED[@]} could not be evaluated (${scenario}):"
+    for name in "${ORACLE_UNMEASURED[@]}"; do
+      echo "  - ${name#*: }"
+    done
+    echo "This is a setup result, not an oracle verdict; rerun after tuning the load."
+    return "$CHAOS_UNMEASURED_EXIT"
+  fi
   if [[ ${#ORACLE_FAIL[@]} -eq 0 ]]; then
     echo "RESULT: PASS -- all pinned oracle assertions held (${scenario})"
     echo "Paste this block into the ADR-0077 section 3 rehearsal record."
@@ -297,6 +318,7 @@ check_dependencies() {
     oracle_sibling_takeover_within_bound \
     oracle_no_orphaned_lease \
     oracle_conservation_holds \
+    oracle_conservation_or_unmeasured \
     oracle_custody_and_catalog_verify_clean \
     oracle_no_partial_output_leak; do
     if declare -F "$fn" >/dev/null 2>&1; then
@@ -510,15 +532,117 @@ ravel_cli() {
   fi
 }
 
-# Write a fresh OTLP metrics fixture to stdout (one `demo_requests_total`
-# gauge point at the current wall clock). Prefers a prebuilt example binary on
-# PATH, as the nightly lane provides, over a per-invocation `cargo run`.
+# Shape of the large fixture: series count and points per series, passed to
+# gen_otlp_fixture as `SERIES POINTS`. 1000 x 100 is 10^5 points per export,
+# about 3.8 MB of OTLP protobuf, under the server's 16 MiB request-body limit.
+# Scenario 2 sends CHAOS_EXPORT_COUNT of them (2 * 10^6 points at the
+# defaults) so a compaction has enough input to take measurable time, and
+# scenario 1 sends one as its in-flight export. These are starting values;
+# tune them from a real nightly run.
+CHAOS_FIXTURE_SERIES="${CHAOS_FIXTURE_SERIES:-1000}"
+CHAOS_FIXTURE_POINTS="${CHAOS_FIXTURE_POINTS:-100}"
+# Strict-ack exports each scenario drives before its kill. Scenario 1 sends
+# the one-point fixture this many times; scenario 2 sends a freshly generated
+# large fixture this many times.
+CHAOS_EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
+
+# Write a fresh OTLP metrics fixture to stdout. With no arguments it is one
+# `demo_requests_total` gauge point at the current wall clock; with
+# `SERIES POINTS` it is SERIES series of POINTS points each, all within the
+# last two minutes. Prefers a prebuilt example binary on PATH, as the nightly
+# lane provides, over a per-invocation `cargo run`.
 chaos_gen_fixture() {
   if chaos_have_command gen_otlp_fixture; then
-    gen_otlp_fixture
+    gen_otlp_fixture "$@"
   else
-    cargo run --quiet -p ravel-server --example gen_otlp_fixture
+    cargo run --quiet -p ravel-server --example gen_otlp_fixture -- "$@"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Seal wait (scenario 2). An ingest hour becomes compactable only once it is
+# sealed: the end of the hour plus the catalog's seal margin. The margin is
+# CatalogConfig::default(), compiled in, so it is read from the server's own
+# startup log rather than restated here.
+# ---------------------------------------------------------------------------
+
+# Extra seconds past the computed seal, so a worker's first pass after the
+# wait is not racing the boundary.
+CHAOS_SEAL_SAFETY_SECONDS="${CHAOS_SEAL_SAFETY_SECONDS:-120}"
+# Interval between progress lines while waiting.
+CHAOS_SEAL_PROGRESS_SECONDS="${CHAOS_SEAL_PROGRESS_SECONDS:-600}"
+
+# Print the seal margin in seconds from a server log body: the value of the
+# first `seal_margin_secs=N` field (services/ravel-server/src/lib.rs,
+# `log_resolved_request_budget`). ANSI colour codes around the field are
+# removed first. Returns 1, printing nothing, when the field is absent or its
+# value is not a non-negative integer. Pure: no I/O.
+chaos_seal_margin_from_log() {
+  local body="$1"
+  local value
+  value="$(awk '
+    {
+      line = $0
+      gsub(/\033\[[0-9;]*m/, "", line)
+      at = index(line, "seal_margin_secs=")
+      if (at == 0) next
+      rest = substr(line, at + length("seal_margin_secs="))
+      split(rest, f, /[ \t\r]/)
+      print f[1]
+      exit
+    }' <<<"$body")"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+# Print the unix second at which every ingest hour up to and including the
+# one holding `last_ack_unix_s` is sealed, plus the safety margin:
+# (floor(last_ack / 3600) + 1) * 3600 + seal_margin + safety.
+# Args: last_ack_unix_s seal_margin_s [safety_s]. Returns 64 on a non-integer
+# argument. Pure: no clock.
+chaos_sealed_at_unix_s() {
+  local last_ack="$1" margin="$2" safety="${3:-$CHAOS_SEAL_SAFETY_SECONDS}"
+  local v
+  for v in "$last_ack" "$margin" "$safety"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || return 64
+  done
+  echo $(( (last_ack / 3600 + 1) * 3600 + margin + safety ))
+}
+
+# The clock and the sleep the seal wait uses; tests replace both.
+chaos_now_unix_s() {
+  date +%s
+}
+chaos_sleep() {
+  sleep "$1"
+}
+
+# Block until the clock reaches `sealed_at`. Logs the target and the total
+# wait once, then a progress line every CHAOS_SEAL_PROGRESS_SECONDS.
+# Args: sealed_at_unix_s.
+chaos_wait_until_sealed() {
+  local sealed_at="$1"
+  local now remaining step
+  now="$(chaos_now_unix_s)"
+  remaining=$(( sealed_at - now ))
+  if [[ "$remaining" -le 0 ]]; then
+    log "seal wait: sealed_at=${sealed_at} is already past (now=${now}); no wait"
+    return 0
+  fi
+  log "seal wait: sealed_at=${sealed_at} ($(date -u -d "@${sealed_at}" +%FT%TZ 2>/dev/null || echo "unix ${sealed_at}")), waiting ${remaining}s"
+  while [[ "$remaining" -gt 0 ]]; do
+    step="$CHAOS_SEAL_PROGRESS_SECONDS"
+    [[ "$remaining" -lt "$step" ]] && step="$remaining"
+    chaos_sleep "$step"
+    now="$(chaos_now_unix_s)"
+    remaining=$(( sealed_at - now ))
+    if [[ "$remaining" -gt 0 ]]; then
+      log "seal wait: ${remaining}s left until sealed_at=${sealed_at}"
+    fi
+  done
+  log "seal wait: done (now=${now})"
 }
 
 ravel_server_cmd() {
@@ -702,15 +826,17 @@ wait_for_metric_at_least() {
 # ---------------------------------------------------------------------------
 # Flush / compaction observation markers.
 #
-# Scenario 1 keys off `ravel_ingest_flushes_by_size_total`. That counter is
-# incremented at flush ATTEMPT time (crates/ravel-ingest/src/span_metrics.rs:
-# "Attempt-time, same as flushes_by_size"), so an increment means a flush has
-# STARTED but not necessarily completed -- exactly the "mid-flush" window
-# ADR-0077 section 4 names. The kill fires as soon as the counter rises past
-# its pre-load baseline. Only the metrics pipeline's sample counts
-# (`signal="metrics"`): the load is OTLP metrics, and a logs or traces flush
-# in the same process would otherwise fire the kill outside any flush this
-# scenario's writes are in.
+# Scenario 1 keys off the count of flush attempts. No family counts every
+# flush, so it is the sum of the five per-trigger families the server renders
+# (services/ravel-server/src/metrics.rs): size, age, adaptive age, age floor,
+# and manual. Each FlushTrigger increments exactly one of them
+# (`IngestMetrics::record_flush`, crates/ravel-ingest/src/metrics.rs), so the
+# sum counts each flush once, and each is incremented at flush ATTEMPT time,
+# so a rise means a flush has STARTED but not necessarily completed. The
+# adaptive family is rendered only for pipelines that carry adaptive
+# counters; an absent family adds nothing. Only the metrics pipeline's samples count (`signal="metrics"`):
+# the load is OTLP metrics, and a logs or traces flush in the same process
+# would otherwise fire the kill outside any flush this scenario's writes are in.
 #
 # Scenario 2 keys off the compaction lifecycle: a compaction is observed
 # in-flight when the maintain worker owns units and has begun a run but has
@@ -720,19 +846,76 @@ wait_for_metric_at_least() {
 # is genuinely interrupted mid-flight.
 # ---------------------------------------------------------------------------
 
-CHAOS_FLUSH_METRIC="ravel_ingest_flushes_by_size_total"
+CHAOS_FLUSH_METRICS=(
+  ravel_ingest_flushes_by_size_total
+  ravel_ingest_flushes_by_age_total
+  ravel_ingest_flushes_by_age_adaptive_total
+  ravel_ingest_flushes_by_age_floor_total
+  ravel_ingest_flushes_manual_total
+)
 CHAOS_FLUSH_SELECTOR="signal=metrics"
+# Scrapes per second while waiting for a flush to start. A flush can finish
+# inside one second, so this polls faster than wait_for_metric_at_least.
+CHAOS_FLUSH_POLLS_PER_SECOND="${CHAOS_FLUSH_POLLS_PER_SECOND:-5}"
 CHAOS_COMPACTION_PUBLISH_MARKER="compaction record published"
 
-# Wait until the flush counter has risen past `baseline`, i.e. a flush has
-# been attempted since load began. This is the scenario-1 "mid-flush" trigger.
+# Print the metrics pipeline's flush-attempt count from a /metrics body: the
+# sum of CHAOS_FLUSH_METRICS under CHAOS_FLUSH_SELECTOR. Prints the empty
+# string when none of the families has a matching sample. Pure: no I/O.
+flush_attempts_from_body() {
+  local body="$1"
+  local name v total=""
+  for name in "${CHAOS_FLUSH_METRICS[@]}"; do
+    v="$(metric_value_from_body "$body" "$name" "$CHAOS_FLUSH_SELECTOR")"
+    [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+    total=$(( ${total:-0} + ${v%.*} ))
+  done
+  printf '%s\n' "$total"
+}
+
+# Scrape a server's flush-attempt count. Returns 1 when the scrape fails.
+flush_attempts() {
+  local base_url="$1"
+  local body
+  body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || return 1
+  flush_attempts_from_body "$body"
+}
+
+# Wait until the flush-attempt count has risen past `baseline`, i.e. a flush
+# of any trigger has started since the baseline was read. This is the
+# scenario-1 "mid-flush" trigger. Args: base_url baseline deadline_seconds.
+# Returns 0 on the rise, 1 when the deadline passes first.
 wait_for_flush_started() {
   local base_url="$1"
   local baseline="$2"
   local deadline_seconds="$3"
-  wait_for_metric_at_least \
-    "$base_url" "$CHAOS_FLUSH_METRIC" "$(( baseline + 1 ))" "$deadline_seconds" \
-    "$CHAOS_FLUSH_SELECTOR"
+  local polls=$(( deadline_seconds * CHAOS_FLUSH_POLLS_PER_SECOND ))
+  local interval
+  interval="$(awk -v n="$CHAOS_FLUSH_POLLS_PER_SECOND" 'BEGIN { printf "%.3f", 1 / n }')"
+  local i value
+  for (( i = 0; i < polls; i++ )); do
+    value="$(flush_attempts "$base_url")" || value=""
+    if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -gt "$baseline" ]]; then
+      return 0
+    fi
+    sleep "$interval"
+  done
+  return 1
+}
+
+# The scenario-1 summary line for where the kill landed. Args: flush_observed
+# (0|1), inflight_export_acked (0|1), baseline, attempts at the kill. The kill
+# landed mid-flush when a flush had started and the export sent to fill it
+# was still unacknowledged when the server died.
+kill_timing_line() {
+  local observed="$1" acked="$2" baseline="$3" at_kill="$4"
+  if [[ "$observed" -eq 1 && "$acked" -eq 0 ]]; then
+    echo "KILL-TIMING: mid-flush=yes (flush attempts ${baseline} -> ${at_kill}, in-flight export unacknowledged at the kill)"
+  elif [[ "$observed" -eq 1 ]]; then
+    echo "KILL-TIMING: mid-flush=no (flush attempts ${baseline} -> ${at_kill}, but the in-flight export was acknowledged before the kill)"
+  else
+    echo "KILL-TIMING: mid-flush=no (no flush attempt observed; attempts stayed at ${baseline})"
+  fi
 }
 
 # Wait until a compaction has begun for the worker whose log is `log_file`,
@@ -764,6 +947,32 @@ wait_for_compaction_in_flight() {
     waited=$(( waited + 1 ))
   done
   return 1
+}
+
+# Conservation, unless the kill provably missed the compaction. Args:
+# observed (1 when worker A was seen mid-compaction before the kill, else 0),
+# worker A's log file, then the oracle_conservation_holds arguments
+# (survivor_base_url, conservation_aborts_baseline, survivor_log_file).
+#
+# When A was not observed mid-compaction AND its own log carries the publish
+# marker, the unit finished before the kill and no takeover of an interrupted
+# compaction happened: return CHAOS_UNMEASURED_EXIT and record no oracle
+# outcome. Every other case runs oracle_conservation_holds and returns its
+# result, so a missing publish after a real mid-flight kill stays a FAIL.
+oracle_conservation_or_unmeasured() {
+  local observed="$1"
+  local worker_a_log="$2"
+  shift 2
+  local a_body=""
+  if [[ -r "$worker_a_log" ]]; then
+    a_body="$(cat "$worker_a_log")"
+  fi
+  if [[ "$observed" -ne 1 && "$a_body" == *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
+    ORACLE_UNMEASURED+=("conservation-holds: could not measure: compaction finished before the kill")
+    log "could not measure: compaction finished before the kill (worker A was not observed mid-compaction and its log carries '${CHAOS_COMPACTION_PUBLISH_MARKER}')"
+    return "$CHAOS_UNMEASURED_EXIT"
+  fi
+  oracle_conservation_holds "$@"
 }
 
 # ---------------------------------------------------------------------------

@@ -193,9 +193,14 @@ jobs:
   # ci.yml's doc-scripts job (scripts/chaos/lib.test.sh).
   chaos:
     runs-on: ubuntu-latest
-    # Two release builds cold, then scenario 2's takeover budget (3 * H plus
-    # one maintenance tick, 8 minutes at the defaults) on top of scenario 1.
-    timeout-minutes: 60
+    # Long on purpose: scenario 2 can only kill a worker mid-compaction once
+    # the hours it wrote are sealed, and an ingest hour seals at the end of
+    # the hour plus the catalog's compiled-in seal margin (4800 s), so the
+    # script sleeps up to about 2 h 22 min (scripts/chaos/kill-maintain-worker.sh,
+    # "SEAL WAIT"). On top of that: two release builds cold, scenario 1, and
+    # scenario 2's takeover budget (3 * H plus one maintenance tick, 8 minutes
+    # at the defaults).
+    timeout-minutes: 240
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"

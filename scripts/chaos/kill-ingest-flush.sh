@@ -16,12 +16,16 @@
 # This is the exit criterion's "kill -9 mid-flush against RustFS with no
 # strict-ack violation" row (ADR-0077 section 4).
 #
-# MID-FLUSH TRIGGER (named explicitly, per the task): the counter
-# `ravel_ingest_flushes_by_size_total`, scraped from the server's /metrics.
-# It is incremented at flush ATTEMPT time
-# (crates/ravel-ingest/src/span_metrics.rs), so an increment past the
-# pre-load baseline means a flush has STARTED. The SIGKILL fires the moment
-# it rises, landing the kill inside the flush window.
+# MID-FLUSH TRIGGER (named explicitly, per the task): the metrics pipeline's
+# flush-attempt count, the sum of the five per-trigger `ravel_ingest_flushes_*`
+# families scraped from the server's /metrics (`flush_attempts_from_body` in
+# lib.sh), so a size-, age- or manually-triggered flush all count. After the
+# strict-ack exports the scenario reads that count, sends one more, large,
+# export in the background, and SIGKILLs the server as soon as the count
+# rises. The kill landed mid-flush when that in-flight export was never
+# acknowledged; the scenario prints that verdict as a `KILL-TIMING:
+# mid-flush=yes|no` line before the oracle summary. With no rise within the
+# budget it kills anyway and warns.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
 # RustFS, driving load, or issuing a real kill. That is the only proof
@@ -54,9 +58,10 @@ BASE_URL="http://${HTTP_ADDR}"
 # A query for any other name is unsatisfiable and makes the durability oracle
 # green-by-vacuity, which is the failure mode this whole lane exists to close.
 SERIES="demo_requests_total"
-# Number of strict-ack exports to drive before the kill. Each returns a
-# commit token recorded as an acked-before-kill write.
-EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
+# Number of strict-ack exports of the one-point fixture to drive before the
+# in-flight export. Each returns a commit token recorded as an
+# acked-before-kill write.
+EXPORT_COUNT="${CHAOS_EXPORT_COUNT}"
 
 usage() {
   cat <<'EOF'
@@ -86,7 +91,8 @@ chaos_tenant_hash_args || exit 64
 
 if [[ "$MODE" == "check" ]]; then
   echo "== kill-ingest-flush.sh --check (scenario 1: kill ingest mid-flush) =="
-  echo "mid-flush trigger marker: ${CHAOS_FLUSH_METRIC} (attempt-time increment)"
+  echo "mid-flush trigger marker: sum of ${CHAOS_FLUSH_METRICS[*]} (${CHAOS_FLUSH_SELECTOR}, attempt-time increments)"
+  echo "in-flight export: ${CHAOS_FIXTURE_SERIES} series x ${CHAOS_FIXTURE_POINTS} points"
   rc=0
   check_dependencies || rc=$?
   exit "$rc"
@@ -102,6 +108,9 @@ SERVER_PID=""
 SERVER_LOG="$(chaos_logfile ingest-flush server-pre-kill)"
 SERVER_RESTART_LOG="$(chaos_logfile ingest-flush server-post-kill)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
+INFLIGHT_FIXTURE_PATH="$(mktemp --suffix=.pb)"
+INFLIGHT_TOKENS_PATH="$(mktemp)"
+INFLIGHT_PID=""
 
 cleanup() {
   # The pending exit status, read before anything else can replace it. A
@@ -110,12 +119,15 @@ cleanup() {
   local code=$?
   trap - ERR
   set +e
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "$SERVER_PID" "${INFLIGHT_PID:-}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   chaos_release_logs "$code" "$SERVER_LOG" "$SERVER_RESTART_LOG"
-  rm -f "$FIXTURE_PATH"
+  rm -f "$FIXTURE_PATH" "${INFLIGHT_FIXTURE_PATH:-}" "${INFLIGHT_TOKENS_PATH:-}"
   rustfs_down
 }
 trap cleanup EXIT
@@ -144,18 +156,12 @@ server_reachable() {
 log "bringing up RustFS and qualifying the store"
 rustfs_up
 
-log "generating OTLP fixture"
+log "generating OTLP fixtures"
 chaos_gen_fixture > "$FIXTURE_PATH"
 
 log "starting ravel-server (pre-kill instance)"
 start_server_bg "$SERVER_LOG"
 chaos_wait_for "server to accept connections" 60 server_reachable
-
-# Record the flush baseline before driving load, so "flush started" is a
-# rise past this value.
-FLUSH_BASELINE="$(metric_value "$BASE_URL" "$CHAOS_FLUSH_METRIC" "$CHAOS_FLUSH_SELECTOR")" \
-  || FLUSH_BASELINE=0
-[[ "${FLUSH_BASELINE%.*}" =~ ^[0-9]+$ ]] || FLUSH_BASELINE=0
 
 log "driving ${EXPORT_COUNT} strict-ack exports"
 # Commit tokens are opaque base64 strings, not integers (see
@@ -174,15 +180,45 @@ for _ in $(seq 1 "$EXPORT_COUNT"); do
 done
 log "recorded ${#ACKED_TOKENS[@]} strict-ack commit token(s) before kill"
 
-log "waiting for a flush to start (mid-flush trigger: ${CHAOS_FLUSH_METRIC})"
-if wait_for_flush_started "$BASE_URL" "${FLUSH_BASELINE%.*}" 60; then
+# Every strict-acked export has already flushed, so a flush to land in needs
+# one more write. The baseline is read after the acked exports and before the
+# in-flight one, so the rise is that export's flush, whatever triggered it.
+chaos_gen_fixture "$CHAOS_FIXTURE_SERIES" "$CHAOS_FIXTURE_POINTS" > "$INFLIGHT_FIXTURE_PATH"
+FLUSH_BASELINE="$(flush_attempts "$BASE_URL")" || FLUSH_BASELINE=""
+[[ "$FLUSH_BASELINE" =~ ^[0-9]+$ ]] || FLUSH_BASELINE=0
+log "flush attempts before the in-flight export: ${FLUSH_BASELINE}"
+( drive_one_export "$HTTP_ADDR" "$INFLIGHT_FIXTURE_PATH" > "$INFLIGHT_TOKENS_PATH" ) &
+INFLIGHT_PID=$!
+
+FLUSH_OBSERVED=0
+log "waiting for a flush to start (mid-flush trigger: flush attempts > ${FLUSH_BASELINE})"
+if wait_for_flush_started "$BASE_URL" "$FLUSH_BASELINE" 60; then
+  FLUSH_OBSERVED=1
   log "flush observed in flight -- issuing SIGKILL mid-flush"
 else
   log "no flush observed within budget; issuing SIGKILL anyway (writes still strict-acked)"
   echo "::warning::chaos scenario 1 killed the server without observing a flush in flight; this run did not exercise a mid-flush kill"
 fi
+ATTEMPTS_AT_KILL="$(flush_attempts "$BASE_URL")" || ATTEMPTS_AT_KILL=""
+[[ "$ATTEMPTS_AT_KILL" =~ ^[0-9]+$ ]] || ATTEMPTS_AT_KILL="unknown"
 sigkill_pid "$SERVER_PID"
 SERVER_PID=""
+
+# The in-flight export ends once the server is gone. If it was acknowledged
+# before the kill took effect, it is an acked write like the others and the
+# kill did not land mid-flush.
+INFLIGHT_RC=0
+wait "$INFLIGHT_PID" || INFLIGHT_RC=$?
+INFLIGHT_PID=""
+INFLIGHT_ACKED=0
+if [[ "$INFLIGHT_RC" -eq 0 && -s "$INFLIGHT_TOKENS_PATH" ]]; then
+  INFLIGHT_ACKED=1
+  mapfile -t inflight_tokens < "$INFLIGHT_TOKENS_PATH"
+  ACKED_TOKENS+=("${inflight_tokens[@]}")
+  log "the in-flight export was acknowledged before the kill; its ${#inflight_tokens[@]} token(s) join the acked set"
+fi
+KILL_TIMING="$(kill_timing_line "$FLUSH_OBSERVED" "$INFLIGHT_ACKED" "$FLUSH_BASELINE" "$ATTEMPTS_AT_KILL")"
+log "$KILL_TIMING"
 
 log "restarting ravel-server (post-kill instance)"
 start_server_bg "$SERVER_RESTART_LOG"
@@ -196,6 +232,7 @@ oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
 # Scenario 1 is not release-blocking by ADR-0077 section 4 (that clause is
 # scenario 2), but a strict-ack violation here is the exit-criterion failure
 # for the ingest row; report it as an ordinary oracle failure.
+echo "$KILL_TIMING"
 summary_rc=0
 print_oracle_summary "scenario 1: kill ingest mid-flush" normal || summary_rc=$?
 exit "$summary_rc"

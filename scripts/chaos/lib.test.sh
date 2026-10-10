@@ -192,13 +192,167 @@ check "wait_for_metric_at_least reaches threshold" "0" \
   "$(rc_of wait_for_metric_at_least http://stub ravel_maintain_units_owned 4 2)"
 check "wait_for_metric_at_least honours a selector" "1" \
   "$(rc_of wait_for_metric_at_least http://stub ravel_ingest_flushes_by_size_total 6 1 signal=metrics)"
-# The load is metrics-only, so only the metrics pipeline's flushes count:
-# baseline 4 -> 5 is a rise, baseline 5 is not, even though the logs pipeline
-# alone holds 6 and the unselected total is 11.
+# The load is metrics-only, so only the metrics pipeline's flushes count, and
+# every trigger's family counts: size 5 + age 9 = 14 attempts. Baseline 13 is
+# a rise, baseline 14 is not, even though the logs pipeline holds 6 more and
+# the unselected total is 20.
+check "flush attempts sum every trigger family on the metrics signal" "14" \
+  "$(flush_attempts_from_body "${METRICS_SAMPLE}")"
 check "flush trigger fires on a metrics-signal rise" "0" \
-  "$(rc_of wait_for_flush_started http://stub 4 2)"
+  "$(rc_of wait_for_flush_started http://stub 13 2)"
 check "flush trigger ignores other signals' flushes" "1" \
-  "$(rc_of wait_for_flush_started http://stub 5 1)"
+  "$(rc_of wait_for_flush_started http://stub 14 1)"
+
+# A run where the only flush was time-triggered: the size family stays at 0,
+# which is what left the size-only trigger waiting out its whole budget.
+METRICS_TIME_ONLY='# TYPE ravel_ingest_flushes_by_size_total counter
+ravel_ingest_flushes_by_size_total{mode="all",signal="metrics"} 0
+ravel_ingest_flushes_by_size_total{mode="all",signal="logs"} 0
+# TYPE ravel_ingest_flushes_by_age_total counter
+ravel_ingest_flushes_by_age_total{mode="all",signal="metrics"} 1
+ravel_ingest_flushes_by_age_total{mode="all",signal="logs"} 0
+# TYPE ravel_ingest_flushes_by_age_floor_total counter
+ravel_ingest_flushes_by_age_floor_total{mode="all",signal="metrics"} 0
+# TYPE ravel_ingest_flushes_manual_total counter
+ravel_ingest_flushes_manual_total{mode="all",signal="metrics"} 0'
+check "time-triggered flush: all-flushes figure is 1" "1" \
+  "$(flush_attempts_from_body "${METRICS_TIME_ONLY}")"
+check "time-triggered flush: the trigger fires from baseline 0" "0" \
+  "$(METRICS_SAMPLE="${METRICS_TIME_ONLY}" rc_of wait_for_flush_started http://stub 0 1)"
+check "time-triggered flush: no rise past baseline 1" "1" \
+  "$(METRICS_SAMPLE="${METRICS_TIME_ONLY}" rc_of wait_for_flush_started http://stub 1 1)"
+METRICS_ADAPTIVE_MANUAL='ravel_ingest_flushes_by_size_total{mode="all",signal="metrics"} 0
+ravel_ingest_flushes_by_age_total{mode="all",signal="metrics"} 0
+ravel_ingest_flushes_by_age_adaptive_total{mode="all",signal="metrics"} 2
+ravel_ingest_flushes_by_age_floor_total{mode="all",signal="metrics"} 4
+ravel_ingest_flushes_manual_total{mode="all",signal="metrics"} 1'
+check "adaptive, floor and manual flushes count too" "7" \
+  "$(flush_attempts_from_body "${METRICS_ADAPTIVE_MANUAL}")"
+check "no flush family at all reads as absent" "" \
+  "$(flush_attempts_from_body 'ravel_build_up 1')"
+
+check "kill timing: flush seen, export unacked is mid-flush=yes" \
+  "KILL-TIMING: mid-flush=yes (flush attempts 3 -> 4, in-flight export unacknowledged at the kill)" \
+  "$(kill_timing_line 1 0 3 4)"
+check "kill timing: flush seen but export acked is mid-flush=no" "KILL-TIMING: mid-flush=no" \
+  "$(kill_timing_line 1 1 3 4 | cut -d' ' -f1-2)"
+check "kill timing: no flush seen is mid-flush=no" "KILL-TIMING: mid-flush=no" \
+  "$(kill_timing_line 0 0 3 3 | cut -d' ' -f1-2)"
+scenario1_body="$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")"
+check "scenario 1 prints the kill-timing line on stdout" "yes" \
+  "$([[ "${scenario1_body}" == *$'\necho "$KILL_TIMING"\n'* ]] && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
+# Seal wait (scenario 2).
+# ---------------------------------------------------------------------------
+
+# 2026-10-10T03:10:00Z, 03:59:59Z and 04:00:00Z as unix seconds; the seal is
+# the end of the hour + 4800 s margin + 120 s safety.
+ACK_0310=1791601800
+ACK_0359=1791604799
+ACK_0400=1791604800
+SEALED_0522=1791609720  # 2026-10-10T05:22:00Z = 04:00 + 4800 + 120
+SEALED_0622=1791613320  # 2026-10-10T06:22:00Z = 05:00 + 4800 + 120
+check "sealed_at: last ack 03:10:00 seals at 05:22:00" "${SEALED_0522}" \
+  "$(chaos_sealed_at_unix_s "${ACK_0310}" 4800 120)"
+check "sealed_at: last ack 03:59:59 seals at 05:22:00" "${SEALED_0522}" \
+  "$(chaos_sealed_at_unix_s "${ACK_0359}" 4800 120)"
+check "sealed_at: last ack 04:00:00 seals an hour later, 06:22:00" "${SEALED_0622}" \
+  "$(chaos_sealed_at_unix_s "${ACK_0400}" 4800 120)"
+check "sealed_at: safety defaults to 120 s" "${SEALED_0522}" \
+  "$(chaos_sealed_at_unix_s "${ACK_0310}" 4800)"
+check "sealed_at: a non-integer margin is refused with 64" "64" \
+  "$(rc_of chaos_sealed_at_unix_s "${ACK_0310}" 48x0)"
+
+# Modelled on tracing's default fmt output for log_resolved_request_budget
+# (services/ravel-server/src/lib.rs), plain and with ANSI field colouring.
+SEAL_LOG_LINE='2026-10-10T03:00:01.123456Z  INFO ravel_server: per-query S3 request budget resolved max_s3_requests=4096 source="derived" covered_span_secs=8400 seal_margin_secs=4800'
+SEAL_LOG_ANSI=$'2026-10-10T03:00:01.123456Z \e[32m INFO\e[0m \e[2mravel_server\e[0m\e[2m:\e[0m per-query S3 request budget resolved \e[3mmax_s3_requests\e[0m\e[2m=\e[0m4096 \e[3mseal_margin_secs\e[0m\e[2m=\e[0m4800'
+SEAL_LOG="2026-10-10T03:00:00.000001Z  INFO ravel_server: starting
+${SEAL_LOG_LINE}
+2026-10-10T03:00:02.000001Z  INFO ravel_server: listening"
+check "seal margin read from the server's log line" "4800" \
+  "$(chaos_seal_margin_from_log "${SEAL_LOG}")"
+check "seal margin read through ANSI colouring" "4800" \
+  "$(chaos_seal_margin_from_log "${SEAL_LOG_ANSI}")"
+check "seal margin: a log without the field is refused" "1" \
+  "$(rc_of chaos_seal_margin_from_log '2026-10-10T03:00:00Z  INFO ravel_server: starting')"
+check "seal margin: a non-integer value is refused" "1" \
+  "$(rc_of chaos_seal_margin_from_log "${SEAL_LOG_LINE/seal_margin_secs=4800/seal_margin_secs=48.5}")"
+check "seal margin: an empty value is refused" "1" \
+  "$(rc_of chaos_seal_margin_from_log "${SEAL_LOG_LINE/seal_margin_secs=4800/seal_margin_secs=}")"
+
+# The wait loop against a fake clock: 1500 s to go sleeps 600, 600, 300, and
+# logs the target once and a progress line after each sleep that leaves time.
+seal_wait_trace() {
+  local clock="${SCRATCH}/clock" sleeps="${SCRATCH}/sleeps"
+  printf '%s\n' 1000 >"${clock}"
+  : >"${sleeps}"
+  chaos_now_unix_s() { cat "${clock}"; }
+  chaos_sleep() {
+    printf '%s ' "$1" >>"${sleeps}"
+    printf '%s\n' $(( $(cat "${clock}") + $1 )) >"${clock}"
+  }
+  local out
+  out="$(chaos_wait_until_sealed 2500 2>&1)"
+  printf 'sleeps=%s targets=%s progress=%s\n' "$(cat "${sleeps}")" \
+    "$(grep -c 'sealed_at=2500 (' <<<"${out}")" "$(grep -c 's left until' <<<"${out}")"
+}
+check "seal wait: one target line, a progress line per 10 min" \
+  "sleeps=600 600 300  targets=1 progress=2" "$(seal_wait_trace)"
+
+scenario2_line() { grep -n -m1 -F -- "$1" "${CHAOS_DIR}/kill-maintain-worker.sh" | cut -d: -f1; }
+stop_line="$(scenario2_line 'kill "$INGEST_PID"')"
+margin_line="$(scenario2_line 'chaos_seal_margin_from_log "$(cat "$INGEST_LOG")"')"
+wait_line="$(scenario2_line 'chaos_wait_until_sealed "$SEALED_AT"')"
+workers_line="$(scenario2_line 'start_worker "$WORKER_A_HTTP"')"
+check "scenario 2 stops ingest, reads the margin, waits, then starts workers" "yes" \
+  "$([[ -n "${stop_line}" && "${stop_line}" -lt "${margin_line:-0}" && "${margin_line}" -lt "${wait_line:-0}" && "${wait_line}" -lt "${workers_line:-0}" ]] && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
+# Scenario 2's conservation verdict, with the could-not-measure guard. The
+# stubbed /metrics serves conservation aborts 1, the baseline passed here.
+# ---------------------------------------------------------------------------
+
+LOG_PUBLISHED="${SCRATCH}/published.log"
+LOG_SILENT="${SCRATCH}/silent.log"
+printf '2026-10-10T05:30:00Z  INFO ravel_maintain::publish: compaction record published shard=0\n' >"${LOG_PUBLISHED}"
+printf '2026-10-10T05:30:00Z  INFO ravel_maintain: maintain pass compacted=0\n' >"${LOG_SILENT}"
+cons() { rc_of oracle_conservation_or_unmeasured "$1" "$2" http://stub 1 "$3"; }
+check "classifier: not observed, A published is could-not-measure (3)" "3" \
+  "$(cons 0 "${LOG_PUBLISHED}" "${LOG_SILENT}")"
+check "classifier: observed, B published passes conservation" "0" \
+  "$(cons 1 "${LOG_SILENT}" "${LOG_PUBLISHED}")"
+check "classifier: observed, nothing published fails conservation" "1" \
+  "$(cons 1 "${LOG_SILENT}" "${LOG_SILENT}")"
+check "classifier: observed, A published, B silent still fails conservation" "1" \
+  "$(cons 1 "${LOG_PUBLISHED}" "${LOG_SILENT}")"
+check "classifier: not observed, A silent runs the oracle (B silent fails)" "1" \
+  "$(cons 0 "${LOG_SILENT}" "${LOG_SILENT}")"
+unmeasured_summary_rc() {
+  ORACLE_PASS=(other)
+  ORACLE_FAIL=()
+  ORACLE_UNMEASURED=()
+  [[ -n "$1" ]] && ORACLE_FAIL=("$1")
+  oracle_conservation_or_unmeasured 0 "${LOG_PUBLISHED}" http://stub 1 "${LOG_SILENT}" >/dev/null 2>&1
+  rc_of print_oracle_summary scenario blocking
+}
+check "summary: could-not-measure with nothing failed exits 3" "3" "$(unmeasured_summary_rc "")"
+check "summary: could-not-measure never hides a failure (exit 2)" "2" \
+  "$(unmeasured_summary_rc "no-orphaned-lease: detail")"
+
+# ---------------------------------------------------------------------------
+# Fixture arguments reach gen_otlp_fixture, and none are added by default.
+# ---------------------------------------------------------------------------
+
+GEN_STUB_DIR="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nprintf "argc=%%s args=%%s\\n" "$#" "$*"\n' >"${GEN_STUB_DIR}/gen_otlp_fixture"
+chmod +x "${GEN_STUB_DIR}/gen_otlp_fixture"
+check "chaos_gen_fixture with no arguments passes none" "argc=0 args=" \
+  "$(PATH="${GEN_STUB_DIR}:${PATH}" chaos_gen_fixture)"
+check "chaos_gen_fixture passes SERIES POINTS through" "argc=2 args=1000 100" \
+  "$(PATH="${GEN_STUB_DIR}:${PATH}" chaos_gen_fixture "${CHAOS_FIXTURE_SERIES}" "${CHAOS_FIXTURE_POINTS}")"
+rm -rf "${GEN_STUB_DIR}"
 
 # ---------------------------------------------------------------------------
 # Commit tokens: opaque strings, extracted verbatim.
