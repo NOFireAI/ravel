@@ -58,6 +58,10 @@ pub struct MemoryGate {
     pub memory_budget_bytes: u64,
     pub interval_ms: u64,
     pub wait_ms: u64,
+    /// The bounded `--max-ingest-buffer-bytes` in `all` mode, else 0. Stamped
+    /// so an operator can see what the startup check left out: the check
+    /// compares the cache caps alone (ADR-2633, startup-check amendment).
+    pub ingest_buffer_bytes: u64,
     /// One of the `SOURCE_*` constants: who set the mark, or why the gate is
     /// off.
     pub source: &'static str,
@@ -73,6 +77,8 @@ impl MemoryGate {
             memory_budget_bytes = self.memory_budget_bytes,
             interval_ms = self.interval_ms,
             wait_ms = self.wait_ms,
+            ingest_buffer_bytes = self.ingest_buffer_bytes,
+            ingest_buffer_in_mark_check = false,
             source = self.source,
             "memory gate resolved"
         );
@@ -84,14 +90,14 @@ impl MemoryGate {
 }
 
 /// Startup refusal: the memory that sits inside `stats.resident` whenever the
-/// caches and the ingest buffer are full already reaches the mark, so the
-/// gate would never open (ADR-2633 section 2).
+/// caches are full already reaches the mark, so the gate would never open
+/// (ADR-2633 section 2). The ingest buffer ceiling is not part of the check:
+/// its fixed default against the budget floor would refuse every small
+/// default `all` process (ADR-2633, startup-check amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryGateMarkReached {
     /// `memory_hard_caps_bytes`: the two resolved cache ceilings.
     pub hard_caps_bytes: u64,
-    /// The bounded `--max-ingest-buffer-bytes` in `all` mode, else 0.
-    pub ingest_buffer_bytes: u64,
     pub high_water_bytes: u64,
     pub high_water_percent: u8,
     pub memory_budget_bytes: u64,
@@ -101,16 +107,11 @@ impl std::fmt::Display for MemoryGateMarkReached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the cache hard caps ({} bytes) plus the ingest buffer ceiling ({} bytes) total {} \
-             bytes, which reaches the memory gate's high-water mark ({} bytes, {}% of \
-             memory_budget_bytes {}): with the caches and the ingest buffer full the gate would \
-             never open. Lower --cache-max-bytes, --catalog-cache-max-bytes or \
-             --max-ingest-buffer-bytes, raise --memory-gate-high-water-percent, or pass \
-             --disable-memory-gate",
+            "the cache hard caps ({} bytes) reach the memory gate's high-water mark ({} bytes, \
+             {}% of memory_budget_bytes {}): with the caches full the gate would never open. \
+             Lower --cache-max-bytes or --catalog-cache-max-bytes, raise \
+             --memory-gate-high-water-percent, or pass --disable-memory-gate",
             self.hard_caps_bytes,
-            self.ingest_buffer_bytes,
-            self.hard_caps_bytes
-                .saturating_add(self.ingest_buffer_bytes),
             self.high_water_bytes,
             self.high_water_percent,
             self.memory_budget_bytes,
@@ -129,7 +130,8 @@ fn percent_of(budget: u64, percent: u8) -> u64 {
 /// Resolves the gate from its flags and the facts that turn it off. The off
 /// reasons are checked in the order the stamp's sources list them: gateway
 /// mode, a fallback budget, `--disable-memory-gate`, a build without
-/// jemalloc. An enabled gate whose mark the hard caps reach is refused.
+/// jemalloc. An enabled gate whose mark the cache hard caps reach is refused;
+/// the ingest buffer ceiling is stamped and not counted.
 pub fn resolve(
     flags: MemoryGateFlags,
     mode: Mode,
@@ -158,6 +160,10 @@ pub fn resolve(
         memory_budget_bytes: performance.memory_budget_bytes,
         interval_ms: flags.interval_ms,
         wait_ms: flags.wait_ms,
+        ingest_buffer_bytes: match (mode, ingest_buffer) {
+            (Mode::All, IngestByteBudgetLimit::Bounded(bytes)) => bytes,
+            _ => 0,
+        },
         source: SOURCE_DEFAULT,
     };
     if let Some(source) = off {
@@ -166,26 +172,9 @@ pub fn resolve(
     }
 
     let high_water_bytes = percent_of(performance.memory_budget_bytes, high_water_percent);
-    let ingest_buffer_bytes = match (mode, ingest_buffer) {
-        (Mode::All, IngestByteBudgetLimit::Bounded(bytes)) => bytes,
-        (Mode::All, IngestByteBudgetLimit::Unlimited) => {
-            tracing::warn!(
-                high_water_bytes,
-                "memory gate: --max-ingest-buffer-bytes is unlimited, so the mark was checked \
-                 against the cache caps alone; an ingest buffer that grows to the mark keeps the \
-                 gate closed"
-            );
-            0
-        }
-        _ => 0,
-    };
-    let held = performance
-        .memory_hard_caps_bytes
-        .saturating_add(ingest_buffer_bytes);
-    if held >= high_water_bytes {
+    if performance.memory_hard_caps_bytes >= high_water_bytes {
         return Err(MemoryGateMarkReached {
             hard_caps_bytes: performance.memory_hard_caps_bytes,
-            ingest_buffer_bytes,
             high_water_bytes,
             high_water_percent,
             memory_budget_bytes: performance.memory_budget_bytes,
@@ -396,7 +385,14 @@ pub fn start_sampler(gate: &MemoryGate, budget: Arc<MemoryBudget>) -> std::io::R
 fn run_sampler(budget: &MemoryBudget, high_water: u64, interval: Duration) {
     let mut read_resident = crate::mem_stats::read_resident;
     let mut purge = || {
-        crate::mem_stats::purge_arenas();
+        let report = crate::mem_stats::purge_arenas();
+        if report.arenas_purged == 0 {
+            tracing::warn!(
+                arenas_skipped = report.arenas_skipped,
+                "memory gate purge found no initialised arena to purge, so resident will not \
+                 fall; the purge still counts in ravel_memory_gate_purges_total"
+            );
+        }
     };
     let mut warned_unread = false;
     loop {
@@ -538,43 +534,24 @@ mod tests {
     }
 
     #[test]
-    fn hard_caps_and_the_ingest_ceiling_reaching_the_mark_are_refused() {
-        // Mark at 70% of 10 GiB = 7 GiB. Caps 3 GiB + ingest 4 GiB = 7 GiB.
+    fn the_hard_caps_reaching_the_mark_are_refused_and_the_ingest_ceiling_is_only_stamped() {
+        // Mark at 70% of 10 GiB = 7 GiB. Caps 3 GiB; an ingest ceiling of
+        // 4 GiB would reach the mark if it counted, and it does not.
         let all = performance(Mode::All, 10 * GIB, 2 * GIB, GIB);
-        let refused = resolve(
+        let gate = resolve(
             flags(),
             Mode::All,
             &all,
             IngestByteBudgetLimit::Bounded(4 * GIB),
             true,
         )
-        .expect_err("caps plus ingest reach the mark");
-        assert_eq!(refused.hard_caps_bytes, 3 * GIB);
-        assert_eq!(refused.ingest_buffer_bytes, 4 * GIB);
-        assert_eq!(refused.high_water_bytes, 7 * GIB);
-        let message = refused.to_string();
-        assert!(
-            message.contains(&format!("total {} bytes", 7 * GIB)),
-            "{message}"
-        );
-        assert!(
-            message.contains(&format!("high-water mark ({} bytes", 7 * GIB)),
-            "{message}"
-        );
+        .expect("the ingest ceiling is outside the check");
+        assert!(gate.enabled);
+        assert_eq!(gate.ingest_buffer_bytes, 4 * GIB);
 
-        // One byte under the mark is accepted.
-        resolve(
-            flags(),
-            Mode::All,
-            &all,
-            IngestByteBudgetLimit::Bounded(4 * GIB - 1),
-            true,
-        )
-        .expect("one byte under the mark");
-
-        // Outside `all` mode the ingest ceiling does not count.
+        // Outside `all` mode the ingest ceiling is not stamped either.
         let query = performance(Mode::Query, 10 * GIB, 2 * GIB, GIB);
-        resolve(
+        let gate = resolve(
             flags(),
             Mode::Query,
             &query,
@@ -582,8 +559,9 @@ mod tests {
             true,
         )
         .expect("query mode holds no ingest buffer");
+        assert_eq!(gate.ingest_buffer_bytes, 0);
 
-        // The caps alone reaching the mark are refused too.
+        // The caps reaching the mark are refused, naming both figures.
         let tight = performance(Mode::Query, 10 * GIB, 4 * GIB, 3 * GIB);
         let refused = resolve(
             flags(),
@@ -593,7 +571,28 @@ mod tests {
             true,
         )
         .expect_err("caps reach the mark");
-        assert_eq!(refused.ingest_buffer_bytes, 0);
+        assert_eq!(refused.hard_caps_bytes, 7 * GIB);
+        assert_eq!(refused.high_water_bytes, 7 * GIB);
+        let message = refused.to_string();
+        assert!(
+            message.contains(&format!("cache hard caps ({} bytes)", 7 * GIB)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("high-water mark ({} bytes", 7 * GIB)),
+            "{message}"
+        );
+
+        // One byte under the mark is accepted.
+        let under = performance(Mode::Query, 10 * GIB, 4 * GIB, 3 * GIB - 1);
+        resolve(
+            flags(),
+            Mode::Query,
+            &under,
+            IngestByteBudgetLimit::Unlimited,
+            true,
+        )
+        .expect("one byte under the mark");
 
         // An off gate checks nothing.
         resolve(

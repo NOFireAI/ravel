@@ -165,6 +165,7 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         memory_budget_bytes: 100,
         interval_ms: 10,
         wait_ms: memory_gate::DEFAULT_WAIT_MS,
+        ingest_buffer_bytes: 0,
         source: memory_gate::SOURCE_FLAG,
     };
     let budget = running.process_memory_budget();

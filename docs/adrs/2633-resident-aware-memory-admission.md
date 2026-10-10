@@ -277,9 +277,10 @@ peak of about 21.7 GB on a 30 GB host.
 The percentage applies to the budget, not the host, because the budget is the
 figure the operator chose and the acceptance test is stated against. A
 startup check refuses a configuration where the cache hard caps plus, in
-`all` mode, the ingest buffer ceiling reach the mark: those sit inside
-`resident`, and with them full the gate would never open. At the defaults the
-caps are 30 % of the budget (45 % on a loopback store), well under 70 %.
+`all` mode, the ingest buffer ceiling reach the mark (the startup-check
+amendment below drops the ingest term): those sit inside `resident`, and
+with them full the gate would never open. At the defaults the caps are 30 %
+of the budget (45 % on a loopback store), well under 70 %.
 
 The gate is off, and the stamp says why, when there is no budget to take a
 fraction of (`--mode gateway`, or a budget that resolved from the fallback),
@@ -517,7 +518,9 @@ below.
 
 An `all`-mode process counts its ingest buffers inside `resident`, so heavy
 ingest can close the gate on queries. The startup check keeps the ingest
-ceiling under the mark; it does not reserve room for queries beside it.
+ceiling under the mark (no longer: see the startup-check amendment below,
+which stamps the ceiling and does not count it); it does not reserve room
+for queries beside it.
 
 ### Pre-registered acceptance test
 
@@ -655,3 +658,28 @@ ravel-sql, ravel-query, ravel-catalog, ravel-server)
 - The scaled and M1-shaped runs above, pre-registered on the issue before the
   first run, with the stamps listed.
 - Acceptance: the pass criteria above, quoted with their measured figures.
+
+## Amendment (2026-10-10, #2730): the startup check compares the cache caps alone
+
+<!-- amendment-applies: sections="2. A forced purge at the high-water mark, and the default mark|Consequences" pointer="startup-check amendment" -->
+<!-- amendment-supersedes: phrase="the ingest buffer ceiling reach the mark" pointer="startup-check amendment" -->
+<!-- amendment-supersedes: phrase="The startup check keeps the ingest ceiling under the mark" pointer="startup-check amendment" -->
+
+Section 2 had the startup check add the `all`-mode ingest buffer ceiling to
+the cache hard caps, and justified the check against the caps alone ("30 %
+of the budget, well under 70 %"). The ingest term breaks that justification:
+`--max-ingest-buffer-bytes` defaults to a fixed 512 MiB while the budget has
+a 1 GiB floor, so at the defaults the check fires whenever
+`0.30 B + 512 MiB >= 0.70 B`, which is every budget of 1.28 GiB or less
+(2 GiB on a loopback store, where the caps are 45 %). A 2 GiB host, or any
+host whose available memory resolves to the floor, would refuse to start a
+default `all` process.
+
+Decision: the check compares `memory_hard_caps_bytes` alone against the
+mark. The ingest buffer ceiling is stamped on the `memory gate resolved`
+line (`ingest_buffer_bytes`, with `ingest_buffer_in_mark_check=false`) and
+not counted. The ingest buffer has its own ledger in `ravel-ingest` and does
+not pass through `MemoryBudget::try_reserve`, so a closed gate never
+throttles it: in `all` mode heavy ingest can hold the gate closed, which
+section 2's Consequences already state. The refusal message names the caps,
+the mark and the budget.
