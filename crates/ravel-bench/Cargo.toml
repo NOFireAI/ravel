@@ -85,6 +85,9 @@ stats_alloc = "0.1.10"
 # `futures` reuse the workspace pins already used by ravel-object-store.
 arrow = { workspace = true, optional = true }
 parquet = { version = "59", optional = true, features = ["async", "object_store"] }
+# `sql-latency` activates `parquet` too, for the ClickBench Parquet fixture
+# writer (`src/clickbench_parquet/fixture.rs`): datafusion 55 shares this
+# parquet major, so its arrow types unify with the ones the lane queries.
 # The read-side Parquet reader is driven through the `object_store` version
 # `parquet` itself depends on (0.13), NOT the workspace pin (0.14), so the
 # counting wrapper implements the same `ObjectStore` trait the async reader
@@ -95,7 +98,7 @@ futures = { workspace = true, optional = true }
 # Gated behind `flight-egress` (off by default). The egress bench
 # drives the real Flight SQL service and the JSON encoder in-process, so it
 # links ravel-sql with its `flight-sql` feature (which pulls datafusion, arrow
-# 58, and arrow-flight) plus the transport types the DoGet path speaks.
+# 59, and arrow-flight) plus the transport types the DoGet path speaks.
 # ravel-sql is an internal path crate not yet listed in the workspace
 # `[workspace.dependencies]`, so it is named by path here; every other dep
 # below reuses a workspace pin.
@@ -122,31 +125,17 @@ arrow-flight = { workspace = true, optional = true }
 # the real physical plan (`displayable`, `ExecutionPlan::output_partitioning`)
 # to record what each swept combination actually did, so it needs datafusion in
 # scope. Not a new external crate to the workspace: ravel-sql already pins and
-# links datafusion 54 with the same version/features, so feature unification
+# links datafusion 55 with the same version/features, so feature unification
 # resolves this to that same instance rather than a second copy.
-datafusion = { version = "54", default-features = false, features = ["sql"], optional = true }
-# Gated behind `sql-latency`. The ClickBench Parquet fixture writer
-# (`src/clickbench_parquet/fixture.rs`) writes the synthetic corpus with
-# parquet's own `ArrowWriter`, independent of any table-read path. Named
-# `parquet58` (not `parquet`) because the crate already has a `parquet`
-# optional dependency pinned to major 59 under `parquet-baseline`; Cargo does
-# not allow two dependency entries on the same package name, and the two
-# majors serve different lanes. Pinned to major 58 so its arrow types unify
-# with the one `datafusion` 54 (and so `sql-latency`) already links, rather
-# than pulling a second arrow instance into this feature. Not a new external
-# crate: `parquet` 58.4.0 already resolves in the workspace lockfile via
-# `datafusion-datasource-parquet`.
-parquet58 = { package = "parquet", version = "58", default-features = false, features = [
-    "arrow",
-], optional = true }
+datafusion = { version = "55.2", default-features = false, features = ["sql"], optional = true }
 # Gated behind `sql-latency`. The ClickBench Parquet lane's reference engine
 # (`src/clickbench_parquet/engine.rs`) registers the fixture directly as a
 # DataFusion `ListingTable` over `ParquetFormat`, independent of any Ravel
 # read path. It still links the same DataFusion build as Ravel; the
 # `reference` module doc in that file says what it does and does not catch.
 # Not a new external crate: this already resolves in
-# the workspace lockfile at 54.1.0, the same version `ravel-parquet` links.
-datafusion-datasource-parquet = { version = "54", default-features = false, optional = true }
+# the workspace lockfile at the version `ravel-parquet` links.
+datafusion-datasource-parquet = { version = "55.2", default-features = false, optional = true }
 # Gated behind `sql-latency`. The logs scan-partitioning scaling bench
 # (`logs_scan_scaling`) wires ADR-0046's read cache into `LogSegmentFetcher` so
 # it can report the object-store request count with and without the cache's
@@ -207,7 +196,7 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet58", "dep:ravel-pqtable", "dep:ravel-memory", "dep:datafusion-datasource-parquet"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet", "dep:ravel-pqtable", "dep:ravel-memory", "dep:datafusion-datasource-parquet"]
 # The `sql_latency_bench --flight` lane (issue #680): the same corpus executed
 # through a running `ravel-server`'s Flight SQL endpoint instead of an
 # in-process executor. Off by default. No new external crate: `arrow-flight`

@@ -78,14 +78,15 @@ and stays conformant.
 ## Score
 
 - Supported and covered: 58
-- Intentionally rejected: 68
+- Intentionally rejected: 71
 - Unclassified / broken: 0
-- **Conformance: 126 / 126 = 100.0%**
+- **Conformance: 129 / 129 = 100.0%**
 
 ## Conformance table
 
 | Category | Construct | Example | State | Evidence | Rationale |
 | --- | --- | --- | --- | --- | --- |
+| Aggregate | `any_value` | `SELECT any_value(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
 | Aggregate | `approx_distinct` | `SELECT approx_distinct(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
 | Aggregate | `approx_median` | `SELECT approx_median(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
 | Aggregate | `approx_percentile_cont` | `SELECT approx_percentile_cont(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
@@ -168,7 +169,9 @@ and stays conformant.
 | Scalar function | `current_time` | `SELECT current_time FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
 | Scalar function | `current_timestamp` | `SELECT current_timestamp FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
 | Scalar function | `encode` | `SELECT encode('a', 'hex') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | encoding family representative: hex of the byte 0x61 = '61' |
+| Scalar function | `file_row_index` | `SELECT file_row_index() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
 | Scalar function | `has_word` | `SELECT count(*) FROM logs WHERE has_word(body, '1')` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
+| Scalar function | `input_file_name` | `SELECT input_file_name() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
 | Scalar function | `label` | `SELECT label(labels, '__name__') FROM samples WHERE value = 3.0` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
 | Scalar function | `label_match` | `SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
 | Scalar function | `length` | `SELECT length('résumé') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | character count, not byte count: 'résumé' is 6 characters but 7 bytes (the 'é's are two-byte UTF-8) |

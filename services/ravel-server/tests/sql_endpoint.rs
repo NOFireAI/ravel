@@ -4308,11 +4308,9 @@ async fn a_dropped_request_future_records_the_cost_it_incurred() {
 /// `DictionaryHandling::Resend`), every value assertion would still pass while
 /// the optimisation silently had nothing to key on.
 ///
-/// arrow-flight carries arrow 58 and this crate's `arrow` dev-dependency is the
-/// workspace 59 pin, so the decoded batch's `DataType` is compared by its
-/// `Debug` form rather than a cross-major `==`. The plain-form values are
-/// asserted over the HTTP JSON surface, which renders the same dictionary column
-/// as plain strings.
+/// The decoded batch's `DataType` is compared by its `Debug` form. The
+/// plain-form values are asserted over the HTTP JSON surface, which renders
+/// the same dictionary column as plain strings.
 #[cfg(feature = "flight-sql")]
 mod flight_wire {
     use std::net::SocketAddr;

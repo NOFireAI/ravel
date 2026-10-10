@@ -397,9 +397,9 @@ async fn start_server(
     .expect("server starts")
 }
 
-/// Decode `DoGet`'s messages into this crate's arrow by re-framing them as an
-/// IPC stream (arrow-flight carries a different arrow major, so its batches
-/// cannot be compared with this crate's types directly).
+/// Decode `DoGet`'s messages into a batch by re-framing them as an IPC stream
+/// and reading it with this crate's arrow, independent of arrow-flight's own
+/// decoder.
 fn to_batch(messages: &[FlightData]) -> arrow::record_batch::RecordBatch {
     let mut ipc: Vec<u8> = Vec::new();
     for message in messages {

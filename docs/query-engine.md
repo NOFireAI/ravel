@@ -4142,9 +4142,9 @@ keeps the later-arriving group, and the unbounded sort's own tie-break is
 arrival-order dependent too; SQL leaves that order unspecified.
 
 On the test fixture (200,000 distinct keys, `ORDER BY max(ts) DESC LIMIT 10`)
-`peakIntermediateBytes` is 1,706,120 with the rule installed against 10,748,928
+`peakIntermediateBytes` is 1,706,120 with the rule installed against 9,438,720
 without it. Across a tenfold increase in distinct keys the rule-off figure grows
-9.4x and the rule-on figure 1.62x, and the residual growth on the rule-on side
+8.26x and the rule-on figure 1.62x, and the residual growth on the rule-on side
 is the scan's own batches rather than aggregate state. The statement orders by
 `ts`, a fixed non-nullable column, rather than a typed attribute column: a
 typed attribute column is always nullable and the ordering-input conjunct
@@ -4590,7 +4590,7 @@ arrival order varies.
 
 A declared `Str` column reaches Arrow as `Dictionary(Int32, Utf8)` (ADR-0099
 decision 5). That is the type a client receives, and it is deliberately not the
-type the engine groups on. DataFusion 54 has no specialized group-value table
+type the engine groups on. DataFusion 55 has no specialized group-value table
 for `Dictionary`: it is absent from both the single-column dispatch in
 `aggregates::group_values::new_group_values` and the `supported_type` list the
 multi-column `GroupValuesColumn` is built from, so a `GROUP BY` over one falls

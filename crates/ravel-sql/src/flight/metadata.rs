@@ -151,7 +151,7 @@ fn build_sql_info() -> Result<SqlInfoData, FlightError> {
     let mut builder = SqlInfoDataBuilder::new();
     builder.append(SqlInfo::FlightSqlServerName, "Ravel");
     builder.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
-    builder.append(SqlInfo::FlightSqlServerArrowVersion, "58");
+    builder.append(SqlInfo::FlightSqlServerArrowVersion, "59");
     // The read-only invariant, restated where a driver can read it.
     builder.append(SqlInfo::FlightSqlServerReadOnly, true);
     builder.append(
