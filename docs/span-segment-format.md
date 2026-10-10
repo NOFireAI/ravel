@@ -479,10 +479,12 @@ writer:
 - the section is mandatory (v5) and sits between BLOCKS and SKIP_IDX, the
   RLOG placement, so the suffix probe that covers the footer, BLOOM and
   SKIP_IDX (a reader choice, as RLOG's probe length is) never has to span
-  the bucket frames. A `trace_id =` lookup then issues one ranged GET for the
-  KEY_IDX header and directory (about 1 KB at `bucket_bits = 8`) and one for
-  the bucket it needs; the footer's section entry gives the offsets, so
-  neither GET depends on adjacency. A read that is not a `trace_id` lookup
+  the bucket frames. A `trace_id =` lookup then issues one ranged GET for
+  `[0, min(len, 64 KiB))` of the section, sized from the footer's section
+  entry (the one-field header and directory are about 1 KB at `bucket_bits
+  = 8`, so that read also carries the first buckets), and one for the
+  bucket it needs when that bucket lies beyond the first read; neither GET
+  depends on adjacency. A read that is not a `trace_id` lookup
   never touches the section.
 
 A `trace_id =` lookup probes KEY_IDX after the SKIP_IDX range test and

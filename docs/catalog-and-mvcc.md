@@ -933,7 +933,7 @@ object; a header, directory or frame crc32c mismatch; `bucket_bits` outside
 1..=16; a directory whose ends are not non-decreasing or whose last end
 differs from `body_len`; a frame whose decompressed length is not the sum of
 its entries' encodings or whose `entry_count` disagrees; an entry ordinal at
-or past the part's `entry_count`; a `key8` outside the leaf's slice; a
+or past the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `key8` that does not mix to the bucket it sits in; unsorted or duplicate
 `(key8, entry ordinal)` pairs; a block delta list that is empty or that
 overflows `u32`. The body ceiling is
@@ -960,24 +960,22 @@ the live leaves and the next fold rebuilds them from the sections; the
 lookup stays correct throughout, and the cost is silent. No HEAD field can
 constrain such a folder (it predates every field here, and the fold builds
 HEAD as a fresh struct, so an unknown field does not survive its CAS), so
-the guard sits in the sweeper, which ships in the same change as the first
-leaf writer: before deleting an `idx/*.kidx` object past the protection
-horizon it reads the leaf header's `part_blake3`; if HEAD names a live part
-with that hash and no `key_index` ref for the leaf's field, the leaf is
-orphaned by an old folder, is kept, and is counted in
-`ravel_catalog_sweep_orphaned_leaves_total`. A leaf whose `part_blake3`
-names no live part is swept as before. There is no automatic re-attach: a
-kept leaf is never read again, and the part is re-indexed by the next fold
-that re-encodes it (a compaction, an erasure rewrite or a retention
-change), after which the kept leaf names no live part and is swept like
-any other. Until then the part reads as uncovered for that field and is
-scanned, so the cost of a bad rollout is one extra rebuild per affected
-part when it is next re-encoded, never a whole-tenant backfill, and the
-fold's scope rule above holds without exception. The fold report counts
-leaves written per fold, so a fold that writes leaves for parts it did not
-re-encode is a figure outside its band. The mixed-version combinations
-(old folder then new sweeper, old sweeper against a new HEAD, new folder
-after an old folder) are tested, not assumed (ADR-0849 section 1a).
+and the sweeper does not special-case the leaves it strips: a kept leaf
+that nothing re-attaches is never read again and costs its bytes for the
+life of the part, so `.kidx` objects are swept exactly as `.cstat` objects
+are, when HEAD does not name them past the protection horizon. The
+affected parts read as uncovered for that field and are scanned (the
+ADR-0849 safety lemma), and each is re-indexed by the next fold that
+re-encodes it (a compaction, an erasure rewrite or a retention change).
+The cost of a bad rollout is one rebuild per part when it is next
+re-encoded and scans until then, never a whole-tenant backfill and nothing
+retained; the fold's scope rule above holds without exception. It is
+detected rather than prevented: `ravel_catalog_sweep_deleted_total{kind="kidx"}`
+rising while HEAD carries no `key_index` refs is the signature, and the
+next new-format fold's leaves-written count names the parts. The
+mixed-version combinations (old folder then new sweeper, old sweeper
+against a new HEAD, new folder after an old folder) are tested, not
+assumed (ADR-0849 section 1a).
 
 ### Idempotency marker body layout
 

@@ -178,10 +178,15 @@ POSTINGS carries one.
   offset and bucket area, all under a header crc32c. The writer lays every
   field's directory directly after the header in field order and every
   bucket area after them, and `prefix_len` names the end of the last
-  directory, so a probe's first ranged GET, `[0, prefix_len)`, holds the
-  header and every directory for any conformant writer; a directory or
-  bucket area on the wrong side of `prefix_len` is `Corrupted`. Readers
-  still address by the header's offsets, never by adjacency. **The indexed set is written here and never
+  directory. The writer keeps `prefix_len` at or below a fixed
+  `KEY_IDX_PREFIX_MAX` of 64 KiB (lowering `bucket_bits` for the object if
+  64 fields at 8 bits would exceed it), so a probe's first ranged GET is
+  `[0, min(len, 64 KiB))`, sized from the footer's section entry with no
+  section byte read first, and holds the header and every directory for any
+  conformant writer: at most two GETs per probe, and one when the section
+  fits in the first read. A `prefix_len` above the constant, or a directory
+  or bucket area on the wrong side of it, is `Corrupted`. Readers still
+  address by the header's offsets, never by adjacency. **The indexed set is written here and never
   inferred from live config at read time** (ADR-0849 section 3): a field the
   header does not name is uncovered in this object for that field.
 
@@ -339,21 +344,23 @@ flowchart LR
     predates this change strips field 8 from every part it carries
     forward; no HEAD field can constrain it (it predates every field here,
     and the fold rebuilds HEAD as a fresh prost struct, so a stamp would
-    not survive its CAS). The guard is in the sweeper: a leaf whose
-    `part_blake3` names a live part with no `key_index` ref for its field
-    is kept and counted (`ravel_catalog_sweep_orphaned_leaves_total`),
-    not swept. There is no automatic re-attach: a kept leaf is never read
-    again, and the part is re-indexed by the next fold that re-encodes it
-    (a compaction, an erasure rewrite, or a retention change), after which
-    the kept leaf no longer names a live part and is swept like any other.
-    Until then the part reads as uncovered for that field and is scanned,
-    which is the safety lemma's outcome, and the cost after a bad rollout
-    is one extra rebuild per affected part, not a backfill. The fold
-    report counts leaves written per fold, so a fold that rebuilds parts
-    it did not re-encode is a figure outside its band. The mixed-version
-    combinations (old folder then new sweeper, old sweeper against a new
-    HEAD, new folder after an old folder) are a required test of the
-    guard, not an intention.
+    not survive its CAS), and the sweeper does not special-case the
+    leaves it strips: with no re-attach, a kept leaf buys nothing a reader
+    can use and costs its bytes for the life of the part, so the sweeper
+    treats a `.kidx` exactly as it treats a `.cstat`, deleting what HEAD
+    does not name past the protection horizon. After such a folder runs,
+    every affected part reads as uncovered for that field and is scanned,
+    which is the safety lemma's outcome, and the part is re-indexed by the
+    next fold that re-encodes it. The cost of a bad rollout is therefore
+    the same as the cost of never having folded with leaves: one rebuild
+    per part when it is next re-encoded, and scans until then; no backfill
+    and nothing retained. It is detected, not prevented:
+    `ravel_catalog_sweep_deleted_total{kind="kidx"}` rising while HEAD
+    carries no `key_index` refs is the signature, and the fold report's
+    leaves-written count on the next new-format fold names the parts
+    affected. The mixed-version combinations (old folder then new sweeper,
+    old sweeper against a new HEAD, new folder after an old folder) are a
+    required test, not an intention.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
   an unsupported version treating the leaf as absent (ADR-0849 section 4).
