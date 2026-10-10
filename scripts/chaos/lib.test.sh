@@ -238,6 +238,26 @@ check "kill timing: flush seen but export acked is mid-flush=no" "KILL-TIMING: m
   "$(kill_timing_line 1 1 3 4 | cut -d' ' -f1-2)"
 check "kill timing: no flush seen is mid-flush=no" "KILL-TIMING: mid-flush=no" \
   "$(kill_timing_line 0 0 3 3 | cut -d' ' -f1-2)"
+timing_for_rc() { kill_timing_line 1 "$(chaos_inflight_answered "$1")" 3 4 | cut -d' ' -f1-2; }
+check "kill timing: curl exit 22 (HTTP error answered) is mid-flush=no" "KILL-TIMING: mid-flush=no" \
+  "$(timing_for_rc 22)"
+check "kill timing: curl exit 52 (empty reply) is mid-flush=yes" "KILL-TIMING: mid-flush=yes" \
+  "$(timing_for_rc 52)"
+check "kill timing: curl exit 56 (connection reset) is mid-flush=yes" "KILL-TIMING: mid-flush=yes" \
+  "$(timing_for_rc 56)"
+check "kill timing: curl exit 0 (acknowledged) is mid-flush=no" "KILL-TIMING: mid-flush=no" \
+  "$(timing_for_rc 0)"
+check "kill timing: no commit token (exit 1, answered) is mid-flush=no" "KILL-TIMING: mid-flush=no" \
+  "$(timing_for_rc 1)"
+check "unanswered curl codes" "7 18 28 52 55 56" "${CHAOS_CURL_UNANSWERED_CODES[*]}"
+scenario1_line() { grep -n -m1 -F -- "$1" "${CHAOS_DIR}/kill-ingest-flush.sh" | cut -d: -f1; }
+detect_line="$(scenario1_line 'if wait_for_flush_started')"
+first_kill_line="$(scenario1_line 'sigkill_pid "$SERVER_PID"')"
+check "scenario 1 sends the SIGKILL on the line after the detecting poll" "yes" \
+  "$([[ -n "${detect_line}" && "${first_kill_line:-0}" -eq $(( detect_line + 2 )) ]] && echo yes || echo no)"
+check "scenario 1 scrapes no flush count after the detection" "0" \
+  "$(awk -v d="${detect_line:-0}" 'NR > d && index($0, "flush_attempts \"$BASE_URL\"") { n++ } END { print n + 0 }' \
+    "${CHAOS_DIR}/kill-ingest-flush.sh")"
 scenario1_body="$(cat "${CHAOS_DIR}/kill-ingest-flush.sh")"
 check "scenario 1 prints the kill-timing line on stdout" "yes" \
   "$([[ "${scenario1_body}" == *$'\necho "$KILL_TIMING"\n'* ]] && echo yes || echo no)"
@@ -309,37 +329,113 @@ workers_line="$(scenario2_line 'start_worker "$WORKER_A_HTTP"')"
 check "scenario 2 stops ingest, reads the margin, waits, then starts workers" "yes" \
   "$([[ -n "${stop_line}" && "${stop_line}" -lt "${margin_line:-0}" && "${margin_line}" -lt "${wait_line:-0}" && "${wait_line}" -lt "${workers_line:-0}" ]] && echo yes || echo no)"
 
+# The seal wait's input is the time the ingest server has exited, not the last
+# successful ack: a write answered 503 Abandoned, or the shutdown flush, can
+# land after that ack. A last ack at 03:59:50 and an exit at 04:00:05 seal an
+# hour later than the ack alone would.
+ACK_035950=1791604790
+EXIT_040005=1791604805
+check "seal input: last ack 03:59:50 alone would seal at 05:22:00" "${SEALED_0522}" \
+  "$(chaos_sealed_at_unix_s "${ACK_035950}" 4800 120)"
+check "seal input: exit 04:00:05 seals at 06:22:00" "${SEALED_0622}" \
+  "$(chaos_sealed_at_unix_s "${EXIT_040005}" 4800 120)"
+reaped_line="$(scenario2_line 'wait "$INGEST_PID"')"
+exit_stamp_line="$(scenario2_line 'INGEST_EXIT_UNIX_S="$(chaos_now_unix_s)"')"
+sealed_from_exit_line="$(scenario2_line 'SEALED_AT="$(chaos_sealed_at_unix_s "$INGEST_EXIT_UNIX_S"')"
+check "scenario 2 stamps the ingest exit after reaping it and seals from that stamp" "yes" \
+  "$([[ -n "${reaped_line}" && "${reaped_line}" -lt "${exit_stamp_line:-0}" && "${exit_stamp_line}" -lt "${sealed_from_exit_line:-0}" ]] && echo yes || echo no)"
+check "scenario 2 never seals from the last ack" "0" \
+  "$(grep -c -F 'chaos_sealed_at_unix_s "$LAST_ACK_UNIX_S"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+
 # ---------------------------------------------------------------------------
 # Scenario 2's conservation verdict, with the could-not-measure guard. The
-# stubbed /metrics serves conservation aborts 1, the baseline passed here.
+# stubbed /metrics serves conservation aborts 1: a baseline of 1 is no rise,
+# a baseline of 0 is a rise.
 # ---------------------------------------------------------------------------
 
+# Modelled on tracing's default fmt output for publish.rs:331 and the pass
+# line in services/ravel-server/src/maintain.rs.
+PUB_LINE='2026-10-10T05:30:00Z  INFO ravel_maintain::publish: compaction record published key=k parts=1'
+pass_line() { printf '2026-10-10T05:30:0%sZ  INFO ravel_server::maintain: maintenance: retention + compaction pass complete tenant=ab signal=Metrics shard=%s retired=0 compacted=%s already_done=0 not_sealed=0\n' "$1" "$1" "$2"; }
 LOG_PUBLISHED="${SCRATCH}/published.log"
 LOG_SILENT="${SCRATCH}/silent.log"
-printf '2026-10-10T05:30:00Z  INFO ravel_maintain::publish: compaction record published shard=0\n' >"${LOG_PUBLISHED}"
+LOG_A_FINISHED="${SCRATCH}/a-finished.log"
+LOG_A_UNIT2="${SCRATCH}/a-unit2.log"
+printf '%s\n' "${PUB_LINE}" >"${LOG_PUBLISHED}"
 printf '2026-10-10T05:30:00Z  INFO ravel_maintain: maintain pass compacted=0\n' >"${LOG_SILENT}"
-cons() { rc_of oracle_conservation_or_unmeasured "$1" "$2" http://stub 1 "$3"; }
-check "classifier: not observed, A published is could-not-measure (3)" "3" \
-  "$(cons 0 "${LOG_PUBLISHED}" "${LOG_SILENT}")"
-check "classifier: observed, B published passes conservation" "0" \
-  "$(cons 1 "${LOG_SILENT}" "${LOG_PUBLISHED}")"
-check "classifier: observed, nothing published fails conservation" "1" \
-  "$(cons 1 "${LOG_SILENT}" "${LOG_SILENT}")"
-check "classifier: observed, A published, B silent still fails conservation" "1" \
-  "$(cons 1 "${LOG_PUBLISHED}" "${LOG_SILENT}")"
-check "classifier: not observed, A silent runs the oracle (B silent fails)" "1" \
-  "$(cons 0 "${LOG_SILENT}" "${LOG_SILENT}")"
-unmeasured_summary_rc() {
+# A published every unit it started: the pass ended after its publish.
+{ printf '%s\n' "${PUB_LINE}"; pass_line 0 1; pass_line 1 0; } >"${LOG_A_FINISHED}"
+# A published unit 1 and was still merging unit 2 at the kill: its pass had
+# not ended, so no pass line follows the publish.
+{ printf '%s\n' "${PUB_LINE}"; printf '2026-10-10T05:30:01Z  INFO ravel_server: other work\n'; } >"${LOG_A_UNIT2}"
+LOG_A_LATER_PUBLISH="${SCRATCH}/a-later-publish.log"
+{ printf '%s\n' "${PUB_LINE}"; pass_line 0 1; printf '%s\n' "${PUB_LINE}"; } >"${LOG_A_LATER_PUBLISH}"
+
+unfinished() { rc_of compaction_unfinished_in_log "$1"; }
+check "unfinished: no publish at all" "0" "$(unfinished "$(cat "${LOG_SILENT}")")"
+check "unfinished: a publish with no pass line after it" "0" "$(unfinished "${PUB_LINE}")"
+check "unfinished: a publish followed by a compacted>=1 pass line is finished" "1" \
+  "$(unfinished "$(cat "${LOG_A_FINISHED}")")"
+check "unfinished: a compacted=0 pass line after the publish does not finish it" "0" \
+  "$(unfinished "${PUB_LINE}"$'\n'"$(pass_line 0 0)")"
+check "unfinished: a publish with its pass still running" "0" \
+  "$(unfinished "$(cat "${LOG_A_UNIT2}")")"
+check "unfinished: a publish after the last finished pass" "0" \
+  "$(unfinished "$(cat "${LOG_A_LATER_PUBLISH}")")"
+check "unfinished: already_done=1 is not compacted=1" "0" \
+  "$(unfinished "${PUB_LINE}"$'\n''x maintenance: retention + compaction pass complete compacted=0 already_done=1')"
+check "unfinished: pass line read through ANSI colouring" "1" \
+  "$(unfinished "${PUB_LINE}"$'\n\e[32m INFO\e[0m maintenance: retention + compaction pass complete \e[3mcompacted\e[0m\e[2m=\e[0m2')"
+
+# Args: A's log, B's log, aborts baseline.
+cons() { rc_of oracle_conservation_or_unmeasured "$1" http://stub "${3:-1}" "$2"; }
+check "classifier: A finished its pass, B silent is could-not-measure (3)" "3" \
+  "$(cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
+check "classifier: B published passes conservation" "0" \
+  "$(cons "${LOG_SILENT}" "${LOG_PUBLISHED}")"
+check "classifier: nothing published fails conservation" "1" \
+  "$(cons "${LOG_SILENT}" "${LOG_SILENT}")"
+check "classifier: A published with no pass end, B silent fails conservation" "1" \
+  "$(cons "${LOG_PUBLISHED}" "${LOG_SILENT}")"
+check "classifier: A published unit 1, started unit 2, B silent fails conservation" "1" \
+  "$(cons "${LOG_A_UNIT2}" "${LOG_SILENT}")"
+check "classifier: B aborts rose (1 against 0), A finished, B silent fails" "1" \
+  "$(cons "${LOG_A_FINISHED}" "${LOG_SILENT}" 0)"
+check "classifier: B aborts rose (1 against 0), B published still fails" "1" \
+  "$(cons "${LOG_SILENT}" "${LOG_PUBLISHED}" 0)"
+check "classifier: unreadable aborts counter fails even when A finished" "1" \
+  "$(CURL_MODE=unreachable cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
+scenario2_summary() {
+  # Args: A's log, B's log, aborts baseline, an extra failure or "".
   ORACLE_PASS=(other)
   ORACLE_FAIL=()
   ORACLE_UNMEASURED=()
-  [[ -n "$1" ]] && ORACLE_FAIL=("$1")
-  oracle_conservation_or_unmeasured 0 "${LOG_PUBLISHED}" http://stub 1 "${LOG_SILENT}" >/dev/null 2>&1
-  rc_of print_oracle_summary scenario blocking
+  [[ -n "$4" ]] && ORACLE_FAIL=("$4")
+  oracle_conservation_or_unmeasured "$1" http://stub "$3" "$2" >/dev/null 2>&1
+  local rc=0
+  print_oracle_summary scenario blocking >"${SCRATCH}/summary.out" 2>&1 || rc=$?
+  printf 'rc=%s conservation-fail=%s\n' "${rc}" \
+    "$(grep -c '^  FAIL  conservation-holds' "${SCRATCH}/summary.out")"
 }
-check "summary: could-not-measure with nothing failed exits 3" "3" "$(unmeasured_summary_rc "")"
-check "summary: could-not-measure never hides a failure (exit 2)" "2" \
-  "$(unmeasured_summary_rc "no-orphaned-lease: detail")"
+check "summary: could-not-measure with nothing failed exits 3" "rc=3 conservation-fail=0" \
+  "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 1 "")"
+check "summary: could-not-measure never hides a failure (exit 2)" "rc=2 conservation-fail=0" \
+  "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 1 "no-orphaned-lease: detail")"
+check "summary: B aborts rose while A finished and published is exit 2, conservation FAIL" \
+  "rc=2 conservation-fail=1" "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 0 "")"
+check "summary: A started unit 2, B published nothing is exit 2" "rc=2 conservation-fail=1" \
+  "$(scenario2_summary "${LOG_A_UNIT2}" "${LOG_SILENT}" 1 "")"
+check "summary: A published every unit it started, B nothing is exit 3" "rc=3 conservation-fail=0" \
+  "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 1 "")"
+
+scenario2_body="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"
+universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"
+inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight')"
+first_a_kill_line="$(scenario2_line 'sigkill_pid "$WORKER_A_PID"')"
+check "scenario 2 checks the universe before the wait, and kills right after it" "yes" \
+  "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_a_kill_line:-0}" -eq $(( inflight_wait_line + 2 )) ]] && echo yes || echo no)"
+check "scenario 2 headers make no 'provably' claim" "no" \
+  "$([[ "${scenario2_body}" == *provabl* ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 # Fixture arguments reach gen_otlp_fixture, and none are added by default.

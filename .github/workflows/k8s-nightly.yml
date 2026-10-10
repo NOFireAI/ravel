@@ -187,7 +187,8 @@ jobs:
   # exit-code contract they declare themselves: scenario 1 exits 1 on a
   # pinned-oracle failure, scenario 2 exits 2 on any pinned-oracle failure (a
   # release-blocking bug, not a flaky test), and both exit 3 or more on a
-  # setup or usage error, with no oracle verdict. Each step names which of those it got in
+  # setup or usage error, with no oracle verdict; scenario 2's exit 3 also
+  # covers a run whose conservation could not be measured. Each step names which of those it got in
   # an error annotation, and a nonzero exit from either script fails this job.
   # The helpers both scripts rest on are covered on every pull request by
   # ci.yml's doc-scripts job (scripts/chaos/lib.test.sh).
@@ -276,6 +277,7 @@ jobs:
             0) ;;
             1) echo "::error::chaos scenario 2 unexpected exit 1 (a setup failure outside the ERR trap); no oracle verdict" ;;
             2) echo "::error::RELEASE-BLOCKING: chaos scenario 2 pinned-oracle failure (exit 2, ADR-0077 section 4)" ;;
+            3) echo "::error::chaos scenario 2 could not measure (exit 3); no oracle verdict. A RESULT: COULD NOT MEASURE line in the ORACLE SUMMARY names why; without one, setup failed before the oracle ran" ;;
             *) echo "::error::chaos scenario 2 setup or usage error (exit ${code}); no oracle verdict" ;;
           esac
           exit "$code"

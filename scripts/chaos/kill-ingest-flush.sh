@@ -22,10 +22,12 @@
 # lib.sh), so a size-, age- or manually-triggered flush all count. After the
 # strict-ack exports the scenario reads that count, sends one more, large,
 # export in the background, and SIGKILLs the server as soon as the count
-# rises. The kill landed mid-flush when that in-flight export was never
-# acknowledged; the scenario prints that verdict as a `KILL-TIMING:
-# mid-flush=yes|no` line before the oracle summary. With no rise within the
-# budget it kills anyway and warns.
+# rises, with no further scrape between the detecting poll and the kill. The
+# kill landed mid-flush when that in-flight export got no answer: its curl
+# exit code is one of CHAOS_CURL_UNANSWERED_CODES (lib.sh). An HTTP error
+# status (curl exit 22) is an answer and reads as not mid-flush. The scenario
+# prints that verdict as a `KILL-TIMING: mid-flush=yes|no` line before the
+# oracle summary. With no rise within the budget it kills anyway and warns.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
 # RustFS, driving load, or issuing a real kill. That is the only proof
@@ -192,32 +194,35 @@ INFLIGHT_PID=$!
 
 FLUSH_OBSERVED=0
 log "waiting for a flush to start (mid-flush trigger: flush attempts > ${FLUSH_BASELINE})"
+# The SIGKILL follows the detecting poll with no scrape in between: a flush
+# can finish in less time than one scrape takes.
 if wait_for_flush_started "$BASE_URL" "$FLUSH_BASELINE" 60; then
   FLUSH_OBSERVED=1
-  log "flush observed in flight -- issuing SIGKILL mid-flush"
+  sigkill_pid "$SERVER_PID"
+  log "flush observed in flight at ${CHAOS_FLUSH_ATTEMPTS_SEEN} attempts -- SIGKILL issued"
 else
-  log "no flush observed within budget; issuing SIGKILL anyway (writes still strict-acked)"
+  sigkill_pid "$SERVER_PID"
+  log "no flush observed within budget; SIGKILL issued anyway (writes still strict-acked)"
   echo "::warning::chaos scenario 1 killed the server without observing a flush in flight; this run did not exercise a mid-flush kill"
 fi
-ATTEMPTS_AT_KILL="$(flush_attempts "$BASE_URL")" || ATTEMPTS_AT_KILL=""
-[[ "$ATTEMPTS_AT_KILL" =~ ^[0-9]+$ ]] || ATTEMPTS_AT_KILL="unknown"
-sigkill_pid "$SERVER_PID"
 SERVER_PID=""
+ATTEMPTS_AT_DETECTION="${CHAOS_FLUSH_ATTEMPTS_SEEN:-unknown}"
 
-# The in-flight export ends once the server is gone. If it was acknowledged
-# before the kill took effect, it is an acked write like the others and the
-# kill did not land mid-flush.
+# The in-flight export ends once the server is gone. An exit code outside
+# CHAOS_CURL_UNANSWERED_CODES means the server answered it before the kill
+# (curl's 22 is an HTTP error status, 429 or 503 among them), so the kill did
+# not land mid-flush; a success is an acked write like the others.
 INFLIGHT_RC=0
 wait "$INFLIGHT_PID" || INFLIGHT_RC=$?
 INFLIGHT_PID=""
-INFLIGHT_ACKED=0
+INFLIGHT_ANSWERED="$(chaos_inflight_answered "$INFLIGHT_RC")"
+log "in-flight export exit code ${INFLIGHT_RC} (answered=${INFLIGHT_ANSWERED})"
 if [[ "$INFLIGHT_RC" -eq 0 && -s "$INFLIGHT_TOKENS_PATH" ]]; then
-  INFLIGHT_ACKED=1
   mapfile -t inflight_tokens < "$INFLIGHT_TOKENS_PATH"
   ACKED_TOKENS+=("${inflight_tokens[@]}")
   log "the in-flight export was acknowledged before the kill; its ${#inflight_tokens[@]} token(s) join the acked set"
 fi
-KILL_TIMING="$(kill_timing_line "$FLUSH_OBSERVED" "$INFLIGHT_ACKED" "$FLUSH_BASELINE" "$ATTEMPTS_AT_KILL")"
+KILL_TIMING="$(kill_timing_line "$FLUSH_OBSERVED" "$INFLIGHT_ANSWERED" "$FLUSH_BASELINE" "$ATTEMPTS_AT_DETECTION")"
 log "$KILL_TIMING"
 
 log "restarting ravel-server (post-kill instance)"

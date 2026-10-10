@@ -22,27 +22,35 @@
 # ordinary failure, and from >2 setup/usage errors) so the distinction is
 # legible to the ADR-0077 section 3 rehearsal record.
 #
-# MID-COMPACTION TRIGGER (named explicitly): the compaction lifecycle. A
-# compaction is observed in flight when a worker owns units
-# (ravel_maintain_units_owned >= 1) and its log has NOT yet emitted the
-# "compaction record published" line
-# (crates/ravel-maintain/src/publish.rs:200) for the current run. The SIGKILL
-# fires in that window, so the compaction is genuinely interrupted before its
-# record is published.
+# MID-COMPACTION TRIGGER (named explicitly): the compaction lifecycle as
+# worker A's log shows it. The SIGKILL fires once A owns a unit
+# (ravel_maintain_units_owned >= 1) and its log shows unfinished compaction
+# work: no "compaction record published" line
+# (crates/ravel-maintain/src/publish.rs:331) yet, or none of its
+# "maintenance: retention + compaction pass complete" lines with
+# compacted>=1 after the last one. No per-bucket start signal exists to read,
+# so this cannot tell a merge in progress from a pass still in its retention
+# or sweep work; see compaction_unfinished_in_log in lib.sh.
 #
 # SEAL WAIT: an ingest hour is compactable only once sealed, at the end of
 # the hour plus the catalog's seal margin (CatalogConfig::default(), logged
-# by the server as `seal_margin_secs=N`; 4800 s today). After the exports are
-# acknowledged the ingest server is stopped, so nothing writes into a later
-# hour, and the scenario sleeps until
-# (floor(last_ack / 3600) + 1) * 3600 + seal_margin + 120 s before starting
-# the maintain workers: up to about 2 h 22 min at the current margin.
+# by the server as `seal_margin_secs=N`; 4800 s today). After the exports the
+# ingest server is stopped with SIGTERM, so nothing writes into a later hour.
+# A write can still land after the last successful ack (a strict write
+# answered 503 `Abandoned` is stored by a later flush, see
+# docs/consistency-model.md, and the shutdown flushes too), so the
+# wait is measured from when the server has exited: the scenario sleeps
+# until (floor(exit / 3600) + 1) * 3600 + seal_margin + 120 s before starting
+# the maintain workers, up to about 2 h 22 min at the current margin.
 #
 # Exit status: 0 when every pinned oracle assertion held; 2 when any failed
 # (release-blocking); 3 on a setup error, when the server log carries no
-# parseable `seal_margin_secs=`, or when the kill provably missed the
-# compaction (worker A was not observed mid-compaction and had already
-# published its record) and no other assertion failed; 64 on a usage error.
+# parseable `seal_margin_secs=`, or when conservation could not be measured
+# and no other assertion failed. Could-not-measure means the survivor
+# published no compaction record, its conservation-abort counter did not
+# rise, and worker A's log at the kill shows its last publish followed by a
+# finished pass (oracle_conservation_or_unmeasured in lib.sh); 64 on a usage
+# error.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
 # RustFS, spawning workers, or issuing a real kill. That is the only proof
@@ -119,10 +127,10 @@ if [[ "$MODE" == "check" ]]; then
   echo "== kill-maintain-worker.sh --check (scenario 2: kill maintain worker mid-compaction) =="
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
-  echo "mid-compaction trigger marker: units_owned>=1 before '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
+  echo "mid-compaction trigger marker: units_owned>=1 and no '${CHAOS_COMPACTION_PASS_MARKER}' (compacted>=1) after the last '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
   echo "load: ${EXPORT_COUNT} exports of ${CHAOS_FIXTURE_SERIES} series x ${CHAOS_FIXTURE_POINTS} points"
-  echo "seal wait: end of last ack's hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
+  echo "seal wait: end of the ingest server's exit hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
   rc=0
   check_dependencies || rc=$?
   exit "$rc"
@@ -235,12 +243,15 @@ log "stopping the ingest server before the seal wait"
 kill "$INGEST_PID" 2>/dev/null || true
 wait "$INGEST_PID" 2>/dev/null || true
 INGEST_PID=""
+# Its last write, including any shutdown flush, is no later than its exit.
+INGEST_EXIT_UNIX_S="$(chaos_now_unix_s)"
+log "ingest server exited at unix ${INGEST_EXIT_UNIX_S} (last successful ack at unix ${LAST_ACK_UNIX_S})"
 
 SEAL_MARGIN_S="$(chaos_seal_margin_from_log "$(cat "$INGEST_LOG")")" || {
   log "the ingest server log carries no parseable 'seal_margin_secs=N' line (${INGEST_LOG}); cannot compute when the written hours seal"
   exit 3
 }
-SEALED_AT="$(chaos_sealed_at_unix_s "$LAST_ACK_UNIX_S" "$SEAL_MARGIN_S")"
+SEALED_AT="$(chaos_sealed_at_unix_s "$INGEST_EXIT_UNIX_S" "$SEAL_MARGIN_S")"
 log "seal_margin_secs=${SEAL_MARGIN_S} (from the ingest log), safety ${CHAOS_SEAL_SAFETY_SECONDS}s"
 chaos_wait_until_sealed "$SEALED_AT"
 
@@ -258,34 +269,35 @@ BREAKER_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_orphan_breaker_t
   || BREAKER_BASELINE=0
 [[ "${BREAKER_BASELINE%.*}" =~ ^[0-9]+$ ]] || BREAKER_BASELINE=0
 
-log "waiting for worker A to be mid-compaction"
-OBSERVED_MID_COMPACTION=0
-if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" 120; then
-  OBSERVED_MID_COMPACTION=1
-  log "worker A observed mid-compaction -- issuing SIGKILL"
-else
-  log "did not observe worker A mid-compaction within budget; killing anyway"
-  echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
-fi
-
 # The >= comparison in the two takeover oracles below only discriminates while
 # the store holds this scenario's tenant alone. See
 # `assert_single_tenant_universe` in lib.sh for why. Checked before the kill,
-# because a violated precondition otherwise reports PASS.
+# because a violated precondition otherwise reports PASS, and before the wait,
+# so nothing runs between the in-flight observation and the kill.
 assert_single_tenant_universe || true
 
+log "waiting for worker A to be mid-compaction"
 # Timestamp the kill so the takeover oracle can measure wall-clock against the
 # 3*H + tick bound. `date +%s` is the real clock ADR-0077 section 4 requires.
-KILL_EPOCH="$(date +%s)"
-sigkill_pid "$WORKER_A_PID"
+if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" 120; then
+  KILL_EPOCH="$(date +%s)"
+  sigkill_pid "$WORKER_A_PID"
+  log "worker A observed mid-compaction -- SIGKILL issued"
+else
+  KILL_EPOCH="$(date +%s)"
+  sigkill_pid "$WORKER_A_PID"
+  log "did not observe worker A mid-compaction within budget; SIGKILL issued anyway"
+  echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
+fi
 WORKER_A_PID=""
 
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
 oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
-# Worker A is dead, so its log is final: whether it published before the kill
-# decides whether the conservation oracle measured anything.
-oracle_conservation_or_unmeasured "$OBSERVED_MID_COMPACTION" "$WORKER_A_LOG" \
+# Worker A is dead, so its log is its state at the kill: whether it shows
+# unfinished compaction work decides whether a survivor that published
+# nothing is a failure or could not be measured.
+oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
   "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
 oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
