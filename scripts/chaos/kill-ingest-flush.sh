@@ -189,8 +189,8 @@ chaos_gen_fixture "$CHAOS_FIXTURE_SERIES" "$CHAOS_FIXTURE_POINTS" > "$INFLIGHT_F
 FLUSH_BASELINE="$(flush_attempts "$BASE_URL")" || FLUSH_BASELINE=""
 [[ "$FLUSH_BASELINE" =~ ^[0-9]+$ ]] || FLUSH_BASELINE=0
 log "flush attempts before the in-flight export: ${FLUSH_BASELINE}"
-( drive_one_export "$HTTP_ADDR" "$INFLIGHT_FIXTURE_PATH" > "$INFLIGHT_TOKENS_PATH" ) &
-INFLIGHT_PID=$!
+chaos_start_background_export "$HTTP_ADDR" "$INFLIGHT_FIXTURE_PATH" "$INFLIGHT_TOKENS_PATH"
+INFLIGHT_PID="$CHAOS_BG_EXPORT_PID"
 
 FLUSH_OBSERVED=0
 log "waiting for a flush to start (mid-flush trigger: flush attempts > ${FLUSH_BASELINE})"

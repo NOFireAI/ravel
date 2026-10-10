@@ -904,15 +904,25 @@ flush_attempts() {
 # Returns 0 on the rise, with the count that poll read in
 # CHAOS_FLUSH_ATTEMPTS_SEEN, so the caller can kill without another scrape;
 # 1 when the deadline passes first.
+# Run drive_one_export in the background with its stdout in a file, and set
+# CHAOS_BG_EXPORT_PID. The subshell drops the caller's ERR trap and errexit:
+# under the scenarios' `set -eE` and `trap 'exit 3' ERR`, a failing export
+# would otherwise exit 3, and `wait` would report 3 instead of curl's code.
+# Args: http_addr fixture_path out_path.
+chaos_start_background_export() {
+  ( trap - ERR; set +e; drive_one_export "$1" "$2" >"$3" ) &
+  CHAOS_BG_EXPORT_PID=$!
+}
+
 wait_for_flush_started() {
   local base_url="$1"
   local baseline="$2"
   local deadline_seconds="$3"
-  local polls=$(( deadline_seconds * CHAOS_FLUSH_POLLS_PER_SECOND ))
   local interval
   interval="$(awk -v n="$CHAOS_FLUSH_POLLS_PER_SECOND" 'BEGIN { printf "%.3f", 1 / n }')"
-  local i value
-  for (( i = 0; i < polls; i++ )); do
+  local start value
+  start="$(date +%s)"
+  while (( $(date +%s) - start < deadline_seconds )); do
     value="$(flush_attempts "$base_url")" || value=""
     if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -gt "$baseline" ]]; then
       CHAOS_FLUSH_ATTEMPTS_SEEN="$value"
@@ -1346,6 +1356,14 @@ oracle_conservation_or_unmeasured() {
   fi
   if [[ -r "$worker_a_log" ]]; then
     a_body="$(cat "$worker_a_log")"
+  fi
+  # With no publish in A's log there is no unit it can be shown to have been
+  # merging: it may have been mid-way through its first, or held nothing to
+  # compact. Its log cannot tell the two apart, so this is not a verdict.
+  if [[ "$a_body" != *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
+    ORACLE_UNMEASURED+=("${name}: could not measure: worker A published no compaction record before the kill, so its log cannot show an interrupted unit")
+    log "could not measure: worker A's log has no '${CHAOS_COMPACTION_PUBLISH_MARKER}' line, and the survivor published nothing after the kill"
+    return "$CHAOS_UNMEASURED_EXIT"
   fi
   if compaction_unfinished_in_log "$a_body"; then
     oracle_bad "$name" \
