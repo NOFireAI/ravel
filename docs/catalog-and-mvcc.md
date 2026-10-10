@@ -971,18 +971,25 @@ the regular fold, so the repair is explicit: `ravel-cli catalog fold
 scope rule above, re-encodes every part in HEAD that lacks a `key_index`
 ref for a declared field (every part, for spans), builds each leaf from
 the sections as the regular fold does, and reports parts rebuilt, leaves
-written, section bytes read and section GETs issued. Like the plain CLI
-fold it holds no claim and keeps no cursor: a run that stops is rerun and
-skips the parts that now carry a ref, and it takes `--writers-stopped` as
-the same assertion the plain fold takes. Detection: this sweep reports
+written, section bytes read and ranged GETs issued (footer suffix and
+section reads together). It publishes in batches: every `--batch-parts`
+parts (default 1,000) it runs one fold attempt whose single HEAD CAS
+carries the refs for that batch, so a run that stops or exhausts the CAS
+retries on one batch has published every earlier batch, loses at most that
+batch's `2 x 1,000` GETs, and leaves that batch's leaves unreferenced for
+this sweep; the rerun skips every part whose ref an earlier batch
+published. Like the plain CLI fold it holds no claim and keeps no cursor
+(HEAD is the cursor), and it takes `--writers-stopped` as the same
+assertion the plain fold takes. Detection: this sweep reports
 `CatalogSweepOutcome { deleted, kept }` with no per-kind split and no
 metric of its own today, so the leaf writer's change adds `deleted_kidx` to
 the outcome and renders it as
 `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
 rising while HEAD carries no `key_index` refs is the signature an operator
 acts on. The cost of a bad rollout is one rebuild run over the affected
-parts, `2 x entries` ranged GETs (a footer suffix and a section range per
-entry) plus the sections' bytes, and scans until it has run; nothing is
+parts, `2 x entries` ranged GETs in total (a footer suffix and a section
+range per entry, `2 x 1,000` per batch) plus the sections' bytes, and scans
+until it has run; nothing is
 retained and nothing is silent. The
 mixed-version combinations (old folder then new sweeper, old sweeper
 against a new HEAD, new folder after an old folder, then the rebuild) are

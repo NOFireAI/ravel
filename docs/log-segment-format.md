@@ -1725,7 +1725,10 @@ All violations are `Corrupted`, never panics:
 - key_idx (ADR-2707, proposed): header crc mismatch; `version` above the
   one the reader knows; `bucket_bits` outside 1 to 16; non-zero reserved
   bytes; `field_count` zero or over 64; field names not ascending or not
-  unique; an unknown `key_type`; a directory, bucket area or frame range
+  unique; an unknown `key_type`; a header `prefix_len` not equal to the
+  footer `Section` entry's copy, or a zero `prefix_len` on a kind-9
+  entry; a `dir_offset` outside `[0, prefix_len)` or a `buckets_offset`
+  below `prefix_len`; a directory, bucket area or frame range
   outside the section; `ends[]` decreasing or not ending at `buckets_len`;
   frames that do not tile the bucket area exactly; directory or frame crc
   mismatch; a decompressed length not equal to `entry_count x 12`; entries

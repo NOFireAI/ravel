@@ -84,7 +84,7 @@ v0.23 entry recipe), unfolded tenant, stock server.
 | figure | measured |
 |---|---|
 | distinct (UserID, 8,192-row block) pairs per object (offline, 411 objects of about 243,896 rows) | p50 49,899, max 165,431 |
-| implied tier-1 KEY_IDX size at about 10 B per entry | about 2% of object bytes (about 0.5 MB per 25 MB object) |
+| implied tier-1 KEY_IDX size at 12 B per entry (`key8` plus a `u32` block ordinal, before directories and header) | about 2% of object bytes (about 0.5 MB per 25 MB object) |
 | objects per UserID, p50 / p99 / max | 1 / 3 / 213 |
 | the q20 key | 4 rows, 1 object, 1 block |
 | cold wall (3 passes) | 3.23, 3.27, 5.21 s |
@@ -364,12 +364,22 @@ flowchart LR
     HEAD that lacks a `key_index` ref for a declared field (every part,
     for spans), builds the leaf from the sections as a regular fold would,
     and reports parts rebuilt, leaves written, section bytes read and
-    section GETs issued. Like the CLI fold it extends, it holds no claim
-    and keeps no cursor (`services/ravel-cli/src/catalog.rs` has neither;
-    a rebuild that stops is rerun and skips the parts that now carry a
-    ref, which is what makes it restartable), and it takes
-    `--writers-stopped` as the same assertion the plain fold takes, since
-    nothing in the CLI can detect a live writer. Detection: the
+    ranged GETs issued (the footer suffix and section reads together, the
+    figure the acceptance band counts). It publishes in batches: every
+    `--batch-parts` parts (default 1,000) it runs one fold attempt whose
+    single HEAD CAS carries the `key_index` refs for the parts that batch
+    rebuilt, so the fold's one-CAS-per-attempt rule holds and the run is
+    a sequence of attempts rather than one. That is what makes it
+    restartable: a run that stops, or that loses one batch's CAS to the
+    server's scheduled fold `MAX_HEAD_CAS_ATTEMPTS` times
+    (`FoldCasRetriesExhausted`), has published every earlier batch, loses
+    at most the current batch's `2 x 1,000` GETs, and leaves that batch's
+    leaves unreferenced for the catalog sweep; the rerun skips every part
+    whose ref an earlier batch published. Like the CLI fold it extends it
+    holds no claim and keeps no cursor (`services/ravel-cli/src/catalog.rs`
+    has neither; HEAD is the cursor), and it takes `--writers-stopped` as
+    the same assertion the plain fold takes, since nothing in the CLI can
+    detect a live writer. Detection: the
     unreferenced-catalog-object sweep reports `CatalogSweepOutcome
     { deleted, kept }` with no per-kind split today and no metric of its
     own (`ravel_maintain_objects_deleted_total` counts the per-shard data
@@ -379,8 +389,9 @@ flowchart LR
     rising while HEAD carries no `key_index` refs is the signature the
     operator acts on. The cost of a bad rollout is one rebuild run over the
     affected parts: per part entry, one footer suffix GET and one section
-    range GET, so `2 x entries` ranged GETs (about 160,000 on the Stage 0
-    spans load as written, about 1,600 at the decision 9 geometry) and the
+    range GET, so `2 x entries` ranged GETs in total, `2 x 1,000` per
+    batch at the default (about 160,000 on the Stage 0 spans load as
+    written, about 1,600 at the decision 9 geometry) and the
     sections' bytes (about 2% of logs bytes, about 6% of span bytes); the
     request figure is the one that decides viability, as the Context's
     566 s resolve shows, and both figures are banded in the acceptance
@@ -741,7 +752,7 @@ cache state) and stamped into the report.
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
 | T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), inspector | 3 | ravel-logseg, ravel-catalog (config), ravel-cli | yes |
-| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index`, `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
+| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index [--batch-parts N]` (one fold attempt and HEAD CAS per batch), `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
 | T10 spans read path: routing, tier 2, tier 1, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T12 Stage 1: the Stage 0 arms re-run against the table above, acceptance amendment | all | docs | no |
