@@ -514,13 +514,15 @@ private); `trace_block_span` becomes the SKIP_IDX-only convenience that
 calls it on its own run. The reader splits the intersection into maximal
 contiguous runs, calls `block_run_span` per run, issues one ranged GET per
 returned span, and decodes each with `decode_trace(&span, bytes)` as
-today. Spans of one trace sort contiguously (the object
-sorts by `(trace_id, start_ts)`), so the intersection is one run in every
-case but a prefix collision whose other trace sits between this trace's
-blocks, which yields two runs and two GETs. A prefix collision (two traces sharing 8 leading
-bytes) is thus at most one extra block read and at most one extra GET, and
-the per-row `trace_id` equality the reader already applies removes it from
-the result. An empty intersection with a present key is also legal and
+today. Under this format's sort order the intersection is always one run:
+the object sorts by `(trace_id, start_ts)`, every trace id that sorts
+between two ids sharing an 8-byte prefix shares that prefix too, so the
+records carrying one `key8` are one contiguous range and the blocks holding
+them one contiguous run, and the SKIP_IDX candidate set is contiguous for
+the same reason. The run splitting is therefore defensive, not required,
+and a prefix collision (two traces sharing 8 leading bytes) costs at most
+one extra block inside the same GET; the per-row `trace_id` equality the
+reader already applies removes it from the result. An empty intersection with a present key is also legal and
 yields no rows. `Corrupted` is reserved for the
 section's own checks (checksums, a block ordinal at or past the SKIP_IDX
 block count, unsorted or duplicate entries). The section

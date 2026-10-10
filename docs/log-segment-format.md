@@ -1322,6 +1322,9 @@ additive under ADR-0066's R1 rule, readers first), of type `I64`, `STR` or
 `TypedAttrColumnConfig.index_trace_id` is set. `BOOL` is never indexed. The
 writer receives that set (`RlogWriter::with_key_index_fields`) and **writes
 it into the section header; a reader never infers it from live config.** A
+declared field with no matching rows in the object is still named, with
+`entry_count = 0`, an all-zero directory and `buckets_len = 0`, so an absent
+key is proved absent by the probe rather than left to a scan. A
 field the header does not name is uncovered in this object for that field,
 whatever the tenant's current declaration says (ADR-0849 section 3).
 

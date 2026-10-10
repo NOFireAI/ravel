@@ -535,9 +535,18 @@ flowchart LR
   completion is settled by #1848 for both object kinds. Until a rewrite
   lands, the pending-erasure predicate filters rows after the index, so the
   index never surfaces an erased subject in a result.
-- **Compaction.** The writer path emits KEY_IDX for every object, L0 and
-  L1 alike (`RspanWriter::finish_compacted` and `RlogWriter::finish_compacted`
-  share the flush pipeline). When the compaction record lands, the fold
+- **Compaction.** Every object carries KEY_IDX, L0 and L1 alike. For RSPAN
+  that follows from the shared flush pipeline (`RspanWriter::finish_compacted`
+  builds `trace_id` from rows). For RLOG the indexed set is a builder input
+  (`RlogWriter::with_key_index_fields`), so the compactor recovers it the
+  way it recovers the POSTINGS names today: the union of its inputs' KEY_IDX
+  headers (`crates/ravel-maintain/src/rlog.rs`, the `input_indexed_fields`
+  path), handed to the fresh writer, and the erasure rewrite passes the same
+  recovered set, since an index over the surviving rows is still exact and
+  an unstamped rewrite would leave the part uncovered for good. T8 owns
+  both paths in `ravel-maintain`, with a test that a compacted and an
+  erasure-rewritten object each carry every input's fields. When the
+  compaction record lands, the fold
   re-encodes the part and rebuilds its leaves from the new entry set.
   Rebuilding reads the sections again (about 2% of a logs part's bytes and
   about 6% of a spans part's per rebuild, derived); merging the previous
@@ -753,9 +762,11 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   its window: index buckets plus one or two blocks. The folded Stage 0
   tenant goes from 4.35 GB and 60 GETs per lookup to a few hundred KB
   (target, below). A lookup with no range still grows with the number of
-  covering parts, by one directory and one bucket per part, about
-  `4 x sqrt(body)` decompressed bytes (about 4.4 KB for a 1.2 MB
-  hour-sized part, 64 KB only for a part at the 256 MiB ceiling): the
+  covering parts, by one part GET in the resolve (the entry list lives in
+  the part object and shard routing reads it) plus one directory and one
+  bucket per part, the index share about `4 x sqrt(body)` decompressed
+  bytes (about 4.4 KB for a 1.2 MB hour-sized part, 64 KB only for a part
+  at the 256 MiB ceiling): the
   trillion-span extrapolation goes from 22 TB of data to a few KB of
   index per covering part, and the acceptance table bands that function
   of the part's body rather than the count alone.
@@ -816,7 +827,7 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 4.5 MB over 1,024 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 2 per part, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 1 part GET per covering part in the `resolve` phase (the entry list lives in the part object, and shard routing reads it), resolve bytes = the covering parts' object sizes, both reported beside the part count; then 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 4.5 MB over 1,024 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 1 part GET per covering part, a part GET outside `resolve`, resolve bytes over the parts' summed sizes, more than 2 leaf GETs per part, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` decompressed bytes per probed object = `prefix_len` (stored as is, about 1 KB per field at 8 bits) plus one bucket's `uncompressed_len` (2 to 8 KB at Stage 0 entry counts; the frame on the wire is zstd and at most that), expected 3 to 9 KB per object (one declared field) and 1.2 to 3.7 MB over the 410-object corpus, bounded at 16 KB per object with up to four declared fields (6.5 MB), with wire bytes reported beside | a whole-object GET, or `keyIndex` decompressed bytes over 32 KB per probed object |
@@ -839,7 +850,7 @@ cache state) and stamped into the report.
 | T5 `GET /api/traces/<id>`, `ravel_get_trace` without a range, the SQL window rule | 12 | ravel-server, ravel-sql | no |
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
-| T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), inspector | 3 | ravel-logseg, ravel-catalog (config), ravel-cli | yes |
+| T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), compactor and erasure rewrite carry the recovered field set, inspector | 3, 6 | ravel-logseg, ravel-catalog (config), ravel-maintain, ravel-cli | yes |
 | T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index [--batch-entries N]` (not a fold: attaches refs to unchanged parts, one HEAD CAS per batch), `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
 | T10 spans read path: routing, tier 2, tier 1, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
