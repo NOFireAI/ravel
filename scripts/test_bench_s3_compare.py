@@ -127,6 +127,16 @@ class CommittedEnvelope(unittest.TestCase):
         self.assertEqual(bad.returncode, 1)
         self.assertIn("s3_requests.get", bad.stderr)
 
+    def test_summariser_refuses_an_exact_figure_that_varies(self):
+        doc = _envelope_doc()
+        runs = copy.deepcopy(doc["runs"])
+        runs[-1]["s3_requests"]["put"] += 1
+        with self.assertRaises(s3_envelope.InputError) as caught:
+            s3_envelope.build_document(doc["environment"], runs, doc["_meta"]["runs_on"], [])
+        self.assertIn("s3_requests.put", str(caught.exception))
+        built = s3_envelope.build_document(doc["environment"], doc["runs"], doc["_meta"]["runs_on"], [])
+        self.assertEqual(built["envelope"], doc["envelope"])
+
     def test_exact_figures_are_identical_across_every_run(self):
         doc = _envelope_doc()
         for name, _rpath, _run_path, kind in bench_s3_compare.FIGURES:
@@ -145,8 +155,18 @@ class CommittedEnvelope(unittest.TestCase):
         self.assertEqual([r["scheduled"] for r in meta["runs"]], [r["scheduled"] for r in doc["runs"]])
         self.assertEqual(len(doc["runs"]), 5)
         with open(_WORKFLOW, encoding="utf-8") as fh:
-            runs_on = re.findall(r"^\s+runs-on:\s*(\S+)\s*$", fh.read(), re.MULTILINE)
+            workflow = fh.read()
+        runs_on = re.findall(r"^\s+runs-on:\s*(\S+)\s*$", workflow, re.MULTILINE)
         self.assertEqual(runs_on, [meta["runs_on"]])
+        # The load point the guide publishes is the lane's own invocation,
+        # less the binary path and the output file.
+        invocations = re.findall(r"\./target/release/(bench_report(?:[^\n]*\\\n)*[^\n]*)", workflow)
+        self.assertEqual(len(invocations), 1)
+        args = re.sub(r"\s*\\\n\s*", " ", invocations[0]).split()
+        if "--out" in args:
+            i = args.index("--out")
+            del args[i:i + 2]
+        self.assertEqual(" ".join(args), meta["load_point"])
         self.assertEqual(meta["region"], doc["environment"]["region"])
         self.assertEqual(meta["max_flush_delay_ms"], doc["environment"]["max_flush_delay_ms"])
         self.assertEqual(len(meta["unexplained"]), 3)

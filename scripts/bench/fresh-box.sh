@@ -315,7 +315,7 @@ echo "fresh-box: launched $INSTANCE_ID" >&2
 run aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 
 SSH_OPTS=(-i "$V_identity_file" -o StrictHostKeyChecking=accept-new
-  -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o ConnectTimeout=15)
+  -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o ConnectTimeout=15)
 if [ "$V_access" = ssm ]; then
   host="$INSTANCE_ID"
   SSH_OPTS+=(-o "ProxyCommand=aws ssm start-session --region $REGION --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p")
@@ -353,6 +353,8 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   cores="$(remote nproc)"
   arch="$(remote uname -m)"
+  [[ "$cores" =~ ^[0-9]+$ ]] || { echo "fresh-box: remote nproc printed '$cores', not a core count" >&2; exit 1; }
+  [[ "$arch" =~ ^[A-Za-z0-9_]+$ ]] || { echo "fresh-box: remote uname -m printed '$arch', not an architecture" >&2; exit 1; }
 fi
 
 setup='set -euo pipefail

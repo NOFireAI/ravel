@@ -492,7 +492,8 @@ jobs:
         run: bash scripts/tests/flag-doc-guard.test.sh
       - name: Fleet-result-merge squash cases
         run: bash scripts/tests/fleet-result-merge-squash.test.sh
-      - run: bash scripts/bench/fresh-box.test.sh
+      - name: Fresh-box launcher cases
+        run: bash scripts/bench/fresh-box.test.sh
       # And the check that keeps this list honest. Python suites are enrolled
       # by `unittest discover -p 'test_*.py'`, so they cannot be orphaned;
       # shell suites are enumerated by hand and a new one runs nowhere until
