@@ -1956,8 +1956,10 @@ enum CatalogCommand {
         /// be folded; lowering this seals them sooner. The flag asserts that no
         /// writer is still flushing, not that this host's clock is exact: the
         /// clock-skew allowance and the fold safety margin keep their defaults.
-        /// UNSAFE under a live writer: a commit record published into a bucket
-        /// this fold already sealed is not picked up by a later incremental
+        /// UNSAFE under a live writer: later folds keep an hour this fold
+        /// sealed early open to late commits only until their own seal margin
+        /// passes it, so a commit record published into it after that, or
+        /// with no such fold running before then, is not picked up by a later
         /// fold, whose reconcile window re-lists hours below the watermark but
         /// skips a bucket holding only level-0 commit records. The default is
         /// the safe 1h; use this only for a tenant known quiescent, such as one
