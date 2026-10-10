@@ -174,7 +174,11 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let body = loop {
         let body = scrape(&client, &base).await;
-        if value(&body, "ravel_memory_gate_purge_seconds_count") >= 1.0 {
+        // The sampler records the purge before it writes the gate, so a scrape
+        // between the two reads the count with the gauges still at 0.
+        if value(&body, "ravel_memory_gate_purge_seconds_count") >= 1.0
+            && value(&body, "ravel_memory_gate_high_water_bytes") >= 1.0
+        {
             break body;
         }
         assert!(Instant::now() < deadline, "no purge within 30 s:\n{body}");
