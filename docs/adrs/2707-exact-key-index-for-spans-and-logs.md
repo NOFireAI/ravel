@@ -384,15 +384,15 @@ flowchart LR
     the setting, and `2 x` the largest part otherwise; the report states
     the largest unindexed part's entries up front so the operator can
     compute the ceiling before the run. Each batch is one HEAD CAS,
-    bounded like the fold's
-    at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD,
-    keeps the refs for the batch parts whose blake3 the new HEAD still
-    names (a leaf is keyed by `part_blake3`, so it is still that part's)
-    and drops the rest, whose leaves the catalog sweep deletes. The report
-    carries parts rebuilt, leaves written, section bytes read, ranged GETs
-    issued (footer suffix and section together, the figure the acceptance
-    band counts), the attempt count, and per attempt the part GETs, leaf
-    PUTs and HEAD CAS. That is what makes it restartable: a run that
+    bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the
+    attempt re-reads HEAD, keeps the refs for the batch parts whose blake3
+    the new HEAD still names (a leaf is keyed by `part_blake3`, so it is
+    still that part's) and drops the rest, whose leaves the catalog sweep
+    deletes. The report carries the largest unindexed part's entries,
+    parts rebuilt, leaves written, section bytes read, ranged GETs issued
+    (footer suffix and section together, the figure the acceptance band
+    counts), the attempt count, and per attempt the part GETs, leaf PUTs
+    and HEAD CAS. That is what makes it restartable: a run that
     stops, or exhausts the CAS retries on one batch, has published every
     earlier batch, loses at most `2 x` the entries in that batch, and
     leaves that batch's leaves unreferenced for the sweep; the rerun skips
@@ -404,16 +404,16 @@ flowchart LR
     no claim and keeps no cursor (`services/ravel-cli/src/catalog.rs` has
     neither; HEAD is the cursor), and it takes `--writers-stopped` as the
     same assertion the plain fold takes, since nothing in the CLI can
-    detect a live writer. Detection:
-    the
-    unreferenced-catalog-object sweep reports `CatalogSweepOutcome
-    { deleted, kept }` with no per-kind split today and no metric of its
-    own (`ravel_maintain_objects_deleted_total` counts the per-shard data
+    detect a live writer. Detection: the unreferenced-catalog-object
+    sweep reports `CatalogSweepOutcome { deleted, kept }` with no per-kind
+    split today and no metric of its own
+    (`ravel_maintain_objects_deleted_total` counts the per-shard data
     sweep's four `SweepReport` fields and nothing under `catalog/`), so T9
     adds `deleted_kidx` to the outcome and renders it as
-    `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
-    rising while HEAD carries no `key_index` refs is the signature the
-    operator acts on. The cost of a bad rollout is one rebuild run over the
+    `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that
+    series rising while HEAD carries no `key_index` refs is the signature
+    the operator acts on. The cost of a bad rollout is one rebuild run over
+    the
     affected parts: per part entry, one footer suffix GET and one section
     range GET, so `2 x entries` ranged GETs in total, at most
     `2 x max(batch_entries, largest part's entries)` per attempt, which
@@ -421,15 +421,13 @@ flowchart LR
     and `2 x` the largest part otherwise (about 160,000 on the Stage 0
     spans load as written, about 1,600 at the decision 9 geometry, one
     batch in either case) and the sections' bytes (about 2% of logs
-    bytes, about
-    6% of span bytes); the request figure is the one that decides
-    viability, as the Context's 566 s resolve shows, and both figures are
-    banded in the acceptance table. That run scans until it has run;
-    nothing is retained and nothing is silent. The mixed-version
-    combinations (old
-    folder then new sweeper, old sweeper against a new HEAD, new folder
-    after an old folder, then the rebuild) are a
-    required test, not an intention.
+    bytes, about 6% of span bytes); the request figure is the one that
+    decides viability, as the Context's 566 s resolve shows, and both
+    figures are banded in the acceptance table. That run scans until it
+    has run; nothing is retained and nothing is silent. The mixed-version
+    combinations (old folder then new sweeper, old sweeper against a new
+    HEAD, new folder after an old folder, then the rebuild) are a required
+    test, not an intention.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
   an unsupported version treating the leaf as absent (ADR-0849 section 4).
@@ -755,8 +753,9 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   resolve already issues (the `records + 3` band); no second GET and no
   new object. That is the price of decision 4's "the publish is the HEAD
   CAS alone" and of rejected alternative 8's "nothing more in HEAD" (64
-  refs per part would be 20x this). The acceptance table bands the bytes
-  per (part, field, slice).
+  refs per part would be 64x this for one-field spans, 16x at four
+  declared fields). The acceptance table bands the bytes per (part,
+  field, slice).
 - **Cost accounting** gains a phase; the per-phase rule holds: an index GET
   never lands in a scan counter.
 
@@ -779,7 +778,7 @@ cache state) and stamped into the report.
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
 | fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports the largest unindexed part's entries, its attempt count (at least `ceil(entries / max(batch_entries, largest part's entries))`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and one HEAD CAS; no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object data GET, or any figure missing from the report |
-| HEAD bytes added by field 8 | at most 256 B per (covering part, declared field, key slice), where slices per (part, field) = `ceil(leaf entries x 12 B / 256 MiB)` (one for any part whose leaf body stays under the ceiling, two on a Stage 0-sized spans part); under 256 KB over 1,024 one-field, one-slice parts, read in the one HEAD GET the resolve already issues; HEAD bytes and leaf-ref count on the resolve report | over 512 B per (part, field, slice), more than one HEAD GET per resolve, or either figure missing |
+| HEAD bytes added by field 8 | at most 256 B per (covering part, declared field, key slice), where the ceiling is tested after compression (`body_len`, the zstd bucket frames, against `DEFAULT_MAX_COLUMN_STATS_BYTES` = 256 MiB) so slices per (part, field) is at most `ceil(leaf entries x 12 B / 256 MiB)`, the raw-bytes upper bound: one for a Stage 0-sized spans part (about 20 M entries, about 240 MB raw, under the ceiling before compression), and decision 4's 13-bit sizing of that part as one body agrees; at most 256 KiB over 1,024 one-field, one-slice parts at the band, about 200 KiB at the predicted 200 B per ref, read in the one HEAD GET the resolve already issues; HEAD bytes and leaf-ref count on the resolve report | over 512 B per (part, field, slice), more than one HEAD GET per resolve, or either figure missing |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 

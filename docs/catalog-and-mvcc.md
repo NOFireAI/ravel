@@ -988,36 +988,34 @@ boundaries, so one ingest hour larger than it yields one part above it),
 so the ceiling is `2 x batch_entries` only while no unindexed part exceeds
 the setting and `2 x` the largest part otherwise; the report states the
 largest unindexed part's entries up front. Each batch is one HEAD CAS,
-bounded
-like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt
-re-reads HEAD, keeps the refs for the batch parts whose blake3 the new
-HEAD still names (a leaf is keyed by `part_blake3`) and drops the rest,
-whose leaves this sweep deletes. The report carries parts rebuilt, leaves
-written, section bytes read, ranged GETs issued (footer suffix and section
-together), the attempt count, and per attempt the part GETs, leaf PUTs and
-HEAD CAS. A run that stops or exhausts the CAS retries on one batch has
+bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the
+attempt re-reads HEAD, keeps the refs for the batch parts whose blake3 the
+new HEAD still names (a leaf is keyed by `part_blake3`) and drops the
+rest, whose leaves this sweep deletes. The report carries the largest
+unindexed part's entries, parts rebuilt, leaves written, section bytes
+read, ranged GETs issued (footer suffix and section together), the attempt
+count, and per attempt the part GETs, leaf PUTs and HEAD CAS. A run that
+stops or exhausts the CAS retries on one batch has
 therefore published every earlier batch, loses at most `2 x` the entries
 in that batch, and leaves that batch's leaves unreferenced for this sweep;
 the rerun skips every part whose ref an earlier batch published. A
 one-part tenant is a single batch, and an interruption there loses the
 whole run. Like the plain CLI fold it holds no claim and keeps no cursor
 (HEAD is the cursor), and it takes `--writers-stopped` as the same
-assertion the plain fold takes.
-Detection: this sweep reports
+assertion the plain fold takes. Detection: this sweep reports
 `CatalogSweepOutcome { deleted, kept }` with no per-kind split and no
-metric of its own today, so the leaf writer's change adds `deleted_kidx` to
-the outcome and renders it as
+metric of its own today, so the leaf writer's change adds `deleted_kidx`
+to the outcome and renders it as
 `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
 rising while HEAD carries no `key_index` refs is the signature an operator
 acts on. The cost of a bad rollout is one rebuild run over the affected
 parts, `2 x entries` ranged GETs in total (a footer suffix and a section
 range per entry, at most `2 x max(batch_entries, largest part's entries)`
 per attempt, 500,000 at the default while no part exceeds the seal
-threshold) plus the sections' bytes, and that
-run scans until it has run; nothing is retained
-and nothing is silent. The mixed-version combinations (old folder then new
-sweeper, old sweeper against a new HEAD, new folder after an old folder,
-then the rebuild) are
+threshold) plus the sections' bytes, and that run scans until it has run;
+nothing is retained and nothing is silent. The mixed-version combinations
+(old folder then new sweeper, old sweeper against a new HEAD, new folder
+after an old folder, then the rebuild) are
 tested, not assumed (ADR-0849 section 1a).
 
 ### Idempotency marker body layout
