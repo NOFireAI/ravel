@@ -192,9 +192,10 @@ pub async fn run(
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     load_memory_bytes: Option<u64>,
+    fold_after_load: bool,
     now_ns: i64,
 ) -> anyhow::Result<()> {
-    run_warning_to(
+    run_fold_warning_to(
         store,
         parquet_path,
         tenant,
@@ -210,7 +211,8 @@ pub async fn run(
         target_bytes,
         max_flush_delay,
         zstd_level,
-        load_memory_bytes,
+        LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
+        fold_after_load,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -224,6 +226,7 @@ pub async fn run(
 /// warnings are the whole operator-facing deliverable of ADR-0100 decision 1,
 /// and with `eprintln!` inlined here, deleting the emit loop left every test
 /// green. Only [`run`]'s one-line delegation above is now unproven by a test.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_warning_to(
     store: Arc<dyn ObjectStoreBackend>,
@@ -270,6 +273,7 @@ pub(crate) async fn run_warning_to(
 
 /// [`run_warning_to`] with the memory request injected in place of the host
 /// read, so a test can give a logs load a derived budget below one batch.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_memory_warning_to(
     store: Arc<dyn ObjectStoreBackend>,
@@ -291,6 +295,67 @@ pub(crate) async fn run_memory_warning_to(
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    run_fold_warning_to(
+        store,
+        parquet_path,
+        tenant,
+        mapping_path,
+        signal,
+        shards,
+        batch_rows,
+        skip_rows,
+        read_cursors,
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+        max_flush_delay,
+        zstd_level,
+        load_memory,
+        false,
+        now_ns,
+        warnings,
+    )
+    .await
+}
+
+/// [`run_memory_warning_to`] with `--fold-after-load` (ADR-2677 decision 1).
+/// Only a logs load folds; a metrics or spans load given the flag is refused
+/// before anything is written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_fold_warning_to(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping_path: &Path,
+    signal: SignalArg,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    zstd_level: RlogZstdLevel,
+    load_memory: LoadMemoryRequest,
+    fold_after_load: bool,
+    now_ns: i64,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    let refused = match signal {
+        SignalArg::Metrics => Some("metrics"),
+        SignalArg::Spans => Some("spans"),
+        SignalArg::Logs => None,
+    };
+    if let (true, Some(name)) = (fold_after_load, refused) {
+        anyhow::bail!(
+            "--fold-after-load supports only --signal logs; this {name} load was refused before \
+             any row was read or written. Load without it, then seal the loaded hours with \
+             `ravel-cli catalog fold --signal {name} --writers-stopped` once the load has exited"
+        );
+    }
     let load_memory_bytes = match load_memory {
         LoadMemoryRequest::Flag(bytes) => Some(bytes),
         LoadMemoryRequest::Derived { .. } | LoadMemoryRequest::Unbudgeted => None,
@@ -389,11 +454,12 @@ pub(crate) async fn run_memory_warning_to(
         None,
         zstd_level,
         Some(memory_options),
+        fold_after_load,
     )
     .await
     {
         Ok(report) => {
-            print_summary(&report);
+            print_summary(&report, true);
             if let Some(warning) = &report.load_memory_warning {
                 let _ = writeln!(warnings, "{warning}");
             }
@@ -861,7 +927,8 @@ pub(super) fn skip_rows_past_end_warning(
 }
 
 /// Print the completion summary (ADR-0089 deliverable 6) to stdout.
-fn print_summary(report: &LoadReport) {
+/// `fold_covered` is `false` beside a [`LoadError::FoldLeftCommitsUncovered`].
+fn print_summary(report: &LoadReport, fold_covered: bool) {
     let secs = report.elapsed.as_secs_f64();
     let rows_per_sec = if secs > 0.0 {
         report.rows_processed as f64 / secs
@@ -874,6 +941,9 @@ fn print_summary(report: &LoadReport) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    if let Some(fold) = &report.fold {
+        print!("{}", fold_summary(fold, fold_covered));
+    }
     let memory = &report.load_memory;
     // A resolved budget always has a nonzero floor; a derived budget can be 0.
     if memory.floor_bytes > 0 {
@@ -891,6 +961,38 @@ fn print_summary(report: &LoadReport) {
     print_flush_mix(report);
     #[cfg(feature = "stage-timing")]
     print_stage_timings(report);
+}
+
+/// The `--fold-after-load` lines of the summary (ADR-2677 decision 1). The
+/// fold's elapsed is part of the `elapsed` line above it, not added to it.
+/// `covered` is `false` when the snapshot the fold left was not confirmed to
+/// hold every commit the load wrote.
+pub(super) fn fold_summary(fold: &LoadFold, covered: bool) -> String {
+    if fold.seal_through_hour.is_none() {
+        return "  fold after load  : no fold: nothing was written\n".to_string();
+    }
+    let hour = |h: Option<u32>| h.map_or_else(|| "none".to_string(), |h| h.to_string());
+    let outcome = match (fold.no_op, covered) {
+        (false, true) => "sealed",
+        (true, true) => "no-op, HEAD already sealed",
+        (false, false) => "folded, commits not confirmed in the snapshot (see the error below)",
+        (true, false) => {
+            "no-op, HEAD already sealed, commits not confirmed in the snapshot (see the error \
+             below)"
+        }
+    };
+    format!(
+        "  fold after load  : {outcome}, seal_through_hour {}, watermark_hour {}, entries {}, \
+         parts read {}, buckets listed {}, records read {}, elapsed {:.3}s (included in \
+         elapsed)\n",
+        hour(fold.seal_through_hour),
+        hour(fold.watermark_hour),
+        fold.entry_count,
+        fold.parts_read,
+        fold.buckets_listed,
+        fold.records_read,
+        fold.elapsed.as_secs_f64(),
+    )
 }
 
 /// Print the per-shard flush trigger mix (issue #983) under the summary totals.
@@ -978,6 +1080,30 @@ fn print_stage_timings(report: &LoadReport) {
 /// [`SEQUENTIAL_RESUMABLE_SETTINGS`]).
 fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
     let tokens = err.durable_tokens();
+    // A `--fold-after-load` failure happens after every row is durable: the
+    // load itself finished, so its summary is printed and nothing is partial.
+    if let Some(report) = err.finished_report() {
+        let uncovered = matches!(err, LoadError::FoldLeftCommitsUncovered { .. });
+        print_summary(report, !uncovered);
+        if uncovered {
+            println!(
+                "{} commit token(s)/segment(s) are durable (the whole file loaded and the fold \
+                 after it ran; the error below names what its snapshot was not confirmed to \
+                 hold):",
+                tokens.len()
+            );
+        } else {
+            println!(
+                "{} commit token(s)/segment(s) are durable (the whole file loaded; only the fold \
+                 after it failed):",
+                tokens.len()
+            );
+        }
+        for token in tokens {
+            println!("  {}", token.encode());
+        }
+        return;
+    }
     let is_flush = matches!(err, LoadError::Flush { .. });
     if tokens.is_empty() {
         if is_flush {

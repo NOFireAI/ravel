@@ -763,6 +763,35 @@ enum Command {
         /// when it is set. `0` is rejected.
         #[arg(long, value_name = "BYTES")]
         load_memory_bytes: Option<u64>,
+        /// Fold the loaded tenant's logs catalog once the load succeeds
+        /// (ADR-2677 decision 1), so the next query resolves the loaded hours
+        /// from the snapshot instead of listing them. UNSAFE under a live
+        /// writer: the loader asserts that it is the tenant's only writer and
+        /// seals through the latest ingest hour it wrote, so a commit another
+        /// writer publishes into a sealed hour is not picked up by a later
+        /// incremental fold and stays invisible to queries without a commit
+        /// token until the HEAD is rebuilt. Logs only: a metrics or spans load
+        /// with this flag is refused before any row is read or written.
+        ///
+        /// Before it reads any row, the load is refused when the logs catalog
+        /// HEAD has already sealed the current ingest hour (for example by an
+        /// earlier `--fold-after-load` in the same hour): wait for the next
+        /// hour, or rebuild the HEAD as the troubleshooting guide's "Rebuild
+        /// the snapshot" describes. The fold seals without moving the clock,
+        /// and its time is part of the summary's elapsed. A failed fold fails
+        /// the load, though every loaded object is already durable and
+        /// `catalog fold --signal logs --writers-stopped` seals them once the
+        /// cause is fixed. After the fold, the load reads back the snapshot of
+        /// the HEAD it left and checks that every commit it wrote is in it, as
+        /// a level-0 entry or replaced by a compaction or rewrite whose parts
+        /// the snapshot holds. A commit missing from it (for example because
+        /// another fold sealed its hour while the load was writing), or a HEAD
+        /// or part that cannot be read for the check, also fails the load,
+        /// naming the hours and up to ten of the missing commits, or saying
+        /// the check could not be made. The check's time is part of the
+        /// fold's. A load that wrote nothing runs no fold and no check.
+        #[arg(long)]
+        fold_after_load: bool,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -1926,13 +1955,30 @@ enum CatalogCommand {
         /// writer is still flushing, not that this host's clock is exact: the
         /// clock-skew allowance and the fold safety margin keep their defaults.
         /// UNSAFE under a live writer: a commit record published into a bucket
-        /// this fold already sealed is never picked up by a later incremental
-        /// fold, which re-lists only hours after the watermark. The default is
+        /// this fold already sealed is not picked up by a later incremental
+        /// fold, whose reconcile window re-lists hours below the watermark but
+        /// skips a bucket holding only level-0 commit records. The default is
         /// the safe 1h; use this only for a tenant known quiescent, such as one
         /// whose bulk load has finished and whose writer process has exited.
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// Seal through the hour this fold runs in, as well as every hour the
+        /// seal margin seals. Asserts that no writer will publish into the
+        /// current hour or any earlier one, so a load that has finished can
+        /// be folded completely now instead of once the margin has passed its
+        /// last hour. The fold's clock is not moved; the report's
+        /// `seal_through_hour` names the hour applied. Combines with
+        /// `--max-flush-lifetime`. UNSAFE under a live writer: a commit record
+        /// published into a bucket this fold already sealed is not picked up
+        /// by a later incremental fold, whose reconcile window re-lists hours
+        /// below the watermark but skips a bucket holding only level-0 commit
+        /// records, and stays invisible to queries that carry no commit token
+        /// until the HEAD is rebuilt. Use this only for a tenant known
+        /// quiescent, such as one whose bulk load has finished and whose
+        /// writer process has exited.
+        #[arg(long)]
+        writers_stopped: bool,
         /// Print the full `FoldReport` as JSON instead of the human-readable
         /// text report. Either form carries every counter on the report.
         #[arg(long)]
@@ -2124,10 +2170,11 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     shards,
                     signal,
                     max_flush_lifetime,
+                    writers_stopped,
                     json,
                     tenant_kms,
                 },
-        } => catalog::fold(
+        } => catalog::fold_with_writers_stopped(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -2135,6 +2182,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             shards,
             signal,
             max_flush_lifetime,
+            writers_stopped,
             now_ns()?,
             json,
         )
@@ -2828,6 +2876,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             max_flush_delay,
             zstd_level,
             load_memory_bytes,
+            fold_after_load,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -2847,6 +2896,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 max_flush_delay,
                 zstd_level,
                 load_memory_bytes,
+                fold_after_load,
                 now_ns()?,
             )
             .await;

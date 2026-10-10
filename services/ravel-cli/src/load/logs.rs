@@ -3,6 +3,8 @@
 
 use super::*;
 
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
 /// Bulk-import `parquet_path` into `tenant`'s logs signal.
 ///
 /// - `shards` is the configured shard count. It is validated against (or, for a
@@ -74,6 +76,52 @@ pub async fn load(
     .await
 }
 
+/// [`load`] followed by `--fold-after-load` (ADR-2677 decision 1): once every
+/// write is acked the router is shut down, so no flush can follow, and the
+/// logs snapshot is folded through the highest ingest hour the load wrote,
+/// with a fresh reading of `clock` as the fold's time. The fold's figures are
+/// in [`LoadReport::fold`] and its time is inside [`LoadReport::elapsed`].
+/// A fold that fails fails the load with [`LoadError::Fold`]; the loaded
+/// objects are durable either way.
+#[allow(clippy::too_many_arguments)]
+pub async fn load_with_fold_after_load(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<LoadReport, LoadError> {
+    load_instrumented_at(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        0,
+        read_cursors,
+        pipeline_depth,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        DEFAULT_TARGET_BYTES,
+        None,
+        now_ns,
+        clock,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        None,
+        true,
+    )
+    .await
+}
+
 /// [`load`] with the object-size levers and the memory budget given: the
 /// flush target (`--target-bytes`), the age trigger (`--max-flush-delay`,
 /// `None` = the default) and the memory budget's inputs (see
@@ -115,6 +163,7 @@ pub async fn load_with_memory(
         None,
         RlogZstdLevel::DEFAULT,
         Some(load_memory),
+        false,
     )
     .await
 }
@@ -198,6 +247,7 @@ pub(super) async fn load_instrumented(
         on_batch_queued,
         RlogZstdLevel::DEFAULT,
         None,
+        false,
     )
     .await
 }
@@ -206,7 +256,8 @@ pub(super) async fn load_instrumented(
 /// the router's [`IngestConfig::rlog_zstd_level`], the level every page and
 /// section of each object the load writes compresses at. `load_memory` is the
 /// memory budget's inputs, resolved once the read-cursor count is known;
-/// `None` derives the budget from this host's memory.
+/// `None` derives the budget from this host's memory. `fold_after_load` is
+/// the `--fold-after-load` flag ([`load_with_fold_after_load`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_instrumented_at(
     store: Arc<dyn ObjectStoreBackend>,
@@ -229,6 +280,7 @@ pub(super) async fn load_instrumented_at(
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
     load_memory: Option<LoadMemoryOptions>,
+    fold_after_load: bool,
 ) -> Result<LoadReport, LoadError> {
     load_with_drain_reflush_period(
         store,
@@ -252,6 +304,7 @@ pub(super) async fn load_instrumented_at(
         zstd_level,
         DRAIN_REFLUSH_PERIOD,
         load_memory,
+        fold_after_load,
     )
     .await
 }
@@ -286,6 +339,7 @@ pub(super) async fn load_with_drain_reflush_period(
     zstd_level: RlogZstdLevel,
     drain_reflush_period: Duration,
     load_memory: Option<LoadMemoryOptions>,
+    fold_after_load: bool,
 ) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
@@ -348,6 +402,18 @@ pub(super) async fn load_with_drain_reflush_period(
 
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
+
+    // Before the provisioning check below, which can write a record.
+    if fold_after_load {
+        refuse_a_sealed_current_hour(
+            Arc::clone(&store),
+            tenant,
+            &tenant_id,
+            shards,
+            clock.now_ns(),
+        )
+        .await?;
+    }
 
     // Reuse the server's provisioning validation/adoption. Fresh signal: pins
     // the record at `shards`. Existing record: a differing count is refused
@@ -423,7 +489,7 @@ pub(super) async fn load_with_drain_reflush_period(
             ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
         },
         Arc::clone(&store),
-        clock,
+        Arc::clone(&clock),
     ));
 
     // Every Strict write below waits this long for its ack, and the wait is
@@ -548,7 +614,7 @@ pub(super) async fn load_with_drain_reflush_period(
     // load parked on the age trigger, or forever on a raised one. At the
     // default target every write flushes itself and this never runs, so the
     // default layout is unchanged.
-    let _stall_flusher = match &budget {
+    let stall_flusher = match &budget {
         Some(budget) if target_bytes > DEFAULT_TARGET_BYTES => Some(spawn_stall_flusher(
             Arc::clone(&router),
             Arc::clone(budget),
@@ -836,12 +902,333 @@ pub(super) async fn load_with_drain_reflush_period(
     }
     report.load_memory_peak_bytes = budget.as_ref().map_or(0, |b| b.peak_bytes());
     report.load_memory_waits = budget.as_ref().map_or(0, |b| b.waits_total());
+    if fold_after_load {
+        let fold_started = Instant::now();
+        if let Some(stall_flusher) = stall_flusher {
+            stall_flusher.stop().await;
+        }
+        let outcome = fold_after_load_through(
+            store,
+            router,
+            clock.as_ref(),
+            &tenant_id,
+            shards,
+            &report.tokens,
+            fold_started,
+        )
+        .await;
+        report.elapsed = started.elapsed();
+        return match outcome {
+            Ok(fold) => {
+                report.fold = Some(fold);
+                Ok(report)
+            }
+            Err(FoldFailure::Failed(cause)) => Err(LoadError::Fold {
+                durable: report.tokens.clone(),
+                cause,
+                rerun: format!(
+                    "ravel-cli catalog fold --tenant {} --shards {shards} --signal logs \
+                     --writers-stopped",
+                    shell_word(tenant)
+                ),
+                report: Box::new(report),
+            }),
+            Err(FoldFailure::Uncovered {
+                fold,
+                hours,
+                finding,
+            }) => {
+                report.fold = Some(fold);
+                Err(LoadError::FoldLeftCommitsUncovered {
+                    durable: report.tokens.clone(),
+                    hours: hours
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    finding,
+                    verify: format!(
+                        "ravel-cli catalog verify --tenant {} --signal logs",
+                        shell_word(tenant)
+                    ),
+                    report: Box::new(report),
+                })
+            }
+        };
+    }
     report.elapsed = started.elapsed();
     Ok(report)
 }
 
+/// The `--fold-after-load` preflight (ADR-2677 decision 1): refuse the load
+/// when the logs catalog HEAD has already sealed the hour bucket of `now_ns`.
+/// Only an earlier operator-asserted seal puts the watermark that high, and
+/// every object this load would write falls in that hour or a later one, so
+/// the part written before the next hour begins would be invisible to
+/// queries that carry no commit token. An absent HEAD, or a watermark below
+/// the current hour, passes.
+pub(super) async fn refuse_a_sealed_current_hour(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    tenant_id: &TenantId,
+    shards: u32,
+    now_ns: i64,
+) -> Result<(), LoadError> {
+    let hour = u32::try_from(now_ns.div_euclid(NS_PER_HOUR)).map_err(|_| {
+        LoadError::Setup(format!(
+            "--fold-after-load: clock reading {now_ns} ns has no ingest-hour bucket"
+        ))
+    })?;
+    let catalog = crate::catalog::enforcing_catalog(
+        store,
+        ravel_catalog::CatalogConfig {
+            shard_count: shards.max(1),
+            ..ravel_catalog::CatalogConfig::default()
+        },
+    )
+    .map_err(|err| {
+        LoadError::Setup(format!(
+            "--fold-after-load: failed to build catalog for the preflight: {err}"
+        ))
+    })?;
+    let watermark_hour = catalog
+        .head_watermark_hour(&tenant_id.hash(), Signal::Logs)
+        .await
+        .map_err(|err| {
+            LoadError::Setup(format!(
+                "--fold-after-load: could not read the logs catalog HEAD for tenant {tenant:?}: \
+                 {err}"
+            ))
+        })?;
+    match watermark_hour {
+        Some(watermark_hour) if watermark_hour >= hour => Err(LoadError::HourAlreadySealed {
+            tenant: tenant.to_string(),
+            hour,
+            watermark_hour,
+            first_open_hour: u64::from(watermark_hour) + 1,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `word` as one shell word: unchanged when it holds only characters no
+/// shell treats specially, single-quoted otherwise. A leading `=` is quoted
+/// because zsh expands `=name` to the path of the command `name`.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && !word.starts_with('=')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/@+=,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// Why the `--fold-after-load` step did not succeed. The caller attaches the
+/// finished report and turns it into a [`LoadError`].
+#[derive(Debug)]
+enum FoldFailure {
+    /// The fold could not run or returned an error.
+    Failed(String),
+    /// The fold ran, and the snapshot of the HEAD it left does not cover every
+    /// commit this load wrote, or that could not be checked.
+    Uncovered {
+        fold: LoadFold,
+        hours: Vec<u32>,
+        finding: String,
+    },
+}
+
+/// The most commits an uncovered-commits finding names one by one.
+const UNCOVERED_COMMITS_NAMED: usize = 10;
+
+/// The snapshot entry identity of the L0 commit `token` names.
+fn token_identity(token: &CommitToken) -> ravel_catalog::EntryIdentity {
+    (
+        token.shard,
+        token.ingest_hour_bucket,
+        *token.writer_id.as_bytes(),
+        token.epoch,
+        token.seq,
+    )
+}
+
+/// What a `--fold-after-load` coverage check over `tokens` found, as the
+/// ingest hours to name and the sentence naming them; `None` when the
+/// snapshot covers every token. A `coverage` error names every token hour,
+/// since none of them could be confirmed.
+fn uncovered_commits<E: std::fmt::Display>(
+    tokens: &[CommitToken],
+    coverage: Result<ravel_catalog::SnapshotCoverage, E>,
+) -> Option<(Vec<u32>, String)> {
+    let joined = |hours: &[u32]| {
+        hours
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match coverage {
+        Ok(coverage) if coverage.missing.is_empty() => None,
+        Ok(coverage) => {
+            let missing = &coverage.missing;
+            let mut hours: Vec<u32> = missing.iter().map(|id| id.1).collect();
+            hours.sort_unstable();
+            hours.dedup();
+            let mut named = missing
+                .iter()
+                .take(UNCOVERED_COMMITS_NAMED)
+                .map(|(shard, hour, writer_id, epoch, seq)| {
+                    format!(
+                        "shard {shard} hour {hour} writer {} epoch {epoch} seq {seq}",
+                        uuid::Uuid::from_bytes(*writer_id)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if missing.len() > UNCOVERED_COMMITS_NAMED {
+                named.push_str(&format!(
+                    "; and {} more",
+                    missing.len() - UNCOVERED_COMMITS_NAMED
+                ));
+            }
+            let finding = if coverage.watermark_hour.is_none() {
+                format!(
+                    "{} of the {} commits it published are in no snapshot: the fold left no \
+                     catalog HEAD, in ingest hour(s) {}: {named}",
+                    missing.len(),
+                    tokens.len(),
+                    joined(&hours)
+                )
+            } else {
+                format!(
+                    "{} of the {} commits it published are not in the snapshot of the catalog \
+                     HEAD its fold left, in ingest hour(s) {}: {named}",
+                    missing.len(),
+                    tokens.len(),
+                    joined(&hours)
+                )
+            };
+            Some((hours, finding))
+        }
+        Err(err) => {
+            let mut hours: Vec<u32> = tokens.iter().map(|t| t.ingest_hour_bucket).collect();
+            hours.sort_unstable();
+            hours.dedup();
+            let finding = format!(
+                "whether the snapshot of the catalog HEAD its fold left covers the {} commits it \
+                 published into ingest hour(s) {} could not be checked: {err}",
+                tokens.len(),
+                joined(&hours)
+            );
+            Some((hours, finding))
+        }
+    }
+}
+
+/// The `--fold-after-load` step (ADR-2677 decision 1), run once every write
+/// has acked. Shutting the router down waits for every shard actor to finish
+/// its last flush and closes its mailbox, which is what makes the loader's
+/// assertion true: nothing it started can publish into an hour after the
+/// fold seals it. The fold then seals the logs snapshot through the highest
+/// ingest hour among `tokens`, at a fresh reading of `clock`. Last, the
+/// snapshot of the HEAD the fold left is read back, and the step fails with
+/// [`FoldFailure::Uncovered`] unless it covers every one of `tokens` (see
+/// [`ravel_catalog::snapshot_coverage`]) or when it cannot be read. With no
+/// tokens there is nothing to seal, no fold runs and nothing is read.
+async fn fold_after_load_through(
+    store: Arc<dyn ObjectStoreBackend>,
+    router: Arc<LogIngestRouter>,
+    clock: &dyn Clock,
+    tenant_id: &TenantId,
+    shards: u32,
+    tokens: &[CommitToken],
+    started: Instant,
+) -> Result<LoadFold, FoldFailure> {
+    // Every write task, the drain ticker and the stall flusher have been
+    // joined by now, so this is the last handle.
+    let router = Arc::try_unwrap(router).map_err(|_| {
+        FoldFailure::Failed(
+            "the ingest router is still shared, so it cannot be shut down".to_string(),
+        )
+    })?;
+    router.shutdown().await;
+
+    let token_hours: Vec<u32> = tokens.iter().map(|t| t.ingest_hour_bucket).collect();
+    let Some(seal_through_hour) = token_hours.iter().copied().max() else {
+        return Ok(LoadFold {
+            elapsed: started.elapsed(),
+            ..LoadFold::default()
+        });
+    };
+    let now_ns = clock.now_ns();
+    let coverage_store = Arc::clone(&store);
+    let catalog = crate::catalog::enforcing_catalog(
+        store,
+        ravel_catalog::CatalogConfig {
+            shard_count: shards,
+            ..ravel_catalog::CatalogConfig::default()
+        },
+    )
+    .map_err(|err| FoldFailure::Failed(format!("failed to build catalog: {err}")))?;
+    let fold = catalog
+        .fold_with_seal_through(
+            &tenant_id.hash(),
+            Signal::Logs,
+            uuid::Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+            &ravel_catalog::RefoldRequest::new(),
+            Some(seal_through_hour),
+        )
+        .await
+        .map_err(|err| FoldFailure::Failed(err.to_string()))?;
+    let identities: Vec<ravel_catalog::EntryIdentity> = tokens.iter().map(token_identity).collect();
+    let coverage = ravel_catalog::snapshot_coverage(
+        coverage_store.as_ref(),
+        &tenant_id.hash(),
+        Signal::Logs,
+        &identities,
+    )
+    .await;
+    let (parts_read, buckets_listed, records_read) = coverage.as_ref().map_or((0, 0, 0), |c| {
+        (c.parts_read, c.buckets_listed, c.records_read)
+    });
+    let load_fold = LoadFold {
+        elapsed: started.elapsed(),
+        entry_count: fold.entry_count,
+        watermark_hour: fold.watermark_hour,
+        seal_through_hour: Some(seal_through_hour),
+        no_op: fold.no_op,
+        parts_read,
+        buckets_listed,
+        records_read,
+    };
+    match uncovered_commits(tokens, coverage) {
+        None => Ok(load_fold),
+        Some((hours, finding)) => Err(FoldFailure::Uncovered {
+            fold: load_fold,
+            hours,
+            finding,
+        }),
+    }
+}
+
 /// Aborts its task when dropped, so every return path of the loader stops it.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// Aborts the task and waits for it to end, so whatever it held is
+    /// released before this returns.
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

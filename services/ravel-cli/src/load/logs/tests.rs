@@ -2241,6 +2241,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         RlogZstdLevel::DEFAULT,
         UNREACHED_REFLUSH_PERIOD,
         None,
+        false,
     );
 
     let driver = async {
@@ -3765,4 +3766,80 @@ mod load_skip_rows {
                  {multi}"
         );
     }
+}
+
+/// `uncovered_commits` turns a coverage result into the hours and sentence
+/// the `--fold-after-load` error carries: nothing when every token is
+/// covered; the missing hours, count and first ten commits otherwise; and
+/// every token hour when coverage could not be checked.
+#[test]
+fn uncovered_commits_names_the_missing_commits() {
+    const H: u32 = 472_222;
+    let writer = uuid::Uuid::from_u128(0x6c3f_3102_5da4_454b_b826_aa47_f78c_ac09);
+    let tokens: Vec<CommitToken> = (0..12u64)
+        .map(|seq| CommitToken {
+            shard: (seq % 2) as u32,
+            writer_id: writer,
+            epoch: 7,
+            seq,
+            ingest_hour_bucket: if seq < 2 { H } else { H + 1 },
+        })
+        .collect();
+    let covered = ravel_catalog::SnapshotCoverage::default();
+    assert_eq!(uncovered_commits::<String>(&tokens, Ok(covered)), None);
+
+    let missing = ravel_catalog::SnapshotCoverage {
+        watermark_hour: Some(H + 1),
+        missing: tokens[1..].iter().map(token_identity).collect(),
+        ..ravel_catalog::SnapshotCoverage::default()
+    };
+    let (hours, finding) =
+        uncovered_commits::<String>(&tokens, Ok(missing)).expect("eleven are missing");
+    assert_eq!(hours, vec![H, H + 1]);
+    assert!(
+        finding.starts_with(
+            "11 of the 12 commits it published are not in the snapshot of the catalog HEAD its \
+             fold left, in ingest hour(s) 472222, 472223: shard 1 hour 472222 writer \
+             6c3f3102-5da4-454b-b826-aa47f78cac09 epoch 7 seq 1; "
+        ),
+        "{finding}"
+    );
+    assert_eq!(finding.matches(" writer ").count(), 10, "{finding}");
+    assert!(finding.contains("seq 10; and 1 more"), "{finding}");
+    assert!(!finding.contains("seq 11"), "{finding}");
+
+    // No HEAD after the fold: there is no snapshot it left to name.
+    let no_head = ravel_catalog::SnapshotCoverage {
+        missing: tokens[..1].iter().map(token_identity).collect(),
+        ..ravel_catalog::SnapshotCoverage::default()
+    };
+    let (hours, finding) =
+        uncovered_commits::<String>(&tokens[..1], Ok(no_head)).expect("one is missing");
+    assert_eq!(hours, vec![H]);
+    assert_eq!(
+        finding,
+        "1 of the 1 commits it published are in no snapshot: the fold left no catalog HEAD, \
+         in ingest hour(s) 472222: shard 0 hour 472222 writer \
+         6c3f3102-5da4-454b-b826-aa47f78cac09 epoch 7 seq 0"
+    );
+
+    let (hours, finding) =
+        uncovered_commits(&tokens, Err("part t/x/p.part: not found")).expect("unchecked");
+    assert_eq!(hours, vec![H, H + 1]);
+    assert_eq!(
+        finding,
+        "whether the snapshot of the catalog HEAD its fold left covers the 12 commits it \
+         published into ingest hour(s) 472222, 472223 could not be checked: part t/x/p.part: \
+         not found"
+    );
+}
+
+/// A tenant `shell_word` would leave bare only when no shell rewrites it.
+#[test]
+fn shell_word_quotes_what_a_shell_would_rewrite() {
+    assert_eq!(shell_word("acme"), "acme");
+    assert_eq!(shell_word("a=b,c:d"), "a=b,c:d");
+    assert_eq!(shell_word("=acme"), "'=acme'");
+    assert_eq!(shell_word("it's"), "'it'\\''s'");
+    assert_eq!(shell_word(""), "''");
 }
