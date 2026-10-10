@@ -183,7 +183,9 @@ job stays gated on the head repository matching this one, because this
 repository is public and the job runs pull request code on persistent
 hardware; and the baseline must be re-recorded on that runner, since the
 committed one is labelled as a demonstration and its sampling knobs are not
-recorded, which an enforcing compare now refuses.
+recorded, which an enforcing compare now refuses (superseded by the
+2026-10-10 baseline amendment below: the committed baseline now records its
+knobs).
 
 What decision 3 already requires before enforcing, unchanged by this proposal:
 
@@ -239,7 +241,8 @@ GitHub-hosted runner against an object store the workflow provisions
 itself (for example a MinIO container service), not against a persistent
 self-hosted box holding a warm cache and a `pull-requests: write` token --
 and the committed baseline needs re-recording with knobs recorded before
-any enforcing comparison would trust it.
+any enforcing comparison would trust it (done: see the 2026-10-10 baseline
+amendment below).
 
 The committed baseline under `bench/baselines/` remains a demonstration
 (superseded by the 2026-10-10 baseline amendment below) recorded on a fleet
@@ -263,4 +266,3 @@ The `bench-compare` workflow's pinned knobs move to the recorded values, and
 the job stays disabled: decision 3 remains advisory, and nothing here adds a
 runner. A comparison against this baseline is meaningful only for a run on
 the same instance type at the same knobs, which `fresh-box.sh` provides.
-
