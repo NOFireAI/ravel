@@ -233,6 +233,7 @@ impl ServiceError {
         } else {
             tracing::warn!(
                 tenant = %tenant_hash.to_hex(),
+                variant = err.variant_name(),
                 error = %err,
                 client_message = %message,
                 "sql query error redacted from client response",
@@ -441,5 +442,93 @@ impl From<ServiceError> for Response {
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
         ApiError::from(self).into_response()
+    }
+}
+
+#[cfg(all(test, feature = "sql"))]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #2044: the WARN line for a redacted SQL error names the error variant,
+    /// so the three `FetchMemoryExhausted` refusals, which share one client
+    /// message, are told apart in the log, and the client message itself is
+    /// the memory-family one.
+    ///
+    /// Prove-the-test: drop `variant = err.variant_name()` from the warn in
+    /// `ServiceError::from_sql` and the `variant=` needle is missing.
+    #[test]
+    fn the_redacted_sql_warn_line_names_the_error_variant() {
+        let tenant = ravel_types::TenantId::new("acme".to_string()).hash();
+        let (requested, reserved, limit) = (4096, 1024, 2048);
+        let cases = [
+            (
+                ravel_sql::SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted {
+                    requested,
+                    reserved,
+                    limit,
+                }),
+                "Fetch::FetchMemoryExhausted",
+            ),
+            (
+                ravel_sql::SqlError::LogFetch(ravel_query::LogFetchError::FetchMemoryExhausted {
+                    requested,
+                    reserved,
+                    limit,
+                }),
+                "LogFetch::FetchMemoryExhausted",
+            ),
+            (
+                ravel_sql::SqlError::SpanFetch(ravel_sql::SpanFetchError::FetchMemoryExhausted {
+                    requested,
+                    reserved,
+                    limit,
+                }),
+                "SpanFetch::FetchMemoryExhausted",
+            ),
+        ];
+        for (err, variant) in cases {
+            let log = CapturedLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let service_error = tracing::subscriber::with_default(subscriber, || {
+                ServiceError::from_sql(err, tenant)
+            });
+            assert_eq!(service_error.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(service_error.error_type, "unavailable");
+            assert!(
+                service_error
+                    .message
+                    .starts_with("query memory budget exhausted"),
+                "{}",
+                service_error.message
+            );
+            let text = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("utf8");
+            assert!(text.contains(" WARN "), "{text}");
+            assert!(
+                text.contains("sql query error redacted from client response"),
+                "{text}"
+            );
+            assert!(text.contains(&format!("variant=\"{variant}\"")), "{text}");
+        }
     }
 }

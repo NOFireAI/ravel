@@ -2492,13 +2492,35 @@ pub async fn start_with_heartbeat(
         ]));
     }
 
+    // The ADR-1170 process-wide memory accountant, sized from
+    // `ResolvedPerformanceDefaults::memory_remainder_bytes` (the shared
+    // headroom left after both hard cache carves, `main`'s
+    // `config.process_memory_budget_bytes`). Built once, here, before
+    // `metrics_state` and the `sql`-featured executor below so both install
+    // the SAME instance rather than two independently drifting counters: the
+    // SQL executor reserves against it via
+    // `SqlExecutor::with_process_memory_budget`, and the `/metrics` gauges
+    // read it back at scrape time.
+    let process_memory_budget = Arc::new(ravel_memory::MemoryBudget::new(
+        config.process_memory_budget_bytes,
+    ));
+
+    // The memory admission wait (#2044) every query surface's admission runs
+    // against the budget above, shared with `/metrics` for its two counters.
+    let memory_admission = Arc::new(ravel_query::http::service::MemoryAdmissionGate::new(
+        process_memory_budget.clone(),
+        config.query_budgets.memory_admission_fraction.0,
+    ));
+
     // Fleet-global query concurrency ceiling (ADR-0061 decision 2): one shared
     // controller per process, gating every query surface below. Constructed
     // unconditionally (cheap) but only threaded into the query states and
     // reconciled in the query-serving modes; an `Unlimited` ceiling never
     // rejects and does no reconciliation I/O.
-    let query_admission =
-        ravel_query::QueryAdmissionController::shared(config.query_concurrency_limit);
+    let query_admission = Arc::new(
+        ravel_query::QueryAdmissionController::new(config.query_concurrency_limit)
+            .with_memory_gate(memory_admission.clone()),
+    );
 
     // Process-wide in-flight ingest-request ceiling: one shared
     // controller per process, threaded into every `GatewayState`/
@@ -2548,19 +2570,6 @@ pub async fn start_with_heartbeat(
     // Shared with `query_accounting` above: the same allowlist bounds the
     // ADR-0076 decision 2 per-tenant PUT attribution family the same way.
     let metrics_tenant_allowlist = Arc::new(metrics_tenant_allowlist);
-
-    // The ADR-1170 process-wide memory accountant, sized from
-    // `ResolvedPerformanceDefaults::memory_remainder_bytes` (the shared
-    // headroom left after both hard cache carves, `main`'s
-    // `config.process_memory_budget_bytes`). Built once, here, before
-    // `metrics_state` and the `sql`-featured executor below so both install
-    // the SAME instance rather than two independently drifting counters: the
-    // SQL executor reserves against it via
-    // `SqlExecutor::with_process_memory_budget`, and the `/metrics` gauges
-    // read it back at scrape time.
-    let process_memory_budget = Arc::new(ravel_memory::MemoryBudget::new(
-        config.process_memory_budget_bytes,
-    ));
 
     // The ADR-1702 read and write CPU gates, built in every mode: every mode
     // decodes or encodes something, and `/metrics` renders both regardless.
@@ -2901,6 +2910,7 @@ pub async fn start_with_heartbeat(
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
         process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
+        memory_admission: memory_admission.clone(),
         cpu_gates: cpu_gates.clone(),
         // Both fold routes, not just the background task: the on-demand route
         // mounted below runs the same `Catalog::fold` into the same
@@ -3012,6 +3022,9 @@ pub async fn start_with_heartbeat(
         // reported. Emitted only in the query-serving modes, beside the engine
         // it describes.
         config.query_budgets.logs_fetch_stamp().emit();
+        config
+            .query_budgets
+            .emit_memory_admission(memory_admission.threshold_bytes());
         // ADR-0071 cross-cluster federation: build one gRPC
         // federation client per configured remote and install a `Federation` on
         // the engine. `None` when no `--remote-cluster` is set, leaving the

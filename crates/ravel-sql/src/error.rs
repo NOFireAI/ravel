@@ -53,6 +53,13 @@ pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
 /// error, changed etag between reads, invalidated snapshot).
 pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
 
+/// Stable client message for a segment fetch refused by the process-wide
+/// memory budget (`FetchMemoryExhausted` on the metrics, logs, and spans
+/// fetchers). Same class as [`MSG_UNAVAILABLE`] (503, retryable), worded in
+/// the memory family so a caller can tell memory pressure from a storage
+/// fault (#2044).
+pub const MSG_FETCH_MEMORY_EXHAUSTED: &str = "query memory budget exhausted: the process could not reserve memory to fetch segment data; retry";
+
 /// Stable client message for a `min_commit_token` that did not resolve.
 pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retry";
 
@@ -582,13 +589,14 @@ impl SqlError {
                     source: StoreError::Corrupted(_),
                     ..
                 } => MSG_CORRUPT.to_string(),
+                FetchError::Store { .. } | FetchError::EtagChanged { .. } => {
+                    MSG_UNAVAILABLE.to_string()
+                }
                 // A memory-budget refusal carries only byte counts (no object
-                // key or tenant identity); redacted to the transient message
-                // like a storage fault, since retrying under less pressure can
-                // succeed.
-                FetchError::Store { .. }
-                | FetchError::EtagChanged { .. }
-                | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                // key or tenant identity). Same transient class as a storage
+                // fault, since retrying under less pressure can succeed, but
+                // a memory-family message so it is not read as one.
+                FetchError::FetchMemoryExhausted { .. } => MSG_FETCH_MEMORY_EXHAUSTED.to_string(),
             },
             SqlError::LogFetch(fetch) => match fetch {
                 // A carry paired with the wrong segment is an integrity
@@ -601,9 +609,12 @@ impl SqlError {
                     source: StoreError::Corrupted(_),
                     ..
                 } => MSG_CORRUPT.to_string(),
-                LogFetchError::Store { .. }
-                | LogFetchError::EtagChanged { .. }
-                | LogFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                LogFetchError::Store { .. } | LogFetchError::EtagChanged { .. } => {
+                    MSG_UNAVAILABLE.to_string()
+                }
+                LogFetchError::FetchMemoryExhausted { .. } => {
+                    MSG_FETCH_MEMORY_EXHAUSTED.to_string()
+                }
             },
             SqlError::SpanFetch(fetch) => match fetch {
                 // A cross-tenant object is an integrity violation of the fetched
@@ -615,8 +626,10 @@ impl SqlError {
                     source: StoreError::Corrupted(_),
                     ..
                 } => MSG_CORRUPT.to_string(),
-                SpanFetchError::Store { .. }
-                | SpanFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+                SpanFetchError::FetchMemoryExhausted { .. } => {
+                    MSG_FETCH_MEMORY_EXHAUSTED.to_string()
+                }
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::Parquet(parquet) => parquet.client_message(),
@@ -644,6 +657,58 @@ impl SqlError {
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),
             SqlError::Shared { message, .. } => message.clone(),
+        }
+    }
+
+    /// The variant's name, with the inner variant for the three fetch errors
+    /// (`"LogFetch::FetchMemoryExhausted"`). For log lines: several variants
+    /// redact to one client message, and this names which one it was without
+    /// the `Display` detail's keys or figures.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            SqlError::Validation(_) => "Validation",
+            SqlError::CrossSignalQuery => "CrossSignalQuery",
+            SqlError::TooManyTables { .. } => "TooManyTables",
+            SqlError::Catalog(_) => "Catalog",
+            SqlError::ColumnStats(_) => "ColumnStats",
+            SqlError::Fetch(fetch) => match fetch {
+                FetchError::Store { .. } => "Fetch::Store",
+                FetchError::Corrupt { .. } => "Fetch::Corrupt",
+                FetchError::EtagChanged { .. } => "Fetch::EtagChanged",
+                FetchError::FetchMemoryExhausted { .. } => "Fetch::FetchMemoryExhausted",
+            },
+            SqlError::LogFetch(fetch) => match fetch {
+                LogFetchError::Store { .. } => "LogFetch::Store",
+                LogFetchError::Corrupt { .. } => "LogFetch::Corrupt",
+                LogFetchError::EtagChanged { .. } => "LogFetch::EtagChanged",
+                LogFetchError::FetchMemoryExhausted { .. } => "LogFetch::FetchMemoryExhausted",
+                LogFetchError::CarryMismatch { .. } => "LogFetch::CarryMismatch",
+            },
+            SqlError::SpanFetch(fetch) => match fetch {
+                SpanFetchError::Store { .. } => "SpanFetch::Store",
+                SpanFetchError::Corrupt { .. } => "SpanFetch::Corrupt",
+                SpanFetchError::TenantMismatch { .. } => "SpanFetch::TenantMismatch",
+                SpanFetchError::FetchMemoryExhausted { .. } => "SpanFetch::FetchMemoryExhausted",
+            },
+            SqlError::CorruptStreamAttrs(_) => "CorruptStreamAttrs",
+            SqlError::RunInvariant(_) => "RunInvariant",
+            SqlError::Parquet(_) => "Parquet",
+            SqlError::SnapshotInvalidated => "SnapshotInvalidated",
+            SqlError::DeadlineExceeded { .. } => "DeadlineExceeded",
+            SqlError::TooManySamples { .. } => "TooManySamples",
+            SqlError::TooManySegments { .. } => "TooManySegments",
+            SqlError::TooManySeries { .. } => "TooManySeries",
+            SqlError::TooManyBytesScanned { .. } => "TooManyBytesScanned",
+            SqlError::RequestBudgetExceeded { .. } => "RequestBudgetExceeded",
+            SqlError::ResourcesExhausted(_) => "ResourcesExhausted",
+            SqlError::SpillBudgetExhausted(_) => "SpillBudgetExhausted",
+            SqlError::SpillUnavailable(_) => "SpillUnavailable",
+            SqlError::Plan(_) => "Plan",
+            SqlError::Execution(_) => "Execution",
+            SqlError::Internal(_) => "Internal",
+            SqlError::UnencodableResult { .. } => "UnencodableResult",
+            SqlError::OperatorPanic(_) => "OperatorPanic",
+            SqlError::Shared { .. } => "Shared",
         }
     }
 
@@ -898,6 +963,47 @@ mod tests {
         );
         assert_redacted(&err.client_message());
         assert_eq!(err.class(), ErrorClass::Unavailable);
+    }
+
+    /// #2044: each fetcher's `FetchMemoryExhausted` answers the memory-family
+    /// message in the same 503 class it had, so a caller can tell process
+    /// memory pressure apart from a storage fault. The figures stay in the
+    /// log detail only.
+    ///
+    /// FLIP: return `MSG_UNAVAILABLE` from any one of the three arms and its
+    /// row fails with `right: "query memory budget exhausted: ..."`.
+    #[test]
+    fn fetch_memory_refusals_answer_the_memory_message_in_the_unavailable_class() {
+        let (requested, reserved, limit) = (4096, 1024, 2048);
+        let cases = [
+            SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }),
+            SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }),
+            SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }),
+        ];
+        for err in cases {
+            assert_eq!(err.client_message(), MSG_FETCH_MEMORY_EXHAUSTED, "{err:?}");
+            assert!(
+                err.client_message()
+                    .starts_with("query memory budget exhausted"),
+                "{err:?}"
+            );
+            assert_eq!(err.class(), ErrorClass::Unavailable, "{err:?}");
+            assert!(!err.is_integrity_fault(), "{err:?}");
+            assert!(err.to_string().contains("4096"), "log detail: {err}");
+            assert_redacted(&err.client_message());
+        }
     }
 
     #[test]

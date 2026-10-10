@@ -19,6 +19,7 @@
 //!   understands.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -38,7 +39,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use prost::Message;
 use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
-use ravel_query::QueryAdmissionController;
+use ravel_query::{QueryAdmissionController, QueryPermit};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
 use tonic::metadata::MetadataMap;
@@ -301,6 +302,28 @@ impl RavelFlightSqlService {
         self.auth.tenant(metadata)
     }
 
+    /// Admission for one RPC (ADR-0061 decision 2): the memory admission wait
+    /// bounded by `deadline` (#2044), then a concurrency slot. Either refusal
+    /// is `RESOURCE_EXHAUSTED`, before any store work.
+    async fn admit(&self, deadline: Duration) -> Result<QueryPermit, Status> {
+        self.query_admission
+            .admit_within(deadline)
+            .await
+            .map(|admitted| admitted.permit)
+            .map_err(|refused| Status::resource_exhausted(refused.client_message()))
+    }
+
+    /// What is left of a ticket's clamped deadline, the bound on the memory
+    /// admission wait at redemption. The stream re-reads the clock after
+    /// admission, so time spent waiting comes out of the same deadline.
+    fn ticket_budget(&self, ticket_deadline_ns: i64) -> Duration {
+        let now_ns = self.clock.now_ns();
+        let deadline_ns = self
+            .config
+            .clamp_ticket_deadline_ns(ticket_deadline_ns, now_ns);
+        Duration::from_nanos(u64::try_from(deadline_ns.saturating_sub(now_ns)).unwrap_or(0))
+    }
+
     /// Count `reason` and return the status the refused slice fetch answers.
     fn reject_slice(&self, reason: SliceReject) -> Status {
         self.slice_rejects.record(reason);
@@ -319,9 +342,7 @@ impl RavelFlightSqlService {
         let tenant = ticket.tenant;
         // Admission for the scan (ADR-0061 decision 2), after the capability
         // verified so a refused slice costs no permit.
-        let permit = self.query_admission.try_admit().map_err(|_| {
-            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
-        })?;
+        let permit = self.admit(self.ticket_budget(ticket.deadline_ns)).await?;
         let span = tracing::info_span!(
             "flight_sql_slice_fragment",
             tenant_hash = %tenant.to_hex(),
@@ -440,18 +461,25 @@ impl FlightSqlService for RavelFlightSqlService {
         // ticket is redeemed. The two RPCs are separate points in time, so one
         // logical Flight query never holds two slots at once. See
         // `do_get_statement`.
-        let _permit = self.query_admission.try_admit().map_err(|_| {
-            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
-        })?;
-
+        //
+        // The request is parsed first because its deadline bounds the memory
+        // admission wait; the wait's time comes out of that deadline, and the
+        // ticket below is minted from what is left.
         let now_ns = self.clock.now_ns();
-        let req = sql_request(
+        let mut req = sql_request(
             query.query.clone(),
             request.metadata(),
             min_tokens,
             now_ns,
             &self.config,
         )?;
+        let admitted = self
+            .query_admission
+            .admit_within(req.deadline)
+            .await
+            .map_err(|refused| Status::resource_exhausted(refused.client_message()))?;
+        let _permit = admitted.permit;
+        req.deadline = admitted.remaining_deadline;
 
         // Step 2: resolve exactly once. For the signal tables this snapshot,
         // and only this snapshot, is what DoGet will execute against. Parquet
@@ -657,9 +685,7 @@ impl FlightSqlService for RavelFlightSqlService {
         // the minted ticket stays valid and redeemable later within its deadline,
         // so the client should simply retry the DoGet. This rejection is emitted
         // before any store work, mirroring `get_flight_info_statement`.
-        let permit = self.query_admission.try_admit().map_err(|_| {
-            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
-        })?;
+        let permit = self.admit(self.ticket_budget(decoded.deadline_ns)).await?;
 
         // The statement now reaches execution against its pinned snapshot for a
         // resolved tenant, so it is auditable (ADR-0042 decision 4, ADR-0062

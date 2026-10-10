@@ -214,7 +214,8 @@ instant, the cache cap, a fetch guard, or an SQL reservation; a handoff may
 put a byte under two, and that overlap is accounted rather than tolerated, but
 no byte may ever be under none.** Coverage is the invariant and a gap is the
 violation; the overlap is measured by `handoff_overlap` so `unique` can
-subtract it. "Exactly one" was the original wording and it contradicted the
+subtract it. The limit check does not subtract it (see the admission wait
+amendment below for why). "Exactly one" was the original wording and it contradicted the
 handoff cases immediately below it. Concretely:
 
 - A fetched buffer handed to an SQL scan is charged by that scan's own
@@ -1137,3 +1138,75 @@ read lower than what is live; they can read higher, by at most the
 aggregate's own peak reservation, from its first shrink until its stream is
 dropped. ADR-0102's aggregate hold amendment records why `can_spill`
 selects it.
+
+## Amendment (2026-10-10, #2044): a bounded wait at admission
+
+<!-- amendment-applies: sections="2. A fetch byte reservation at the points where the unit is known" pointer="admission wait amendment" -->
+
+The ClickBench concurrent phase (10 connections, limit 15.92 GB) ended 81
+statements in error, 62 of them a process-budget refusal at a fetch
+reservation. The process peak of fetch reservations was 5.85 GB, about
+0.585 GB per connection, and the handoff overlap peaked at 2.34 GB, 14.7%
+of the limit. Two changes were considered.
+
+**The limit check keeps counting handed-off bytes.** Subtracting
+`handoff_overlap` from `reserved` before comparing against the limit would
+return the 2.34 GB, but only if the overlap is bounded by the cache cap,
+since the cap is what is supposed to cover those bytes. It is not. A
+fetcher marks its reservation handed off whenever a cache is configured,
+before knowing whether the cache accepted the value
+(`crates/ravel-query/src/fetcher.rs`, the `mark_handed_off` call in the
+coalesced-run fetch, and the matching calls in `log_fetcher.rs`), and the
+cache declines a value larger than `max_entry_bytes`. A declined value's
+bytes are under the fetch guard alone, yet they are counted in the overlap.
+Bytes a reader keeps after the cache evicts them also stay in the overlap
+for as long as the reader holds them, so the overlap can exceed the cache
+cap without limit. Subtracting it would let `reserved - overlap` read below
+what is live, leaving those bytes under no ledger the limit check counts,
+which is the gap decision 2's handoff rule names as the violation. The
+`ravel_memory_handoff_overlap_bytes` help text already says the figure
+over-states. Narrowing the mark to values the cache accepted is the
+prerequisite for subtracting it, and it is not done here.
+
+**Admission waits for headroom instead of refusing at once.** Before a
+query takes its concurrency permit, `QueryAdmissionController::admit_within`
+checks the process budget. While `reserved >= fraction * limit` it re-reads
+the counter every 10 ms. It admits once `reserved` falls below the
+threshold, and refuses with the existing admission class (HTTP 503
+`unavailable` for PromQL, metadata and SQL; gRPC `RESOURCE_EXHAUSTED` for
+Flight SQL) once the next re-check would pass the statement's deadline.
+The refusal message is "query memory budget exhausted: no headroom freed
+before the statement deadline; retry". The time spent waiting comes out of
+the statement's deadline, so a statement that waited has that much less
+time to run. Every admission site goes through the wait:
+`QueryControls::admit` for the HTTP endpoints, and the Flight SQL
+`get_flight_info` and `do_get` sites. Reservation growth never waits: a
+fetch or SQL reservation that does not fit is refused at once, as decision 2
+says, because a query that already holds memory and waits for more can
+deadlock against another doing the same.
+
+The fraction defaults to 0.75. At the measured limit that leaves 3.98 GB of
+headroom above the threshold: the 2.34 GB overlap peak plus 1.64 GB, about
+2.8 times one connection's mean fetch peak. A statement admitted just under
+the threshold therefore has room for its own fetches even while the
+overlap is at its peak. A higher fraction admits statements into headroom
+too small for one connection's fetches; a lower one makes queries wait
+while a quarter or more of the budget is free. Statements waiting together
+pass together when headroom appears, so the wait reduces refusals but does
+not serialize admission; the headroom above the threshold is what absorbs
+that burst. The figure is calibrated on one workload and one host size and
+is a starting value, not a measured optimum.
+
+`--query-memory-admission-fraction` sets it, from 0 to 1; 0 disables the
+wait. The resolved value, its source and the threshold in bytes are logged on the `performance default resolved`
+line. An unlimited budget never waits. Two counters report the wait:
+`ravel_memory_admission_waits_total` counts admissions that had to
+wait, and `ravel_memory_admission_wait_refusals_total` counts the
+waits that ended in a refusal.
+
+Separately, a fetch refused by the budget (`FetchMemoryExhausted` from the
+metric, log and span fetchers) now answers SQL clients with "query memory
+budget exhausted: the process could not reserve memory to fetch segment
+data; retry" instead of the generic unavailable message. The status (503)
+and `errorType` (`unavailable`) are unchanged, and the server's WARN line
+for the redacted error names the error variant.

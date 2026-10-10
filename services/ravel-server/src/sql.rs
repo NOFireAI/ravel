@@ -417,8 +417,8 @@ async fn run_ddl(
 
     let handle = tokio::spawn(async move {
         let ddl_result: Result<DdlOutcome, ServiceError> = async {
-            let _permit = match task_controls.admit() {
-                Ok(permit) => permit,
+            let (_permit, deadline) = match task_controls.admit(deadline).await {
+                Ok(admitted) => admitted,
                 Err(err) => {
                     accounting.record_ddl(
                         tenant_hash,

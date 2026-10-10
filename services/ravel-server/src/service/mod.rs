@@ -412,10 +412,10 @@ impl QueryService {
             .as_ref()
             .ok_or_else(|| ServiceError::unsupported_surface("analytics"))?;
 
-        let _permit = self.controls.admit()?;
         let deadline = self
             .controls
             .clamp_deadline(request.deadline, state.engine.config().deadline);
+        let (_permit, deadline) = self.controls.admit(deadline).await?;
         let now_ns = self.clock.now_ns();
         let live = ravel_query::LiveQueryAccounting::new();
         let guard = self
@@ -493,10 +493,10 @@ impl QueryService {
             .as_ref()
             .ok_or_else(|| ServiceError::unsupported_surface("exemplars"))?;
 
-        let _permit = self.controls.admit()?;
         let deadline = self
             .controls
             .clamp_deadline(request.deadline, state.deadline);
+        let (_permit, deadline) = self.controls.admit(deadline).await?;
         let now_ns = self.clock.now_ns();
 
         // The live handle each read attempt installs its own accounting into,
@@ -591,8 +591,10 @@ impl QueryService {
             .as_ref()
             .ok_or_else(|| ServiceError::unsupported_surface("SQL"))?;
 
-        let _permit = self.controls.admit()?;
-        let request = &self.clamped_sql_request(state, request);
+        let mut request = self.clamped_sql_request(state, request);
+        let (_permit, deadline) = self.controls.admit(request.deadline).await?;
+        request.deadline = deadline;
+        let request = &request;
         let live = ravel_sql::LiveAccounting::new();
         let guard = self
             .controls
@@ -649,8 +651,10 @@ impl QueryService {
             .as_ref()
             .ok_or_else(|| ServiceError::unsupported_surface("SQL"))?;
 
-        let _permit = self.controls.admit()?;
-        let request = &self.clamped_sql_request(state, request);
+        let mut request = self.clamped_sql_request(state, request);
+        let (_permit, deadline) = self.controls.admit(request.deadline).await?;
+        request.deadline = deadline;
+        let request = &request;
         // An explain resolves a snapshot, so it spends store requests and is
         // accounted like any other read.
         let accounting = QueryAccounting::new();
