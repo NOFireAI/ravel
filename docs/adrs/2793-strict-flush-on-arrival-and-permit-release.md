@@ -173,33 +173,44 @@ between two writes opens a third flush and the band does not hold.
 **4. The admission permit is released at enqueue; pending strict acks get
 their own bound.**
 
-The router's write splits into two phases: `submit`, which charges the
-ADR-0069 byte budget, sends to every involved shard and returns a
-`Submitted` handle, and `Submitted::acks()`, which awaits the strict acks
-under the ack deadline and returns the receipt. `write` remains as the
-composition of the two for callers that do not care.
+The router's write splits into two phases: `submit`, which takes a
+pending-ack permit for a strict write, then charges the ADR-0069 byte
+budget, sends to every involved shard and returns a `Submitted` handle,
+and `Submitted::acks()`, which awaits the strict acks under the ack
+deadline and returns the receipt. The permit comes before the charge so a
+pending-ack refusal leaves nothing charged and nothing to release. `write`
+remains as the composition of the two for callers that do not care.
 
 The admission layers stop holding the permit for the handler's lifetime,
 with one mechanism per transport, because the two transports drop request
 extensions at different times:
 
-- HTTP: the middleware (`ingest_admission.rs:246`) keeps holding the
-  permit across `next.run(request)`, as today, and also hands the handler
-  a cloneable release handle through the request extensions, an
-  `Arc<Mutex<Option<IngestPermit>>>` that owns the permit. The handler
-  clones the handle out of the extensions, calls `submit`, then empties the
-  slot, which releases the permit; it then awaits `acks()`. A handler that
-  never reaches `submit` leaves the slot full and the layer's own clone
-  releases the permit when the request ends, as today.
-- gRPC: the layer keeps the permit in its own future
-  (`ingest_admission.rs:444-452`) and hands the handler the same kind of
-  handle. The handler reads it from the extensions before
-  `request.into_inner()`, the way it reads the admission marker today, so
-  tonic dropping the extensions mid-handler drops a clone of the handle,
-  never the permit. The existing marker is not precedent for this: its
-  comment (`ingest_admission.rs:84-96`) exists to forbid a bare permit in
-  extensions, and the handle design honors that reason because the layer
-  always holds a clone of its own.
+One ownership model on every transport: a release handle, an
+`Arc<Mutex<Option<IngestPermit>>>`, owns the permit; the admission layer
+holds one clone of the handle for the request's lifetime and the handler
+takes another. Emptying the slot releases the permit; dropping a clone
+never does. A handler that never reaches `submit` leaves the slot full,
+and the layer's clone releases the permit when the request ends, as today.
+
+- HTTP: the middleware (`ingest_admission.rs:246`) moves the permit into a
+  handle, keeps a clone across `next.run(request)`, and puts another in
+  the request extensions. The OTLP metrics, logs and traces handlers and
+  the Remote Write handler (`remote_write.rs:334`, behind the same
+  middleware, strict-only by construction and so the surface that holds
+  its permit across every ack today) clone the handle out, call `submit`,
+  empty the slot, then await `acks()`.
+- gRPC: the layer (`ingest_admission.rs:444-452`) stops moving the bare
+  permit into its own future (`let _permit = permit;`) and holds a clone
+  of the handle there instead, with another clone in the extensions. The
+  handler reads it from the extensions before `request.into_inner()`, the
+  way it reads the admission marker today, so tonic dropping the
+  extensions mid-handler drops a clone, never the permit. On the
+  direct-call path, where no layer ran and `admit_grpc_request` took the
+  permit itself (`otlp_grpc.rs:78-84`), the handler owns that permit and
+  drops it after `submit`. The existing marker is not precedent for any
+  of this: its comment (`ingest_admission.rs:84-96`) exists to forbid a
+  bare permit in extensions, and the handle design honors that reason
+  because the layer always holds a clone of its own.
 - OTAP: the batch handler already holds its permit locally and drops it
   after `submit`.
 
@@ -219,9 +230,9 @@ text and counter `ravel_ingest_pending_ack_shed_total`, and the gauge
 `ravel_ingest_pending_strict_acks` shows the held count. The two refusals
 differ in where they shed: the in-flight ceiling decides at the request
 head and a shed request never buffers a body, while the pending-ack bound
-is taken inside `submit`, after decode and after the byte charge, so a
-refusal there has paid a full decode. It is a bound on held contexts, not
-a replacement for the head shed. Buffered writes
+is taken inside `submit`, after decode and before the byte charge, so a
+refusal there has paid a full decode and holds no charge. It is a bound
+on held contexts, not a replacement for the head shed. Buffered writes
 return at enqueue and take none. The default is the in-flight ceiling
 times eight: at the aged policy's 2.2 s that is about 3,700 strict requests
 per second before refusal, at the arrival policy's 0.1 s about 80,000, and
@@ -232,7 +243,7 @@ tens of megabytes at the default, not gigabytes.
 flowchart LR
     subgraph gateway
         A[admission middleware<br/>take in-flight permit] --> B[decode body<br/>charge decode bytes]
-        B --> C[router.submit<br/>charge byte budget<br/>take pending-ack permit<br/>send to shards]
+        B --> C[router.submit<br/>take pending-ack permit<br/>charge byte budget<br/>send to shards]
         C --> D[drop in-flight permit]
         D --> E[Submitted.acks<br/>await under deadline]
     end
@@ -315,12 +326,13 @@ flowchart LR
   enqueue and names the pending-ack bound. Two in-tree sentences become
   false the moment the permit is released at enqueue and change in the
   same commit as that behavior: the middleware comment at
-  `services/ravel-server/src/ingest_admission.rs:235-241` ("covers the body
-  read, the decode, and the durable write") and the
+  `services/ravel-server/src/ingest_admission.rs:235-241`, which loses
+  "and the durable write" from what the permit covers, and the
   `--max-inflight-ingest-requests` help at
   `services/ravel-server/src/config.rs:1550-1565`, which keeps its
-  head-shed sentence and loses "durable write" from what the permit
-  spans. `docs/reference/ravel-server-flags.md`,
+  head-shed sentence and gains one saying the permit is released at
+  enqueue, so the count bounds decodes in flight and no longer covers the
+  ack wait. `docs/reference/ravel-server-flags.md`,
   `docs/reference/http-api.md`, `docs/guides/ingest.md` and `docs/concepts.md`
   gain the header value and flags. The flag doc test
   `ingest_flag_docs_name_the_inflate_term` keeps pinning the in-flight
