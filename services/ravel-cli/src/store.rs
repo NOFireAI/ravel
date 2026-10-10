@@ -702,7 +702,11 @@ pub async fn read_bytes(args: &StoreArgs, key_or_path: &str) -> anyhow::Result<V
     if !ravel_object_store::is_addressable_key(key_or_path) {
         return Err(
             anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)).context(
-                format!("no file at {key_or_path:?}, and it is not an object store key"),
+                format!(
+                    "{key_or_path:?} is neither an existing file nor an object store key (a \
+                     request for it would reach {:?})",
+                    ravel_pqtable::keys::store_path(key_or_path)
+                ),
             ),
         );
     }
@@ -935,7 +939,11 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            format!("no file at {missing:?}, and it is not an object store key")
+            format!(
+                "{missing:?} is neither an existing file nor an object store key (a request \
+                 for it would reach {:?})",
+                missing.trim_start_matches('/')
+            )
         );
         assert!(
             !format!("{err:#}").contains("is not addressable"),

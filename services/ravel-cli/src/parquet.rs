@@ -1133,21 +1133,18 @@ mod tests {
         assert_eq!(deletes(denied.inner()), 2);
     }
 
-    /// Handles keys the way the S3 adapter does under ADR-2637, and records
-    /// the key of every `delete` call. A request for a key its path encoding
-    /// would rewrite fails with `UnaddressableKey` naming the key it would
-    /// reach, and never reaches `inner`; a list page reports such a key in
-    /// `unaddressable`, never as an object. With `lose_deletes` set, a delete
-    /// of an addressable key reports success and removes nothing.
-    struct S3Keys<S> {
+    /// Records the key of every `delete` call, including a call `inner` then
+    /// refuses. With `lose_deletes` set, a delete reports success and removes
+    /// nothing.
+    struct DeleteRecorder<S> {
         inner: S,
         deletes: std::sync::Mutex<Vec<String>>,
         lose_deletes: bool,
     }
 
-    impl<S> S3Keys<S> {
+    impl<S> DeleteRecorder<S> {
         fn new(inner: S) -> Self {
-            S3Keys {
+            DeleteRecorder {
                 inner,
                 deletes: std::sync::Mutex::new(Vec::new()),
                 lose_deletes: false,
@@ -1159,50 +1156,15 @@ mod tests {
         }
     }
 
-    /// `key`, or the S3 adapter's refusal of a key its path encoding rewrites.
-    fn addressable(key: &str) -> Result<&str, ravel_object_store::StoreError> {
-        if ravel_object_store::is_addressable_key(key) {
-            Ok(key)
-        } else {
-            Err(ravel_object_store::StoreError::UnaddressableKey {
-                key: key.to_string(),
-                addresses: store_path(key),
-            })
-        }
-    }
-
-    /// Move every object of `objects` the S3 adapter cannot address into
-    /// `unaddressable`, in key order.
-    fn classify(
-        objects: &mut Vec<ravel_object_store::ObjectMeta>,
-        unaddressable: &mut Vec<ravel_object_store::UnaddressableKey>,
-    ) {
-        let (kept, moved): (Vec<_>, Vec<_>) = std::mem::take(objects)
-            .into_iter()
-            .partition(|meta| ravel_object_store::is_addressable_key(&meta.key));
-        *objects = kept;
-        unaddressable.extend(
-            moved
-                .into_iter()
-                .map(|meta| ravel_object_store::UnaddressableKey {
-                    addresses: store_path(&meta.key),
-                    key: meta.key,
-                    size: meta.size,
-                    last_modified_unix_ms: meta.last_modified_unix_ms,
-                }),
-        );
-        unaddressable.sort_by(|a, b| a.key.cmp(&b.key));
-    }
-
     #[async_trait::async_trait]
-    impl<S: ObjectStoreBackend> ObjectStoreBackend for S3Keys<S> {
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for DeleteRecorder<S> {
         async fn put(
             &self,
             key: &str,
             data: Bytes,
             opts: PutOptions,
         ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
-            self.inner.put(addressable(key)?, data, opts).await
+            self.inner.put(key, data, opts).await
         }
 
         async fn get(
@@ -1210,7 +1172,7 @@ mod tests {
             key: &str,
             range: ravel_object_store::GetRange,
         ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
-            self.inner.get(addressable(key)?, range).await
+            self.inner.get(key, range).await
         }
 
         async fn put_multipart<'a>(
@@ -1218,14 +1180,14 @@ mod tests {
             key: &str,
         ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
         {
-            self.inner.put_multipart(addressable(key)?).await
+            self.inner.put_multipart(key).await
         }
 
         async fn head(
             &self,
             key: &str,
         ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
-            self.inner.head(addressable(key)?).await
+            self.inner.head(key).await
         }
 
         async fn list(
@@ -1233,30 +1195,18 @@ mod tests {
             prefix: &str,
             page: Option<ravel_object_store::PageToken>,
         ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
-            let mut page = self.inner.list(prefix, page).await?;
-            classify(&mut page.objects, &mut page.unaddressable);
-            Ok(page)
+            self.inner.list(prefix, page).await
         }
 
         async fn list_delimited(
             &self,
             prefix: &str,
         ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
-            let mut listed = self.inner.list_delimited(prefix).await?;
-            classify(&mut listed.objects, &mut listed.unaddressable);
-            let (kept, moved): (Vec<String>, Vec<String>) =
-                std::mem::take(&mut listed.common_prefixes)
-                    .into_iter()
-                    .partition(|p| ravel_object_store::is_addressable_prefix(p));
-            listed.common_prefixes = kept;
-            listed.unaddressable_prefixes.extend(moved);
-            listed.unaddressable_prefixes.sort();
-            Ok(listed)
+            self.inner.list_delimited(prefix).await
         }
 
         async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
             self.deletes.lock().expect("lock").push(key.to_string());
-            let key = addressable(key)?;
             if self.lose_deletes {
                 return Ok(());
             }
@@ -1306,8 +1256,8 @@ mod tests {
     }
 
     /// [`forged_table`] plus the stray keys `rests` of `acme`, written raw at
-    /// store time 5_000, behind [`S3Keys`].
-    async fn stray_table(rests: &[&str]) -> S3Keys<InstrumentedStore<MemoryStore>> {
+    /// store time 5_000, behind a [`DeleteRecorder`].
+    async fn stray_table(rests: &[&str]) -> DeleteRecorder<InstrumentedStore<MemoryStore>> {
         let store = forged_table().await;
         store.inner().set_clock_ms(5_000);
         for rest in rests {
@@ -1315,7 +1265,7 @@ mod tests {
                 .inner()
                 .insert_foreign(&acme_key(rest), Bytes::from_static(b"x"));
         }
-        S3Keys::new(store)
+        DeleteRecorder::new(store)
     }
 
     /// The keys under `prefix` that a listing of `store` reports
@@ -1529,7 +1479,7 @@ mod tests {
                 .await
                 .expect("put");
         }
-        let store = S3Keys::new(FaultStore::new(
+        let store = DeleteRecorder::new(FaultStore::new(
             store,
             FaultPlan::empty().with_rule(
                 Rule::new(Op::List, ScriptedFault::Permanent("listing refused".into()))
@@ -1569,7 +1519,7 @@ mod tests {
         let hash = TenantId::new("acme").hash();
         let prefix = ravel_pqtable::keys::manifest_prefix(&hash, "hits").expect("prefix");
         let tilde = format!("{prefix}~~~~~~~~~~~~~~~~~~~~.pqm");
-        let store = S3Keys::new(forged_table().await);
+        let store = DeleteRecorder::new(forged_table().await);
         store
             .inner
             .inner()
@@ -1658,7 +1608,7 @@ mod tests {
                 .await
                 .expect("put");
         }
-        let store = S3Keys::new(FaultStore::new(
+        let store = DeleteRecorder::new(FaultStore::new(
             store,
             FaultPlan::empty().with_rule(
                 Rule::new(

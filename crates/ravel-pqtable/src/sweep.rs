@@ -237,9 +237,7 @@ mod tests {
     use crate::keys::{grants_key, manifest_key};
     use crate::manifest::encode_manifest;
     use crate::resolve;
-    use crate::test_util::{
-        CountingStore, S3KeyStore, TENANT_A, TENANT_B, file_for, live_manifest,
-    };
+    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, file_for, live_manifest};
     use crate::writer::{Intent, Outcome, apply};
 
     const GRACE: u64 = 660_000;
@@ -530,8 +528,8 @@ mod tests {
         for (i, rest) in STRAY_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x63 + i as u8; 16]);
             let (logs, _guard) = capture_logs();
-            let store = two_versions_behind_s3_keys(&tenant).await;
-            let stray = put_stray(store.inner.inner(), &tenant, rest).await;
+            let store = two_versions(&tenant).await;
+            let stray = put_stray(store.inner(), &tenant, rest).await;
             let now = (1 + GRACE + SKEW_MS) as i64;
             for _ in 0..2 {
                 let planned = plan(&store, &tenant, now, GRACE, GRACE)
@@ -551,10 +549,7 @@ mod tests {
                 .await
                 .expect("plan");
             execute(&store, &planned).await.expect("execute");
-            assert_eq!(
-                store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
-                1
-            );
+            assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 1);
             store
                 .head(&stray)
                 .await
@@ -562,15 +557,10 @@ mod tests {
         }
     }
 
-    /// Versions 1 and 2 of `hits`, written at store time 0, behind the S3
-    /// adapter's key handling.
-    async fn two_versions_behind_s3_keys(
-        tenant: &TenantHash,
-    ) -> S3KeyStore<InstrumentedStore<MemoryStore>> {
-        let store = S3KeyStore {
-            inner: InstrumentedStore::new(MemoryStore::with_page_size(2)),
-        };
-        store.inner.inner().set_clock_ms(0);
+    /// Versions 1 and 2 of `hits`, written at store time 0.
+    async fn two_versions(tenant: &TenantHash) -> InstrumentedStore<MemoryStore> {
+        let store = InstrumentedStore::new(MemoryStore::with_page_size(2));
+        store.inner().set_clock_ms(0);
         for v in [1, 2] {
             let bytes = encode_manifest(tenant, &live_manifest("hits", v, &[1])).expect("encode");
             store
@@ -589,13 +579,13 @@ mod tests {
     /// listing and counted in [`resolve::unaddressable_listings`]; the sweep
     /// deletes the superseded version and leaves the stray key in the store.
     #[tokio::test]
-    async fn a_stray_key_the_s3_adapter_cannot_address_is_skipped_and_counted_by_the_sweep() {
+    async fn an_unaddressable_stray_key_is_skipped_and_counted_by_the_sweep() {
         use crate::resolve::tests::{UNLISTABLE_SHAPES, put_stray};
 
         for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x7a + i as u8; 16]);
-            let store = two_versions_behind_s3_keys(&tenant).await;
-            let stray = put_stray(store.inner.inner(), &tenant, rest).await;
+            let store = two_versions(&tenant).await;
+            let stray = put_stray(store.inner(), &tenant, rest).await;
             let now = (1 + GRACE + SKEW_MS) as i64;
             let planned = plan(&store, &tenant, now, GRACE, GRACE)
                 .await
@@ -611,19 +601,18 @@ mod tests {
             assert_eq!(resolve::unaddressable_listings(&tenant), 1, "{rest:?}");
             execute(&store, &planned).await.expect("execute");
             assert_eq!(
-                store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+                store.metrics().snapshot().op(StoreOp::Delete).calls,
                 1,
                 "{rest:?}"
             );
             store
-                .inner
                 .inner()
                 .head(&stray)
                 .await
                 .expect_err("unaddressable, so the memory store refuses it too");
             assert!(
                 ravel_object_store::list_all_reporting(
-                    store.inner.inner(),
+                    store.inner(),
                     &tenant_manifest_prefix(&tenant)
                 )
                 .await
