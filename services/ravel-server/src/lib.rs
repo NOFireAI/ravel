@@ -40,6 +40,7 @@ pub mod maintain;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod mem_stats;
+pub mod memory_gate;
 pub mod metadata_sink_task;
 pub mod metrics;
 pub mod normalize_reject_metrics;
@@ -1120,6 +1121,9 @@ pub struct Running {
     /// to the end of [`Running::shutdown`], so the heartbeat keeps beating
     /// through the drain.
     runtime_heartbeat_task: Option<AbortOnDrop>,
+    /// The ADR-1170 process memory budget, which the memory gate sampler
+    /// (ADR-2633) writes the resident gate of.
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     /// This process's hold on `<cache-dir>/sql-spill/<instance-id>` (ADR-0954
     /// requirement 7, amended by issue #2416), `Some` when SQL spill resolved
     /// under `--cache-dir`. Its lock tells every other process's startup sweep
@@ -1357,6 +1361,12 @@ impl Running {
     /// (ADR-1702 decision 8).
     pub fn readiness(&self) -> health::Readiness {
         self.readiness.clone()
+    }
+
+    /// The process memory budget, for `main` to start the memory gate
+    /// sampler on (ADR-2633 task 2).
+    pub fn process_memory_budget(&self) -> Arc<ravel_memory::MemoryBudget> {
+        self.process_memory_budget.clone()
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
@@ -4229,6 +4239,7 @@ pub async fn start_with_heartbeat(
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
         runtime_heartbeat_task: None,
+        process_memory_budget,
         #[cfg(feature = "sql")]
         sql_spill_owner,
     })

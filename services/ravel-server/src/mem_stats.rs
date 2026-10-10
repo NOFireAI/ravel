@@ -143,6 +143,114 @@ pub fn configure_background_thread(_malloc_conf: Option<&str>) -> BackgroundThre
     }
 }
 
+/// Whether this build runs under jemalloc, the allocator the memory gate's
+/// reading and purge need (ADR-2633 section 2).
+pub const JEMALLOC: bool = cfg!(not(target_env = "msvc"));
+
+/// Refreshes jemalloc's stats epoch and reads `stats.resident`, the memory
+/// gate's one reading. `None` when either call fails.
+#[cfg(not(target_env = "msvc"))]
+pub fn read_resident() -> Option<u64> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    epoch::advance().ok()?;
+    stats::resident::read().ok().map(|resident| resident as u64)
+}
+
+/// No jemalloc on msvc, so nothing to read.
+#[cfg(target_env = "msvc")]
+pub fn read_resident() -> Option<u64> {
+    None
+}
+
+/// What one forced purge did, arena by arena.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeReport {
+    /// Arenas whose decay settings were set to 0 and back.
+    pub arenas_purged: u32,
+    /// Arena indices below `arenas.narenas` whose decay settings could not be
+    /// read or set, which jemalloc answers with EFAULT for an uninitialised
+    /// arena. Nothing was changed on them.
+    pub arenas_skipped: u32,
+    /// Decay writes that set a value back and failed, leaving that arena
+    /// purging eagerly until something else writes it.
+    pub restore_failures: u32,
+}
+
+/// Forces jemalloc to return every initialised arena's unused dirty and muzzy
+/// pages to the operating system (ADR-2633 section 2). For each arena below
+/// `arenas.narenas` it sets `muzzy_decay_ms` to 0 when it is nonzero, sets
+/// `dirty_decay_ms` to 0 (jemalloc purges synchronously on a write of 0), then
+/// restores both to the values the writes returned. The `tikv-jemalloc-ctl`
+/// error type exposes no errno, so every failed read or set is treated as
+/// the EFAULT of an uninitialised arena and the arena is skipped.
+#[cfg(not(target_env = "msvc"))]
+pub fn purge_arenas() -> PurgeReport {
+    use tikv_jemalloc_ctl::{Access, AsName, arenas};
+
+    let mut report = PurgeReport::default();
+    let narenas = match arenas::narenas::read() {
+        Ok(narenas) => narenas,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read arenas.narenas; no purge ran");
+            return report;
+        }
+    };
+    for index in 0..narenas {
+        let muzzy_key = format!("arena.{index}.muzzy_decay_ms\0");
+        let dirty_key = format!("arena.{index}.dirty_decay_ms\0");
+        let muzzy = muzzy_key.as_str().name();
+        let dirty = dirty_key.as_str().name();
+
+        let muzzy_current: isize = match muzzy.read() {
+            Ok(value) => value,
+            Err(_) => {
+                report.arenas_skipped += 1;
+                continue;
+            }
+        };
+        let muzzy_restore = if muzzy_current != 0 {
+            match muzzy.update(0_isize) {
+                Ok(previous) => Some(previous),
+                Err(_) => {
+                    report.arenas_skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        match dirty.update(0_isize) {
+            Ok(previous) => {
+                if dirty.write(previous).is_err() {
+                    report.restore_failures += 1;
+                }
+                report.arenas_purged += 1;
+            }
+            Err(_) => report.arenas_skipped += 1,
+        }
+        if let Some(previous) = muzzy_restore
+            && muzzy.write(previous).is_err()
+        {
+            report.restore_failures += 1;
+        }
+    }
+    if report.restore_failures > 0 {
+        tracing::warn!(
+            restore_failures = report.restore_failures,
+            "memory gate purge could not restore some arena decay settings; those arenas \
+             purge eagerly until restarted"
+        );
+    }
+    report
+}
+
+/// No jemalloc on msvc, so nothing to purge.
+#[cfg(target_env = "msvc")]
+pub fn purge_arenas() -> PurgeReport {
+    PurgeReport::default()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

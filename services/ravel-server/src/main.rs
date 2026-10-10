@@ -68,6 +68,12 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to resolve the host-derived performance defaults")?;
     performance.emit(host);
     configure_allocator();
+    // ADR-2633 task 2: the resident memory gate's mark, from the budget just
+    // resolved. Refuses a mark the cache caps and ingest ceiling reach.
+    let memory_gate = cli
+        .resolve_memory_gate(&performance)
+        .context("failed to resolve the memory gate")?;
+    memory_gate.emit();
     // ADR-1702 decision 3: the read and write CPU gates' permits, derived from
     // the same host profile unless a flag sets them.
     let cpu_gate_permits = cli.resolve_cpu_gate_permits(host);
@@ -663,6 +669,8 @@ async fn main() -> anyhow::Result<()> {
         heartbeat,
     )
     .await?;
+    ravel_server::memory_gate::start_sampler(&memory_gate, running.process_memory_budget())
+        .context("failed to start the memory gate sampler thread")?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
     if let Some(listener) = &health_listener {
         listener.attach_readiness(running.readiness());
@@ -782,6 +790,100 @@ mod tests {
         std::hint::black_box(big);
     }
 
+    /// Every initialised arena's `(dirty_decay_ms, muzzy_decay_ms)`, by index.
+    #[cfg(not(target_env = "msvc"))]
+    fn arena_decays() -> Vec<(u32, isize, isize)> {
+        use tikv_jemalloc_ctl::{Access, AsName, arenas};
+
+        let narenas = arenas::narenas::read().expect("arenas.narenas read must succeed");
+        (0..narenas)
+            .filter_map(|index| {
+                let dirty = format!("arena.{index}.dirty_decay_ms\0");
+                let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
+                let dirty: isize = dirty.as_str().name().read().ok()?;
+                let muzzy: isize = muzzy.as_str().name().read().ok()?;
+                Some((index, dirty, muzzy))
+            })
+            .collect()
+    }
+
+    /// Writes each arena's `(dirty_decay_ms, muzzy_decay_ms)`.
+    #[cfg(not(target_env = "msvc"))]
+    fn set_arena_decays(decays: &[(u32, isize, isize)]) {
+        use tikv_jemalloc_ctl::{Access, AsName};
+
+        for (index, dirty, muzzy) in decays {
+            for (kind, value) in [("dirty", dirty), ("muzzy", muzzy)] {
+                let key = format!("arena.{index}.{kind}_decay_ms\0");
+                key.as_str()
+                    .name()
+                    .write(*value)
+                    .expect("decay write must succeed on an initialised arena");
+            }
+        }
+    }
+
+    /// ADR-2633 section 2: the forced purge returns freed pages to the
+    /// operating system and leaves every arena's decay settings as it found
+    /// them. Allocated in 1 MiB pieces, below jemalloc's 8 MiB oversize
+    /// threshold, so the freed pages sit in ordinary arenas instead of the
+    /// huge arena, which purges on free by itself. Dirty decay is pinned to
+    /// -1 so no freed page leaves before the purge, and muzzy decay to a
+    /// nonzero value so the muzzy set-and-restore runs.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn memory_gate_purge_returns_freed_pages_and_restores_decay() {
+        const MIB: usize = 1 << 20;
+        const FREED_MIB: usize = 256;
+
+        let original = arena_decays();
+        assert!(!original.is_empty(), "arena 0 is always initialised");
+        let pinned: Vec<_> = original
+            .iter()
+            .map(|(index, _, _)| (*index, -1, 7_000))
+            .collect();
+        set_arena_decays(&pinned);
+        let before_purge_decays = arena_decays();
+        assert!(
+            before_purge_decays
+                .iter()
+                .all(|(_, dirty, muzzy)| (*dirty, *muzzy) == (-1, 7_000))
+        );
+
+        let pieces: Vec<Vec<u8>> = (0..FREED_MIB).map(|_| vec![7u8; MIB]).collect();
+        std::hint::black_box(&pieces);
+        drop(pieces);
+
+        let before = ravel_server::mem_stats::read_resident().expect("resident read");
+        let started = std::time::Instant::now();
+        let report = ravel_server::mem_stats::purge_arenas();
+        let elapsed = started.elapsed();
+        let after = ravel_server::mem_stats::read_resident().expect("resident read");
+        let after_purge_decays = arena_decays();
+        set_arena_decays(&original);
+        eprintln!("memory gate purge: {elapsed:?}, resident {before} -> {after}, {report:?}");
+
+        assert!(report.arenas_purged >= 1, "{report:?}");
+        assert_eq!(report.restore_failures, 0, "{report:?}");
+        let fell = before.saturating_sub(after);
+        assert!(
+            fell >= 200 * MIB as u64,
+            "resident fell by {fell} bytes ({before} -> {after}) across the purge of {FREED_MIB} \
+             MiB of freed pages; at least 200 MiB must return"
+        );
+        for (index, dirty, muzzy) in &before_purge_decays {
+            let restored = after_purge_decays
+                .iter()
+                .find(|(i, _, _)| i == index)
+                .expect("an initialised arena stays initialised");
+            assert_eq!(
+                (restored.1, restored.2),
+                (*dirty, *muzzy),
+                "arena {index}'s (dirty_decay_ms, muzzy_decay_ms) after the purge"
+            );
+        }
+    }
+
     /// A `tracing` writer appending every emitted byte to a shared buffer.
     #[derive(Clone)]
     struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -853,6 +955,25 @@ mod tests {
             call_at < start_at,
             "the allocator step must run before start"
         );
+    }
+
+    /// `main` stamps the memory gate once before any listener binds, and
+    /// starts its sampler once, on the running server's own budget.
+    #[test]
+    fn main_stamps_the_memory_gate_before_start_and_samples_after() {
+        const SRC: &str = include_str!("main.rs");
+        let stamp = concat!("\n    memory_gate", ".emit();\n");
+        let sampler = concat!(
+            "ravel_server::memory_gate::start_",
+            "sampler(&memory_gate, running.process_memory_budget())"
+        );
+        assert_eq!(SRC.matches(stamp).count(), 1);
+        assert_eq!(SRC.matches(sampler).count(), 1);
+        let start_at = SRC
+            .find(concat!("ravel_server::", "start_with_heartbeat("))
+            .expect("main starts the server");
+        assert!(SRC.find(stamp).expect("stamp present") < start_at);
+        assert!(SRC.find(sampler).expect("sampler start present") > start_at);
     }
 
     /// ADR-1733 decision 2 reachability: the one production `ServerConfig`

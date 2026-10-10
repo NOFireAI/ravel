@@ -38,13 +38,18 @@ pub struct MemoryBudget {
     refusals: RefusalCounts,
 }
 
-/// The resident gate's state (ADR-2633 section 1): whether it is open, and
-/// the process resident reading and high-water mark it was last set from.
+/// The resident gate's state (ADR-2633 section 1): whether it is open, the
+/// last process resident reading, and the last high-water mark.
 ///
 /// Written only by [`MemoryBudget::set_resident_gate`], whose caller is the
-/// server's memory-gate sampler thread (ADR-2633 task 2, issue #2730). Until
-/// that sampler exists nothing in production calls the setter, so every
-/// budget stays open and `try_reserve` behaves as it did before the gate.
+/// server's memory-gate sampler thread (ADR-2633 task 2, issue #2730). A
+/// process with the gate off never starts the sampler, so its budget stays
+/// open and `try_reserve` behaves as it did before the gate.
+///
+/// The reading and the mark are two independent relaxed stores, so a reader
+/// can see the reading of one setter call beside the mark of the next. The
+/// pair is consistent in practice only because the server derives the mark
+/// once at startup and passes the same value on every call.
 ///
 /// The 128-byte alignment gives the group a block of its own, apart from
 /// `reserved`: a check site's load of `open` never shares a cache line with
@@ -95,12 +100,15 @@ impl MemoryBudget {
     /// otherwise. This is the gate's only writer; the server's sampler thread
     /// calls it once per sample with the post-purge reading (ADR-2633
     /// section 2), and a test can call it to hold the gate closed.
+    ///
+    /// The gate is disabled by never calling this, never by a mark of 0: a
+    /// mark of 0 closes the gate for every reading.
     pub fn set_resident_gate(&self, resident: u64, high_water: u64) {
         self.gate.resident.store(resident, Ordering::Relaxed);
         self.gate.high_water.store(high_water, Ordering::Relaxed);
         // Release pairs with the acquire fence on the refusal path, so a
-        // refusal reports this call's figures or a later call's, never an
-        // earlier one's.
+        // refusal reads each figure from this call or a later one. The two
+        // figures may come from different calls.
         self.gate
             .open
             .store(resident < high_water, Ordering::Release);
@@ -269,8 +277,10 @@ impl MemoryBudget {
     #[cold]
     #[inline(never)]
     fn refuse_resident(&self, n: u64) -> Option<MemoryExhausted> {
-        // Pairs with the release store in `set_resident_gate`: the figures
-        // below are those of the write that closed the gate or a later one.
+        // Pairs with the release store in `set_resident_gate`: each figure
+        // below is from the write that closed the gate or a later one, not
+        // necessarily both from the same write (the mark is fixed for the
+        // process's life, which is what keeps the pair consistent).
         fence(Ordering::Acquire);
         let resident = self.gate_resident();
         let high_water = self.gate_high_water();
