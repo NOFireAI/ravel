@@ -6,7 +6,9 @@
 //! partial-success response: an operator could see a tenant's data being
 //! dropped by a client-side log line, and nothing at all on `/metrics`. This
 //! collector records them under the `skew` and `structural` reasons ADR-0051
-//! section 6 already reserved on `ravel_admission_rejected_total`.
+//! section 6 already reserved on `ravel_admission_rejected_total`, and under
+//! `resolved_label_bytes` for the whole-request label-byte bound (ADR-2708
+//! D2).
 //!
 //! It is a `ravel-server`-local counter, separate from the `ravel-ingest`
 //! `AdmissionController`'s per-tenant usage, for the same reason
@@ -43,6 +45,7 @@ pub struct NormalizeRejectMetrics {
 struct Counts {
     skew: u64,
     structural: u64,
+    resolved_label_bytes: u64,
     body_conversions: u64,
     resource_attrs_dropped: u64,
 }
@@ -60,6 +63,11 @@ pub struct TenantNormalizeRejects {
     /// unsupported type or temporality, a name or attribute over its limit, a
     /// malformed identifier.
     pub structural_total: u64,
+    /// Points, records, or spans rejected because their request's projected
+    /// resolved-label bytes exceeded `max_resolved_label_bytes_per_request`
+    /// (ADR-2708 D2). Every datum of the request counts, matching the
+    /// partial-success count.
+    pub resolved_label_bytes_total: u64,
     /// Log records whose structured body was converted to its canonical JSON
     /// form at normalization. Never a rejection, and not a count of stored
     /// records: the handler adds these as soon as normalization returns, which
@@ -99,6 +107,9 @@ impl NormalizeRejectMetrics {
         let row = rows.entry((tenant.hash(), signal)).or_default();
         row.skew = row.skew.saturating_add(counts.skew as u64);
         row.structural = row.structural.saturating_add(counts.structural as u64);
+        row.resolved_label_bytes = row
+            .resolved_label_bytes
+            .saturating_add(counts.resolved_label_bytes as u64);
     }
 
     /// Adds `count` admitted-after-conversion log records to `(tenant,
@@ -136,6 +147,7 @@ impl NormalizeRejectMetrics {
                 signal,
                 skew_total: counts.skew,
                 structural_total: counts.structural,
+                resolved_label_bytes_total: counts.resolved_label_bytes,
                 body_conversions_total: counts.body_conversions,
                 resource_attrs_dropped_total: counts.resource_attrs_dropped,
             })
@@ -174,6 +186,7 @@ mod tests {
             NormalizeRejectCounts {
                 skew: 2,
                 structural: 3,
+                resolved_label_bytes: 0,
             },
         );
         metrics.record(
@@ -182,6 +195,7 @@ mod tests {
             NormalizeRejectCounts {
                 skew: 1,
                 structural: 0,
+                resolved_label_bytes: 0,
             },
         );
         metrics.record(
@@ -190,6 +204,7 @@ mod tests {
             NormalizeRejectCounts {
                 skew: 0,
                 structural: 7,
+                resolved_label_bytes: 0,
             },
         );
         metrics.record_body_conversions(&tenant("acme"), Signal::Logs, 4);
@@ -199,6 +214,16 @@ mod tests {
             NormalizeRejectCounts {
                 skew: 5,
                 structural: 0,
+                resolved_label_bytes: 0,
+            },
+        );
+        metrics.record(
+            &tenant("acme"),
+            Signal::Spans,
+            NormalizeRejectCounts {
+                skew: 0,
+                structural: 0,
+                resolved_label_bytes: 9,
             },
         );
         metrics.record_resource_attrs_dropped(&tenant("acme"), Signal::Metrics, 2);
@@ -206,7 +231,14 @@ mod tests {
 
         let mut rows = metrics.snapshot();
         rows.sort_by_key(|r| (r.tenant_hash, r.signal as u8));
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
+
+        let acme_spans = rows
+            .iter()
+            .find(|r| r.tenant_hash == tenant("acme").hash() && r.signal == Signal::Spans)
+            .expect("acme spans row");
+        assert_eq!(acme_spans.resolved_label_bytes_total, 9);
+        assert_eq!(acme_spans.structural_total, 0);
 
         let acme_metrics = rows
             .iter()
@@ -214,6 +246,7 @@ mod tests {
             .expect("acme metrics row");
         assert_eq!(acme_metrics.skew_total, 3);
         assert_eq!(acme_metrics.structural_total, 3);
+        assert_eq!(acme_metrics.resolved_label_bytes_total, 0);
         assert_eq!(acme_metrics.body_conversions_total, 0);
         assert_eq!(acme_metrics.resource_attrs_dropped_total, 5);
 

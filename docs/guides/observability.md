@@ -2076,7 +2076,7 @@ metric name.
 
 #### Reading the `reason` label
 
-The `reason` label carries one of six values. Each reason counts a different
+The `reason` label carries one of seven values. Each reason counts a different
 unit, so a rate summed across reasons means nothing. Read them separately.
 
 | `reason` | Counts | What it means |
@@ -2087,8 +2087,10 @@ unit, so a rate summed across reasons means nothing. Read them separately.
 | `series_cap` | Series | The tenant is at its active series or stream cap, so points for series past the cap were dropped. |
 | `skew` | Points, records, or spans | The event timestamp sat too far ahead of, or behind, ingest time. A sender clock problem, or a backfill wider than the accepted lag. |
 | `structural` | Points, records, or spans | The data itself cannot be represented: a delta-temporality metric, an over-long label, a body kind with no stored form. Retrying the same payload always fails the same way. |
+| `resolved_label_bytes` | Points, records, or spans | The whole request was rejected because the labels normalization would build for it exceeded `max_resolved_label_bytes_per_request` (256 MiB): many histogram buckets, summary quantiles, log records or spans each copying large attributes. Every unit in the request is counted. Splitting the batch clears it; retrying it unchanged does not. |
 
-`skew` and `structural` count individual points, log records, or spans. They
+`skew`, `structural` and `resolved_label_bytes` count individual points, log
+records, or spans. They
 match the count that the sender receives in the OTLP partial-success
 response, so a client that reads `rejected_data_points` and an operator who
 reads this counter see the same number. The OTLP Arrow (OTAP) surface has no
@@ -2102,6 +2104,12 @@ The two reasons need different alerts:
 - `structural` never clears without a change to what the sender emits. Page a
   human on any sustained rate. See
   [the ingest guide's temporality recipe](ingest.md#delta-temporality-metrics).
+
+`resolved_label_bytes` gets no shipped alert. Only the three OTLP surfaces
+(HTTP and gRPC for metrics, logs and spans) count it, and a real exporter does
+not reach the bound, so any increase names a sender worth reading the
+partial-success message of; see
+[Resolved-label bytes](admission-limits.md#resolved-label-bytes).
 
 Both alerts ship as the `ravel-ingest-rejections` group.
 

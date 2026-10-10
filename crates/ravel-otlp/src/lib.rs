@@ -17,6 +17,7 @@
 //! stream identity at all, so resource and scope attributes are merged into
 //! each span's single `attrs` map instead of feeding an identity hash.
 
+pub mod label_projection;
 pub mod limits;
 pub mod logs_limits;
 pub mod logs_normalize;
@@ -26,9 +27,13 @@ pub mod promcompat;
 pub mod traces_limits;
 pub mod traces_normalize;
 
+pub use label_projection::{
+    RESOLVED_LABEL_OVERHEAD_BYTES, project_log_resolved_label_bytes, project_resolved_label_bytes,
+    project_span_resolved_label_bytes,
+};
 pub use limits::{
-    AdmissionClass, IngestLimits, NormalizeRejectCounts, Rejection,
-    resource_attrs_dropped_from_rejections,
+    AdmissionClass, DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST, IngestLimits,
+    NormalizeRejectCounts, Rejection, resource_attrs_dropped_from_rejections,
 };
 pub use logs_limits::{LogIngestLimits, LogRejection};
 pub use logs_normalize::{LogNormalizeOutput, NormalizedLogRecord, normalize_logs};

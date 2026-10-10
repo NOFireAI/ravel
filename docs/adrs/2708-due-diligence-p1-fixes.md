@@ -109,7 +109,9 @@ The rule for every row is the same: the projection counts every attribute
 byte the normalizer would copy for that unit, so a projection that undercounts
 the normalizer's real allocation is a defect, not a tuning choice. The logs
 and traces projections get no run-collapsing rule unless their normalizer
-already shares the copy for identical consecutive records.
+already shares the copy for identical consecutive records. The per-label
+charge and what it rests on are stated exactly in the label-byte accounting
+amendment below.
 
 HTTP and gRPC reach each signal through the one handler named in its row.
 OTAP metrics do not pass through `handle_export` (`services/ravel-server/src/otap_grpc.rs:298-302`);
@@ -399,3 +401,39 @@ operator), which is why the waves are serial.
 Every task except I carries an end-to-end test through a real server entry
 point (startup, the OTLP or OTAP handler, the alert loop, a query route or a
 maintain tick).
+
+## Amendment (2026-10-10): label-byte accounting for D2 (#2710)
+
+<!-- amendment-applies: sections="D2. OTLP requests are bounded by projected resolved-label bytes (#2710)" pointer="label-byte accounting amendment" -->
+
+D2 says the projection counts every byte the normalizer copies. This
+amendment states how, as implemented in `crates/ravel-otlp/src/label_projection.rs`.
+
+- **The per-label charge.** Every label or attribute a normalizer keeps is
+  charged `label_bytes(name_len, value_len)`: the element slot
+  (`RESOLVED_LABEL_OVERHEAD_BYTES`, 64 bytes, at least the 48 of a metric
+  `Label` or span attribute pair and the 56 of a log attribute pair) plus
+  the name length
+  plus the value length. Every projection uses this one formula, including
+  the `le="+Inf"` label of a classic histogram.
+- **Lengths are allocations.** The formula charges lengths, so every name
+  and value string a normalizer keeps is held at exact capacity: each passes
+  through `exact_capacity`, and the resource-prefix, scope and nested
+  attribute vectors are shrunk when built. Without it an integer value
+  formatted by `to_string` keeps about 20 bytes whatever its length, and a
+  float such as `1e260` keeps a 520-byte buffer for 261 bytes.
+- **Reserved slots for empty values.** The gauge, sum and
+  exponential-histogram paths size the label vector from the raw attribute
+  count, then drop empty-valued attributes, so each dropped attribute still
+  occupies a slot. Each is charged `RESOLVED_LABEL_OVERHEAD_BYTES`.
+- **Two unfilled slots per exploded point.** A classic histogram or summary
+  point's `_count` and `_sum` series each reserve an `le` or `quantile` slot
+  and never fill it, so each exploded point is charged two more slots.
+- **ADR-0051.** The whole-request rejection is counted under a new eighth
+  admission reason, `reason="resolved_label_bytes"`, recorded in ADR-0051's
+  own amendment.
+
+Property tests in `normalize.rs`, `logs_normalize.rs` and
+`traces_normalize.rs` check, per metric, per log record and per span, that
+every kept name and value has capacity equal to its length and that the
+projection is at least what normalization allocated.

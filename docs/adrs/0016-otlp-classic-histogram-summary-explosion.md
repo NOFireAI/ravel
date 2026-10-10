@@ -89,7 +89,8 @@ Exactness rules, the load-bearing details:
 - Sanitization, resource-attribute mapping, admission limits, and skew
   bounds are unchanged from the existing gauge/sum path; the exploded
   series pass through the same `build_point`-equivalent checks
-  per-series.
+  per-series. Two request-level bounds specific to the explosion were
+  added later (see the ADR-2708 D2 amendment below).
 - min/max fields have no Prometheus-convention representation and are
   dropped with a per-request counter (visible, not silent); same for
   histogram exemplars pending ADR-0017's exemplar decision.
@@ -114,8 +115,31 @@ Exactness rules, the load-bearing details:
   normalized points. Per-request data-point limits keep counting OTLP
   data points (the wire unit senders reason about), while downstream
   buffer sizing sees the multiplied count; the plan's tickets carry a
-  measurement note for max_data_points_per_request sizing.
+  measurement note for max_data_points_per_request sizing. The label bytes
+  the explosion copies are now bounded per request too (see the ADR-2708 D2
+  amendment below).
 - ravel-otap's normalizer mirrors ravel-otlp point-for-point and gains
   the same explosion when its metrics tables carry histogram/summary
   payloads; that lands as a follow-up ticket under the OTLP-vs-OTAP
   differential gate, not silently.
+
+## Amendment (2026-10-10): ADR-2708 D2 bounds the explosion's label copies
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-2708 D2 amendment" -->
+
+Each exploded series carries its own copy of the data point's labels, so one
+classic histogram point builds `bounds + 3` label sets and one summary point
+`quantiles + 2`. The per-point attribute and length limits did not bound the
+product, and nothing bounded a summary's quantile count. ADR-2708 D2 adds two
+bounds, both in `IngestLimits` and neither configurable:
+
+- `max_summary_quantiles` (64) rejects a summary data point with more
+  quantiles, the way `max_histogram_buckets` (160) already rejects a classic
+  histogram data point with more bounds. Rejection stays atomic per data
+  point.
+- `max_resolved_label_bytes_per_request` (256 MiB) rejects the whole request
+  when a read-only projection of the label bytes normalization would build
+  exceeds it. The projection weights each point by the multiplicity above.
+
+Series identity, label formatting and the exactness rules above are unchanged.
+ADR-2708 D2 is normative for the projection and its budget charge.
