@@ -779,7 +779,7 @@ fired).
 (`UploadIntegrity`):
 
 - `Off` (the library default) attaches no checksum and reports
-  `upload_checksum: false`. This is the historical behavior.
+  `upload_checksum: false`.
 - `Crc64Nvme` / `Sha256` configure `object_store`'s whole-client
   `AmazonS3Builder::with_checksum_algorithm`, so it computes that digest over
   the exact payload and sends it as `x-amz-checksum-crc64nvme` /
@@ -974,8 +974,7 @@ otherwise (see "Upload checksums").
 
 `S3Config` selects a credential source explicitly through `auth`
 (`S3AuthMode`), never by inferring one from the absence of keys. The default
-is `S3AuthMode::Static`, which is every deployment today and behaves exactly
-as before ADR-0106.
+is `S3AuthMode::Static`.
 
 **Static mode (ADR-0072 decision 1).** Takes long-lived `access_key_id` /
 `secret_access_key`, an optional temporary `session_token` for STS-issued or
@@ -1268,13 +1267,13 @@ genuinely a different store. The command only ever writes under
 reads, lists, or writes any tenant-prefixed key, so it is safe to run
 against a bucket that already holds production data.
 
-The scratch objects the suite leaves behind are no longer a handful. The two
-listing probes dominate the count, and each writes `max(page_size + 2, 5)`
+The two listing probes dominate the count of scratch objects the suite
+leaves behind, and each writes `max(page_size + 2, 5)`
 small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
 14 the other probes leave (two conditional-write keys, five read-after-write,
 five list-after-write, one concurrent-create, and the delete probe's
-surviving key): 2018 objects at the default page size of 1000, against 24
-before the page size became a parameter. The delete probe's second key, the
+surviving key): 2018 objects at the default page size of 1000. The delete
+probe's second key, the
 three `ListedKeysRoundTripPlusAndSpace` keys and the stored-checksum echo
 probe's object are the only scratch objects a run deletes; the echo object
 stays too when its delete is refused, and the run prints a note naming it.
@@ -1638,8 +1637,7 @@ bucket launchers (the create-bucket Jobs in `deploy/k8s/` and the compose
 and one enabled whole-bucket rule carrying `ExpiredObjectDeleteMarker`,
 `NoncurrentVersionExpiration` and `AbortIncompleteMultipartUpload` of 7 days.
 
-With the flag off (the default), none of this runs, and startup behavior
-is unchanged from before this gate existed. The flag makes an
+With the flag off (the default), none of this runs. The flag makes an
 unprotected production deployment *visible and refusable*; it does not
 and cannot make Object Lock or lifecycle policy real in-process: that
 capability is still reserved for its own trait-extending ADR per
@@ -1964,8 +1962,8 @@ than on the request path:
   Anything other than a clean `NotFound` or, for the identity read, the
   exact probe payload (an access denial, a timeout, different bytes) is
   `Inconclusive`, which is a refusal. Passing an inconclusive candidate
-  would qualify a grant on the strength of an error message. One
-  consequence is worth stating plainly: credentials scoped so tightly that
+  would qualify a grant on the strength of an error message.
+  Credentials scoped so tightly that
   they cannot read `sys/` answer the marker read with an access denial
   rather than a `NotFound`, so a grant offered under least-privilege
   credentials of that shape is refused. That is the intended trade, because

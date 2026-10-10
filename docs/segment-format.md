@@ -48,17 +48,13 @@ side of a rolling upgrade (or the build a rollback returns to) reads that object
 normally. A corrupt object is swept as usual.
 
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
-bulk data-object format. Until the v1.0 release (ADR-0531: the
-format-lifecycle activation milestone is v1.0, distinct from the software's
-0.9.0 first public release and not yet shipped), ADR-0027's
+bulk data-object format. Until the v1.0 release (ADR-0531), ADR-0027's
 single-supported-version rule above stands, a bump is forward-only, and the
 N/N-1 window is not opened. From v1.0 onward the supported-version window
 becomes N/N-1: the writer always emits the current version N, and the reader
 accepts N and N-1. The window is single-sourced as
 `ravel_segment::SUPPORTED_VERSIONS`, and the writer, reader gate,
-`audit-versions`, and the `migrate` job all read it; it holds exactly one
-version today, v7, so the two-version shape is capability the code carries for a
-future bump rather than behaviour any build has now. Rollout is
+`audit-versions`, and the `migrate` job all read it. Rollout is
 readers-before-writers: a release that writes N+1 requires a fleet already
 reading N+1. Old-version objects converge to the current version three ways, in
 preference order: retention ages them out; compaction and the `maintain migrate`
@@ -385,7 +381,7 @@ they are the trailing blocks 17-21 above. In the sparse (chunked)
 SERIES_META_CHUNKS form (kind 9) the same columns are re-laid per chunk, scoped
 to each frame's runs; see SERIES_META_CHUNKS below. A merged L1 object over a
 large tenant is exactly the sparse case, so the sparse form must carry them
-(ADR-0092 decision 1); it is no longer a fail-closed gap.
+(ADR-0092 decision 1).
 
 ## Sparse catalog
 
@@ -519,8 +515,7 @@ Duplicate keys are legal because compaction copies exemplars verbatim and
 never drops a record. Two L0 objects can each hold an exemplar for the same
 series at the same timestamp, which is what a retried write produces, and
 both must reach the L1 output. Readers therefore reject only a descending
-key. An earlier revision required strictly ascending keys, and ADR-0047's
-2026-08-03 amendment relaxed it.
+key.
 
 The writer sorts with a stable sort, so records that share a key keep the
 caller's order and the encoded bytes stay a function of the input order
@@ -574,7 +569,7 @@ in the output's own SERIES_IDS. Records of one series keep canonical input
 order, and the writer's stable sort by `(series_index, ts_ns)` leaves the
 section ascending with equal keys intact. Every input exemplar must reach
 exactly one output part, or the run is abandoned before anything is
-published -- except an erasure rewrite (ADR-0064 §4, :359), which drops an
+published -- except an erasure rewrite (ADR-0064 §4), which drops an
 exemplar matching the erasure predicate instead of carrying it forward, by
 design rather than by fault.
 
@@ -700,13 +695,11 @@ Every byte a reader interprets is checksum-verified before use (ADR-0010 §4).
   covered). A whole SERIES_META_CHUNKS read verifies the section crc; a
   single-frame read verifies the frame's own crc32c from the directory.
 - The page crc guards series binding, enc, comp, and payload, checked on
-  first touch. A compacted metrics page is no longer a verbatim copy: under v7
-  (ADR-0092 decision 1) L1 compaction merges every contributing run of a series
-  into one run and re-encodes its pages, so page CRCs are recomputed rather than
-  carried. (An L0 flush and any path that does copy a page byte-for-byte still
-  keeps the original per-page crc, since a verbatim copy alters none of
-  `series_id || enc || comp || payload`; the metrics compaction path just no
-  longer takes that shortcut.)
+  first touch. Under v7 (ADR-0092 decision 1) L1 compaction merges every
+  contributing run of a series into one run and re-encodes its pages, so page
+  CRCs are recomputed rather than carried. (An L0 flush and any path that does
+  copy a page byte-for-byte keeps the original per-page crc, since a verbatim
+  copy alters none of `series_id || enc || comp || payload`.)
 - EXEMPLARS carries no crc beyond its section crc32c, and that is sufficient
   because every read of it decompresses and verifies the whole section
   first: there is no ranged fetch into the section, so there is no partial
