@@ -303,6 +303,13 @@ pub struct FoldReport {
     /// dropped on the way through, which is the coverage shortfall ADR-0873's
     /// deployment gate is read against.
     pub stamped_entries: u64,
+    /// The operator-asserted seal-through hour this fold applied
+    /// ([`Catalog::fold_with_seal_through`], ADR-2677 decision 1): `Some` only
+    /// when a supplied hour was above the hour the seal margin alone seals at
+    /// `now_ns`, and so set the fold's target. Set on a no-op as well, when
+    /// that target was already at or below HEAD's watermark. `None` when no
+    /// hour was supplied or the margin already sealed it.
+    pub seal_through_hour: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1056,6 +1063,55 @@ impl Catalog {
         default_retention_ns: Option<i64>,
         refold_request: &RefoldRequest,
     ) -> Result<FoldReport, CatalogError> {
+        self.fold_with_seal_through(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            transactions,
+            default_retention_ns,
+            refold_request,
+            None,
+        )
+        .await
+    }
+
+    /// [`Catalog::fold_with_refold_request`], sealing through at least
+    /// `seal_through_hour` (ADR-2677 decision 1).
+    ///
+    /// The fold's target watermark is the greater of the hour the seal margin
+    /// seals at `now_ns` and `seal_through_hour`. Supplying an hour is an
+    /// operator assertion that no writer will publish a commit into that hour
+    /// or any earlier one: the margin exists because a live writer may still
+    /// do so, and a commit published into an hour after it is sealed is
+    /// skipped by every later fold's reconcile and stays invisible to queries
+    /// that carry no commit token until a HEAD rebuild. `now_ns` stays the
+    /// real time for everything else: HEAD's `created_unix_ns`, the retention
+    /// frontier, and the outcome metrics. A target at or below HEAD's
+    /// watermark is a no-op, exactly as for [`Catalog::fold`].
+    ///
+    /// A `seal_through_hour` later than the hour bucket of `now_ns` is
+    /// refused with [`CatalogError::InvalidConfig`] before anything is read:
+    /// no writer can have published into an hour that has not begun.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fold_with_seal_through(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
+        seal_through_hour: Option<u32>,
+    ) -> Result<FoldReport, CatalogError> {
+        if let Some(hour) = seal_through_hour
+            && i64::from(hour) > now_ns.div_euclid(NS_PER_HOUR)
+        {
+            return Err(CatalogError::InvalidConfig(
+                "seal_through_hour is later than the hour bucket of now_ns",
+            ));
+        }
         let result = self
             .fold_inner(
                 tenant,
@@ -1065,10 +1121,40 @@ impl Catalog {
                 transactions,
                 default_retention_ns,
                 refold_request,
+                seal_through_hour,
             )
             .await;
         self.record_fold_outcome(signal, now_ns, result.is_ok());
         result
+    }
+
+    /// HEAD's watermark hour for `(tenant, signal)`, read exactly as a fold
+    /// reads it. `None` when HEAD is absent or fails to decode, the two
+    /// states a fold rebuilds from a full listing. A HEAD newer than this
+    /// process understands is [`CatalogError::UnsupportedHeadVersion`], as it
+    /// is for a fold.
+    pub async fn head_watermark_hour(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+    ) -> Result<Option<u32>, CatalogError> {
+        let mut counters = RequestCounters::default();
+        match self
+            .get_head(&head_object_key(tenant, signal), &mut counters)
+            .await?
+        {
+            HeadState::UnsupportedVersion { format_version } => {
+                Err(CatalogError::UnsupportedHeadVersion { format_version })
+            }
+            state => Ok(state.watermark_hour()),
+        }
+    }
+
+    /// The last ingest-hour bucket the seal margin alone seals at `now_ns`
+    /// under this catalog's config, with no seal-through hour supplied.
+    /// `None` when no hour is sealed yet.
+    pub fn margin_watermark_hour(&self, now_ns: i64) -> Option<u32> {
+        sealed_watermark_hour(now_ns, self.config())
     }
 
     /// The fold body. Wrapped by [`Catalog::fold`] rather than instrumented
@@ -1085,8 +1171,13 @@ impl Catalog {
         _transactions: &[Transaction],
         default_retention_ns: Option<i64>,
         refold_request: &RefoldRequest,
+        seal_through_hour: Option<u32>,
     ) -> Result<FoldReport, CatalogError> {
         let head_key = head_object_key(tenant, signal);
+        let margin_hour = sealed_watermark_hour(now_ns, self.config());
+        let applied_seal_through =
+            seal_through_hour.filter(|ceiling| margin_hour.is_none_or(|hour| *ceiling > hour));
+        let target_hour = applied_seal_through.or(margin_hour);
         // Fold never runs on the query path (module docs above) and keeps
         // its own `RequestCounters`; this handle exists only to satisfy the
         // shared cache/load API's `QueryAccounting` parameter and is discarded.
@@ -1176,13 +1267,21 @@ impl Catalog {
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
 
-            let Some(watermark_hour) = sealed_watermark_hour(now_ns, self.config()) else {
-                return Ok(no_op_report(head_state.watermark_hour(), counters));
+            let Some(watermark_hour) = target_hour else {
+                return Ok(no_op_report(
+                    head_state.watermark_hour(),
+                    applied_seal_through,
+                    counters,
+                ));
             };
             if let Some(watermark_hour_old) = head_state.watermark_hour()
                 && watermark_hour_old >= watermark_hour
             {
-                return Ok(no_op_report(Some(watermark_hour_old), counters));
+                return Ok(no_op_report(
+                    Some(watermark_hour_old),
+                    applied_seal_through,
+                    counters,
+                ));
             }
 
             let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
@@ -2293,6 +2392,7 @@ impl Catalog {
                         refold_hours_reconciled: refold_hours_reconciled as usize,
                         stamped_records: coverage.records(),
                         stamped_entries: coverage.entries(),
+                        seal_through_hour: applied_seal_through,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -3148,7 +3248,11 @@ pub async fn fetch_segment_names(
     Ok(names)
 }
 
-fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldReport {
+fn no_op_report(
+    watermark_hour: Option<u32>,
+    seal_through_hour: Option<u32>,
+    counters: RequestCounters,
+) -> FoldReport {
     FoldReport {
         watermark_hour,
         previous_watermark_hour: watermark_hour,
@@ -3178,6 +3282,7 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         // totals either.
         stamped_records: 0,
         stamped_entries: 0,
+        seal_through_hour,
     }
 }
 
@@ -9149,5 +9254,234 @@ mod tests {
             );
             assert_eq!(catalog.fold_cycles(untouched), 0);
         }
+    }
+
+    // ---- ADR-2677 decision 1: operator-asserted seal-through hour ----
+
+    async fn read_metrics_head(store: &MemoryStore) -> SnapshotHead {
+        let got = store
+            .get(&head_object_key(&tenant(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("head present");
+        snapshot_format::decode_head(&got.data).expect("head decodes")
+    }
+
+    async fn fold_sealing(
+        catalog: &Catalog,
+        now_ns: i64,
+        seal_through_hour: Option<u32>,
+    ) -> FoldReport {
+        catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                seal_through_hour,
+            )
+            .await
+            .expect("fold")
+    }
+
+    /// Ten minutes into hour `hour`: the seal margin alone seals nothing
+    /// later than `hour - 3` there.
+    fn now_inside(hour: u32) -> i64 {
+        i64::from(hour) * NS_PER_HOUR + 10 * 60 * 1_000_000_000
+    }
+
+    #[tokio::test]
+    async fn seal_through_hour_seals_the_open_hour_and_no_ops_at_or_below_the_watermark() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+        assert_eq!(sealed_watermark_hour(now, catalog.config()), Some(H - 3));
+        publish_segment(&store, 0, Uuid::new_v4(), 1, H - 1, now - NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, H, now).await;
+
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert!(!sealed.no_op, "{sealed:?}");
+        assert_eq!(sealed.watermark_hour, Some(H));
+        assert_eq!(sealed.seal_through_hour, Some(H));
+        assert_eq!(sealed.entry_count, 2, "both hours' records are folded");
+        // The ceiling moves the target, not the clock: HEAD records the real
+        // fold time.
+        assert_eq!(read_metrics_head(&store).await.created_unix_ns, now);
+
+        for ceiling in [H, H - 1] {
+            let again = fold_sealing(&catalog, now + 60 * 1_000_000_000, Some(ceiling)).await;
+            assert!(again.no_op, "seal-through {ceiling}: {again:?}");
+            assert_eq!(again.watermark_hour, Some(H));
+            assert_eq!(again.seal_through_hour, Some(ceiling));
+        }
+
+        // Without a ceiling the scheduled fold no-ops on the asserted hours
+        // until the margin alone passes them.
+        for later in [now_at_seal(H) - 1, now_at_seal(H)] {
+            let scheduled = fold_sealing(&catalog, later, None).await;
+            assert!(scheduled.no_op, "at {later}: {scheduled:?}");
+            assert_eq!(scheduled.watermark_hour, Some(H));
+            assert_eq!(scheduled.seal_through_hour, None);
+        }
+        let natural = fold_sealing(&catalog, now_at_seal(H + 1), None).await;
+        assert!(!natural.no_op, "{natural:?}");
+        assert_eq!(natural.watermark_hour, Some(H + 1));
+        assert_eq!(natural.seal_through_hour, None);
+        assert_eq!(natural.entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn seal_through_hour_below_the_margin_hour_leaves_the_margin_target() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+        let margin_hour = H - 3;
+        assert_eq!(catalog.margin_watermark_hour(now), Some(margin_hour));
+        publish_segment(&store, 0, Uuid::new_v4(), 1, H - 5, now - 5 * NS_PER_HOUR).await;
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            margin_hour,
+            now - 3 * NS_PER_HOUR,
+        )
+        .await;
+
+        let report = fold_sealing(&catalog, now, Some(H - 5)).await;
+        assert!(!report.no_op, "{report:?}");
+        assert_eq!(report.watermark_hour, Some(margin_hour), "{report:?}");
+        assert_eq!(report.seal_through_hour, None, "{report:?}");
+        assert_eq!(report.entry_count, 2, "{report:?}");
+        assert_eq!(
+            read_metrics_head(&store).await.watermark_hour,
+            margin_hour,
+            "HEAD carries the margin hour, not the lower seal-through hour"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_through_hour_after_the_current_hour_is_refused_before_any_read() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, H, now).await;
+
+        let err = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                Some(H + 1),
+            )
+            .await
+            .expect_err("a seal-through hour after now's hour is refused");
+        assert!(
+            matches!(
+                err,
+                CatalogError::InvalidConfig(
+                    "seal_through_hour is later than the hour bucket of now_ns"
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(
+            store
+                .get(&head_object_key(&tenant(), Signal::Metrics), GetRange::Full)
+                .await
+                .is_err(),
+            "no HEAD was written"
+        );
+
+        // The current hour itself is accepted.
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+    }
+
+    #[tokio::test]
+    async fn head_watermark_hour_reads_the_folded_head() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        assert_eq!(
+            catalog
+                .head_watermark_hour(&tenant(), Signal::Metrics)
+                .await
+                .expect("read"),
+            None,
+            "no HEAD yet"
+        );
+        let now = now_inside(H);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, H, now).await;
+        fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(
+            catalog
+                .head_watermark_hour(&tenant(), Signal::Metrics)
+                .await
+                .expect("read"),
+            Some(H)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_commit_into_a_sealed_hour_is_invisible_until_rebuild() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+        let on_time = publish_segment(&store, 0, Uuid::new_v4(), 1, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H));
+
+        // A writer the operator asserted was stopped publishes into hour H
+        // after the seal.
+        let late = publish_segment(&store, 0, Uuid::new_v4(), 2, H, now + 1).await;
+        let window = ravel_types::TimeRange {
+            start_ns: i64::from(H) * NS_PER_HOUR,
+            end_ns: i64::from(H + 1) * NS_PER_HOUR,
+        };
+        let query_now = i64::from(H + 1) * NS_PER_HOUR + 1;
+        let seqs = |snapshot: &crate::Snapshot| {
+            let mut seqs: Vec<u64> = snapshot.segments.iter().map(|s| s.writer_seq).collect();
+            seqs.sort_unstable();
+            seqs
+        };
+        let fresh = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let resolved = fresh
+            .resolve(&tenant(), Signal::Metrics, window, &[], query_now)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            seqs(&resolved),
+            vec![on_time.writer_seq],
+            "the late commit is invisible to a query carrying no token"
+        );
+        // The next scheduled fold does not pick it up either.
+        let next = fold_sealing(&fresh, now_at_seal(H + 1), None).await;
+        assert_eq!(next.entry_count, 1, "{next:?}");
+
+        // A HEAD rebuild lists the sealed hours again and finds it.
+        store
+            .delete(&head_object_key(&tenant(), Signal::Metrics))
+            .await
+            .expect("delete HEAD");
+        let rebuilt_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let rebuilt = fold_sealing(&rebuilt_catalog, now_at_seal(H + 1), None).await;
+        assert!(rebuilt.rebuilt, "{rebuilt:?}");
+        assert_eq!(rebuilt.entry_count, 2);
+        let after = rebuilt_catalog
+            .resolve(&tenant(), Signal::Metrics, window, &[], query_now)
+            .await
+            .expect("resolve");
+        assert_eq!(seqs(&after), vec![on_time.writer_seq, late.writer_seq]);
     }
 }

@@ -92,7 +92,8 @@ pub use provisioning::{
     validate_or_adopt,
 };
 pub use seal_divergence::{
-    EntryIdentity, SealDivergenceError, SealDivergenceReport, verify_seal_divergence,
+    EntryIdentity, SealDivergenceError, SealDivergenceReport, SnapshotCoverage, snapshot_coverage,
+    verify_seal_divergence,
 };
 pub use snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 pub use snapshot_format::{
