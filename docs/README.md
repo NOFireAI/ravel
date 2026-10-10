@@ -94,7 +94,8 @@ Come back to one lane when you have a specific question.
   how to size them.
 - [guides/cost-model.md](guides/cost-model.md): why request charges, and
   not stored bytes, are the bill. The write-side formula and the levers
-  that move it, and the read-side knob that trades round trips for bytes.
+  that move it, the read-side knob that trades round trips for bytes, and
+  the [measured real-S3 envelope](guides/cost-model.md#measured-envelope).
 - [guides/distributed-query.md](guides/distributed-query.md): fan-out of
   one read across processes and federation across clusters, both off by
   default. The cost gate, the fragment keys and their rotation, the remote

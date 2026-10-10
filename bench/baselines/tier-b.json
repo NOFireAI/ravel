@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "label": "EXECUTOR BOX (x86_64, 8 cores, shared fleet host), recorded by hand with quick sampling (sample-size 10). A shared host under unknown load, so these numbers are a demonstration of the machinery rather than a reference: compare only against a run on this same machine, and re-record through bench-tier-b.sh record with the host, binary commit and knobs stamped.",
+    "label": "EXECUTOR BOX (x86_64, 8 cores, shared fleet host), recorded by hand with quick sampling (sample-size 10). These numbers are a demonstration of the compare machinery, not a regression reference; a usable baseline is recorded on a fresh instance with scripts/bench/fresh-box.sh.",
     "note": "median_ns/mean_ns are criterion point estimates in nanoseconds. See scripts/bench-compare.py and ADR-0070 decision 3."
   },
   "benchmarks": {

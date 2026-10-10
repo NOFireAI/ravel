@@ -578,6 +578,45 @@ invoice. Then reconcile it against a real bill once traffic is flowing. Treat
 a persistent gap between the two as a signal that one of the two assumptions
 no longer holds.
 
+## Measured envelope
+
+The weekly `bench-s3` workflow runs one load point against real S3 in
+eu-central-1: `bench_report --store s3 --shards 4 --target-series 1000
+--points-per-sec 50000 --duration-secs 10`, with a 500 ms flush delay, on a
+shared `ubuntu-latest` hosted runner. The table gives the minimum and maximum
+over its five scheduled runs of 2026-09-07, 2026-09-14, 2026-09-21,
+2026-09-28 and 2026-10-05. Latencies are in milliseconds, rounded to the
+whole millisecond.
+
+| figure | min | max |
+|---|---:|---:|
+| `ingest.strict_ack_latency_ms.p50` | 735 | 1,026 |
+| `ingest.strict_ack_latency_ms.p95` | 1,077 | 1,505 |
+| `ingest.strict_ack_latency_ms.p99` | 1,479 | 1,903 |
+| `query.warm_latency_ms.p50` | 1,221 | 1,696 |
+| `query.warm_latency_ms.p95` | 1,248 | 1,875 |
+| `query.warm_latency_ms.p99` | 1,250 | 1,896 |
+| `query.cold_latency_ms.p50` | 1,491 | 2,278 |
+| `s3_requests.put` | 128 | 128 |
+| `s3_requests.get` | 47,205 | 78,279 |
+| `s3_requests.list` | 50,135 | 50,160 |
+
+This is a range at one load point on a shared hosted runner, comparable only
+to runs of the same lane. It is a range rather than one run because the five
+runs disagree by up to 40 percent on strict-ack p50 at the same load point.
+Three things in it are unexplained and tracked as an open issue, named under
+[Background](#background); do not read them as expected behaviour:
+
+- About 50,135 LIST requests for 128 PUTs on every run.
+- GET stepping from about 47,000 to about 78,000 between the 2026-09-21 and
+  2026-09-28 runs.
+- 506 matched series against `--target-series 1000` on every run.
+
+The runs, the computed envelope and its provenance are in
+[bench/baselines/s3-envelope.json](../../bench/baselines/s3-envelope.json).
+Each weekly run is compared against it by `scripts/bench-s3-compare.py`, which
+warns and never fails the run.
+
 ## Background
 
 The two-object commit protocol and request-cost reduction through flush
@@ -589,4 +628,5 @@ from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088. The
 cost-based-versus-latency-first fetch policy and its measured trade: ADR-1196.
 The store cost profile, and the resolution that turns a fetch policy into the
 byte quantities the fetch layer runs on, including the precedence an explicit
-`--logs-request-cost-bytes` takes over a derived rate: ADR-0996.
+`--logs-request-cost-bytes` takes over a derived rate: ADR-0996. The three
+unexplained items in the measured envelope: issue #2686.

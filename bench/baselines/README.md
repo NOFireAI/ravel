@@ -1,9 +1,17 @@
-# ADR-0070 tier B bench baselines
+# Bench baselines
 
-This directory holds the committed criterion baselines that the tier B
-regression compare (ADR-0070 decision 3) diffs a PR's bench run against. It is
-the one path under `bench/` that is tracked; all other bench output stays
-gitignored.
+This directory is the one path under `bench/` that is tracked; all other bench
+output stays gitignored. It holds two kinds of baseline:
+
+- `tier-b.json`: the criterion baseline that the tier B regression compare
+  (ADR-0070 decision 3) diffs a bench run against. The committed file is a
+  demonstration of the machinery (below); a usable baseline is recorded on a
+  fresh EC2 instance with `scripts/bench/fresh-box.sh`.
+- `s3-envelope.json`: the real-S3 envelope of the weekly `bench-s3` lane, the
+  min and max of each compared figure over five of its runs. Summarised from
+  the lane's own reports with `scripts/bench/s3-envelope.py` (below).
+
+Both comparisons are advisory (ADR-0070 decision 3 as amended 2026-09-19).
 
 ## What tier B compares
 
@@ -42,8 +50,9 @@ the numbers.
 Each baseline file carries a `_meta.label` naming the environment it was
 recorded on. A criterion timing number only means something relative to a
 baseline taken on the same hardware under the same load. This repository has
-no self-hosted reference runner and will not get one, so every baseline is
-recorded by hand on a machine the recorder names.
+no self-hosted reference runner and will not get one, so a timing baseline is
+recorded on a fresh EC2 instance launched for the run and terminated after it,
+every time, and never on a shared or long-lived box.
 
 A hand-recorded baseline is only usable for a comparison once five things are
 stamped into it, in the `_meta.label` text or a `_meta` field:
@@ -88,6 +97,78 @@ checkable. `tier-b.json` as committed predates the stamping and carries no
 `_meta.knobs`: the compare reports `NOT RECORDED` for it and an enforcing run
 refuses the pair. That is deliberate. The knobs it was recorded at are not
 fully recoverable from the file, and writing values nobody observed is the
-drift this check exists to catch. Re-recording it through
-`bench-tier-b.sh record` on a named machine, with the host, the binary commit
-and the knobs stamped, fixes it.
+drift this check exists to catch. Re-recording it with
+`scripts/bench/fresh-box.sh`, which runs `bench-tier-b.sh record` on a fresh
+instance with the host, the binary commit and the knobs stamped, fixes it.
+
+## Recording a tier B baseline on a fresh instance
+
+`scripts/bench/fresh-box.sh` launches one EC2 instance, clones the repository
+at the given commit, installs the toolchain from `rust-toolchain.toml`, runs
+`scripts/bench-tier-b.sh record` with the five stamps above in the label, copies
+the baseline back, and terminates the instance. Every input is a flag (or a
+`FRESH_BOX_*` environment variable) with no default; `--help` lists them, and a
+missing one exits 64 naming it before anything is launched.
+
+```sh
+scripts/bench/fresh-box.sh --dry-run \
+  --instance-type c7i.2xlarge --ami ami-... --subnet subnet-... \
+  --security-group sg-... --region eu-central-1 \
+  --access ssh --key-name KEY --identity-file ~/.ssh/KEY.pem --ssh-user ubuntu \
+  --volume-gb 120 --repo-url https://github.com/OWNER/ravel.git \
+  --commit <40-character sha> --out bench/baselines/tier-b.json \
+  --sample-size 10 --warmup 1 --measure 3 --max-series 2000
+```
+
+`--dry-run` prints every `aws`, `ssh` and `scp` command and runs none; drop it
+to launch. The label stamps the host from the instance's own `nproc`,
+`uname -m` and instance type, the binary commit, "Corpus: none" (every tier B
+bench generates its own input), the four knobs, and "No flush cadence:
+store-independent". Use the knob values the `bench-compare` workflow pins, or
+move its pins with the new baseline.
+
+An EXIT trap terminates the instance by id on every exit path, including a
+failure mid-run, and then polls until the instance reports `shutting-down` or
+`terminated`. When it cannot confirm that, it prints
+`COULD NOT CONFIRM TERMINATION of instance <id>` and exits 70: terminate that
+instance by hand. The instance is also launched with
+`--instance-initiated-shutdown-behavior terminate`.
+
+The cases are in `scripts/bench/fresh-box.test.sh`, run with stub `aws`, `ssh`
+and `scp` commands in CI's doc-scripts job.
+
+## The real-S3 envelope
+
+`s3-envelope.json` holds the `environment` of the lane's load point, one
+summary entry per run under `runs`, the computed `envelope` (min and max per
+figure), and `_meta`: the workflow, the run ids and dates, the `runs-on` label
+the lane ran on, the region, the flush delay, the load point command line, and
+an `unexplained` list of what the runs show that nobody has explained yet.
+
+The weekly lane's "Compare against the committed real-S3 envelope" step runs
+`scripts/bench-s3-compare.py` against it after every run. Latency figures warn
+past the envelope max plus 25 percent; GET, LIST and both byte counts past the
+max plus 10 percent; PUT, accepted points and matched series must equal the
+envelope exactly. A pair whose environment differs is refused as not a
+comparison (exit 2). The step never fails the job; `--enforce` exits 1 on a
+figure outside its band, for a local run.
+
+To re-record it, take five runs of the lane at the same load point (five
+scheduled runs, or dispatch it five times), download each run's
+`bench-s3-report` artifact, and summarise them. Never edit the file by hand:
+`scripts/test_bench_s3_compare.py` recomputes every min and max from `runs`
+and fails on a disagreement.
+
+```sh
+scripts/bench/s3-envelope.py summarise --out bench/baselines/s3-envelope.json \
+  --runs-on ubuntu-latest \
+  --report RUN_ID:YYYY-MM-DD:path/to/report-s3.json \
+  --unexplained "text, naming its issue"
+scripts/bench/s3-envelope.py check bench/baselines/s3-envelope.json
+```
+
+Give `--report` once per run and `--unexplained` once per open item.
+`--runs-on` is the `runs-on` value of `.github/workflows/bench-s3.yml`, verbatim;
+a test asserts the two agree. Restate every open `unexplained` item: nothing is
+carried over from the previous file. Then update the "Measured envelope" table
+in `docs/guides/cost-model.md`, whose figures a test checks against this file.
