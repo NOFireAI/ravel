@@ -2393,4 +2393,296 @@ mod tests {
             }
         }
     }
+
+    /// ADR-2773 decision 1: an integer page decodes straight into a
+    /// block-length value buffer and a validity bitmap, and what a reader sees
+    /// through it equals the per-cell build it replaced.
+    mod int_column_buffers {
+        use super::*;
+        use crate::columnar::ColumnarBlockView;
+        use crate::encoding::{decode_i64, encode_i64};
+        use crate::field_dir::FieldDir;
+        use crate::page::COMP_NONE;
+        use crate::rlog_codec::{decode_gcd_i64, encode_column_ref, i64_candidates};
+        use crate::stream_dir::StreamDir;
+        use proptest::prelude::*;
+
+        /// The event-timestamp column carries the encoding under test, the
+        /// observed-timestamp column references it (tag 11 is only valid
+        /// there), and a declared column repeats it.
+        const VALUE_COL: u32 = COL_TS;
+        const REF_COL: u32 = COL_OBSERVED_TS;
+        const DECLARED_COL: u32 = 20;
+
+        const ENCODINGS: [Enc; 7] = [
+            Enc::Plain,
+            Enc::Constant,
+            Enc::Rle,
+            Enc::DeltaZigzag,
+            Enc::DoubleDelta,
+            Enc::ForBitpack,
+            Enc::GcdI64,
+        ];
+
+        fn plans(ids: &[u32]) -> Vec<ColumnPlan> {
+            ids.iter()
+                .map(|&column_id| ColumnPlan {
+                    column_id,
+                    ty: FieldType::I64,
+                })
+                .collect()
+        }
+
+        /// The value page `enc` writes for `present_values`, or `None` when
+        /// `enc` does not apply to them.
+        fn value_page(enc: Enc, present_values: &[i64]) -> Option<Vec<u8>> {
+            i64_candidates(present_values)
+                .into_iter()
+                .find(|(e, _)| *e == enc)
+                .map(|(_, bytes)| bytes)
+        }
+
+        /// The pages of one integer column: a presence bitmap when some row
+        /// is absent, then the value page.
+        fn column_pages(
+            column_id: u32,
+            presence: &[bool],
+            enc: Enc,
+            value: Vec<u8>,
+            descs: &mut Vec<PageDesc>,
+            bytes: &mut Vec<Option<Vec<u8>>>,
+        ) {
+            let mut push = |enc: Enc, page: Vec<u8>| {
+                descs.push(PageDesc {
+                    column_id,
+                    enc,
+                    comp: COMP_NONE,
+                    len: page.len() as u64,
+                    uncomp_len: page.len() as u64,
+                });
+                bytes.push(Some(page));
+            };
+            if presence.iter().any(|p| !p) {
+                push(Enc::Bitmap, encode_bitmap(presence));
+            }
+            push(enc, value);
+        }
+
+        /// Test-only copy of the per-cell build the buffers replaced: decode
+        /// the present values into their own vector, then scatter them into
+        /// one `Option` per row against the presence bitmap.
+        fn per_cell_build(
+            enc: Enc,
+            value: &[u8],
+            presence: &[bool],
+        ) -> Result<Vec<Option<i64>>, LogSegError> {
+            let present_count = presence.iter().filter(|p| **p).count();
+            let values = match enc {
+                Enc::GcdI64 => decode_gcd_i64(value, present_count)?,
+                _ => decode_i64(enc, value, present_count)?,
+            };
+            scatter(presence, values)
+        }
+
+        /// One generated column: per-row values (`None` absent) under one
+        /// encoding, and the surviving-row subset a scan keeps.
+        #[derive(Debug, Clone)]
+        struct Case {
+            enc: Enc,
+            cells: Vec<Option<i64>>,
+            keep: Vec<bool>,
+        }
+
+        /// Absence shapes: none, every row, the first row, the last row, and
+        /// an arbitrary mix (which includes interior rows).
+        fn presence_strategy(n: usize) -> impl Strategy<Value = Vec<bool>> {
+            (0u8..5, proptest::collection::vec(any::<bool>(), n)).prop_map(move |(shape, mut p)| {
+                match shape {
+                    0 => p.iter_mut().for_each(|b| *b = true),
+                    1 => p.iter_mut().for_each(|b| *b = false),
+                    2 => p[0] = false,
+                    3 => p[n - 1] = false,
+                    _ => {}
+                }
+                p
+            })
+        }
+
+        fn case_strategy() -> impl Strategy<Value = Case> {
+            (1usize..300, 0usize..ENCODINGS.len()).prop_flat_map(|(n, e)| {
+                let enc = ENCODINGS[e];
+                (
+                    presence_strategy(n),
+                    proptest::collection::vec(-(1i64 << 40)..(1i64 << 40), n),
+                    2i64..1000,
+                    proptest::collection::vec(any::<bool>(), n),
+                    any::<bool>(),
+                )
+                    .prop_map(move |(presence, raw, step, mut keep, keep_all)| {
+                        let values: Vec<i64> = match enc {
+                            Enc::Constant => vec![raw[0]; n],
+                            // Quotients 0 and 1 first, so the present values'
+                            // gcd is exactly `step` whenever two are present.
+                            Enc::GcdI64 => (0..n)
+                                .map(|i| {
+                                    let q = if i < 2 { i as i64 } else { raw[i] & 0xfffff };
+                                    raw[0] + q * step
+                                })
+                                .collect(),
+                            _ => raw,
+                        };
+                        if keep_all {
+                            keep.iter_mut().for_each(|k| *k = true);
+                        }
+                        let cells = presence
+                            .iter()
+                            .zip(values)
+                            .map(|(&p, v)| p.then_some(v))
+                            .collect();
+                        Case { enc, cells, keep }
+                    })
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            /// Every encoding, plus GCD and a tag-11 reference: the decoded
+            /// buffers read exactly as the per-cell build does, through the
+            /// whole-block accessor, the cursor, and the value buffer and
+            /// validity over the surviving rows.
+            #[test]
+            fn integer_column_decoded_once_equals_the_per_cell_build(case in case_strategy()) {
+                let n = case.cells.len();
+                let presence: Vec<bool> = case.cells.iter().map(Option::is_some).collect();
+                let present_values: Vec<i64> = case.cells.iter().flatten().copied().collect();
+                // An all-absent column has no value to encode; its value page is
+                // the empty plain page.
+                let (enc, value) = if present_values.is_empty() {
+                    (Enc::Plain, Vec::new())
+                } else {
+                    let value = value_page(case.enc, &present_values);
+                    prop_assume!(value.is_some(), "{:?} does not apply", case.enc);
+                    (case.enc, value.unwrap_or_default())
+                };
+                let expected = per_cell_build(enc, &value, &presence)?;
+                prop_assert_eq!(&expected, &case.cells);
+
+                let mut descs = Vec::new();
+                let mut bytes = Vec::new();
+                column_pages(VALUE_COL, &presence, enc, value.clone(), &mut descs, &mut bytes);
+                column_pages(
+                    REF_COL,
+                    &presence,
+                    Enc::ColumnRef,
+                    encode_column_ref(VALUE_COL),
+                    &mut descs,
+                    &mut bytes,
+                );
+                column_pages(DECLARED_COL, &presence, enc, value, &mut descs, &mut bytes);
+                let block = read_block_pages(
+                    n,
+                    &descs,
+                    &bytes,
+                    &plans(&[DECLARED_COL]),
+                    PageCounters::default(),
+                )?;
+
+                let col = block.i64_column(VALUE_COL).expect("decoded");
+                let referenced = block.i64_column(REF_COL).expect("decoded");
+                prop_assert!(referenced.shares_buffer_with(col));
+                prop_assert_eq!(block.int_values_buffers(), 2);
+                for column_id in [VALUE_COL, REF_COL, DECLARED_COL] {
+                    let values = block.i64_column(column_id).map(|c| c.values().len());
+                    prop_assert_eq!(values, Some(n));
+                    prop_assert_eq!(block.i64_col(column_id), Some(expected.clone()));
+                }
+
+                let rows: Vec<usize> = (0..n).filter(|&r| case.keep[r]).collect();
+                let streams = StreamDir::new(Vec::new());
+                let fields = FieldDir::new(Vec::new());
+                let view = ColumnarBlockView::new(&streams, &fields, &block, &rows);
+                for column_id in [VALUE_COL, REF_COL, DECLARED_COL] {
+                    let buffers = view.i64_values(column_id);
+                    let cursor = view.i64_cursor(column_id);
+                    let values = buffers.values().expect("column present");
+                    prop_assert_eq!(buffers.len(), rows.len());
+                    for (i, &row) in rows.iter().enumerate() {
+                        let bit = buffers
+                            .validity()
+                            .is_none_or(|bits| bits[row / 8] & (1 << (row % 8)) != 0);
+                        prop_assert_eq!(bit, expected[row].is_some(), "row {}", row);
+                        if let Some(v) = expected[row] {
+                            prop_assert_eq!(values[row], v, "row {}", row);
+                        }
+                        prop_assert_eq!(buffers.at(i), expected[row], "row {}", row);
+                        prop_assert_eq!(cursor.at(i), expected[row], "row {}", row);
+                    }
+                }
+            }
+        }
+
+        /// Per encoding: the value buffer holds one slot per row, the
+        /// validity has one set bit per present row, and the counter counts
+        /// one buffer per integer column decoded from a value page. The tag-11
+        /// column builds no buffer of its own, so it adds nothing.
+        #[test]
+        fn integer_page_decode_writes_block_length_values_and_validity() {
+            let presence = [false, true, true, false, true, true, true, true, true, false];
+            let n = presence.len();
+            let present_count = presence.iter().filter(|p| **p).count();
+            let other: Vec<i64> = (0..present_count as i64).collect();
+            for enc in ENCODINGS {
+                let present_values: Vec<i64> = match enc {
+                    Enc::Constant => vec![42; present_count],
+                    _ => (0..present_count as i64).map(|i| 7 + 6 * i * i).collect(),
+                };
+                let value = value_page(enc, &present_values)
+                    .unwrap_or_else(|| panic!("{enc:?} applies to the fixture"));
+                let mut descs = Vec::new();
+                let mut bytes = Vec::new();
+                column_pages(VALUE_COL, &presence, enc, value, &mut descs, &mut bytes);
+                column_pages(
+                    REF_COL,
+                    &presence,
+                    Enc::ColumnRef,
+                    encode_column_ref(VALUE_COL),
+                    &mut descs,
+                    &mut bytes,
+                );
+                let (other_enc, other_page) = encode_i64(&other);
+                column_pages(
+                    DECLARED_COL,
+                    &presence,
+                    other_enc,
+                    other_page,
+                    &mut descs,
+                    &mut bytes,
+                );
+                let block = read_block_pages(
+                    n,
+                    &descs,
+                    &bytes,
+                    &plans(&[DECLARED_COL]),
+                    PageCounters::default(),
+                )
+                .unwrap_or_else(|e| panic!("{enc:?}: {e}"));
+
+                for column_id in [VALUE_COL, REF_COL, DECLARED_COL] {
+                    let col = block.i64_column(column_id).expect("decoded");
+                    assert_eq!(col.values().len(), n, "{enc:?} column {column_id}");
+                    let bits = col.validity().expect("some row is absent");
+                    let set: usize = bits.iter().map(|b| b.count_ones() as usize).sum();
+                    assert_eq!(set, present_count, "{enc:?} column {column_id}");
+                    assert_eq!(col.null_count(), n - present_count);
+                }
+                let mut present = present_values.iter();
+                for (row, &p) in presence.iter().enumerate() {
+                    let want = if p { present.next().copied() } else { None };
+                    assert_eq!(block.i64_column(VALUE_COL).and_then(|c| c.get(row)), want);
+                }
+                assert_eq!(block.int_values_buffers(), 2, "{enc:?}");
+            }
+        }
+    }
 }
