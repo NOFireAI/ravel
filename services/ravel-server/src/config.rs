@@ -1604,12 +1604,16 @@ pub struct Cli {
     /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
     /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
     /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables
-    /// this byte ceiling, but it does not leave spawned-flush memory
-    /// unbounded on its own: `--max-queued-flushes` still caps the ordinary
-    /// flush queue regardless of this setting. The exemption from that cap
-    /// that can keep growing is a buffer that has crossed its per-(shard,
-    /// tenant) memory backstop, and under `0` it is bounded only by how long
-    /// a stall lasts (the gauge itself is still tracked for `/metrics` either
+    /// this byte ceiling, and then nothing else bounds spawned-flush memory in
+    /// total. `--max-queued-flushes` does not bound a shard's queue on its
+    /// own: a tenant with no flush in flight is never refused by it, so the
+    /// ordinary queue can reach `--max-queued-flushes` plus one window per
+    /// tenant on the shard with nothing in flight, and every backstop
+    /// crossing (a buffer past its per-(shard, tenant) memory backstop, or
+    /// one whose object estimate has reached 4x the object-size target)
+    /// spawns past it too. Under a nonzero budget this byte ceiling bounds
+    /// that total; under `0` the crossings are bounded only by how long a
+    /// stall lasts (the gauge itself is still tracked for `/metrics` either
     /// way).
     ///
     /// What `0` leaves unbounded is narrower than it was, but it is not
@@ -1742,14 +1746,19 @@ pub struct Cli {
     /// `ravel_ingest_deferral_cap_refused_total`. A strict write already
     /// waiting on that flush is answered 503, and its rows are still written by
     /// the flush that opens past the cap. The deferred flush itself still waits
-    /// for a slot as long as the stall lasts. Drains (`FlushNow`, shutdown) are
-    /// never refused, and neither is a tenant buffer that has crossed its
-    /// per-(shard, tenant) memory backstop, so THE QUEUE CAN EXCEED THIS CAP
-    /// under memory pressure: the backstop is the only bound on one buffer's
-    /// resident memory, and refusing there would trade a bounded queue of flush
-    /// tasks for an unbounded buffer, the worse of the two failures. Size the
-    /// steady state from this cap; what bounds the overshoot is the paragraph
-    /// below. `0` is rejected. A `--max-inflight-flushes` above this value is
+    /// for a slot as long as the stall lasts. THIS CAP DOES NOT BOUND THE QUEUE
+    /// ON ITS OWN. Drains (`FlushNow`, shutdown) are never refused; a tenant
+    /// with no flush in flight on the shard is never refused, so a neighbour's
+    /// stalled windows cannot fill the queue against it, and the ordinary
+    /// queue can reach this cap plus one window per tenant on the shard with
+    /// nothing in flight; and a buffer that has crossed its per-(shard,
+    /// tenant) memory backstop, or whose object estimate has reached 4x the
+    /// object-size target, spawns past the cap: the backstop is the only bound
+    /// on one buffer's resident memory, and refusing there would trade a
+    /// bounded queue of flush tasks for an unbounded buffer, the worse of the
+    /// two failures. Under a nonzero `--max-ingest-buffer-bytes` that byte
+    /// budget bounds the total; under `0` nothing else does (the paragraph
+    /// below). `0` is rejected. A `--max-inflight-flushes` above this value is
     /// accepted and raises the effective cap to match, since effective
     /// per-shard flush concurrency is the lower of the two. Matches
     /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8.

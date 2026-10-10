@@ -699,21 +699,26 @@ by the flush deadline. At one permit (`--max-inflight-flushes 1`, which logs
 a warning at startup) the share is 1 and gives no isolation: one tenant's
 stalled flush holds the shard's only permit, so every co-resident tenant's
 flush queues behind it until the stall clears or its `max_flush_lifetime`
-abandons it. What queues is a spawned task, not the actor: the co-resident tenants' writes are still accepted, their age triggers
-still fire, and each trigger hands its buffer off and spawns another waiting
-flush. So the queue grows with the stall, and every flush in it holds a whole
-flush window and its ADR-0069 byte charge from the moment it left the actor,
-which is what the budget sheds against. Two things bound that queue. The byte
-budget bounds it only when it is configured: under the default `Bounded(512
-MiB)` a sustained stall stops admitting new bytes before the queue grows
-without limit, while under `--max-ingest-buffer-bytes 0` (`Unlimited`)
-`try_charge` never sheds (ADR-1642). `max_queued_flushes`
-(`IngestConfig::max_queued_flushes`, `--max-queued-flushes`, default 8 per
-shard) bounds it under
-either setting: once a shard holds that many spawned-but-unreaped flushes it
-refuses its own size and age triggers rather than spawning another, and the
-refused tenant's rows stay buffered with their `oldest_arrival_ns` unreset, so
-the next tick re-fires the same trigger as soon as a flush has been reaped.
+abandons it. What queues is a spawned task, not the actor: the co-resident
+tenants' writes are still accepted, their age triggers still fire, and each
+trigger hands its buffer off and spawns another waiting flush. So the queue
+grows with the stall, and every flush in it holds a whole flush window and its
+ADR-0069 byte charge from the moment it left the actor, which is what the
+budget sheds against. Two things bound that queue. The byte budget bounds it
+only when it is configured: under the default `Bounded(512 MiB)` a sustained
+stall stops admitting new bytes before the queue grows without limit, while
+under `--max-ingest-buffer-bytes 0` (`Unlimited`) `try_charge` never sheds
+(ADR-1642). `max_queued_flushes` (`IngestConfig::max_queued_flushes`,
+`--max-queued-flushes`, default 8 per shard) bounds the ordinary triggers
+under either setting, though not to the cap alone: once a shard holds that
+many spawned-but-unreaped flushes it refuses the size and age triggers of
+every tenant that already has a flush in flight there, rather than spawning
+another, and the refused tenant's rows stay buffered with their
+`oldest_arrival_ns` unreset, so the next tick re-fires the same trigger as
+soon as a flush has been reaped. A tenant with nothing in flight is never
+refused, so the ordinary queue reaches at most `max_queued_flushes` plus one
+window per such tenant on the shard; the backstop crossings below spawn past
+both.
 Nothing is acked and nothing is dropped by a refusal, which is why it is
 available under `Unlimited` where a shed is not (see the ADR-1642 amendment).
 The cost is deadline, not durability: a deferred age trigger misses
@@ -774,8 +779,9 @@ charged from pin time whether it is queued or executing; on `ravel-cli load`
 (`--max-inflight-flushes`, ADR-0807 as amended) `--pipeline-depth` already
 caps the outstanding batches, so the flush window costs no further memory and
 only decides whether that bounded set of objects is written concurrently. The
-loader drives one tenant, so it sets the share to the permit count. `0` is rejected at the CLI edge (`Cli::validate` on
-the server, a typed `LoadError::Setup` on the loader): it would deadlock every
+loader drives one tenant, so it sets the share to the permit count. `0` is
+rejected at the CLI edge (`Cli::validate` on the server, a typed
+`LoadError::Setup` on the loader): it would deadlock every
 flush, since a shard could never acquire a permit to run one. On the server
 `--max-inflight-flushes-per-tenant 0` is rejected for the same reason, and a
 share above `--max-inflight-flushes` is rejected because it could never bind.
@@ -1373,9 +1379,12 @@ terms:
    store queues spawned flushes that each hold a whole flush window; the
    ADR-1642 amendment caps that queue per shard at `max_queued_flushes`
    (default 8). At the cap a shard refuses its size and age triggers, leaving
-   the rows buffered for the next tick, so the windows those two triggers
-   produce are bounded by `shard_count x max_queued_flushes x` the largest
-   flush window regardless of `--max-ingest-buffer-bytes`.
+   the rows buffered for the next tick, except for a tenant with no flush in
+   flight on the shard, which the cap never refuses (ADR-2708 D3). So the
+   windows those two triggers produce per shard are bounded by
+   `max_queued_flushes` plus one window per tenant on the shard with nothing
+   in flight, each at most the largest flush window; the count grows with the
+   number of active tenants, not with the stall.
 
    The exempt path has no such product, and writing one would read as an upper
    bound that does not hold. A tenant buffer past its memory backstop spawns
@@ -1790,11 +1799,13 @@ Counters recorded today:
   reading can therefore exceed `max_inflight_flushes` (ADR-1642), and the
   excess over it, floored at zero, is the shard's queue of flushes waiting on
   the bound. At `max_queued_flushes` the shard refuses further size and age
-  triggers (the ADR-1642 amendment), so in steady state the sum is bounded by
-  `shard_count x max_queued_flushes`. A shard's reading can sit above that
-  cap while one of its tenant buffers is past its memory backstop: such a
-  buffer spawns whatever the queue depth, since the backstop is the only bound
-  on its resident memory. The overshoot is one window per backstop CROSSING,
+  triggers (the ADR-1642 amendment), but never for a tenant with no flush in
+  flight on the shard (ADR-2708 D3), so a shard's ordinary reading is bounded
+  by `max_queued_flushes` plus one per tenant on the shard with nothing in
+  flight. A shard's reading can sit above that while one of its tenant
+  buffers is past its memory backstop or its object backstop: such a buffer
+  spawns whatever the queue depth, since the backstop is the only bound on its
+  resident memory (or, for the object backstop, its object size). The overshoot is one window per backstop CROSSING,
   not one per buffer currently over its backstop: an exempt spawn drains the
   buffer it fires on, so the windows accumulate as the tenant crosses again.
   Each costs a backstop's worth of buffered memory, so the overshoot tracks
