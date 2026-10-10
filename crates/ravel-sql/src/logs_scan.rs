@@ -6792,10 +6792,10 @@ fn declared_i64_from_buffers(
     }
     let mut filled: Vec<(usize, i64)> = Vec::new();
     for k in 0..array.len() {
-        if array.is_null(k) {
-            if let Some(AttrValue::I64(v)) = resolver.fallback_at(view, start + k, cache)? {
-                filled.push((k, *v));
-            }
+        if array.is_null(k)
+            && let Some(AttrValue::I64(v)) = resolver.fallback_at(view, start + k, cache)?
+        {
+            filled.push((k, *v));
         }
     }
     if filled.is_empty() {

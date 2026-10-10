@@ -6340,7 +6340,7 @@ impl BlockRangeFetcher {
                         &mut stats,
                     )
                     .await?;
-                &**local_field_dir.insert(Arc::new(decoded))
+                local_field_dir.insert(Arc::new(decoded))
             };
             let numeric = if wants_numeric {
                 let refs: Vec<&Predicate> = prune.iter().collect();
