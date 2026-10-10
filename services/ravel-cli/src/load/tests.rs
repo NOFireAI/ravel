@@ -101,22 +101,30 @@ fn default_max_inflight_flushes_matches_pipeline_depth() {
 }
 
 /// The loader's `--max-inflight-flushes` default deliberately does NOT track
-/// `IngestConfig::max_inflight_flushes` (issue #800). That field's default of
-/// 1 governs the client-facing serving path, whose Strict ack contract
-/// ADR-0067 decision 2 froze and whose memory has no outer window capping
-/// it; the bulk loader is a different workload. This pins the divergence so
-/// that raising the serving default later is a deliberate edit here too,
-/// rather than something that silently re-couples the two.
+/// `IngestConfig::max_inflight_flushes` (issue #800). That field's default
+/// governs the client-facing serving path, whose memory has no outer window
+/// capping it; the bulk loader's tracks `--pipeline-depth`. ADR-2708 D3 moved
+/// the serving default from 1 to 4, so the two now coincide by value only.
+/// This pins the serving default so that moving it again is a deliberate edit
+/// here too, and pins that a load gives its one tenant every permit rather
+/// than the serving path's N-1 share.
 #[test]
 fn loader_flush_window_default_diverges_from_the_serving_default() {
     assert_eq!(
         IngestConfig::default().max_inflight_flushes,
-        1,
-        "the serving default is unchanged at 1 (ADR-0067 decision 2)"
+        4,
+        "the serving default is 4 (ADR-2708 D3)"
     );
-    assert!(
-        DEFAULT_MAX_INFLIGHT_FLUSHES > IngestConfig::default().max_inflight_flushes,
-        "the bulk loader pipelines flushes where the serving path does not"
+    assert_eq!(
+        IngestConfig::default().max_inflight_flushes_per_tenant,
+        None,
+        "the serving path leaves the share at max(1, N-1)"
+    );
+    let cfg = build_ingest_config(4, DEFAULT_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    assert_eq!(
+        cfg.max_inflight_flushes_per_tenant,
+        Some(DEFAULT_MAX_INFLIGHT_FLUSHES as usize),
+        "a load's one tenant may use every --max-inflight-flushes permit"
     );
 }
 
