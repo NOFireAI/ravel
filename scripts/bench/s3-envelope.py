@@ -88,6 +88,13 @@ def run_entry(run_id, date, report):
 def build_document(environment, runs, runs_on, unexplained):
     """The envelope file's content. The `envelope` member is always computed."""
     env = environment
+    envelope = bench_s3_compare.compute_envelope(runs)
+    for name, _rpath, _run_path, kind in bench_s3_compare.FIGURES:
+        if kind == "exact" and envelope[name]["min"] != envelope[name]["max"]:
+            raise InputError(
+                f"{name} must be identical across every run to be compared exactly, "
+                f"got {envelope[name]['min']} to {envelope[name]['max']}"
+            )
     return {
         "_meta": {
             "workflow": WORKFLOW,
@@ -107,7 +114,7 @@ def build_document(environment, runs, runs_on, unexplained):
         },
         "environment": env,
         "runs": runs,
-        "envelope": bench_s3_compare.compute_envelope(runs),
+        "envelope": envelope,
     }
 
 
