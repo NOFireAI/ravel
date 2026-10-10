@@ -100,10 +100,20 @@ Buffered mode (opt-in per request, named "buffered"):
   throttled tenant still gets its full lifetime for its own store calls once it
   holds a permit. A flush whose flush-open deadline already elapsed when its
   task is scheduled is abandoned without taking a permit rather than wasting
-  one.
-- Loss from a stalled co-resident prefix is therefore not a buffered-mode
-  outcome: a flush queued behind the stall reaches the store once the stall
-  clears. Buffered rows are dropped with no crash in the cases below, and in
+  one. The lifetime is also bounded by the flush's pinned ingest hour `H`: the
+  deadline at grant is `min(now, end(H)) + max_flush_lifetime` (ADR-2708 D3),
+  so a flush granted past `end(H) + max_flush_lifetime` is abandoned without a
+  PUT, is not moved to a later hour, and is counted on `abandoned_hour_bound`.
+  That keeps every publish inside the catalog's seal of `H`.
+- A stalled prefix holds at most `max_inflight_flushes_per_tenant` of its
+  shard's permits (default `max(1, N - 1)` of 4), so a co-resident tenant's
+  flush normally takes a free permit and does not queue behind the stall at
+  all. Only stalls on several tenants of one shard at once, or a deployment
+  run at `--max-inflight-flushes 1`, queue it. Loss from a stalled co-resident
+  prefix is therefore not a buffered-mode outcome while the wait stays inside
+  the flush's hour bound: a flush queued behind the stall reaches the store
+  once the stall clears, and one still queued past the bound is the hour-bound
+  abandon above, which drops already-acked rows. Buffered rows are dropped with no crash in the cases below, and in
   every one of them those rows were already acked, because a buffered ack fires
   at enqueue and no drop happens before that. One: the flush's own store calls,
   after it holds the permit, do not land. That is a genuinely stuck backend
@@ -137,10 +147,11 @@ Buffered mode (opt-in per request, named "buffered"):
   why case two states the enforced and the bypass passes separately.
 - Strict mode does not share the buffered loss exposure, because a strict
   write is acked only after its flush commits and an abandoned flush returns a
-  retryable error instead. A strict write co-resident with a stalled prefix
-  instead takes `WriteError::AckTimeout` once the request's ack deadline
-  elapses while its flush is still queued for the permit, even though its own
-  prefix stayed healthy.
+  retryable error instead. A strict write co-resident with stalled prefixes
+  that hold every permit of its shard (see the share above) instead takes
+  `WriteError::AckTimeout` once the request's ack deadline elapses while its
+  flush is still queued for the permit, even though its own prefix stayed
+  healthy.
 - Never described as durable. No commit token is returned.
 
 Rejection: admission failures (limits, auth, quota, the ingest byte budget)
@@ -165,8 +176,11 @@ partial-success message with rejected point counts and reasons.
   (`--max-flush-delay`), default 2 s in strict mode (ADR-0076 decision 4);
   the p99 visibility target under target load tracks that budget, not a fixed
   sub-second constant. The permit wait is zero unless the shard already has
-  `max_inflight_flushes` flushes running (ADR-1642), which is where a stalled
-  tenant's throttled prefix shows up in a co-resident tenant's visibility.
+  `max_inflight_flushes` flushes running (ADR-1642), which is where stalled
+  tenants' throttled prefixes show up in a co-resident tenant's visibility
+  once they hold every permit. A tenant at its own per-tenant share defers its
+  trigger instead, which adds to its own flush delay rather than to anyone
+  else's permit wait.
 - There is no cross-shard ordering guarantee. A query snapshot may include
   commit N+1 of shard A and not commit M of shard B, regardless of wall-clock
   order. Per (writer, shard), commits are sequenced by `seq`.

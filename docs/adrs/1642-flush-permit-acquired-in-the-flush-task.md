@@ -8,10 +8,12 @@ Status: Accepted (2026-09-12). Amended 2026-09-20 (issue #1740, see
 refusal binds the library entry" below), 2026-10-04 (issue #2429, see
 "Amendment (2026-10-04): the hand-back also fires on a generation mismatch"
 below), 2026-10-04 (issue #2465, see "Amendment (2026-10-04): every
-startup cadence check binds the library entry" below), and 2026-10-05 (issue
+startup cadence check binds the library entry" below), 2026-10-05 (issue
 #2600, see "Amendment (2026-10-05): the hand-back counts are exported"
+below), and 2026-10-10 (issue #1921, ADR-2708 D3, see "Amendment
+(2026-10-10): a per-tenant flush share and an hour-bounded grant deadline"
 below). Supersedes ADR-0067 decision 2. Issues #1292, #1641, #1740, #1916,
-#2410, #2438, #2429, #2465, and #2600.
+#2410, #2438, #2429, #2465, #2600, and #1921.
 
 ## Context
 
@@ -298,6 +300,10 @@ labelled by `{mode, signal}`, so the alarm below is a scrape rule and not a
 library reading. A nonzero `flush_trigger_deferred` rate means a shard is at
 its cap and its tenants' visibility deadlines are slipping; it is the signal
 that the object store, not ingest, is the thing to look at.
+Since ADR-2708 D3 a tenant at its per-tenant flush share is refused through
+the same path and counted on the same counter, a tenant with no flush in
+flight is never refused by the cap, and an object-size backstop is exempt like
+the memory backstop (see the flush share amendment below).
 
 The consequence bullets above are unchanged except in their bound. Memory per
 shard still rises by one flush window per spawned flush, and the in-flight gauge
@@ -1066,3 +1072,68 @@ increase.
 
 Nothing about when a hand-back fires, what it waits on, or when it writes in
 place changes here.
+
+## Amendment (2026-10-10): a per-tenant flush share and an hour-bounded grant deadline (issue #1921)
+
+<!-- amendment-applies: sections="Amendment: the queued-flush cap (issue #1740)" pointer="flush share amendment" -->
+
+ADR-2708 D3 is the decision; this section records what it changes here.
+
+Moving the permit wait off the actor stopped a stalled flush from parking the
+actor, but it left the permits themselves shared. At the old default of one
+permit per shard, a tenant whose prefix is throttled or hung held that permit
+for its whole stall (about 101 s for a hung create-if-absent PUT, about 200 s
+per attempt for a retried `503 SlowDown`), and a co-resident tenant's strict
+write queued behind it and timed out its 10 s ack deadline. The aggregate
+bound this ADR defends was intact; the isolation it was meant to buy was not.
+
+`--max-inflight-flushes` now defaults to 4, and the new
+`--max-inflight-flushes-per-tenant` (`IngestConfig::max_inflight_flushes_per_tenant`)
+caps how many flushes one tenant may have spawned and not yet finished on one
+shard,
+defaulting to `max(1, N - 1)`. The actor counts flushes per (shard, tenant)
+beside its `JoinSet`, incremented at spawn and decremented when the flush task
+finishes, after it has released its permits, and the
+semaphore stays one FIFO per shard. The refusal check reads, in order: a
+Manual trigger is never refused; a buffer past its memory backstop or its
+object backstop is never refused; a tenant at its share is refused; a tenant
+with no flush in flight is never refused; otherwise the queued-flush cap
+applies. A refusal takes the path the queued-flush cap amendment describes
+(buffer reinserted, age clock unreset, `flush_trigger_deferred` incremented),
+so `flush_trigger_deferred` rising now means a shard at its cap or a tenant at
+its share, and the deferral cap counts both. That cap refuses writes for the
+whole shard, so one tenant held at its share for the cap's length (3559.8 s at
+the defaults) refuses new writes for every tenant on that shard, as a shard at
+its queued-flush cap already could. One hung tenant holds at most
+N - 1 permits, and a co-resident tenant's flush takes the last one. Two hung
+tenants on one shard can still take all four.
+
+The object backstop is new: a buffer whose `flush_est_bytes` has reached 4x
+`target_bytes` fires as a backstop crossing, exempt from both the share and
+the cap, so a deferred buffer's object stops growing there. The memory
+backstop alone did not bound a native-histogram object, which charges 16 bytes
+a point and can encode several times that. The charge is unchanged (#2737).
+
+The deadline a flush takes at grant is now `min(now, end(pinned hour)) +
+max_flush_lifetime` rather than `now + max_flush_lifetime`. A flush granted
+past that bound is abandoned in the queue without a PUT and counted on
+`abandoned_hour_bound` (`ravel_ingest_abandoned_hour_bound_total`), and it is
+not re-pinned to a later hour. The bound sits inside the maintain seal
+(`end(H) + max_flush_lifetime + clock_skew_allowance`, 65 minutes at defaults)
+and the fold seal (80 minutes), so a buffered flush queued behind a long stall
+can no longer publish into an hour the catalog has sealed. A flush granted
+inside its hour still gets the full lifetime from grant, which is what #1739
+asked for. The pin is still taken at flush open, so the deferral cap
+amendment's reasoning stands.
+
+Decision 1's ordering note is unchanged: with more permits, publication order
+already diverged from `seq` order, and nothing consumes grant order.
+
+Tests: `crates/ravel-ingest/tests/tenant_flush_isolation.rs` runs the share,
+the exemption for a tenant with no flush in flight, and the grant deadline on
+all three pipelines; the object backstop is tested on the metrics actor only; `ravel_ingest::shard::tests`
+holds the abandoned-without-a-put, clamped-to-the-hour-end, parked-charge,
+and native-histogram cases; and
+`services/ravel-server/tests/tenant_flush_isolation_e2e.rs` shows a strict
+write from a second tenant acknowledged while three flushes of the first are
+held at the store.

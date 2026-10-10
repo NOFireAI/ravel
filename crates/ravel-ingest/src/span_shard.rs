@@ -61,10 +61,11 @@ use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag,
-    checked_ingest_hour_bucket, duration_nanos_saturating, idle_age_threshold,
-    memory_backstop_crossed, size_trigger_fires, store_clock_lag,
+    checked_ingest_hour_bucket, duration_nanos_saturating, grant_deadline_ns, idle_age_threshold,
+    memory_backstop_crossed, object_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
+use crate::flush_share::TenantFlushShares;
 use crate::generation::{
     FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck, mismatch_retry_spent,
     reread_and_check, send_hand_back,
@@ -461,6 +462,24 @@ impl SpanFlushCtx {
         drop(charges);
     }
 
+    /// Abandons a flush granted its permit at or past its pinned ingest hour's
+    /// end plus `max_flush_lifetime`, before any store call (ADR-2708 D3). Its
+    /// waiters are acked with a retryable `Abandoned` error and its byte
+    /// charges are dropped.
+    fn abandon_hour_bound(&self, pinned: SpanPinnedFlush) {
+        let SpanPinnedFlush {
+            waiters, charges, ..
+        } = pinned;
+        self.metrics.record_abandoned_hour_bound();
+        self.ack_waiters(
+            waiters,
+            Err(SpanWriteError::Abandoned(
+                "flush permit granted past its ingest hour's flush bound".into(),
+            )),
+        );
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the injected
     /// `Clock`, returning `None` if the deadline is already past or elapses
     /// while `fut` is still in flight. Built on `tokio::select!` racing
@@ -649,8 +668,11 @@ pub(crate) struct SpanShardActor {
     /// Immutable bundle handed by `Arc::clone` to every spawned flush task
     /// (ADR-0067 decision 1).
     ctx: Arc<SpanFlushCtx>,
-    /// Bounds concurrently in-flight flush tasks (ADR-0067 decision 2).
+    /// Bounds concurrently in-flight flush tasks (ADR-0067 decision 2). The
+    /// shard's one FIFO flush semaphore.
     semaphore: Arc<Semaphore>,
+    /// Each tenant's flush share on this shard (ADR-2708 D3).
+    shares: TenantFlushShares,
     /// Tracks spawned flush tasks so `join_all_flushes` can await durability
     /// before `FlushNow`/`Shutdown`/the channel-close drain return, and so the
     /// actor loop can opportunistically reap finished ones.
@@ -725,6 +747,7 @@ impl SpanShardActor {
             metrics,
             ctx,
             semaphore: Arc::new(Semaphore::new(config.max_inflight_flushes as usize)),
+            shares: TenantFlushShares::new(config.flush_share_per_tenant()),
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
@@ -816,6 +839,7 @@ impl SpanShardActor {
                 }
                 Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
                     handle_flush_join_result(self.shard, result);
+                    self.shares.prune();
                     self.record_queued_flushes();
                 }
             }
@@ -1311,6 +1335,7 @@ impl SpanShardActor {
             handle_flush_join_result(self.shard, result);
             self.record_queued_flushes();
         }
+        self.shares.prune();
     }
 
     /// Whether `trigger` must be refused because this shard already has
@@ -1339,11 +1364,29 @@ impl SpanShardActor {
     /// grow without one (PR #1903 review finding 1). The exempt path is this
     /// early return, the only way past the length check below; a refusal
     /// always counts on `flush_trigger_deferred`.
-    fn queued_flush_cap_reached(&self, trigger: FlushTrigger, buf: &SpanTenantBuf) -> bool {
+    ///
+    /// The per-tenant share and the object backstop (ADR-2708 D3) apply as on
+    /// [`crate::shard::ShardActor::queued_flush_cap_reached`]: an object-backstop
+    /// crossing is exempt, a tenant at its share is refused, and a tenant with
+    /// nothing spawned is never refused by the queue cap.
+    fn queued_flush_cap_reached(
+        &self,
+        trigger: FlushTrigger,
+        tenant_hash: TenantHash,
+        buf: &SpanTenantBuf,
+    ) -> bool {
         if matches!(trigger, FlushTrigger::Manual) {
             return false;
         }
-        if memory_backstop_crossed(buf.est_bytes, &self.config, self.backstop_ceiling.get()) {
+        if memory_backstop_crossed(buf.est_bytes, &self.config, self.backstop_ceiling.get())
+            || object_backstop_crossed(buf.flush_est_bytes, &self.config)
+        {
+            return false;
+        }
+        if self.shares.at_share(tenant_hash) {
+            return true;
+        }
+        if self.shares.in_flight(tenant_hash) == 0 {
             return false;
         }
         self.flushes.len() >= self.config.queued_flush_cap()
@@ -1477,7 +1520,8 @@ impl SpanShardActor {
             return;
         }
         let raw_ns = self.clock.now_ns();
-        let refused = self.queued_flush_cap_reached(trigger, &buf);
+        let tenant_hash = tenant.hash();
+        let refused = self.queued_flush_cap_reached(trigger, tenant_hash, &buf);
         if refused {
             buf.deferred_since_ns.get_or_insert(raw_ns);
         }
@@ -1580,7 +1624,6 @@ impl SpanShardActor {
                 return;
             }
         };
-        let tenant_hash = tenant.hash();
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
@@ -1818,12 +1861,14 @@ impl SpanShardActor {
         // still waiting for a permit counts as in flight, because it is holding
         // a flush window of memory.
         let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
+        let slot = self.shares.enter(tenant_hash);
         let semaphore = Arc::clone(&self.semaphore);
         let shard = self.shard;
         let ctx = Arc::clone(&self.ctx);
         let metrics = Arc::clone(&self.metrics);
         self.flushes.spawn(async move {
             let _guard = guard;
+            let slot = slot;
             let mut pinned = pinned;
             // Issue #1739 part 2: a flush whose flush-open deadline already
             // elapsed while it sat in the spawn queue must not take a permit only
@@ -1845,7 +1890,8 @@ impl SpanShardActor {
             // parks; the actor does not. The wait is this shard's
             // `flush_permit_wait_ns` (issue #865), measured on the injected clock.
             let permit_wait_start_ns = ctx.clock.now_ns();
-            let permit = match semaphore.acquire_owned().await {
+            // The tenant's share permit is taken first (ADR-2708 D3).
+            let permit = match slot.acquire(&semaphore).await {
                 Ok(permit) => permit,
                 Err(_) => panic!(
                     "ravel-ingest: span flush semaphore closed unexpectedly on shard {shard}"
@@ -1866,10 +1912,21 @@ impl SpanShardActor {
             // rows with no PUT. The re-derived value only ever moves the deadline
             // later (grant is at or after open), so it never shortens a flush's
             // store budget.
-            pinned.deadline_ns = ctx
-                .clock
-                .now_ns()
-                .saturating_add(duration_nanos_saturating(ctx.config.max_flush_lifetime));
+            //
+            // ADR-2708 D3 clamps it to the pinned hour's end plus
+            // `max_flush_lifetime` and abandons a flush granted past that bound
+            // without a PUT. The hour is not re-pinned.
+            pinned.deadline_ns = match grant_deadline_ns(
+                ctx.clock.now_ns(),
+                pinned.ingest_hour_bucket,
+                ctx.config.max_flush_lifetime,
+            ) {
+                Some(deadline_ns) => deadline_ns,
+                None => {
+                    ctx.abandon_hour_bound(pinned);
+                    return;
+                }
+            };
             // Per-shard skew (issue #865, ADR-1692): time the whole flush,
             // matching `crate::shard`'s own off-actor span.
             let started_ns = ctx.clock.now_ns();
@@ -2626,6 +2683,7 @@ mod tests {
     async fn catalog_resolve_correct_over_out_of_order_commit_landings() {
         let config = IngestConfig {
             max_inflight_flushes: 2,
+            max_inflight_flushes_per_tenant: Some(2),
             ..flush_on_first()
         };
         let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));

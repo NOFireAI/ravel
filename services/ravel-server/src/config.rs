@@ -1604,12 +1604,16 @@ pub struct Cli {
     /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
     /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
     /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables
-    /// this byte ceiling, but it does not leave spawned-flush memory
-    /// unbounded on its own: `--max-queued-flushes` still caps the ordinary
-    /// flush queue regardless of this setting. The exemption from that cap
-    /// that can keep growing is a buffer that has crossed its per-(shard,
-    /// tenant) memory backstop, and under `0` it is bounded only by how long
-    /// a stall lasts (the gauge itself is still tracked for `/metrics` either
+    /// this byte ceiling, and then nothing else bounds spawned-flush memory in
+    /// total. `--max-queued-flushes` does not bound a shard's queue on its
+    /// own: a tenant with no flush in flight is never refused by it, so the
+    /// ordinary queue can reach `--max-queued-flushes` plus one window per
+    /// tenant on the shard with nothing in flight, and every backstop
+    /// crossing (a buffer past its per-(shard, tenant) memory backstop, or
+    /// one whose object estimate has reached 4x the object-size target)
+    /// spawns past it too. Under a nonzero budget this byte ceiling bounds
+    /// that total; under `0` the crossings are bounded only by how long a
+    /// stall lasts (the gauge itself is still tracked for `/metrics` either
     /// way).
     ///
     /// What `0` leaves unbounded is narrower than it was, but it is not
@@ -1620,25 +1624,27 @@ pub struct Cli {
     /// refuses a size or age trigger once it already holds
     /// `--max-queued-flushes` spawned flushes (default 8 per shard), leaving
     /// the rows buffered for the next tick rather than shedding them. That
-    /// cap bounds the ORDINARY triggers whatever this flag is set to. It does
-    /// not bound every spawn: a buffer that has crossed its per-(shard,
-    /// tenant) memory backstop is exempt and spawns past the cap, because
-    /// refusing there would trade a bounded queue of flush tasks for an
-    /// unbounded buffer.
+    /// cap does not bound every spawn: a tenant with no flush in flight on
+    /// the shard is never refused by it, and a buffer past its per-(shard,
+    /// tenant) memory backstop, or whose object estimate has reached 4x the
+    /// object-size target, spawns past it, because refusing there would trade
+    /// a bounded queue of flush tasks for an unbounded buffer.
     ///
     /// So the bound on spawned flush memory per shard depends on this flag.
     /// When it is nonzero, a queued flush stays charged against this ceiling
     /// until its PUTs complete, so the exempt windows push the gauge to the
     /// ceiling, admission sheds, and the refill that would spawn the next one
     /// stops: the ceiling bounds them. Under `0` there is no ceiling and
-    /// nothing sheds behind the backstop, so a shard holds
-    /// `--max-queued-flushes` windows PLUS one exempt window per backstop
-    /// crossing, and only the length of the stall bounds how many crossings
-    /// accumulate. That is what `0` leaves unbounded on a stalled store.
-    /// Bounded under `0` are one buffer's own resident memory (the backstop)
-    /// and the ordinary queue (the cap); unbounded are the exempt windows and
-    /// the sum across tenants, which is exactly what this ceiling bounds when
-    /// it is enabled. A host with many active tenants can exhaust memory
+    /// nothing sheds behind the backstops, so a shard holds
+    /// `--max-queued-flushes` windows, plus one window per tenant on the shard
+    /// with nothing in flight, plus one exempt window per backstop crossing
+    /// (memory or object), and only the length of the stall bounds how many
+    /// crossings accumulate. That is what `0` leaves unbounded on a stalled
+    /// store. Bounded under `0` are one buffer's own resident memory (the
+    /// memory backstop), one buffer's object (the object backstop) and the
+    /// ordinary queue (the cap plus one window per tenant with nothing in
+    /// flight); unbounded are the backstop windows and the sum across
+    /// tenants, which is exactly what this ceiling bounds when it is enabled. A host with many active tenants can exhaust memory
     /// under `0` with the store healthy too, without any single bound being
     /// crossed.
     ///
@@ -1659,23 +1665,34 @@ pub struct Cli {
     /// so the shard actor never waits for one: it keeps draining its channel
     /// and firing age triggers for every tenant on the shard while a flush is
     /// stalled. This makes the knob the per-shard cross-tenant flush
-    /// isolation control as much as a throughput one. At the default of 1, a
-    /// tenant whose S3 key prefix is being throttled (`503 SlowDown`, applied
-    /// per prefix) holds the shard's only permit, and co-resident tenants'
-    /// flushes queue behind it until the stall clears. A queued flush's
-    /// `max_flush_lifetime` budget is measured from when it acquires the permit,
-    /// not from flush-open, so the wait itself does not abandon
-    /// it: a buffered write's rows stay invisible to queries until the stall
-    /// clears, then commit, rather than being dropped. A co-resident strict
-    /// write instead takes `WriteError::AckTimeout` once the request's ack
-    /// deadline elapses while its flush is still queued for the permit, even
-    /// though its own prefix stayed healthy. Raising the bound gives those
-    /// tenants a permit to flush on, at the cost of more concurrent PUTs and more
-    /// encode memory in flight. Queued flushes hold their buffers and their
-    /// ADR-0069 byte charges, so the byte budget, not this bound, is what
-    /// sheds when a shard backs up. Matches
+    /// isolation control as much as a throughput one: one tenant may hold at
+    /// most `--max-inflight-flushes-per-tenant` of the shard's permits
+    /// (ADR-2708 D3, default N-1), so at the default of 4 a tenant whose S3
+    /// key prefix is stalled leaves a permit for its co-resident tenants'
+    /// flushes. At 1 there is no permit to leave: a stalled tenant holds the
+    /// shard's only permit and co-resident tenants' flushes queue behind it
+    /// until the stall clears, and [`Cli::validate`] warns. How long one
+    /// stalled flush holds its permit depends on the stall. A hung
+    /// create-if-absent PUT is not retried inside object_store, so Ravel's
+    /// five attempts at the 20 s request timeout plus backoff hold it about
+    /// 101 s. A retryable status such as `503 SlowDown` (applied per prefix)
+    /// is retried inside object_store, so one Ravel attempt takes about 200 s
+    /// (`retry_timeout` plus one `request_timeout`) and five approach 1000 s,
+    /// bounded first by the flush deadline. A queued flush's deadline is set
+    /// when it acquires the permit, as `min(now, end(pinned hour)) +
+    /// max_flush_lifetime`: a wait inside the pinned hour's bound keeps the
+    /// full lifetime, so a buffered write's rows stay invisible until the
+    /// stall clears and then commit, while a flush granted past that bound is
+    /// abandoned without a PUT and counted on
+    /// `ravel_ingest_abandoned_hour_bound_total` rather than published into an
+    /// hour the maintain seal may already have closed. A strict write takes
+    /// `WriteError::AckTimeout` once the request's ack deadline elapses while
+    /// its flush is still queued for a permit. More permits cost more
+    /// concurrent PUTs and more encode memory in flight. Queued flushes hold
+    /// their buffers and their ADR-0069 byte charges, so the byte budget, not
+    /// this bound, is what sheds when a shard backs up. Matches
     /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
-    /// 1 (today's non-pipelined behavior). `0` is rejected by
+    /// 4. `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
     /// never acquire a permit to run one. A value ABOVE `--max-queued-flushes`
     /// (default 8) is accepted and raises the effective queue cap to match,
@@ -1686,8 +1703,25 @@ pub struct Cli {
     /// refusal would crash-loop an already-admitted cluster on upgrade.
     /// Nothing lowers this flag; set `--max-queued-flushes` yourself when you
     /// want the queue deeper than the permit count.
-    #[arg(long = "max-inflight-flushes", default_value_t = 1)]
+    #[arg(long = "max-inflight-flushes", default_value_t = 4)]
     pub max_inflight_flushes: u32,
+
+    /// How many of a shard's `--max-inflight-flushes` permits one tenant's
+    /// flushes may hold or wait on at once, for all three ingest pipelines
+    /// (ADR-2708 D3). Unset resolves to `max(1, --max-inflight-flushes - 1)`,
+    /// so one stalled tenant leaves at least one permit free for the shard's
+    /// other tenants whenever there is more than one. A trigger from a tenant
+    /// at its share is deferred and counted on
+    /// `ravel_ingest_flush_trigger_deferred_total`; its buffer keeps merging
+    /// until a slot frees, the memory backstop crosses, or its object
+    /// estimate reaches 4x the flush target, which fire regardless. `0` is
+    /// rejected by [`Cli::validate`] (every trigger would defer), and so is a
+    /// value above `--max-inflight-flushes`, which a tenant could never use.
+    #[arg(
+        long = "max-inflight-flushes-per-tenant",
+        env = "RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT"
+    )]
+    pub max_inflight_flushes_per_tenant: Option<usize>,
 
     /// Per-shard bound on flush tasks spawned and not yet reaped, for all
     /// three ingest pipelines (issue #1740). ADR-1642 moved the
@@ -1714,14 +1748,19 @@ pub struct Cli {
     /// `ravel_ingest_deferral_cap_refused_total`. A strict write already
     /// waiting on that flush is answered 503, and its rows are still written by
     /// the flush that opens past the cap. The deferred flush itself still waits
-    /// for a slot as long as the stall lasts. Drains (`FlushNow`, shutdown) are
-    /// never refused, and neither is a tenant buffer that has crossed its
-    /// per-(shard, tenant) memory backstop, so THE QUEUE CAN EXCEED THIS CAP
-    /// under memory pressure: the backstop is the only bound on one buffer's
-    /// resident memory, and refusing there would trade a bounded queue of flush
-    /// tasks for an unbounded buffer, the worse of the two failures. Size the
-    /// steady state from this cap; what bounds the overshoot is the paragraph
-    /// below. `0` is rejected. A `--max-inflight-flushes` above this value is
+    /// for a slot as long as the stall lasts. THIS CAP DOES NOT BOUND THE QUEUE
+    /// ON ITS OWN. Drains (`FlushNow`, shutdown) are never refused; a tenant
+    /// with no flush in flight on the shard is never refused, so a neighbour's
+    /// stalled windows cannot fill the queue against it, and the ordinary
+    /// queue can reach this cap plus one window per tenant on the shard with
+    /// nothing in flight; and a buffer that has crossed its per-(shard,
+    /// tenant) memory backstop, or whose object estimate has reached 4x the
+    /// object-size target, spawns past the cap: the backstop is the only bound
+    /// on one buffer's resident memory, and refusing there would trade a
+    /// bounded queue of flush tasks for an unbounded buffer, the worse of the
+    /// two failures. Under a nonzero `--max-ingest-buffer-bytes` that byte
+    /// budget bounds the total; under `0` nothing else does (the paragraph
+    /// below). `0` is rejected. A `--max-inflight-flushes` above this value is
     /// accepted and raises the effective cap to match, since effective
     /// per-shard flush concurrency is the lower of the two. Matches
     /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8.
@@ -6837,6 +6876,30 @@ impl Cli {
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
                  acquire a permit to run one. Set a positive count (1 keeps today's \
                  non-pipelined behavior)."
+            );
+        }
+        if let Some(share) = self.max_inflight_flushes_per_tenant {
+            if share == 0 {
+                anyhow::bail!(
+                    "--max-inflight-flushes-per-tenant '0' would defer every age and size \
+                     trigger: no tenant could ever take a flush permit. Set a positive count, \
+                     or leave it unset for max(1, --max-inflight-flushes - 1)."
+                );
+            }
+            if !u32::try_from(share).is_ok_and(|s| s <= self.max_inflight_flushes) {
+                anyhow::bail!(
+                    "--max-inflight-flushes-per-tenant '{share}' exceeds \
+                     --max-inflight-flushes '{}': a tenant can hold at most every permit on \
+                     its shard.",
+                    self.max_inflight_flushes
+                );
+            }
+        }
+        if self.max_inflight_flushes == 1 {
+            tracing::warn!(
+                "--max-inflight-flushes 1 gives no cross-tenant flush isolation: a tenant \
+                 whose object-store prefix stalls holds its shard's only flush permit, and \
+                 every co-resident tenant's flushes wait behind it (ADR-2708 D3)."
             );
         }
 
@@ -16076,6 +16139,56 @@ mod tests {
     }
 
     #[test]
+    fn zero_max_inflight_flushes_per_tenant_fails_validate() {
+        let err = cli(&["--max-inflight-flushes-per-tenant", "0"])
+            .validate()
+            .expect_err("a share of 0 would defer every trigger");
+        assert!(
+            err.to_string()
+                .contains("--max-inflight-flushes-per-tenant '0'"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_above_permits_fails_validate() {
+        let err = cli(&[
+            "--max-inflight-flushes",
+            "4",
+            "--max-inflight-flushes-per-tenant",
+            "5",
+        ])
+        .validate()
+        .expect_err("a share above the permit count could never be used");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--max-inflight-flushes-per-tenant '5'")
+                && msg.contains("--max-inflight-flushes '4'"),
+            "error names both flags and values: {msg}"
+        );
+    }
+
+    #[test]
+    fn max_inflight_flushes_per_tenant_up_to_permits_validates() {
+        for share in ["1", "3", "4"] {
+            let parsed = cli(&[
+                "--max-inflight-flushes",
+                "4",
+                "--max-inflight-flushes-per-tenant",
+                share,
+            ]);
+            parsed
+                .validate()
+                .expect("a share in 1..=--max-inflight-flushes is fine");
+            assert_eq!(
+                parsed.max_inflight_flushes_per_tenant,
+                share.parse().ok(),
+                "flag parses into the field"
+            );
+        }
+    }
+
+    #[test]
     fn zero_max_queued_flushes_fails_validate() {
         let err = cli(&["--max-queued-flushes", "0"])
             .validate()
@@ -16242,8 +16355,18 @@ mod tests {
     fn max_inflight_flushes_and_adaptive_flush_delay_default() {
         let parsed = cli(&[]);
         assert_eq!(
-            parsed.max_inflight_flushes, 1,
+            parsed.max_inflight_flushes, 4,
             "default matches ravel_ingest::IngestConfig::max_inflight_flushes"
+        );
+        assert_eq!(
+            parsed.max_inflight_flushes_per_tenant, None,
+            "unset resolves to N-1 inside ravel_ingest"
+        );
+        let defaults = ravel_ingest::IngestConfig::default();
+        assert_eq!(defaults.max_inflight_flushes, parsed.max_inflight_flushes);
+        assert_eq!(
+            defaults.max_inflight_flushes_per_tenant,
+            parsed.max_inflight_flushes_per_tenant
         );
         assert!(
             !parsed.adaptive_flush_delay,

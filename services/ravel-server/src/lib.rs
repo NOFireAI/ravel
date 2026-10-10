@@ -500,6 +500,11 @@ pub struct ServerConfig {
     /// extended to logs and spans by ADR-0076 decision 3). See
     /// `--max-inflight-flushes`.
     pub max_inflight_flushes: u32,
+    /// Per-tenant share of `max_inflight_flushes`, forwarded to
+    /// [`ravel_ingest::IngestConfig::max_inflight_flushes_per_tenant`] on all
+    /// three ingest pipelines (ADR-2708 D3). `None` resolves to `max(1,
+    /// max_inflight_flushes - 1)`. See `--max-inflight-flushes-per-tenant`.
+    pub max_inflight_flushes_per_tenant: Option<usize>,
     /// Per-shard bound on spawned-but-unreaped flush tasks, forwarded to
     /// [`ravel_ingest::IngestConfig::max_queued_flushes`] on all three ingest
     /// pipelines (issue #1740). A buffer over its memory backstop spawns even
@@ -2221,6 +2226,13 @@ fn ingest_config_refusal(e: &IngestConfigError) -> String {
             "{e}. --idle-flush-byte-floor must be below --min-flush-bytes, or 0 to disable \
              the sub-floor hold"
         ),
+        IngestConfigError::ZeroFlushSharePerTenant => format!(
+            "{e}. Set --max-inflight-flushes-per-tenant to a positive count, or leave it unset \
+             for max(1, --max-inflight-flushes - 1)"
+        ),
+        IngestConfigError::FlushShareAboveMaxInflightFlushes { .. } => {
+            format!("{e}. --max-inflight-flushes-per-tenant must not exceed --max-inflight-flushes")
+        }
     }
 }
 
@@ -2317,6 +2329,7 @@ pub async fn start_with_heartbeat(
             IngestConfig {
                 shard_count: config.shard_count,
                 max_inflight_flushes: config.max_inflight_flushes,
+                max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
                 max_queued_flushes: config.max_queued_flushes as usize,
                 adaptive_flush_delay: config.adaptive_flush_delay,
                 max_flush_delay: config.max_flush_delay,
@@ -2409,6 +2422,7 @@ pub async fn start_with_heartbeat(
             IngestConfig {
                 shard_count: config.shard_count,
                 max_inflight_flushes: config.max_inflight_flushes,
+                max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
                 max_queued_flushes: config.max_queued_flushes as usize,
                 max_flush_delay: config.max_flush_delay,
                 max_flush_delay_idle: config.max_flush_delay_idle,
@@ -2441,6 +2455,7 @@ pub async fn start_with_heartbeat(
             IngestConfig {
                 shard_count: config.shard_count,
                 max_inflight_flushes: config.max_inflight_flushes,
+                max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
                 max_queued_flushes: config.max_queued_flushes as usize,
                 max_flush_delay: config.max_flush_delay,
                 max_flush_delay_idle: config.max_flush_delay_idle,
@@ -5235,6 +5250,7 @@ mod startup_test_support {
             listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
             shard_count: 1,
             max_inflight_flushes: 1,
+            max_inflight_flushes_per_tenant: None,
             max_queued_flushes: 8,
             adaptive_flush_delay: false,
             max_flush_delay: Duration::from_secs(2),

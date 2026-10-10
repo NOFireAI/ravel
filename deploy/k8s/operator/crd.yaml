@@ -235,7 +235,14 @@
                         ]
                       },
                       "maxInflightFlushes": {
-                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field.\nOmit to keep `ravel-server`'s own default of 1 (today's non-pipelined\nbehavior). The CRD schema enforces a minimum of 1 at admission:\n`ravel-server` rejects 0 as a flush deadlock.",
+                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field.\nOmit to keep `ravel-server`'s own default of 4 (ADR-2708 D3). The CRD\nschema enforces a minimum of 1 at admission: `ravel-server` rejects 0\nas a flush deadlock.",
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "maxInflightFlushesPerTenant": {
+                        "description": "How many of a shard's flush permits one tenant may hold or wait on at\nonce (`--max-inflight-flushes-per-tenant`, ADR-2708 D3). Omit to keep\n`ravel-server`'s own default of `max(1, maxInflightFlushes - 1)`, which\nleaves a permit for co-resident tenants whenever there is more than\none. Gateway-only, like `maxInflightFlushes`. The CRD schema enforces a\nminimum of 1 at admission, and a CEL rule on `gateway` refuses a value\nabove `maxInflightFlushes` (4 when that is omitted), which\n`ravel-server` would otherwise reject at startup.",
                         "format": "uint32",
                         "minimum": 1.0,
                         "nullable": true,
@@ -281,6 +288,10 @@
                       {
                         "message": "gateway.ingestAffinity.key.source canonicalTenant requires backend: ravelNative -- ingress-nginx cannot run the ravel-tenant-resolve auth chain that canonical-tenant hashing needs",
                         "rule": "!has(self.ingestAffinity) || !has(self.ingestAffinity.key) || !has(self.ingestAffinity.key.source) || self.ingestAffinity.key.source != 'canonicalTenant' || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
+                      },
+                      {
+                        "message": "gateway.maxInflightFlushesPerTenant must not exceed gateway.maxInflightFlushes (ravel-server's default of 4 when unset); ravel-server refuses the pair at startup",
+                        "rule": "!has(self.maxInflightFlushesPerTenant) || self.maxInflightFlushesPerTenant <= (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 4)"
                       }
                     ]
                   },

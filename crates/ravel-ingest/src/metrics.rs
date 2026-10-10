@@ -24,7 +24,8 @@
 //!   abandoned is therefore counted in both `flushes_by_*` **and** one of the
 //!   `abandoned_*` counters. Flushes that actually reached a durable commit
 //!   are the four trigger counters summed, minus `abandoned_retry_exhausted`,
-//!   `abandoned_input_rejected`, and `abandoned_queue_deadline`; the bare
+//!   `abandoned_input_rejected`, `abandoned_queue_deadline`, and
+//!   `abandoned_hour_bound`; the bare
 //!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
 //!   waiters are acked, i.e. at the flush's terminal outcome. They count
@@ -135,6 +136,12 @@ pub struct IngestMetrics {
     /// from permit grant this fires only when a flush's task is scheduled after
     /// its flush-open deadline already passed.
     abandoned_queue_deadline: AtomicU64,
+    /// Flushes abandoned without a PUT because they were granted a
+    /// `max_inflight_flushes` permit at or past their pinned ingest hour's end
+    /// plus `max_flush_lifetime` (`WriteError::Abandoned`, ADR-2708 D3).
+    /// Publishing them would land rows in an hour maintain may already have
+    /// sealed. A contention signal like `abandoned_queue_deadline`.
+    abandoned_hour_bound: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the segment build, data-key derivation, or commit-record
     /// build failed (`WriteError::SegmentBuild`). A client signal: identical
@@ -553,8 +560,9 @@ impl ShardSkew {
     }
 
     /// One size or age flush trigger refused because shard `shard` was already
-    /// at `max_queued_flushes` and the buffer was under its memory backstop
-    /// (issue #1740).
+    /// at `max_queued_flushes` (issue #1740), or because the tenant already
+    /// held its per-tenant flush share (ADR-2708 D3), with the buffer under its
+    /// memory and object backstops.
     pub(crate) fn record_flush_trigger_deferred(&self, shard: u32) {
         if let Some(s) = self.shards.get(shard as usize) {
             s.flush_trigger_deferred.fetch_add(1, Ordering::Relaxed);
@@ -721,7 +729,9 @@ pub struct ShardSkewStats {
     /// cap is enforced against and it reads at or above the other.
     pub flushes_queued: u64,
     /// Size and age flush triggers this shard refused because `flushes_queued`
-    /// was already at `IngestConfig::max_queued_flushes` (issue #1740). The
+    /// was already at `IngestConfig::max_queued_flushes` (issue #1740), or
+    /// because the tenant already held its
+    /// `IngestConfig::max_inflight_flushes_per_tenant` share (ADR-2708 D3). The
     /// tenant's rows stay buffered with their arrival bookkeeping intact and
     /// the next tick re-fires the trigger, so a nonzero figure is deferred
     /// work, never lost work. Sustained growth means flushes are not draining
@@ -729,9 +739,9 @@ pub struct ShardSkewStats {
     ///
     /// Drain triggers ([`FlushTrigger::Manual`]: explicit flush-all, shutdown,
     /// channel close) are never refused and never counted here, and neither
-    /// is a trigger on a buffer over its memory backstop: that one spawns past
-    /// the cap rather than let a buffer grow unbounded, so `flushes_queued`
-    /// can rise while this stays flat.
+    /// is a trigger on a buffer over its memory or object backstop: that one
+    /// spawns past the cap rather than let a buffer grow unbounded, so
+    /// `flushes_queued` can rise while this stays flat.
     pub flush_trigger_deferred: u64,
 }
 
@@ -750,6 +760,9 @@ pub struct IngestMetricsSnapshot {
     /// before any store call (issue #1739). Distinct from
     /// `abandoned_retry_exhausted` (a store failure).
     pub abandoned_queue_deadline: u64,
+    /// Flushes abandoned without a PUT because their permit was granted past
+    /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
+    pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_points_total: u64,
@@ -857,7 +870,8 @@ pub struct IngestMetricsSnapshot {
     /// Sum across shards of `flush_trigger_deferred` from
     /// [`IngestMetrics::shard_skew_by_shard`] at snapshot time: size and age
     /// flush triggers refused because the shard was already at
-    /// `max_queued_flushes` (issue #1740). Cumulative. The per-shard breakdown
+    /// `max_queued_flushes` (issue #1740) or the tenant at its per-tenant
+    /// flush share (ADR-2708 D3). Cumulative. The per-shard breakdown
     /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
     /// directly for that.
     pub flush_trigger_deferred_total: u64,
@@ -1046,6 +1060,13 @@ impl IngestMetrics {
     pub(crate) fn record_abandoned_queue_deadline(&self) {
         self.abandoned_queue_deadline
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned without a PUT because its permit was granted past its
+    /// pinned hour's end plus `max_flush_lifetime` (`WriteError::Abandoned`,
+    /// ADR-2708 D3): a contention signal, retryable.
+    pub(crate) fn record_abandoned_hour_bound(&self) {
+        self.abandoned_hour_bound.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A flush abandoned because the input could not be built into a durable
@@ -1241,6 +1262,7 @@ impl IngestMetrics {
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
+            abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_points_total: self.buffered_points_total.load(Ordering::Relaxed),
@@ -1717,11 +1739,15 @@ mod tests {
         metrics.record_abandoned_retry_exhausted();
         metrics.record_abandoned_input_rejected();
         metrics.record_abandoned_queue_deadline();
+        metrics.record_abandoned_hour_bound();
+        metrics.record_abandoned_hour_bound();
+        metrics.record_abandoned_hour_bound();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.abandoned_retry_exhausted, 2);
         assert_eq!(snap.abandoned_input_rejected, 1);
         assert_eq!(snap.abandoned_queue_deadline, 1);
+        assert_eq!(snap.abandoned_hour_bound, 3);
     }
 
     /// Each hand-back counts on the total and on exactly one per-reason
