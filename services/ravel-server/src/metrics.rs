@@ -46,8 +46,8 @@
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
 //! `MergeMemoryKind`, `DeletedObjectKind` and, in a `sql` build, `DdlKind`
 //! render `kind`, `AlertOutcome` and, in a `sql` build, `DdlOutcome` render
-//! `outcome`, and `ReadGateSite` and `WriteGateSite` both render
-//! `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
+//! `outcome`, and `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
+//! render `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
 //! only constructor.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
@@ -403,6 +403,29 @@ pub enum Label {
     /// is the only constructor and refuses any index at or above the runtime's
     /// worker count, which is fixed when the runtime is built.
     RuntimeWorker(u32),
+    /// Which check site a memory refusal sample counts (ADR-2633 section 4):
+    /// `admission`, `reserve` or `grow`. Shares the `site` key with
+    /// [`Label::ReadGateSite`].
+    MemoryRefusalSite(MemoryRefusalSite),
+}
+
+/// The closed `site` set of `ravel_memory_gate_refusals_total` and
+/// `ravel_memory_budget_refusals_total` (ADR-2633 section 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRefusalSite {
+    Admission,
+    Reserve,
+    Grow,
+}
+
+impl MemoryRefusalSite {
+    fn name(self) -> &'static str {
+        match self {
+            MemoryRefusalSite::Admission => "admission",
+            MemoryRefusalSite::Reserve => "reserve",
+            MemoryRefusalSite::Grow => "grow",
+        }
+    }
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -589,6 +612,7 @@ impl Label {
             Label::ReadGateSite(_) => "site",
             Label::WriteGateSite(_) => "site",
             Label::RuntimeWorker(_) => "worker",
+            Label::MemoryRefusalSite(_) => "site",
         }
     }
 
@@ -633,6 +657,7 @@ impl Label {
             Label::ReadGateSite(site) => ravel_cpu_gate::GateSite::name(*site).to_string(),
             Label::WriteGateSite(site) => ravel_cpu_gate::GateSite::name(*site).to_string(),
             Label::RuntimeWorker(index) => index.to_string(),
+            Label::MemoryRefusalSite(site) => site.name().to_string(),
         }
     }
 
@@ -5732,6 +5757,135 @@ fn render_cache_residency_family(
     }
 }
 
+/// The ADR-2633 memory gate families. The two gauges are the budget's own
+/// gate figures, which only the sampler writes, so both read 0 when the gate
+/// is off. The `admission` and `grow` refusal sites render 0: their checks
+/// are ADR-2633 task 3.
+fn render_memory_gate_family(
+    out: &mut String,
+    mode: Mode,
+    budget: &ravel_memory::MemoryBudget,
+    stats: &crate::memory_gate::MemoryGateStatsSnapshot,
+) {
+    let nanos_to_seconds = |nanos: u64| nanos as f64 / 1_000_000_000.0;
+    let labels = [Label::Mode(mode)];
+    let scalars: [(&str, &str, &str, u64); 4] = [
+        (
+            "ravel_memory_gate_resident_bytes",
+            "jemalloc stats.resident as the memory gate sampler last read it, after the forced purge \
+             when one ran; 0 when the gate is off.",
+            "gauge",
+            budget.gate_resident(),
+        ),
+        (
+            "ravel_memory_gate_high_water_bytes",
+            "The memory gate's high-water mark (--memory-gate-high-water-percent of the memory \
+             budget); 0 when the gate is off.",
+            "gauge",
+            budget.gate_high_water(),
+        ),
+        (
+            "ravel_memory_gate_purges_total",
+            "Forced jemalloc purges the memory gate sampler ran, one per sample at or above the mark.",
+            "counter",
+            stats.purges,
+        ),
+        (
+            "ravel_memory_gate_samples_total",
+            "Memory gate samples that read stats.resident.",
+            "counter",
+            stats.samples,
+        ),
+    ];
+    for (name, help, kind, value) in scalars {
+        write_header(out, name, help, kind);
+        write_sample(out, name, &labels, value);
+    }
+
+    write_header(
+        out,
+        "ravel_memory_gate_epoch_refresh_seconds_total",
+        "Wall time the memory gate sampler spent refreshing the jemalloc stats epoch and reading \
+         stats.resident, the post-purge re-read included; the forced purge is not counted here.",
+        "counter",
+    );
+    write_sample_f64(
+        out,
+        "ravel_memory_gate_epoch_refresh_seconds_total",
+        &labels,
+        nanos_to_seconds(stats.epoch_refresh_nanos),
+    );
+
+    write_header(
+        out,
+        "ravel_memory_gate_purge_seconds",
+        "Wall time of each forced jemalloc purge, on the memory gate sampler thread.",
+        "histogram",
+    );
+    let mut cumulative = 0u64;
+    for (index, count) in stats.purge_buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*count);
+        let le = match crate::memory_gate::PURGE_BUCKET_BOUNDS_MICROS.get(index) {
+            Some(bound) => (*bound as f64 / 1_000_000.0).to_string(),
+            None => "+Inf".to_string(),
+        };
+        write_histogram_bucket(
+            out,
+            "ravel_memory_gate_purge_seconds_bucket",
+            &labels,
+            &le,
+            cumulative,
+        );
+    }
+    write_sample_f64(
+        out,
+        "ravel_memory_gate_purge_seconds_sum",
+        &labels,
+        nanos_to_seconds(stats.purge_nanos),
+    );
+    // The `+Inf` bucket, so `_count` can never exceed the last bucket.
+    write_sample(
+        out,
+        "ravel_memory_gate_purge_seconds_count",
+        &labels,
+        cumulative,
+    );
+
+    let gate_sites: &[(MemoryRefusalSite, u64)] = &[
+        (MemoryRefusalSite::Admission, 0),
+        (MemoryRefusalSite::Reserve, budget.gate_refusals()),
+        (MemoryRefusalSite::Grow, 0),
+    ];
+    let budget_sites: &[(MemoryRefusalSite, u64)] = &[
+        (MemoryRefusalSite::Reserve, budget.accounted_refusals()),
+        (MemoryRefusalSite::Grow, 0),
+    ];
+    let refusals = [
+        (
+            "ravel_memory_gate_refusals_total",
+            "Memory reservations refused because the resident memory gate was closed, by check site.",
+            gate_sites,
+        ),
+        (
+            "ravel_memory_budget_refusals_total",
+            "Memory reservations refused because the process memory budget's ledger was full, by \
+             check site.",
+            budget_sites,
+        ),
+    ];
+    for (name, help, sites) in refusals {
+        write_header(out, name, help, "counter");
+        for (site, value) in sites {
+            write_sample(
+                out,
+                name,
+                &[Label::Mode(mode), Label::MemoryRefusalSite(*site)],
+                *value,
+            );
+        }
+    }
+}
+
 /// This process's own allocator-reported figures (#1170), read live at
 /// scrape time via [`crate::mem_stats::read`]: a whole-process RSS number
 /// cannot say which subsystem grew, so this surfaces the allocator's own
@@ -8186,6 +8340,12 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         render_runtime_family(&mut body, state.mode, &runtime);
     }
     render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
+    render_memory_gate_family(
+        &mut body,
+        state.mode,
+        &state.process_memory_budget,
+        &crate::memory_gate::STATS.snapshot(),
+    );
     render_store_control_plane_family(&mut body, state.mode, &state.store_metrics.control_plane());
     (
         StatusCode::OK,
@@ -8519,6 +8679,7 @@ mod tests {
             Label::ReadGateSite(ravel_cpu_gate::ReadSite::CatalogPart),
             Label::WriteGateSite(ravel_cpu_gate::WriteSite::MetricsFlush),
             Label::RuntimeWorker(0),
+            Label::MemoryRefusalSite(MemoryRefusalSite::Reserve),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -8566,6 +8727,7 @@ mod tests {
                 Label::ReadGateSite(_) => "site",
                 Label::WriteGateSite(_) => "site",
                 Label::RuntimeWorker(_) => "worker",
+                Label::MemoryRefusalSite(_) => "site",
             })
             .collect();
         assert_eq!(
@@ -8625,6 +8787,8 @@ mod tests {
                 // so two variants map to it.
                 "site",
                 "worker",
+                // MemoryRefusalSite (ADR-2633 section 4) reuses the `site` key.
+                "site",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -8637,8 +8801,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            31,
-            "exactly 31 label variants every build has, 21 distinct keys (sql adds DdlKind, \
+            32,
+            "exactly 32 label variants every build has, 21 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
@@ -8748,6 +8912,103 @@ mod tests {
                 "{family} renders one sample per gate"
             );
         }
+    }
+
+    /// The memory gate families carry the budget's gate figures and refusal
+    /// counters and the sampler's stats, and both gauges read 0 on a budget
+    /// whose gate was never set.
+    #[test]
+    fn memory_gate_families_render_the_budget_and_sampler_figures() {
+        let samples = |body: &str| -> Vec<String> {
+            body.lines()
+                .filter(|line| line.starts_with("ravel_memory_"))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let off = ravel_memory::MemoryBudget::new(1_000);
+        let mut body = String::new();
+        render_memory_gate_family(
+            &mut body,
+            Mode::Query,
+            &off,
+            &crate::memory_gate::MemoryGateStatsSnapshot::default(),
+        );
+        assert!(off.gate_open());
+        let off_samples = samples(&body);
+        assert!(
+            off_samples.contains(&"ravel_memory_gate_resident_bytes{mode=\"query\"} 0".to_string()),
+            "{body}"
+        );
+        assert!(
+            off_samples
+                .contains(&"ravel_memory_gate_high_water_bytes{mode=\"query\"} 0".to_string()),
+            "{body}"
+        );
+
+        let budget = ravel_memory::MemoryBudget::new(1_000);
+        assert!(budget.try_reserve(600).is_ok());
+        assert!(budget.try_reserve(600).is_err());
+        budget.set_resident_gate(900, 800);
+        assert!(budget.try_reserve(1).is_err());
+        assert!(budget.try_reserve(1).is_err());
+        let mut purge_buckets = [0; crate::memory_gate::PURGE_BUCKET_COUNT];
+        purge_buckets[0] = 1;
+        purge_buckets[3] = 2;
+        let stats = crate::memory_gate::MemoryGateStatsSnapshot {
+            samples: 5,
+            epoch_refresh_nanos: 1_500_000_000,
+            purges: 3,
+            purge_nanos: 2_000_000,
+            purge_buckets,
+        };
+        let mut body = String::new();
+        render_memory_gate_family(&mut body, Mode::Query, &budget, &stats);
+
+        for (name, kind) in [
+            ("ravel_memory_gate_resident_bytes", "gauge"),
+            ("ravel_memory_gate_high_water_bytes", "gauge"),
+            ("ravel_memory_gate_purges_total", "counter"),
+            ("ravel_memory_gate_samples_total", "counter"),
+            ("ravel_memory_gate_epoch_refresh_seconds_total", "counter"),
+            ("ravel_memory_gate_purge_seconds", "histogram"),
+            ("ravel_memory_gate_refusals_total", "counter"),
+            ("ravel_memory_budget_refusals_total", "counter"),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {name} {kind}\n")).count(),
+                1,
+                "{body}"
+            );
+        }
+        let expected = [
+            "ravel_memory_gate_resident_bytes{mode=\"query\"} 900",
+            "ravel_memory_gate_high_water_bytes{mode=\"query\"} 800",
+            "ravel_memory_gate_purges_total{mode=\"query\"} 3",
+            "ravel_memory_gate_samples_total{mode=\"query\"} 5",
+            "ravel_memory_gate_epoch_refresh_seconds_total{mode=\"query\"} 1.5",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.0001\"} 1",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.00025\"} 1",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.0005\"} 1",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.001\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.0025\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.005\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.01\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.025\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.05\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.1\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.25\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"1\"} 3",
+            "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"+Inf\"} 3",
+            "ravel_memory_gate_purge_seconds_sum{mode=\"query\"} 0.002",
+            "ravel_memory_gate_purge_seconds_count{mode=\"query\"} 3",
+            "ravel_memory_gate_refusals_total{mode=\"query\",site=\"admission\"} 0",
+            "ravel_memory_gate_refusals_total{mode=\"query\",site=\"reserve\"} 2",
+            "ravel_memory_gate_refusals_total{mode=\"query\",site=\"grow\"} 0",
+            "ravel_memory_budget_refusals_total{mode=\"query\",site=\"reserve\"} 1",
+            "ravel_memory_budget_refusals_total{mode=\"query\",site=\"grow\"} 0",
+        ];
+        assert_eq!(samples(&body), expected, "{body}");
     }
 
     /// `ravel_health_heartbeat_age_seconds` reads the heartbeat's injected
