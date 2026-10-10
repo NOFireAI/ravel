@@ -321,9 +321,11 @@ caps are stated and asserted per phase:
   very different latency. With `parallelism < L` the leaves resolve in
   `ceil(L / parallelism)` waves and cold routing costs
   `1 + ceil(L / parallelism)` sequential round trips, which breaks the
-  two-round-trip bound stated below. **This ADR requires `parallelism >= L`** for every
-  declared root, so the two-round-trip bound stays literally true rather than
-  becoming a formula. Root validation rejects a root declaring `L > parallelism`,
+  two-round-trip bound stated below. **This ADR requires `parallelism >= L`** (see the part-bound point root amendment below for the one exception) for every
+  declared root of a layout-constant shape, so the two-round-trip bound stays
+  literally true rather than becoming a formula; a part-bound point root
+  instead requires `parallelism >= 2 x P_window` and states the bound beyond
+  `P_window` as a wave count. Root validation rejects a root declaring `L > parallelism`,
   and the shape lint covers that case explicitly — it is a rejected input with a
   test, not a possibility to be assumed away;
 - every cap has a **finite maximum fixed in root validation**, and a root
@@ -760,6 +762,7 @@ Supersedes in part: ADR-0049 (the global-inverted-index rejection only)
 ## Amendment (2026-10-10, ADR-2707): a part-bound point root
 
 <!-- amendment-applies: sections="2. Routing must never be per-object" pointer="part-bound point root amendment" -->
+<!-- amendment-supersedes: phrase="This ADR requires `parallelism >= L`" pointer="part-bound point root amendment" -->
 
 ADR-2707 adds a point index whose leaf is bound to one snapshot part (the
 `.kidx` leaf, one per (part, field, key slice)), so a lookup probes two

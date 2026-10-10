@@ -472,8 +472,9 @@ flowchart LR
 - **Candidates.** `candidates = leaf matches over covered entries + every
   uncovered segment`, where uncovered means: an entry the leaf lists as
   uncovered, a part with no leaf for the field, a leaf that failed
-  validation, every segment above the watermark (the unsealed tail), and
-  every token-resolved segment (ADR-0849 section 3). No false negatives.
+  validation, every part the per-query ceiling left unprobed, every
+  segment above the watermark (the unsealed tail), and every
+  token-resolved segment (ADR-0849 section 3). No false negatives.
 - **Tier 1.** A candidate with no block set (an uncovered segment) is
   probed in the object: the footer, the KEY_IDX directory, one bucket. A
   present key names the blocks; an absent key drops the object without a
@@ -481,7 +482,8 @@ flowchart LR
   addressed and sized from the footer's section entry (decision 1): the
   first is `[0, prefix_len)` of the section, the header and every
   directory, about 1 KB per field at 8 bits; the second is one bucket,
-  2 to 8 KB at the Stage 0 entry counts. A tail object in RLOG pays those
+  1 to 8 KB at the Stage 0 entry counts (1.2 to 2.4 KB for spans, 2 to
+  8 KB for logs). A tail object in RLOG pays those
   two on top of the tail probe it already pays; in RSPAN the fetcher's
   suffix covers the footer, BLOOM and SKIP_IDX (a reader choice, as RLOG's
   probe length is) and stops there, since KEY_IDX sits below SKIP_IDX and
@@ -821,7 +823,7 @@ cache state) and stamped into the report.
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
-| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports the largest unindexed part's entries, its attempt count (at least `ceil(entries / max(batch_entries, largest part's entries))`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and one HEAD CAS; no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object data GET, or any figure missing from the report |
+| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports the largest unindexed part's entries, its attempt count (at least `ceil(entries / max(batch_entries, largest part's entries))`, at most the unindexed part count) and per attempt one GET per batch part, the batch's leaf PUTs and its HEAD CAS tries (one, plus one HEAD re-read and CAS per lost CAS, at most `MAX_HEAD_CAS_ATTEMPTS`; an attempt is one batch's publish including its retries, so retries never add attempts); no LIST, no part or `.csnap` PUT, no whole-object data GET; every figure on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, an attempt count outside that range, any LIST, part PUT, `.csnap` PUT or whole-object data GET, or any figure missing from the report |
 | HEAD bytes added by field 8 | at most 256 B per (covering part, declared field, key slice), where the ceiling bounds the (part, field)'s declared decompressed body (the sum of its frames' `uncompressed_len`, the quantity `DEFAULT_MAX_COLUMN_STATS_BYTES` = 256 MiB caps for `.cstat` too), so slices per (part, field) = `ceil(decompressed body bytes / 256 MiB)` over the (part, field)'s entries before slicing: one for a Stage 0-sized spans part (about 20 M entries at about 12 B each with one block per trace per object, about 240 MB, under the ceiling), and decision 4's 13-bit sizing of that part as one body agrees; at most 256 KiB over 1,024 one-field, one-slice parts at the band, about 200 KiB at the predicted 200 B per ref, read in the one HEAD GET the resolve already issues; HEAD bytes and leaf-ref count on the resolve report | over 512 B per (part, field, slice), more than one HEAD GET per resolve, or either figure missing |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |

@@ -872,8 +872,9 @@ slice of the pair) and `part_blake3` (32, the one covered part).
                                                    delta-coded from -1)
 ```
 
-Entries are sorted ascending by `(key8, entry_ordinal)` and unique. Buckets
-are selected by the same mix the section uses
+Within a bucket, entries are sorted ascending by `(key8, entry_ordinal)`
+and unique, so a probe is a binary search. Buckets are selected by the same
+mix the section uses
 (`(u64::from_be_bytes(key8).wrapping_mul(0x9E3779B97F4A7C15)) >> (64 -
 bucket_bits)`), over the key slice. A block set is the block bitmap
 ADR-0849 section 1b requires, in the encoding that is small for the sets
@@ -933,8 +934,9 @@ part, issued concurrently across parts, under a per-query ceiling of 2,048
 leaf GETs; parts beyond the ceiling are scanned, not probed. Candidates are
 the matches over covered entries plus every uncovered segment: the entries a
 leaf lists as uncovered, every part without a leaf for the field, every leaf
-that failed validation, every segment above the watermark (the unsealed
-tail, listed) and every token-resolved segment. Spans lookups also drop
+that failed validation, every part the per-query ceiling left unprobed,
+every segment above the watermark (the unsealed tail, listed) and every
+token-resolved segment. Spans lookups also drop
 every entry and tail object outside the shard `shard_for_span` selects for
 that hour's generation (ADR-0052). These probes are their own cost phase
 (`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
@@ -979,7 +981,9 @@ report); a header `tenant_hash` or `signal` that disagrees with the
 request, which is the hard `FieldMismatch` above rather than an uncovered
 part; an `uncovered_entry_ordinals` list whose length differs from the
 ref's `uncovered_count`, or, for a whole-object reader, slices of one
-(part, field) whose lists differ; an entry ordinal at or past
+(part, field) whose lists differ; a header `part_entry_count` that differs
+from the covered part ref's `entry_count` in the HEAD the lookup resolved
+(so coverage is never narrower than the part); an entry ordinal at or past
 the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `key8` that does not mix to the bucket it sits in; unsorted or duplicate
 `(key8, entry ordinal)` pairs; a block delta list that is empty or that
@@ -1049,8 +1053,10 @@ new HEAD still names (a leaf is keyed by `part_blake3`) and drops the
 rest, whose leaves this sweep deletes. The report carries the largest
 unindexed part's entries, parts rebuilt, leaves written, section bytes
 read, ranged GETs issued (footer suffix and section together), the attempt
-count, and per attempt the part GETs, leaf PUTs and HEAD CAS. A run that
-stops or exhausts the CAS retries on one batch has
+count, and per attempt the part GETs, leaf PUTs and HEAD CAS tries (an
+attempt is one batch's publish including its retries, at most
+`MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt). A
+run that stops or exhausts the CAS retries on one batch has
 therefore published every earlier batch, loses at most `2 x` the entries
 in that batch, and leaves that batch's leaves unreferenced for this sweep;
 the rerun skips every part whose ref an earlier batch published. A
