@@ -1910,7 +1910,10 @@ use datafusion::arrow::array::StringArray;
 use datafusion::physical_plan::ExecutionPlan;
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
-use ravel_sql::{AlertsTableProvider, AuditTableProvider, LogsTableProvider};
+use ravel_sql::{
+    AlertsTableProvider, AuditTableProvider, CeilingBreach, LogsTableProvider, SessionTable,
+    SpillDecision, TenantDelegatingPool, TenantMemoryAccountant, build_session,
+};
 use ravel_types::logstream::log_stream_id;
 
 /// A generic RLOG record on the stream identified by `resource`, carrying
@@ -2384,18 +2387,29 @@ async fn distributed_logs_order_by_ts_limit_skips_nothing() {
     let sql = "SELECT ts, body FROM logs ORDER BY ts LIMIT 2";
     let want = vec![(1, "b1".to_string()), (2, "b2".to_string())];
 
-    let local_ctx = SessionContext::new();
-    local_ctx
-        .register_table(
-            "logs",
-            Arc::new(LogsTableProvider::new(
-                snapshot.clone(),
-                TENANT,
-                fetcher.clone(),
-                PhaseAccounting::new(),
-            )),
-        )
-        .expect("register local logs");
+    // The local side runs in the production session, whose
+    // `ConfirmTopKThreshold` rule the skip needs, on one partition so the
+    // early segment is read first and the late one is skipped every time.
+    let mut config = SqlConfig::default();
+    config.engine.fetch_concurrency = 1;
+    let local_ctx = build_session(
+        &config,
+        Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            TenantMemoryAccountant::new(1 << 30),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        )),
+        SessionTable::Logs(Arc::new(LogsTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            PhaseAccounting::new(),
+        ))),
+        false,
+        SpillDecision::Disabled,
+    )
+    .expect("local session builds");
     let local_plan = local_ctx
         .sql(sql)
         .await
