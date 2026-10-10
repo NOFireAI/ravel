@@ -9,8 +9,9 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use ravel_ingest::{
-    AdmissionController, IngestExemplar, IngestPoint, IngestRouter, MetadataSink, RequestRejection,
-    WriteError, WriteMode, plausible_ingest_clock,
+    AdmissionController, IngestByteBudget, IngestByteCharge, IngestByteShed, IngestExemplar,
+    IngestPoint, IngestRouter, MetadataSink, RequestRejection, WriteError, WriteMode,
+    plausible_ingest_clock,
 };
 use ravel_otlp::normalize::normalize_metrics_with_metadata;
 use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
@@ -45,6 +46,11 @@ pub struct IngestState {
     /// this one `Arc`, so the counter does not move when a fleet switches
     /// transport.
     pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
+    /// The process-wide ingest byte budget (ADR-0069), the same `Arc` the
+    /// router charges. `handle_export` charges a request's projected
+    /// resolved-label bytes to it for the duration of normalization (ADR-2708
+    /// D2).
+    pub budget: Arc<IngestByteBudget>,
 }
 
 pub struct IngestOutcome {
@@ -120,6 +126,26 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 /// on a request whose reasons genuinely are all distinct.
 const MAX_PREGROUPED_VARIANTS: usize = 16;
 
+/// Charges the resolved-label bytes normalization is projected to build
+/// (ADR-2708 D2) to the ingest byte budget, before it builds them. A
+/// projection over `max_projected` charges nothing: the normalizer rejects
+/// that request whole before allocating a label, so there is nothing to hold
+/// budget for, and the sender gets the partial-success rejection rather than
+/// a 429 it would retry. The caller holds the guard across normalization and
+/// drops it before the router takes its own charge, so the two never coexist.
+pub(crate) fn charge_projected_labels(
+    budget: &Arc<IngestByteBudget>,
+    projected: usize,
+    max_projected: usize,
+) -> Result<IngestByteCharge, IngestByteShed> {
+    let bytes = if projected > max_projected {
+        0
+    } else {
+        u64::try_from(projected).unwrap_or(u64::MAX)
+    };
+    budget.try_charge(bytes)
+}
+
 pub async fn handle_export(
     state: &IngestState,
     tenant: TenantId,
@@ -170,6 +196,12 @@ pub async fn handle_export(
     // tenant x lifetime series cardinality (the same growth vector
     // `shard.rs`'s per-flush cap comment already rejected building one layer
     // lower).
+    let label_charge = charge_projected_labels(
+        &state.budget,
+        ravel_otlp::project_resolved_label_bytes(&request, &state.limits),
+        state.limits.max_resolved_label_bytes_per_request,
+    )
+    .map_err(|IngestByteShed| IngestRequestError::Write(WriteError::BufferBudgetExceeded))?;
     let mut cap = ExemplarCap::new(state.limits.exemplar_cap_window_ns);
     let (result, metadata) =
         normalize_metrics_with_metadata(&tenant, request, &state.limits, ingest_ts_ns, &mut cap);
@@ -247,6 +279,9 @@ pub async fn handle_export(
         rejected_count += series_cap_rejected;
     }
 
+    // Released before the router charges the normalized batch (ADR-2708 D2):
+    // the projection and the batch estimate describe the same labels.
+    drop(label_charge);
     let tenant_hash = tenant.hash();
     let receipt = state
         .router
@@ -447,6 +482,7 @@ mod tests {
             provisioning: None,
             metadata_sink: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            budget: IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
         }
     }
 
@@ -478,6 +514,7 @@ mod tests {
             provisioning: None,
             metadata_sink: Some(sink.clone()),
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            budget: IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
         };
         (state, store, sink)
     }
@@ -1399,6 +1436,7 @@ mod tests {
             provisioning: None,
             metadata_sink: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            budget: IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
         };
 
         let tenant = TenantId::new("acme");
@@ -1483,5 +1521,236 @@ mod tests {
             row.requests_rejected_clock_total, 1,
             "the reason=\"clock\" rejected counter incremented exactly once"
         );
+    }
+
+    /// A state whose router charges `router_budget` and whose label projection
+    /// charges `label_budget`, which may be the same `Arc`.
+    fn state_with_budgets(
+        router_budget: Arc<IngestByteBudget>,
+        label_budget: Arc<IngestByteBudget>,
+    ) -> IngestState {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = Arc::new(
+            IngestRouter::new(
+                IngestConfig::default(),
+                store,
+                Signal::Metrics,
+                Arc::new(SystemClock),
+            )
+            .with_budget(router_budget),
+        );
+        IngestState {
+            budget: label_budget,
+            router,
+            ..state()
+        }
+    }
+
+    /// Four gauge points, each with its own attribute value, so the label memo
+    /// shares nothing and the projection is several hundred bytes.
+    fn labelled_gauge_request() -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "temperature".to_string(),
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: (0..4)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: BASE_TS_NS as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    attributes: vec![KeyValue {
+                                        key: "room".to_string(),
+                                        value: Some(AnyValue {
+                                            value: Some(AnyValueVariant::StringValue(format!(
+                                                "room-{i}"
+                                            ))),
+                                        }),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// ADR-2708 D2: a budget one byte short of the projected label bytes sheds
+    /// the request as `BufferBudgetExceeded` (the transport's 429), and the
+    /// stale points normalization would have rejected as skew move no counter.
+    /// That the shed happens before normalization allocates is pinned by
+    /// `tests/label_charge_allocations.rs`; no counter here can tell.
+    #[tokio::test]
+    async fn a_budget_short_of_the_label_projection_sheds_the_request() {
+        use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+
+        let too_old = BASE_TS_NS - IngestLimits::default().max_ingest_lag_ns - 1;
+        let mut request = labelled_gauge_request();
+        if let Some(MetricData::Gauge(gauge)) =
+            &mut request.resource_metrics[0].scope_metrics[0].metrics[0].data
+        {
+            for point in &mut gauge.data_points {
+                point.time_unix_nano = too_old as u64;
+            }
+        }
+        let projected =
+            ravel_otlp::project_resolved_label_bytes(&request, &IngestLimits::default());
+        assert!(projected > 0, "the fixture projects some label bytes");
+        let budget = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Bounded(
+            projected as u64 - 1,
+        ));
+        let state = state_with_budgets(
+            IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
+            budget.clone(),
+        );
+
+        let err = match handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            request.clone(),
+            BASE_TS_NS,
+        )
+        .await
+        {
+            Ok(_) => panic!("a projection over the budget must shed"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                IngestRequestError::Write(WriteError::BufferBudgetExceeded)
+            ),
+            "expected the buffer-budget shed, got: {err:?}"
+        );
+        assert_eq!(budget.shed_total(), 1);
+        assert_eq!(budget.in_flight_bytes(), 0);
+        assert_eq!(
+            metrics_normalize_totals(&state),
+            (0, 0),
+            "normalization must not run for a shed request"
+        );
+
+        // The same request under a budget that fits reaches normalization.
+        let state = state_with_budgets(
+            IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
+            IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Bounded(
+                projected as u64,
+            )),
+        );
+        handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            request,
+            BASE_TS_NS,
+        )
+        .await
+        .expect("a projection that fits is admitted");
+        assert_eq!(metrics_normalize_totals(&state), (4, 0));
+    }
+
+    /// The projection charge is released before the router charges the
+    /// normalized batch, so on one shared budget the peak is the larger of
+    /// the two charges, never their sum.
+    #[tokio::test]
+    async fn label_charge_is_released_before_the_router_charge() {
+        // Separate budgets measure each charge alone.
+        let label_only = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited);
+        let router_only = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited);
+        let state = state_with_budgets(router_only.clone(), label_only.clone());
+        handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            labelled_gauge_request(),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("the gauge write succeeds");
+        let label_bytes = label_only.peak_bytes();
+        let router_bytes = router_only.peak_bytes();
+        assert_eq!(
+            label_bytes as usize,
+            ravel_otlp::project_resolved_label_bytes(
+                &labelled_gauge_request(),
+                &IngestLimits::default()
+            ),
+            "the label charge is exactly the projection"
+        );
+        assert!(router_bytes > 0, "the router charged the batch");
+        assert_eq!(
+            label_only.in_flight_bytes(),
+            0,
+            "the label charge is refunded"
+        );
+
+        let shared = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited);
+        let state = state_with_budgets(shared.clone(), shared.clone());
+        handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            labelled_gauge_request(),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("the gauge write succeeds");
+        assert_eq!(
+            shared.peak_bytes(),
+            label_bytes.max(router_bytes),
+            "the two charges must not coexist (label {label_bytes}, router {router_bytes})"
+        );
+    }
+
+    /// A request over `max_resolved_label_bytes_per_request` charges nothing:
+    /// the normalizer rejects it whole before building a label, so it is
+    /// reported through partial success rather than shed.
+    #[tokio::test]
+    async fn over_bound_request_is_rejected_not_shed() {
+        let budget = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Bounded(1));
+        let mut state = state_with_budgets(
+            IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
+            budget.clone(),
+        );
+        state.limits.max_resolved_label_bytes_per_request = 10;
+
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            labelled_gauge_request(),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("an over-bound request is a partial success, not an error");
+        let partial = outcome
+            .response
+            .partial_success
+            .expect("the whole request was rejected");
+        assert_eq!(partial.rejected_data_points, 4);
+        assert_eq!(budget.shed_total(), 0);
+        assert_eq!(budget.peak_bytes(), 0);
+        let row = state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.signal == Signal::Metrics)
+            .expect("a metrics row");
+        assert_eq!(row.resolved_label_bytes_total, 4);
     }
 }

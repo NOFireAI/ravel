@@ -79,7 +79,22 @@ pub struct IngestLimits {
     /// client multiply object size at will. Default 10 seconds, matching
     /// [`ravel_types::ExemplarCap::DEFAULT_WINDOW_NS`].
     pub exemplar_cap_window_ns: i64,
+    /// Upper bound on the resolved-label bytes normalization would build for
+    /// one request (ADR-2708 D2), projected by
+    /// [`crate::project_resolved_label_bytes`] before any label set is
+    /// allocated. A request whose projection exceeds it is rejected whole.
+    /// Default 256 MiB, about 12x the projection of a 10,000-point batch.
+    pub max_resolved_label_bytes_per_request: usize,
+    /// Quantiles on a single `Summary` data point. Like
+    /// [`IngestLimits::max_histogram_buckets`], a summary explodes into one
+    /// series per quantile plus `_sum`/`_count`, each carrying a copy of the
+    /// base label set, so the quantile list needs its own cap. Default 64.
+    pub max_summary_quantiles: usize,
 }
+
+/// Default for [`IngestLimits::max_resolved_label_bytes_per_request`] and its
+/// log and span equivalents: 256 MiB.
+pub const DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST: usize = 256 * 1024 * 1024;
 
 const SECOND_NANOS: i64 = 1_000_000_000;
 const MINUTE_NANOS: i64 = 60 * SECOND_NANOS;
@@ -99,6 +114,8 @@ impl Default for IngestLimits {
             max_ingest_lag_ns: 2 * HOUR_NANOS,
             resource_attribute_allowlist: default_resource_attribute_allowlist(),
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
+            max_resolved_label_bytes_per_request: DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
+            max_summary_quantiles: 64,
         }
     }
 }
@@ -140,6 +157,19 @@ pub enum Rejection {
         exploded: usize,
         count: usize,
         max: usize,
+    },
+
+    /// The resolved-label bytes normalization would build for the request
+    /// (ADR-2708 D2), projected before any label set is allocated, exceed
+    /// `max_resolved_label_bytes_per_request`. `count` is the request's wire
+    /// data-point count, all of which are rejected.
+    #[error(
+        "request projects to {projected} resolved-label bytes, more than the per-request limit of {max}; rejecting {count} data points"
+    )]
+    ResolvedLabelBytesExceeded {
+        projected: usize,
+        max: usize,
+        count: usize,
     },
 
     #[error(
@@ -253,6 +283,9 @@ pub enum Rejection {
     #[error("summary has two quantile_values entries with the same quantile")]
     DuplicateQuantile,
 
+    #[error("summary has {quantiles} quantile values, more than the per-point limit of {max}")]
+    TooManySummaryQuantiles { quantiles: usize, max: usize },
+
     /// Informational, not an admission failure: the data point was admitted
     /// and its exploded series stored, but its `min`/`max` fields have no
     /// Prometheus-convention representation (ADR-0016) and were dropped.
@@ -330,6 +363,10 @@ pub enum Rejection {
 ///   could not be placed in the admission window around ingest time.
 /// * [`AdmissionClass::Structural`] is everything else the layer refuses:
 ///   a shape, a type, a limit, or a value the storage format cannot represent.
+/// * [`AdmissionClass::ResolvedLabelBytes`] is the whole-request bound on
+///   projected resolved-label bytes (ADR-2708 D2). It is a limit like the
+///   structural ones, but counted under its own `reason` so an operator can
+///   tell a request refused for label volume from one refused for shape.
 ///
 /// A rejection that costs the sender nothing (an informational drop of a
 /// histogram `min`/`max`, an exemplar, or a single attribute of an otherwise
@@ -339,6 +376,7 @@ pub enum Rejection {
 pub enum AdmissionClass {
     Skew,
     Structural,
+    ResolvedLabelBytes,
 }
 
 /// Rejected points, records, or spans totalled per [`AdmissionClass`] over one
@@ -352,19 +390,21 @@ pub enum AdmissionClass {
 pub struct NormalizeRejectCounts {
     pub skew: usize,
     pub structural: usize,
+    pub resolved_label_bytes: usize,
 }
 
 impl NormalizeRejectCounts {
     /// Whether anything at all was rejected, so a caller can skip taking a
     /// counter lock on the (overwhelmingly common) clean request.
     pub fn is_empty(&self) -> bool {
-        self.skew == 0 && self.structural == 0
+        self.skew == 0 && self.structural == 0 && self.resolved_label_bytes == 0
     }
 
     pub fn add(&mut self, class: Option<AdmissionClass>, count: usize) {
         match class {
             Some(AdmissionClass::Skew) => self.skew += count,
             Some(AdmissionClass::Structural) => self.structural += count,
+            Some(AdmissionClass::ResolvedLabelBytes) => self.resolved_label_bytes += count,
             None => {}
         }
     }
@@ -461,7 +501,12 @@ impl Rejection {
             | Rejection::NativeHistogramCountInconsistent
             | Rejection::NativeHistogramCountOverflow
             | Rejection::NonFiniteQuantile
-            | Rejection::DuplicateQuantile => Some(AdmissionClass::Structural),
+            | Rejection::DuplicateQuantile
+            | Rejection::TooManySummaryQuantiles { .. } => Some(AdmissionClass::Structural),
+
+            Rejection::ResolvedLabelBytesExceeded { .. } => {
+                Some(AdmissionClass::ResolvedLabelBytes)
+            }
 
             // Informational: the point was admitted and stored.
             Rejection::HistogramMinMaxDropped { .. }
@@ -489,6 +534,7 @@ impl Rejection {
         match self {
             Rejection::TooManyDataPoints { count, .. }
             | Rejection::TooManyExplodedPoints { count, .. }
+            | Rejection::ResolvedLabelBytesExceeded { count, .. }
             | Rejection::TooManyResourceAttributes { count, .. }
             | Rejection::MetricNameTooLong { count, .. }
             | Rejection::EmptyMetricName { count }
@@ -534,6 +580,30 @@ mod tests {
             ]
         );
         assert_eq!(limits.exemplar_cap_window_ns, 10_000_000_000);
+        assert_eq!(limits.max_resolved_label_bytes_per_request, 268_435_456);
+        assert_eq!(limits.max_summary_quantiles, 64);
+    }
+
+    #[test]
+    fn resolved_label_bytes_rejection_counts_every_point_of_the_request() {
+        let r = Rejection::ResolvedLabelBytesExceeded {
+            projected: 300,
+            max: 200,
+            count: 17,
+        };
+        assert_eq!(r.rejected_count(), 17);
+        assert_eq!(
+            r.admission_class(),
+            Some(AdmissionClass::ResolvedLabelBytes)
+        );
+        assert_eq!(
+            Rejection::TooManySummaryQuantiles {
+                quantiles: 65,
+                max: 64
+            }
+            .rejected_count(),
+            1
+        );
     }
 
     #[test]
@@ -614,6 +684,11 @@ mod tests {
                 Rejection::NativeHistogramCountOverflow => structural,
                 Rejection::NonFiniteQuantile => structural,
                 Rejection::DuplicateQuantile => structural,
+                Rejection::TooManySummaryQuantiles { .. } => structural,
+
+                Rejection::ResolvedLabelBytesExceeded { .. } => {
+                    Some(AdmissionClass::ResolvedLabelBytes)
+                }
 
                 // Informational: the point was admitted and stored, so it
                 // costs the sender nothing and must move no counter.
@@ -693,6 +768,15 @@ mod tests {
             Rejection::NativeHistogramCountOverflow,
             Rejection::NonFiniteQuantile,
             Rejection::DuplicateQuantile,
+            Rejection::TooManySummaryQuantiles {
+                quantiles: 65,
+                max: 64,
+            },
+            Rejection::ResolvedLabelBytesExceeded {
+                projected: 2,
+                max: 1,
+                count: 1,
+            },
             Rejection::HistogramMinMaxDropped { count: 1 },
             Rejection::HistogramExemplarsDropped { count: 1 },
             Rejection::IntegerValuePrecisionLoss { value: i64::MAX },
@@ -705,7 +789,7 @@ mod tests {
 
         // One entry per variant, each a distinct one, so no variant is
         // covered twice while another is missing.
-        assert_eq!(variants.len(), 33);
+        assert_eq!(variants.len(), 35);
         for (i, a) in variants.iter().enumerate() {
             for b in &variants[i + 1..] {
                 assert_ne!(
@@ -761,6 +845,18 @@ mod tests {
         counts.add(None, 100);
         assert_eq!(counts.skew, 3);
         assert_eq!(counts.structural, 5);
+        assert_eq!(counts.resolved_label_bytes, 0);
         assert!(!counts.is_empty());
+
+        counts.add(Some(AdmissionClass::ResolvedLabelBytes), 7);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 5);
+        assert_eq!(counts.resolved_label_bytes, 7);
+
+        let only_bytes = NormalizeRejectCounts {
+            resolved_label_bytes: 1,
+            ..NormalizeRejectCounts::default()
+        };
+        assert!(!only_bytes.is_empty());
     }
 }

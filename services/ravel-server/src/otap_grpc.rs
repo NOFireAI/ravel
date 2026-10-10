@@ -511,6 +511,9 @@ mod tests {
             normalize_metrics: Arc::new(
                 crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
             ),
+            budget: ravel_ingest::IngestByteBudget::shared(
+                ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            ),
         }
     }
 

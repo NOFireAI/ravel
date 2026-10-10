@@ -312,6 +312,12 @@ parquet = { version = "59", default-features = false, features = ["arrow"] }
 # erasure tests in src/maintain.rs can store a `stream_attrs` blob the writer
 # refuses (`RlogWriter::with_unchecked_stream_attrs`, issue #2580).
 ravel-logseg = { workspace = true, features = ["test-support"] }
+# Test-only: tests/label_charge_allocations.rs proves a request shed on its
+# projected label bytes allocates nothing near those bytes (ADR-2708 D2). The
+# workspace forbids `unsafe_code`, so allocation counting goes through the
+# dependency that owns the `unsafe impl GlobalAlloc`, at the version ravel-otlp
+# and ravel-sql already use.
+stats_alloc = "0.1.10"
 
 [lints]
 workspace = true

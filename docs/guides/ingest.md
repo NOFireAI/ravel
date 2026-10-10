@@ -436,6 +436,8 @@ Defaults. No `ravel-server` flag configures them:
 | `max_data_points_per_request` | 100,000 |
 | `max_attributes_per_point` | 64 |
 | `max_histogram_buckets` | 160 |
+| `max_summary_quantiles` | 64 |
+| `max_resolved_label_bytes_per_request` | 256 MiB |
 | `max_label_name_len` | 256 bytes |
 | `max_label_value_len` | 4,096 bytes |
 | `max_metric_name_len` | 512 bytes |
@@ -462,7 +464,16 @@ labels of the point. The default is an order of magnitude above the widest
 bound list that a real exporter emits. The `DefBuckets` of the Prometheus Go
 client is 11 bounds, and the default explicit boundaries of the
 OpenTelemetry SDK are 15. Exponential (native) histograms are not exploded
-and are not subject to the cap.
+and are not subject to the cap. `max_summary_quantiles` is the same bound on
+the quantiles of one `Summary` data point.
+
+`max_resolved_label_bytes_per_request` bounds the label bytes that
+normalization would build for the whole request, counting every bucket's and
+quantile's copy of the point's labels. A request over it is rejected whole
+with a partial success, and a request under it is charged against the ingest
+buffer byte budget until it is written; see
+[Resolved-label bytes](admission-limits.md#resolved-label-bytes). The same
+bound, with the same default, applies to logs and spans.
 
 ## Event-time skew bounds
 
@@ -552,6 +563,7 @@ Defaults. No `ravel-server` flag configures them:
 | `max_body_len` | 65,536 bytes |
 | `max_resource_attributes` | 128 |
 | `max_scope_attributes` | 64 |
+| `max_resolved_label_bytes_per_request` | 256 MiB; each record counts its own copy of its resource and scope attributes |
 | Attribute nesting | 15 kvlists around a value; an array level costs half a kvlist level, so 31 arrays fit |
 | Entries in one array or kvlist | 1,048,576 |
 

@@ -111,6 +111,22 @@ pub fn normalize_logs(
         };
     }
 
+    // Every record copies its stream attributes, so attribute bytes grow
+    // with records times stream width, which no per-record limit bounds
+    // (ADR-2708 D2). Read-only, before any record is built.
+    let projected = crate::label_projection::project_log_resolved_label_bytes(&req, limits);
+    if projected > limits.max_resolved_label_bytes_per_request {
+        return LogNormalizeOutput {
+            records: Vec::new(),
+            rejected: vec![LogRejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: limits.max_resolved_label_bytes_per_request,
+                count: total_records,
+            }],
+            body_conversions: 0,
+        };
+    }
+
     let mut records = Vec::new();
     let mut rejected = Vec::new();
     let mut body_conversions = 0;
@@ -3094,5 +3110,153 @@ mod tests {
             vec![scope_logs("lib", "1", vec![rec])],
         )]));
         assert_eq!(out.records[0].severity_num, 0);
+    }
+
+    // --- resolved-label byte bound (ADR-2708 D2) ---
+
+    /// `n` attribute-free records under one resource carrying a single
+    /// `width`-byte attribute, so every byte of the projection past the
+    /// once-per-resource copies comes from the per-record stream copy.
+    fn wide_stream_request(n: usize, width: usize) -> ExportLogsServiceRequest {
+        request(vec![resource_logs(
+            vec![string_kv("svc", &"x".repeat(width))],
+            vec![scope_logs(
+                "lib",
+                "1",
+                (0..n)
+                    .map(|i| {
+                        record(
+                            Some(any(AnyValueVariant::StringValue("m".into()))),
+                            vec![],
+                            1_000 + i as u64,
+                        )
+                    })
+                    .collect(),
+            )],
+        )])
+    }
+
+    #[test]
+    fn log_records_rejected_by_label_bytes() {
+        const N: usize = 50;
+        // The converted `svc=<1000 bytes>` is 1067. The encoded stream
+        // preimage is 1015 (count 1, key 1+3, value 1+2+1000, scope name
+        // 1+3, version 1+1, empty scope set 1), built once per scope and
+        // copied once per record.
+        let req = wide_stream_request(N, 1_000);
+        let projected = crate::project_log_resolved_label_bytes(&req, &LogIngestLimits::default());
+        assert_eq!(projected, 1_067 + 1_015 * (N + 1));
+
+        let limits = LogIngestLimits {
+            max_resolved_label_bytes_per_request: 10_000,
+            ..LogIngestLimits::default()
+        };
+        let out = normalize_logs(req, &limits, 5_000);
+        assert!(out.records.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: 10_000,
+                count: N,
+            }]
+        );
+        let counts = crate::NormalizeRejectCounts::from_log_rejections(&out.rejected);
+        assert_eq!(counts.resolved_label_bytes, N);
+        assert_eq!(counts.structural, 0);
+
+        // Under the default bound every record is admitted.
+        let out = normalize(wide_stream_request(N, 1_000));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), N);
+        assert!(out.records.iter().all(|r| r.stream_attrs.len() == 1_015));
+    }
+
+    fn attr_value_heap_bytes(value: &AttrValue) -> usize {
+        match value {
+            AttrValue::Str(s) => s.len(),
+            AttrValue::Bytes(b) => b.len(),
+            AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 0,
+            AttrValue::List(items) => items
+                .iter()
+                .map(|v| std::mem::size_of::<AttrValue>() + attr_value_heap_bytes(v))
+                .sum(),
+            AttrValue::Map(entries) => entries
+                .iter()
+                .map(|(k, v)| {
+                    std::mem::size_of::<(String, AttrValue)>() + k.len() + attr_value_heap_bytes(v)
+                })
+                .sum(),
+        }
+    }
+
+    #[test]
+    fn projection_is_not_below_the_built_bytes() {
+        let nested = AnyValueVariant::KvlistValue(KeyValueList {
+            values: vec![
+                string_kv("a", "1"),
+                kv(
+                    "b",
+                    AnyValueVariant::ArrayValue(ArrayValue {
+                        values: vec![
+                            any(AnyValueVariant::StringValue("xy".into())),
+                            any(AnyValueVariant::IntValue(7)),
+                        ],
+                    }),
+                ),
+            ],
+        });
+        let records = |base: u64| {
+            (0..5)
+                .map(|i| {
+                    record(
+                        Some(any(AnyValueVariant::StringValue("body".into()))),
+                        vec![
+                            string_kv("http.route", &format!("/r/{i}")),
+                            kv("code", AnyValueVariant::IntValue(200)),
+                            kv("ok", AnyValueVariant::BoolValue(true)),
+                            kv("raw", AnyValueVariant::BytesValue(vec![1, 2, 3])),
+                            kv("nested", nested.clone()),
+                        ],
+                        base + i,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut scoped = scope_logs("lib", "1.0", records(1_000));
+        if let Some(scope) = scoped.scope.as_mut() {
+            scope.attributes = vec![string_kv("scope.attr", "s"), kv("n", nested.clone())];
+        }
+        let req = request(vec![
+            resource_logs(
+                vec![
+                    string_kv("service.name", "api"),
+                    kv("replicas", AnyValueVariant::IntValue(3)),
+                ],
+                vec![scoped, scope_logs("", "", records(2_000))],
+            ),
+            resource_logs(vec![], vec![scope_logs("other", "", records(3_000))]),
+        ]);
+        let limits = LogIngestLimits::default();
+        let projected = crate::project_log_resolved_label_bytes(&req, &limits);
+        let out = normalize_logs(req, &limits, 5_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), 15);
+        let built: usize = out
+            .records
+            .iter()
+            .map(|r| {
+                r.stream_attrs.len()
+                    + r.attrs
+                        .iter()
+                        .map(|(k, v)| {
+                            std::mem::size_of::<(String, AttrValue)>()
+                                + k.len()
+                                + attr_value_heap_bytes(v)
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        assert!(projected >= built, "projected {projected} < built {built}");
     }
 }

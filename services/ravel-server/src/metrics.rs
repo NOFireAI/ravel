@@ -158,15 +158,16 @@ impl Level {
 /// 6, extended by the 2026-08-13 amendment). ADR-0051 named a closed set of
 /// six reasons `{body_size, byte_rate, series_rate, series_cap, skew,
 /// structural}`; the amendment adds a seventh, `clock`, for the receiver-clock
-/// floor. Six of the seven are here. Four come from
+/// floor, and ADR-2708 D2 an eighth, `resolved_label_bytes`. Seven of the
+/// eight are here. Four come from
 /// `AdmissionController::usage_snapshot` (`ravel_ingest::TenantUsage`), which
 /// covers the byte-rate and active-cap layers plus the receiver-clock floor.
-/// The other two, `skew` and `structural`, come from
+/// The other three, `skew`, `structural` and `resolved_label_bytes`, come from
 /// [`crate::normalize_reject_metrics::NormalizeRejectMetrics`]: the
 /// normalization layer keeps no row in that snapshot, so the ingest surfaces
 /// count its decisions where they observe them.
 ///
-/// The seventh, `body_size`, is enforced at the transport and still keeps no
+/// The eighth, `body_size`, is enforced at the transport and still keeps no
 /// per-tenant counter, so a variant for it would render samples no data source
 /// can fill. It joins this enum when its counter does, additively, the same
 /// way a new `Signal` variant joins `signal_name`.
@@ -189,19 +190,25 @@ pub enum RejectReason {
     /// name or attribute over its limit, a malformed identifier, an
     /// inconsistent histogram. Counted per rejected datum, like `skew`.
     Structural,
+    /// A point, record, or span whose request was rejected whole because its
+    /// projected resolved-label bytes exceeded
+    /// `max_resolved_label_bytes_per_request` (ADR-2708 D2). Counted per
+    /// rejected datum, like `skew`.
+    ResolvedLabelBytes,
 }
 
 impl RejectReason {
-    /// Every reason with a counter, so the rejected family renders all six
+    /// Every reason with a counter, so the rejected family renders all seven
     /// series per (tenant, signal) even when some are zero (the same
     /// zero-is-not-absence discipline the other families keep).
-    const ALL: [RejectReason; 6] = [
+    const ALL: [RejectReason; 7] = [
         RejectReason::ByteRate,
         RejectReason::SeriesRate,
         RejectReason::SeriesCap,
         RejectReason::Clock,
         RejectReason::Skew,
         RejectReason::Structural,
+        RejectReason::ResolvedLabelBytes,
     ];
 
     fn name(self) -> &'static str {
@@ -212,6 +219,7 @@ impl RejectReason {
             RejectReason::Clock => "clock",
             RejectReason::Skew => "skew",
             RejectReason::Structural => "structural",
+            RejectReason::ResolvedLabelBytes => "resolved_label_bytes",
         }
     }
 }
@@ -5897,6 +5905,7 @@ struct AdmissionAcc {
     rejected_clock: u64,
     rejected_skew: u64,
     rejected_structural: u64,
+    rejected_resolved_label_bytes: u64,
     body_conversions: u64,
     resource_attrs_dropped: u64,
     reconciliation_failures: u64,
@@ -5911,6 +5920,7 @@ impl AdmissionAcc {
             RejectReason::Clock => self.rejected_clock,
             RejectReason::Skew => self.rejected_skew,
             RejectReason::Structural => self.rejected_structural,
+            RejectReason::ResolvedLabelBytes => self.rejected_resolved_label_bytes,
         }
     }
 }
@@ -5972,6 +5982,9 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         let acc = rows.entry(key).or_default();
         acc.rejected_skew = acc.rejected_skew.saturating_add(row.skew_total);
         acc.rejected_structural = acc.rejected_structural.saturating_add(row.structural_total);
+        acc.rejected_resolved_label_bytes = acc
+            .rejected_resolved_label_bytes
+            .saturating_add(row.resolved_label_bytes_total);
         acc.body_conversions = acc
             .body_conversions
             .saturating_add(row.body_conversions_total);
@@ -6098,10 +6111,10 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         out,
         "ravel_admission_rejected_total",
         "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap, \
-         clock, skew, structural). byte_rate and clock count whole requests; series_rate and \
-         series_cap count series; skew and structural count individual data points, log records, \
-         or spans rejected in normalization, matching what the sender is told through OTLP \
-         partial success.",
+         clock, skew, structural, resolved_label_bytes). byte_rate and clock count whole \
+         requests; series_rate and series_cap count series; skew, structural and \
+         resolved_label_bytes count individual data points, log records, or spans rejected in \
+         normalization, matching what the sender is told through OTLP partial success.",
         "counter",
     );
     for ((hash, signal), acc) in &ordered {
@@ -14572,6 +14585,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                     signal: Signal::Logs,
                     skew_total: 2,
                     structural_total: 3,
+                    resolved_label_bytes_total: 6,
                     body_conversions_total: 4,
                     resource_attrs_dropped_total: 0,
                 },
@@ -14580,6 +14594,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                     signal: Signal::Metrics,
                     skew_total: 0,
                     structural_total: 0,
+                    resolved_label_bytes_total: 0,
                     body_conversions_total: 0,
                     resource_attrs_dropped_total: 5,
                 },
@@ -14633,6 +14648,20 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                  signal=\"logs\",reason=\"structural\"}} 3"
             )),
             "structural rejections must render under reason=structural:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\",reason=\"resolved_label_bytes\"}} 6"
+            )),
+            "label-byte rejections must render under reason=resolved_label_bytes:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"metrics\",reason=\"resolved_label_bytes\"}} 0"
+            )),
+            "a zero reason still renders:\n{body}"
         );
         assert!(
             body.contains(&format!(
@@ -15712,6 +15741,9 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            budget: ravel_ingest::IngestByteBudget::shared(
+                ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            ),
         };
 
         for i in 0..WRITES {

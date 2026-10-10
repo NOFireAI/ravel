@@ -1780,6 +1780,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
             metadata_sink: metadata_sink.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
+            budget: ingest_buffer_budget.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -1793,6 +1794,7 @@ fn gateway_state(
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
+            budget: ingest_buffer_budget.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
@@ -1806,6 +1808,7 @@ fn gateway_state(
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
+            budget: ingest_buffer_budget.clone(),
         },
         admission: admission.clone(),
         budget: ingest_buffer_budget.clone(),

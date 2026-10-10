@@ -2311,6 +2311,7 @@ mod tests {
                 ravel_otlp::NormalizeRejectCounts {
                     skew: 0,
                     structural: 1,
+                    resolved_label_bytes: 0,
                 },
                 "{dp:?}"
             );
@@ -2509,6 +2510,7 @@ mod tests {
             ravel_otlp::NormalizeRejectCounts {
                 skew: 0,
                 structural: 1,
+                resolved_label_bytes: 0,
             }
         );
 
