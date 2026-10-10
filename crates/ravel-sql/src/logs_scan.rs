@@ -1472,6 +1472,10 @@ struct BlockMetrics {
     /// post-decode filter: a query that touches two of a hundred attributes
     /// leaves this large and `pages_decoded` small.
     pages_skipped: Count,
+    /// Integer column value buffers this partition's block decodes built, one
+    /// per integer column decoded from its own value page per block
+    /// ([`ScanStats::int_values_buffers`], ADR-2773 decision 1).
+    int_values_buffers: Count,
     /// Output batches this partition built through the columnar fast path
     /// (ADR-0099 decisions 2-3), straight from a [`ColumnarBlockView`] with no
     /// `LogRecord` and no `merged_attrs`. The output of the two paths is
@@ -1605,6 +1609,8 @@ impl BlockMetrics {
                 .counter("blocks_pruned_by_postings", partition),
             pages_decoded: MetricBuilder::new(metrics).counter("pages_decoded", partition),
             pages_skipped: MetricBuilder::new(metrics).counter("pages_skipped", partition),
+            int_values_buffers: MetricBuilder::new(metrics)
+                .counter("int_values_buffers", partition),
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
             rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
             plan_full_reads: MetricBuilder::new(metrics).counter("plan_full_reads", partition),
@@ -1688,6 +1694,8 @@ impl BlockMetrics {
         self.scanned.add(stats.blocks_scanned as usize);
         self.pages_decoded.add(stats.pages_decoded as usize);
         self.pages_skipped.add(stats.pages_skipped as usize);
+        self.int_values_buffers
+            .add(stats.int_values_buffers as usize);
     }
 }
 
