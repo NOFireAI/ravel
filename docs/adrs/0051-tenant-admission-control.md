@@ -337,7 +337,8 @@ extension seam the renderer's module docs define:
 Cardinality is bounded by construction: (configured tenants + `other`) ×
 3 signals × 6 reasons, all through the compile-time-closed `Label` enum
 (the fail-closed ingest-timestamp plausibility amendment below adds a
-seventh, `clock`).
+seventh, `clock`, and the resolved-label bytes amendment below an eighth,
+`resolved_label_bytes`).
 ADR-0044 blocked per-tenant series on an auth decision for the
 unauthenticated `/metrics` route; the decision here is an explicit
 opt-in flag, `--metrics-tenant-labels` (default off, everything folds to
@@ -848,3 +849,16 @@ budget the request's write also draws on, and "one LIST plus one PUT" becomes up
 `dedup_window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1` GETs plus one
 PUT. Recorded as an appended amendment, with an inline pointer added to
 section 5.
+
+## Amendment (2026-10-10, #2710): the resolved-label bytes reason
+
+<!-- amendment-applies: sections="6. Per-tenant usage export" pointer="resolved-label bytes amendment" -->
+
+ADR-2708 D2 bounds each OTLP request by the resolved-label bytes its
+normalizer would build, and rejects a request over
+`max_resolved_label_bytes_per_request` whole. Section 6's closed `reason` set
+gains an eighth value for that rejection, `reason="resolved_label_bytes"` on
+`ravel_admission_rejected_total`, counted per rejected point, record or span
+like `skew` and `structural`, so it matches the count the sender receives in
+the OTLP partial success. Cardinality stays bounded by construction: (configured
+tenants + `other`) x 3 signals x 8 reasons. The rest of section 6 is unchanged.

@@ -76,6 +76,7 @@ use ravel_types::{
     TypeError,
 };
 
+use crate::label_projection::exact_capacity;
 use crate::limits::{IngestLimits, Rejection};
 use crate::metadata::{MetricKind, MetricMetadata};
 use crate::promcompat::format_float;
@@ -299,6 +300,22 @@ fn normalize_impl(
         );
     }
 
+    // Third bound, on the label bytes the points would carry (ADR-2708 D2):
+    // neither count above sees attribute width, so a request under both can
+    // still build an unbounded label volume. Read-only, before any label set
+    // exists.
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    if projected > limits.max_resolved_label_bytes_per_request {
+        return whole_request_rejection(
+            &req,
+            Rejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: limits.max_resolved_label_bytes_per_request,
+                count: total_points,
+            },
+        );
+    }
+
     let mut points = Vec::new();
     let mut histogram_points = Vec::new();
     let mut rejected = Vec::new();
@@ -480,6 +497,8 @@ fn normalize_resource(
 
     let resource_labels = match build_resource_labels(resource, limits) {
         Ok((labels, dropped)) => {
+            #[cfg(test)]
+            label_capacity_stats::record_prefix(&labels, labels.capacity());
             if dropped > 0 {
                 rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
             }
@@ -898,6 +917,56 @@ pub mod memo_stats {
     }
 }
 
+/// Element capacity of every label `Vec` handed to `LabelSet::new`, keyed by
+/// its buffer address, so a test can charge a kept set what its `Vec`
+/// actually allocated rather than its length. Thread-local, test-only.
+#[cfg(test)]
+pub(crate) mod label_capacity_stats {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    use ravel_types::{Label, LabelSet};
+
+    thread_local! {
+        static CAPACITIES: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+        static PREFIX_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Add what one resource's label prefix allocated: its `Vec`'s element
+    /// capacity times the size of a `Label`, plus every name and value.
+    pub(super) fn record_prefix(labels: &[Label], capacity: usize) {
+        let bytes = capacity * std::mem::size_of::<Label>()
+            + labels
+                .iter()
+                .map(|l| l.name.capacity() + l.value.capacity())
+                .sum::<usize>();
+        PREFIX_BYTES.with(|p| p.set(p.get() + bytes));
+    }
+
+    /// Bytes every resource label prefix built since the last [`reset`]
+    /// allocated.
+    pub(crate) fn prefix_bytes() -> usize {
+        PREFIX_BYTES.with(Cell::get)
+    }
+
+    pub(super) fn record(labels: &[Label], capacity: usize) {
+        let addr = labels.as_ptr() as usize;
+        CAPACITIES.with(|c| c.borrow_mut().insert(addr, capacity));
+    }
+
+    pub(crate) fn reset() {
+        CAPACITIES.with(|c| c.borrow_mut().clear());
+        PREFIX_BYTES.with(|p| p.set(0));
+    }
+
+    /// Capacity recorded for the `Vec` now held by `set`, found by the
+    /// address of its first element (`LabelSet::new` sorts in place).
+    pub(crate) fn capacity_of(set: &LabelSet) -> Option<usize> {
+        let addr = set.iter().next()? as *const Label as usize;
+        CAPACITIES.with(|c| c.borrow().get(&addr).copied())
+    }
+}
+
 /// Whether an OTLP `as_int` value survives conversion to the `f64` the
 /// segment format stores. `f64` carries a 53-bit mantissa, so every integer
 /// with magnitude up to 2^53 is exact and some larger even integers are too.
@@ -1079,11 +1148,13 @@ fn build_point(
         |attributes| {
             let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
             labels.extend_from_slice(ctx.resource_labels);
-            labels.push(Label {
-                name: METRIC_NAME_LABEL.to_string(),
-                value: ctx.metric_name.to_string(),
-            });
+            labels.push(kept_label(
+                METRIC_NAME_LABEL.to_string(),
+                ctx.metric_name.to_string(),
+            ));
             push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            #[cfg(test)]
+            label_capacity_stats::record(&labels, labels.capacity());
             LabelSet::new(labels).map_err(|err| match err {
                 TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
                 // LabelSet::new only ever returns DuplicateLabelName; this arm
@@ -1151,11 +1222,13 @@ fn build_native_histogram_point(
         |attributes| {
             let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
             labels.extend_from_slice(ctx.resource_labels);
-            labels.push(Label {
-                name: METRIC_NAME_LABEL.to_string(),
-                value: ctx.metric_name.to_string(),
-            });
+            labels.push(kept_label(
+                METRIC_NAME_LABEL.to_string(),
+                ctx.metric_name.to_string(),
+            ));
             push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            #[cfg(test)]
+            label_capacity_stats::record(&labels, labels.capacity());
             LabelSet::new(labels).map_err(|err| match err {
                 TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
                 _ => Rejection::DuplicateLabelName(String::new()),
@@ -1398,14 +1471,16 @@ fn finish_point(
 ) -> Result<NormalizedPoint, Rejection> {
     let mut labels = Vec::with_capacity(base_labels.len() + 2);
     labels.extend_from_slice(base_labels);
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: metric_name.to_string(),
-    });
+    labels.push(kept_label(
+        METRIC_NAME_LABEL.to_string(),
+        metric_name.to_string(),
+    ));
     if let Some((name, value)) = extra_label {
         push_checked(&mut labels, name.to_string(), value, ctx.limits)?;
     }
 
+    #[cfg(test)]
+    label_capacity_stats::record(&labels, labels.capacity());
     let label_set = LabelSet::new(labels).map_err(|err| match err {
         TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
         _ => Rejection::DuplicateLabelName(String::new()),
@@ -1598,6 +1673,14 @@ fn explode_summary(
             return Err(Rejection::DuplicateQuantile);
         }
     }
+    // Precedes `build_explode_base_labels` for the reason the histogram
+    // bucket cap does: every quantile below copies the base label set.
+    if dp.quantile_values.len() > ctx.limits.max_summary_quantiles {
+        return Err(Rejection::TooManySummaryQuantiles {
+            quantiles: dp.quantile_values.len(),
+            max: ctx.limits.max_summary_quantiles,
+        });
+    }
 
     let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
     let stale = has_no_recorded_value(dp.flags);
@@ -1730,6 +1813,9 @@ fn build_resource_labels(
         })
         .count();
 
+    // Kept for every point under the resource and charged once by the
+    // projection at the per-label rate, which a grown `Vec` could exceed.
+    labels.shrink_to_fit();
     Ok((labels, dropped))
 }
 
@@ -1765,8 +1851,18 @@ fn push_checked(
             max: limits.max_label_value_len,
         });
     }
-    labels.push(Label { name, value });
+    labels.push(kept_label(name, value));
     Ok(())
+}
+
+/// Every label a kept set holds is built here, so its name and value carry no
+/// spare capacity and the projection's per-label charge
+/// ([`crate::label_projection::label_bytes`]) bounds what it allocates.
+fn kept_label(name: String, value: String) -> Label {
+    Label {
+        name: exact_capacity(name),
+        value: exact_capacity(value),
+    }
 }
 
 fn find_attr_value(attrs: &[KeyValue], key: &str) -> Result<Option<String>, Rejection> {
@@ -1971,7 +2067,7 @@ pub fn metadata_unit_word(unit: &str, kind: MetricKind) -> String {
 /// non-monotonic `Sum` and a `Gauge` are both `Gauge`, `Histogram` and
 /// `ExponentialHistogram` are `Histogram`, and `Summary` is `Summary`. `None`
 /// data carries no points and is handled before this is called.
-fn metric_kind_of(data: &MetricData) -> (MetricKind, bool) {
+pub(crate) fn metric_kind_of(data: &MetricData) -> (MetricKind, bool) {
     match data {
         MetricData::Gauge(_) => (MetricKind::Gauge, false),
         MetricData::Sum(s) if s.is_monotonic => (MetricKind::Counter, true),
@@ -5881,5 +5977,739 @@ mod tests {
             let unmemoised = normalize_metrics(&tenant, split, &limits, MEMO_TS);
             proptest::prop_assert_eq!(memoised, unmemoised);
         }
+    }
+
+    // --- resolved-label byte bound (ADR-2708 D2) ---
+
+    fn limits_with_label_bytes(max: usize) -> IngestLimits {
+        IngestLimits {
+            max_resolved_label_bytes_per_request: max,
+            ..IngestLimits::default()
+        }
+    }
+
+    /// `g{k=<v>}` gauge points, each value `width` bytes, alternating between
+    /// two attribute values when `alternate` is set.
+    fn wide_gauge_request(
+        points: usize,
+        width: usize,
+        alternate: bool,
+    ) -> ExportMetricsServiceRequest {
+        let a = "a".repeat(width);
+        let b = "b".repeat(width);
+        request(vec![resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "g",
+                (0..points)
+                    .map(|i| {
+                        let v = if alternate && i % 2 == 1 { &b } else { &a };
+                        number_point(
+                            vec![string_kv("k", v)],
+                            1_000 + i as i64,
+                            NumberValue::AsDouble(i as f64),
+                        )
+                    })
+                    .collect(),
+            )],
+        )])
+    }
+
+    /// Bytes every distinct label set the output holds actually allocated:
+    /// its `Vec`'s element capacity, as recorded when the set was built, times
+    /// the size of a `Label`, plus the heap capacity of every name and value;
+    /// plus what each resource's label prefix allocated, which the projection
+    /// charges once per resource. Reset [`label_capacity_stats`] before the
+    /// normalize call.
+    fn built_label_bytes(out: &NormalizeOutput) -> usize {
+        let mut seen = HashSet::new();
+        let sets = out
+            .points
+            .iter()
+            .map(|p| &p.labels)
+            .chain(out.histogram_points.iter().map(|p| &p.labels));
+        let mut total = 0;
+        for set in sets {
+            if seen.insert(Arc::as_ptr(set)) {
+                let capacity = label_capacity_stats::capacity_of(set)
+                    .expect("every kept label set was recorded when built");
+                assert!(capacity >= set.len());
+                total += capacity * std::mem::size_of::<Label>()
+                    + set
+                        .iter()
+                        .map(|l| l.name.capacity() + l.value.capacity())
+                        .sum::<usize>();
+            }
+        }
+        total + label_capacity_stats::prefix_bytes()
+    }
+
+    #[test]
+    fn alternating_attribute_gauge_rejected_before_allocation() {
+        const P: usize = 100;
+        let req = wide_gauge_request(P, 1_000, true);
+        // `__name__="g"` is 73 bytes, `k=<1000 bytes>` 1065, per point.
+        let projected = crate::project_resolved_label_bytes(&req, &IngestLimits::default());
+        assert_eq!(projected, P * (73 + 1_065));
+
+        memo_stats::reset();
+        let out = normalize_metrics(&tenant(), req, &limits_with_label_bytes(10_000), 1_000_000);
+        let (hits, misses) = memo_stats::snapshot();
+        assert_eq!((hits, misses), (0, 0), "no label set may be built");
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: 10_000,
+                count: P,
+            }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), P);
+
+        // The same request under the default bound is admitted in full.
+        let out = normalize_metrics(
+            &tenant(),
+            wide_gauge_request(P, 1_000, true),
+            &IngestLimits::default(),
+            1_000_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), P);
+    }
+
+    #[test]
+    fn identical_attribute_run_counts_once() {
+        let limits = IngestLimits::default();
+        // One `{__name__="g", k="a"}` set: 73 + 66 bytes, whatever the run
+        // length, because the memo builds it once and shares it.
+        for n in [1, 2, 100] {
+            let req = wide_gauge_request(n, 1, false);
+            assert_eq!(
+                crate::project_resolved_label_bytes(&req, &limits),
+                139,
+                "{n}"
+            );
+        }
+        // Two alternating values never share a set: every point counts.
+        assert_eq!(
+            crate::project_resolved_label_bytes(&wide_gauge_request(2, 1, true), &limits),
+            278
+        );
+        assert_eq!(
+            crate::project_resolved_label_bytes(&wide_gauge_request(100, 1, true), &limits),
+            100 * 139
+        );
+
+        // A bound equal to the projection admits the run; one byte less
+        // rejects it.
+        let out = normalize_metrics(
+            &tenant(),
+            wide_gauge_request(100, 1, false),
+            &limits_with_label_bytes(139),
+            1_000_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 100);
+        let out = normalize_metrics(
+            &tenant(),
+            wide_gauge_request(100, 1, false),
+            &limits_with_label_bytes(138),
+            1_000_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected.len(), 1);
+        assert_eq!(out.rejected[0].rejected_count(), 100);
+    }
+
+    #[test]
+    fn histogram_explosion_rejected_by_label_bytes() {
+        let limits = IngestLimits::default();
+        // Exact pin: `h{k="v"}` with bounds [1, 2.5] explodes into five
+        // series of 146 bytes each (prefix 0, `k="v"` 66, `__name__` 73 plus
+        // the 7-byte suffix allowance), plus `le` labels of 67, 69 and 70,
+        // plus 128 for the slot `_count` and `_sum` each reserve and leave
+        // empty.
+        let small = request(vec![resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "h",
+                vec![histogram_point(
+                    vec![string_kv("k", "v")],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![1.0, 2.5],
+                    vec![1, 1, 1],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        )]);
+        assert_eq!(crate::project_resolved_label_bytes(&small, &limits), 1_064);
+
+        // One point at the bucket cap with one 4000-byte attribute: 163
+        // series copy that attribute, about 670 KB, so a 100 KB bound refuses
+        // a request a per-point view would read as 4 KB of labels.
+        let mut dp = wide_histogram_point(limits.max_histogram_buckets);
+        dp.attributes = vec![string_kv("k", &"x".repeat(4_000))];
+        let req = request(vec![resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "h",
+                vec![dp],
+                AggregationTemporality::Cumulative,
+            )],
+        )]);
+        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        assert!(projected >= 163 * 4_065, "{projected}");
+
+        let bounded = limits_with_label_bytes(100_000);
+        memo_stats::reset();
+        let out = normalize_metrics(&tenant(), req.clone(), &bounded, 1_000_000);
+        assert_eq!(memo_stats::snapshot(), (0, 0));
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: 100_000,
+                count: 1,
+            }]
+        );
+
+        // Under the default bound it explodes as before.
+        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), limits.max_histogram_buckets + 3);
+    }
+
+    #[test]
+    fn summary_over_quantile_cap_rejects_point() {
+        let limits = IngestLimits::default();
+        let summary_with = |quantiles: usize| {
+            request(vec![resource_metrics(
+                vec![],
+                vec![summary_metric(
+                    "s",
+                    vec![summary_point(
+                        vec![string_kv("k", "v")],
+                        1_000,
+                        10,
+                        5.0,
+                        (0..quantiles)
+                            .map(|i| value_at_quantile(i as f64 / 1_000.0, 1.0))
+                            .collect(),
+                    )],
+                )],
+            )])
+        };
+
+        let over = limits.max_summary_quantiles + 1;
+        memo_stats::reset();
+        let out = normalize_metrics(&tenant(), summary_with(over), &limits, 1_000_000);
+        assert_eq!(memo_stats::snapshot(), (0, 0));
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::TooManySummaryQuantiles {
+                quantiles: over,
+                max: limits.max_summary_quantiles,
+            }]
+        );
+
+        let at = limits.max_summary_quantiles;
+        let out = normalize_metrics(&tenant(), summary_with(at), &limits, 1_000_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), at + 2);
+    }
+
+    #[test]
+    fn projection_is_not_below_the_built_bytes() {
+        let limits = IngestLimits::default();
+        // Empty-valued attributes the normalizer drops after sizing the set,
+        // names it must sanitise, and a mix of scalar kinds.
+        let gauge_attrs = |i: i64| {
+            vec![
+                string_kv("http.route", &format!("route-{}", i / 3)),
+                string_kv("empty.a", ""),
+                int_kv("code", 200 + i),
+                string_kv("empty_b", ""),
+                bool_kv("ok", i % 2 == 0),
+                string_kv("naïve.key", "v"),
+            ]
+        };
+        // Runs of three equal sets, then a change.
+        let gauge_points = (0..12)
+            .map(|i| {
+                number_point(
+                    gauge_attrs(i / 3 * 3),
+                    1_000 + i,
+                    NumberValue::AsDouble(i as f64),
+                )
+            })
+            .collect();
+        // Alternating sets, so no two consecutive points share one.
+        let sum_points = (0..6)
+            .map(|i| {
+                number_point(
+                    vec![
+                        string_kv("method", if i % 2 == 0 { "GET" } else { "POST" }),
+                        string_kv("blank", ""),
+                    ],
+                    1_000 + i,
+                    NumberValue::AsInt(i),
+                )
+            })
+            .collect();
+        let histogram_points = (0..3)
+            .map(|i| {
+                histogram_point(
+                    vec![
+                        string_kv("route", &format!("/r/{i}")),
+                        string_kv("blank", ""),
+                    ],
+                    1_000,
+                    4,
+                    Some(2.0),
+                    vec![0.1, 0.25, 1.0],
+                    vec![1, 1, 1, 1],
+                )
+            })
+            .collect();
+        // No resource labels and no attributes: the exploded `_count` and
+        // `_sum` series carry `__name__` alone in a two-slot `Vec`.
+        let bare_histogram_points = vec![histogram_point(
+            vec![string_kv("blank", "")],
+            1_000,
+            1,
+            Some(1.0),
+            vec![],
+            vec![1],
+        )];
+        let summary_points = (0..2)
+            .map(|i| {
+                summary_point(
+                    vec![
+                        string_kv("route", &format!("/s/{i}")),
+                        string_kv("blank", ""),
+                    ],
+                    1_000,
+                    10,
+                    5.0,
+                    vec![value_at_quantile(0.5, 1.0), value_at_quantile(0.99, 2.0)],
+                )
+            })
+            .collect();
+        let bare_summary_points = vec![summary_point(
+            vec![],
+            1_000,
+            10,
+            5.0,
+            vec![value_at_quantile(0.5, 1.0)],
+        )];
+        // The ticket's shape: one varying attribute among many empty ones,
+        // alternating so every point builds its own set.
+        let sparse_points = (0..4)
+            .map(|i| {
+                let mut attributes: Vec<KeyValue> =
+                    (0..8).map(|e| string_kv(&format!("e{e}"), "")).collect();
+                attributes.push(string_kv("k", if i % 2 == 0 { "a" } else { "b" }));
+                number_point(attributes, 1_000 + i, NumberValue::AsDouble(i as f64))
+            })
+            .collect();
+        let exp_points = (0..4)
+            .map(|i| ExponentialHistogramDataPoint {
+                attributes: vec![
+                    string_kv("pod", &format!("p{}", i / 2)),
+                    string_kv("e1", ""),
+                    string_kv("e2", ""),
+                    string_kv("e3", ""),
+                ],
+                time_unix_nano: 1_000,
+                ..Default::default()
+            })
+            .collect();
+        let resources = vec![
+            (
+                vec![
+                    string_kv("service.name", "checkout"),
+                    string_kv("service.namespace", "shop"),
+                    string_kv("service.instance.id", "i-1"),
+                ],
+                vec![
+                    gauge_metric("temperature", gauge_points),
+                    sum_metric(
+                        "requests",
+                        sum_points,
+                        AggregationTemporality::Cumulative,
+                        true,
+                    ),
+                    histogram_metric(
+                        "latency",
+                        histogram_points,
+                        AggregationTemporality::Cumulative,
+                    ),
+                ],
+            ),
+            (
+                vec![string_kv("service.name", "billing")],
+                vec![
+                    summary_metric("rpc", summary_points),
+                    exponential_histogram_metric(
+                        "size",
+                        exp_points,
+                        AggregationTemporality::Cumulative,
+                    ),
+                ],
+            ),
+            (
+                vec![],
+                vec![
+                    gauge_metric("sparse", sparse_points),
+                    histogram_metric(
+                        "bare",
+                        bare_histogram_points,
+                        AggregationTemporality::Cumulative,
+                    ),
+                    summary_metric("bare_s", bare_summary_points),
+                ],
+            ),
+        ];
+
+        // Each metric alone, so slack elsewhere in the request cannot hide an
+        // undercount on one path, then the whole request.
+        for (resource, metrics) in &resources {
+            for metric in metrics {
+                let req = request(vec![resource_metrics(
+                    resource.clone(),
+                    vec![metric.clone()],
+                )]);
+                let projected = crate::project_resolved_label_bytes(&req, &limits);
+                label_capacity_stats::reset();
+                let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+                assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+                let built = built_label_bytes(&out);
+                assert!(
+                    projected >= built,
+                    "{}: projected {projected} < built {built}",
+                    metric.name
+                );
+            }
+        }
+
+        let req = request(
+            resources
+                .into_iter()
+                .map(|(resource, metrics)| resource_metrics(resource, metrics))
+                .collect(),
+        );
+        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        label_capacity_stats::reset();
+        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 12 + 6 + 3 * 6 + 3 + 2 * 4 + 3 + 4);
+        assert_eq!(out.histogram_points.len(), 4);
+        let built = built_label_bytes(&out);
+        assert!(built > 0);
+        assert!(projected >= built, "projected {projected} < built {built}");
+    }
+
+    #[test]
+    fn projection_covers_a_bare_explosion() {
+        // No resource labels and no attributes: every exploded series is
+        // `__name__` plus at most one `le`/`quantile` label, so the per-label
+        // slack in the projection cannot absorb the unused slot that the
+        // `_count` and `_sum` series reserve.
+        let limits = IngestLimits::default();
+        let req = request(vec![resource_metrics(
+            vec![],
+            vec![
+                histogram_metric(
+                    "h",
+                    vec![histogram_point(
+                        vec![],
+                        1_000,
+                        1,
+                        Some(1.0),
+                        vec![],
+                        vec![1],
+                    )],
+                    AggregationTemporality::Cumulative,
+                ),
+                summary_metric("s", vec![summary_point(vec![], 1_000, 1, 1.0, vec![])]),
+            ],
+        )]);
+        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        label_capacity_stats::reset();
+        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 3 + 2);
+        let built = built_label_bytes(&out);
+        assert!(projected >= built, "projected {projected} < built {built}");
+    }
+
+    /// One metric of every path built over the same attributes: gauge, sum,
+    /// exponential histogram, and the classic histogram and summary explodes
+    /// with their `le`, `quantile`, `_count` and `_sum` series.
+    fn every_metric_path(
+        attributes: &[KeyValue],
+        bounds: &[f64],
+        quantiles: &[f64],
+    ) -> Vec<Metric> {
+        let attrs = || attributes.to_vec();
+        vec![
+            gauge_metric(
+                "g",
+                vec![number_point(attrs(), 1_000, NumberValue::AsDouble(1.0))],
+            ),
+            sum_metric(
+                "s",
+                vec![number_point(attrs(), 1_000, NumberValue::AsInt(1))],
+                AggregationTemporality::Cumulative,
+                true,
+            ),
+            exponential_histogram_metric(
+                "e",
+                vec![ExponentialHistogramDataPoint {
+                    attributes: attrs(),
+                    time_unix_nano: 1_000,
+                    ..Default::default()
+                }],
+                AggregationTemporality::Cumulative,
+            ),
+            histogram_metric(
+                "h",
+                vec![histogram_point(
+                    attrs(),
+                    1_000,
+                    bounds.len() as u64 + 1,
+                    Some(1.0),
+                    bounds.to_vec(),
+                    vec![1; bounds.len() + 1],
+                )],
+                AggregationTemporality::Cumulative,
+            ),
+            summary_metric(
+                "q",
+                vec![summary_point(
+                    attrs(),
+                    1_000,
+                    1,
+                    1.0,
+                    quantiles
+                        .iter()
+                        .map(|q| value_at_quantile(*q, 1.0))
+                        .collect(),
+                )],
+            ),
+        ]
+    }
+
+    /// Normalize each metric of [`every_metric_path`] alone under `resource`
+    /// and check that every kept label's name and value sit at exact capacity
+    /// and that the projection is at least what was allocated, resource
+    /// prefix included. Returns the number of kept points.
+    fn check_label_capacity(
+        limits: &IngestLimits,
+        resource: &[KeyValue],
+        attributes: &[KeyValue],
+        bounds: &[f64],
+        quantiles: &[f64],
+    ) -> Result<usize, proptest::test_runner::TestCaseError> {
+        let mut kept = 0;
+        for metric in every_metric_path(attributes, bounds, quantiles) {
+            let name = metric.name.clone();
+            let req = request(vec![resource_metrics(resource.to_vec(), vec![metric])]);
+            let projected = crate::project_resolved_label_bytes(&req, limits);
+            label_capacity_stats::reset();
+            let out = normalize_metrics(&tenant(), req, limits, 1_000_000);
+            let sets = out
+                .points
+                .iter()
+                .map(|p| &p.labels)
+                .chain(out.histogram_points.iter().map(|p| &p.labels));
+            for set in sets {
+                for label in set.iter() {
+                    proptest::prop_assert_eq!(
+                        label.name.capacity(),
+                        label.name.len(),
+                        "{}: {:?}",
+                        name,
+                        label
+                    );
+                    proptest::prop_assert_eq!(
+                        label.value.capacity(),
+                        label.value.len(),
+                        "{}: {:?}",
+                        name,
+                        label
+                    );
+                }
+            }
+            let built = built_label_bytes(&out);
+            proptest::prop_assert!(
+                projected >= built,
+                "{}: projected {} < built {}",
+                name,
+                projected,
+                built
+            );
+            kept += out.points.len() + out.histogram_points.len();
+        }
+        Ok(kept)
+    }
+
+    fn capacity_resource() -> impl proptest::strategy::Strategy<Value = Vec<KeyValue>> {
+        use crate::label_projection::capacity_cases;
+        use proptest::prelude::*;
+        let keys = [
+            "service.name",
+            "service.namespace",
+            "service.instance.id",
+            "k8s.pod.name",
+        ];
+        prop_oneof![
+            Just(Vec::new()),
+            prop::collection::vec((0..keys.len(), capacity_cases::value()), 0..=4).prop_map(
+                move |pairs| {
+                    let mut seen = HashSet::new();
+                    pairs
+                        .into_iter()
+                        .filter(|(i, _)| seen.insert(*i))
+                        .map(|(i, v)| capacity_cases::kv(keys[i], v))
+                        .collect()
+                }
+            ),
+        ]
+    }
+
+    /// Bucket bounds as the explode admits them: finite and increasing.
+    fn capacity_bounds() -> impl proptest::strategy::Strategy<Value = Vec<f64>> {
+        use crate::label_projection::capacity_cases::special_double;
+        use proptest::prelude::*;
+        prop::collection::vec(prop_oneof![special_double(), any::<f64>()], 0..4).prop_map(
+            |mut bounds| {
+                bounds.retain(|b| b.is_finite());
+                bounds.sort_by(f64::total_cmp);
+                bounds.dedup_by(|b, a| *b <= *a);
+                bounds
+            },
+        )
+    }
+
+    /// Quantiles as the explode admits them: finite, distinct by bits.
+    fn capacity_quantiles() -> impl proptest::strategy::Strategy<Value = Vec<f64>> {
+        use crate::label_projection::capacity_cases::special_double;
+        use proptest::prelude::*;
+        prop::collection::vec(prop_oneof![special_double(), any::<f64>()], 0..4).prop_map(
+            |mut quantiles| {
+                let mut seen = HashSet::new();
+                quantiles.retain(|q| q.is_finite() && seen.insert(q.to_bits()));
+                quantiles
+            },
+        )
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn kept_labels_are_exact_and_projected(
+            resource in capacity_resource(),
+            attributes in crate::label_projection::capacity_cases::attribute_sets(6),
+            bounds in capacity_bounds(),
+            quantiles in capacity_quantiles(),
+        ) {
+            check_label_capacity(&IngestLimits::default(), &resource, &attributes, &bounds, &quantiles)?;
+        }
+    }
+
+    #[test]
+    fn kept_labels_are_exact_and_projected_on_fixed_cases() {
+        use crate::label_projection::capacity_cases::{
+            SANITISED_17, fixed_single_attributes, int, kv,
+        };
+        let bounds = [0.0, 1e260];
+        let quantiles = [-0.0, 0.0, 5e-324, 1e260];
+        let limits = IngestLimits::default();
+        for attribute in fixed_single_attributes() {
+            let kept = check_label_capacity(
+                &limits,
+                &[],
+                std::slice::from_ref(&attribute),
+                &bounds,
+                &quantiles,
+            )
+            .expect("fixed case holds");
+            // 1 gauge, 1 sum, 1 native histogram, 3 buckets + count + sum,
+            // 4 quantiles + count + sum.
+            assert_eq!(kept, 3 + 5 + 6, "{attribute:?}");
+        }
+        // A sanitised 17-byte allowlisted key as the only resource label.
+        let limits = IngestLimits {
+            resource_attribute_allowlist: vec![SANITISED_17.to_string()],
+            ..IngestLimits::default()
+        };
+        let kept = check_label_capacity(
+            &limits,
+            &[kv(SANITISED_17, int(7))],
+            &[],
+            &bounds,
+            &quantiles,
+        )
+        .expect("fixed case holds");
+        assert_eq!(kept, 3 + 5 + 6);
+    }
+
+    #[test]
+    fn the_measured_gauge_shape_is_rejected_at_default_limits() {
+        const POINTS: usize = 100_000;
+        let limits = IngestLimits::default();
+        assert_eq!(limits.max_data_points_per_request, POINTS);
+        let wide = "r".repeat(limits.max_label_value_len);
+        // Nine resource labels: `job` from `service.name`, `instance` from
+        // `service.instance.id`, and the seven default allowlisted keys.
+        let allowlist = crate::limits::default_resource_attribute_allowlist();
+        assert_eq!(allowlist.len(), 7);
+        let mut resource = vec![
+            string_kv("service.name", &wide),
+            string_kv("service.instance.id", &wide),
+        ];
+        resource.extend(allowlist.iter().map(|key| string_kv(key, &wide)));
+        let points = (0..POINTS)
+            .map(|i| {
+                number_point(
+                    vec![string_kv("k", if i % 2 == 0 { "a" } else { "b" })],
+                    1_000 + i as i64,
+                    NumberValue::AsDouble(i as f64),
+                )
+            })
+            .collect();
+        let req = request(vec![resource_metrics(
+            resource,
+            vec![gauge_metric("g", points)],
+        )]);
+
+        let label = |name: usize| name + limits.max_label_value_len + 64;
+        let prefix = label("job".len())
+            + label("instance".len())
+            + allowlist.iter().map(|key| label(key.len())).sum::<usize>();
+        // Every point builds its own set: the prefix, `__name__="g"` (73) and
+        // `k` (66), with nothing shared between alternating neighbours.
+        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        assert_eq!(projected, prefix + POINTS * (prefix + 73 + 66));
+        assert!(projected > limits.max_resolved_label_bytes_per_request);
+
+        memo_stats::reset();
+        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        assert_eq!(memo_stats::snapshot(), (0, 0), "no label set may be built");
+        assert!(out.points.is_empty());
+        assert!(out.histogram_points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: limits.max_resolved_label_bytes_per_request,
+                count: POINTS,
+            }]
+        );
     }
 }

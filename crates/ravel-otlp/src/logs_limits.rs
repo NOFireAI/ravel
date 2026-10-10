@@ -62,6 +62,14 @@ pub struct LogIngestLimits {
     /// reason as [`LogIngestLimits::max_future_skew_ns`]. Raising it for a
     /// tenant is legal only together with the catalog-side window config.
     pub max_ingest_lag_ns: i64,
+    /// Upper bound on the attribute bytes normalization would build for one
+    /// request (ADR-2708 D2), projected by
+    /// [`crate::project_log_resolved_label_bytes`] before any record is
+    /// built: every record carries its own copy of its resource and scope
+    /// attributes, so this grows with records times stream attributes, which
+    /// no per-record limit bounds. A request whose projection exceeds it is
+    /// rejected whole. Default 256 MiB.
+    pub max_resolved_label_bytes_per_request: usize,
 }
 
 const SECOND_NANOS: i64 = 1_000_000_000;
@@ -80,6 +88,8 @@ impl Default for LogIngestLimits {
             max_scope_attributes: 64,
             max_future_skew_ns: 10 * MINUTE_NANOS,
             max_ingest_lag_ns: 2 * HOUR_NANOS,
+            max_resolved_label_bytes_per_request:
+                crate::limits::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         }
     }
 }
@@ -98,6 +108,19 @@ impl Default for LogIngestLimits {
 pub enum LogRejection {
     #[error("request has {count} log records, more than the per-request limit of {max}")]
     TooManyRecords { count: usize, max: usize },
+
+    /// The attribute bytes normalization would build for the request
+    /// (ADR-2708 D2), projected before any record is built, exceed
+    /// `max_resolved_label_bytes_per_request`. `count` is the request's
+    /// record count, all of which are rejected.
+    #[error(
+        "request projects to {projected} resolved-label bytes, more than the per-request limit of {max}; rejecting {count} log records"
+    )]
+    ResolvedLabelBytesExceeded {
+        projected: usize,
+        max: usize,
+        count: usize,
+    },
 
     #[error("record has {count} attributes, more than the per-record limit of {max}")]
     TooManyAttributes { count: usize, max: usize },
@@ -244,6 +267,9 @@ impl LogRejection {
             | LogRejection::TooManyResourceAttributes { .. }
             | LogRejection::TooManyScopeAttributes { .. }
             | LogRejection::UnsupportedBodyKind => Some(AdmissionClass::Structural),
+            LogRejection::ResolvedLabelBytesExceeded { .. } => {
+                Some(AdmissionClass::ResolvedLabelBytes)
+            }
             // Per-attribute drops on an otherwise-stored record: the record
             // still lands, so these cost the sender nothing and must not move
             // a rejected counter (their `rejected_count` is 0 for the same
@@ -282,9 +308,9 @@ impl LogRejection {
     /// path's [`crate::traces_limits::SpanRejection::rejected_count`].
     pub fn rejected_count(&self) -> usize {
         match self {
-            LogRejection::TooManyRecords { count, .. } | LogRejection::Grouped { count, .. } => {
-                *count
-            }
+            LogRejection::TooManyRecords { count, .. }
+            | LogRejection::ResolvedLabelBytesExceeded { count, .. }
+            | LogRejection::Grouped { count, .. } => *count,
             // The record still lands; only one attribute was dropped. These
             // must never inflate `rejected_log_records`.
             LogRejection::AttributeKeyTooLong { .. }
@@ -316,6 +342,21 @@ mod tests {
         assert_eq!(limits.max_scope_attributes, 64);
         assert_eq!(limits.max_future_skew_ns, 600_000_000_000);
         assert_eq!(limits.max_ingest_lag_ns, 7_200_000_000_000);
+        assert_eq!(limits.max_resolved_label_bytes_per_request, 268_435_456);
+    }
+
+    #[test]
+    fn resolved_label_bytes_rejection_counts_every_record() {
+        let r = LogRejection::ResolvedLabelBytesExceeded {
+            projected: 300,
+            max: 200,
+            count: 9,
+        };
+        assert_eq!(r.rejected_count(), 9);
+        assert_eq!(
+            r.admission_class(),
+            Some(crate::limits::AdmissionClass::ResolvedLabelBytes)
+        );
     }
 
     /// The skew bounds are the metrics ones verbatim (ADR-0051 §4): the

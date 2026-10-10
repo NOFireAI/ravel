@@ -117,7 +117,9 @@ construction, is relied on by every holder and is unchanged by this decision.
    every other admission check still runs, so the set of rejected points is
    identical with and without the memo. A miss builds one `LabelSet`, wraps
    it, and stores it. The resource-label prefix is part of the cached set, so
-   the per-point resource clone disappears with it.
+   the per-point resource clone disappears with it. This hit rule is also
+   the run rule of the resolved-label projection (see the ADR-2708 D2
+   amendment below).
 
    `ravel-otap` carries its own `SeriesIdMemo`. It keeps the built-set
    comparison under this decision and wraps each built set in a fresh `Arc`,
@@ -297,3 +299,20 @@ The interleaved shape gains less than the grouped shape, and may gain nothing:
 a one-entry memo keyed on input attributes still misses on every point when
 consecutive points differ. Decision 6 requires only that it not regress. A
 larger memo is a separate question and is not decided here.
+
+## Amendment (2026-10-10): ADR-2708 D2 projects label bytes with the memo's hit rule
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-2708 D2 amendment" -->
+
+ADR-2708 D2 bounds each OTLP metrics request by the label bytes its
+normalizer would build, computed in a read-only pass before normalization
+allocates. On the gauge, sum and native-histogram paths that pass counts a run
+of consecutive points with byte-equal raw attributes once, which is the hit
+rule of decision 2: a hit builds nothing, so the projection charges nothing
+for it. The explode paths share nothing under decision 2 and the projection
+gives them no run rule either. A change to the memo key or its scope must
+change the projection with it, since a projection that counts fewer builds
+than the memo makes is an undercount of the allocation it bounds.
+
+Decisions 1 to 6 are unchanged.
+
