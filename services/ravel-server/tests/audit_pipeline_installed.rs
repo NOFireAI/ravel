@@ -975,7 +975,7 @@ async fn audit_off_by_default_installs_no_pipeline_and_writes_no_record() {
     );
 }
 
-/// `/metrics` renders the audit-failure family exactly when a pipeline runs:
+/// `/metrics` renders the `ravel_audit_*` families exactly when a pipeline runs:
 /// present under `--audit-mode required`, absent under the default `off`,
 /// where reporting a zero would claim a subsystem the process never ran.
 #[tokio::test]
@@ -991,12 +991,17 @@ async fn metrics_render_the_audit_family_only_when_the_audit_is_enabled() {
             .text()
             .await
             .expect("metrics body readable");
-        assert_eq!(
-            metrics.contains("ravel_audit_write_failures_total"),
-            expect_family,
-            "ravel_audit_write_failures_total presence must follow the audit mode \
-             (expected present: {expect_family})"
-        );
+        for family in [
+            "ravel_audit_write_failures_total",
+            "ravel_audit_put_retries_total",
+        ] {
+            assert_eq!(
+                metrics.contains(family),
+                expect_family,
+                "{family} presence must follow the audit mode \
+                 (expected present: {expect_family})"
+            );
+        }
         running.shutdown().await.expect("graceful shutdown");
     }
 }

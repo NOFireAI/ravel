@@ -1,7 +1,9 @@
 # Audit
 
 Ravel writes an immutable audit record for every SQL statement that it
-executes, every legal hold set or cleared, and every reshard. You read the
+executes when the query audit is enabled, every legal hold set or cleared,
+and every reshard. The query audit is off by default; `--audit-mode required`
+enables it. You read the
 records through the `audit` SQL table. A Ravel process writes each record. A
 client cannot write one.
 
@@ -12,8 +14,11 @@ A query selects one kind with `attrs['kind']`.
 
 ### `kind = query`
 
-Ravel writes one record for every query that it executes, after the query
-runs. This applies to every query surface:
+When the query audit is enabled, Ravel writes one record for every query that
+it executes, after the query runs. It is off by default: set `--audit-mode
+required` (or `RAVEL_AUDIT_MODE=required`) to enable it, or `best-effort`
+(see [Write failures](#write-failures)). With the audit off, Ravel writes no
+`kind = query` record. This applies to every query surface:
 
 - `POST /api/v1/sql` and Flight SQL
 - `/api/v1/query` and `/api/v1/query_range`
@@ -26,8 +31,11 @@ the request body or from the ticket that a client sent. A tenant cannot forge
 a record, and cannot suppress the record of a query that it ran.
 
 One group-commit pipeline writes the records of every surface. Ravel installs
-the pipeline only in the query-serving modes (`all` and `query`). The
-`maintain` and `gateway` modes serve no query surface and install no pipeline.
+the pipeline only in the query-serving modes (`all` and `query`), and only
+when the audit is enabled. The `maintain` and `gateway` modes serve no query
+surface and install no pipeline. At startup a query-serving process logs
+`query audit resolved` with the mode it runs (`audit_mode="off"`,
+`"required"`, or `"best-effort"`).
 
 #### Write failures
 
@@ -37,16 +45,24 @@ throttle response) a few times with a short backoff. A non-transient error
 fails the batch. An error that continues through every attempt also fails the
 batch.
 
-`--audit-mode` sets what happens when the pipeline cannot make a record
-durable:
+`--audit-mode` sets whether the pipeline runs, and what happens when it
+cannot make a record durable:
 
 | `--audit-mode` | Result |
 |---|---|
-| `required` (default) | The query fails with a 503 (HTTP) or `Unavailable` (Flight). |
+| `off` (default) | No pipeline and no `kind = query` record. No token key is needed, and `/metrics` carries no `ravel_audit_*` family. |
+| `required` | The query fails with a 503 (HTTP) or `Unavailable` (Flight). |
 | `best-effort` | Ravel logs the failure, counts it on `ravel_audit_write_failures_total`, and lets the response proceed. |
 
-Use `best-effort` for a deployment that prefers an unaudited response to a
-failed query.
+Use `required` where the trail is evidence. Use `best-effort` for a
+deployment that prefers an unaudited response to a failed query.
+
+Under `off`, a process refuses to start when `--audit-text`,
+`--audit-max-batch`, or `--audit-max-age` (or its environment variable) is
+set, because each tunes a pipeline that `off` never installs. The error names
+`--audit-mode required` as the fix. A deployment that relied on the audit
+before it became opt-in, without naming the mode, must set
+`--audit-mode required` when it upgrades.
 
 #### Batching
 
@@ -111,12 +127,13 @@ characters, for a 32-byte key. Ravel accepts hex only.
 
 - If `RAVEL_AUDIT_TOKEN_KEY` is not set, Ravel derives the key from the
   deployment key that `--tenant-hash-key-file` configures.
-- If neither is available, a query-serving process refuses to start under
-  `redacted`. It does not fall back to verbatim text.
+- If neither is available, a query-serving process with the audit enabled
+  refuses to start under `redacted`. It does not fall back to verbatim text.
 - An unkeyed deployment (`--tenant-hash-unkeyed`) must set
   `RAVEL_AUDIT_TOKEN_KEY` or pass `--audit-text plaintext`.
 - A `gateway` or `maintain` process never reads the key, because it writes no
-  query-audit record.
+  query-audit record. Neither does a process under `--audit-mode off`; a key
+  set there is accepted and not used.
 
 Keep the key for as long as you keep the records tokenized under it. A
 different key gives different tokens for the same value. Records written
@@ -341,8 +358,8 @@ ORDER BY ts_ns;
 
 ## Reading the audit trail is audited
 
-A query over `audit` is a SQL statement, so it submits one more query-audit
-record. The statement that you ran appears in the next `audit` query that you
+A query over `audit` is a SQL statement, so with the query audit enabled it
+submits one more query-audit record. The statement that you ran appears in the next `audit` query that you
 run. An investigation that reads the trail repeatedly adds one record per
 read. This behavior is intended.
 
