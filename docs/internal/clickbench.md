@@ -295,16 +295,21 @@ writer, which is true here (see the UNSAFE paragraph in `ravel-cli load
 prints one more line:
 
 ```
-  fold after load  : sealed, seal_through_hour 482110, watermark_hour 482110, entries 8424, elapsed 1.203s (included in elapsed)
+  fold after load  : sealed, seal_through_hour 482110, watermark_hour 482110, entries 8424, parts read 1, buckets listed 0, records read 0, elapsed 1.203s (included in elapsed)
 ```
 
-Check it before going further. `entries` must equal the `objects written`
-figure two lines above it: that equality is the bench precondition, and
-anything lower means part of the load is outside the snapshot. `nothing left
-to seal` in place of `sealed`, or a `fold warning` line under it, means HEAD was
-already sealed through the hours this load wrote (an earlier `--fold-after-load`
-or `--writers-stopped` fold on the same tenant within the hour), so this load's
-objects are invisible to queries. Load into a fresh tenant instead.
+Check it before going further. On a fresh tenant `entries` must equal the
+`objects written` figure two lines above it: that equality is the bench
+precondition. `parts read`, `buckets listed` and `records read` are the cost of
+the check that every commit the load wrote is in the snapshot; a bucket is
+listed only for a commit found in no level-0 entry, so a nonzero figure there
+means part of the load reached the snapshot through a compaction or rewrite, or
+not at all. `no-op, HEAD already sealed` in place of `sealed` means another
+writers-stopped fold sealed these hours after the load's last commit; the load
+still succeeded only because that snapshot holds every commit it wrote. When a
+commit is missing, or the check cannot read the snapshot, the line says the
+commits were not confirmed and the load exits non-zero naming the hours. Load
+into a fresh tenant instead.
 
 If the load ran without the flag, or its fold failed (the load then exits
 non-zero, but every loaded object is already durable), seal the loaded hours by

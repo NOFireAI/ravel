@@ -90,6 +90,16 @@ struct SealMidLoad {
     advance_to: i64,
 }
 
+/// Seals the logs snapshot through hour `HOUR` (a writers-stopped fold by
+/// another process) at the first GET of the logs HEAD once `commits` commit
+/// records have landed: after the load's last commit, before its own fold
+/// reads HEAD.
+struct SealBeforeFold {
+    commits: usize,
+    fired: AtomicBool,
+    report: Mutex<Option<ravel_catalog::FoldReport>>,
+}
+
 /// One step of a [`CommitScript`], run when the `at_commit`-th commit record
 /// (1-based) is PUT, before that PUT lands: first a fold by another process
 /// at the clock's current reading when `fold` is `Some` (its value is the
@@ -165,6 +175,7 @@ struct RecordingStore {
     listed_keys: Mutex<Vec<String>>,
     put_keys: Mutex<Vec<String>>,
     seal_mid_load: Option<SealMidLoad>,
+    seal_before_fold: Option<SealBeforeFold>,
     script: Option<CommitScript>,
 }
 
@@ -183,6 +194,16 @@ impl RecordingStore {
             fired: AtomicBool::new(false),
             clock,
             advance_to,
+        });
+        Arc::new(store)
+    }
+
+    fn sealing_before_fold(inner: Arc<dyn ObjectStoreBackend>, commits: usize) -> Arc<Self> {
+        let mut store = Self::build(inner);
+        store.seal_before_fold = Some(SealBeforeFold {
+            commits,
+            fired: AtomicBool::new(false),
+            report: Mutex::new(None),
         });
         Arc::new(store)
     }
@@ -213,6 +234,7 @@ impl RecordingStore {
             listed_keys: Mutex::new(Vec::new()),
             put_keys: Mutex::new(Vec::new()),
             seal_mid_load: None,
+            seal_before_fold: None,
             script: None,
         }
     }
@@ -226,6 +248,15 @@ impl RecordingStore {
             .filter(|key| is_data_key(key) || keys::parse_commit_key(key).is_ok())
             .cloned()
             .collect()
+    }
+
+    fn commit_put_count(&self) -> usize {
+        self.put_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| keys::parse_commit_key(key).is_ok())
+            .count()
     }
 
     fn put_count(&self) -> usize {
@@ -302,6 +333,34 @@ impl ObjectStoreBackend for RecordingStore {
         outcome
     }
     async fn get(&self, k: &str, r: GetRange) -> Result<GetOutcome, StoreError> {
+        if let Some(hook) = &self.seal_before_fold
+            && k.ends_with(&self.head_suffix)
+            && self.commit_put_count() == hook.commits
+            && !hook.fired.swap(true, Ordering::SeqCst)
+        {
+            let catalog = Catalog::new(
+                Arc::clone(&self.inner),
+                CatalogConfig {
+                    shard_count: SHARDS,
+                    ..CatalogConfig::default()
+                },
+            )
+            .expect("catalog");
+            let fold = catalog
+                .fold_with_seal_through(
+                    &TenantId::new(TENANT).hash(),
+                    ravel_types::Signal::Logs,
+                    uuid::Uuid::new_v4(),
+                    CLOCK_NS,
+                    &[],
+                    None,
+                    &ravel_catalog::RefoldRequest::new(),
+                    Some(HOUR),
+                )
+                .await
+                .expect("the seal before the load's fold");
+            *hook.report.lock().unwrap() = Some(fold);
+        }
         if k.ends_with(&self.head_suffix) && self.head_written.load(Ordering::SeqCst) {
             if self.refuse_written_head_reads.load(Ordering::SeqCst) {
                 return Err(StoreError::AccessDenied("HEAD read refused".to_string()));
@@ -618,6 +677,13 @@ async fn load_with_fold_after_load_resolves_from_the_snapshot_through_sql() {
     let head = ravel_catalog::decode_head(&head_bytes).expect("HEAD decodes");
     assert_eq!(head.watermark_hour, HOUR);
     assert_eq!(head.created_unix_ns, CLOCK_NS);
+    assert_eq!(
+        fold.parts_read,
+        head.parts.len(),
+        "the coverage check read every part once: {fold:?}"
+    );
+    assert_eq!(fold.buckets_listed, 0, "every commit is a level-0 entry");
+    assert_eq!(fold.records_read, 0, "{fold:?}");
 
     // Only now query, and only the query's LISTs are counted.
     store.reset();
@@ -823,6 +889,76 @@ async fn a_seal_landing_mid_load_fails_the_load_naming_the_uncovered_hour() {
     );
 }
 
+/// The token identities of `tokens` as snapshot entry identities.
+fn identities(tokens: &[ravel_types::CommitToken]) -> Vec<ravel_catalog::EntryIdentity> {
+    tokens
+        .iter()
+        .map(|t| {
+            (
+                t.shard,
+                t.ingest_hour_bucket,
+                *t.writer_id.as_bytes(),
+                t.epoch,
+                t.seq,
+            )
+        })
+        .collect()
+}
+
+/// Another writers-stopped fold seals hour `H` after the load's last commit
+/// and before the load's own fold, so that fold has nothing left to seal. The
+/// snapshot the other fold left holds every commit the load wrote, so the
+/// load succeeds with a no-op fold and a token-less query counts every row.
+#[tokio::test]
+async fn a_seal_after_the_last_commit_leaves_a_no_op_fold_that_succeeds() {
+    const COMMITS: usize = 8;
+    let (_dir, parquet_path, mapping) = write_fixture();
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let store = RecordingStore::sealing_before_fold(Arc::clone(&inner), COMMITS);
+    let report = try_run_load(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        &parquet_path,
+        &mapping,
+        true,
+        Arc::new(AtomicI64::new(CLOCK_NS)),
+    )
+    .await
+    .expect("every commit is in the snapshot the other fold left");
+    assert_eq!(report.tokens.len(), COMMITS, "{:?}", report.tokens);
+    assert!(report.tokens.iter().all(|t| t.ingest_hour_bucket == HOUR));
+    let hook = store.seal_before_fold.as_ref().expect("hook");
+    assert!(hook.fired.load(Ordering::SeqCst), "the other seal ran");
+    let other = hook.report.lock().unwrap().clone().expect("the other fold");
+    assert!(!other.no_op, "the other fold sealed hour {HOUR}: {other:?}");
+    assert_eq!(other.watermark_hour, Some(HOUR), "{other:?}");
+    assert_eq!(other.entry_count, COMMITS as u64, "{other:?}");
+
+    let fold = report.fold.clone().expect("the fold ran");
+    assert!(fold.no_op, "the load's fold had nothing to seal: {fold:?}");
+    assert_eq!(fold.seal_through_hour, Some(HOUR), "{fold:?}");
+    assert_eq!(fold.watermark_hour, Some(HOUR), "{fold:?}");
+    assert_eq!(fold.buckets_listed, 0, "every commit is a level-0 entry");
+
+    let coverage = ravel_catalog::snapshot_coverage(
+        inner.as_ref(),
+        &TenantId::new(TENANT).hash(),
+        ravel_types::Signal::Logs,
+        &identities(&report.tokens),
+    )
+    .await
+    .expect("readable");
+    assert_eq!(coverage.watermark_hour, Some(HOUR));
+    assert!(coverage.missing.is_empty(), "{coverage:?}");
+
+    let value = count_rows(&build_app(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)).await;
+    assert_eq!(count_of(&value), ROWS as i64, "{value}");
+    assert_eq!(
+        unfolded_segments(&value),
+        0,
+        "every segment resolves from the snapshot: {value}"
+    );
+}
+
 /// The value after `label` up to the next `,` or ` `, parsed.
 fn field<T: std::str::FromStr>(line: &str, label: &str) -> T {
     let rest = line
@@ -879,6 +1015,9 @@ fn the_load_summary_prints_the_fold_figures() {
     let watermark: u32 = field(&fold, "watermark_hour ");
     assert_eq!(seal_through, watermark, "{fold}");
     assert_eq!(field::<u64>(&fold, "entries "), objects, "{fold}");
+    assert_eq!(field::<usize>(&fold, "parts read "), 1, "{fold}");
+    assert_eq!(field::<usize>(&fold, "buckets listed "), 0, "{fold}");
+    assert_eq!(field::<usize>(&fold, "records read "), 0, "{fold}");
     let fold_elapsed: f64 = field(&fold, "elapsed ");
     assert!(
         fold.ends_with("(included in elapsed)"),
