@@ -839,6 +839,13 @@ first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
 .kidx:
   magic       "RKI1"
   u32 LE      header_len
+  u32 LE      prefix_len          (bytes from the object start through
+                                   dir_crc32c, which must equal
+                                   4 + 4 + 4 + header_len + 4
+                                   + 4 x 2^bucket_bits + 4; fixed width
+                                   outside the protobuf so its own encoding
+                                   cannot change header_len; the ref's copy
+                                   sizes GET 1, this one is authoritative)
   header      KeyIndexLeafHeader protobuf (ravel.catalog.v1): format_version
               (1), tenant_hash (16), signal, part_blake3 (32), field,
               key_type, key8_lo, key8_hi, bucket_bits,
@@ -846,11 +853,9 @@ first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
               part_entry_count (the covered part's SnapshotEntry count;
               coverage = part_entry_count minus the uncovered ordinals),
               repeated uncovered_entry_ordinals (each below
-              part_entry_count), body_len, prefix_len (the bytes from the
-              object start through dir_crc32c, which must equal
-              4 + 4 + header_len + 4 + 4 x 2^bucket_bits + 4; the ref's
-              copy sizes GET 1, this one is the authoritative value)
-  u32 LE      header_crc32c       (over magic, header_len and header)
+              part_entry_count), body_len
+  u32 LE      header_crc32c       (over magic, header_len, prefix_len and
+                                   header)
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
   u32 LE      dir_crc32c
   body:       bucket frames tiling [0, body_len) exactly, each
@@ -897,8 +902,11 @@ exactly one slice of every part that carries leaves for the field, and a
 lookup key between the keys present still probes (and prunes) rather than
 scanning. A part whose slices do not tile is `Corrupted` for that field.
 For each covered part, in the one slice that holds the lookup's `key8`:
-GET 1 is `[0, prefix_len)` (header and directory,
-verified by their crcs). The ref's copies of `field`, `key_type`, `key8_lo`,
+a ref `prefix_len` of zero or greater than the ref's `size` rejects the
+leaf as `Corrupted` before any GET is issued (tier 1's zero-or-past-`len`
+rule), so GET 1 never exceeds the object's size; GET 1 is then
+`[0, prefix_len)` (header and directory, verified by their crcs). The
+ref's copies of `field`, `key_type`, `key8_lo`,
 `key8_hi`, `bucket_bits`, `entry_count`, `part_blake3` and `prefix_len`
 serve only to pick the slice and size GET 1; the header is authoritative,
 being under the leaf's blake3, and after GET 1 the reader compares the two
@@ -934,15 +942,20 @@ of the leaf), not by the part's hash, for the reason the
 column-statistics section gives:
 two folds whose per-entry degrade differed would otherwise collide under
 `AlreadyExists`. `bucket_bits` is chosen so that the directory and the mean
-bucket are about equal in bytes, clamped to 12..=16 at the writer; the
+bucket are about equal in bytes, clamped to 12..=13 at the writer (the
+balance `body = 4 x 2^(2b)` in decompressed bytes gives 12 at a 64 MiB body
+and 13 at the 256 MiB ceiling, so nothing higher is reachable under it, and
+below 64 MiB the floor of 12 holds with a fixed 16 KB directory); the
 reader accepts 1..=16 and rejects any other value before allocating the
 directory. The leaf's corruption conditions, each a typed `Corrupted` that
 makes the reader treat the part as uncovered for that field (never a panic,
 never wrong data): a magic other than `RKI1`; a `header_len` past the
 object; a header, directory or frame crc32c mismatch; `bucket_bits` outside
-1..=16; a header `prefix_len` not equal to
-`4 + 4 + header_len + 4 + 4 x 2^bucket_bits + 4`, or a GET 1 (sized by the
-ref's copy) shorter than it, so a truncated directory is never read; a
+1..=16; a ref `prefix_len` of zero or greater than the ref's `size`
+(rejected before GET 1 is issued, so a bad ref copy can neither inflate
+nor truncate the read); a header `prefix_len` not equal to
+`4 + 4 + 4 + header_len + 4 + 4 x 2^bucket_bits + 4`, or a GET 1 (sized by
+the ref's copy) shorter than it, so a truncated directory is never read; a
 directory whose ends are not non-decreasing or whose last end
 differs from `body_len`; a frame whose declared `uncompressed_len` exceeds
 the body ceiling (refused before decompression allocates anything), or

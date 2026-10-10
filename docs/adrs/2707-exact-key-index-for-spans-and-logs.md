@@ -84,7 +84,7 @@ v0.23 entry recipe), unfolded tenant, stock server.
 | figure | measured |
 |---|---|
 | distinct (UserID, 8,192-row block) pairs per object (offline, 411 objects of about 243,896 rows) | p50 49,899, max 165,431 |
-| implied tier-1 KEY_IDX size at 12 B per entry (`key8` plus a `u32` block ordinal, before directories and header) | about 2% of object bytes (about 0.5 MB per 25 MB object) |
+| implied tier-1 KEY_IDX size at 12 B per entry (`key8` plus a `u32` block ordinal, before directories and header) | about 0.6 MB per 25 MB object (49,899 x 12 B), about 2.4%, cited as about 2% elsewhere in this ADR |
 | objects per UserID, p50 / p99 / max | 1 / 3 / 213 |
 | the q20 key | 4 rows, 1 object, 1 block |
 | cold wall (3 passes) | 3.23, 3.27, 5.21 s |
@@ -338,9 +338,14 @@ flowchart LR
     (the ADR-1413 order). `bucket_bits` balances the directory against the
     mean bucket, both in decompressed bytes (the directory is stored
     uncompressed, the bucket's wire bytes are at most its decompressed
-    bytes), clamped to 12..=16 (13 at the Stage 0 day as one part,
-    derived: a 32 KB directory and a 29 KB mean bucket at that body, 32 KB
-    at the ceiling); the body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
+    bytes), with the writer clamp 12..=13: the balance `body = 4 x 2^(2b)`
+    gives 12 at a 64 MiB decompressed body and 13 at the 256 MiB ceiling,
+    so nothing higher is reachable under it, and below 64 MiB the floor of
+    12 holds with a fixed 16 KB directory and a mean bucket of
+    `body / 4096` (13 at the Stage 0 day as one part, derived: a 32 KB
+    directory and a 29 KB mean bucket at that body, 32 KB at the ceiling;
+    the reader accepts 1..=16); the body ceiling is
+    `DEFAULT_MAX_COLUMN_STATS_BYTES`
     (256 MiB) in that constant's own meaning, a cap on the declared
     decompressed body: every bucket frame declares its `uncompressed_len`,
     the reader checks it against the ceiling before it allocates (per
@@ -387,8 +392,9 @@ flowchart LR
     `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, and that is a seal threshold, not
     a cap: `partition_parts` splits only at hour boundaries, so one ingest
     hour larger than it yields one part above it (the Stage 0 load, at
-    80,000 entries in one ingest hour, stays under it; a bulk load three
-    times that size with the pre-decision 9 loader defaults would not).
+    80,000 entries in one ingest hour, stays under it; a bulk load whose
+    single ingest hour exceeds 250,000 objects, more than 3.125x the
+    Stage 0 load with the pre-decision 9 loader defaults, would not).
     The ceiling is therefore `2 x batch_entries` only while no unindexed
     part exceeds the setting, and `2 x` the largest part otherwise; the
     report states the largest unindexed part's entries up front so the
@@ -734,8 +740,9 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   one entry per trace per object: 20 M entries, about 240 MB raw against
   4.17 GB of span data, about 6% before compression (derived; the
   measured section size is a T7 acceptance figure, pre-registered below).
-  On logs it is the measured 2% of object bytes (p50 49,899 pairs per
-  25 MB object). Tier 2 holds one `(key8, entry ordinal, block set)` entry
+  On logs it is about 2% of object bytes, 2.4% derived from the measured
+  pair count (p50 49,899 pairs per 25 MB object). Tier 2 holds one
+  `(key8, entry ordinal, block set)` entry
   per (key, object) pair, about 12 B each: for the Stage 0 spans corpus
   that is again about 20 M entries and about 240 MB, about 6% of the span
   data, and about 2% for the logs corpus (derived). Both tiers therefore
@@ -785,10 +792,10 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, where the balance rule `4 x 2^b = body / 2^b` over the same decompressed quantity at the 256 MiB body ceiling gives `bucket_bits` = 13 (a 32 KB directory and a 32 KB mean bucket): at most about 64 KB per covering part, about 64 MB at the 1,024-part ceiling; the per-part figure is reported beside the count, with wire bytes beside it | more than 2 per part, index GETs in any other phase, or `keyIndex` decompressed bytes over 128 KB per covering part (2x the balanced figure) |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the writer clamp produces for the part's body: an hour-ranged part sits below the 64 MiB body where `bucket_bits` = 12, so 16 KB of directory plus `body / 4096` (about 20 KB at a 16 MiB body, about 20 MB over 1,024 such parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 2 per part, index GETs in any other phase, or `keyIndex` decompressed bytes over 2x `16 KB + body / 4096` for the part's own body (128 KB at the ceiling) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
-| q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` wire bytes per probed object = `prefix_len` (about 1 KB per field at 8 bits) plus one bucket (2 to 8 KB at Stage 0 entry counts), so under 16 KB per object with up to four declared fields, about 6.5 MB over the 410-object corpus | a whole-object GET, or `keyIndex` bytes over 32 KB per probed object |
+| q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` decompressed bytes per probed object = `prefix_len` (stored as is, about 1 KB per field at 8 bits) plus one bucket's `uncompressed_len` (2 to 8 KB at Stage 0 entry counts; the frame on the wire is zstd and at most that), so under 16 KB per object with up to four declared fields, about 6.5 MB over the 410-object corpus, with wire bytes reported beside | a whole-object GET, or `keyIndex` decompressed bytes over 32 KB per probed object |
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
