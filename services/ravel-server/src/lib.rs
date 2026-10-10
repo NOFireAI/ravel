@@ -127,6 +127,16 @@ const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 /// the ones already in the batch.
 const AUDIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// The `--audit-mode` value a resolved [`ServerConfig::audit_pipeline`]
+/// stands for, as spelled on the command line, for the startup log line.
+fn query_audit_mode_label(audit: Option<&ravel_maintain::AuditPipelineConfig>) -> &'static str {
+    match audit.map(|config| config.audit_mode) {
+        None => "off",
+        Some(ravel_maintain::AuditMode::Required) => "required",
+        Some(ravel_maintain::AuditMode::BestEffort) => "best-effort",
+    }
+}
+
 /// Emits a prominent startup warning when the dev-only insecure tenant header
 /// is enabled. The `--dev-insecure-tenant-header` flag lets a client name its
 /// own tenant via `x-ravel-tenant`, bypassing authenticated tenant resolution.
@@ -822,13 +832,15 @@ pub struct ServerConfig {
     /// local tenant no remote names runs a fully local query.
     pub remote_clusters: Vec<crate::config::RemoteClusterConfig>,
     /// The resolved query-audit pipeline config (ADR-0062 decision 2b), from
-    /// `--audit-mode`/`--audit-max-batch`/`--audit-max-age`. In a query-serving
-    /// mode ([`Mode::All`]/[`Mode::Query`]) [`start`] spawns one
-    /// [`ravel_maintain::AuditPipeline`] from this and installs its sink on
-    /// every query surface; `Mode::Maintain`/`Mode::Gateway` serve no query
-    /// surface and install [`ravel_maintain::NoopQueryAuditSink`] instead,
-    /// ignoring this field.
-    pub audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    /// `--audit-mode`/`--audit-max-batch`/`--audit-max-age`, or `None` under
+    /// `--audit-mode off` (the default since the opt-in amendment). When it is
+    /// `Some` in a query-serving mode ([`Mode::All`]/[`Mode::Query`]), [`start`]
+    /// spawns one [`ravel_maintain::AuditPipeline`] from it and installs its
+    /// sink on every query surface. When it is `None`, or in
+    /// `Mode::Maintain`/`Mode::Gateway`, which serve no query surface, no
+    /// pipeline is spawned and every query surface keeps
+    /// [`ravel_maintain::NoopQueryAuditSink`].
+    pub audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
     /// How a query-audit record's `query.text` is recorded (ADR-0062 decision
     /// 2e), resolved from `--audit-text` and the audit token key by
     /// [`crate::config::resolve_audit_text_policy`]. [`start`] wraps the
@@ -1384,9 +1396,11 @@ async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) {
 }
 
 impl Running {
-    /// Whether `start` spawned a query-audit pipeline for this process
-    /// (`true` in [`Mode::All`]/[`Mode::Query`], `false` in
-    /// [`Mode::Maintain`]/[`Mode::Gateway`], which serve no query surface).
+    /// Whether `start` spawned a query-audit pipeline for this process:
+    /// `true` in [`Mode::All`]/[`Mode::Query`] when
+    /// [`ServerConfig::audit_pipeline`] is `Some`, `false` under
+    /// `--audit-mode off` and in [`Mode::Maintain`]/[`Mode::Gateway`], which
+    /// serve no query surface.
     pub fn has_audit_pipeline(&self) -> bool {
         self.audit_pipeline.is_some()
     }
@@ -3038,21 +3052,35 @@ pub async fn start_with_heartbeat(
         // groups its batch by that field, so one process-wide pipeline serves
         // every tenant without needing a static tenant list (which an
         // OIDC/mTLS deployment legitimately does not have).
-        let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
-            store.clone(),
-            config.audit_pipeline.clone(),
-        ));
-        // ADR-0062 decision 2e: the `--audit-text` posture is applied here,
-        // once, by wrapping the sink every surface below installs. Under
-        // `redacted` the pipeline receives already-tokenized text, so no
-        // plaintext query text reaches the RLOG object or its commit record;
-        // under `plaintext` this hands back the pipeline itself unwrapped.
-        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> =
-            config.audit_text.wrap(audit_pipeline_handle.clone());
-        // `/metrics` reads the pipeline's failure counter at scrape time, so it
-        // takes the pipeline itself rather than a snapshot taken here.
-        metrics_state.audit_pipeline = Some(audit_pipeline_handle.clone());
-        running_audit_pipeline = Some(audit_pipeline_handle);
+        //
+        // Under `--audit-mode off` (ADR-0062 opt-in amendment) no pipeline is
+        // spawned: every surface keeps the no-op sink, `/metrics` renders no
+        // audit family, and shutdown has nothing to drain.
+        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = match &config.audit_pipeline {
+            Some(audit_config) => {
+                let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
+                    store.clone(),
+                    audit_config.clone(),
+                ));
+                // `/metrics` reads the pipeline's failure counter at scrape
+                // time, so it takes the pipeline itself rather than a snapshot
+                // taken here.
+                metrics_state.audit_pipeline = Some(audit_pipeline_handle.clone());
+                running_audit_pipeline = Some(audit_pipeline_handle.clone());
+                // ADR-0062 decision 2e: the `--audit-text` posture is applied
+                // here, once, by wrapping the sink every surface below
+                // installs. Under `redacted` the pipeline receives
+                // already-tokenized text, so no plaintext query text reaches
+                // the RLOG object or its commit record; under `plaintext` this
+                // hands back the pipeline itself unwrapped.
+                config.audit_text.wrap(audit_pipeline_handle)
+            }
+            None => Arc::new(ravel_maintain::NoopQueryAuditSink),
+        };
+        tracing::info!(
+            audit_mode = query_audit_mode_label(config.audit_pipeline.as_ref()),
+            "query audit resolved"
+        );
 
         // The provenance stamp of the resolved policy (ADR-0996 decision 2).
         // The server exposes no config endpoint, so this startup line is where
@@ -4272,7 +4300,11 @@ pub async fn start_with_heartbeat(
         idle_tenant_state_task,
         metadata_sink_task,
         audit_pipeline: running_audit_pipeline,
-        audit_drain_timeout: config.audit_pipeline.max_age + AUDIT_DRAIN_GRACE,
+        audit_drain_timeout: config
+            .audit_pipeline
+            .as_ref()
+            .map_or(Duration::ZERO, |audit| audit.max_age)
+            + AUDIT_DRAIN_GRACE,
         // Clone the readiness handle onto `Running` so `shutdown` can flip it to
         // draining; the `/readyz` route holds the other clone.
         readiness: readiness.clone(),

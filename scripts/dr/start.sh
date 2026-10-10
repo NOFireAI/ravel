@@ -208,14 +208,16 @@ mapfile -d '' -t SERVER_ARGV < <(dr_ravel_server_argv \
   --listen-grpc "${DR_GRPC_ADDR}" \
   --tenant-token-file "${TOKEN_FILE}")
 
+# The query audit is opt-in since #2791; the restored server keeps it on, as
+# the seeded one ran.
 if [[ "${BACKGROUND}" -eq 0 ]]; then
   dr_log "starting ravel-server against ${DR_BUCKET_REPLICA} (foreground)"
-  RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" exec "${SERVER_ARGV[@]}"
+  RAVEL_AUDIT_MODE=required RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" exec "${SERVER_ARGV[@]}"
 fi
 
 SERVER_LOG="${DR_LOG_DIR}/start-server.log"
 dr_log "starting ravel-server against ${DR_BUCKET_REPLICA} (background)"
-RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" "${SERVER_ARGV[@]}" >"${SERVER_LOG}" 2>&1 &
+RAVEL_AUDIT_MODE=required RAVEL_AUDIT_TOKEN_KEY="${DR_SERVER_AUDIT_KEY}" "${SERVER_ARGV[@]}" >"${SERVER_LOG}" 2>&1 &
 server_pid=$!
 printf '%s\n' "${server_pid}" >"${DR_LOG_DIR}/dr-server.pid"
 

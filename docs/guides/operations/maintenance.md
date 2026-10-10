@@ -1743,9 +1743,11 @@ The audit log decides whether a version is forged:
   before it touches storage (see [the audit guide](../audit.md)). A manifest
   version with no `attempted` record for its table at or shortly before its
   `stored_unix_ms` was therefore not written by Ravel.
-- This holds under `--audit-mode required`, the default. Under `best-effort` a
-  statement can run without its record, so also check
-  `ravel_audit_write_failures_total` for that window.
+- This holds under `--audit-mode required`. Under `best-effort` a statement
+  can run without its record, so
+  also check `ravel_audit_write_failures_total` for that window. Under `off`,
+  the default, the server writes no record at all, and the audit log cannot
+  decide the question.
 - A matching record does not prove the version legitimate, because the
   record's text cannot name the version number that it went on to write. Also
   compare its statement with the version's `statement`.

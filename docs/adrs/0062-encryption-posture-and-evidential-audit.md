@@ -63,7 +63,7 @@ Named non-goals (unchanged gaps, referenced not re-litigated): the ADR-0046 loca
 
 **2b. Non-lossy via group commit, not local durability.** A single `AuditPipeline` in `ravel-server` batches submitted events and flushes on `max_batch` records or `max_age` (default 25 ms, configurable; an event that finds the pipeline idle is flushed at once, per the idle-flush amendment below): one RLOG object containing the batch's records plus one commit record, written in the existing `audit_write.rs` durability order. Every submitter awaits its batch's flush result; the response is released only after the audit record is durable in object storage. This respects the invariant directly — the only buffer is in memory, and nothing in it is ever acknowledged: a crash before flush destroys the buffered records *and* the un-responded queries together, so no acknowledged query ever lacks a durable audit record ("non-lossy" is defined as exactly that property, and it is the strongest property any system can offer without lying — records for responses never sent are not evidence of anything).
 
-Failure semantics: if the flush fails, every query in the batch fails (HTTP 503 / Flight `Unavailable`), `audit_mode=required` being the default. During an S3 outage queries fail closed instead of running unaudited — the precise inversion of the lossiness gap. `audit_mode=best-effort` remains available as an explicit, documented opt-out (dev, single-tenant labs); choosing it is visible configuration, per "approximation is opt-in and visible."
+Failure semantics: if the flush fails, every query in the batch fails (HTTP 503 / Flight `Unavailable`), `audit_mode=required` being the default (superseded by the opt-in amendment below: the audit is now off by default, and `required` is the recommended value where it is enabled). During an S3 outage queries fail closed instead of running unaudited — the precise inversion of the lossiness gap. `audit_mode=best-effort` remains available as an explicit, documented opt-out (dev, single-tenant labs); choosing it is visible configuration, per "approximation is opt-in and visible."
 
 Cost and latency: the response tail gains up to `max_age` plus one dual-PUT round trip (S3 PUT p50 ~10-30 ms); an event submitted while a flush is in flight waits out that flush first, which the idle-flush amendment below makes more common for the event right behind an idle one. PUT count drops from 2/query to 2/flush — at 100 queries/s and 25 ms batching, from 200 PUTs/s to <=80/s worst case (at most 160 PUTs/s under the idle-flush amendment below) and far fewer under load, directly shrinking the keyspace growth rate before retention even runs.
 
@@ -104,7 +104,7 @@ Gaps closed: per-tenant KMS by 1a-1e; coverage by 2a; lossiness by 2b; unbounded
 - **Two ADR amendments ride along**: ADR-0042 decision 1 (mechanism rewritten to match reality, historical posture stated plainly) and ADR-0055 §1/§3 (deny-delete narrowed to the legal-hold shard; Maintain gains the query-audit-shard delete used by retention). Both are in-place amendments with a dated note, the established pattern in ADR-0055 itself.
 - **New object key `t/<hash>/enc`** (CAS, additive; this ADR authorizes it — no existing layout changes, no version bumps). New config surface: `--s3-kms-key`, `--tenant-kms-key`, `--audit-mode`, `--audit-text`, audit `max_batch`/`max_age`, `audit_retention`, `RAVEL_AUDIT_TOKEN_KEY`.
 - **`RAVEL_AUDIT_TOKEN_KEY` and per-tenant key ARNs are out-of-bucket durability-adjacent state**, same class as the deployment-keyed tenant hash key: losing the token key loses targeted-confirmation ability (records remain valid); losing KMS key config is recoverable from the `enc` records.
-- **Query tail latency gains the audit flush** (<= `max_age` + one dual-PUT RTT) on every audited surface, in `required` mode, except against a degraded store, where each tenant group in the flush is bounded by `AUDIT_WRITE_BUDGET` (30 s) instead, and a flush writes its groups one after another (2026-09-27 amendment). An event submitted while a flush is in flight pays `max_age` plus two dual-PUT round trips, a case the idle-flush amendment makes more common for the event right behind an idle one. Dashboards polling PromQL pay it too; `max_age` tuning and the documented best-effort opt-out are the relief valves. Before/after numbers are recorded when the implementation lands.
+- **Query tail latency gains the audit flush** (<= `max_age` + one dual-PUT RTT) on every audited surface, in `required` mode (a process with the audit off, the default since the opt-in amendment below, pays none of it), except against a degraded store, where each tenant group in the flush is bounded by `AUDIT_WRITE_BUDGET` (30 s) instead, and a flush writes its groups one after another (2026-09-27 amendment). An event submitted while a flush is in flight pays `max_age` plus two dual-PUT round trips, a case the idle-flush amendment makes more common for the event right behind an idle one. Dashboards polling PromQL pay it too; `max_age` tuning and the documented best-effort opt-out are the relief valves. Before/after numbers are recorded when the implementation lands.
 - **Fail-closed coupling**: in `required` mode an S3 outage now fails queries that the read cache could have served. This is the deliberate trade — the exact complaint was that queries outlive the trail.
 - **KMS cost**: SSE-KMS adds KMS requests per PUT for keyed tenants; S3 Bucket Keys (bucket-side configuration, documented in operations.md) reduce this. MinIO KMS (KES) compatibility gets a docs note; the decorator itself is backend-agnostic since it only builds more `S3Store`s.
 - **IAM/role interaction**: per-tenant BYOK key policies must grant the ADR-0055 role principals (Gateway/Query/Maintain) usage; operations.md's policy templates gain the KMS statements. Revoked key = that tenant fails closed, others unaffected (new failure-path tests with `FaultStore` asserting the injected fault fired).
@@ -308,3 +308,58 @@ and its commit record at about 49 ms each. For sequential traffic this
 amendment removes the 25 ms wait. The two PUTs of about 49 ms each remain,
 and they are the largest part of the floor on a folded tenant; ADR-2509
 defers them.
+
+## Amendment (2026-10-10): the query audit is opt-in, off by default (#2791)
+
+<!-- amendment-applies: sections="2. Audit: one evidential pipeline for every query surface|Consequences" pointer="opt-in amendment" -->
+<!-- amendment-supersedes: phrase="audit_mode=required being the default" pointer="opt-in amendment" -->
+
+This is the opt-in amendment. Section 2b made `audit_mode=required` the
+default, so every query-serving process wrote a query-audit record per query
+and paid the flush on every response. `--audit-mode` (`RAVEL_AUDIT_MODE`)
+now takes three values, and `off` is the default:
+
+| Value | Pipeline | On a failed audit flush |
+|---|---|---|
+| `off` (default) | none installed | not applicable: no record is written |
+| `required` | installed | the query fails closed (HTTP 503 / Flight `Unavailable`) |
+| `best-effort` | installed | the failure is logged and counted, and the response is served |
+
+**`required` stays the recommended value where the trail is evidence.**
+Everything section 2 decides about an enabled audit is unchanged: one
+pipeline per query-serving process, every read surface submitting through
+it, the response released only after its record is durable, the
+`--audit-text` posture, and the retry ladder and idle trigger of the earlier
+amendments. A deployment that relies on the query-audit trail as evidence
+sets `--audit-mode required`.
+
+**`off` installs no pipeline and needs no token key.** Under `off`, `start`
+spawns no `AuditPipeline`, every surface keeps the no-op sink, `/metrics`
+renders no `ravel_audit_*` family, and shutdown has nothing to drain. The
+`--audit-text` posture is not resolved, so the server starts in the default
+`redacted` posture with no `RAVEL_AUDIT_TOKEN_KEY` and no deployment key. A
+key that is set anyway is accepted and not read. The maintenance side of
+section 2c is unchanged: retention and compaction of the query-audit shard
+still run over whatever records an earlier enabled run wrote. The startup
+log stamps the resolved mode (`query audit resolved`, `audit_mode=...`) in
+the query-serving modes.
+
+**The dead-flag refusal is how an operator learns the default moved.** Under
+`off`, a query-serving process (`all` or `query`) with an explicitly passed
+`--audit-text`, `--audit-max-batch` or `--audit-max-age` (or its environment
+variable) refuses to start, naming `--audit-mode required` as the fix. Those
+flags tune a pipeline `off` never installs, so a deployment that passes one
+expects the audit to run. Starting anyway would drop its records without a
+signal; refusing makes the upgrade visible at the first restart. A `gateway`
+or `maintain` process never installed the pipeline and keeps ignoring those
+flags under every audit mode, so an environment shared across tiers that sets
+them for the query tier does not stop the other tiers. A deployment that relied on the old default
+without passing any of them, and without naming the mode, gets no refusal:
+it must set `--audit-mode required` on upgrade, which the changelog states.
+
+**Consequences.** The tail-latency cost in the Consequences section applies
+only to a process with the audit enabled. A process with the audit off pays
+no audit flush and fails no query on an audit write, because it makes none.
+`RAVEL_AUDIT_TOKEN_KEY` stays durability-adjacent state for a deployment
+that enables the audit with `--audit-text redacted`, and is not needed by one
+that does not.

@@ -171,9 +171,11 @@ async fn main() -> anyhow::Result<()> {
     // Resolved here, beside the deployment key its token key can be derived
     // from. Under `redacted` with no key available, this refuses to start
     // only in the modes that install the query-audit pipeline (`all` and
-    // `query`; `Mode::installs_query_audit_pipeline`): a process that will
-    // actually write audit records and cannot tokenize them must not start,
-    // but `gateway` and `maintain` write none and so read no key.
+    // `query`; `Mode::installs_query_audit_pipeline`) with `--audit-mode`
+    // `required` or `best-effort`: a process that will actually write audit
+    // records and cannot tokenize them must not start, but `gateway`,
+    // `maintain`, and any process under `--audit-mode off` (the default)
+    // write none and so read no key.
     let audit_text = cli
         .resolve_audit_text_policy(deployment_key.as_deref())
         .context("failed to resolve --audit-text")?;

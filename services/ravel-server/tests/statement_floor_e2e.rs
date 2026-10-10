@@ -279,8 +279,9 @@ struct Fixture {
 /// An unfolded logs tenant ([`SHARDS`] shards, [`OBJECTS_PER_SHARD`] commit
 /// records in each, no catalog HEAD) behind a recording `FaultStore`, served
 /// by a real `ravel_server::start` in query mode with the background fold off
-/// and `audit_pipeline` as its resolved `--audit-max-batch`/`--audit-max-age`.
-async fn start_fixture(audit_pipeline: ravel_maintain::AuditPipelineConfig) -> Fixture {
+/// and `audit_pipeline` as its resolved `--audit-mode`/`--audit-max-batch`/
+/// `--audit-max-age` (`None` is `--audit-mode off`).
+async fn start_fixture(audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>) -> Fixture {
     let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
     for shard in 0..SHARDS {
         for hour in 0..OBJECTS_PER_SHARD {
@@ -322,7 +323,7 @@ async fn start_fixture(audit_pipeline: ravel_maintain::AuditPipelineConfig) -> F
 
 fn server_config(
     tokens: HashMap<String, TenantId>,
-    audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
 ) -> ServerConfig {
     ServerConfig {
         audit_pipeline,
@@ -466,7 +467,7 @@ async fn wait_for_list_count(log: &RequestLog, n: usize, why: &str) {
 /// size ([`WINDOW_END_HOUR`]) is what selects the prefix path here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_prefix_listing_runs_shards_concurrently_through_http() {
-    let fx = start_fixture(Default::default()).await;
+    let fx = start_fixture(None).await;
     let gate = fx
         .fault
         .hold(Op::List, Some(shard_prefix(0)), Occurrence::Nth(1));
@@ -508,7 +509,7 @@ async fn sql_prefix_listing_runs_shards_concurrently_through_http() {
 /// cached absence each statement repeats the GET.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_missing_catalog_head_is_read_once_through_http() {
-    let fx = start_fixture(Default::default()).await;
+    let fx = start_fixture(None).await;
 
     let (status, value) = run_statement(&fx).await;
     assert_counts_every_record(status, &value);
@@ -551,10 +552,11 @@ async fn sql_missing_catalog_head_is_read_once_through_http() {
 async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
     let max_age = Duration::from_secs(10);
     let bound = Duration::from_secs(5);
-    let audit = ravel_maintain::AuditPipelineConfig {
+    let audit = Some(ravel_maintain::AuditPipelineConfig {
         max_age,
+        audit_mode: ravel_maintain::AuditMode::Required,
         ..Default::default()
-    };
+    });
 
     let fx = start_fixture(audit.clone()).await;
     assert_eq!(fx.log.audit_puts(), (0, 0), "no audit write before a query");
