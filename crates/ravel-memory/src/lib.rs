@@ -48,8 +48,8 @@ pub struct MemoryBudget {
 ///
 /// The 128-byte alignment gives the group a block of its own, apart from
 /// `reserved`: a check site's load of `open` never shares a cache line with
-/// a reservation's CAS, and the sampler's write at most once per interval is
-/// the only thing that invalidates the line. 128 rather than 64 covers
+/// a reservation's CAS, and `set_resident_gate` is the only writer to the
+/// line. 128 rather than 64 covers
 /// adjacent-line prefetch on x86_64 and the 128-byte lines of some aarch64
 /// cores.
 #[derive(Debug)]
@@ -217,7 +217,8 @@ impl MemoryBudget {
     /// [`accounted_refusals`] and [`gate_refusals`] grows by one.
     ///
     /// Gate rule: while the gate is closed, any `n > 0` is refused with
-    /// [`ExhaustionCause::Resident`] before the reservation CAS runs. A
+    /// [`ExhaustionCause::Resident`] before the reservation CAS runs, unless
+    /// the reading and mark it then loads show the gate already reopened. A
     /// zero-byte reservation is always admitted by the gate (the ledger
     /// still refuses it when it is already over `limit`).
     ///
@@ -495,8 +496,9 @@ pub struct MemoryExhausted {
 pub enum ExhaustionCause {
     /// The ledger would have exceeded its limit (or overflowed a `u64`).
     Accounted,
-    /// The resident gate was closed: the process resident reading was at or
-    /// above the high-water mark when the gate was last set.
+    /// The resident gate was closed. `resident` and `high_water` are the
+    /// gate's figures as the refusal read them, and `resident` is at or above
+    /// `high_water`.
     Resident { resident: u64, high_water: u64 },
 }
 
@@ -854,7 +856,9 @@ mod tests {
         assert_eq!(budget.accounted_refusals(), 1);
         assert_eq!(budget.gate_refusals(), 1);
 
-        budget.reserve(101).expect_err("reserve refuses the same way");
+        budget
+            .reserve(101)
+            .expect_err("reserve refuses the same way");
         assert_eq!(
             (budget.accounted_refusals(), budget.gate_refusals()),
             (2, 1)
@@ -870,7 +874,9 @@ mod tests {
         let budget = MemoryBudget::new(100);
         budget.set_resident_gate(400, 500);
         budget.gate.open.store(false, Ordering::Relaxed);
-        budget.try_reserve(1).expect("the figures show the gate open");
+        budget
+            .try_reserve(1)
+            .expect("the figures show the gate open");
         assert_eq!(budget.reserved(), 1);
         assert_eq!(
             (budget.accounted_refusals(), budget.gate_refusals()),
