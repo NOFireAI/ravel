@@ -5,7 +5,11 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$HERE/fresh-box.sh"
+# FRESH_BOX_SCRIPT points the cases at another copy of the script, to show a
+# case failing against a broken one; FRESH_BOX_TEST_BASH names the bash every
+# case runs it under (e.g. /bin/bash 3.2 on macOS).
+SCRIPT="${FRESH_BOX_SCRIPT:-$HERE/fresh-box.sh}"
+TEST_BASH="${FRESH_BOX_TEST_BASH:-bash}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -17,11 +21,36 @@ STUBS="$TMP/stubs"
 mkdir -p "$STUBS"
 cat >"$STUBS/aws" <<'STUB'
 #!/usr/bin/env bash
+# Instances "launched" under the run tag are kept one per line in
+# $STUB_LOG.instances; STUB_LAUNCH picks how run-instances behaves:
+#   ""       launch i-0123456789abcdef0 and print its id
+#   fail     launch it, then exit non-zero with no output
+#   garbage  launch it, then print no parseable id
+#   twice    launch i-0fedcba9876543210 and i-0123456789abcdef0 and print
+#            only the second, as a retried launch without a token would
+#   none     launch nothing and exit non-zero
 echo "aws $*" >>"$STUB_LOG"
+INSTANCES="$STUB_LOG.instances"
 case "$*" in
   *"ec2 describe-images"*) echo /dev/sda1 ;;
-  *"ec2 run-instances"*) echo i-0123456789abcdef0 ;;
+  *"ec2 run-instances"*)
+    case "${STUB_LAUNCH:-}" in
+      none) echo "An error occurred (InvalidAMIID.Malformed)" >&2; exit 254 ;;
+      twice) printf 'i-0fedcba9876543210\ni-0123456789abcdef0\n' >>"$INSTANCES" ;;
+      *) echo i-0123456789abcdef0 >>"$INSTANCES" ;;
+    esac
+    case "${STUB_LAUNCH:-}" in
+      fail) echo "Connection was closed before we received a valid response" >&2; exit 255 ;;
+      garbage) echo "None" ;;
+      *) echo i-0123456789abcdef0 ;;
+    esac
+    ;;
   *"ec2 terminate-instances"*) echo terminating ;;
+  *"--filters"*)
+    [ -n "${STUB_LOOKUP_FAIL:-}" ] && { echo "lookup failed" >&2; exit 255; }
+    [ -f "$INSTANCES" ] && tr '\n' '\t' <"$INSTANCES"
+    echo
+    ;;
   *"State.Name"*) echo "${STUB_STATE:-terminated}" ;;
   *"InstanceType"*) echo c7i.2xlarge ;;
   *"PublicIpAddress"*) printf '203.0.113.5\t10.0.0.5\n' ;;
@@ -58,12 +87,12 @@ COMMIT=0123456789abcdef0123456789abcdef01234567
 ARGS=(
   --instance-type c7i.2xlarge --ami ami-0aaaabbbbccccdddd --subnet subnet-0feedface
   --security-group sg-0c0ffee --region eu-central-1 --access ssh --key-name bench-key
-  --identity-file "$TMP/key.pem" --ssh-user ubuntu --volume-gb 120
+  --identity-file "$TMP/key.pem" --ssh-user ubuntu --volume-gb 120 --max-minutes 90
   --repo-url https://example.invalid/ravel.git --commit "$COMMIT" --out "$TMP/out.json"
   --sample-size 10 --warmup 1 --measure 3 --max-series 2000
 )
 FLAGS=(--instance-type --ami --subnet --security-group --region --access --key-name
-  --identity-file --ssh-user --volume-gb --repo-url --commit --out --sample-size
+  --identity-file --ssh-user --volume-gb --max-minutes --repo-url --commit --out --sample-size
   --warmup --measure --max-series)
 
 # fresh_box <case> [args...]: runs the script with stubs, fast retry knobs and
@@ -73,11 +102,13 @@ fresh_box() {
   shift
   log="$TMP/$name.log"
   : >"$log"
+  rm -f "$log.instances"
   out="$(env -i PATH="$STUBS:/usr/bin:/bin" HOME="$TMP" STUB_LOG="$log" \
     STUB_STATE="${STUB_STATE:-}" STUB_FAIL_BENCH="${STUB_FAIL_BENCH:-}" \
-    FRESH_BOX_CONFIRM_ATTEMPTS=2 FRESH_BOX_CONFIRM_SLEEP=0 \
+    STUB_LAUNCH="${STUB_LAUNCH:-}" STUB_LOOKUP_FAIL="${STUB_LOOKUP_FAIL:-}" \
+    FRESH_BOX_CONFIRM_ATTEMPTS=2 FRESH_BOX_CONFIRM_SLEEP=0 FRESH_BOX_LOOKUP_ATTEMPTS=2 \
     FRESH_BOX_REACH_ATTEMPTS=2 FRESH_BOX_REACH_SLEEP=0 \
-    bash "$SCRIPT" "$@" 2>&1)"
+    "$TEST_BASH" "$SCRIPT" "$@" 2>&1)"
   code=$?
 }
 
@@ -95,6 +126,18 @@ elif ! printf '%s\n' "$out" | grep -q 'DRY-RUN: ssh .*bench-tier-b.sh'; then
   fail dry-run "no ssh line running bench-tier-b.sh record"
 elif ! printf '%s\n' "$out" | grep -q 'DRY-RUN: scp '; then
   fail dry-run "no scp line"
+elif ! run_id="$(printf '%s\n' "$out" | sed -n 's/^fresh-box: run id \([^ ]*\) .*/\1/p')" \
+  || [ -z "$run_id" ]; then
+  fail dry-run "no run id printed"
+elif ! plain="$(printf '%s\n' "$out" | tr -d '\\')" \
+  || ! printf '%s\n' "$plain" | grep -qF -- "--client-token $run_id "; then
+  fail dry-run "run-instances carries no --client-token $run_id"
+elif ! printf '%s\n' "$plain" | grep -qF -- "{Key=ravel-fresh-box-run,Value=$run_id}"; then
+  fail dry-run "run-instances carries no ravel-fresh-box-run=$run_id tag"
+elif ! printf '%s\n' "$plain" | grep -q -- "--user-data .*#!/bin/sh.*shutdown -h +90"; then
+  fail dry-run "run-instances carries no shutdown -h +90 user-data"; printf '%s\n' "$out" | sed 's/^/    /'
+elif ! printf '%s\n' "$plain" | grep -qF -- "--filters Name=tag:ravel-fresh-box-run,Values=$run_id"; then
+  fail dry-run "the trap's lookup by tag is not printed"; printf '%s\n' "$out" | sed 's/^/    /'
 else
   pass dry-run
 fi
@@ -180,6 +223,78 @@ elif ! printf '%s\n' "$out" | grep -q 'COULD NOT CONFIRM TERMINATION of instance
   fail unconfirmed "instance id not printed: $out"
 else
   pass unconfirmed
+fi
+
+# --- the trap finds launched instances by the run tag when it has no id ---
+# run_id_of: the run id the script printed for the last case.
+run_id_of() { printf '%s\n' "$out" | sed -n 's/^fresh-box: run id \([^ ]*\) .*/\1/p'; }
+# tag_case NAME WANT_IDS: the lookup ran with this run's tag, one terminate call
+# named exactly WANT_IDS, each was confirmed, and the exit was 1.
+tag_case() {
+  local name="$1" want="$2" rid term id
+  rid="$(run_id_of)"
+  term="$(grep '^aws ec2 terminate-instances' "$log")"
+  if [ "$code" -ne 1 ]; then
+    fail "$name" "exit $code, want 1"; printf '%s\n' "$out" | sed 's/^/    /'
+  elif [ -z "$rid" ] || ! grep -qF -- "--filters Name=tag:ravel-fresh-box-run,Values=$rid Name=instance-state-name,Values=pending,running,shutting-down,stopping,stopped" "$log"; then
+    fail "$name" "no describe-instances lookup by this run's tag"; sed 's/^/    /' "$log"
+  elif [ "$term" != "aws ec2 terminate-instances --region eu-central-1 --instance-ids $want --output text" ]; then
+    fail "$name" "terminate call was '$term', want ids '$want'"
+  else
+    for id in $want; do
+      if ! printf '%s\n' "$out" | grep -qF "fresh-box: $id is terminated"; then
+        fail "$name" "$id not confirmed: $out"; return
+      fi
+    done
+    pass "$name"
+  fi
+}
+STUB_LAUNCH=fail fresh_box launch-cli-failed "${ARGS[@]}"
+tag_case launch-cli-failed "i-0123456789abcdef0"
+STUB_LAUNCH=garbage fresh_box launch-no-id "${ARGS[@]}"
+tag_case launch-no-id "i-0123456789abcdef0"
+STUB_LAUNCH=twice fresh_box launch-twice "${ARGS[@]}"
+if grep -q '^ssh ' "$log"; then
+  # The run went ahead on the returned id: the trap still ends both.
+  [ "$code" -eq 0 ] || fail launch-twice "exit $code"
+  code=1
+fi
+tag_case launch-twice "i-0123456789abcdef0 i-0fedcba9876543210"
+
+# --- a launch AWS refused leaves nothing to terminate and exits 1 ---
+STUB_LAUNCH=none fresh_box launch-refused "${ARGS[@]}"
+if [ "$code" -ne 1 ]; then
+  fail launch-refused "exit $code, want 1"
+elif grep -q '^aws ec2 terminate-instances' "$log"; then
+  fail launch-refused "terminate called with nothing launched"
+elif ! printf '%s\n' "$out" | grep -qF "no instance found under tag ravel-fresh-box-run=$(run_id_of)"; then
+  fail launch-refused "the empty lookup is not reported: $out"
+else
+  pass launch-refused
+fi
+
+# --- no id and a failed lookup cannot be confirmed: exit 70 naming the tag ---
+STUB_LAUNCH=fail STUB_LOOKUP_FAIL=1 fresh_box lookup-failed "${ARGS[@]}"
+if [ "$code" -ne 70 ]; then
+  fail lookup-failed "exit $code, want 70"
+elif ! printf '%s\n' "$out" | grep -qF "COULD NOT CONFIRM TERMINATION: no instance id and the lookup by tag ravel-fresh-box-run=$(run_id_of) failed"; then
+  fail lookup-failed "the run tag is not printed: $out"
+else
+  pass lookup-failed
+fi
+
+# --- a failing step's own exit code is reported as 1 ---
+STUB_FAIL_BENCH=1 fresh_box midfail-code "${ARGS[@]}"
+if [ "$code" -ne 1 ]; then fail failure-code "exit $code, want 1"; else pass failure-code; fi
+
+# --- each run gets a fresh run id ---
+fresh_box dry-a --dry-run "${ARGS[@]}"
+first="$(run_id_of)"
+fresh_box dry-b --dry-run "${ARGS[@]}"
+if [ -z "$first" ] || [ "$first" = "$(run_id_of)" ]; then
+  fail run-id-unique "two runs printed run id '$first'"
+else
+  pass run-id-unique
 fi
 
 # --- --help names every input ---
