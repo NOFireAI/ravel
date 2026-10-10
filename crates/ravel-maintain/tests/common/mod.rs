@@ -451,8 +451,36 @@ pub async fn seed_rlog_input_at_hour(
     unchecked_stream_attrs: bool,
     segment_format_version: u32,
 ) -> String {
+    seed_rlog_input_with_config(
+        store,
+        writer_id,
+        epoch,
+        seq,
+        hour,
+        records,
+        unchecked_stream_attrs,
+        segment_format_version,
+        ravel_logseg::RlogConfig::default(),
+    )
+    .await
+}
+
+/// [`seed_rlog_input_at_hour`] with the writer geometry `config` (block target,
+/// row group size) in place of [`ravel_logseg::RlogConfig::default`].
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_rlog_input_with_config(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    epoch: u64,
+    seq: u64,
+    hour: u32,
+    records: &[ravel_logseg::LogRecord],
+    unchecked_stream_attrs: bool,
+    segment_format_version: u32,
+    config: ravel_logseg::RlogConfig,
+) -> String {
+    use ravel_logseg::RlogWriter;
     use ravel_logseg::writer::ObjectIdentity;
-    use ravel_logseg::{RlogConfig, RlogWriter};
     let th = tenant_hash();
     let identity = ObjectIdentity {
         tenant_hash: th.0,
@@ -461,7 +489,7 @@ pub async fn seed_rlog_input_at_hour(
         writer_epoch: epoch,
         writer_seq: seq,
     };
-    let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    let mut w = RlogWriter::new(config, identity);
     if unchecked_stream_attrs {
         w = w.with_unchecked_stream_attrs();
     }
