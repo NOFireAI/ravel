@@ -9,23 +9,20 @@
 //! version at or below the bound instead. A `.pqm` key under a table's `v/`
 //! prefix whose slot names no version at all
 //! ([`ListedManifestKey::InvalidVersion`]) is treated the same way: every
-//! listing here, and the sweep's, skips it rather than failing when the store
-//! lists it. The S3 adapter cannot list such a key holding a control
-//! character, an empty segment or a `.` or `..` segment: [`versions`], and so
-//! every resolve of that table, fails with [`ResolveError::Store`] instead,
-//! as do the tenant-wide listings. Each listing that finds either kind is
+//! listing here, and the sweep's, skips it rather than failing. A key the
+//! store cannot address (a control character, an empty segment or a `.` or
+//! `..` segment among them) is listed as unaddressable instead, as described
+//! below. Each listing that finds either kind is
 //! counted, and the table is reported once per process as an
 //! [`AboveBoundVersions`] warning.
 //!
 //! A key the Query grant admits whose segment between `pq/t/` and `/v/` is
 //! not a valid table name ([`ListedManifestKey::InvalidTable`]) belongs to no
 //! table, so no per-table listing sees it. The tenant-wide listings here and
-//! in the sweep skip it the same way when the store lists it, count each
-//! listing that finds one per tenant ([`invalid_table_listings`]) and report
-//! the tenant once per process as an [`InvalidTableKeys`] warning. The S3
-//! adapter cannot list such a key holding a control character, an empty
-//! segment or a `.` or `..` segment: the listing fails with
-//! [`ResolveError::Store`] instead.
+//! in the sweep skip it the same way, count each listing that finds one per
+//! tenant ([`invalid_table_listings`]) and report the tenant once per process
+//! as an [`InvalidTableKeys`] warning. Such a key the store cannot address is
+//! listed as unaddressable instead.
 //!
 //! A key the store lists but reports unaddressable
 //! ([`ravel_object_store::is_addressable_key`]) is in no listing's objects, so
@@ -478,9 +475,7 @@ async fn list_grouped(
 /// skipped and counted ([`above_bound_resolves`]); any other key that is not a
 /// version of this table is [`ResolveError::ForeignKey`]. A key the store
 /// reports unaddressable is skipped, and the listing is counted per tenant
-/// ([`unaddressable_listings`]). On S3 such a key holding a control
-/// character, an empty segment or a `.` or `..` segment fails the listing with
-/// [`ResolveError::Store`].
+/// ([`unaddressable_listings`]), whatever made it unaddressable.
 pub async fn versions(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -503,9 +498,7 @@ pub async fn versions(
 /// ([`invalid_table_listings`]). Any other key under that prefix that is not
 /// a manifest key is [`ResolveError::ForeignKey`]. Keys the store reports
 /// unaddressable are skipped, returned in [`TenantListing::unaddressable`],
-/// and the listing is counted per tenant ([`unaddressable_listings`]). On S3
-/// a key under that prefix holding a control character, an empty segment or a
-/// `.` or `..` segment fails the listing with [`ResolveError::Store`].
+/// and the listing is counted per tenant ([`unaddressable_listings`]).
 pub async fn tenant_listing(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
