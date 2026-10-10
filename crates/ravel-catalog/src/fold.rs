@@ -275,14 +275,15 @@ pub struct FoldReport {
     /// band uses; a request naming more hours than the cap allows carries the
     /// remainder to whichever later fold the requester asks again, and this
     /// field counts only the hours this call actually re-listed. `0` on a
-    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]), and on a request
-    /// submitted to a first fold, a rebuild, or a fold call that turns out to
-    /// be a no-op: the pass sits inside the same reconcile branch as the fixed
-    /// window and the frontier band, which runs on none of the three (a no-op
-    /// fold has nothing newly sealed), so a request against an unchanged
-    /// watermark reconciles nothing regardless of what it names
-    /// (docs/adrs/0064-selective-subject-erasure.md, the no-op carve-out). The
-    /// requester resubmits a still-held hour on its next sweep.
+    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]), on a first fold or
+    /// a rebuild (both derive every hour from the commit layout, so the pass
+    /// does not run), on a no-op fold over a HEAD with no held-open hours
+    /// (it returns before any reconcile), and when every requested hour is
+    /// one this fold lists anyway (the fixed window, the frontier band, or
+    /// the held-open hours) or one no snapshot entry names. A fold that
+    /// re-lists held-open hours without advancing the watermark runs the
+    /// pass before deciding `no_op`, so this field can be nonzero on a no-op
+    /// report. The requester resubmits a still-held hour on its next sweep.
     pub refold_hours_reconciled: usize,
     /// Stamped carriers this fold read: L0 commit records whose
     /// `declared_column_stats` (field 20) was non-empty, plus L1 compaction
@@ -1348,8 +1349,14 @@ impl Catalog {
                 .filter(|target| head_state.watermark_hour().is_none_or(|old| *target > old));
             // `held_listings` is `Some` only on a fold that does not advance
             // the watermark and runs solely to fold a late commit into a
-            // held-open hour: its reconcile pass is those listings and
-            // nothing else.
+            // held-open hour: its reconcile pass is those listings, plus a
+            // targeted re-fold pass over any `refold_request` hours outside
+            // the held range (see the reconcile-pass match below).
+            //
+            // `held_open_probe_cache` holds the parts the held-open pre-check
+            // already read, keyed by part object key, so the main load below
+            // reads each part once per fold. Empty on every other path.
+            let mut held_open_probe_cache: HashMap<String, Vec<SnapshotEntry>> = HashMap::new();
             let (watermark_hour, held_listings) = match (advance_to, held_open, &head_state) {
                 (Some(target), _, _) => (target, None),
                 (None, Some(held), HeadState::Valid { head, .. }) => {
@@ -1358,14 +1365,21 @@ impl Catalog {
                         .discover_bucket_listings(tenant, signal, &held_buckets)
                         .await?;
                     counters.list_requests += held_buckets.len() as u64;
-                    if !self
+                    let (has_unfolded, probe_cache) = self
                         .held_open_has_unfolded(head, held, &listings, &mut counters)
-                        .await
-                    {
+                        .await;
+                    held_open_probe_cache = probe_cache;
+                    // A quiet held range returns before the full snapshot
+                    // load, unless a refold request is queued: the targeted
+                    // pass below needs every entry, and a fold over this HEAD
+                    // takes no other path until the margin passes the
+                    // watermark.
+                    if !has_unfolded && refold_request.is_empty() {
                         return Ok(no_op_report(
                             Some(head.watermark_hour),
                             applied_seal_through,
                             counters,
+                            0,
                         ));
                     }
                     (head.watermark_hour, Some(listings))
@@ -1375,13 +1389,14 @@ impl Catalog {
                         head_state.watermark_hour(),
                         applied_seal_through,
                         counters,
+                        0,
                     ));
                 }
             };
 
             let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
                 HeadState::Valid { head, .. } => match self
-                    .load_previous_entries(head, &mut counters)
+                    .load_previous_entries(head, &held_open_probe_cache, &mut counters)
                     .await
                 {
                     Ok(entries) => {
@@ -1531,7 +1546,9 @@ impl Catalog {
             // time (issue #526).
             let mut frontier_listed_hours: HashSet<u32> = HashSet::new();
             let mut refold_hours_reconciled: u64 = 0;
-            if let (Some(listings), Some(_)) = (&held_listings, reconcile_watermark) {
+            if let (Some(listings), Some(held), Some(_)) =
+                (&held_listings, held_open, reconcile_watermark)
+            {
                 // A fold that does not advance the watermark re-lists only
                 // the held-open hours: every other hour is reconciled by the
                 // next fold that does advance it, exactly as on a no-op fold.
@@ -1553,6 +1570,24 @@ impl Catalog {
                     )
                     .await?;
                 }
+                // The held hours were just listed above, so the targeted
+                // pass skips them.
+                refold_hours_reconciled = self
+                    .run_targeted_refold_pass(
+                        tenant,
+                        signal,
+                        &generations,
+                        refold_request,
+                        |hour| (held.0..=held.1).contains(&hour),
+                        &accounting,
+                        &mut entries,
+                        &mut seen,
+                        &mut dirty_hours,
+                        &mut counters,
+                        &mut layout_drift_count,
+                        &mut coverage,
+                    )
+                    .await?;
             } else if let Some(watermark_hour_old) = reconcile_watermark {
                 let window = self.config().fold_reconcile_window_hours;
                 // The window always reaches the held-open hours, which sit at
@@ -1692,91 +1727,27 @@ impl Catalog {
                 // instead of deleting them, and they occupy storage until
                 // retention drops the hour. `refold_request` is how the holder
                 // names those hours (see `RefoldRequest` for why the fold
-                // cannot derive them itself), and this pass re-lists them
-                // through the same per-bucket reconcile the other two use.
-                //
-                // Three filters keep the pass targeted, and together they are
-                // what bounds its work to the hours that can actually be
-                // leaking:
-                //
-                // - `< lo` drops anything the fixed window already lists,
-                //   which also drops every hour at or above the old watermark
-                //   (the incremental range folds those fresh this cycle).
-                // - `!frontier_listed_hours` drops what the frontier pass just
-                //   listed, so no bucket is listed twice in one fold.
-                // - `named_hours` drops hours no snapshot entry covers. Such an
-                //   hour cannot be blocking a delete on HEAD reachability, so
-                //   listing it is pure cost.
-                //
-                // Whatever survives is capped oldest-first, so one caller
-                // reporting a large blocked set cannot turn a fold into an
-                // unbounded LIST fan-out.
-                //
-                // The cap is `frontier_reconcile_max_hours`, read from the
-                // runtime config rather than from its default, which is what
-                // makes "the two sparse passes share one cap" true for an
-                // operator who lowers it and not only for one who leaves it
-                // alone. The bound suits both for the same reason: it sits far
-                // above the steady-state set, so it only ever bounds a recovery
-                // case.
-                //
-                // The remainder is not tracked in the snapshot: the requester
-                // re-derives its blocked set each pass, so a still-blocked hour
-                // comes back on the next request.
-                if !refold_request.is_empty() {
-                    let named_hours: HashSet<u32> =
-                        entries.iter().map(|e| e.ingest_hour_bucket).collect();
-                    // `RefoldRequest` iterates ascending, so this is
-                    // oldest-first without a sort: the hours whose held inputs
-                    // have occupied storage longest are reconciled before the
-                    // cap is spent.
-                    let candidates: Vec<u32> = refold_request
-                        .hours()
-                        .filter(|hour| {
-                            *hour < lo
-                                && !frontier_listed_hours.contains(hour)
-                                && named_hours.contains(hour)
-                        })
-                        .collect();
-                    let cap = self.config().frontier_reconcile_max_hours as usize;
-                    let take = candidates.len().min(cap);
-                    if take < candidates.len() {
-                        tracing::warn!(
-                            tenant = %tenant.to_hex(),
-                            requested = candidates.len(),
-                            reconciled = take,
-                            "targeted re-fold request exceeds the per-fold cap; the remainder is \
-                             carried to whichever later fold the requester asks for it again"
-                        );
-                    }
-                    let refold_hours = &candidates[..take];
-                    if !refold_hours.is_empty() {
-                        let refold_buckets = hour_set_buckets(&generations, refold_hours);
-                        let refold_listings = self
-                            .discover_bucket_listings(tenant, signal, &refold_buckets)
-                            .await?;
-                        counters.list_requests += refold_buckets.len() as u64;
-                        refold_hours_reconciled = refold_hours.len() as u64;
-                        for (shard, hour, listing) in &refold_listings {
-                            self.reconcile_one_bucket(
-                                tenant,
-                                signal,
-                                *shard,
-                                *hour,
-                                listing,
-                                &accounting,
-                                &mut entries,
-                                &mut seen,
-                                &mut dirty_hours,
-                                &mut counters,
-                                &mut layout_drift_count,
-                                &mut coverage,
-                                false,
-                            )
-                            .await?;
-                        }
-                    }
-                }
+                // cannot derive them itself). [`Self::run_targeted_refold_pass`]
+                // re-lists them through the same per-bucket reconcile the
+                // other two passes use, excluding whatever the fixed window
+                // (`< lo`) or the frontier pass (`frontier_listed_hours`) just
+                // covered, so no bucket is listed twice in one fold.
+                refold_hours_reconciled = self
+                    .run_targeted_refold_pass(
+                        tenant,
+                        signal,
+                        &generations,
+                        refold_request,
+                        |hour| hour >= lo || frontier_listed_hours.contains(&hour),
+                        &accounting,
+                        &mut entries,
+                        &mut seen,
+                        &mut dirty_hours,
+                        &mut counters,
+                        &mut layout_drift_count,
+                        &mut coverage,
+                    )
+                    .await?;
             }
             if refold_hours_reconciled > 0 {
                 tracing::debug!(
@@ -1786,12 +1757,14 @@ impl Catalog {
                 );
             }
             // A fold run only for the held-open hours whose reconcile found
-            // every listed commit already folded writes nothing.
+            // every listed commit already folded writes nothing. The report
+            // still carries the hours the targeted pass re-listed.
             if held_listings.is_some() && !rebuilt && dirty_hours.is_empty() {
                 return Ok(no_op_report(
                     Some(watermark_hour),
                     applied_seal_through,
                     counters,
+                    refold_hours_reconciled,
                 ));
             }
             // A reconcile that changed any hour invalidates the append-only,
@@ -2611,13 +2584,22 @@ impl Catalog {
     /// against its recorded blake3 before trusting its entries. Any
     /// failure (GET error, hash mismatch, decode error) is returned to the
     /// caller, which falls back to a full rebuild.
+    ///
+    /// `probe_cache` holds the parts a held-open fold's
+    /// `held_open_has_unfolded` pre-check already read, keyed by part object
+    /// key, so each part is read once per fold. Empty on every other path.
     async fn load_previous_entries(
         &self,
         head: &SnapshotHead,
+        probe_cache: &HashMap<String, Vec<SnapshotEntry>>,
         counters: &mut RequestCounters,
     ) -> Result<Vec<SnapshotEntry>, CatalogError> {
         let mut entries = Vec::new();
         for part_ref in &head.parts {
+            if let Some(cached) = probe_cache.get(&part_ref.key) {
+                entries.extend(cached.iter().cloned());
+                continue;
+            }
             entries.extend(self.load_part_entries(part_ref, counters).await?);
         }
         Ok(entries)
@@ -2652,13 +2634,18 @@ impl Catalog {
     /// listings name no commit record. A part that cannot be read answers
     /// true, so the caller takes the full fold path, whose own load of the
     /// same part fails and rebuilds.
+    ///
+    /// Also returns every part read here, keyed by part object key, so
+    /// `load_previous_entries` does not read it again this fold. A part that
+    /// fails here is not cached; the main load reads it again and rebuilds on
+    /// the same failure.
     async fn held_open_has_unfolded(
         &self,
         head: &SnapshotHead,
         held: (u32, u32),
         listings: &[BucketListing],
         counters: &mut RequestCounters,
-    ) -> bool {
+    ) -> (bool, HashMap<String, Vec<SnapshotEntry>>) {
         let names_a_commit = listings.iter().any(|(_, _, listing)| {
             listing.iter().any(|meta| {
                 matches!(
@@ -2668,27 +2655,32 @@ impl Catalog {
             })
         });
         if !names_a_commit {
-            return false;
+            return (false, HashMap::new());
         }
         let mut folded: HashSet<EntryIdentity> = HashSet::new();
+        let mut loaded: HashMap<String, Vec<SnapshotEntry>> = HashMap::new();
         for part_ref in head
             .parts
             .iter()
             .filter(|part| part.min_hour <= held.1 && part.watermark_hour >= held.0)
         {
             match self.load_part_entries(part_ref, counters).await {
-                Ok(entries) => folded.extend(
-                    entries
-                        .iter()
-                        .filter(|entry| (held.0..=held.1).contains(&entry.ingest_hour_bucket))
-                        .map(entry_identity),
-                ),
-                Err(_) => return true,
+                Ok(entries) => {
+                    folded.extend(
+                        entries
+                            .iter()
+                            .filter(|entry| (held.0..=held.1).contains(&entry.ingest_hour_bucket))
+                            .map(entry_identity),
+                    );
+                    loaded.insert(part_ref.key.clone(), entries);
+                }
+                Err(_) => return (true, loaded),
             }
         }
-        listings
+        let has_unfolded = listings
             .iter()
-            .any(|(_, _, listing)| lists_an_unfolded_commit(listing, |id| folded.contains(id)))
+            .any(|(_, _, listing)| lists_an_unfolded_commit(listing, |id| folded.contains(id)));
+        (has_unfolded, loaded)
     }
 
     /// Load and verify the previous fold's postings object before trusting
@@ -3069,6 +3061,86 @@ impl Catalog {
         Ok(())
     }
 
+    /// The targeted re-fold pass (issue #526): re-lists and reconciles the
+    /// `refold_request` hours that survive `exclude` and are named by
+    /// `entries`, oldest-first, capped at `frontier_reconcile_max_hours`.
+    /// Both the advancing path and the held-open-only path call it.
+    ///
+    /// `exclude` drops the hours the caller already lists this fold (the
+    /// fixed window and frontier band when advancing, the held-open range
+    /// otherwise), so no bucket is listed twice. An hour no entry names
+    /// cannot be blocking a delete on HEAD reachability, so it is dropped
+    /// uncounted.
+    ///
+    /// Returns the number of hours re-listed.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_targeted_refold_pass(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        generations: &[ShardGeneration],
+        refold_request: &RefoldRequest,
+        exclude: impl Fn(u32) -> bool,
+        accounting: &QueryAccounting,
+        entries: &mut Vec<SnapshotEntry>,
+        seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+        dirty_hours: &mut HashSet<u32>,
+        counters: &mut RequestCounters,
+        layout_drift_count: &mut u64,
+        coverage: &mut declared_stats::StampCoverage,
+    ) -> Result<u64, CatalogError> {
+        if refold_request.is_empty() {
+            return Ok(0);
+        }
+        let named_hours: HashSet<u32> = entries.iter().map(|e| e.ingest_hour_bucket).collect();
+        // `RefoldRequest` iterates ascending, so this is oldest-first without
+        // a sort: the hours whose held inputs have occupied storage longest
+        // are reconciled before the cap is spent.
+        let candidates: Vec<u32> = refold_request
+            .hours()
+            .filter(|hour| !exclude(*hour) && named_hours.contains(hour))
+            .collect();
+        let cap = self.config().frontier_reconcile_max_hours as usize;
+        let take = candidates.len().min(cap);
+        if take < candidates.len() {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                requested = candidates.len(),
+                reconciled = take,
+                "targeted re-fold request exceeds the per-fold cap; the remainder is \
+                 carried to whichever later fold the requester asks for it again"
+            );
+        }
+        let refold_hours = &candidates[..take];
+        if refold_hours.is_empty() {
+            return Ok(0);
+        }
+        let refold_buckets = hour_set_buckets(generations, refold_hours);
+        let refold_listings = self
+            .discover_bucket_listings(tenant, signal, &refold_buckets)
+            .await?;
+        counters.list_requests += refold_buckets.len() as u64;
+        for (shard, hour, listing) in &refold_listings {
+            self.reconcile_one_bucket(
+                tenant,
+                signal,
+                *shard,
+                *hour,
+                listing,
+                accounting,
+                entries,
+                seen,
+                dirty_hours,
+                counters,
+                layout_drift_count,
+                coverage,
+                false,
+            )
+            .await?;
+        }
+        Ok(refold_hours.len() as u64)
+    }
+
     /// Classify one `(shard, hour)` commit bucket's listing into the entries
     /// it should contribute to the snapshot, the single shared classifier for both the incremental fold loop and
     /// the reconcile pass (ADR-0063 section 4). Partitioning the bucket's keys
@@ -3446,6 +3518,7 @@ fn no_op_report(
     watermark_hour: Option<u32>,
     seal_through_hour: Option<u32>,
     counters: RequestCounters,
+    refold_hours_reconciled: u64,
 ) -> FoldReport {
     FoldReport {
         watermark_hour,
@@ -3467,10 +3540,11 @@ fn no_op_report(
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
-        // The carve-out this field documents: a no-op fold never reaches the
-        // reconcile branch that runs the targeted re-fold pass, so a request
-        // against it reconciles zero hours regardless of what it names.
-        refold_hours_reconciled: 0,
+        // Usually `0` (a no-op fold normally never reaches a reconcile
+        // branch at all), but the held-open-only path runs the targeted
+        // re-fold pass BEFORE deciding `no_op`, so the caller can tell a
+        // fully-reconciled request apart from one this fold never looked at.
+        refold_hours_reconciled: refold_hours_reconciled as usize,
         // A no-op fold reads no commit record and writes no entry, so it has
         // no coverage to report and contributes nothing to the process-global
         // totals either.
@@ -9707,6 +9781,377 @@ mod tests {
         // HEAD and the tenant config, then each snapshot part, since the
         // listing names commit records.
         assert_eq!(quiet.get_requests, 2 + next.parts_total, "{quiet:?}");
+    }
+
+    /// A fold whose held-open range is quiet still reconciles a requested
+    /// hour outside that range: every fold over this HEAD takes the
+    /// held-open path until the margin passes the watermark, so a request it
+    /// skipped would stay stale however often it was resubmitted. An early
+    /// return on `!has_unfolded` alone leaves `refold_hours_reconciled` at 0
+    /// and HEAD naming the superseded segment at `H - 5`.
+    #[tokio::test]
+    async fn held_open_quiet_fold_still_serves_a_refold_request_outside_the_range() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+
+        let stale =
+            publish_segment(&store, 0, Uuid::new_v4(), 1, H - 5, now - 5 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+
+        // A late compaction lands in hour H - 5, well below the held-open
+        // range [H - 2, H] (margin hour H - 3, default 26-hour window), after
+        // the hour was already folded.
+        let compaction =
+            publish_compaction(&store, 0, H - 5, &[&stale], now - 4 * NS_PER_HOUR).await;
+
+        // Still well inside H's natural margin, and nothing new published
+        // into the held-open range itself: without a request this fold would
+        // be the ordinary quiet no-op the test above exercises.
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert!(later < now_at_seal(H));
+        let second = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later,
+                &[],
+                None,
+                &RefoldRequest::from_hours([H - 5]),
+                None,
+            )
+            .await
+            .expect("second fold");
+
+        assert!(
+            !second.no_op,
+            "the targeted pass found hour H-5 dirty: {second:?}"
+        );
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+        assert_eq!(
+            second.refold_hours_reconciled, 1,
+            "the out-of-range requested hour was reconciled, not dropped"
+        );
+
+        let head_keys = head_object_keys(store.as_ref()).await;
+        assert!(
+            head_keys.contains(
+                &keys::reconstruct_l1_part_key(&compaction, &compaction.parts[0])
+                    .expect("l1 part key")
+            ),
+            "hour H-5 must now name the compaction output: {head_keys:?}"
+        );
+        assert!(
+            !head_keys.contains(&keys::reconstruct_data_key(&stale).expect("data key")),
+            "hour H-5 must no longer name its superseded L0 input: {head_keys:?}"
+        );
+    }
+
+    /// A requested hour that is already clean still counts as reconciled on
+    /// a held-open fold that stays a no-op. The server's `run_tick` dequeues
+    /// a no-op fold's request only when this count is nonzero, so a pass
+    /// that counted only changed hours would leave a clean hour queued.
+    #[tokio::test]
+    async fn held_open_quiet_fold_reconciles_a_clean_requested_hour_without_going_dirty() {
+        const H: u32 = 480_000;
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, H - 5, now - 5 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+
+        // No late record anywhere: hour H - 5 is already exactly what the
+        // snapshot holds, and the held-open range [H - 2, H] is quiet too.
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert!(later < now_at_seal(H));
+        let second = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later,
+                &[],
+                None,
+                &RefoldRequest::from_hours([H - 5]),
+                None,
+            )
+            .await
+            .expect("second fold");
+
+        assert!(
+            second.no_op,
+            "nothing changed anywhere, in or out of the held range: {second:?}"
+        );
+        assert_eq!(
+            second.refold_hours_reconciled, 1,
+            "the clean requested hour was still reconciled, so a caller can dequeue it"
+        );
+    }
+
+    /// Records every `get()` key, so a fold-cost test can tell one part read
+    /// twice from two parts read once each. Every other method delegates.
+    struct GetLoggingStore<S> {
+        inner: S,
+        get_keys: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl<S> GetLoggingStore<S> {
+        fn new(inner: S) -> Self {
+            GetLoggingStore {
+                inner,
+                get_keys: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The keys `get()` was called with since the last call, in order.
+        fn take_get_keys(&self) -> Vec<String> {
+            std::mem::take(&mut *self.get_keys.lock())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for GetLoggingStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.get_keys.lock().push(key.to_string());
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// How many times each of `part_keys` appears in `get_keys`.
+    fn part_get_counts(part_keys: &[String], get_keys: &[String]) -> Vec<usize> {
+        part_keys
+            .iter()
+            .map(|part| get_keys.iter().filter(|key| *key == part).count())
+            .collect()
+    }
+
+    /// A HEAD sealed through `H` at `now_inside(H)` with one snapshot part per
+    /// hour (`snapshot_part_max_entries = 1`, one shard): hours `H - 6` and
+    /// `H - 5` lie below the held-open range `[H - 2, H]` a fold five minutes
+    /// later sees, hours `H - 1` and `H` inside it. Returns the catalog, the
+    /// commit record published into `H - 1` before the seal, and the HEAD's
+    /// part keys with how many of them cover the held range.
+    async fn four_part_held_open_fixture(
+        inner: &Arc<MemoryStore>,
+        store: &Arc<GetLoggingStore<Arc<MemoryStore>>>,
+        compact_h_minus_1: bool,
+    ) -> (Catalog, Vec<String>, usize) {
+        const H: u32 = 480_000;
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 1,
+                snapshot_part_max_entries: 1,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+        let now = now_inside(H);
+        publish_segment(inner, 0, Uuid::new_v4(), 1, H - 6, now - 6 * NS_PER_HOUR).await;
+        publish_segment(inner, 0, Uuid::new_v4(), 2, H - 5, now - 5 * NS_PER_HOUR).await;
+        let a = publish_segment(inner, 0, Uuid::new_v4(), 3, H - 1, now - NS_PER_HOUR).await;
+        if compact_h_minus_1 {
+            let b = publish_segment(inner, 0, Uuid::new_v4(), 4, H - 1, now - NS_PER_HOUR).await;
+            publish_compaction(inner, 0, H - 1, &[&a, &b], now - 30 * 60 * 1_000_000_000).await;
+        }
+        publish_segment(inner, 0, Uuid::new_v4(), 5, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+        assert_eq!(sealed.parts_total, 4, "one part per hour: {sealed:?}");
+
+        let head = read_metrics_head(inner).await;
+        let held = held_open_hours(
+            H,
+            catalog.margin_watermark_hour(now + 5 * 60 * 1_000_000_000),
+            catalog.config().fold_reconcile_window_hours,
+        )
+        .expect("H is held open five minutes later");
+        assert_eq!(held, (H - 2, H));
+        let covering = head
+            .parts
+            .iter()
+            .filter(|part| part.min_hour <= held.1 && part.watermark_hour >= held.0)
+            .count();
+        assert_eq!(covering, 2, "the parts of H - 1 and H cover the held range");
+        let part_keys = head.parts.iter().map(|part| part.key.clone()).collect();
+        store.take_get_keys();
+        (catalog, part_keys, covering)
+    }
+
+    /// A held-open fold that folds a late commit reads every snapshot part
+    /// exactly once: the parts covering the held range in the pre-check, and
+    /// only the other parts in the main load. Reading the covering parts
+    /// again in the main load adds `covering` to the figure.
+    #[tokio::test]
+    async fn held_open_fold_of_a_late_commit_gets_each_snapshot_part_once() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(GetLoggingStore::new(inner.clone()));
+        let (catalog, part_keys, covering) =
+            four_part_held_open_fixture(&inner, &store, false).await;
+
+        publish_segment(&inner, 0, Uuid::new_v4(), 6, H - 1, now_inside(H) + 1).await;
+        let later = now_inside(H) + 5 * 60 * 1_000_000_000;
+        let next = fold_sealing(&catalog, later, None).await;
+        assert!(!next.no_op, "the late commit is folded: {next:?}");
+        assert!(!next.rebuilt, "{next:?}");
+        assert_eq!(next.entry_count, 5, "{next:?}");
+
+        let get_keys = store.take_get_keys();
+        assert_eq!(
+            part_get_counts(&part_keys, &get_keys),
+            vec![1; part_keys.len()],
+            "each part of the previous HEAD is read once: {get_keys:?}"
+        );
+        // HEAD and the tenant config, each of the previous HEAD's parts once
+        // (`covering` of them in the pre-check, the rest in the main load),
+        // then both commit records in the reconciled bucket H - 1.
+        let parts = part_keys.len() as u64;
+        assert_eq!(parts, 4);
+        assert_eq!(covering, 2);
+        assert_eq!(next.get_requests, 2 + parts + 2, "{next:?}");
+    }
+
+    /// The compact-then-seal order: hour `H - 1` was compacted before the
+    /// seal, so its listing still names the two compacted level-0 records,
+    /// which the snapshot holds only as the compaction's level-1 part. The
+    /// pre-check therefore takes the full path on every fold in the window;
+    /// that path still reads each snapshot part exactly once, then the
+    /// bucket's compaction record and both level-0 records, and writes
+    /// nothing.
+    #[tokio::test]
+    async fn held_open_compacted_hour_reads_each_snapshot_part_once_and_stays_a_no_op() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(GetLoggingStore::new(inner.clone()));
+        let (catalog, part_keys, covering) =
+            four_part_held_open_fixture(&inner, &store, true).await;
+        let head_before = read_metrics_head(&inner).await;
+
+        let later = now_inside(H) + 5 * 60 * 1_000_000_000;
+        let quiet = fold_sealing(&catalog, later, None).await;
+        assert!(quiet.no_op, "nothing new in the held range: {quiet:?}");
+        assert_eq!(
+            read_metrics_head(&inner).await.parts,
+            head_before.parts,
+            "no HEAD was written"
+        );
+
+        let get_keys = store.take_get_keys();
+        assert_eq!(
+            part_get_counts(&part_keys, &get_keys),
+            vec![1; part_keys.len()],
+            "each part of the HEAD is read once: {get_keys:?}"
+        );
+        // HEAD and the tenant config, each part once (`covering` of them in
+        // the pre-check), then the compaction record and its two level-0
+        // inputs in bucket H - 1.
+        let parts = part_keys.len() as u64;
+        assert_eq!(parts, 4);
+        assert_eq!(covering, 2);
+        assert_eq!(quiet.get_requests, 2 + parts + 3, "{quiet:?}");
+    }
+
+    /// A quiet held-open fold reads only the parts covering the held range;
+    /// the same fold with a refold request queued loads the whole snapshot,
+    /// each part once, and still writes nothing when the requested hour is
+    /// clean.
+    #[tokio::test]
+    async fn held_open_quiet_fold_loads_the_whole_snapshot_only_for_a_refold_request() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(GetLoggingStore::new(inner.clone()));
+        let (catalog, part_keys, covering) =
+            four_part_held_open_fixture(&inner, &store, false).await;
+        let later = now_inside(H) + 5 * 60 * 1_000_000_000;
+
+        let quiet = fold_sealing(&catalog, later, None).await;
+        assert!(quiet.no_op, "{quiet:?}");
+        let get_keys = store.take_get_keys();
+        // The parts of H - 6 and H - 5 are not read; H - 1 and H are.
+        assert_eq!(part_get_counts(&part_keys, &get_keys), vec![0, 0, 1, 1]);
+        // HEAD and the tenant config, then the covering parts.
+        assert_eq!(quiet.get_requests, 2 + covering as u64, "{quiet:?}");
+
+        let requested = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later + 60 * 1_000_000_000,
+                &[],
+                None,
+                &RefoldRequest::from_hours([H - 6]),
+                None,
+            )
+            .await
+            .expect("fold");
+        assert!(
+            requested.no_op,
+            "the requested hour is clean: {requested:?}"
+        );
+        assert_eq!(requested.refold_hours_reconciled, 1, "{requested:?}");
+        let get_keys = store.take_get_keys();
+        assert_eq!(
+            part_get_counts(&part_keys, &get_keys),
+            vec![1; part_keys.len()],
+            "{get_keys:?}"
+        );
+        // HEAD and the tenant config, then every part once. Bucket H - 6
+        // holds only a level-0 record, so the targeted pass lists it and
+        // reads nothing.
+        assert_eq!(
+            requested.get_requests,
+            2 + part_keys.len() as u64,
+            "{requested:?}"
+        );
     }
 
     #[test]
