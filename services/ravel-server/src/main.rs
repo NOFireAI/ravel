@@ -924,6 +924,9 @@ mod tests {
     fn startup_enables_and_stamps_the_allocator_background_thread() {
         use tikv_jemalloc_ctl::background_thread;
 
+        let _jemalloc = JEMALLOC_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             std::env::var_os(ravel_server::mem_stats::MALLOC_CONF_ENV).is_none(),
             "this test asserts the default path; unset _RJEM_MALLOC_CONF to run it"
