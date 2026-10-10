@@ -54,7 +54,7 @@ all. Some keys split more than one family:
 | `carrier` | The declared-statistics drop tally across its four carrier labels. |
 | `allocator`, `stat` | The process allocator gauges. |
 | `component` | The memory budget's reserved-bytes gauge by which side reserved it. |
-| `gate`, `site` | The CPU gate families by gate and by call site, each from a closed set. |
+| `gate`, `site` | The CPU gate families by gate and by call site, each from a closed set. `site` also splits the memory gate's two refusal counters (`ravel_memory_gate_refusals_total`, `ravel_memory_budget_refusals_total`) by check site. |
 | `worker` | The tokio runtime's per-worker busy counter, bounded by the runtime's fixed worker count. |
 | `level` | The scrub counters by which part of the commit lineage a target came from (`l0`, `l1` or `rewrite`). |
 | `shard` | The per-shard ingest skew family only, beside `mode` and `signal` and never beside `tenant_hash`. |
