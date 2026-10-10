@@ -1977,23 +1977,25 @@ mod tests {
         );
     }
 
-    /// A request whose only hour lies inside the held range (999 of
-    /// 998..=1000) is excluded from the targeted pass, so a quiet held-open
-    /// fold reconciles 0 requested hours and the request stays queued. That
-    /// ends: once the margin reaches the watermark no hour is held open, and
-    /// the first fold whose margin passes it advances the watermark and
-    /// dequeues the request. A tick that removes on every no-op fold loses it
-    /// at the first tick.
+    /// A request whose only hour lies inside the held range (1000 of
+    /// 998..=1000, an hour the snapshot names, so only the held-range
+    /// exclusion keeps it out) is excluded from the targeted pass, so a quiet
+    /// held-open fold reconciles 0 requested hours and the request stays
+    /// queued. That ends: once the margin reaches the watermark no hour is
+    /// held open, and the first fold whose margin passes it advances the
+    /// watermark and dequeues the request. A tick that removes on every no-op
+    /// fold loses it at the first tick, and a held-open pass that does not
+    /// exclude the held range reconciles it (count 1) and dequeues it there.
     #[tokio::test]
     async fn run_tick_keeps_a_held_range_request_until_an_advancing_fold() {
         let (store, catalog, tenant) = held_open_tick_fixture("run-tick-refold-held").await;
         let refold = RefoldQueue::default();
-        refold.send(tenant, Signal::Metrics, BTreeSet::from([999]));
+        refold.send(tenant, Signal::Metrics, BTreeSet::from([1000]));
 
         let held = tick_at(&catalog, store.as_ref(), tenant, &refold, held_clock()).await;
         assert_eq!(held.no_op, vec![tenant], "{held:?}");
         assert_eq!(held.refold_hours_reconciled, 0, "{held:?}");
-        assert_eq!(pending_hours(&refold, tenant, Signal::Metrics), vec![999]);
+        assert_eq!(pending_hours(&refold, tenant, Signal::Metrics), vec![1000]);
 
         // The margin hour equals the watermark: nothing is held open and
         // nothing advances.
@@ -2010,7 +2012,7 @@ mod tests {
         )
         .await;
         assert_eq!(caught_up.no_op, vec![tenant], "{caught_up:?}");
-        assert_eq!(pending_hours(&refold, tenant, Signal::Metrics), vec![999]);
+        assert_eq!(pending_hours(&refold, tenant, Signal::Metrics), vec![1000]);
 
         let advanced = tick_at(
             &catalog,
