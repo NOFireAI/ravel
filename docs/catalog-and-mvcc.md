@@ -880,8 +880,10 @@ measured (p50 one object per key on the ClickBench corpus).
 
 **Binding and coverage.** A leaf binds the covered part's exact `blake3`,
 never its `watermark_hour` (ADR-0849 section 1). Three checks, with two
-outcomes. A leaf whose header `tenant_hash` differs from the requesting
-tenant's is a hard `CatalogError::FieldMismatch` (ADR-0050 section 2),
+outcomes. A leaf whose header `tenant_hash` or `signal` differs from the
+requesting tenant's or from the signal prefix it was read under is a hard
+`CatalogError::FieldMismatch` (ADR-0050 section 2; a misplaced object, not
+a degraded one),
 counted in `ravel_catalog_isolation_breach_total`, with no fallback: the
 lookup fails. A leaf whose header `part_blake3` differs from the part's hash
 in the HEAD it resolved, or whose `format_version` it does not support, is
@@ -961,7 +963,13 @@ directory whose ends are not non-decreasing or whose last end
 differs from `body_len`; a frame whose declared `uncompressed_len` exceeds
 the body ceiling (refused before decompression allocates anything), or
 whose decompressed length differs from it, or whose decompressed bytes are
-not exactly `entry_count` entries' encodings; an entry ordinal at or past
+not exactly `entry_count` entries' encodings; for a whole-object reader
+(`inspect kidx`) only, per-frame `entry_count`s that do not sum to the
+header's `entry_count` (a single-bucket probe cannot check the sum and
+treats the header total as advisory, used for `bucket_bits` sizing and the
+report); a header `tenant_hash` or `signal` that disagrees with the
+request, which is the hard `FieldMismatch` above rather than an uncovered
+part; an entry ordinal at or past
 the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `key8` that does not mix to the bucket it sits in; unsorted or duplicate
 `(key8, entry ordinal)` pairs; a block delta list that is empty or that

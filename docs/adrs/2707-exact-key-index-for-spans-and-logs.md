@@ -676,7 +676,9 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   test over random key sets per key type, and corrupt and truncated inputs
   (a flipped byte in the header, the directory, a frame; a bucket whose keys
   do not mix to that bucket; unsorted or duplicate entries; a frame whose
-  decompressed length is not `entry_count x 12`), each a typed `Corrupted`.
+  frame `entry_count` over `KEY_IDX_BUCKET_MAX_ENTRIES` (2^20) or over the
+  field's total, refused before the buffer is allocated; a decompressed
+  length that is not `entry_count x 12`), each a typed `Corrupted`.
   The RSPAN v5 and RLOG object fuzz harnesses are extended to the new
   section; the `.kidx` decoder gets its own fuzz target and a part-binding
   test (same watermark, different part bytes, leaf rejected). Proptest seed
@@ -735,10 +737,12 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   its window: index buckets plus one or two blocks. The folded Stage 0
   tenant goes from 4.35 GB and 60 GETs per lookup to a few hundred KB
   (target, below). A lookup with no range still grows with the number of
-  covering parts, by one directory and one bucket per part (about 64 KB at
-  the balanced 13 bits): the trillion-span extrapolation goes from 22 TB
-  of data to about 64 KB of index per covering part, and the acceptance
-  table bands that figure rather than the count alone.
+  covering parts, by one directory and one bucket per part, about
+  `4 x sqrt(body)` decompressed bytes (about 4.4 KB for a 1.2 MB
+  hour-sized part, 64 KB only for a part at the 256 MiB ceiling): the
+  trillion-span extrapolation goes from 22 TB of data to a few KB of
+  index per covering part, and the acceptance table bands that function
+  of the part's body rather than the count alone.
 - **Storage.** Tier 1 holds one `(key8, block)` entry per distinct pair,
   about 12 B before the bucket's zstd. On the Stage 0 spans corpus that is
   one entry per trace per object: 20 M entries, about 240 MB raw against
@@ -799,7 +803,7 @@ cache state) and stamped into the report.
 | spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 4.5 MB over 1,024 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 2 per part, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
-| q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` decompressed bytes per probed object = `prefix_len` (stored as is, about 1 KB per field at 8 bits) plus one bucket's `uncompressed_len` (2 to 8 KB at Stage 0 entry counts; the frame on the wire is zstd and at most that), expected 3 to 9 KB per object (one declared field) and 2.5 to 5 MB over the 410-object corpus, bounded at 16 KB per object with up to four declared fields (6.5 MB), with wire bytes reported beside | a whole-object GET, or `keyIndex` decompressed bytes over 32 KB per probed object |
+| q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` decompressed bytes per probed object = `prefix_len` (stored as is, about 1 KB per field at 8 bits) plus one bucket's `uncompressed_len` (2 to 8 KB at Stage 0 entry counts; the frame on the wire is zstd and at most that), expected 3 to 9 KB per object (one declared field) and 1.2 to 3.7 MB over the 410-object corpus, bounded at 16 KB per object with up to four declared fields (6.5 MB), with wire bytes reported beside | a whole-object GET, or `keyIndex` decompressed bytes over 32 KB per probed object |
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |

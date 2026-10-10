@@ -1396,7 +1396,10 @@ key_idx (stored uncompressed; bucket payloads zstd):
     u32 LE   dir_crc32c            (over the ends array)
 
   per field, at buckets_offset, frames tiling [0, buckets_len) exactly:
-    u32 LE   entry_count
+    u32 LE   entry_count           (at most KEY_IDX_BUCKET_MAX_ENTRIES =
+                                    2^20 and at most the field's own
+                                    entry_count, both checked before the
+                                    12 x entry_count buffer is allocated)
     u32 LE   frame_crc32c          (over the zstd bytes that follow)
     zstd     entries[entry_count]: key8 [8], block u32 LE
                                    (decompresses to exactly entry_count x 12)
@@ -1431,7 +1434,16 @@ BLOCKS and SKIP_IDX, so the 256 KiB tail probe (ADR-0699 decision 5) does
 not carry it: a key probe on an opened object costs exactly two ranged
 GETs for every conformant writer, the first of `prefix_len` bytes and the
 second one bucket. A `Section` entry for kind 9 whose `prefix_len` is zero
-or past `len` is `Corrupted`.
+or past `len` is `Corrupted`, and so is one over `KEY_IDX_PREFIX_MAX` =
+4 MiB, a reader-side ceiling on the first GET: the accepted ranges alone
+(64 fields at 16 bits) would allow a 16 MiB prefix on an object the
+shipped writer prices at about 1 KB per field, and the ceiling bounds the
+read before it is issued. A bucket frame's `entry_count` is bounded before
+its buffer is allocated, by `KEY_IDX_BUCKET_MAX_ENTRIES` = 2^20 (12 MiB
+decompressed) and by the field's own `entry_count`; a probe that reads one
+bucket cannot check that the per-bucket counts sum to the field's total,
+so that total is advisory for the probe (it sizes `bucket_bits` and the
+report) and a whole-object reader (`inspect`) verifies the sum.
 At the measured sizes (p50 49,899 entries per 25 MB ClickBench object, about
 2% of object bytes) a bucket holds about 200 entries, a few KB (derived from
 the Stage 0 figures on ADR-2707).
@@ -1726,12 +1738,18 @@ All violations are `Corrupted`, never panics:
   one the reader knows; `bucket_bits` outside 1 to 16; non-zero reserved
   bytes; `field_count` zero or over 64; field names not ascending or not
   unique; an unknown `key_type`; a header `prefix_len` not equal to the
-  footer `Section` entry's copy, or a zero `prefix_len` on a kind-9
-  entry; a `dir_offset` outside `[0, prefix_len)` or a `buckets_offset`
-  below `prefix_len`; a directory, bucket area or frame range
-  outside the section; `ends[]` decreasing or not ending at `buckets_len`;
-  frames that do not tile the bucket area exactly; directory or frame crc
-  mismatch; a decompressed length not equal to `entry_count x 12`; entries
+  footer `Section` entry's copy, a zero `prefix_len` on a kind-9 entry, or
+  a `prefix_len` past `len` or over `KEY_IDX_PREFIX_MAX` (4 MiB, checked
+  before the first GET); a `dir_offset` outside `[0, prefix_len)` or a
+  `buckets_offset` below `prefix_len`; a directory, bucket area or frame
+  range outside the section; `ends[]` decreasing or not ending at
+  `buckets_len`; frames that do not tile the bucket area exactly;
+  directory or frame crc mismatch; a frame `entry_count` over
+  `KEY_IDX_BUCKET_MAX_ENTRIES` (2^20) or over the field's `entry_count`
+  (both checked before the buffer is allocated); a decompressed length not
+  equal to `entry_count x 12`; for a whole-object reader only, per-bucket
+  counts that do not sum to the field's `entry_count` (a single-bucket
+  probe treats the total as advisory); entries
   not ascending or not unique; a key whose mix does not select the bucket
   it sits in; a block ordinal at or past the object's block count.
 - page_dir: whole-section crc mismatch (checked before the section is decoded
