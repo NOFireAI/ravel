@@ -365,21 +365,41 @@ flowchart LR
     for spans), builds the leaf from the sections as a regular fold would,
     and reports parts rebuilt, leaves written, section bytes read and
     ranged GETs issued (the footer suffix and section reads together, the
-    figure the acceptance band counts). It publishes in batches: every
-    `--batch-parts` parts (default 1,000) it runs one fold attempt whose
-    single HEAD CAS carries the `key_index` refs for the parts that batch
-    rebuilt, so the fold's one-CAS-per-attempt rule holds and the run is
-    a sequence of attempts rather than one. That is what makes it
-    restartable: a run that stops, or that loses one batch's CAS to the
-    server's scheduled fold `MAX_HEAD_CAS_ATTEMPTS` times
-    (`FoldCasRetriesExhausted`), has published every earlier batch, loses
-    at most the current batch's `2 x 1,000` GETs, and leaves that batch's
-    leaves unreferenced for the catalog sweep; the rerun skips every part
-    whose ref an earlier batch published. Like the CLI fold it extends it
-    holds no claim and keeps no cursor (`services/ravel-cli/src/catalog.rs`
-    has neither; HEAD is the cursor), and it takes `--writers-stopped` as
-    the same assertion the plain fold takes, since nothing in the CLI can
-    detect a live writer. Detection: the
+    figure the acceptance band counts). It publishes in batches bounded
+    in the unit the cost has: a batch is the shortest run of the remaining
+    unindexed parts, at least one, whose entry total reaches
+    `--batch-entries` (default 100,000), and each batch is one fold
+    attempt whose single HEAD CAS carries that batch's `key_index` refs,
+    so the fold's one-CAS-per-attempt rule holds and the run is a sequence
+    of attempts rather than one. The fold would otherwise carry an
+    unchanged part forward by content hash (`existing_by_blake3`, the
+    same bytes re-encode to the same blake3) with its old ref and skip
+    the per-part derived-object build, so the rebuild excludes the batch's
+    parts from that carry-forward, per batch, by the mechanism the
+    reconcile-dirty rule already uses; every other part, including every
+    earlier batch's, stays carried forward with its ref, which is what
+    lets those refs survive each later attempt's CAS. A rebuild attempt
+    skips the reconcile pass (there is nothing new to reconcile under the
+    `--writers-stopped` assertion it takes) and the window LISTs with it,
+    and the report carries the attempt count and the per-attempt requests
+    (snapshot PUT, HEAD CAS, leaf PUTs) beside the section figures, so a
+    many-batch run's fixed cost is visible rather than hidden in a band
+    that counts only sections. That is what makes it restartable: a run
+    that stops, or that loses one batch's CAS to the server's scheduled
+    fold `MAX_HEAD_CAS_ATTEMPTS` times (`FoldCasRetriesExhausted`), has
+    published every earlier batch, loses at most `2 x` the entries in the
+    current batch, and leaves that batch's leaves unreferenced for the
+    catalog sweep; the rerun skips every part whose ref an earlier batch
+    published. The bound is honest about small tenants: a part holds up to
+    `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES` = 250,000 entries and the Stage 0
+    load is one part of 80,000, so there the run is a single batch and an
+    interruption loses all 160,000 GETs; the batch bounds a month-scale
+    tenant with hour-ranged parts, not a one-part one. Like the CLI fold
+    it extends it holds no claim and keeps no cursor
+    (`services/ravel-cli/src/catalog.rs` has neither; HEAD is the cursor),
+    and it takes `--writers-stopped` as the same assertion the plain fold
+    takes, since nothing in the CLI can detect a live writer. Detection:
+    the
     unreferenced-catalog-object sweep reports `CatalogSweepOutcome
     { deleted, kept }` with no per-kind split today and no metric of its
     own (`ravel_maintain_objects_deleted_total` counts the per-shard data
@@ -389,14 +409,15 @@ flowchart LR
     rising while HEAD carries no `key_index` refs is the signature the
     operator acts on. The cost of a bad rollout is one rebuild run over the
     affected parts: per part entry, one footer suffix GET and one section
-    range GET, so `2 x entries` ranged GETs in total, `2 x 1,000` per
-    batch at the default (about 160,000 on the Stage 0 spans load as
-    written, about 1,600 at the decision 9 geometry) and the
-    sections' bytes (about 2% of logs bytes, about 6% of span bytes); the
-    request figure is the one that decides viability, as the Context's
-    566 s resolve shows, and both figures are banded in the acceptance
-    table. Scans until it has run; nothing is retained and nothing is
-    silent. The mixed-version combinations (old
+    range GET, so `2 x entries` ranged GETs in total, at most
+    `2 x batch_entries` per attempt (about 160,000 on the Stage 0 spans
+    load as written, about 1,600 at the decision 9 geometry, one batch in
+    either case) and the sections' bytes (about 2% of logs bytes, about
+    6% of span bytes); the request figure is the one that decides
+    viability, as the Context's 566 s resolve shows, and both figures are
+    banded in the acceptance table. That run scans until it has run;
+    nothing is retained and nothing is silent. The mixed-version
+    combinations (old
     folder then new sweeper, old sweeper against a new HEAD, new folder
     after an old folder, then the rebuild) are a
     required test, not an intention.
@@ -736,7 +757,7 @@ cache state) and stamped into the report.
 | default `ravel-cli load` of the 200 M spans | about 800 objects; load time within 1.5x of the 110 s large-batch arm; the report names the size trigger for the majority of objects | under 600 or over 1,200 objects, over 165 s, or age-paced |
 | resolve GETs above 25,000 records | records + 3 | anything else |
 | tier-1 section size | spans about 6% of object bytes (about 1.2 B/span against 21 B/span stored); logs about 2% of object bytes | over 2x either |
-| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry), both figures on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` GETs, or either figure missing from the report |
+| fold section reads | spans about 6% and logs about 2% of re-encoded part bytes per fold, the tier-1 size plus one footer per entry; `2 x entries` ranged GETs (footer suffix plus section per entry); a rebuild reports attempts = `ceil(entries / batch_entries)` and per attempt one snapshot PUT, one HEAD CAS and the batch's leaf PUTs, no window LIST; all four figures on the report | over 2x the signal's tier-1 figure, over `2 x entries + 3` section GETs, more attempts than the formula, any LIST or a per-attempt request beyond the three kinds, or any figure missing from the report |
 | rows | exact on every lookup, the row check removing every prefix collision | any other count |
 | every other statement and load | no regression over 5% | over 5% |
 
@@ -752,7 +773,7 @@ cache state) and stamped into the report.
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
 | T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), inspector | 3 | ravel-logseg, ravel-catalog (config), ravel-cli | yes |
-| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index [--batch-parts N]` (one fold attempt and HEAD CAS per batch), `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
+| T9 `.kidx` leaf, fold build, HEAD ref (catalog.proto), sweep reference set, `CatalogSweepOutcome.deleted_kidx` rendered as `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`, `catalog fold --rebuild-key-index [--batch-entries N]` (one fold attempt and HEAD CAS per batch, batch parts excluded from the content-hash carry-forward, no reconcile pass), `inspect kidx`, ADR-0064 amendment and #1848 | 4, 6 | ravel-catalog, ravel-maintain, ravel-cli, ravel-server (metrics) | yes |
 | T10 spans read path: routing, tier 2, tier 1, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T12 Stage 1: the Stage 0 arms re-run against the table above, acceptance amendment | all | docs | no |

@@ -972,15 +972,29 @@ scope rule above, re-encodes every part in HEAD that lacks a `key_index`
 ref for a declared field (every part, for spans), builds each leaf from
 the sections as the regular fold does, and reports parts rebuilt, leaves
 written, section bytes read and ranged GETs issued (footer suffix and
-section reads together). It publishes in batches: every `--batch-parts`
-parts (default 1,000) it runs one fold attempt whose single HEAD CAS
-carries the refs for that batch, so a run that stops or exhausts the CAS
-retries on one batch has published every earlier batch, loses at most that
-batch's `2 x 1,000` GETs, and leaves that batch's leaves unreferenced for
-this sweep; the rerun skips every part whose ref an earlier batch
-published. Like the plain CLI fold it holds no claim and keeps no cursor
-(HEAD is the cursor), and it takes `--writers-stopped` as the same
-assertion the plain fold takes. Detection: this sweep reports
+section reads together). It publishes in batches bounded in entries: a
+batch is the shortest run of the remaining unindexed parts, at least one,
+whose entry total reaches `--batch-entries` (default 100,000), and each
+batch is one fold attempt whose single HEAD CAS carries that batch's refs.
+The batch's parts are excluded from the by-content-hash carry-forward
+(`existing_by_blake3`), per batch, by the reconcile-dirty rule's mechanism
+below: an unchanged part re-encodes to the same blake3 and would otherwise
+be carried forward with its old, ref-less entry and skip the derived-object
+build. Every other part, including every earlier batch's, stays carried
+forward with its ref, so those refs survive each later attempt's CAS. A
+rebuild attempt skips the reconcile pass and its window LISTs (nothing is
+new under the `--writers-stopped` assertion it takes), and the report
+carries the attempt count and the per-attempt requests (snapshot PUT,
+HEAD CAS, leaf PUTs) beside the section figures. A run that stops or
+exhausts the CAS retries on one batch has therefore published every
+earlier batch, loses at most `2 x` the entries in that batch, and leaves
+that batch's leaves unreferenced for this sweep; the rerun skips every
+part whose ref an earlier batch published. A one-part tenant (a part holds
+up to `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES` = 250,000 entries) is a single
+batch, and an interruption there loses the whole run. Like the plain CLI
+fold it holds no claim and keeps no cursor (HEAD is the cursor), and it
+takes `--writers-stopped` as the same assertion the plain fold takes.
+Detection: this sweep reports
 `CatalogSweepOutcome { deleted, kept }` with no per-kind split and no
 metric of its own today, so the leaf writer's change adds `deleted_kidx` to
 the outcome and renders it as
@@ -988,11 +1002,11 @@ the outcome and renders it as
 rising while HEAD carries no `key_index` refs is the signature an operator
 acts on. The cost of a bad rollout is one rebuild run over the affected
 parts, `2 x entries` ranged GETs in total (a footer suffix and a section
-range per entry, `2 x 1,000` per batch) plus the sections' bytes, and scans
-until it has run; nothing is
-retained and nothing is silent. The
-mixed-version combinations (old folder then new sweeper, old sweeper
-against a new HEAD, new folder after an old folder, then the rebuild) are
+range per entry, at most `2 x batch_entries` per attempt) plus the
+sections' bytes, and that run scans until it has run; nothing is retained
+and nothing is silent. The mixed-version combinations (old folder then new
+sweeper, old sweeper against a new HEAD, new folder after an old folder,
+then the rebuild) are
 tested, not assumed (ADR-0849 section 1a).
 
 ### Idempotency marker body layout
