@@ -27,7 +27,9 @@
 //!
 //! Before any load it scrapes `/metrics` once and exits 2 when one of
 //! `ravel_health_heartbeat_age_seconds`, `ravel_cpu_gate_jobs_total` or
-//! `ravel_cpu_gate_inline_total` is missing, naming it.
+//! `ravel_cpu_gate_inline_total` is missing, naming it, or when the heartbeat
+//! family carries other than exactly one sample, naming the count. It also
+//! exits 2 with fewer than 2 load tasks, since one task issues no SQL.
 //!
 //! The bands, fixed before the first run:
 //!
@@ -77,7 +79,7 @@ struct Args {
     /// Minimum load duration in seconds.
     #[arg(long, default_value_t = 60)]
     seconds: u64,
-    /// Concurrent query tasks. Default: one per core.
+    /// Concurrent query tasks, at least 2. Default: one per core.
     #[arg(long)]
     queries: Option<usize>,
     #[arg(long, default_value_t = 4)]
@@ -110,7 +112,12 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     run::configure_allocator();
     let host = HostStamp::detect();
     println!("{}", host.line());
-    let workers = args.queries.unwrap_or(host.cores).max(1);
+    let workers = args.queries.unwrap_or(host.cores);
+    if workers < 2 {
+        anyhow::bail!(
+            "{workers} load task(s): the PromQL and SQL loads need at least 2 (pass --queries 2 or more)"
+        );
+    }
 
     let hour = run::fixture_hour(run::wall_now_ns());
     let hour_start = hour * NS_PER_HOUR;
@@ -192,13 +199,12 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let sql_url = format!("http://{http}/api/v1/sql");
 
     let stop = run::WindowStop::new();
-    let start = Instant::now();
     let prober = run::spawn_prober(
         format!("http://{health}/readyz"),
-        start,
         Duration::from_millis(PROBE_INTERVAL_MS),
         Arc::clone(&stop),
     )?;
+    let start = prober.start;
 
     let scraper = {
         let stop = Arc::clone(&stop);
@@ -213,9 +219,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
                 let age_s = run::scrape(&client, http, run::HEARTBEAT_SCRAPE_TIMEOUT)
                     .await
                     .ok()
-                    .and_then(|body| {
-                        saturation::single_value(&body, "ravel_health_heartbeat_age_seconds")
-                    });
+                    .and_then(|body| saturation::single_value(&body, saturation::HEARTBEAT_FAMILY));
                 scrapes.push(Scrape {
                     latency: sent.elapsed(),
                     age_s,
@@ -287,6 +291,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         saturation::probes_in_window(&probes, window).len()
     );
     println!("{}", saturation::scrape_summary(&scrapes));
+    println!("{}", saturation::wake_lateness_line(&probes, window));
     let mut figs = FigureSet::new();
     figs.record(fig::WINDOW_MS, saturation::window_ms(window));
     figs.record(fig::PROMQL_QUERIES_OK, tally.promql_ok as f64);
