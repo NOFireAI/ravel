@@ -25,10 +25,10 @@
 //! deletes exactly those, except a key the S3 adapter would send a delete
 //! of to a different key ([`StrayClass::Undeletable`]) and, unless asked, a
 //! key that may be a table created before its name was reserved
-//! ([`StrayClass::ReservedName`]). The S3 adapter cannot list a key holding
-//! a control character, an empty segment or a `.` or `..` segment at all:
-//! the listing that meets one fails, here and in the tenant-wide listings,
-//! and only a delete of the exact key through an S3 tool removes it.
+//! ([`StrayClass::ReservedName`]). A key no request reaches unchanged (a
+//! control character, an empty segment or a `.` or `..` segment among them)
+//! is listed, reported unaddressable by the store, never deleted here, and
+//! removed only by a delete of the exact key through an S3 tool.
 //!
 //! The repair runs under the Maintain credential, which lists and deletes
 //! under `t/<tenant_hash>/pq/t/` and reads no manifest. Which versions are
@@ -431,9 +431,7 @@ fn stray_class(tenant: &TenantHash, key: &str) -> Option<StrayClass> {
 /// owns them. A key the listing reports unaddressable is listed too, as
 /// [`StrayClass::Undeletable`]. Manifest keys of valid tables and keys of no
 /// manifest shape are not listed. One paginated LIST of a prefix that ends at
-/// a segment boundary; no key is read. On S3 a key under that prefix holding
-/// a control character, an empty segment or a `.` or `..` segment fails the
-/// listing with [`RepairError::Store`], as it fails the tenant-wide listings.
+/// a segment boundary; no key is read.
 pub async fn list_stray(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,

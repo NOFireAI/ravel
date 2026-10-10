@@ -167,9 +167,12 @@ they did before.
   both back verbatim. It runs on the scripted S3 server and on RustFS. A
   backend that fails it is not supported for listing until it passes. A
   key that does not decode to UTF-8 is unaddressable (decision 2), with
-  its key shown as the still-encoded text;
+  its key shown as the still-encoded text (so is one holding a `%` that
+  does not decode, see the implementation drift amendment below);
 - sent through the `HttpClient` that `S3HttpConnector` produces from the same
-  `ClientOptions` the data plane uses. Each call keeps the connector scope it
+  `ClientOptions` the data plane uses (built from `S3HttpConfig` instead and
+  wrapped by the connector, see the implementation drift amendment below).
+  Each call keeps the connector scope it
   uses today: `connector::scope(StoreOp::List, ..)` for `list` and
   `list_after`, and `connector::scope(StoreOp::ListDelimited, ..)` for
   `list_delimited` (`s3.rs:2801`), so each HTTP attempt is still billed to
@@ -224,11 +227,13 @@ raw last key. In detail:
     - a `ListPage` call (`list`, `list_after`) is itself one page of a
       drain that is already capped at `MAX_LIST_PAGES` pages, so its own
       ceiling is a new, small `MAX_RESPONSES_PER_PAGE` of
-      `ceil(page_size / 1000) + 16`: the responses a full page needs plus
-      16 that may come back empty. The composed wire-request bound of a
-      drained `S3Store` listing is therefore
+      `ceil(page_size / 1000) + 16` (the implementation drift amendment
+      below records that this was never implemented): the responses a full
+      page needs plus 16 that may come back empty. The composed
+      wire-request bound of a drained `S3Store` listing is therefore
       `MAX_LIST_PAGES × MAX_RESPONSES_PER_PAGE`, 1.7 million requests at
-      the default 1000-key page size, where today the loop inside
+      the default 1000-key page size (the implementation drift amendment
+      below gives the bound the code has), where today the loop inside
       `object_store` has no bound. The contract's page-ceiling sentence
       changes to state it (see "Docs that change").
 - A truncated response with no `NextContinuationToken` at all is
@@ -540,7 +545,8 @@ axum server already answers ListObjectsV2 (`Op::List`), extended to script a
   `unaddressable`, the metric), the `UnaddressableKey` error, the retry
   sentence at "Retry and failure", the page-ceiling sentence (now the
   composed `MAX_LIST_PAGES × MAX_RESPONSES_PER_PAGE` request bound for
-  `S3Store`, and `MAX_LIST_PAGES` responses for `list_delimited`), and
+  `S3Store`, which the implementation drift amendment below restates, and
+  `MAX_LIST_PAGES` responses for `list_delimited`), and
   `S3Store`'s line under "Implementations".
 - `crates/ravel-maintain/src/discover.rs` module doc: the adapter now
   classifies tenant prefixes, so an unaddressable one is skipped and counted
@@ -614,3 +620,59 @@ passes with the new amendment's markers, no sentence in ADR-2040 or
 `resolve.rs` still says S3 fails a listing on such a key, and `discover.rs`
 no longer promises `InvalidTenantPrefix` for a prefix the adapter now
 skips.
+
+## Amendment (2026-10-10): implementation drift in the list client, the page bound and undecodable keys
+
+<!-- amendment-applies: sections="1. Ravel's own SigV4 ListObjectsV2 GET for S3|Consequences" pointer="implementation drift amendment" -->
+<!-- amendment-supersedes: phrase="MAX_RESPONSES_PER_PAGE" pointer="implementation drift amendment" -->
+<!-- amendment-supersedes: phrase="1.7 million requests" pointer="implementation drift amendment" -->
+<!-- amendment-supersedes: phrase="produces from the same `ClientOptions` the data plane uses" pointer="implementation drift amendment" -->
+
+Three places where the code that landed differs from decision 1 as
+written, recorded here so the decision says what the code does.
+
+**The list client is built from `S3HttpConfig`.** Decision 1 sends the
+ListObjectsV2 request through the `HttpClient` that `S3HttpConnector`
+produces from the data plane's `ClientOptions`. `ClientOptions` has no
+control over redirects, and the client `object_store` builds from it follows
+up to ten. A followed wrong-region 301 would fail with the target's
+signature error instead of the region hint, and would carry the signed
+request to another host. `list_http_client` in
+`crates/ravel-object-store/src/s3.rs` therefore builds the reqwest client
+itself from the same `S3HttpConfig` and `allow_http`, matching what
+`ClientOptions` would build (timeouts, HTTP/1 only, no response
+decompression, the shuffling DNS resolver) except that redirects are off, and
+`S3HttpConnector::wrap` wraps it. Every attempt still passes through the
+connector, so the connector scopes, `Date` observation and the
+per-operation metrics blocks are as decision 1 states.
+
+**The page bound is `16 × page_size` responses.** Decision 1's
+`MAX_RESPONSES_PER_PAGE` of `ceil(page_size / 1000) + 16` was never
+implemented. That figure assumes a full response of 1000 keys, but
+ListObjectsV2 may return fewer than `max-keys`, so it would fail a page that
+is making progress. The code that landed charged only keyless truncated
+responses to the ceiling, 16 of them over the whole call, which bounded a
+call at `page_size + 16` responses but failed a page over a sparse prefix
+once 16 keyless responses had accumulated, however many keys came between
+them. Since this amendment the ceiling (`EMPTY_RESPONSE_ALLOWANCE` in
+`crates/ravel-object-store/src/s3/list.rs`, still 16, still reported as
+`StoreError::ListPageCeiling` with `ceiling: 16`) counts keyless responses
+in a row, and a response carrying a key starts the count again. A call
+receives at most `page_size` responses carrying keys, each after at most 15
+keyless ones, and only a page left short of full takes up to 16 keyless ones
+after its last, so one `list` or `list_after` call sends at most
+`16 × page_size` requests. The composed bound of a drained `S3Store` listing
+is `MAX_LIST_PAGES × 16 × page_size`: 1.6 billion requests at the default
+1000-key page size, reached only by a backend returning one key per
+response after 15 empty ones. `list_delimited` keeps its ceiling of
+`MAX_LIST_PAGES` responses. `docs/object-store-contract.md` states the
+same bound.
+
+**A key that does not URL-decode is unaddressable.** Decision 1 makes a key
+that does not decode to UTF-8 unaddressable. The code that landed did that,
+but refused a `%` not followed by two hex digits as a body that is not a
+`ListBucketResult`, which failed the whole listing on one key. Such a key,
+or common prefix, now keeps its still-encoded text, which holds a `%`; since
+`Path::from` encodes every `%`, that text is never addressable, so the
+listing reports it in `unaddressable`, counts it and returns the rest, as
+decision 2 requires of every key it cannot address.
