@@ -1073,6 +1073,18 @@ check "ensure: that refusal names the missing condition" \
 
 rm -rf "${ENSURE_TMP}"
 
+# --- printf formats ---------------------------------------------------------
+
+# A printf whose format starts with a dash is parsed as an option: bash
+# refuses it with "invalid option" and exit 2, which under set -e ends the
+# script at that line. restore-check.sh's phase-log line did this and stopped
+# every rehearsal that reached reconstruction. `printf -- '-...'` is the safe
+# form. The scan covers every DR script, comment lines excluded.
+dash_formats="$(grep -n -E "^[^#]*printf +(['\"])-" "${DR_DIR}"/*.sh || true)"
+check "printf: no DR script passes a format that starts with a dash" "" "${dash_formats}"
+check "printf: the phase-log line still exists to be scanned" "1" \
+  "$(grep -c "printf -- '--- ravel-cli" "${DR_DIR}/restore-check.sh")"
+
 # --- result ----------------------------------------------------------------
 
 printf '\nlib.test.sh: %s passed, %s failed\n' "${PASSED}" "${FAILED}"

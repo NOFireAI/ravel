@@ -175,7 +175,7 @@ CLI_RC=0
 cli() {
   CLI_RC=0
   CLI_OUT="$(dr_ravel_cli "$@" 2>&1)" || CLI_RC=$?
-  printf '--- ravel-cli %s (exit %s)\n%s\n' "$*" "${CLI_RC}" "${CLI_OUT}" >>"${PHASE_LOG}"
+  printf -- '--- ravel-cli %s (exit %s)\n%s\n' "$*" "${CLI_RC}" "${CLI_OUT}" >>"${PHASE_LOG}"
   if [[ "${CLI_RC}" -ne 0 ]]; then
     # The tool's own output carries the artefact it failed on (verify-custody
     # names the mismatching data key on its `<-- ANOMALY` line, for one), and a
