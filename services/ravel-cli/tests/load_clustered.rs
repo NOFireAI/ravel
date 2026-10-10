@@ -290,6 +290,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         None,
         RlogZstdLevel::new(3).expect("in range"),
         None,
+        false,
         fx.now_ns,
     )
     .await

@@ -2,7 +2,7 @@
 //! (one-shot), `inspect` (decode HEAD and every
 //! referenced snapshot part), and `verify` (re-list sealed commit records
 //! and diff against the snapshot). Built strictly against `ravel-catalog`'s
-//! public API: no new methods added to that crate for this tool.
+//! public API.
 //!
 //! Every one of the three is per (tenant, signal), exactly as
 //! `ravel_catalog::Catalog::fold` and the ADR-0020 resolve are: a tenant's
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ravel_catalog::{CatalogConfig, FoldReport, PartLimits};
+use ravel_catalog::{CatalogConfig, FoldReport, PartLimits, RefoldRequest};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::catalog::v1::SnapshotColumnStatsPartRef;
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -91,18 +91,78 @@ pub async fn fold(
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
-    fold_inner(
+    fold_with_writers_stopped(
         store,
         selection,
         tenant,
         shard_count,
         signal,
         max_flush_lifetime_ns,
+        false,
+        now_ns,
+        json,
+    )
+    .await
+}
+
+/// [`fold`], plus `--writers-stopped` (ADR-2677 decision 1). With
+/// `writers_stopped`, the fold seals through the hour bucket of `now_ns` as
+/// well as every hour the seal margin seals, so the hour in progress is folded
+/// now rather than once the margin has passed it. That is an assertion that no
+/// writer will publish into the current hour or any earlier one: a commit
+/// published into a sealed hour stays invisible to queries that carry no
+/// commit token until a HEAD rebuild. `now_ns` itself is not moved.
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_with_writers_stopped(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    writers_stopped: bool,
+    now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
+    let seal_through_hour = if writers_stopped {
+        Some(hour_bucket(now_ns)?)
+    } else {
+        None
+    };
+    fold_core(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        seal_through_hour,
         now_ns,
         json,
         None,
     )
     .await
+}
+
+/// The ingest-hour bucket `now_ns` falls in.
+fn hour_bucket(now_ns: i64) -> anyhow::Result<u32> {
+    u32::try_from(now_ns.div_euclid(NS_PER_HOUR))
+        .map_err(|_| anyhow::anyhow!("clock reading {now_ns} ns has no ingest-hour bucket"))
+}
+
+const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
+
+/// A catalog with provisioning enforcement on, exactly as the server's query
+/// path builds one: an enforcing fold reads the tenant's real shard-generation
+/// history and stamps a correct `shard_generation_count` and fan-out ceiling,
+/// instead of short-circuiting to the single implicit generation 0 and
+/// enumerating only `0..--shards` (ADR-0052 sections 4/5, Finding 3). Without
+/// this the fold is blind to any reshard and writes an under-scanning HEAD.
+pub(crate) fn enforcing_catalog(
+    store: Arc<dyn ObjectStoreBackend>,
+    config: CatalogConfig,
+) -> Result<ravel_catalog::Catalog, ravel_catalog::CatalogError> {
+    Ok(ravel_catalog::Catalog::new(store, config)?.with_provisioning_enforcement())
 }
 
 /// The testable core of [`fold`]. `column_stats_ceiling_override`, when
@@ -125,6 +185,34 @@ pub async fn fold_inner(
     json: bool,
     column_stats_ceiling_override: Option<u64>,
 ) -> anyhow::Result<(FoldReport, String)> {
+    fold_core(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        None,
+        now_ns,
+        json,
+        column_stats_ceiling_override,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fold_core(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    seal_through_hour: Option<u32>,
+    now_ns: i64,
+    json: bool,
+    column_stats_ceiling_override: Option<u64>,
+) -> anyhow::Result<(FoldReport, String)> {
     let mut catalog_config = CatalogConfig {
         shard_count,
         ..CatalogConfig::default()
@@ -142,28 +230,23 @@ pub async fn fold_inner(
         &tenant_hash,
     )
     .await?;
-    // Enforcing, exactly as the server's query path (`ravel_server::query`) is:
-    // an enforcing fold reads the tenant's real shard-generation history and
-    // stamps a correct `shard_generation_count` and fan-out ceiling, instead of
-    // short-circuiting to the single implicit generation 0 and enumerating only
-    // `0..--shards` (ADR-0052 sections 4/5, Finding 3). Without this the fold is
-    // blind to any reshard and writes an under-scanning HEAD.
-    let mut catalog = ravel_catalog::Catalog::new(store, catalog_config)
-        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
-        .with_provisioning_enforcement();
+    let mut catalog = enforcing_catalog(store, catalog_config)
+        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?;
     if let Some(ceiling) = column_stats_ceiling_override {
         catalog.set_column_stats_part_ceiling_for_test(ceiling);
     }
 
     let folder_id = Uuid::new_v4();
     let report = catalog
-        .fold(
+        .fold_with_seal_through(
             &tenant_hash,
             signal.to_signal(),
             folder_id,
             now_ns,
             &[],
             None,
+            &RefoldRequest::new(),
+            seal_through_hour,
         )
         .await
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
@@ -252,6 +335,10 @@ fn render_fold_report(
         humantime::format_duration(Duration::from_nanos(
             u64::try_from(seal_margin_ns).unwrap_or(0)
         ))
+    ));
+    out.push_str(&format!(
+        "seal_through_hour: {:?}\n",
+        report.seal_through_hour
     ));
     out.push_str(&format!("buckets_folded: {}\n", report.buckets_folded));
     out.push_str(&format!("entry_count: {}\n", report.entry_count));
