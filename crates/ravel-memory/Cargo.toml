@@ -7,5 +7,17 @@ rust-version.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [lints]
 workspace = true
+
+[lib]
+# Only the criterion `[[bench]]` target below understands `cargo bench`'s
+# `--quick` flag; the lib's own libtest harness rejects it.
+bench = false
+
+[[bench]]
+name = "reserve_release"
+harness = false

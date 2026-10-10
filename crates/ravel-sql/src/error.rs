@@ -888,6 +888,7 @@ mod tests {
             requested: 4096,
             reserved: 1024,
             limit: 2048,
+            cause: ravel_memory::ExhaustionCause::Accounted,
         };
         let err = SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(exhausted));
         assert_eq!(err.client_message(), MSG_UNAVAILABLE);
@@ -1579,6 +1580,7 @@ mod tests {
                     requested: 4096,
                     reserved: 1024,
                     limit: 2048,
+                    cause: ravel_memory::ExhaustionCause::Accounted,
                 },
             )),
             SqlError::RunInvariant(ravel_query::QueryError::PrioritySampleCountMismatch {

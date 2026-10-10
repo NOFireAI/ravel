@@ -12547,6 +12547,7 @@ mod tests {
                 requested: 0,
                 reserved: cached_len + foreign,
                 limit: cached_len,
+                cause: ravel_memory::ExhaustionCause::Accounted,
             },
             "the first refusal, reported with both cached parts still reserved"
         );
@@ -12615,6 +12616,7 @@ mod tests {
                         requested: large_len,
                         reserved: small_len + foreign,
                         limit,
+                        cause: ravel_memory::ExhaustionCause::Accounted,
                     },
                     "the first refusal, with the small tenant's part still cached"
                 );
