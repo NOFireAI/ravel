@@ -1337,7 +1337,10 @@ entry; the indexed value is the one the `logs` SQL column reads for the row
 (the merged attribute view, ADR-0049 amendment), so a key held only at
 resource or scope level indexes every block of that stream.
 
-`key8` is 8 bytes derived by key type:
+`key_type` is the section's own enumeration, not `TypedAttrColumnType`
+(proto/ravel/sys.proto: STR 1, I64 2, BOOL 3, BYTES 4): the writer maps a
+declared `I64` to 2, `STR` to 3, `BYTES` to 4, and the fixed `trace_id`
+column to 1. `key8` is 8 bytes derived by key type:
 
 | key_type | value | key8 |
 |---|---|---|

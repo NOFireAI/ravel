@@ -651,8 +651,9 @@ reporting `Inexact` so the coordinator's residual still applies.
 
 Both entry points accept an optional window. Without one the resolve covers
 the whole tenant: every folded part in HEAD plus the unsealed tail (hours
-above the watermark, listed), bounded by retention. Cost is 2 leaf GETs per
-covering part under decision 5's ceiling plus tail probes, and the answer is
+above the watermark, listed), bounded by retention. Cost is 1 part GET plus
+2 leaf GETs per covering part up to decision 5's ceiling, a segment scan of
+every covering part beyond it, plus tail probes, and the answer is
 the spans in view, with docs/guides/traces.md's incomplete-trace semantics
 unchanged: no waiting for a missing root or sibling. `ravel_get_trace`'s
 `time_range` (`GetTraceInput.time_range`, `crates/ravel-mcp/src/catalog.rs`,
@@ -775,9 +776,12 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   (target, below). A lookup with no range still grows with the number of
   covering parts, by one part GET in the resolve (the entry list lives in
   the part object and shard routing reads it) plus one directory and one
-  bucket per part, the index share about `4 x sqrt(body)` decompressed
-  bytes (about 4.4 KB for a 1.2 MB hour-sized part, 64 KB only for a part
-  at the 256 MiB ceiling): the
+  bucket per part up to `P_max` = 1,024 parts, the index share about
+  `4 x sqrt(body)` decompressed bytes (about 4.4 KB for a 1.2 MB
+  hour-sized part, 64 KB only for a part at the 256 MiB ceiling), and by a
+  segment scan of each part past `P_max` (decision 5: the remainder is
+  scanned, never probed, so a lookup over more than 1,024 covering parts
+  is a bounded probe plus a scan of the rest): the
   trillion-span extrapolation goes from 22 TB of data to a few KB of
   index per covering part, and the acceptance table bands that function
   of the part's body rather than the count alone.
@@ -838,7 +842,8 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 1 part GET per covering part in the `resolve` phase (the entry list lives in the part object, and shard routing reads it), resolve bytes = the covering parts' object sizes, both reported beside the part count; then 2 leaf GETs per covering part up to `P_max`, `keyIndex` phase only, and 0 index GETs of either tier for a part beyond `P_max` (its scan bytes reported); `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 4.5 MB over 1,024 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 1 part GET per covering part, a part GET outside `resolve`, resolve bytes over the parts' summed sizes, more than 2 leaf GETs per part, any index GET for a part beyond `P_max`, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 1 part GET per covering part in the `resolve` phase (the entry list lives in the part object, and shard routing reads it), resolve bytes = the covering parts' object sizes, both reported beside the part count; then 2 leaf GETs per covering part, `keyIndex` phase only (at most 744 covering parts, under `P_max`); `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, at what the balance rule produces for the part's own body: about `4 x sqrt(body)` within the power-of-two rounding (about 4.4 KB at a 1.2 MB hour-sized part, 16 KB at 16 MiB, about 3.3 MB over 744 hour-sized parts); only a part at the 256 MiB ceiling (a one-part day) reaches 13 bits and 64 KB; the per-part figure is reported beside the count, with the part's body size and the wire bytes beside it | more than 1 part GET per covering part, a part GET outside `resolve`, resolve bytes over the parts' summed sizes, more than 2 leaf GETs per part, index GETs in any other phase, or `keyIndex` decompressed bytes over `8 x sqrt(body)` for the part's own body (128 KB at the ceiling) |
+| spans lookup without a range, tenant past `P_max` (90 days of hour-ranged parts, 2,160 covering parts) | 1 part GET per covering part in `resolve`; exactly `2 x P_max` = 2,048 leaf GETs in `keyIndex`; 0 index GETs of either tier for the 1,136 parts beyond `P_max`, whose segments are scanned with their scan bytes reported under `scan`; rows exact | any index GET for a part beyond `P_max`, more than 2,048 leaf GETs, a scanned part missing from the scan report, or any other count |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` decompressed bytes per probed object = `prefix_len` (stored as is, about 1 KB per field at 8 bits) plus one bucket's `uncompressed_len` (2 to 8 KB at Stage 0 entry counts; the frame on the wire is zstd and at most that), expected 3 to 9 KB per object (one declared field) and 1.2 to 3.7 MB over the 410-object corpus, bounded at 16 KB per object with up to four declared fields (6.5 MB), with wire bytes reported beside | a whole-object GET, or `keyIndex` decompressed bytes over 32 KB per probed object |
@@ -857,7 +862,7 @@ cache state) and stamped into the report.
 | T1 resolve reads each record once | 8 | ravel-catalog | no |
 | T2 loader defaults for every signal, trigger mix and warning on every report, ADR-2614 amendment | 9 | ravel-cli, ravel-ingest (visibility) | no |
 | T3 ranged trace reads (`block_run_span` on the range reader) and the spans read cache | 7, 10 | ravel-rspan, ravel-query, ravel-server | no |
-| T4 fragments carry the pushdown | 11 | ravel-sql | no |
+| T4 fragments carry the pushdown: the ticket plumbing for the trace id, time bounds and declared comparisons (the `KeyEquals` arm does not exist yet; its ticket field and the worker's probe path ride T11) | 11 | ravel-sql | no |
 | T5 `GET /api/traces/<id>`, `ravel_get_trace` without a range, the SQL window rule | 12 | ravel-server, ravel-sql | no |
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
@@ -867,7 +872,9 @@ cache state) and stamped into the report.
 | T11 logs read path: `KeyEquals`, `prune_segments_by_key_index`, block sets, statistics | 5, 7 | ravel-sql, ravel-query | no |
 | T12 Stage 1: the Stage 0 arms re-run against the table above, acceptance amendment | all | docs | no |
 
-Wave 0 is T1 to T5, no format change, dispatchable now. Wave 1 is T6, then
+Wave 0 is T1 to T5, no format change, dispatchable now (T4 carries only the
+ticket plumbing that exists today; the `KeyEquals` field and the worker's
+probe path land with T11). Wave 1 is T6, then
 T7 and T8 concurrently (both consume T6). Wave 2 is T9. Wave 3 is T10 and
 T11 (both consume T9; T11 also consumes T8). T12 closes the epic. The
 first v5 write (T7) is the irreversible step for spans data and is
