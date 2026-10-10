@@ -9,6 +9,8 @@ description = "OTAP (OpenTelemetry Arrow) ingest: gRPC stream state, Arrow IPC d
 [dependencies]
 ravel-types = { workspace = true }
 ravel-otlp = { workspace = true }
+# The ADR-1702 write gate a payload's zstd decompression runs on.
+ravel-cpu-gate = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 prost = { workspace = true }

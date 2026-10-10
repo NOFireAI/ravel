@@ -33,6 +33,7 @@ mod span_shard;
 mod stage_timing;
 mod storage_layout;
 mod value;
+mod write_gate;
 
 pub use admission::{
     AdmissionController, AdmissionLimits, CountLimit, IdentityAdmission, RateLimit,

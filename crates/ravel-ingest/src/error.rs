@@ -45,7 +45,9 @@ pub enum WriteError {
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RSEG segment failed (a deterministic input problem, e.g.
-    /// oversized batch); retrying identical input will fail again.
+    /// oversized batch); retrying identical input will fail again. Also the
+    /// answer when the ADR-1702 write gate returns no result for the encode:
+    /// the job panicked, or the runtime cancelled it while shutting down.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
     /// Two points in one shard buffer carried the same `series_id` but

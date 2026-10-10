@@ -30,6 +30,8 @@ use crate::router::WriteMode;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
 use crate::span_shard::{SpanShardActor, SpanShardMsg, est_span_bytes};
+use crate::write_gate::WriteGateSlot;
+use ravel_cpu_gate::WriteGate;
 
 /// Routing v1 for spans (persistent contract, ADR-0041 decision 2): shard from
 /// the trace id's leading bytes, in exactly the style
@@ -124,6 +126,9 @@ pub struct SpanIngestRouter {
     /// limit. Written by [`SpanIngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
+    /// The write gate every shard actor's flush encode runs on, shared the same
+    /// way. Written by [`SpanIngestRouter::with_write_gate`].
+    write_gate: WriteGateSlot,
 }
 
 impl SpanIngestRouter {
@@ -139,6 +144,7 @@ impl SpanIngestRouter {
         // `rand::rng()` and `Uuid::new_v4()` off this production path.
         let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
+        let write_gate = WriteGateSlot::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<SpanShardHandle>>| {
             let weak = weak.clone();
             let store = Arc::clone(&store);
@@ -148,6 +154,7 @@ impl SpanIngestRouter {
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let backstop_ceiling = backstop_ceiling.clone();
+            let write_gate = write_gate.clone();
             let factory = move |shard_count: u32| -> Vec<SpanShardHandle> {
                 let scope: Arc<dyn FlushScope<SpanShardMsg>> =
                     Arc::new(SwitchScope::new(weak.clone(), shard_count));
@@ -171,6 +178,7 @@ impl SpanIngestRouter {
                             backstop_ceiling.clone(),
                             cap_flag.clone(),
                             Arc::clone(&scope),
+                            write_gate.clone(),
                         );
                         tokio::spawn(actor.run());
                         SpanShardHandle {
@@ -193,7 +201,19 @@ impl SpanIngestRouter {
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             backstop_ceiling,
+            write_gate,
         }
+    }
+
+    /// Runs every shard's flush encode on the ADR-1702 write gate under the
+    /// `span_flush` site, sized by the flushed buffer's bytes so the gate's
+    /// inline floor applies. Without it the encode runs inline on the flush
+    /// task. Like [`Self::with_budget`] it reaches actors that already exist
+    /// and every actor a later generation spawns.
+    #[must_use]
+    pub fn with_write_gate(self, gate: Arc<WriteGate>) -> Self {
+        self.write_gate.set(gate);
+        self
     }
 
     /// Installs the shared process-wide ingest buffer byte budget (ADR-0069),
@@ -1029,5 +1049,64 @@ mod tests {
             .await
             .expect("after a refresh the write routes again");
         router.shutdown().await;
+    }
+
+    /// ADR-1702 task 9: a gated encode that panics fails its flush. The strict
+    /// write gets the typed `SegmentBuild` error rather than the
+    /// `ShardUnavailable` a dropped ack would produce, nothing is stored, the
+    /// shard does not die, and the next write commits.
+    #[tokio::test]
+    async fn panicked_gated_span_encode_fails_the_strict_write() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let gate = Arc::new(WriteGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes: 0,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ));
+        let router = SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            Arc::clone(&store),
+            Arc::new(SystemClock),
+        )
+        .with_write_gate(gate);
+        router.write_gate.panic_next_encode();
+        let tenant = TenantId::new("acme");
+        let err = router
+            .write(
+                tenant.clone(),
+                vec![norm_span(trace_id(1), 1, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a panicked encode fails the write");
+        assert!(
+            matches!(err, SpanWriteError::SegmentBuild(_)),
+            "expected SegmentBuild, got {err:?}"
+        );
+        assert!(
+            list_all(store.as_ref(), "t/")
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        let snapshot = router.metrics().snapshot();
+        assert_eq!(snapshot.abandoned_input_rejected, 1);
+        assert_eq!(snapshot.shard_deaths, 0);
+        router
+            .write(
+                tenant,
+                vec![norm_span(trace_id(1), 2, 2_000)],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("the shard survives and the next write commits");
     }
 }

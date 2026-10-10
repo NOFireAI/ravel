@@ -17,6 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
+use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 use ravel_ingest::{
     AdmissionController, Clock, IngestByteBudget, IngestByteCharge, IngestPoint, IngestRouter,
     IngestValue, RequestRejection, WriteError, WriteMode, plausible_ingest_clock,
@@ -112,12 +113,20 @@ fn charge_snappy_inflate(
 /// keeps the guard alive through normalization and drops it before the router
 /// charges the normalized batch.
 ///
+/// With `write_gate` set, the snappy inflate and protobuf decode run on it as
+/// one job under the `remote_write_snappy` site, sized by the compressed body
+/// (ADR-1702). The charge moves into the job and comes back with the decoded
+/// request, so it is held while the job waits for a permit and, if the request
+/// is dropped meanwhile, released only when the job returns.
+///
 /// `Err` says which response to return: 429 for a budget shed, 400 for a body
-/// the decoder rejected (unchanged from before this charge existed).
-fn decode_body_charged(
+/// the decoder rejected (unchanged from before this charge existed), 500 or 503
+/// when the gate returned no result.
+async fn decode_body_charged(
     body: &Bytes,
     version: RemoteWriteVersion,
     budget: &Arc<IngestByteBudget>,
+    write_gate: Option<&WriteGate>,
 ) -> Result<(ResolvedRequest, Option<IngestByteCharge>), DecodeChargeError> {
     // Charge before the decoder allocates: a body whose inflate would cross the
     // ceiling is shed here, so the process never grows by the expansion.
@@ -125,15 +134,31 @@ fn decode_body_charged(
         Ok(charge) => charge,
         Err(SnappyChargeError::Shed) => return Err(DecodeChargeError::Shed),
     };
-    let resolved = match version {
-        RemoteWriteVersion::V1 => {
-            ravel_remote_write::decode_write_request(body, MAX_DECOMPRESSED_PAYLOAD_BYTES)
-                .map_err(|err: Rw1DecodeError| err.to_string())
-        }
-        RemoteWriteVersion::V2 => {
-            ravel_remote_write::decode_request(body, MAX_DECOMPRESSED_PAYLOAD_BYTES)
-                .map_err(|err: Rw2DecodeError| err.to_string())
-        }
+    let input_bytes = body.len() as u64;
+    let body = body.clone();
+    let decode = move || {
+        let resolved = match version {
+            RemoteWriteVersion::V1 => {
+                ravel_remote_write::decode_write_request(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES)
+                    .map_err(|err: Rw1DecodeError| err.to_string())
+            }
+            RemoteWriteVersion::V2 => {
+                ravel_remote_write::decode_request(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES)
+                    .map_err(|err: Rw2DecodeError| err.to_string())
+            }
+        };
+        (resolved, charge)
+    };
+    let (resolved, charge) = match write_gate {
+        Some(gate) => gate
+            .run(
+                WriteSite::RemoteWriteSnappy,
+                JobSize::Bytes(input_bytes),
+                decode,
+            )
+            .await
+            .map_err(DecodeChargeError::Gate)?,
+        None => decode(),
     };
     match resolved {
         // On this path `charge` drops here, refunding the budget exactly.
@@ -152,6 +177,9 @@ enum DecodeChargeError {
     Shed,
     /// The decoder rejected the body, with its own message.
     Decode(String),
+    /// The write gate returned no result: the decode job panicked, or the
+    /// runtime dropped it while shutting down. Nothing was written.
+    Gate(CpuGateError),
 }
 
 impl IntoResponse for DecodeChargeError {
@@ -160,6 +188,15 @@ impl IntoResponse for DecodeChargeError {
             DecodeChargeError::Shed => ingest_buffer_budget_shed_response(),
             DecodeChargeError::Decode(message) => {
                 (StatusCode::BAD_REQUEST, message).into_response()
+            }
+            DecodeChargeError::Gate(err) => {
+                let status = match err {
+                    CpuGateError::Panicked => StatusCode::INTERNAL_SERVER_ERROR,
+                    CpuGateError::Cancelled | CpuGateError::Closed => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                (status, format!("remote write decode failed: {err}")).into_response()
             }
         }
     }
@@ -306,6 +343,10 @@ pub struct RemoteWriteState {
     /// normalization, so the expansion is inside the declared bound rather than
     /// a transient outside it (issue #1419).
     pub budget: Arc<IngestByteBudget>,
+    /// The ADR-1702 write gate the body's snappy inflate and decode run on,
+    /// sized by the compressed body. `None` runs them inline on the request
+    /// task.
+    pub write_gate: Option<Arc<WriteGate>>,
 }
 
 impl crate::ingest_admission::IngestAdmissionState for RemoteWriteState {
@@ -497,13 +538,15 @@ async fn remote_write(
     // The snappy expansion is charged against the process-wide ingest byte
     // budget before it is allocated (ADR-0069 as amended by issue #1419). The
     // guard lives until just before the router takes its own charge below.
-    let (resolved, inflate_charge) = match decode_body_charged(&body, version, &state.budget) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            state.metrics.record_request_rejected();
-            return error.into_response();
-        }
-    };
+    let (resolved, inflate_charge) =
+        match decode_body_charged(&body, version, &state.budget, state.write_gate.as_deref()).await
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                state.metrics.record_request_rejected();
+                return error.into_response();
+            }
+        };
 
     // Metric metadata (ADR-0085 decision 1), captured before `resolved` is
     // consumed by normalization. Cloned rather than moved out: the decoded
@@ -768,6 +811,7 @@ mod tests {
             clock,
             metadata_sink: None,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            write_gate: None,
         })
     }
 
@@ -964,13 +1008,14 @@ mod tests {
     /// Non-vacuity: drop the charge inside `decode_body_charged` (return only
     /// the request) and the first two assertions read 0 instead of the inflated
     /// length.
-    #[test]
-    fn inflate_charge_is_held_through_decode_and_normalize() {
+    #[tokio::test]
+    async fn inflate_charge_is_held_through_decode_and_normalize() {
         let tenant = TenantId::new("acme");
         let (body, inflated_len) = rw2_snappy_body(400);
         let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(64 * 1024 * 1024));
 
-        let Ok((resolved, charge)) = decode_body_charged(&body, RemoteWriteVersion::V2, &budget)
+        let Ok((resolved, charge)) =
+            decode_body_charged(&body, RemoteWriteVersion::V2, &budget, None).await
         else {
             panic!("a well-formed body inside the budget decodes");
         };
@@ -1010,8 +1055,8 @@ mod tests {
     ///
     /// Non-vacuity: remove the `budget.try_charge` call and the body inflates
     /// and decodes fine, so both the error and the 429 disappear.
-    #[test]
-    fn inflate_over_the_ceiling_is_shed_without_allocating() {
+    #[tokio::test]
+    async fn inflate_over_the_ceiling_is_shed_without_allocating() {
         let (body, inflated_len) = rw2_snappy_body(400);
         let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(inflated_len - 1));
 
@@ -1029,7 +1074,8 @@ mod tests {
         );
         assert_eq!(budget.shed_total(), 1, "the shed is counted exactly once");
 
-        let Err(error) = decode_body_charged(&body, RemoteWriteVersion::V2, &budget) else {
+        let Err(error) = decode_body_charged(&body, RemoteWriteVersion::V2, &budget, None).await
+        else {
             panic!("a shed body produces a response, not a decoded request");
         };
         let response = error.into_response();

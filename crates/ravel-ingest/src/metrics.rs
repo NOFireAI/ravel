@@ -137,7 +137,8 @@ pub struct IngestMetrics {
     abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the segment build, data-key derivation, or commit-record
-    /// build failed (`WriteError::SegmentBuild`). A client signal: identical
+    /// build failed, or the write gate returned no encode result
+    /// (`WriteError::SegmentBuild`). A client signal: identical
     /// input will fail again, so the write is not retryable. Split out from
     /// `abandoned_retry_exhausted` because `error.rs` already treats the two
     /// causes differently.

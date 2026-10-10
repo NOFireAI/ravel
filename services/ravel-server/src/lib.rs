@@ -1774,6 +1774,7 @@ fn gateway_state(
     normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
+    write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
@@ -1824,6 +1825,7 @@ fn gateway_state(
         budget: ingest_buffer_budget.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
+        write_gate: Some(write_gate.clone()),
     })
 }
 
@@ -1837,6 +1839,7 @@ fn remote_write_state(
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
+    write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
@@ -1855,6 +1858,7 @@ fn remote_write_state(
         clock: Arc::new(SystemClock),
         metadata_sink: metadata_sink.clone(),
         budget: ingest_buffer_budget.clone(),
+        write_gate: Some(write_gate.clone()),
     })
 }
 
@@ -2312,6 +2316,12 @@ pub async fn start_with_heartbeat(
     let ingest_buffer_budget =
         ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
 
+    // The ADR-1702 read and write CPU gates, built in every mode: every mode
+    // decodes or encodes something, and `/metrics` renders both regardless.
+    // Built before the ingest routers, whose flush encodes run on the write
+    // gate.
+    let cpu_gates = cpu_gates::CpuGates::new(config.cpu_gate_permits);
+
     let ingest_router = if config.mode.holds_ingest_buffer() {
         let ingest_config = validated_ingest_config(
             IngestConfig {
@@ -2345,7 +2355,8 @@ pub async fn start_with_heartbeat(
                 Signal::Metrics,
                 Arc::new(SystemClock),
             )
-            .with_budget(ingest_buffer_budget.clone()),
+            .with_budget(ingest_buffer_budget.clone())
+            .with_write_gate(cpu_gates.write.clone()),
         ))
     } else {
         None
@@ -2425,7 +2436,8 @@ pub async fn start_with_heartbeat(
                 Arc::new(SystemClock),
                 indexed_fields,
             )
-            .with_budget(ingest_buffer_budget.clone()),
+            .with_budget(ingest_buffer_budget.clone())
+            .with_write_gate(cpu_gates.write.clone()),
         ))
     } else {
         None
@@ -2452,7 +2464,8 @@ pub async fn start_with_heartbeat(
         )?;
         Some(Arc::new(
             SpanIngestRouter::new(span_ingest_config, store.clone(), Arc::new(SystemClock))
-                .with_budget(ingest_buffer_budget.clone()),
+                .with_budget(ingest_buffer_budget.clone())
+                .with_write_gate(cpu_gates.write.clone()),
         ))
     } else {
         None
@@ -2610,10 +2623,6 @@ pub async fn start_with_heartbeat(
         config.process_memory_budget_bytes,
     ));
 
-    // The ADR-1702 read and write CPU gates, built in every mode: every mode
-    // decodes or encodes something, and `/metrics` renders both regardless.
-    let cpu_gates = cpu_gates::CpuGates::new(config.cpu_gate_permits);
-
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
@@ -2670,6 +2679,7 @@ pub async fn start_with_heartbeat(
             &normalize_reject_metrics,
             &ingest_buffer_budget,
             &metadata_sink,
+            &cpu_gates.write,
             ingest_lag.admission_lag_ns,
         );
         http_router = http_router.merge(otlp_http::router(state));
@@ -2682,6 +2692,7 @@ pub async fn start_with_heartbeat(
             &ingest_concurrency,
             &metadata_sink,
             &ingest_buffer_budget,
+            &cpu_gates.write,
             ingest_lag.admission_lag_ns,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
@@ -2701,6 +2712,7 @@ pub async fn start_with_heartbeat(
                 &normalize_reject_metrics,
                 &ingest_buffer_budget,
                 &metadata_sink,
+                &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
             );
             let mtls_rw_state = remote_write_state(
@@ -2712,6 +2724,7 @@ pub async fn start_with_heartbeat(
                 &ingest_concurrency,
                 &metadata_sink,
                 &ingest_buffer_budget,
+                &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
             );
             mtls_router = mtls_router
@@ -3650,6 +3663,7 @@ pub async fn start_with_heartbeat(
             &normalize_reject_metrics,
             &ingest_buffer_budget,
             &metadata_sink,
+            &cpu_gates.write,
             ingest_lag.admission_lag_ns,
         )),
         _ => None,

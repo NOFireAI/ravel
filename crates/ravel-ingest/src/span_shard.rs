@@ -74,6 +74,8 @@ use crate::shard::{InPlaceCause, InPlaceWarnings};
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
 use crate::span_router::shard_for_span;
+use crate::write_gate::WriteGateSlot;
+use ravel_cpu_gate::WriteSite;
 
 pub(crate) type SpanAck = oneshot::Sender<Result<CommitToken, SpanWriteError>>;
 
@@ -271,6 +273,16 @@ struct SpanFlushCtx {
     rng: Arc<dyn RngSource>,
     config: IngestConfig,
     metrics: Arc<SpanIngestMetrics>,
+    /// The ADR-1702 write gate the encode runs on, shared with the router.
+    write_gate: WriteGateSlot,
+}
+
+/// What a span flush's encode job hands back to the flush task: the RSPAN bytes
+/// and their blake3 hash, and the byte charges the job held while it waited and
+/// ran.
+struct EncodedSpanFlush {
+    encoded: Result<(Vec<u8>, [u8; 32]), ravel_rspan::SpanSegError>,
+    charges: Vec<Arc<IngestByteCharge>>,
 }
 
 /// One span flush's identity and payload, pinned by the actor before the flush
@@ -288,6 +300,9 @@ struct SpanPinnedFlush {
     min_ingest_ts_ns: i64,
     max_ingest_ts_ns: i64,
     spans: Vec<NormalizedSpan>,
+    /// The buffer's `est_bytes`, which sizes the encode against the write
+    /// gate's inline floor.
+    input_bytes: u64,
     waiters: Vec<SpanAck>,
     /// The global ingest-byte-budget charges this flush's buffer held (ADR-0069).
     /// Carried into the flush task purely so they are dropped -- and the bytes
@@ -313,13 +328,10 @@ impl SpanFlushCtx {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             spans,
+            input_bytes,
             waiters,
             charges,
         } = pinned;
-        // Held to this flush's terminal outcome (every early `return` below is
-        // still inside this scope), then dropped here: that drop is the
-        // ADR-0069 budget refund for exactly the bytes this buffer held.
-        let _charges = charges;
 
         // One pass computes the commit-record fields RspanWriter does not
         // surface after `finish()`: the distinct trace count (the span analogue
@@ -337,20 +349,51 @@ impl SpanFlushCtx {
         let series_count = trace_ids.len() as u64;
         let sample_count = spans.len() as u64;
 
-        let mut writer = RspanWriter::new(RspanConfig::default(), identity);
-        for span in spans {
-            writer.push(to_rspan_record(span));
-        }
-        let bytes = match writer.finish() {
-            Ok(bytes) => bytes,
+        // The encode and its content hash run on the write gate when one is
+        // attached (ADR-1702). The job takes the byte charges with the spans and
+        // returns them with the object, so they stay held through the permit
+        // wait and the encode whether or not this task is still waiting.
+        let encoded = self
+            .write_gate
+            .encode(WriteSite::SpanFlush, input_bytes, move || {
+                let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+                for span in spans {
+                    writer.push(to_rspan_record(span));
+                }
+                EncodedSpanFlush {
+                    encoded: writer.finish().map(|bytes| {
+                        let content_hash = *blake3::hash(&bytes).as_bytes();
+                        (bytes, content_hash)
+                    }),
+                    charges,
+                }
+            })
+            .await;
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                // Nothing was written, and the job's charges dropped with its
+                // result. The encode produced no object, as a failed build does:
+                // a panicked job would panic again on the same input, and a job
+                // the gate cancelled or never ran means the runtime is shutting
+                // down.
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(err.to_string())));
+                return;
+            }
+        };
+        // Held to this flush's terminal outcome (every early `return` below is
+        // still inside this scope), then dropped here: that drop is the
+        // ADR-0069 budget refund for exactly the bytes this buffer held.
+        let _charges = encoded.charges;
+        let (bytes, content_hash) = match encoded.encoded {
+            Ok(encoded) => encoded,
             Err(e) => {
                 self.metrics.record_abandoned_input_rejected();
                 self.ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(e.to_string())));
                 return;
             }
         };
-
-        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data = Bytes::from(bytes);
 
         let data_key = match keys::data_key(
@@ -702,6 +745,7 @@ impl SpanShardActor {
         backstop_ceiling: BufferBudgetCeiling,
         cap_flag: DeferralCapFlag,
         scope: Arc<dyn FlushScope<SpanShardMsg>>,
+        write_gate: WriteGateSlot,
     ) -> Self {
         cap_flag.publish(None, clock.now_ns());
         let ctx = Arc::new(SpanFlushCtx {
@@ -713,6 +757,7 @@ impl SpanShardActor {
             rng,
             config,
             metrics: Arc::clone(&metrics),
+            write_gate,
         });
         SpanShardActor {
             shard,
@@ -1754,6 +1799,7 @@ impl SpanShardActor {
         self.next_seq += 1;
         let SpanTenantBuf {
             spans,
+            est_bytes,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
@@ -1793,6 +1839,7 @@ impl SpanShardActor {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             spans,
+            input_bytes: est_bytes as u64,
             waiters,
             charges,
         };
@@ -2007,6 +2054,7 @@ mod tests {
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 Arc::new(crate::generation::AlwaysInScope),
+                WriteGateSlot::default(),
             );
             let task = tokio::spawn(actor.run());
             Harness {
@@ -2589,6 +2637,7 @@ mod tests {
             BufferBudgetCeiling::unlimited(),
             DeferralCapFlag::new(exhaustion_config(4).flush_deferral_cap_ns()),
             Arc::new(crate::generation::AlwaysInScope),
+            WriteGateSlot::default(),
         );
         let task = tokio::spawn(actor.run());
 
@@ -2934,6 +2983,7 @@ mod tests {
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 scope,
+                WriteGateSlot::default(),
             )
         }
 

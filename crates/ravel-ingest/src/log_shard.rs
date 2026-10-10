@@ -82,6 +82,8 @@ use crate::shard::{InPlaceCause, InPlaceWarnings};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
 use crate::storage_layout::{WriterLayout, writer_layout};
+use crate::write_gate::WriteGateSlot;
+use ravel_cpu_gate::WriteSite;
 
 pub(crate) type LogAck = oneshot::Sender<Result<CommitToken, LogWriteError>>;
 
@@ -659,6 +661,31 @@ struct LogFlushCtx {
     /// the `stage-timing` feature.
     #[cfg(feature = "stage-timing")]
     stage_timings: Arc<LogStageTimings>,
+    /// The ADR-1702 write gate the encode runs on, shared with the router.
+    write_gate: WriteGateSlot,
+}
+
+/// What a log flush's encode job hands back to the flush task: the RLOG bytes
+/// with their writer stats and blake3 hash, and the byte charges the job held
+/// while it waited and ran.
+struct EncodedLogFlush {
+    encoded: Result<EncodedRlog, RlogEncodeError>,
+    charges: Vec<Arc<IngestByteCharge>>,
+    #[cfg(feature = "stage-timing")]
+    encode_elapsed: Duration,
+}
+
+/// Which writer step refused the payload: only `finish` reports a stream-id
+/// collision.
+enum RlogEncodeError {
+    Push(LogSegError),
+    Finish(LogSegError),
+}
+
+struct EncodedRlog {
+    bytes: Vec<u8>,
+    stats: ravel_logseg::writer::WriteStats,
+    content_hash: [u8; 32],
 }
 
 /// One log flush's identity and payload, pinned by the actor before the flush
@@ -676,6 +703,9 @@ struct LogPinnedFlush {
     min_ingest_ts_ns: i64,
     max_ingest_ts_ns: i64,
     payload: FlushPayload,
+    /// The buffer's `est_bytes`, which sizes the encode against the write
+    /// gate's inline floor.
+    input_bytes: u64,
     waiters: Vec<LogAck>,
     /// The global ingest-byte-budget charges this flush's buffer held (ADR-0069).
     /// Carried into the flush task purely so they are dropped -- and the bytes
@@ -764,14 +794,11 @@ impl LogFlushCtx {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             payload,
+            input_bytes,
             waiters,
             charges,
             declared_stats,
         } = pinned;
-        // Held to this flush's terminal outcome (every early `return` below is
-        // still inside this scope), then dropped here: that drop is the
-        // ADR-0069 budget refund for exactly the bytes this buffer held.
-        let _charges = charges;
 
         // One pass over the payload computes the commit-record fields
         // RlogWriter does not surface after `finish()`: the distinct stream
@@ -835,41 +862,83 @@ impl LogFlushCtx {
             .into_iter()
             .map(|col| (col.key, declared_type_tag(col.ty)))
             .collect();
-        // Encode: RLOG serialization only (RlogWriter push + finish), excluding
-        // the indexed-field and layout resolution above and the object-store
-        // PUT below.
-        #[cfg(feature = "stage-timing")]
-        let encode_start = std::time::Instant::now();
         let rlog_config = RlogConfig {
             zstd_level: self.config.rlog_zstd_level.get(),
             ..RlogConfig::default()
         };
-        let mut writer = RlogWriter::new(rlog_config, identity)
-            .with_indexed_fields(indexed_fields)
-            .with_sort_descriptor(writer_layout.descriptor, writer_layout.generation)
-            .with_bloom_scope(writer_layout.bloom_scope);
-        let push_result = match payload {
-            FlushPayload::Rows(records) => records
-                .into_iter()
-                .try_for_each(|rec| writer.push(to_logseg_record(rec))),
-            FlushPayload::Columnar(batches) => batches
-                .into_iter()
-                .try_for_each(|batch| writer.push_columnar(batch)),
+        // The encode runs on the write gate when one is attached (ADR-1702).
+        // The job takes the byte charges with the payload and returns them with
+        // the object, so they stay held through the permit wait and the encode
+        // whether or not this task is still waiting.
+        let encoded = self
+            .write_gate
+            .encode(WriteSite::LogFlush, input_bytes, move || {
+                // Encode: RLOG serialization only (RlogWriter push + finish),
+                // excluding the indexed-field and layout resolution above, the
+                // permit wait and the object-store PUT below. The content hash
+                // is taken in the same job, after the stage closes.
+                #[cfg(feature = "stage-timing")]
+                let encode_start = std::time::Instant::now();
+                let mut writer = RlogWriter::new(rlog_config, identity)
+                    .with_indexed_fields(indexed_fields)
+                    .with_sort_descriptor(writer_layout.descriptor, writer_layout.generation)
+                    .with_bloom_scope(writer_layout.bloom_scope);
+                let push_result = match payload {
+                    FlushPayload::Rows(records) => records
+                        .into_iter()
+                        .try_for_each(|rec| writer.push(to_logseg_record(rec))),
+                    FlushPayload::Columnar(batches) => batches
+                        .into_iter()
+                        .try_for_each(|batch| writer.push_columnar(batch)),
+                };
+                let finish_result = push_result
+                    .map_err(RlogEncodeError::Push)
+                    .and_then(|()| writer.finish_with_stats().map_err(RlogEncodeError::Finish));
+                // `Encode` closes here, immediately after `finish_with_stats`
+                // returns: the hash below and the bloom-sample fold and
+                // `record_postings` after the job are bookkeeping on an
+                // already-finished object, not part of RLOG serialization, and
+                // must not grow the figure this stage exists to attribute
+                // precisely.
+                #[cfg(feature = "stage-timing")]
+                let encode_elapsed = encode_start.elapsed();
+                EncodedLogFlush {
+                    encoded: finish_result.map(|(bytes, stats)| EncodedRlog {
+                        content_hash: *blake3::hash(&bytes).as_bytes(),
+                        bytes,
+                        stats,
+                    }),
+                    charges,
+                    #[cfg(feature = "stage-timing")]
+                    encode_elapsed,
+                }
+            })
+            .await;
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                // Nothing was written, and the job's charges dropped with its
+                // result. The encode produced no object, as a failed build does:
+                // a panicked job would panic again on the same input, and a job
+                // the gate cancelled or never ran means the runtime is shutting
+                // down.
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(err.to_string())));
+                return;
+            }
         };
-        if let Err(e) = push_result {
-            self.metrics.record_abandoned_input_rejected();
-            self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
-            return;
-        }
-        let finish_result = writer.finish_with_stats();
-        // `Encode` closes here, immediately after `finish_with_stats` returns:
-        // the bloom-sample fold and `record_postings` below are bookkeeping on
-        // an already-finished object, not part of RLOG serialization, and must
-        // not grow the figure this stage exists to attribute precisely.
+        // Held to this flush's terminal outcome (every early `return` below is
+        // still inside this scope), then dropped here: that drop is the
+        // ADR-0069 budget refund for exactly the bytes this buffer held.
+        let _charges = encoded.charges;
         #[cfg(feature = "stage-timing")]
-        let encode_elapsed = encode_start.elapsed();
-        let bytes = match finish_result {
-            Ok((bytes, stats)) => {
+        let encode_elapsed = encoded.encode_elapsed;
+        let (bytes, content_hash) = match encoded.encoded {
+            Ok(EncodedRlog {
+                bytes,
+                stats,
+                content_hash,
+            }) => {
                 // Per-block bloom-construction time (issue #1516). The measurement
                 // itself is nested inside the `Encode` window, taken inside
                 // `finish_with_stats`; this fold is not, and runs after
@@ -884,14 +953,14 @@ impl LogFlushCtx {
                 // Write-side POSTINGS metrics: section bytes, per-field distinct
                 // counts, and the cap-exceeded counter.
                 self.metrics.record_postings(stats);
-                bytes
+                (bytes, content_hash)
             }
-            Err(LogSegError::InconsistentStreamAttrs(msg)) => {
+            Err(RlogEncodeError::Finish(LogSegError::InconsistentStreamAttrs(msg))) => {
                 self.metrics.record_stream_id_collision();
                 self.ack_waiters(waiters, Err(LogWriteError::StreamIdCollision(msg)));
                 return;
             }
-            Err(e) => {
+            Err(RlogEncodeError::Push(e) | RlogEncodeError::Finish(e)) => {
                 self.metrics.record_abandoned_input_rejected();
                 self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
                 return;
@@ -900,7 +969,6 @@ impl LogFlushCtx {
         #[cfg(feature = "stage-timing")]
         self.stage_timings.record(LogStage::Encode, encode_elapsed);
 
-        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data = Bytes::from(bytes);
 
         let data_key = match keys::data_key(
@@ -1270,6 +1338,7 @@ impl LogShardActor {
         backstop_ceiling: BufferBudgetCeiling,
         cap_flag: DeferralCapFlag,
         scope: Arc<dyn FlushScope<LogShardMsg>>,
+        write_gate: WriteGateSlot,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<LogStageTimings>,
     ) -> Self {
         cap_flag.publish(None, clock.now_ns());
@@ -1285,6 +1354,7 @@ impl LogShardActor {
             indexed_fields,
             #[cfg(feature = "stage-timing")]
             stage_timings,
+            write_gate,
         });
         LogShardActor {
             shard,
@@ -2520,6 +2590,7 @@ impl LogShardActor {
         };
         let LogTenantBuf {
             content,
+            est_bytes,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
@@ -2589,6 +2660,7 @@ impl LogShardActor {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             payload,
+            input_bytes: est_bytes as u64,
             waiters,
             charges,
             declared_stats,
@@ -2818,6 +2890,7 @@ mod tests {
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 Arc::new(crate::generation::AlwaysInScope),
+                WriteGateSlot::default(),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
@@ -3680,6 +3753,7 @@ mod tests {
             BufferBudgetCeiling::unlimited(),
             DeferralCapFlag::new(exhaustion_config(4).flush_deferral_cap_ns()),
             Arc::new(crate::generation::AlwaysInScope),
+            WriteGateSlot::default(),
             #[cfg(feature = "stage-timing")]
             Arc::new(LogStageTimings::new()),
         );
@@ -4458,6 +4532,7 @@ mod tests {
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 scope,
+                WriteGateSlot::default(),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             )
@@ -5367,6 +5442,7 @@ mod tests {
             BufferBudgetCeiling::unlimited(),
             DeferralCapFlag::new(config.flush_deferral_cap_ns()),
             crate::generation::ScriptedScope::new(ScanCheck::InScanSet, None),
+            WriteGateSlot::default(),
             #[cfg(feature = "stage-timing")]
             Arc::new(LogStageTimings::new()),
         );

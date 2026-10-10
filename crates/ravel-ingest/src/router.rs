@@ -26,6 +26,8 @@ use crate::shard::{ShardActor, ShardMsg};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint};
+use crate::write_gate::WriteGateSlot;
+use ravel_cpu_gate::WriteGate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
@@ -175,6 +177,9 @@ pub struct IngestRouter {
     /// limit. Written by [`IngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
+    /// The write gate every shard actor's flush encode runs on, shared the same
+    /// way. Written by [`IngestRouter::with_write_gate`].
+    write_gate: WriteGateSlot,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
     /// bench reporter reads via [`IngestRouter::stage_timings`]. Present only
@@ -261,6 +266,7 @@ impl IngestRouter {
         // process paths never contend on a shared lock.
         let metrics = Arc::new(IngestMetrics::new(config.shard_count));
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
+        let write_gate = WriteGateSlot::default();
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(MetricStageTimings::new());
         // Each generation's shard-actor set gets a fresh writer identity, so
@@ -274,6 +280,7 @@ impl IngestRouter {
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let backstop_ceiling = backstop_ceiling.clone();
+            let write_gate = write_gate.clone();
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             let factory = move |shard_count: u32| -> Vec<ShardHandle> {
@@ -304,6 +311,7 @@ impl IngestRouter {
                             backstop_ceiling.clone(),
                             cap_flag.clone(),
                             Arc::clone(&scope),
+                            write_gate.clone(),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
@@ -326,6 +334,7 @@ impl IngestRouter {
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             backstop_ceiling,
+            write_gate,
             #[cfg(feature = "stage-timing")]
             stage_timings,
         }
@@ -352,6 +361,17 @@ impl IngestRouter {
     pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
         self.backstop_ceiling.set(budget.limit());
         self.budget = budget;
+        self
+    }
+
+    /// Runs every shard's flush encode on the ADR-1702 write gate under the
+    /// `metrics_flush` site, sized by the flushed buffer's bytes so the gate's
+    /// inline floor applies. Without it the encode runs inline on the flush
+    /// task. Like [`Self::with_budget`] it reaches actors that already exist
+    /// and every actor spawned later, respawns included.
+    #[must_use]
+    pub fn with_write_gate(self, gate: Arc<WriteGate>) -> Self {
+        self.write_gate.set(gate);
         self
     }
 
@@ -796,6 +816,7 @@ impl IngestRouter {
             self.backstop_ceiling.clone(),
             cap_flag,
             scope,
+            self.write_gate.clone(),
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );
@@ -1080,5 +1101,65 @@ mod tests {
         );
         assert_eq!(decoded.series_count, 1);
         assert_eq!(decoded.sample_count, 1);
+    }
+
+    /// ADR-1702 task 9: a gated encode that panics fails its flush. The strict
+    /// write gets the typed `SegmentBuild` error rather than the
+    /// `ShardUnavailable` a dropped ack would produce, nothing is stored, the
+    /// shard does not die, and the next write commits.
+    #[tokio::test]
+    async fn panicked_gated_metrics_encode_fails_the_strict_write() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let gate = Arc::new(WriteGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes: 0,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ));
+        let router = IngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            Arc::clone(&store),
+            Signal::Metrics,
+            Arc::new(crate::clock::SystemClock),
+        )
+        .with_write_gate(gate);
+        router.write_gate.panic_next_encode();
+        let tenant = TenantId::new("acme");
+        let err = router
+            .write(
+                tenant.clone(),
+                vec![test_point(&tenant, "cpu", 1_000, 1.0)],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a panicked encode fails the write");
+        assert!(
+            matches!(err, WriteError::SegmentBuild(_)),
+            "expected SegmentBuild, got {err:?}"
+        );
+        assert!(
+            list_all(store.as_ref(), "t/")
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        let snapshot = router.metrics().snapshot();
+        assert_eq!(snapshot.abandoned_input_rejected, 1);
+        assert_eq!(snapshot.shard_deaths, 0);
+        router
+            .write(
+                tenant.clone(),
+                vec![test_point(&tenant, "cpu", 2_000, 2.0)],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("the shard survives and the next write commits");
     }
 }

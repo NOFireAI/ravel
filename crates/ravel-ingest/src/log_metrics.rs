@@ -76,7 +76,8 @@ pub struct LogIngestMetrics {
     abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RLOG build, data-key derivation, or commit-record
-    /// build failed ([`crate::LogWriteError::SegmentBuild`]). A client
+    /// build failed, or the write gate returned no encode result
+    /// ([`crate::LogWriteError::SegmentBuild`]). A client
     /// signal: identical input will fail again, so the write is not
     /// retryable.
     abandoned_input_rejected: AtomicU64,
