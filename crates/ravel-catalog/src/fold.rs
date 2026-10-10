@@ -122,11 +122,13 @@ pub struct Transaction {
 /// pre-rewrite inputs until retention drops it), and the sweep's gate remains
 /// the delete blocker either way.
 ///
-/// Three kinds of fold ignore a request entirely, because the pass sits in the
-/// same reconcile branch as the other two: a first fold, a rebuild, and a
-/// no-op fold (the watermark did not advance, so the fold returns before any
-/// reconcile work). Nothing records the ignored hours; the requester re-derives
-/// its blocked set on each sweep and resubmits a still-held hour.
+/// Three kinds of fold ignore a request entirely: a first fold, a rebuild,
+/// and a no-op fold over a HEAD with no held-open hour (the watermark did not
+/// advance, so the fold returns before any reconcile work). A fold over
+/// held-open hours does run the targeted pass for the requested hours outside
+/// the held range, even when it then reports a no-op. Nothing records the
+/// ignored hours; the requester re-derives its blocked set on each sweep and
+/// resubmits a still-held hour.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefoldRequest {
     /// Ascending and deduplicated, so a fold spends its cap oldest-first (the
@@ -1549,9 +1551,10 @@ impl Catalog {
             if let (Some(listings), Some(held), Some(_)) =
                 (&held_listings, held_open, reconcile_watermark)
             {
-                // A fold that does not advance the watermark re-lists only
-                // the held-open hours: every other hour is reconciled by the
-                // next fold that does advance it, exactly as on a no-op fold.
+                // A fold that does not advance the watermark re-lists the
+                // held-open hours, and below them only the requested hours of
+                // a queued re-fold request: every other hour is reconciled by
+                // the next fold that does advance it.
                 for (shard, hour, listing) in listings {
                     self.reconcile_one_bucket(
                         tenant,

@@ -297,11 +297,11 @@ that is not a no-op or that reconciled at least one of them, so the
 hand-off does not wait for another sweep. Each fold takes at
 most `frontier_reconcile_max_hours` of the pair's oldest queued hours, the
 most it reconciles, and the rest stay queued for the pair's next fold that
-advances the watermark. A request lost with the process on restart, evicted
+advances the watermark or reconciles them on a held-open no-op. A request lost with the process on restart, evicted
 from the full queue, or cut past an entry's 1024-hour cap is sent again by
 the next sweep pass that finds the hold. `FoldReport`'s
-`refold_hours_reconciled` field reports the count, and is `0` on that path,
-on a plain `Catalog::fold` call, and on any request naming hours the pass
+`refold_hours_reconciled` field reports the count, and is `0` on a no-op
+fold with no held-open hours, on a plain `Catalog::fold` call, and on any request naming hours the pass
 did not reach (docs/adrs/0064-selective-subject-erasure.md, the no-op
 carve-out).
 

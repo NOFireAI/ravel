@@ -593,7 +593,9 @@ the report stays honest; decision 1's "does not take its no-op return"
 means only that it does not return before re-listing. Right after a seal of
 the current hour that is three held-open hours in the first twenty minutes
 of the hour and two after, falling to none as the margin passes them: at
-most twelve LISTs per fold on a four-shard tenant with the default margins,
+most twelve LISTs per fold on a four-shard tenant with the default margins
+(plus, when a targeted re-fold request is queued, the LISTs of up to
+`frontier_reconcile_max_hours` of its hours outside the held-open range),
 plus one GET of each part covering those hours whenever a listing names any
 commit record at all, and none when a fold's margin already covers HEAD's
 watermark. Held-open hours never reach further below the watermark than the
@@ -605,8 +607,9 @@ before the seal, or when a targeted re-fold request is queued; that is the
 snapshot load of an advancing fold. A compacted hour's level-0 records stay
 listed until garbage collection, so each fold in the window also reads that
 bucket's records before concluding there is nothing new (#2744). A queued
-request costs the whole load on each such fold until a fold re-lists one of
-its hours or the margin passes the watermark; the fold runs the targeted
+request costs the whole load on each such fold until the targeted pass
+re-lists one of its hours outside the held-open range, or the margin reaches
+the watermark; the fold runs the targeted
 pass over the requested hours outside the held-open range, may report them
 reconciled on a no-op, and the scheduled fold then dequeues them.
 The query resolve path is unchanged.
