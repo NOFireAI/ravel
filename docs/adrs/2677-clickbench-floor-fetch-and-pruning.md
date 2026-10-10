@@ -592,8 +592,13 @@ the report stays honest; decision 1's "does not take its no-op return"
 means only that it does not return before re-listing. Right after a seal of
 the current hour that is three held-open hours in the first twenty minutes
 of the hour and two after, falling to none as the margin passes them: at
-most twelve LISTs per fold on a four-shard tenant, and none for a HEAD no
-assertion raised. The query resolve path is unchanged.
+most twelve LISTs per fold on a four-shard tenant with the default margins,
+plus a GET of each part covering those hours when a listing names a commit
+HEAD lacks, and none when a fold's margin already covers HEAD's watermark.
+A held-open hour compacted before the seal costs more: its compacted level-0
+records stay listed until garbage collection, so each fold in the window
+reads that bucket's records before concluding there is nothing new (#2744).
+The query resolve path is unchanged.
 
 What stays exposed: a commit that lands after its hour's natural seal, or
 with no fold running between its publish and that seal, is not folded and

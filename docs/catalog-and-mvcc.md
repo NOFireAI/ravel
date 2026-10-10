@@ -958,8 +958,13 @@ the hour and two after that, falling to one and then none as the margin
 catches up. A fold therefore issues at most that many LISTs per shard beyond
 what a fold over the same HEAD without held-open hours issues (twelve on a
 four-shard tenant), plus a GET of each snapshot part covering those hours
-when their listing names any commit record; a fold over a HEAD no assertion
-raised issues no extra request. The query resolve path is unchanged. Once the margin passes an hour it is sealed by
+when their listing names a commit record HEAD does not hold. When a held-open
+hour was compacted before the seal (the compact-then-seal order), its listing
+still names the compacted level-0 records until garbage collection removes
+them, so each fold in the window also reads that bucket's compaction and
+level-0 records before concluding there is nothing new: correct, and more
+reads than the uncompacted case. A fold whose margin hour is at or
+above HEAD's watermark issues no extra request. The query resolve path is unchanged. Once the margin passes an hour it is sealed by
 the lemma like any other, and a commit published into it after that is not
 folded by a later fold, because the reconcile window re-lists hours below the
 watermark but skips a bucket holding only level-0 commit records, so it is

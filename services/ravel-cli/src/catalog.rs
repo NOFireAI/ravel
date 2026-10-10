@@ -110,8 +110,9 @@ pub async fn fold(
 /// well as every hour the seal margin seals, so the hour in progress is folded
 /// now rather than once the margin has passed it. That is an assertion that no
 /// writer will publish into the current hour or any earlier one: a commit
-/// published into a sealed hour stays invisible to queries that carry no
-/// commit token until a HEAD rebuild. `now_ns` itself is not moved.
+/// published into a sealed hour is folded by a later fold only until the
+/// seal margin passes that hour, and after that stays invisible to queries
+/// that carry no commit token until a HEAD rebuild. `now_ns` itself is not moved.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_writers_stopped(
     store: Arc<dyn ObjectStoreBackend>,
