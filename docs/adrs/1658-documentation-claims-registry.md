@@ -123,7 +123,7 @@ capability.
 flowchart LR
     M[review claim matrix<br/>seat, claim, source, verdict, evidence, note] -->|seed once| REG[(docs/review/claims.yaml)]
     REG --> G[check-doc-claims.py]
-    D[normative docs<br/>docs/*.md specs, README, guides, reference, PROGRESS.md] --> G
+    D[normative docs<br/>docs/*.md specs, README, guides, reference] --> G
     SRC[crates/ services/ sources and tests] --> G
     G -->|QUOTE: quote present once| F{findings?}
     G -->|BIND: symbol defined| F
