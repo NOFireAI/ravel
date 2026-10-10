@@ -68,14 +68,12 @@ v3.
 bulk data-object format. The supported-version window is single-sourced as
 `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
-read it. Until the v1.0 release (ADR-0531: the format-lifecycle activation
-milestone is v1.0, distinct from the software's 0.9.0 first public release and
-not yet shipped) the window holds exactly one version (ADR-0027 decision 7,
+read it. Until the v1.0 release (ADR-0531) the window holds exactly one
+version (ADR-0027 decision 7,
 ADR-0892): a bump deletes
 the previous version's reader, and a pre-1.0.0 development store holding older
-objects is wiped or re-ingested. RLOG v3 to v4 in 0.11.0 is the one bump that
-did not do this in the same change; ADR-0892 removed the v3 reader in 0.12.0
-instead. The N/N-1 window ADR-0066 describes, rolled out readers-before-writers
+objects is wiped or re-ingested.
+The N/N-1 window ADR-0066 describes, rolled out readers-before-writers
 -- a release writing N+1 requires a fleet already reading N+1 -- opens at, and
 only at, v1.0.
 
@@ -1260,8 +1258,7 @@ conservative rule above, but no stored object can reach it: POSTINGS version 1
 was only ever written under trailer version 2, and a reader refuses that
 trailer outright (see the top of this document -- v2 read support was deleted
 with ADR-0095, with no dual-reader window). So the version-1 arm is dead for
-stored data, and the "reader accepts both versions" migration story it used to
-carry no longer applies to anything. It is kept as a decoder arm, not a
+stored data. It is kept as a decoder arm, not a
 supported input: only the trailer version window decides what opens.
 
 Adding POSTINGS did not bump the trailer `version` (2 at the time): ADR-0029's
@@ -1463,11 +1460,9 @@ bytes in full to reach any block within it, so its whole-section
 `Section.crc32c` is verified the same way STREAM_DIR's and FIELD_DIR's
 is, before `PostingsSection::parse` touches the header. This is the only
 protection an out-of-bounds or garbage `first_term`, offset, or count in
-the header gets; earlier revisions of this format checked it only
-structurally (ascending order, cap checks, exact block tiling) and not
-by crc, which let a header byte flip route `probe` to the wrong block
-without detection as long as ordering and per-block checksums still
-passed. `probe` adds a second, independent check for a future reader
+the header gets: the structural checks alone (ascending order, cap checks,
+exact block tiling) would let a header byte flip route `probe` to the wrong
+block as long as ordering and per-block checksums still passed. `probe` adds a second, independent check for a future reader
 that fetches one block via a range read instead of the whole section: it
 requires the decompressed block's first term to equal the sparse
 entry's `first_term`, and every term in the block to sort below the next

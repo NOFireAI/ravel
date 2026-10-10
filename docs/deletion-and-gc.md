@@ -403,7 +403,7 @@ window would still call a Hit.
   component), so it would otherwise re-list the whole shard's `l0/`
   data prefix on every maintain tick (default 300 s) even though rules 2 and
   3 already list only the tick's zone-scoped hours. `ravel-maintain`'s
-  per-tick sweep now runs candidate selection only on the tick a full sweep
+  per-tick sweep runs candidate selection only on the tick a full sweep
   is due -- the same cadence memo (`MaintainMemo::full_sweep_due`,
   `interior_reverify_ns`, default 6 h) that already governs when rules 2 and
   3 fall back to their own unscoped pass. Every other tick skips candidate
@@ -424,16 +424,14 @@ window would still call a Hit.
   every 72 ticks skip the rule. The per-pass counters
   (`orphans_quarantined`, `orphans_quarantine_refused`, `quarantine_reaped`,
   and the breaker-trip counter) are unaffected: a skipped pass adds zero,
-  which is the truth about the events it performed. The L0 listing cost that
-  used to be paid every 300 s is now paid once per full-sweep interval
-  instead. The quarantine reaper runs on that same cadence: it is a different
+  which is the truth about the events it performed. The quarantine reaper
+  runs on the full-sweep cadence too: it is a different
   rule over the separate `quarantine/` prefix, but it runs only on a pass that
   ran candidate selection, so the breaker's hold on it cannot be stepped
   around by the next tick (see "A tripped breaker holds the reaper" below).
   Objects already quarantined keep aging out, one full-sweep interval at a
   time rather than one tick at a time, which moves the effective second
-  horizon later by at most one full-sweep interval and never earlier. The key
-  layout of `l0/` and `quarantine/` is unchanged.
+  horizon later by at most one full-sweep interval and never earlier.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
@@ -483,11 +481,10 @@ window would still call a Hit.
 The breaker catches mass loss but, by design, lets small or thinly-spread
 loss through: fewer than `orphan_breaker_min_count` candidates, or a count
 under `orphan_breaker_max_ratio` of a large shard, does not trip it (the
-three scope limits above). Before this amendment those candidates were
-deleted permanently at the first horizon, so an out-of-band commit-record
-loss below the thresholds became permanent data loss with no recovery
-window and nothing paging. Orphan GC therefore no longer deletes a
-candidate at all. It moves each surviving candidate to a `quarantine/`
+three scope limits above). Deleting those candidates at the first horizon
+would make an out-of-band commit-record loss below the thresholds permanent,
+with no recovery window and nothing paging. Orphan GC therefore does not
+delete a candidate at all. It moves each surviving candidate to a `quarantine/`
 prefix and a separate reaper deletes it only after a second horizon:
 
 - **The move is copy-first, delete-second.** An object store has no atomic
@@ -545,9 +542,9 @@ prefix and a separate reaper deletes it only after a second horizon:
 The cost is storage plus transfer. A quarantined object occupies the bucket
 for the second horizon before it is reclaimed, and the `quarantine/` prefix
 would leak without the reaper, which is why the reaper is part of the
-mechanism, not a follow-up. The request cost changed shape too: orphan GC
-went from one DELETE per candidate to a full-object GET plus a full PUT per
-candidate, run serially with no cap on candidates per pass, and the reaper
+mechanism, not a follow-up. The request cost per candidate is a full-object
+GET and a full PUT on top of the live-key DELETE, run serially with no cap
+on candidates per pass, and the reaper
 adds one LIST per swept unit per full-sweep interval: it runs on the pass
 that ran candidate selection, not on every tick. The thin-spread record
 loss this feature exists for is also the expensive case, because it moves
