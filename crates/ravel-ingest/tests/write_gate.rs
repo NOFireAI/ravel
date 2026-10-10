@@ -1,13 +1,20 @@
 //! ADR-1702 task 9: every shard flush's encode runs on the write gate, and a
 //! strict acknowledgement still waits for the flush it depends on.
 //!
-//! Each test parks the gate's only permit on an unrelated job, starts a strict
-//! write that flushes on its first record, and waits until the flush's encode
-//! is queued behind the parked job. At that point the write has not returned
-//! and no commit record exists. Releasing the permit lets the encode run, the
-//! flush publish and the write return, and the commit record is then in the
-//! store. The flush site's `jobs` counter moves by exactly one and its
-//! `inline` counter stays at zero, since the gate's inline floor is 0.
+//! The `*_runs_through_the_write_gate` tests park the gate's only permit on an
+//! unrelated job, start a strict write that flushes on its first record, and
+//! wait until the flush's encode is queued behind the parked job. At that
+//! point the write has not returned and no commit record exists. Releasing the
+//! permit lets the encode run, the flush publish and the write return, and the
+//! commit record is then in the store. The flush site's `jobs` counter moves by
+//! exactly one and its `inline` counter stays at zero, since the gate's inline
+//! floor is 0.
+//!
+//! The `*_keeps_its_charge_*` tests do the same with a buffered write and check
+//! that the flush's ADR-0069 byte charge is held for the whole wait (decision
+//! 6) and refunded once the flush ends. A flush whose lifetime ends while its
+//! encode is still queued is abandoned there without encoding, counted as a
+//! queue-deadline abandonment.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -20,7 +27,10 @@ use std::time::Duration;
 use common::{TestClock, make_point, span_on_shard, tenant};
 use ravel_commit::rng::SeededRng;
 use ravel_cpu_gate::{CpuGateConfig, InstantClock, JobSize, WriteGate, WriteSite};
-use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
+use ravel_ingest::{
+    IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, LogIngestRouter,
+    LogWriteError, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
+};
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -84,16 +94,11 @@ async fn commit_records(store: &dyn ObjectStoreBackend) -> usize {
 /// Runs `write` against `store` behind a parked permit and asserts the
 /// ordering and the per-site count described in the module docs. `write`
 /// resolves to whether the strict write succeeded.
-async fn assert_ack_waits_for_gated_flush<F>(
-    gate: Arc<WriteGate>,
-    site: WriteSite,
-    store: Arc<dyn ObjectStoreBackend>,
-    write: F,
-) where
-    F: Future<Output = bool> + Send + 'static,
-{
+/// Parks the gate's only permit on an unrelated job until the returned sender
+/// is used.
+async fn park_the_permit(gate: &Arc<WriteGate>) -> (mpsc::Sender<()>, JoinHandle<()>) {
     let (release, parked) = mpsc::channel::<()>();
-    let blocker_gate = Arc::clone(&gate);
+    let blocker_gate = Arc::clone(gate);
     let blocker: JoinHandle<()> = tokio::spawn(async move {
         blocker_gate
             .run(WriteSite::OtapDecode, JobSize::Bytes(0), move || {
@@ -106,6 +111,22 @@ async fn assert_ack_waits_for_gated_flush<F>(
         gate.running() == 1
     })
     .await;
+    (release, blocker)
+}
+
+fn unlimited_budget() -> Arc<IngestByteBudget> {
+    IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)
+}
+
+async fn assert_ack_waits_for_gated_flush<F>(
+    gate: Arc<WriteGate>,
+    site: WriteSite,
+    store: Arc<dyn ObjectStoreBackend>,
+    write: F,
+) where
+    F: Future<Output = bool> + Send + 'static,
+{
+    let (release, blocker) = park_the_permit(&gate).await;
     assert_eq!(counts(&gate, site), (0, 0));
 
     let write = tokio::spawn(write);
@@ -139,6 +160,115 @@ async fn assert_ack_waits_for_gated_flush<F>(
         (1, 0),
         "one flush is exactly one gated job at its site, and none inline"
     );
+}
+
+/// Decision 6: a buffered write returns at enqueue and holds no charge of its
+/// own, so once its flush's encode is queued behind the parked permit the
+/// buffer's ADR-0069 charge is held by the flush alone. It stays held, whole,
+/// until the encode runs, and is refunded at the flush's terminal outcome.
+async fn assert_charge_held_while_gated_encode_waits<F>(
+    gate: Arc<WriteGate>,
+    budget: Arc<IngestByteBudget>,
+    buffered_write: F,
+) where
+    F: Future<Output = ()>,
+{
+    let (release, blocker) = park_the_permit(&gate).await;
+    buffered_write.await;
+    wait_until("the flush encode is queued for the permit", || {
+        gate.queued() == 1
+    })
+    .await;
+    let held = budget.in_flight_bytes();
+    assert!(
+        held > 0,
+        "the flush's byte charge is held while its encode waits for a permit"
+    );
+    assert_eq!(
+        held,
+        budget.peak_bytes(),
+        "no part of the flush's charge was refunded before the encode ran"
+    );
+    release.send(()).expect("release the parked job");
+    blocker.await.expect("blocker task");
+    wait_until(
+        "the flush's charge is refunded at its terminal outcome",
+        || budget.in_flight_bytes() == 0,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_metrics_flush_keeps_its_charge_while_its_encode_waits() {
+    let gate = floor_zero_gate();
+    let budget = unlimited_budget();
+    let router = IngestRouter::new(
+        flush_on_first(),
+        Arc::new(MemoryStore::new()),
+        Signal::Metrics,
+        TestClock::new(BASE_NS),
+    )
+    .with_budget(Arc::clone(&budget))
+    .with_write_gate(Arc::clone(&gate));
+    let tenant = tenant("acme");
+    let points = vec![make_point(&tenant, "cpu", &[("host", "a")], 1_000, 1.0)];
+    assert_charge_held_while_gated_encode_waits(gate, budget, async {
+        router
+            .write(tenant, points, WriteMode::Buffered, ACK_DEADLINE)
+            .await
+            .expect("a buffered write enqueues");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_flush_keeps_its_charge_while_its_encode_waits() {
+    let gate = floor_zero_gate();
+    let budget = unlimited_budget();
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::new(MemoryStore::new()),
+        TestClock::new(BASE_NS),
+    )
+    .with_budget(Arc::clone(&budget))
+    .with_write_gate(Arc::clone(&gate));
+    assert_charge_held_while_gated_encode_waits(gate, budget, async {
+        router
+            .write(
+                tenant("acme"),
+                vec![log_record("hello")],
+                WriteMode::Buffered,
+                ACK_DEADLINE,
+            )
+            .await
+            .expect("a buffered write enqueues");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_flush_keeps_its_charge_while_its_encode_waits() {
+    let gate = floor_zero_gate();
+    let budget = unlimited_budget();
+    let router = SpanIngestRouter::new(
+        flush_on_first(),
+        Arc::new(MemoryStore::new()),
+        TestClock::new(BASE_NS),
+    )
+    .with_budget(Arc::clone(&budget))
+    .with_write_gate(Arc::clone(&gate));
+    assert_charge_held_while_gated_encode_waits(gate, budget, async {
+        router
+            .write(
+                tenant("acme"),
+                vec![span_on_shard(0, 1, 1_000)],
+                WriteMode::Buffered,
+                ACK_DEADLINE,
+            )
+            .await
+            .expect("a buffered write enqueues");
+    })
+    .await;
 }
 
 fn log_record(body: &str) -> NormalizedLogRecord {
@@ -185,6 +315,189 @@ async fn flush_encode_runs_through_the_write_gate() {
             .is_ok()
     })
     .await;
+}
+
+/// The wait for a write gate permit is bounded by the flush's lifetime, as the
+/// shard-permit wait is (issue #1739). With the permit parked and the injected
+/// clock moved past `max_flush_lifetime`, the strict write returns `Abandoned`
+/// while the encode is still queued, the flush counts as a queue-deadline
+/// abandonment, its charge is refunded, and once the permit frees the encode
+/// never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_queued_past_its_lifetime_on_the_write_gate_is_abandoned_unencoded() {
+    const LIFETIME: Duration = Duration::from_secs(10);
+    let gate = floor_zero_gate();
+    let budget = unlimited_budget();
+    let clock = TestClock::new(BASE_NS);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let router = Arc::new(
+        IngestRouter::new(
+            IngestConfig {
+                max_flush_lifetime: LIFETIME,
+                ..flush_on_first()
+            },
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+        )
+        .with_budget(Arc::clone(&budget))
+        .with_write_gate(Arc::clone(&gate)),
+    );
+    let (release, blocker) = park_the_permit(&gate).await;
+
+    let tenant = tenant("acme");
+    let points = vec![make_point(&tenant, "cpu", &[("host", "a")], 1_000, 1.0)];
+    let writer = Arc::clone(&router);
+    let write = tokio::spawn(async move {
+        writer
+            .write(tenant, points, WriteMode::Strict, ACK_DEADLINE)
+            .await
+    });
+    wait_until("the flush encode is queued for the permit", || {
+        gate.queued() == 1
+    })
+    .await;
+    assert!(budget.in_flight_bytes() > 0);
+
+    clock.advance_ns(i64::try_from(LIFETIME.as_nanos()).unwrap() + 1);
+    let result = tokio::time::timeout(Duration::from_secs(30), write)
+        .await
+        .expect("the write returns while the permit is still parked")
+        .expect("write task");
+    match result {
+        Err(WriteError::Abandoned(message)) => assert!(
+            message.contains("write gate"),
+            "unexpected abandonment message: {message}"
+        ),
+        other => panic!("expected Abandoned, got {other:?}"),
+    }
+    let snapshot = router.metrics().snapshot();
+    assert_eq!(snapshot.abandoned_queue_deadline, 1);
+    assert_eq!(snapshot.abandoned_retry_exhausted, 0);
+    assert_eq!(snapshot.abandoned_input_rejected, 0);
+    assert_eq!(gate.queued(), 0, "the abandoned waiter left the queue");
+    assert_eq!(
+        budget.in_flight_bytes(),
+        0,
+        "the queued job's charge dropped with it"
+    );
+
+    release.send(()).expect("release the parked job");
+    blocker.await.expect("blocker task");
+    assert_eq!(
+        counts(&gate, WriteSite::MetricsFlush),
+        (0, 0),
+        "the abandoned encode never ran"
+    );
+    assert_eq!(commit_records(store.as_ref()).await, 0);
+}
+
+const LIFETIME: Duration = Duration::from_secs(10);
+
+fn short_lifetime() -> IngestConfig {
+    IngestConfig {
+        max_flush_lifetime: LIFETIME,
+        ..flush_on_first()
+    }
+}
+
+/// Parks the permit, starts `write`, waits for its flush's encode to queue,
+/// moves `clock` past the lifetime and returns the write's error message,
+/// which must arrive while the permit is still parked. Then frees the permit
+/// and checks the encode never ran at `site`.
+async fn abandoned_in_the_gate_queue<F, T, E>(
+    gate: Arc<WriteGate>,
+    site: WriteSite,
+    clock: Arc<TestClock>,
+    write: F,
+) -> E
+where
+    F: Future<Output = Result<T, E>> + Send + 'static,
+    T: std::fmt::Debug + Send + 'static,
+    E: std::fmt::Debug + Send + 'static,
+{
+    let (release, blocker) = park_the_permit(&gate).await;
+    let write = tokio::spawn(write);
+    wait_until("the flush encode is queued for the permit", || {
+        gate.queued() == 1
+    })
+    .await;
+    clock.advance_ns(i64::try_from(LIFETIME.as_nanos()).unwrap() + 1);
+    let err = tokio::time::timeout(Duration::from_secs(30), write)
+        .await
+        .expect("the write returns while the permit is still parked")
+        .expect("write task")
+        .expect_err("the flush is abandoned");
+    release.send(()).expect("release the parked job");
+    blocker.await.expect("blocker task");
+    assert_eq!(
+        counts(&gate, site),
+        (0, 0),
+        "the abandoned encode never ran"
+    );
+    err
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_flush_queued_past_its_lifetime_on_the_write_gate_is_abandoned() {
+    let gate = floor_zero_gate();
+    let clock = TestClock::new(BASE_NS);
+    let router = Arc::new(
+        LogIngestRouter::new(
+            short_lifetime(),
+            Arc::new(MemoryStore::new()),
+            clock.clone(),
+        )
+        .with_write_gate(Arc::clone(&gate)),
+    );
+    let writer = Arc::clone(&router);
+    let err = abandoned_in_the_gate_queue(gate, WriteSite::LogFlush, clock, async move {
+        writer
+            .write(
+                tenant("acme"),
+                vec![log_record("hello")],
+                WriteMode::Strict,
+                ACK_DEADLINE,
+            )
+            .await
+    })
+    .await;
+    assert!(
+        matches!(&err, LogWriteError::Abandoned(m) if m.contains("write gate")),
+        "expected the gate-wait abandonment, got {err:?}"
+    );
+    assert_eq!(router.metrics().snapshot().abandoned_queue_deadline, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_flush_queued_past_its_lifetime_on_the_write_gate_is_abandoned() {
+    let gate = floor_zero_gate();
+    let clock = TestClock::new(BASE_NS);
+    let router = Arc::new(
+        SpanIngestRouter::new(
+            short_lifetime(),
+            Arc::new(MemoryStore::new()),
+            clock.clone(),
+        )
+        .with_write_gate(Arc::clone(&gate)),
+    );
+    let writer = Arc::clone(&router);
+    let err = abandoned_in_the_gate_queue(gate, WriteSite::SpanFlush, clock, async move {
+        writer
+            .write(
+                tenant("acme"),
+                vec![span_on_shard(0, 1, 1_000)],
+                WriteMode::Strict,
+                ACK_DEADLINE,
+            )
+            .await
+    })
+    .await;
+    assert!(
+        matches!(&err, SpanWriteError::Abandoned(m) if m.contains("write gate")),
+        "expected the gate-wait abandonment, got {err:?}"
+    );
+    assert_eq!(router.metrics().snapshot().abandoned_queue_deadline, 1);
 }
 
 async fn stored_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, Vec<u8>)> {

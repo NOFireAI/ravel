@@ -86,10 +86,6 @@ pub enum BatchError {
     IpcDecode(String),
     #[error("arrow IPC decode panicked on malformed input: {0}")]
     InternalPanic(String),
-    /// The write gate returned no result for the payload's decompression. The
-    /// payload never reached a decoder, so the stream's decode state is intact.
-    #[error("zstd decompression did not complete on the CPU write gate: {0}")]
-    Gate(CpuGateError),
 }
 
 /// The IPC stream state for one (payload_type, schema_id) pair is corrupt.
@@ -110,6 +106,15 @@ pub enum StreamError {
     },
     #[error("stream was already torn down by a previous corruption")]
     Poisoned,
+    /// The write gate returned no result for a payload's decompression. That
+    /// payload never reached its decoder, but the batch's earlier payloads
+    /// already fed theirs, so the stream's decode state has advanced past
+    /// what a nack tells the client. A resend on this stream would feed those
+    /// payloads' schema and dictionary messages to decoders that already took
+    /// them, and any the failed payload carried never reach its decoder, so
+    /// the stream is poisoned like a corrupted one.
+    #[error("zstd decompression did not complete on the CPU write gate: {0}")]
+    Gate(CpuGateError),
 }
 
 #[derive(Debug, Error)]
@@ -227,17 +232,69 @@ impl Write for AlignedWriter<'_> {
 /// `arrow_buffer::alloc::ALIGNMENT`), so a subsequent aligned IPC body
 /// buffer can be a zero-copy view rather than requiring `StreamDecoder` to
 /// realign it.
+///
+/// A payload whose frames all declare their content size is also stopped one
+/// byte past the declared total. libzstd stops such a frame early only when
+/// it sized its output buffer to the declared size; with a declared size
+/// above its ring buffer it decodes the whole frame and only then compares.
+/// The limit here keeps the declared size an honest bound for
+/// [`zstd_job_bytes`] either way.
 fn decompress_capped(record: &[u8], cap: u64) -> Result<MutableBuffer, BatchError> {
+    let declared = declared_content_size(record).filter(|&declared| declared < cap);
+    let limit = declared.unwrap_or(cap);
     let decoder =
         zstd::Decoder::new(record).map_err(|e| BatchError::Decompression(e.to_string()))?;
-    let mut limited = decoder.take(cap + 1);
+    let mut limited = decoder.take(limit + 1);
     let mut out = MutableBuffer::new(0);
     io::copy(&mut limited, &mut AlignedWriter(&mut out))
         .map_err(|e| BatchError::Decompression(e.to_string()))?;
-    if out.len() as u64 > cap {
-        return Err(BatchError::DecompressedPayloadTooLarge { limit: cap });
+    if out.len() as u64 > limit {
+        return Err(match declared {
+            Some(declared) => BatchError::Decompression(format!(
+                "frame output exceeds its declared content size of {declared} bytes"
+            )),
+            None => BatchError::DecompressedPayloadTooLarge { limit: cap },
+        });
     }
     Ok(out)
+}
+
+/// The decompressed length `record`'s frame headers declare: the sum of every
+/// frame's content size, or `None` when a frame declares none, a header does
+/// not parse, or `record` is empty.
+fn declared_content_size(record: &[u8]) -> Option<u64> {
+    if record.is_empty() {
+        return None;
+    }
+    let mut rest = record;
+    let mut total: u64 = 0;
+    while !rest.is_empty() {
+        let frame_len = zstd::zstd_safe::find_frame_compressed_size(rest).ok()?;
+        let frame = rest.get(..frame_len).filter(|frame| !frame.is_empty())?;
+        let size = zstd::zstd_safe::get_frame_content_size(frame).ok()??;
+        total = total.checked_add(size)?;
+        rest = &rest[frame_len..];
+    }
+    Some(total)
+}
+
+/// zstd's largest block, `ZSTD_BLOCKSIZE_MAX`.
+const ZSTD_BLOCK_MAX_BYTES: u64 = 128 * 1024;
+
+/// zstd's maximum expansion: the densest unit is an RLE block, a 3-byte block
+/// header and the one byte it repeats, which decodes to up to a whole block.
+const ZSTD_MAX_EXPANSION: u64 = ZSTD_BLOCK_MAX_BYTES / 4;
+
+/// The size the write gate compares against its inline floor for the
+/// decompression of `record` (ADR-1702 decision 4): an upper bound, to within
+/// the one byte past its limit that it reads to detect an overrun, on the
+/// bytes [`decompress_capped`] produces, at most `cap`. That is the declared content
+/// size when every frame declares one, since [`decompress_capped`] stops past
+/// it, and otherwise the compressed length times zstd's maximum expansion.
+fn zstd_job_bytes(record: &[u8], cap: u64) -> u64 {
+    declared_content_size(record)
+        .unwrap_or_else(|| (record.len() as u64).saturating_mul(ZSTD_MAX_EXPANSION))
+        .min(cap)
 }
 
 fn payload_type_of(payload: &ArrowPayload) -> Result<ArrowPayloadType, BatchError> {
@@ -330,6 +387,10 @@ pub struct StreamState {
     poisoned: bool,
     stats: DecodeStats,
     write_gate: Option<Arc<WriteGate>>,
+    /// Makes the next gated decompression fail with this error without
+    /// running, so a test can reach the gate-failure arm.
+    #[cfg(test)]
+    fail_next_gate: Option<CpuGateError>,
 }
 
 impl StreamState {
@@ -341,13 +402,15 @@ impl StreamState {
             poisoned: false,
             stats: DecodeStats::default(),
             write_gate: None,
+            #[cfg(test)]
+            fail_next_gate: None,
         }
     }
 
     /// Runs each payload's zstd decompression in [`decode_gated`] on the
-    /// ADR-1702 write gate under the `otap_decode` site, sized by the
-    /// payload's compressed length so the gate's inline floor applies. `None`
-    /// decompresses inline, as [`decode`] always does.
+    /// ADR-1702 write gate under the `otap_decode` site, sized by an upper
+    /// bound on its decompressed length so the gate's inline floor applies.
+    /// `None` decompresses inline, as [`decode`] always does.
     ///
     /// [`decode`]: Self::decode
     /// [`decode_gated`]: Self::decode_gated
@@ -404,7 +467,8 @@ impl StreamState {
     /// write gate set by [`with_write_gate`](Self::with_write_gate). The
     /// decompression job owns the payload's compressed bytes; nothing else in
     /// the decode leaves the calling task, so the stateful IPC decoders are
-    /// fed in payload order as before.
+    /// fed in payload order as before. A gate failure is a [`StreamError::Gate`]
+    /// and poisons the stream.
     pub async fn decode_gated(
         &mut self,
         batch: BatchArrowRecords,
@@ -417,7 +481,7 @@ impl StreamState {
             let decoded = match payload_type_of(&payload) {
                 Ok(payload_type) => match self.decompress_on_gate(payload.record).await {
                     Ok(raw) => self.decode_raw(payload_type, payload.schema_id, raw),
-                    Err(e) => Err(e.into()),
+                    Err(e) => Err(e),
                 },
                 Err(e) => Err(e.into()),
             };
@@ -429,18 +493,27 @@ impl StreamState {
         })
     }
 
-    async fn decompress_on_gate(&self, record: bytes::Bytes) -> Result<MutableBuffer, BatchError> {
+    async fn decompress_on_gate(
+        &mut self,
+        record: bytes::Bytes,
+    ) -> Result<MutableBuffer, DecodeError> {
         let cap = self.config.max_decompressed_payload_bytes;
         match &self.write_gate {
             Some(gate) => {
-                let size = JobSize::Bytes(record.len() as u64);
-                gate.run(WriteSite::OtapDecode, size, move || {
-                    decompress_capped(&record, cap)
-                })
-                .await
-                .map_err(BatchError::Gate)?
+                #[cfg(test)]
+                if let Some(err) = self.fail_next_gate.take() {
+                    return Err(StreamError::Gate(err).into());
+                }
+                let size = JobSize::Bytes(zstd_job_bytes(&record, cap));
+                let decompressed = gate
+                    .run(WriteSite::OtapDecode, size, move || {
+                        decompress_capped(&record, cap)
+                    })
+                    .await
+                    .map_err(StreamError::Gate)?;
+                Ok(decompressed?)
             }
-            None => decompress_capped(&record, cap),
+            None => Ok(decompress_capped(&record, cap)?),
         }
     }
 
@@ -567,5 +640,155 @@ impl StreamState {
             }
         }
         Ok(batches)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_cpu_gate::{CpuGateConfig, DEFAULT_INLINE_FLOOR_BYTES, InstantClock};
+
+    use super::*;
+    use crate::encode::{DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder};
+
+    const CAP: u64 = 16 * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+
+    fn declaring(data: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(data, 3).expect("compress")
+    }
+
+    fn undeclaring(data: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
+        encoder.include_contentsize(false).expect("no content size");
+        io::Write::write_all(&mut encoder, data).expect("write");
+        encoder.finish().expect("finish")
+    }
+
+    /// A payload whose frames declare their sizes is sized by the declared
+    /// total, so a well-compressing payload under the floor in compressed bytes
+    /// is still sized above it by what it inflates to.
+    #[test]
+    fn a_declared_payload_is_sized_by_its_declared_content() {
+        let one = declaring(&vec![0u8; MIB]);
+        assert!(
+            (one.len() as u64) < DEFAULT_INLINE_FLOOR_BYTES,
+            "the fixture compresses below the floor"
+        );
+        assert_eq!(zstd_job_bytes(&one, CAP), MIB as u64);
+
+        let two = [declaring(&[1u8; 1000]), declaring(&[2u8; 3000])].concat();
+        assert_eq!(zstd_job_bytes(&two, CAP), 4000);
+
+        let over_cap = declaring(&vec![0u8; 17 * MIB]);
+        assert_eq!(zstd_job_bytes(&over_cap, CAP), CAP);
+    }
+
+    /// With any frame undeclared, the size is the compressed length times
+    /// zstd's maximum expansion, capped.
+    #[test]
+    fn an_undeclared_payload_is_sized_by_the_expansion_bound() {
+        let bare = undeclaring(&[3u8; 1000]);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&bare).expect("header"),
+            None
+        );
+        assert_eq!(
+            zstd_job_bytes(&bare, CAP),
+            bare.len() as u64 * ZSTD_MAX_EXPANSION
+        );
+
+        let mixed = [declaring(&[1u8; 1000]), bare].concat();
+        assert_eq!(declared_content_size(&mixed), None);
+        assert_eq!(
+            zstd_job_bytes(&mixed, CAP),
+            (mixed.len() as u64 * ZSTD_MAX_EXPANSION).min(CAP)
+        );
+        assert_eq!(zstd_job_bytes(&vec![0xAB; 4096], CAP), CAP);
+    }
+
+    /// A frame whose header understates its content is stopped one byte past
+    /// the declared size, not at the cap. The frame is built with a 128 KiB
+    /// window so it is not single-segment, and its 4-byte content size is
+    /// rewritten from 1 MiB to 512 KiB: above libzstd's ring buffer for that
+    /// window, so libzstd alone would decode the whole MiB before it noticed.
+    #[test]
+    fn a_frame_that_outgrows_its_declared_size_stops_at_it() {
+        const DECLARED: u32 = 512 * 1024;
+        let mut compressor = zstd::bulk::Compressor::new(3).expect("compressor");
+        compressor
+            .set_parameter(zstd::stream::raw::CParameter::WindowLog(17))
+            .expect("window log");
+        let mut frame = compressor.compress(&vec![7u8; MIB]).expect("compress");
+
+        let descriptor = frame[4];
+        let single_segment = descriptor & 0x20 != 0;
+        assert!(!single_segment, "the fixture carries a window descriptor");
+        assert_eq!(descriptor >> 6, 2, "a 4-byte content size field");
+        assert_eq!(descriptor & 0x03, 0, "no dictionary id");
+        frame[6..10].copy_from_slice(&DECLARED.to_le_bytes());
+        assert_eq!(declared_content_size(&frame), Some(u64::from(DECLARED)));
+
+        match decompress_capped(&frame, CAP) {
+            Err(BatchError::Decompression(message)) => assert!(
+                message.contains(&format!("declared content size of {DECLARED}")),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected the declared-size stop, got {other:?}"),
+        }
+    }
+
+    fn metric(name: &str, points: &[(i64, f64)]) -> MetricRow {
+        MetricRow {
+            name: name.to_string(),
+            kind: MetricKind::Gauge,
+            data_points: points
+                .iter()
+                .map(|&(time_unix_nano, value)| DataPointRow {
+                    exemplars: vec![],
+                    time_unix_nano,
+                    value,
+                    flags: 0,
+                    attrs: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    /// A gate failure on a batch after the first poisons the stream: the
+    /// first batch already fed the decoders, so the state has advanced past
+    /// what the failed batch's nack tells the client, and the next decode on
+    /// this state is refused.
+    #[tokio::test]
+    async fn a_gate_failure_poisons_the_stream() {
+        for injected in [CpuGateError::Panicked, CpuGateError::Cancelled] {
+            let gate = Arc::new(WriteGate::new(
+                CpuGateConfig {
+                    inline_floor_bytes: 0,
+                    ..CpuGateConfig::with_permits(1)
+                },
+                Arc::new(InstantClock::new()),
+            ));
+            let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+            let mut batch = |id: i64| {
+                encoder
+                    .encode_batch(id, &[metric("cpu.load", &[(id * 1_000, 0.5)])])
+                    .expect("encode batch")
+            };
+            let (first, second, third) = (batch(1), batch(2), batch(3));
+            let mut state = StreamState::new(StreamConfig::default()).with_write_gate(Some(gate));
+            state.decode_gated(first).await.expect("first batch");
+
+            state.fail_next_gate = Some(injected);
+            match state.decode_gated(second).await {
+                Err(DecodeError::Stream(StreamError::Gate(err))) => assert_eq!(err, injected),
+                other => panic!("expected a stream-ending gate error, got {other:?}"),
+            }
+            assert!(state.is_poisoned());
+            assert!(matches!(
+                state.decode_gated(third).await,
+                Err(DecodeError::Stream(StreamError::Poisoned))
+            ));
+        }
     }
 }

@@ -74,7 +74,7 @@ use crate::shard::{InPlaceCause, InPlaceWarnings};
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
 use crate::span_router::shard_for_span;
-use crate::write_gate::WriteGateSlot;
+use crate::write_gate::{GATE_DEADLINE_MESSAGE, WriteGateSlot};
 use ravel_cpu_gate::WriteSite;
 
 pub(crate) type SpanAck = oneshot::Sender<Result<CommitToken, SpanWriteError>>;
@@ -352,8 +352,9 @@ impl SpanFlushCtx {
         // The encode and its content hash run on the write gate when one is
         // attached (ADR-1702). The job takes the byte charges with the spans and
         // returns them with the object, so they stay held through the permit
-        // wait and the encode whether or not this task is still waiting.
-        let encoded = self
+        // wait and the encode whether or not this task is still waiting. The
+        // wait is bounded by the flush's deadline, as its store calls are.
+        let encode = self
             .write_gate
             .encode(WriteSite::SpanFlush, input_bytes, move || {
                 let mut writer = RspanWriter::new(RspanConfig::default(), identity);
@@ -367,18 +368,31 @@ impl SpanFlushCtx {
                     }),
                     charges,
                 }
-            })
-            .await;
-        let encoded = match encoded {
-            Ok(encoded) => encoded,
-            Err(err) => {
+            });
+        let encoded = match self.bound_to_deadline(deadline_ns, encode).await {
+            Some(Ok(encoded)) => encoded,
+            Some(Err(err)) => {
                 // Nothing was written, and the job's charges dropped with its
-                // result. The encode produced no object, as a failed build does:
-                // a panicked job would panic again on the same input, and a job
-                // the gate cancelled or never ran means the runtime is shutting
-                // down.
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(err.to_string())));
+                // result. A gate failure is the server's, not the input's: the
+                // waiters get the retryable answer an encode panic gave when it
+                // took the actor down, and the flush counts in no abandoned_*
+                // counter.
+                tracing::error!(
+                    shard = self.shard,
+                    error = %err,
+                    "ravel-ingest: write gate returned no span flush encode result"
+                );
+                self.ack_waiters(waiters, Err(SpanWriteError::ShardUnavailable));
+                return;
+            }
+            None => {
+                // The job's charges drop with it: now if it never started,
+                // when it returns if it did.
+                self.metrics.record_abandoned_queue_deadline();
+                self.ack_waiters(
+                    waiters,
+                    Err(SpanWriteError::Abandoned(GATE_DEADLINE_MESSAGE.into())),
+                );
                 return;
             }
         };

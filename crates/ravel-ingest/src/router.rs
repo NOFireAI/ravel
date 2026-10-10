@@ -1103,63 +1103,78 @@ mod tests {
         assert_eq!(decoded.sample_count, 1);
     }
 
-    /// ADR-1702 task 9: a gated encode that panics fails its flush. The strict
-    /// write gets the typed `SegmentBuild` error rather than the
-    /// `ShardUnavailable` a dropped ack would produce, nothing is stored, the
-    /// shard does not die, and the next write commits.
+    /// ADR-1702 task 9: a gated encode that panics, or that the gate cancels,
+    /// fails its flush with the retryable `ShardUnavailable` an encode panic
+    /// gave before the gate, not the client-fault `SegmentBuild`. Nothing is
+    /// stored, no abandoned_* counter moves, the shard does not die, and the
+    /// next write commits.
     #[tokio::test]
-    async fn panicked_gated_metrics_encode_fails_the_strict_write() {
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let gate = Arc::new(WriteGate::new(
-            ravel_cpu_gate::CpuGateConfig {
-                inline_floor_bytes: 0,
-                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
-            },
-            Arc::new(ravel_cpu_gate::InstantClock::new()),
-        ));
-        let router = IngestRouter::new(
-            IngestConfig {
-                shard_count: 1,
-                target_bytes: 1,
-                ..IngestConfig::default()
-            },
-            Arc::clone(&store),
-            Signal::Metrics,
-            Arc::new(crate::clock::SystemClock),
-        )
-        .with_write_gate(gate);
-        router.write_gate.panic_next_encode();
-        let tenant = TenantId::new("acme");
-        let err = router
-            .write(
-                tenant.clone(),
-                vec![test_point(&tenant, "cpu", 1_000, 1.0)],
-                WriteMode::Strict,
-                Duration::from_secs(30),
+    async fn gate_failed_metrics_encode_fails_the_strict_write_retryably() {
+        for injected in [
+            ravel_cpu_gate::CpuGateError::Panicked,
+            ravel_cpu_gate::CpuGateError::Cancelled,
+        ] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let gate = Arc::new(WriteGate::new(
+                ravel_cpu_gate::CpuGateConfig {
+                    inline_floor_bytes: 0,
+                    ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+                },
+                Arc::new(ravel_cpu_gate::InstantClock::new()),
+            ));
+            let router = IngestRouter::new(
+                IngestConfig {
+                    shard_count: 1,
+                    target_bytes: 1,
+                    ..IngestConfig::default()
+                },
+                Arc::clone(&store),
+                Signal::Metrics,
+                Arc::new(crate::clock::SystemClock),
             )
-            .await
-            .expect_err("a panicked encode fails the write");
-        assert!(
-            matches!(err, WriteError::SegmentBuild(_)),
-            "expected SegmentBuild, got {err:?}"
-        );
-        assert!(
-            list_all(store.as_ref(), "t/")
+            .with_write_gate(gate);
+            router.write_gate.fail_next_encode(injected);
+            let tenant = TenantId::new("acme");
+            let err = router
+                .write(
+                    tenant.clone(),
+                    vec![test_point(&tenant, "cpu", 1_000, 1.0)],
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
                 .await
-                .expect("list")
-                .is_empty()
-        );
-        let snapshot = router.metrics().snapshot();
-        assert_eq!(snapshot.abandoned_input_rejected, 1);
-        assert_eq!(snapshot.shard_deaths, 0);
-        router
-            .write(
-                tenant.clone(),
-                vec![test_point(&tenant, "cpu", 2_000, 2.0)],
-                WriteMode::Strict,
-                Duration::from_secs(30),
-            )
-            .await
-            .expect("the shard survives and the next write commits");
+                .expect_err("a failed gate encode fails the write");
+            assert!(
+                matches!(err, WriteError::ShardUnavailable),
+                "{injected:?}: expected ShardUnavailable, got {err:?}"
+            );
+            assert!(err.is_retryable());
+            assert!(
+                list_all(store.as_ref(), "t/")
+                    .await
+                    .expect("list")
+                    .is_empty()
+            );
+            let snapshot = router.metrics().snapshot();
+            assert_eq!(
+                (
+                    snapshot.abandoned_input_rejected,
+                    snapshot.abandoned_retry_exhausted,
+                    snapshot.abandoned_queue_deadline,
+                ),
+                (0, 0, 0),
+                "{injected:?}: a gate failure is not an abandoned flush"
+            );
+            assert_eq!(snapshot.shard_deaths, 0);
+            router
+                .write(
+                    tenant.clone(),
+                    vec![test_point(&tenant, "cpu", 2_000, 2.0)],
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect("the shard survives and the next write commits");
+        }
     }
 }

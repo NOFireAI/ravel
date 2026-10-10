@@ -137,12 +137,23 @@ impl SpanIngestRouter {
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
         // Production OS-entropy source for writer ids and PUT-retry jitter
         // (ADR-0068 decision 2). Like the log router, the span pipeline has no
         // seeded-injection caller; routing through the seam still keeps
         // `rand::rng()` and `Uuid::new_v4()` off this production path.
-        let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
+        Self::with_rng(config, store, clock, Arc::new(SystemRng))
+    }
+
+    /// Like [`Self::new`] but with an injected [`RngSource`]. A
+    /// [`ravel_commit::rng::SeededRng`] here makes writer ids deterministic,
+    /// which a byte-identity test over two routers and two stores needs.
+    pub(crate) fn with_rng(
+        config: IngestConfig,
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<dyn Clock>,
+        rng: Arc<dyn RngSource>,
+    ) -> Self {
+        let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
         let write_gate = WriteGateSlot::default();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<SpanShardHandle>>| {
@@ -1051,62 +1062,171 @@ mod tests {
         router.shutdown().await;
     }
 
-    /// ADR-1702 task 9: a gated encode that panics fails its flush. The strict
-    /// write gets the typed `SegmentBuild` error rather than the
-    /// `ShardUnavailable` a dropped ack would produce, nothing is stored, the
-    /// shard does not die, and the next write commits.
-    #[tokio::test]
-    async fn panicked_gated_span_encode_fails_the_strict_write() {
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let gate = Arc::new(WriteGate::new(
+    fn floor_zero_write_gate(permits: usize) -> Arc<WriteGate> {
+        Arc::new(WriteGate::new(
             ravel_cpu_gate::CpuGateConfig {
                 inline_floor_bytes: 0,
-                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(permits)
             },
             Arc::new(ravel_cpu_gate::InstantClock::new()),
-        ));
-        let router = SpanIngestRouter::new(
-            IngestConfig {
-                shard_count: 1,
-                target_bytes: 1,
-                ..IngestConfig::default()
-            },
-            Arc::clone(&store),
-            Arc::new(SystemClock),
-        )
-        .with_write_gate(gate);
-        router.write_gate.panic_next_encode();
-        let tenant = TenantId::new("acme");
-        let err = router
-            .write(
-                tenant.clone(),
-                vec![norm_span(trace_id(1), 1, 1_000)],
-                WriteMode::Strict,
-                Duration::from_secs(30),
+        ))
+    }
+
+    /// ADR-1702 task 9: a gated encode that panics, or that the gate cancels,
+    /// fails its flush with the retryable `ShardUnavailable` an encode panic
+    /// gave before the gate, not the client-fault `SegmentBuild`. Nothing is
+    /// stored, no abandoned_* counter moves, the shard does not die, and the
+    /// next write commits.
+    #[tokio::test]
+    async fn gate_failed_span_encode_fails_the_strict_write_retryably() {
+        for injected in [
+            ravel_cpu_gate::CpuGateError::Panicked,
+            ravel_cpu_gate::CpuGateError::Cancelled,
+        ] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let router = SpanIngestRouter::new(
+                IngestConfig {
+                    shard_count: 1,
+                    target_bytes: 1,
+                    ..IngestConfig::default()
+                },
+                Arc::clone(&store),
+                Arc::new(SystemClock),
             )
-            .await
-            .expect_err("a panicked encode fails the write");
-        assert!(
-            matches!(err, SpanWriteError::SegmentBuild(_)),
-            "expected SegmentBuild, got {err:?}"
-        );
-        assert!(
-            list_all(store.as_ref(), "t/")
+            .with_write_gate(floor_zero_write_gate(1));
+            router.write_gate.fail_next_encode(injected);
+            let tenant = TenantId::new("acme");
+            let err = router
+                .write(
+                    tenant.clone(),
+                    vec![norm_span(trace_id(1), 1, 1_000)],
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
                 .await
-                .expect("list")
-                .is_empty()
+                .expect_err("a failed gate encode fails the write");
+            assert!(
+                matches!(err, SpanWriteError::ShardUnavailable),
+                "{injected:?}: expected ShardUnavailable, got {err:?}"
+            );
+            assert!(err.is_retryable());
+            assert!(
+                list_all(store.as_ref(), "t/")
+                    .await
+                    .expect("list")
+                    .is_empty()
+            );
+            let snapshot = router.metrics().snapshot();
+            assert_eq!(
+                (
+                    snapshot.abandoned_input_rejected,
+                    snapshot.abandoned_retry_exhausted,
+                    snapshot.abandoned_queue_deadline,
+                ),
+                (0, 0, 0),
+                "{injected:?}: a gate failure is not an abandoned flush"
+            );
+            assert_eq!(snapshot.shard_deaths, 0);
+            router
+                .write(
+                    tenant,
+                    vec![norm_span(trace_id(1), 2, 2_000)],
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect("the shard survives and the next write commits");
+        }
+    }
+
+    async fn stored_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for meta in list_all(store, "t/").await.expect("list") {
+            let bytes = store
+                .get(&meta.key, GetRange::Full)
+                .await
+                .expect("get object")
+                .data;
+            out.push((meta.key, bytes.to_vec()));
+        }
+        out
+    }
+
+    /// ADR-1702 task 9: an RSPAN flush encoded on the write gate stores the
+    /// same bytes as one encoded inline. Two routers share one pinned clock and
+    /// one seed, so writer id, epoch and seq match; only one has the gate. Every
+    /// stored object, data and commit record, is compared byte for byte, and
+    /// the gate's `span_flush` count equals the number of shards the spans
+    /// span, one flush each, so the gated router encoded every object there.
+    #[tokio::test]
+    async fn gated_span_flush_stores_the_same_objects_as_inline() {
+        /// Pins every clock-derived identity field (epoch, flush open) so the
+        /// two routers match. Flushes run through `flush_all`, never the age
+        /// tick, so the default `sleep` is never depended on.
+        struct FixedClock(i64);
+        impl Clock for FixedClock {
+            fn now_ns(&self) -> i64 {
+                self.0
+            }
+        }
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+        let gate = floor_zero_write_gate(2);
+        let config = IngestConfig {
+            shard_count: 4,
+            target_bytes: 64 * 1024 * 1024,
+            max_flush_delay: Duration::from_secs(3600),
+            ..IngestConfig::default()
+        };
+        let spans: Vec<_> = (0..32u8)
+            .map(|i| norm_span(trace_id(u64::from(i)), i, 1_000 + i64::from(i)))
+            .collect();
+        let shards: std::collections::HashSet<u32> = spans
+            .iter()
+            .map(|s| shard_for_span(&s.trace_id, config.shard_count))
+            .collect();
+        assert!(shards.len() > 1, "the spans must span several shards");
+        let mut stored = Vec::new();
+        for gated in [false, true] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let router = SpanIngestRouter::with_rng(
+                config,
+                Arc::clone(&store),
+                Arc::clone(&clock),
+                Arc::new(ravel_commit::rng::SeededRng::new(0x5EED)),
+            );
+            let router = if gated {
+                router.with_write_gate(Arc::clone(&gate))
+            } else {
+                router
+            };
+            router
+                .write(
+                    TenantId::new("acme"),
+                    spans.clone(),
+                    WriteMode::Buffered,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("buffered write enqueues");
+            router.flush_all().await;
+            stored.push(stored_objects(store.as_ref()).await);
+            router.shutdown().await;
+        }
+        assert_eq!(
+            stored[0].len(),
+            2 * shards.len(),
+            "one data object and one commit record per shard"
         );
-        let snapshot = router.metrics().snapshot();
-        assert_eq!(snapshot.abandoned_input_rejected, 1);
-        assert_eq!(snapshot.shard_deaths, 0);
-        router
-            .write(
-                tenant,
-                vec![norm_span(trace_id(1), 2, 2_000)],
-                WriteMode::Strict,
-                Duration::from_secs(30),
-            )
-            .await
-            .expect("the shard survives and the next write commits");
+        assert_eq!(
+            stored[0], stored[1],
+            "the gated encode must store byte-identical objects"
+        );
+        let site = gate
+            .snapshot()
+            .sites
+            .into_iter()
+            .find(|s| s.site == ravel_cpu_gate::WriteSite::SpanFlush)
+            .expect("span_flush site");
+        assert_eq!((site.jobs, site.inline), (shards.len() as u64, 0));
     }
 }

@@ -72,12 +72,13 @@ pub struct LogIngestMetrics {
     /// queued for a `max_inflight_flushes` permit, before any store call
     /// ([`crate::LogWriteError::Abandoned`], issue #1739). A contention signal,
     /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
-    /// queue is not read as the store failing to accept a PUT.
+    /// queue is not read as the store failing to accept a PUT. Also counts a
+    /// flush whose lifetime, re-derived at permit grant, elapsed before its
+    /// ADR-1702 write gate encode returned.
     abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RLOG build, data-key derivation, or commit-record
-    /// build failed, or the write gate returned no encode result
-    /// ([`crate::LogWriteError::SegmentBuild`]). A client
+    /// build failed ([`crate::LogWriteError::SegmentBuild`]). A client
     /// signal: identical input will fail again, so the write is not
     /// retryable.
     abandoned_input_rejected: AtomicU64,

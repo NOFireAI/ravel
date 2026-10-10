@@ -324,6 +324,49 @@ fn decompress_gzip_capped_charged(
     Ok((chunks, charges))
 }
 
+/// Deflate's maximum expansion: zlib's technical notes give 1032:1, one
+/// 258-byte match per two bits once both Huffman codes are one bit long.
+const DEFLATE_MAX_EXPANSION: u64 = 1032;
+
+/// The size the write gate compares against its inline floor for the inflate
+/// of a `wire_len`-byte gzip body: an upper bound on what it inflates to
+/// (ADR-1702 decision 4). Gzip records a member's inflated length, modulo
+/// 2^32, only in the trailer after that member's deflate data, so nothing
+/// trustworthy is known before inflating. The bound comes from the format,
+/// `wire_len` times deflate's maximum expansion, capped at `cap`, past which
+/// the inflate refuses the body.
+fn gzip_job_bytes(wire_len: u64, cap: usize) -> u64 {
+    wire_len
+        .saturating_mul(DEFLATE_MAX_EXPANSION)
+        .min(cap as u64)
+}
+
+/// The inflated gzip body.
+type GzipInflate = Result<(Vec<Bytes>, Vec<IngestByteCharge>), GzipDecodeError>;
+
+/// Runs [`decompress_gzip_capped_charged`] for `body` on `write_gate` under the
+/// `otlp_http_gzip` site, sized by [`gzip_job_bytes`] (ADR-1702), or inline
+/// when no gate is attached. The job takes each chunk's charge as it inflates
+/// and returns the charges with the chunks, so nothing is charged while it
+/// waits for a permit, and a dropped request releases the charges only when
+/// the job returns. `Err` is the gate returning no result.
+async fn inflate_gzip_gated(
+    write_gate: Option<&WriteGate>,
+    body: Bytes,
+    budget: Arc<IngestByteBudget>,
+) -> Result<GzipInflate, CpuGateError> {
+    let size = gzip_job_bytes(body.len() as u64, MAX_DECOMPRESSED_OTLP_BODY_BYTES);
+    let inflate =
+        move || decompress_gzip_capped_charged(&body, MAX_DECOMPRESSED_OTLP_BODY_BYTES, &budget);
+    match write_gate {
+        Some(gate) => {
+            gate.run(WriteSite::OtlpHttpGzip, JobSize::Bytes(size), inflate)
+                .await
+        }
+        None => Ok(inflate()),
+    }
+}
+
 /// The write gate produced no inflate result: the job panicked, or the runtime
 /// dropped it while shutting down. Nothing was decoded or written, so a retry
 /// is safe; a panic is the server's fault, a cancelled job a transient one.
@@ -416,26 +459,15 @@ async fn admit_and_decode_body(
             // would cross the ceiling is shed mid-inflate (429), before the
             // process grows by the full expansion.
             //
-            // The inflate runs on the write gate when one is attached
-            // (ADR-1702), sized by the compressed body. The job takes each
-            // chunk's charge as it inflates and returns the charges with the
-            // chunks, so nothing is charged while it waits for a permit and a
-            // dropped request releases the charges only when the job returns.
-            let budget = Arc::clone(&state.budget);
-            let inflate = move || {
-                decompress_gzip_capped_charged(&body, MAX_DECOMPRESSED_OTLP_BODY_BYTES, &budget)
-            };
-            let inflated = match &state.write_gate {
-                Some(gate) => {
-                    match gate
-                        .run(WriteSite::OtlpHttpGzip, JobSize::Bytes(wire_len), inflate)
-                        .await
-                    {
-                        Ok(inflated) => inflated,
-                        Err(err) => return Err(Box::new(gate_failure_response(err))),
-                    }
-                }
-                None => inflate(),
+            let inflated = match inflate_gzip_gated(
+                state.write_gate.as_deref(),
+                body,
+                Arc::clone(&state.budget),
+            )
+            .await
+            {
+                Ok(inflated) => inflated,
+                Err(err) => return Err(Box::new(gate_failure_response(err))),
             };
             let (chunks, decode_charge) = match inflated {
                 Ok(result) => result,
@@ -527,8 +559,8 @@ pub struct GatewayState {
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
     /// The ADR-1702 write gate. A gzip body's inflate runs on it under the
     /// `otlp_http_gzip` site, and an OTAP stream's payload decompression
-    /// under `otap_decode`, each sized by its compressed bytes. `None` runs
-    /// both inline on the request task.
+    /// under `otap_decode`, each sized by a bound on its inflated bytes. `None`
+    /// runs both inline on the request task.
     pub write_gate: Option<Arc<WriteGate>>,
 }
 
@@ -1963,5 +1995,128 @@ pub(crate) mod tests {
 
         drop(held);
         assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    fn gzip_gate(inline_floor_bytes: u64) -> Arc<WriteGate> {
+        Arc::new(WriteGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ))
+    }
+
+    fn gzip_site(gate: &WriteGate) -> (u64, u64) {
+        gate.snapshot()
+            .sites
+            .iter()
+            .find(|s| s.site == WriteSite::OtlpHttpGzip)
+            .map_or((0, 0), |s| (s.jobs, s.inline))
+    }
+
+    /// A gzip inflate is sized by deflate's expansion bound on its compressed
+    /// length, capped: a body that compresses below the gate's default floor
+    /// but can inflate above it runs on the gate, and only a body too small to
+    /// reach the floor at 1032:1 runs inline.
+    #[tokio::test]
+    async fn the_gzip_job_is_sized_by_the_deflate_expansion_bound() {
+        assert_eq!(
+            gzip_job_bytes(100, MAX_DECOMPRESSED_OTLP_BODY_BYTES),
+            100 * DEFLATE_MAX_EXPANSION
+        );
+        assert_eq!(
+            gzip_job_bytes(1024 * 1024, MAX_DECOMPRESSED_OTLP_BODY_BYTES),
+            MAX_DECOMPRESSED_OTLP_BODY_BYTES as u64
+        );
+
+        let gate = gzip_gate(ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        let large = Bytes::from(gzip(&vec![0u8; 1024 * 1024]));
+        assert!((large.len() as u64) < ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
+        let inflated = inflate_gzip_gated(Some(&gate), large, Arc::clone(&budget))
+            .await
+            .expect("gate result")
+            .expect("inflate");
+        assert_eq!(gzip_site(&gate), (1, 0));
+        drop(inflated);
+
+        let tiny = Bytes::from(gzip(b"hi"));
+        assert!(gzip_job_bytes(tiny.len() as u64, MAX_DECOMPRESSED_OTLP_BODY_BYTES) < 256 * 1024);
+        inflate_gzip_gated(Some(&gate), tiny, Arc::clone(&budget))
+            .await
+            .expect("gate result")
+            .expect("inflate");
+        assert_eq!(gzip_site(&gate), (1, 1));
+    }
+
+    /// Decision 6 for the gzip inflate: nothing is charged while the job waits
+    /// for a permit, and the charges the job took come back with the chunks
+    /// and stay held until the caller drops them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gzip_charges_come_back_with_the_chunks() {
+        let gate = gzip_gate(0);
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let blocker_gate = Arc::clone(&gate);
+        let blocker = tokio::spawn(async move {
+            blocker_gate
+                .run(WriteSite::OtapDecode, JobSize::Bytes(0), move || {
+                    let _ = parked.recv();
+                })
+                .await
+                .expect("the parked job runs");
+        });
+        while gate.running() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        let body = Bytes::from(gzip(&vec![5u8; 100_000]));
+        let inflate = tokio::spawn({
+            let (gate, budget) = (Arc::clone(&gate), Arc::clone(&budget));
+            async move { inflate_gzip_gated(Some(&gate), body, budget).await }
+        });
+        while gate.queued() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "nothing is charged while the job waits"
+        );
+
+        release.send(()).expect("release the parked job");
+        blocker.await.expect("blocker task");
+        let (chunks, charges) = inflate
+            .await
+            .expect("inflate task")
+            .expect("gate result")
+            .expect("inflate");
+        assert_eq!(chunks.iter().map(Bytes::len).sum::<usize>(), 100_000);
+        assert_eq!(
+            budget.in_flight_bytes(),
+            100_000,
+            "the charges come back with the chunks, still held"
+        );
+        drop(charges);
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    /// A gzip inflate the gate returns no result for answers 500 when the job
+    /// panicked and 503 when it was cancelled.
+    #[test]
+    fn a_gzip_gate_failure_answers_500_for_a_panic_and_503_for_a_cancel() {
+        assert_eq!(
+            gate_failure_response(CpuGateError::Panicked).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            gate_failure_response(CpuGateError::Cancelled).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            gate_failure_response(CpuGateError::Closed).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

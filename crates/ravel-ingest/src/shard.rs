@@ -64,7 +64,7 @@ use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint, IngestValue, ValueKind};
-use crate::write_gate::WriteGateSlot;
+use crate::write_gate::{GATE_DEADLINE_MESSAGE, WriteGateSlot};
 use ravel_cpu_gate::WriteSite;
 
 pub(crate) type Ack = oneshot::Sender<Result<CommitToken, WriteError>>;
@@ -596,8 +596,9 @@ impl FlushCtx {
         // The encode runs on the write gate when one is attached (ADR-1702).
         // The job takes the byte charges with the buffer and returns them with
         // the segment, so they stay held through the permit wait and the encode
-        // whether or not this task is still waiting.
-        let encoded = self
+        // whether or not this task is still waiting. The wait is bounded by the
+        // flush's deadline, as its store calls are.
+        let encode = self
             .write_gate
             .encode(WriteSite::MetricsFlush, input_bytes, move || {
                 // Encode: the SeriesInputV3 build plus the RSEG serialization
@@ -633,18 +634,31 @@ impl FlushCtx {
                     #[cfg(feature = "stage-timing")]
                     encode_elapsed: encode_start.elapsed(),
                 }
-            })
-            .await;
-        let encoded = match encoded {
-            Ok(encoded) => encoded,
-            Err(err) => {
+            });
+        let encoded = match self.bound_to_deadline(deadline_ns, encode).await {
+            Some(Ok(encoded)) => encoded,
+            Some(Err(err)) => {
                 // Nothing was written, and the job's charges dropped with its
-                // result. The encode produced no object, as a failed build does:
-                // a panicked job would panic again on the same input, and a job
-                // the gate cancelled or never ran means the runtime is shutting
-                // down.
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(WriteError::SegmentBuild(err.to_string())));
+                // result. A gate failure is the server's, not the input's: the
+                // waiters get the retryable answer an encode panic gave when it
+                // took the actor down, and the flush counts in no abandoned_*
+                // counter.
+                tracing::error!(
+                    shard = self.shard,
+                    error = %err,
+                    "ravel-ingest: write gate returned no flush encode result"
+                );
+                self.ack_waiters(waiters, Err(WriteError::ShardUnavailable));
+                return;
+            }
+            None => {
+                // The job's charges drop with it: now if it never started,
+                // when it returns if it did.
+                self.metrics.record_abandoned_queue_deadline();
+                self.ack_waiters(
+                    waiters,
+                    Err(WriteError::Abandoned(GATE_DEADLINE_MESSAGE.into())),
+                );
                 return;
             }
         };

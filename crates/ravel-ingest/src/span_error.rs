@@ -20,6 +20,11 @@ pub enum SpanWriteError {
     /// its send half or a strict-mode ack fail because the actor task is
     /// gone. Retryable at the client, but spans routed to a dead shard keep
     /// failing until the process is restarted.
+    ///
+    /// Also the strict waiter's answer when the ADR-1702 write gate returns
+    /// no result for a flush's encode (the job panicked, or the runtime
+    /// cancelled it while shutting down). The actor survives that, so it is
+    /// not a death and the shard keeps accepting writes.
     #[error("shard actor unavailable")]
     ShardUnavailable,
     /// A strict-mode ack did not arrive within the caller's `ack_deadline`.
@@ -44,9 +49,7 @@ pub enum SpanWriteError {
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RSPAN object failed (a deterministic input problem);
-    /// retrying identical input will fail again. Also the answer when the
-    /// ADR-1702 write gate returns no result for the encode: the job panicked,
-    /// or the runtime cancelled it while shutting down.
+    /// retrying identical input will fail again.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
     /// The router's cached provisioning-record view for this tenant is older

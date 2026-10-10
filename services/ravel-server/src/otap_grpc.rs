@@ -28,7 +28,7 @@ use ravel_ingest::{IngestPoint, WriteMode, plausible_ingest_clock};
 use ravel_otap::normalize::normalize_decoded_with_metadata;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
-use ravel_otap::stream::{BatchError, DecodeError, DecodedBatch, StreamConfig, StreamState};
+use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamError, StreamState};
 use ravel_otlp::NormalizeRejectCounts;
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, Signal, TenantId};
 use tonic::{Request, Response, Status, Streaming};
@@ -267,28 +267,42 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                 }
             }
         }
-        // The write gate returned no decompression result. The batch is not
-        // malformed and the decoder never saw it, so only this batch is nacked:
-        // a panicked job as the server's fault, a cancelled one as transient.
-        Err(DecodeError::Batch(BatchError::Gate(err))) => {
-            let code = match err {
-                ravel_cpu_gate::CpuGateError::Panicked => StatusCode::Internal,
-                _ => StatusCode::Unavailable,
-            };
-            (nack(batch_id, code, err.to_string()), false)
-        }
-        // A malformed batch nacks only itself; the decoder is unharmed and the
-        // stream continues (stream.rs `BatchError` contract).
-        Err(DecodeError::Batch(err)) => (
+        Err(err) => decode_error_reply(batch_id, err),
+    }
+}
+
+/// The reply to a batch `StreamState::decode_gated` rejected, and whether the
+/// stream must be torn down after it.
+fn decode_error_reply(batch_id: i64, err: DecodeError) -> (BatchStatus, bool) {
+    match err {
+        // A malformed batch nacks only itself and the stream continues
+        // (stream.rs `BatchError` contract).
+        DecodeError::Batch(err) => (
             nack(batch_id, StatusCode::InvalidArgument, err.to_string()),
             false,
         ),
+        // The write gate returned no decompression result for one payload
+        // after the batch's earlier payloads had already fed their decoders
+        // (stream.rs `StreamError::Gate`). The stream ends as on any other
+        // `StreamError`, which is what keeps a retry off this stream's
+        // advanced decoder state: a resend reaches a fresh stream. The code
+        // follows the HTTP gate answers rather than the corruption arm's
+        // INTERNAL, because the batch itself was not at fault: INTERNAL for a
+        // panicked job, the retryable UNAVAILABLE for a cancelled one.
+        DecodeError::Stream(StreamError::Gate(gate_err)) => {
+            let code = match gate_err {
+                ravel_cpu_gate::CpuGateError::Panicked => StatusCode::Internal,
+                ravel_cpu_gate::CpuGateError::Cancelled | ravel_cpu_gate::CpuGateError::Closed => {
+                    StatusCode::Unavailable
+                }
+            };
+            let err = StreamError::Gate(gate_err);
+            (nack(batch_id, code, err.to_string()), true)
+        }
         // The IPC stream state is corrupt and every future decode would return
         // `Poisoned`; nack this batch and end the gRPC stream so the client
         // tears it down and re-establishes it (stream.rs `StreamError`).
-        Err(DecodeError::Stream(err)) => {
-            (nack(batch_id, StatusCode::Internal, err.to_string()), true)
-        }
+        DecodeError::Stream(err) => (nack(batch_id, StatusCode::Internal, err.to_string()), true),
     }
 }
 
@@ -657,5 +671,34 @@ mod tests {
             .fold((0, 0), |acc, row| {
                 (acc.0 + row.skew_total, acc.1 + row.structural_total)
             })
+    }
+
+    /// A payload decompression the write gate returned no result for nacks
+    /// INTERNAL when the job panicked and UNAVAILABLE when it was cancelled,
+    /// and in both cases ends the stream, as a corrupted decoder does: the
+    /// batch's earlier payloads already advanced the decoders, so a resend
+    /// must reach a fresh stream. A malformed batch still keeps it open.
+    #[test]
+    fn a_gate_failure_nacks_and_ends_the_stream() {
+        use ravel_cpu_gate::CpuGateError;
+        use ravel_otap::stream::BatchError;
+
+        let reply = |err| {
+            let (status, teardown) = decode_error_reply(7, err);
+            assert_eq!(status.batch_id, 7);
+            (status.status_code, teardown)
+        };
+        assert_eq!(
+            reply(StreamError::Gate(CpuGateError::Panicked).into()),
+            (StatusCode::Internal as i32, true)
+        );
+        assert_eq!(
+            reply(StreamError::Gate(CpuGateError::Cancelled).into()),
+            (StatusCode::Unavailable as i32, true)
+        );
+        assert_eq!(
+            reply(BatchError::MalformedIpc("x".into()).into()),
+            (StatusCode::InvalidArgument as i32, false)
+        );
     }
 }

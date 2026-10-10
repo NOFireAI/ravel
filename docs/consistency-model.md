@@ -100,7 +100,8 @@ Buffered mode (opt-in per request, named "buffered"):
   throttled tenant still gets its full lifetime for its own store calls once it
   holds a permit. A flush whose flush-open deadline already elapsed when its
   task is scheduled is abandoned without taking a permit rather than wasting
-  one.
+  one. The re-derived lifetime also bounds the flush's wait for a write gate
+  permit for its encode (case six below).
 - Loss from a stalled co-resident prefix is therefore not a buffered-mode
   outcome: a flush queued behind the stall reaches the store once the stall
   clears. Buffered rows are dropped with no crash in the cases below, and in
@@ -128,7 +129,17 @@ Buffered mode (opt-in per request, named "buffered"):
   `abandoned_input_rejected` counts it. Four: the flush cannot be built at all
   -- the segment writer rejects the batch, the data object key cannot be
   derived, or the commit record fails to build. Those are fail-loud and
-  non-retryable on the same terms as case three, counted the same way. The
+  non-retryable on the same terms as case three, counted the same way. Five:
+  the ADR-1702 write gate returns no result for the flush's encode, because
+  the job panicked or the runtime cancelled it while shutting down. That is a
+  server fault, not bad input: no store call is made, any strict waiter is
+  acked with the retryable `ShardUnavailable` (503), the shard actor keeps
+  running, and the flush is logged at ERROR and counted in no `abandoned_*`
+  counter. Six: the flush's lifetime, re-derived when its permit is granted,
+  elapses before its encode on the write gate returns, most likely because
+  the encode is still queued for a gate permit. The flush is abandoned with
+  no store call, any strict waiter is acked with the retryable `Abandoned`
+  (503), and `abandoned_queue_deadline` counts it. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
   bypass passes disable that check precisely so it cannot drop acknowledged
   rows, and what it costs instead is visibility until a HEAD rebuild (see

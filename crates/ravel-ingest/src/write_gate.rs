@@ -10,14 +10,21 @@ use std::sync::{Arc, RwLock};
 
 use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 
+/// The `Abandoned` message for a flush whose lifetime ended before its gated
+/// encode returned.
+pub(crate) const GATE_DEADLINE_MESSAGE: &str =
+    "flush lifetime elapsed before its write gate encode returned";
+
 /// The write gate a router's flushes encode on, or none.
 #[derive(Clone, Default)]
 pub(crate) struct WriteGateSlot {
     gate: Arc<RwLock<Option<Arc<WriteGate>>>>,
-    /// Makes the next gated encode panic on the gate, so a test can reach the
-    /// flush's gate-error arm.
+    /// Makes the next gated encode fail with this error, so a test can reach
+    /// the flush's gate-error arm: `Panicked` panics inside the job on the
+    /// gate, anything else is returned without running the job, as the gate
+    /// does for a job the runtime cancelled.
     #[cfg(test)]
-    panic_next: Arc<std::sync::atomic::AtomicBool>,
+    fail_next: Arc<std::sync::Mutex<Option<CpuGateError>>>,
 }
 
 impl WriteGateSlot {
@@ -36,9 +43,11 @@ impl WriteGateSlot {
     }
 
     #[cfg(test)]
-    pub(crate) fn panic_next_encode(&self) {
-        self.panic_next
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn fail_next_encode(&self, err: CpuGateError) {
+        *self
+            .fail_next
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(err);
     }
 
     /// Runs one flush's encode for `site`, sized by the bytes the flush
@@ -65,9 +74,16 @@ impl WriteGateSlot {
         };
         #[cfg(test)]
         let job = {
-            let panic = self
-                .panic_next
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let injected = self
+                .fail_next
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let panic = match injected {
+                None => false,
+                Some(CpuGateError::Panicked) => true,
+                Some(err) => return Err(err),
+            };
             move || {
                 assert!(!panic, "injected flush encode panic");
                 job()

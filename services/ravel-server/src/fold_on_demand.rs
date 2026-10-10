@@ -268,7 +268,10 @@ pub struct OnDemandFoldState {
     pub fold_interval: Duration,
     /// The ADR-1702 read gate the outcome classification's snapshot part
     /// decodes run on under the `fold` site. `None` decodes them inline. The
-    /// fold itself runs on the catalog, which carries its own gate.
+    /// fold's own decodes and encodes run inline on the route's task whatever
+    /// this is: `Catalog::fold` does not consult the catalog's read gate. A
+    /// part decode the gate returns no result for leaves the classification
+    /// unable to compare, so the route reports `published`.
     pub read_gate: Option<Arc<ReadGate>>,
 }
 
@@ -792,7 +795,13 @@ async fn read_entry_ids(
             }
         };
         let size = bytes.len() as u64;
-        let decode = move || decode_part(&bytes, &PartLimits::default());
+        #[cfg(test)]
+        let inject_panic = tests::part_decode_panics(&part.key);
+        let decode = move || {
+            #[cfg(test)]
+            assert!(!inject_panic, "injected snapshot part decode panic");
+            decode_part(&bytes, &PartLimits::default())
+        };
         let decoded = match read_gate {
             Some(gate) => gate
                 .run(ReadSite::Fold, JobSize::Bytes(size), decode)
@@ -1370,6 +1379,89 @@ mod tests {
             };
             assert_eq!((site.jobs, site.inline), expected, "{:?}", site.site);
         }
+    }
+
+    /// Key fragments whose snapshot part decode panics in `read_entry_ids`.
+    /// Each test names its own tenant's fragment, so tests running in parallel
+    /// do not see each other's injection.
+    static PANICKING_PART_DECODES: std::sync::Mutex<Vec<String>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn part_decode_panics(key: &str) -> bool {
+        PANICKING_PART_DECODES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|fragment| key.contains(fragment.as_str()))
+    }
+
+    /// A snapshot part decode that panics on the read gate leaves the outcome
+    /// classification unable to compare entry sets, so the route answers
+    /// `published` with the fold's report rather than an error, and does not
+    /// claim the two snapshots hold the same entries. The fixture is the gated
+    /// one above, where every one-sided part goes through the gate.
+    #[tokio::test]
+    async fn a_failed_part_decode_job_reports_published() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("fold-on-demand-gate-fails");
+        let tenant_hash = tenant.hash();
+        let base_hour = NOW_NS / NS_PER_HOUR;
+        let retired_hour = (base_hour - 5) as u32;
+        seed_log_commit(store.as_ref(), &tenant, retired_hour, 0).await;
+        seed_log_commit(store.as_ref(), &tenant, (base_hour - 4) as u32, 1).await;
+        let catalog = catalog(store.clone());
+        fold_once(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS,
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .expect("first fold");
+        seed_log_commit(store.as_ref(), &tenant, (base_hour - 2) as u32, 2).await;
+        publish_retention_tombstone(store.as_ref(), &tenant_hash, 0, retired_hour).await;
+
+        PANICKING_PART_DECODES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(tenant_hash.to_hex());
+        let gate = Arc::new(ReadGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes: 0,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ));
+        let second = fold_once_on_gate(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS + 2 * NS_PER_HOUR,
+            None,
+            Duration::ZERO,
+            Some(gate.as_ref()),
+        )
+        .await
+        .expect("a failed part decode job does not fail the fold route");
+        assert_eq!(second.outcome, FoldOutcome::Published);
+        assert!(second.head_advanced);
+        assert!(second.report.is_some());
+        let fold_site = gate
+            .snapshot()
+            .sites
+            .into_iter()
+            .find(|site| site.site == ReadSite::Fold)
+            .expect("fold site");
+        assert!(
+            fold_site.jobs >= 1,
+            "the injected panic ran on the gate, not inline"
+        );
     }
 
     /// Concurrent-CAS path: two folds race on the same tenant. A `FaultStore`
