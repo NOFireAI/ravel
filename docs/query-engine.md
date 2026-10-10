@@ -1331,16 +1331,61 @@ memory pool's own refusal, `ResourcesExhausted`, is the one the SQL path
 answers 422); the refused query holds no reservation afterwards, so the next
 query is admitted against the same remainder as before.
 
-DataFusion 55's grouped aggregation keeps an emitted batch reserved in the
-SQL query memory pool (`TenantDelegatingPool`) until the last `batch_size`
-slice has been cut from it, so the pool forwards every shrink to the query,
-tenant and process budgets at once
-(`crates/ravel-sql/tests/aggregate_emit_reservation.rs`). The exception is a
-shape DataFusion 55 still runs on its legacy `GroupedHashAggregateStream`,
-such as a single-stage `SELECT DISTINCT ... LIMIT` (one SQL partition, a
-limit and no aggregate function) or a single-stage aggregate over ordered
-input: that stream releases its reservation before it hands out its output,
-so those output bytes are not counted while the consumer holds them.
+DataFusion 55.2 runs most grouped aggregates on its migrated streams
+(`PartialHashAggregateStream`, `FinalHashAggregateStream`,
+`SingleHashAggregateStream` and their ordered and partial-reduce variants).
+Each keeps its materialized output reserved in the SQL query memory pool
+(`TenantDelegatingPool`) until the last `batch_size` slice has been cut from
+it, and the pool forwards their shrinks to the query, tenant and process
+budgets at once (`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
+
+`AggregateExec::execute_typed` still falls back to the legacy
+`GroupedHashAggregateStream` for every shape it has not migrated: a
+single-stage aggregate that carries a limit, such as `SELECT DISTINCT ...
+LIMIT` with one SQL partition (`--sql-partition-count 1`); a single-stage
+aggregate over input ordered on all or part of the group key; the partial
+stage that expands a `GROUPING SETS`, `ROLLUP` or `CUBE`; and a
+partial-reduce stage, because the pool always reports a finite limit. That
+stream shrinks its reservation when it emits, while the emitted batch still
+holds those bytes, so releasing them would let other
+queries be granted memory that is still live. For that stream only, the pool
+holds the bytes it releases instead of returning them to the budgets. The
+held bytes stay charged and count toward every ceiling, a later grow by the
+same aggregate is served from them first, and they are released when the
+aggregate's stream is dropped. The hold is chosen per stream, from the
+consumer name DataFusion gives the legacy stream and its spill flag: it
+applies to a legacy aggregate whose memory consumer DataFusion marks as
+unable to spill: a final or single-stage aggregate on a statement that runs
+without spill, or one whose input is fully sorted on the group key. A
+partial aggregate is never held, because it emits early into the exchange
+that feeds the final aggregate and that exchange reserves what it buffers. A
+final aggregate that can spill is not held either, because its shrink can
+follow a spill to disk, which frees the memory. So on a deployment that runs
+with `--sql-spill-dir`, a legacy final aggregate over an unordered group key
+is built spillable and still hands its live bytes back to the pool at emit:
+the hold does not cover it, and the over-release remains for those
+statements. `ravel_sql::sql_memory_held_bytes()` returns the bytes held
+across the process; no metric renders it yet. The hold can be removed once
+Ravel runs a DataFusion release whose `execute_typed` no longer falls back to
+the legacy stream; upstream tracks that removal as apache/datafusion#25902,
+under the stream-split epic apache/datafusion#22710.
+
+The hold over-charges. From the aggregate's first shrink until its stream is
+dropped, its bytes stay charged while a downstream operator, for example a
+Sort over the aggregate's output, also reserves the emitted batches it is
+handed. A statement that fits under `max_query_bytes` without the hold can
+therefore be refused with 422 `ResourcesExhausted`. The extra charge is
+bounded by the aggregate's own peak: a held aggregate stays charged at the
+largest reservation it has held, never more, because a later grow is served
+from the hold first. The sizing guidance for `--sql-max-query-bytes` is
+unchanged. On DataFusion 54.1, when every grouped aggregate ran on the legacy
+stream, the reservation-lag matrix
+(`crates/ravel-sql/tests/group_by_reservation_lag.rs`, where result batches
+are dropped as they arrive) read peak reserved bytes with the hold on
+-11.6% to +15.9% from a run with it off, no more than the 16.7% spread the
+runs with it on show among themselves (303.1 to 353.7 MiB for one
+configuration). A statement whose aggregate output is reserved downstream was
+not measured, and that is where the extra charge appears.
 
 `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
 the summed sizes of live fetch reservations that a fetcher marked handed off
