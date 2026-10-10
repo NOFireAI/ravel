@@ -334,6 +334,7 @@ fn harness_over_catalog(
             None,
             None,
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
         ),
         analytics: analytics.clone(),
         exemplars: exemplars.clone(),
@@ -1071,6 +1072,7 @@ async fn promql_routes_record_usage_through_the_wired_sink() {
         None,
         None,
         Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        crate::cpu_gates::CpuGates::new(Default::default()).read,
     );
 
     let request = Request::builder()

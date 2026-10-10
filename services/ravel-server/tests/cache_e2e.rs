@@ -245,6 +245,7 @@ async fn cache_dir_attaches_disk_tier_and_a_query_is_served_from_a_disk_hit() {
         None,
         None,
         Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        ravel_server::cpu_gates::CpuGates::new(Default::default()).read,
     );
     let app: Router = router(state);
     let at_ts_s = (now - NS_PER_MIN) / NS_PER_SEC;

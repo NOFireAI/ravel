@@ -418,6 +418,7 @@ fn build_metrics_app(
         None,
         None,
         budget,
+        crate::cpu_gates::CpuGates::new(Default::default()).read,
     );
     ravel_query::http::router(state)
 }

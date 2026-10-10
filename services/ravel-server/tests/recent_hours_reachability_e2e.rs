@@ -250,6 +250,7 @@ fn promql_app(
         None,
         None,
         Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        ravel_server::cpu_gates::CpuGates::new(Default::default()).read,
     );
     ravel_query::http::router(state)
 }

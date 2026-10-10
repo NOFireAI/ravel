@@ -400,6 +400,7 @@ fn promql_harness(
         None,
         None,
         Arc::clone(&process_memory_budget),
+        crate::cpu_gates::CpuGates::new(Default::default()).read,
     );
     let promql = ravel_query::http::router(state.clone());
 
