@@ -8,6 +8,9 @@
 //! delimited LIST of the `t/` prefix enumerates it directly, with no second
 //! source of truth to drift from what is actually durable (ADR-0048 rejected
 //! alternative 2).
+//!
+//! The store adapter classifies the tenant prefixes it lists (ADR-2637);
+//! [`discover_tenants`] says what that leaves for discovery to refuse.
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;

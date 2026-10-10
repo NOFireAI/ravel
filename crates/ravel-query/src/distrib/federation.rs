@@ -32,7 +32,9 @@
 //!
 //! `tenant: None` (an unkeyed remote) still serves every local tenant. It is the
 //! shape of every deployment predating the mapping, and `ravel-server` refuses
-//! it at startup on a coordinator that can resolve more than one local tenant.
+//! it at startup on a coordinator that can resolve more than one local tenant,
+//! which includes one whose durable sys/auth bearer tokens can onboard a tenant
+//! without a restart (a keyed bucket in all, gateway or query mode).
 //!
 //! # Availability
 //!
@@ -137,9 +139,10 @@ pub struct RemoteCluster {
     /// the pre-mapping shape, and it is safe only on a coordinator that runs
     /// queries for at most one local tenant; `ravel-server` refuses an unkeyed
     /// remote on a multi-tenant coordinator at startup
-    /// (`ensure_federation_tenant_mapping`). This variant exists so a
-    /// single-tenant deployment that never wrote a mapping keeps working
-    /// unchanged, not as a wildcard to reach for.
+    /// (`ensure_federation_tenant_mapping`), and a keyed bucket with durable
+    /// sys/auth bearer tokens counts as multi-tenant there. This variant exists
+    /// so a single-tenant deployment on an unkeyed bucket that never wrote a
+    /// mapping keeps working unchanged, not as a wildcard to reach for.
     pub tenant: Option<TenantHash>,
     /// When true, an unavailable/timed-out remote is skipped (with a warning)
     /// rather than failing the query. Defaults to false at the config layer.

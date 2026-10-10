@@ -4,10 +4,10 @@
 # demo bearer token. The internal-logs export gives a reader who runs a plain
 # `docker compose up` a log source, so the README's PromQL-over-logs example
 # (`ravel_log_lines`) has records to match when no telemetrygen is involved
-# (issue #1334). CI's quickstart lanes do not rely on this export: they inject
-# their own deterministic log records with `telemetrygen logs`, the same way
-# they inject the `gen` metric series, so the README assertion does not depend
-# on the collector's log level or emit timing.
+# (issue #1334). The scheduled quickstart-published lane does not rely on this
+# export: it injects its own deterministic log records with `telemetrygen logs`,
+# the same way it injects the `gen` metric series, so the README assertion does
+# not depend on the collector's log level or emit timing.
 #
 # The upstream image (otel/opentelemetry-collector-contrib) is built FROM
 # scratch and runs as uid 10001: every directory shipped in it is owned by
@@ -116,8 +116,8 @@ service:
     # The collector's own delivery counters, on a Prometheus endpoint.
     #
     # This exists so that "is the collector actually delivering?" is a
-    # question with a numeric answer. It is the assertion CI needs (#209) and
-    # the first thing to read when the Grafana dashboard is empty: a non-zero
+    # question with a numeric answer. It is the first thing to read when the
+    # Grafana dashboard is empty: a non-zero
     # `otelcol_exporter_send_failed_metric_points` says the collector is
     # running and Ravel is refusing its exports, which is a different fault
     # from the collector not scraping at all.

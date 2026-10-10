@@ -211,7 +211,8 @@ two need very different responses.
 comment pointing at this issue. That line is removed once gzip lands, which
 returns the quickstart to a stock Collector configuration and turns the
 `check-collector-delivery.sh` assertion (#209) into a live regression test for
-this ADR.
+this ADR. That regression test no longer runs; see the collector-delivery
+amendment below.
 
 ![Where a gzip body meets each admission layer: the compressed cap bounds what is buffered, capped decompression bounds what is expanded, and the byte rate is charged on the decompressed size before anything reaches a shard buffer.](assets/0084-gzip-admission.svg)
 
@@ -266,7 +267,8 @@ it can no longer report, and the metrics in decision 5 need both numbers.
   with no configuration. This is the single most common first-contact failure
   the project has, and it stops being one.
 - The quickstart returns to a stock Collector config, and #209's
-  delivery assertion becomes a standing regression test for this path.
+  delivery assertion becomes a standing regression test for this path. That
+  assertion was later removed; see the collector-delivery amendment below.
 - A new dependency for gzip decompression (`flate2`, which is not currently in
   the workspace). Rust gzip decoders are well-audited and `flate2` is the
   ecosystem default, but it is a genuinely new dependency and is flagged as one.
@@ -303,6 +305,18 @@ it can no longer report, and the metrics in decision 5 need both numbers.
 - No frozen format changes. No RSEG, RLOG, or RSPAN layout change, no protobuf
   schema change, no series-identity or commit-token change, no object-key layout
   change. The wire encoding of a request is not a persisted format.
+
+## Amendment (2026-10-09): the collector-delivery amendment, decision 6 without its regression test
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="collector-delivery amendment" -->
+
+ADR-0081 amendment A6 removed the per-PR `quickstart` job and, with it,
+`scripts/check-collector-delivery.sh`. Decision 6's workaround removal still
+stands: the quickstart Collector runs a stock configuration and sends gzip.
+What is gone is the live regression test decision 6 counted on, so no CI lane
+now asserts that the quickstart Collector's gzip exports are accepted. Gzip
+decoding on the OTLP HTTP path stays covered by ravel-server's own tests
+(`otlp_http.rs` and `tests/inflate_budget_e2e.rs`).
 
 ## Refs
 

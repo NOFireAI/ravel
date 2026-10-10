@@ -2,14 +2,11 @@ name: quickstart-published
 
 # Weekly published-image README check (ADR-0081 decision 8).
 #
-# The per-PR `quickstart` job in ci.yml proves the README matches the code at
-# HEAD, by building the PR's own binaries into an image and running the marked
-# README command blocks against it. It CANNOT prove the README matches the image
-# a reader actually pulls, because a merged doc change ships before the next
-# release tag does. This lane closes that window: it runs the same
-# `scripts/check-readme-commands.sh README.md` against the PUBLISHED images, on a
-# schedule, so a drift between main's README and the shipped image surfaces here
-# rather than in a stranger's terminal.
+# This is the only CI lane that runs the marked README command blocks against a
+# live stack: no per-PR job builds an image and brings the quickstart up. It
+# runs `scripts/check-readme-commands.sh README.md` against the PUBLISHED
+# images, on a schedule, so a drift between main's README and the shipped image
+# surfaces here rather than in a stranger's terminal.
 #
 # It runs the check TWICE (ADR-0081 decisions 8 and 1), as two independent matrix
 # legs so a failure names exactly which one broke:
@@ -17,9 +14,8 @@ name: quickstart-published
 #                         tag a reader following the README pulls.
 #   - `pinned-default` -- the compose file's own pinned default, unmodified
 #                         (RAVEL_IMAGE left unset). This is the one configuration
-#                         nothing else exercises: the per-PR job overrides
-#                         RAVEL_IMAGE with the image it just built, and the
-#                         `latest` leg overrides it with :latest, so a stale pin
+#                         nothing else exercises: the `latest` leg overrides
+#                         RAVEL_IMAGE with :latest, so a stale pin
 #                         in deploy/docker-compose/ravel.yml (a tag that no longer
 #                         resolves) would otherwise first fail in a reader's first
 #                         command. It fails here instead.
@@ -28,9 +24,9 @@ name: quickstart-published
 #
 # NOT a required check and NOT gated on any PR: triggers are `schedule` and
 # `workflow_dispatch` ONLY, never push / pull_request / merge_group, so this lane
-# can never block a merge (house style, matching bench-s3.yml). Unlike the per-PR
-# job it builds nothing -- no cargo, no Dockerfile.prebuilt, no image assembly. It
-# pulls the published images and brings up the same compose stack the reader runs.
+# can never block a merge (house style, matching bench-s3.yml). It builds
+# nothing -- no cargo, no Dockerfile.prebuilt, no image assembly. It pulls the
+# published images and brings up the same compose stack the reader runs.
 #
 # ---------------------------------------------------------------------------
 # THE ONE LEGITIMATE RED STATE (read this if you are looking at a red run at 3am)
@@ -78,14 +74,14 @@ env:
   COMPOSE_FILE: deploy/docker-compose/ravel.yml
   # The check script's readiness poll and marked blocks talk to the loopback
   # port the compose stack publishes; the token is the demo tenant token the
-  # compose file configures. Mirrors the per-PR quickstart job's env exactly.
+  # compose file configures.
   RAVEL_HTTP_BASE: http://127.0.0.1:4318
   RAVEL_TENANT_TOKEN: demo-token
   # RAVEL_READY_QUERY_URL has NO default in check-readme-commands.sh and hard
   # errors when empty, so it is exported explicitly here. `gen` is the series
   # telemetrygen emits deterministically (ADR-0081 D5); no host-metric name is
   # guaranteed non-empty across both generators, so it is the only safe readiness
-  # query. Same value the per-PR quickstart job uses.
+  # query.
   RAVEL_READY_QUERY_URL: http://127.0.0.1:4318/api/v1/query?query=gen
   # Label carried by every tracking issue this lane files, and the key it dedups
   # on. Constant across both legs.
@@ -124,11 +120,11 @@ jobs:
           # stays out of .git/config where that third-party code could read it.
           persist-credentials: false
 
-      # Bring up the SAME compose stack the reader runs (ADR-0081 decisions 1-3),
-      # modelled on the per-PR quickstart job. `--pull always` forces the freshest
-      # published images so this lane tests what a reader actually pulls today,
-      # not a cached layer. The `latest` leg overrides RAVEL_IMAGE; the
-      # `pinned-default` leg leaves it unset so the compose file's pin is used.
+      # Bring up the SAME compose stack the reader runs (ADR-0081 decisions 1-3).
+      # `--pull always` forces the freshest published images so this lane tests
+      # what a reader actually pulls today, not a cached layer. The `latest` leg
+      # overrides RAVEL_IMAGE; the `pinned-default` leg leaves it unset so the
+      # compose file's pin is used.
       - name: Bring up the compose stack
         env:
           RAVEL_IMAGE_OVERRIDE: ${{ matrix.image }}
@@ -141,7 +137,7 @@ jobs:
           fi
           docker compose -f "$COMPOSE_FILE" up -d --pull always
 
-      # Same bounded readiness loop as the per-PR quickstart job: poll /readyz
+      # Bounded readiness loop: poll /readyz
       # until the server can serve, dumping compose logs and failing if it never
       # comes up. A fixed sleep would race image-pull and startup time.
       - name: Wait for ravel-server readiness
@@ -165,8 +161,7 @@ jobs:
       # loopback port. --rate 0 disables telemetrygen's default
       # one-record-per-second-per-worker throttle so all 500 records burst out in
       # seconds instead of 8m20s; the README assertions only require a non-empty
-      # result, so a burst satisfies them at least as easily as a trickle. Same
-      # step as the per-PR quickstart job.
+      # result, so a burst satisfies them at least as easily as a trickle.
       - name: Generate deterministic telemetry with telemetrygen
         run: |
           docker run --rm --network host \
@@ -211,8 +206,7 @@ jobs:
         run: scripts/check-readme-commands.sh README.md
 
       # Always capture logs on failure: a scheduled failure nobody can diagnose is
-      # a lane that gets disabled (ADR-0081 decisions 6 and 8). Same as the per-PR
-      # job.
+      # a lane that gets disabled (ADR-0081 decision 8).
       - name: Dump compose logs on failure
         if: failure()
         run: docker compose -f "$COMPOSE_FILE" logs --no-color || true

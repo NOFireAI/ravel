@@ -75,9 +75,8 @@ Dependency decisions:
   our own protos. No git dependencies (deny.toml forbids them, and no
   otel-arrow Rust crate is published on crates.io).
 - `arrow` / `arrow-ipc` 59.x for IPC decode only; kept out of
-  ingest-critical crates other than ravel-otap. It was also the first
-  arrow-rs foothold in the tree, which the DataFusion query path now
-  shares.
+  ingest-critical crates other than ravel-otap. The DataFusion query path
+  also uses arrow-rs.
 
 Safety (spec §19 applies in full):
 - Decompressed-size caps per payload and per stream before allocation
@@ -143,18 +142,17 @@ Both are the rule the OTLP path applies to the same input. Admission goes
 through the caller's `ravel_types::ExemplarCap` (one exemplar per series per
 window, a security control per ADR-0047 decision 2), so
 `normalize_decoded_with_exemplars` takes that cap by `&mut` from whoever
-owns the long-lived per-shard state; `normalize_decoded` keeps its old
-signature and wraps it with a batch-scoped cap. One cap and one output
+owns the long-lived per-shard state; `normalize_decoded` wraps it with a
+batch-scoped cap. One cap and one output
 vector serve every exemplar source in a batch, so a gauge point and a
 histogram bucket compete for the same per-series window.
 
 A row too malformed to carry (no value column set, which OTLP itself calls
 an invalid exemplar; or no timestamp, which leaves nothing to place it in a
 window), a row the cap turns away, and a row whose `parent_id` matches no
-data point in its table all increment the pre-existing
-`HistogramExemplarsDropped` counter, so that counter now means "dropped by
-the cap, malformed, or orphaned" rather than "every exemplar, always".
-Despite its name it has always covered every metric type, not only
+data point in its table all increment the `HistogramExemplarsDropped`
+counter, which means "dropped by the cap, malformed, or orphaned". Despite
+its name it covers every metric type, not only
 histograms; it is not renamed, because the name reaches no operator-facing
 surface (rejections surface through `Display` and `rejected_count()`, and
 its `Display` string names no metric type) while a rename would break every
@@ -181,8 +179,8 @@ them out would diverge from an OTLP-fronted one on the same overload input.
 
 `EXP_HISTOGRAM_DP_EXEMPLARS` rows are counted as dropped, never carried.
 The reason is structural, not a missing decode: `EXP_HISTOGRAM_DATA_POINTS`
-is rejected as an unsupported metric type on this path (ADR-0017 is a
-separate ticket), so the series an exemplar would attach to is never built.
+is rejected as an unsupported metric type on this path (ADR-0017), so the
+series an exemplar would attach to is never built.
 When that changes, the attachment rule is the data point's own series, the
 same as a gauge or sum: Ravel stores a native histogram as one series with
 one native-histogram sample per timestamp rather than a set of exploded

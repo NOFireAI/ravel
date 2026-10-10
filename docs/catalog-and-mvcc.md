@@ -133,8 +133,7 @@ beside the heartbeat and memo prefixes above. The primitive lives in
 drivers call it: the background maintenance supervisor's compaction tick, and
 `ravel-cli maintain compact-bucket` / `compact-tenant`. Both reach it through
 `ravel_maintain::compact_bucket_claimed`, so an operator's run and a supervisor
-no longer both pay for merging the same sealed bucket. One small mutable object
-per unit of expensive merge work is what stops that double payment. The erasure
+do not both pay for merging the same sealed bucket. The erasure
 rewrite of a bucket (`ravel_maintain::erasure_rewrite_bucket`) and a format
 migration of it (`ravel_maintain::migrate_bucket_format`, which `ravel-cli
 maintain migrate` drives and which publishes a compaction record) take the same
@@ -185,8 +184,8 @@ Between two compactions the claim is **advisory and reconstructible**: it
 gives neither publication rights over the other, the record publish
 (`publish.rs`) never reads it, and losing or corrupting one costs at most a
 duplicated merge. Racing compactions still serialize at the compaction record's
-`CreateIfAbsent` and at content-addressed part keys exactly as they did before
-this prefix existed. Between a compaction (or a migration) and an erasure
+`CreateIfAbsent` and at content-addressed part keys.
+Between a compaction (or a migration) and an erasure
 rewrite of the same bucket it is a fence, as the paragraph above describes:
 their records have different keys, so no `CreateIfAbsent` serializes them, and
 a participating pass publishes only while it holds the claim, with the
@@ -625,8 +624,7 @@ and the CAS read/write helpers.
     manifest (the tenant id encrypted under an AES-256-GCM key derived from
     the deployment key) at each tenant's first write.
 
-  The v2-keyed variant described above (ADR-0050 §3) is the real, default,
-  durable design. There is no re-key migration between schemes (ADR-0050 §3;
+  There is no re-key migration between schemes (ADR-0050 §3;
   docs/guides/operations.md).
 - `m` = metrics signal, `l` = logs, `s` = spans; all three carry data today.
   `p` is reserved for profiles, which no ingest or query path builds.
@@ -801,12 +799,7 @@ truncated object for a reader to silently trust.
 fold no longer writes the v1 or v2 whole-tenant statistics at any size: v3
 per-part objects at field 7 are the only form published. `SnapshotHead`
 fields 11 and 13 are `reserved`, so there is no struct field left to set or
-read for either one; a HEAD encoded today carries neither. This landed as
-one coordinated change across the fold (write side), the reader (decode
-side), and the GC sweep (reachability side) rather than a dual-publish
-window, since the whole-tenant forms had no independent readers left to
-migrate off them first: `load_column_stats`'s only fallback for a
-field-7-less part was the scan path already required for the absent case.
+read for either one; a HEAD encoded today carries neither.
 
 **GC-sweep coverage.** The sweep rule described above
 (`ravel_maintain::sweep::sweep_unreferenced_catalog_objects`) treats HEAD's
@@ -1091,7 +1084,7 @@ The scheduled fold runs in two server modes: `maintain` and `all`. A `gateway`
 or `query` process runs no fold timer. A `query` process keeps the on-demand
 `POST /api/v1/admin/fold` route, which folds the tenant and signal the caller
 names regardless of ownership; a `gateway` process mounts no fold route at all
-and so cannot fold by any route, which was already true before ADR-1693.
+and so cannot fold by any route.
 
 In `maintain`, a `(tenant, signal)` pair is normally folded by one process.
 "Normally" rather than "by exactly one at a time": a membership transition is
@@ -1750,7 +1743,7 @@ endpoint.
 
 ## Snapshot resolution from a folded snapshot
 
-Folding ships, so step 1 of the listing
+Step 1 of the listing
 algorithm above is replaced by a snapshot-backed lookup that degrades to
 full listing on any index failure; min-token resolution and snapshot
 pinning are unchanged:
@@ -1934,9 +1927,8 @@ the snapshot.
 they make on the caller's behalf when driven through their
 `*_with_accounting` counterparts (`resolve_with_accounting`,
 `resolve_pruned_with_accounting`; ADR-0044). The plain `resolve`
-and `resolve_pruned` entry points are unchanged and pass a discarded
-`QueryAccounting` handle, so every existing caller keeps its current
-signature and behavior.
+and `resolve_pruned` entry points pass a discarded `QueryAccounting`
+handle.
 
 `Catalog::guarded_get` is the only place a resolve issues a GET, and
 `Catalog::guarded_list_all` is the LIST funnel for every path except the two
@@ -1951,11 +1943,8 @@ Every GET a resolve issues goes through `guarded_get`, including the two
 provisioning-record reads that provisioning enforcement adds: the generation
 history `Catalog::read_scan_generations` reads fresh on every resolve, and
 the one-shot `shard_count` check `Catalog::enforce_provisioning_once` runs on
-a (tenant, signal)'s first touch. Both were raw `store.get` calls that
-escaped the resolve semaphore and the accounting, so an enforcing catalog
-under-reported a query's GET count by one on every resolve, and by two on a
-(tenant, signal)'s first touch; they now take the same funnel as every other
-resolve GET. The raw `store.get` in `provisioning.rs` remains
+a (tenant, signal)'s first touch. The raw
+`store.get` in `provisioning.rs` remains
 only on the administrative paths, which never run under a query and hold no
 per-query accounting: `validate_or_adopt`'s adoption write and its race
 re-read, `append_generation` (reshard), `raise_format_floor`, and
@@ -1986,8 +1975,7 @@ the same per-tenant figure (22.5 MB each at the 25,000-entry cap, 45 MB
 together). `PartCache` and `PostingsCache` are bounded by their entry count
 alone and evict by insertion order. `HeadCache` additionally carries a
 process-wide capacity bound (`head_cache_capacity`, default 10,000 (tenant,
-signal) entries, FIFO eviction), closing the one cache of the five that previously had a TTL but
-no bound on the number of tenants it could grow to hold. An entry recording a
+signal) entries, FIFO eviction). An entry recording a
 missing HEAD counts against the same bound, but when the cache is full a new
 one is not cached rather than evicting a present HEAD. A present insert at
 capacity evicts the oldest missing-HEAD entry first, and falls back to the

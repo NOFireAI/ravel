@@ -32,6 +32,11 @@
 //!
 //! - `an_unmapped_local_tenant_gets_no_remote_series_from_a_query`
 //! - `an_unmapped_local_tenant_sees_no_remote_label_namespace`
+//!
+//! And one test through a real `ravel_server::start` on a keyed bucket, where a
+//! tenant known only through durable `sys/auth` queries a remote mapped to it:
+//!
+//! - `a_durable_only_tenant_queries_a_remote_mapped_to_it`
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -1351,5 +1356,221 @@ async fn an_unmapped_local_tenant_sees_no_remote_label_namespace() {
         beta_stats.warnings
     );
 
+    remote.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Durable sys/auth tenancy (ADR-2708 D1). On a keyed bucket the startup guard
+// admits `tenant=<t>` for a tenant known only through sys/auth. This proves that
+// newly admitted spelling serves through the real path: `ravel_server::start`
+// installs the durable resolver and builds the federation from the same
+// `RemoteClusterConfig`, and a query authenticated by a sys/auth-only token
+// reaches the remote mapped to its tenant while a static tenant's does not.
+// ---------------------------------------------------------------------------
+
+const KEYED_DEPLOYMENT_KEY: [u8; 32] = [0x5au8; 32];
+const STATIC_ACME_TOKEN: &str = "static-acme-token";
+const DURABLE_BETA_TOKEN: &str = "durable-beta-token";
+
+/// A real `ravel_server::start` on a keyed bucket in `all` mode with one static
+/// bearer tenant (`acme`) and the given remote clusters.
+async fn start_keyed_coordinator(
+    store: Arc<dyn ObjectStoreBackend>,
+    remote_clusters: Vec<RemoteClusterConfig>,
+) -> ravel_server::Running {
+    let tenant_resolver = ravel_server::tenant::build_resolver(
+        std::collections::HashMap::from([(
+            STATIC_ACME_TOKEN.to_string(),
+            TenantId::new(MAPPED_TENANT),
+        )]),
+        false,
+    );
+    let config = ravel_server::ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        max_flush_delay: Duration::from_secs(2),
+        max_flush_delay_idle: Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
+        mode: ravel_server::Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: ravel_server::FoldTaskConfig {
+            enabled: false,
+            ..ravel_server::FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: false,
+        limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        deployment_key: Some(Box::new(KEYED_DEPLOYMENT_KEY)),
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: EngineConfig::default().max_s3_requests,
+        scrub_period: Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters,
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+    };
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("keyed coordinator starts")
+}
+
+/// `/api/v1/query` as `token`, returning the sorted `instance` labels of the
+/// result vector.
+async fn query_instances(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    t_secs: f64,
+) -> Vec<String> {
+    let resp = client
+        .get(format!("{base}/api/v1/query"))
+        .header("authorization", format!("Bearer {token}"))
+        .query(&[("query", METRIC.to_string()), ("time", t_secs.to_string())])
+        .send()
+        .await
+        .expect("query request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(status, 200, "query as {token} must succeed: {body}");
+    let mut out: Vec<String> = body["data"]["result"]
+        .as_array()
+        .expect("result array")
+        .iter()
+        .filter_map(|s| s["metric"]["instance"].as_str().map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A tenant provisioned only in sys/auth (`beta`, no `--tenant-token`) queries
+/// the remote mapped to it with `tenant=beta`, through the resolver chain and
+/// federation `ravel_server::start` installs. The static tenant `acme` on the
+/// same coordinator gets only its own local series, and its query does not
+/// dial the remote.
+#[tokio::test]
+async fn a_durable_only_tenant_queries_a_remote_mapped_to_it() {
+    let base = now_ns() - 10 * NS_PER_MIN;
+    let t_secs = ((base + NS_PER_MIN) / NS_PER_MS) as f64 / 1000.0;
+    let acme = TenantId::new(MAPPED_TENANT);
+    let beta = TenantId::new(UNMAPPED_TENANT);
+
+    let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_series(local_store.as_ref(), &acme, base, "local-acme", 1.0, 1).await;
+    publish_series(local_store.as_ref(), &beta, base, "local-beta", 2.0, 2).await;
+    ravel_catalog::upsert_token_owned(
+        local_store.as_ref(),
+        &KEYED_DEPLOYMENT_KEY,
+        DURABLE_BETA_TOKEN.as_bytes(),
+        UNMAPPED_TENANT,
+        Some(ravel_catalog::MANAGED_BY_OPERATOR),
+        now_ns(),
+    )
+    .await
+    .expect("seed beta in sys/auth only");
+
+    let remote_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let remote_tenant = TenantId::new("remote-side-tenant");
+    publish_series(
+        remote_store.as_ref(),
+        &remote_tenant,
+        base,
+        REMOTE_ONLY_INSTANCE,
+        3.0,
+        1,
+    )
+    .await;
+    let remote = spawn_remote(remote_store, OPERATOR_CRED, &remote_tenant).await;
+
+    let remote_clusters = vec![RemoteClusterConfig {
+        name: "east".to_string(),
+        endpoint: remote.endpoint.clone(),
+        credential: OPERATOR_CRED.to_string(),
+        tenant: Some(beta.clone()),
+        tls: false,
+        tls_ca_file: None,
+        skip_unavailable: false,
+        soft_timeout: Duration::from_secs(10),
+    }];
+    // The startup guard main.rs runs, with what main.rs passes for this
+    // configuration: beta is in no --tenant-token, so only durable auth admits it.
+    ravel_server::ensure_federation_tenant_mapping(
+        &remote_clusters,
+        &std::collections::HashMap::from([(STATIC_ACME_TOKEN.to_string(), acme.clone())]),
+        &[],
+        false,
+        ravel_server::durable_auth_enabled(ravel_server::Mode::All, true),
+        &ravel_server::config::AuthResolverSettings::default(),
+    )
+    .expect("a mapping to a durable-only tenant is admitted on a keyed bucket");
+
+    let running = start_keyed_coordinator(local_store, remote_clusters).await;
+    let base_url = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        query_instances(&client, &base_url, DURABLE_BETA_TOKEN, t_secs).await,
+        vec!["local-beta".to_string(), REMOTE_ONLY_INSTANCE.to_string()],
+        "the durable-only tenant must get its local series plus the mapped remote's"
+    );
+    let seen = remote.seen_auth.lock().clone();
+    assert!(
+        seen.iter().all(|a| a == &format!("Bearer {OPERATOR_CRED}")),
+        "the remote sees only the operator credential: {seen:?}"
+    );
+
+    let dials_before = seen.len();
+    assert!(dials_before > 0, "beta's query must have dialed the remote");
+    assert_eq!(
+        query_instances(&client, &base_url, STATIC_ACME_TOKEN, t_secs).await,
+        vec!["local-acme".to_string()],
+        "the static tenant is not mapped to the remote and must get local data only"
+    );
+    assert_eq!(
+        remote.seen_auth.lock().len(),
+        dials_before,
+        "the static tenant's query must not dial the remote"
+    );
+
+    running.shutdown().await.expect("clean shutdown");
     remote.stop().await;
 }

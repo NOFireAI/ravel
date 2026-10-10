@@ -31,7 +31,8 @@
 # `docker compose -f deploy/docker-compose/ravel.yml up -d`'s job.
 #
 # The GIF in the README is a recording of a passing run of this script.
-# Recording is a local step; CI runs the assertions (ADR-0081 decision 9).
+# Recording is a local step, and so is running the assertions: no CI lane runs
+# this script (ADR-0081 amendment A6).
 #
 # Shell-safety (CLAUDE.md "Writing gate and poll shell"): exit codes are
 # captured as `cmd || code=$?` on the same line; no variable is named `status`,

@@ -54,10 +54,8 @@ milestone at v1.0, which is distinct from the software's first public release
 at 0.9.0 and has not shipped. Before v1.0 a trailer-version bump may break
 backward compatibility outright.
 
-**Version lifecycle and migration (ADR-0066, normative).** The pre-release
-posture above expires at the v1.0 release and not before (ADR-0531: the
-format-lifecycle activation milestone is v1.0, distinct from the software's
-0.9.0 first public release and not yet shipped). RSPAN is a Class A bulk
+**Version lifecycle and migration (ADR-0066, normative).** RSPAN is a Class A
+bulk
 data-object format; from v1.0 onward the supported-version window becomes
 N/N-1 (single-sourced as
 `ravel_rspan::footer::SUPPORTED_VERSIONS`, which holds exactly one version
@@ -560,7 +558,5 @@ lands.
 Memory: `ravel-rspan` has no ranged section reader (no equivalent of RLOG's
 `RlogRangeReader`), so the merge fetches and decodes each input object
 whole. Raw bytes are bounded to one input at a time; decoded records for
-the whole bucket are held in memory across the merge. This is the same
-tradeoff RLOG's merge once accepted, not an oversight, and a ranged
-RSPAN reader is the natural follow-up once span bucket sizes in practice
-justify it.
+the whole bucket are held in memory across the merge. A ranged RSPAN
+reader is the follow-up once span bucket sizes in practice justify it.

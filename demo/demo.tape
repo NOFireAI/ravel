@@ -8,9 +8,9 @@
 #   docker compose -f deploy/docker-compose/ravel.yml up -d
 #   vhs demo/demo.tape
 #
-# The script is the artifact under test and CI runs its assertions; this tape
-# only records it. If the script fails, the recording shows it failing, which is
-# the correct outcome -- never edit the tape to hide a red run.
+# The script is the artifact under test; this tape only records it. If the
+# script fails, the recording shows it failing, which is the correct outcome --
+# never edit the tape to hide a red run.
 
 Output docs/demo.gif
 

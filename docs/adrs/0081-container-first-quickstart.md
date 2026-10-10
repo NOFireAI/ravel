@@ -138,7 +138,8 @@ lying would be the worst possible flake.
 build --file Dockerfile.prebuilt --target server` to assemble a runtime image
 from those binaries. This is the same split ADR-0053 D5 established for the kind
 lane, applied to a far smaller build, and it means the job verifies **the pull
-request's own code**, not a previously released image.
+request's own code**, not a previously released image. A6 in the Amendments
+section below removes this job.
 
 `ravel-cli` is not optional and not a convenience here: `Dockerfile.prebuilt`'s
 `server` target COPYs both binaries (`Dockerfile.prebuilt:65,72`), deliberately,
@@ -156,15 +157,17 @@ This job must be exempt from that gate, because a README-only edit is precisely
 the change it exists to catch. It carries its own path filter: `README.md`,
 `deploy/docker-compose/**`, `demo/**`, `scripts/check-readme-commands.sh`,
 `Dockerfile.prebuilt`, and `services/ravel-server/**`. A5 in the Amendments
-section below narrows when the last of those paths triggers the job.
+section below narrows when the last of those paths triggers the job, and A6
+removes the job.
 
 **8. A weekly lane runs the same script against the published image.**
 
-The per-PR job proves the README matches `HEAD`. It cannot prove the README
-matches what a reader actually pulls, because a merged doc change ships before
-the next release tag does. A scheduled run of the same script with `RAVEL_IMAGE`
-set to `ghcr.io/nofireai/ravel-server:latest` closes that window, plus the
-unmodified-default run from decision 1.
+The per-PR job proves the README matches `HEAD` (until A6 in the Amendments
+section below removes it, leaving this lane as the only one). It cannot prove
+the README matches what a reader actually pulls, because a merged doc change
+ships before the next release tag does. A scheduled run of the same script
+with `RAVEL_IMAGE` set to `ghcr.io/nofireai/ravel-server:latest` closes that
+window, plus the unmodified-default run from decision 1.
 
 That window is also the lane's one legitimate red state, and the lane cannot
 tell it apart from a real defect: between merging a README that documents
@@ -194,11 +197,12 @@ loudly on its own; the GIF is a recording of a passing run. Recording is a local
 step, not a CI step — CI runs the assertions.
 
 The job that runs it is the per-PR `quickstart` job from decision 6, as a step
-after the marked README blocks. Its path filter already covers `demo/**`, it
-already has the stack up, and it is the only lane that both has docker and gates
-a merge. Naming it here is not a formality: the fleet executors that write this
-script cannot run docker, so without an explicit job attachment the script would
-merge unproven, which is precisely the failure mode this ADR exists to close for
+after the marked README blocks (removed by A6 in the Amendments section
+below). Its path filter already covers `demo/**`, it already has the stack
+up, and it is the only lane that both has docker and gates a merge. Naming it
+here is not a formality: the fleet executors that write this script cannot
+run docker, so without an explicit job attachment the script would merge
+unproven, which is precisely the failure mode this ADR exists to close for
 the README.
 
 ![Two paths from a clone to first data: the documented path today compiles the whole workspace before anything runs, while the container-first path pulls one already-built, already-signed image and starts serving in under a minute.](assets/0081-quickstart-paths.svg)
@@ -261,7 +265,7 @@ dashboard is the hook; the kill script is the evidence.
 <!-- amendment-applies: sections="Decision" pointer="Amendments section below" -->
 
 Four things this ADR got wrong or left unsaid, found while implementing it
-(A1 to A4), and one later change to a decision (A5).
+(A1 to A4), and two later changes to decisions (A5, A6).
 Recorded here rather than silently patched into the decisions above, so the
 gap between what was designed and what shipped stays visible.
 
@@ -327,6 +331,22 @@ only where the break is first seen. The push run covers every landing in its
 merge-queue batch, so a red run names the batch, not the single commit.
 Tracked in issue #2520.
 
+**A6 (2026-10-09). The per-PR `quickstart` job is removed.** Decisions 6, 7 and
+9 described a job in `ci.yml` that built the change's own binaries, assembled
+an image, brought the compose stack up and ran the marked README blocks, the
+read-your-write walkthrough, the collector-delivery check and the
+kill-and-recover demo against it. It was the slowest job in the workflow
+(27 minutes on a pull request that touched its paths) and was never promoted
+to a required check, so it delayed feedback without gating anything. It is
+removed, with the two files only it used: the CI-only compose override
+`deploy/docker-compose/ci-host-bucket.yml` and
+`scripts/check-collector-delivery.sh`. Decision 8's weekly
+`quickstart-published` lane remains and still runs the marked README blocks,
+against the published images, so a README break in a change surfaces there
+only after a release ships it. No lane runs `demo/walkthrough.sh`,
+`demo/kill-and-recover.sh` or the collector-delivery assertion any more; a
+break in any of them surfaces only when someone runs the quickstart by hand.
+
 One thing outside this ADR that A2 exposes: `scripts/demo.sh` passes no
 tenant-hash flag either, so the from-source demo only works because a previous
 run left an unkeyed marker behind. On a genuinely fresh `minio-data/` it fails
@@ -338,7 +358,8 @@ the same way. Reported, not fixed here.
   The reader's first payoff becomes a Grafana screen rather than two lines of
   JSON.
 - The README acquires a gate. A wrong port, table, or header in a marked block
-  now fails CI instead of failing a stranger.
+  now fails CI instead of failing a stranger. Since A6 in the Amendments
+  section, only the weekly lane runs it, after a release.
 - New per-PR CI cost: two release builds (`ravel-server --features sql` and
   `ravel-cli`) against a warm cache, plus a compose bring-up and the assertions.
   The job lands advisory and is promoted to required once its warm-cache budget
@@ -346,13 +367,15 @@ the same way. Reported, not fixed here.
   was introduced. Promotion should be faster than Tier B's, and the probation is
   for budget only: Tier B's caution was timing noise, and this job's assertions
   are deterministic, so a red run here is a defect rather than a measurement.
+  The job was never promoted, and A6 in the Amendments section removes it.
 - A documentation-only pull request that touches `README.md` stops being nearly
   free in CI. Today `docs_only` skips all 14 compile lanes — PR #171, the stub
   that claimed this ADR number, skipped every one of them. Once this job is
   required, a README-touching docs PR carries two release builds and a compose
   bring-up on its merge path. That is the intended trade and the whole point of
   decision 7, but it is a real latency cost on the most common PR shape in a
-  docs-heavy repository, and it is stated here rather than discovered.
+  docs-heavy repository, and it is stated here rather than discovered. The
+  job was never made required, and A6 in the Amendments section removes it.
 - The quickstart's SQL surface exists because the image carries `--features
   sql`; the from-source `make demo` still does not. The guides must state which
   path gives which capability rather than describing one surface.

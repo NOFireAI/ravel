@@ -580,9 +580,9 @@ mod tests {
     /// deletes the superseded version and leaves the stray key in the store.
     #[tokio::test]
     async fn an_unaddressable_stray_key_is_skipped_and_counted_by_the_sweep() {
-        use crate::resolve::tests::{UNLISTABLE_SHAPES, put_stray};
+        use crate::resolve::tests::{UNADDRESSABLE_SHAPES, put_stray};
 
-        for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
+        for (i, rest) in UNADDRESSABLE_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x7a + i as u8; 16]);
             let store = two_versions(&tenant).await;
             let stray = put_stray(store.inner(), &tenant, rest).await;

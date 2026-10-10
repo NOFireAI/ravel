@@ -1101,7 +1101,8 @@ listing treats it exactly like a version above the bound: `resolve::versions`
 (and so `resolve::newest`), `resolve::tables` and the sweep's listing skip
 it, count it and warn about it as below, and never fail on it when the store
 lists it (the invalid table segment amendment below names the keys S3 cannot
-list). Before this,
+list; since the counted skip amendment below, S3 lists them as
+unaddressable and the listing goes on). Before this,
 one such key failed every query and DDL statement on its table and every
 `parquet ls` and `parquet sweep` of its tenant.
 
@@ -1261,22 +1262,23 @@ only the shape the Query grant can write is skipped.
 
 **Listings.** `resolve::tables` (through `resolve::tenant_listing`, which
 also returns the skipped keys) and the sweep's listing skip such a key when
-the store lists it. The S3 adapter does not list every such key:
-`object_store` parses each key of a listing response with `Path::parse`,
-which refuses a key holding a control character, an empty segment (such as
-`hits//v/...`, or an empty table segment) or a `.` or `..` segment, and one
-such key fails the whole listing with a store error before Ravel sees it. On
-S3 those shapes therefore still fail `parquet ls`, `parquet sweep` and
-`parquet repair --stray` for the whole tenant. Ravel cannot list such a key,
-so an operator removes it by deleting the exact key with the Maintain
-credential through an S3 tool. The same holds for a key under a valid
-table's own `v/` prefix whose slot names no version: the version bound
-amendment's listings skip and never fail on one only when the store lists
-it, and on S3 one holding a control character, an empty segment (such as
-`hits/v//<20 digits>.pqm`) or a `.` or `..` segment fails
-`resolve::versions`, and so every query and DDL statement on that table, as
-well as the tenant-wide listings. The adapter failing a listing on one key
-it cannot parse is a defect in `ravel-object-store`, tracked as issue #2637.
+the store lists it. Until the counted skip amendment below, the S3 adapter
+did not list every such key: `object_store` parsed each key of a listing
+response with `Path::parse`, which refuses a key holding a control
+character, an empty segment (such as `hits//v/...`, or an empty table
+segment) or a `.` or `..` segment, and one such key fails the whole listing
+with a store error before Ravel sees it (the counted skip amendment below
+replaces this on S3). Those shapes then failed `parquet ls`, `parquet sweep`
+and `parquet repair --stray` for the whole tenant on S3 (no longer: see the
+counted skip amendment below). The same held for a key under a valid table's
+own `v/` prefix whose slot names no version, such as
+`hits/v//<20 digits>.pqm`: on S3 it failed `resolve::versions`, every query
+(no longer: see the counted skip amendment below) and DDL statement on that
+table, and the tenant-wide listings. The adapter failing a listing on one key
+it cannot parse was a defect in `ravel-object-store`, tracked as issue #2637,
+and fixed as the counted skip amendment below records. An operator removes
+such a key by deleting the exact key with the Maintain credential through an
+S3 tool, since no request Ravel sends reaches it unchanged.
 Each listing that finds a key it skips is counted once per tenant,
 however many such keys it finds (`resolve::invalid_table_listings`, a sibling
 of the per-table `resolve::above_bound_resolves`, so neither counter's key
@@ -1300,8 +1302,9 @@ every non-ASCII byte and ``\ { ^ } % ` ] " > [ ~ < # | * ?``; a key that
 changes under it (`keys::is_store_path`) is marked undeletable by Ravel,
 since its delete would go to a different key, report success and leave it.
 The listing shows such a key only when no key the encoding changes sits at
-a list page boundary: the adapter also sends a page's continuation, the last
-key of the page, through `Path::from`, so when that key changes the next
+a list page boundary (no longer so, see the counted skip amendment below):
+the adapter also sends a page's continuation, the last key of the page,
+through `Path::from`, so when that key changes the next
 page starts somewhere else and either returns keys again, failing the
 listing with `ListOrderViolation`, or skips the keys after it. That is the
 same adapter defect, issue #2637.
@@ -1321,10 +1324,11 @@ prints what it deleted, lists the tenant's `pq/t/` prefix again and exits
 non-zero naming every such key still listed, skipped ones included, or
 exits non-zero with the error of that listing if it fails. Every such key
 still there is named only when no key the encoding changes sits at a page
-boundary, as above. An operator removes an undeletable
-key, as one the store cannot list, by deleting the exact key with the
-Maintain credential through an S3 tool. With nothing listed it says so and
-deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
+boundary, as above (every one, since the counted skip amendment below).
+An operator removes an undeletable key, which no request Ravel sends
+reaches unchanged, by deleting the exact key with the Maintain credential
+through an S3 tool. With nothing listed it says so and deletes nothing.
+`--delete-version` stays table-scoped. `--table --delete`
 (`repair::delete_flagged`) applies the same store-path check to the keys it
 flags: a flagged key under the table's own `v/` prefix that changes under
 `Path::from`, such as a slot of 20 tildes, or `hits/v//<20 digits>.pqm`,
@@ -1349,7 +1353,8 @@ delete by hand.
 still the root fix: until it lands, a stolen Query credential can put such
 keys, every tenant-wide listing pages through them until an operator
 removes them, and on S3 one key of a shape the adapter cannot list fails
-those listings outright.
+those listings outright (until the counted skip amendment below, which makes
+it a counted skip).
 
 ## Amendment (2026-10-07): a dead engine is one concurrency violation
 
@@ -1407,3 +1412,63 @@ credential for DDL. This ADR's earlier text called the Query-grant narrowing
 "item 1 of issue #2430"; that narrowing is issue #2430's item 3, still the
 root fix and still open. See ADR-2430 for the two-release readers-first
 rollout, the unkeyed-bucket fallback, and the quiescent-table consequence.
+
+## Amendment (2026-10-10, ADR-2637): on S3 a key no request reaches is a counted skip, not a failed listing
+
+<!-- amendment-applies: sections="Amendment (2026-10-04): manifest versions are bounded, and a repair command removes forged ones|Amendment (2026-10-06): a manifest key under an invalid table segment is skipped, and repair removes it" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="fails the whole listing with a store error" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="sits at a list page boundary" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="sits at a page boundary" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="fails those listings outright" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="Those shapes then failed `parquet ls`" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="on S3 it failed `resolve::versions`" pointer="counted skip amendment" -->
+
+The version bound amendment and the invalid table segment amendment record
+two failures of the S3 adapter's listing, both tracked as issue #2637: a key
+`Path::parse` refuses fails the whole listing, and a page whose last key
+`Path::from` changes resumes somewhere else. ADR-2637 replaced that listing,
+and both are gone.
+
+**Every key is listed.** The S3 adapter sends its own SigV4 ListObjectsV2
+request, takes each key exactly as the store returns it, and resumes the
+next page from the store's continuation token or the raw last key, so no
+key is parsed into a `Path` and no page starts anywhere but after the last
+one. Each listed key is classified (`ravel_object_store::is_addressable_key`):
+a key a request cannot reach unchanged, because `Path::from` drops or
+encodes part of it (a control character, an empty segment, a `.` or `..`
+segment, or any byte the invalid table segment amendment lists), is not one
+of the listing's objects. The page reports it in `unaddressable` instead, the
+store warns about it once per distinct key (sampled past 4096 keys in a
+process) and counts it in
+`ravel_store_list_unaddressable_total`, and the listing returns every other
+key. A key the store returns URL encoded that does not decode (a `%` not
+followed by two hex digits, or bytes that are not UTF-8 once decoded) keeps
+its encoded text, which holds a `%` and so is unaddressable: it is reported
+the same way and does not fail the listing either.
+
+**Listings.** `resolve::versions`, `resolve::tables` and the sweep's listing
+therefore never fail on such a key on S3. Each listing the store reports one
+in is counted per tenant (`resolve::unaddressable_listings`), and
+`resolve::tenant_listing` returns how many it skipped with a sample
+(`TenantListing::unaddressable`), which `parquet ls` names, escaped. No reader
+resolves such a key and the sweep never deletes it. Every query and DDL
+statement on a table, and `parquet ls`, `parquet sweep` and `parquet repair`
+of its tenant, go on past one.
+
+**Repair.** `parquet repair --stray` lists every stray key of the tenant,
+unaddressable ones included, and names an unaddressable one
+`StrayClass::Undeletable`: its delete would reach a different key, so the
+command never deletes it. `--stray --delete` skips it, deletes the other
+stray keys, and then exits non-zero naming it, since the check after
+`--delete` names every such key still listed, wherever the page boundaries
+fall. `repair::delete_stray` itself refuses the whole call with
+`RepairError::Undeletable` before any delete when a caller names such a
+key; the command never names one. `--table` marks an unaddressable flagged key undeletable and its
+`--delete` skips it, as the invalid table segment amendment describes. An
+operator removes such a key, as before, by deleting the exact key with the
+Maintain credential through an S3 tool.
+
+**What stays open.** Narrowing the Query grant (issue #2430's item 3) is
+still the root fix. Until it lands, a stolen Query credential can put keys
+no request reaches; they no longer fail a listing, but each is paged through,
+counted and warned about until an operator removes it by hand.

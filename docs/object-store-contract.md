@@ -276,16 +276,18 @@ trait honors cancellation by drop, so the query deadline (usually well under
   the client fails rather than looping forever, and a token that keeps
   changing without ending is bounded by a page ceiling (`MAX_LIST_PAGES`,
   100 000 pages, 100 million keys at the 1000-key page size). One
-  `S3Store` page can take several ListObjectsV2 responses (below). Only a
-  truncated response carrying no key is charged to that page's ceiling of
-  16; every other response adds at least one key, and ListObjectsV2 may
-  return fewer than `max-keys`, so a page takes at most `page_size + 16`
+  `S3Store` page can take several ListObjectsV2 responses (below). Only
+  truncated responses carrying no key are charged to that page's ceiling
+  of 16, counted in a row: a response carrying a key starts the count
+  again. Each response carrying a key adds at least one, and ListObjectsV2
+  may return fewer than `max-keys`, so a page takes at most `page_size` of
+  those, each after at most 15 keyless ones, and a page left short of full
+  takes up to 16 keyless ones after its last: at most `16 × page_size`
   responses. The request bound of one `S3Store` drain is the composed
-  `MAX_LIST_PAGES` times that figure: 101.6 million responses at the
-  default page size of 1000, a bound a backend reaches only by returning
-  one key per response. `list_delimited` is
-  one call that follows tokens to the end, bounded at `MAX_LIST_PAGES`
-  responses.
+  `MAX_LIST_PAGES` times that figure: 1.6 billion responses at the default
+  page size of 1000, a bound a backend reaches only by returning one key
+  per response after 15 keyless ones. `list_delimited` is one call that
+  follows tokens to the end, bounded at `MAX_LIST_PAGES` responses.
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
   would, minus every key `<= start_after`: each returned key compares
   strictly greater than `start_after`, in the same lexicographic order and
@@ -314,17 +316,19 @@ trait honors cancellation by drop, so the query deadline (usually well under
   `start-after` raw, asks for `encoding-type=url`, and decodes a response
   that echoes `EncodingType=url` (`+` is a space, `%XX` a byte); a
   response without `EncodingType` is read literally. A key that is not
-  UTF-8 once decoded is reported in `unaddressable` under its still-encoded
-  text. One `list` or `list_after` call is one page: it asks for at most
-  1000 keys per response and follows `NextContinuationToken` within the
-  call until the page holds `page_size` keys or the listing ends, so a
-  truncated response with no keys continues the page instead of ending it.
+  UTF-8 once decoded, or holds a `%` not followed by two hex digits, is
+  reported in `unaddressable` under its still-encoded text, so the rest
+  of the listing is returned. One `list` or `list_after` call is one page:
+  it asks for at most 1000 keys per response and follows
+  `NextContinuationToken` within the call until the page holds `page_size`
+  keys or the listing ends, so a truncated response with no keys continues
+  the page instead of ending it.
   A truncated response with no `NextContinuationToken` that leaves the page
   short is `Permanent` naming the prefix, a token equal to the one just
   sent is `ListRepeatedToken` (a response that fills the page is complete,
-  and its token is never checked or sent), and a page's 16th empty
-  truncated response ends it with `ListPageCeiling` instead of another
-  request. Its `list_delimited` follows tokens only and
+  and its token is never checked or sent), and a page's 16th keyless
+  truncated response in a row ends it with `ListPageCeiling` instead of
+  another request. Its `list_delimited` follows tokens only and
   never resumes from a key, since a common prefix can sort after a
   response's last key. An S3 grant read through `ExternalStore` lists
   through `S3Store`.
@@ -779,7 +783,7 @@ fired).
 (`UploadIntegrity`):
 
 - `Off` (the library default) attaches no checksum and reports
-  `upload_checksum: false`. This is the historical behavior.
+  `upload_checksum: false`.
 - `Crc64Nvme` / `Sha256` configure `object_store`'s whole-client
   `AmazonS3Builder::with_checksum_algorithm`, so it computes that digest over
   the exact payload and sends it as `x-amz-checksum-crc64nvme` /
@@ -974,8 +978,7 @@ otherwise (see "Upload checksums").
 
 `S3Config` selects a credential source explicitly through `auth`
 (`S3AuthMode`), never by inferring one from the absence of keys. The default
-is `S3AuthMode::Static`, which is every deployment today and behaves exactly
-as before ADR-0106.
+is `S3AuthMode::Static`.
 
 **Static mode (ADR-0072 decision 1).** Takes long-lived `access_key_id` /
 `secret_access_key`, an optional temporary `session_token` for STS-issued or
@@ -1268,13 +1271,13 @@ genuinely a different store. The command only ever writes under
 reads, lists, or writes any tenant-prefixed key, so it is safe to run
 against a bucket that already holds production data.
 
-The scratch objects the suite leaves behind are no longer a handful. The two
-listing probes dominate the count, and each writes `max(page_size + 2, 5)`
+The two listing probes dominate the count of scratch objects the suite
+leaves behind, and each writes `max(page_size + 2, 5)`
 small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
 14 the other probes leave (two conditional-write keys, five read-after-write,
 five list-after-write, one concurrent-create, and the delete probe's
-surviving key): 2018 objects at the default page size of 1000, against 24
-before the page size became a parameter. The delete probe's second key, the
+surviving key): 2018 objects at the default page size of 1000. The delete
+probe's second key, the
 three `ListedKeysRoundTripPlusAndSpace` keys and the stored-checksum echo
 probe's object are the only scratch objects a run deletes; the echo object
 stays too when its delete is refused, and the run prints a note naming it.
@@ -1638,8 +1641,7 @@ bucket launchers (the create-bucket Jobs in `deploy/k8s/` and the compose
 and one enabled whole-bucket rule carrying `ExpiredObjectDeleteMarker`,
 `NoncurrentVersionExpiration` and `AbortIncompleteMultipartUpload` of 7 days.
 
-With the flag off (the default), none of this runs, and startup behavior
-is unchanged from before this gate existed. The flag makes an
+With the flag off (the default), none of this runs. The flag makes an
 unprotected production deployment *visible and refusable*; it does not
 and cannot make Object Lock or lifecycle policy real in-process: that
 capability is still reserved for its own trait-extending ADR per
@@ -1715,12 +1717,12 @@ one reason it exceeds `calls`, and not the only one: a whole-object read and a
 multipart write each issue several HTTP requests per logical call, so `attempts`
 exceeds `calls` for `get`/`put` even when nothing retried. Read `attempts` as
 what the provider bills, and do not read `attempts - calls` as retry overhead;
-isolating retries specifically would need a separate counter this does not add. The connector
-wraps the default reqwest client and delegates unchanged, so `RetryConfig` and
-every retry behavior above stay exactly as documented: this observes the loop,
-it does not alter it. A backend that issues no HTTP (`MemoryStore`) leaves
-`attempts` at zero. `ravel-server` exports it as `ravel_store_attempts_total`
-beside `ravel_store_calls_total`.
+isolating retries specifically would need a separate counter this does not
+add. The connector wraps the default reqwest client and delegates unchanged,
+so `RetryConfig` and every retry behavior above stay exactly as documented:
+this observes the loop, it does not alter it. A backend that issues no HTTP
+(`MemoryStore`) leaves `attempts` at zero. `ravel-server` exports it as
+`ravel_store_attempts_total` beside `ravel_store_calls_total`.
 
 The decorator also counts, store-wide, every unaddressable key and common
 prefix a successful listing skipped: `page.unaddressable` for `list` and
@@ -1964,8 +1966,8 @@ than on the request path:
   Anything other than a clean `NotFound` or, for the identity read, the
   exact probe payload (an access denial, a timeout, different bytes) is
   `Inconclusive`, which is a refusal. Passing an inconclusive candidate
-  would qualify a grant on the strength of an error message. One
-  consequence is worth stating plainly: credentials scoped so tightly that
+  would qualify a grant on the strength of an error message.
+  Credentials scoped so tightly that
   they cannot read `sys/` answer the marker read with an access denial
   rather than a `NotFound`, so a grant offered under least-privilege
   credentials of that shape is refused. That is the intended trade, because
