@@ -56,6 +56,7 @@ pub mod publish;
 pub mod query_audit;
 pub mod reachability;
 pub mod read;
+pub mod read_gate;
 pub mod request_ledger;
 pub mod retention;
 pub mod rewrite;
@@ -142,7 +143,7 @@ pub use scan::{
 pub use scrub::{
     CoveringPostings, SCRUB_MAX_CATCHUP, SCRUB_REQUESTS_PER_ENTRY, SCRUB_REQUESTS_PER_OBJECT,
     ScrubBudget, ScrubCursor, ScrubLevel, ScrubResult, ScrubTarget, TailTally, TickPlan,
-    UnreadableReason, scrub_one_object,
+    UnreadableReason, scrub_one_object, scrub_one_object_on_gate,
 };
 pub use sweep::{
     CatalogSweepOutcome, ErasureRequestSweepOutcome, HeldBucket, IdemSweepOutcome, LeaseCheck,

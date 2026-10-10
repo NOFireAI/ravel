@@ -4948,6 +4948,7 @@ dependencies = [
  "prost",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-cpu-gate",
  "ravel-fleet",
  "ravel-ingest",
  "ravel-logseg",

@@ -266,7 +266,8 @@ rule on thread placement.
     backstop for what remains.
     A later ADR can move them if the busy metrics show they matter.
     (Extended by the inline open-decode amendment below, which lists the
-    read-path codec decodes that also stay on the workers.)
+    read-path codec decodes that also stay on the workers, and by the #2669
+    amendment below, which lists the maintenance ones.)
 
 ```mermaid
 flowchart LR
@@ -490,7 +491,9 @@ change, shown by reverting the change under test.
     `services/ravel-server/src/fold_on_demand.rs`): compaction decode and
     re-encode, fold, scrub and reachability reads. Acceptance test: the
     floor-0 per-site counter test over one compaction of a fixture tenant,
-    with output bytes identical to the inline baseline.
+    with output bytes identical to the inline baseline. Done in issue #2669,
+    except the scheduled catalog fold's own decodes; see the #2669
+    amendment below.
 11. **Documentation and a saturation bench.** Adds the placement rule to
     `docs/architecture.md`, the flags and metrics to the operations guide,
     and a `ravel-bench` scenario. The scenario runs one 256 MiB part decode
@@ -660,11 +663,15 @@ commit's RLOG object with `RlogReader::new` and `scan` in
 `services/ravel-server/src/alerting.rs`, runs inline too; it reads through
 the store directly, not through a fetcher.
 
-## Amendment (2026-10-10): the write path on the write gate (issue #2669)
+## Amendment (2026-10-10): the write path and maintenance on the gates (issue #2669)
 
 <!-- amendment-applies: sections="Decision|Follow-up tasks, in order" pointer="#2669 amendment" -->
 
-Issue #2669 landed follow-up task 9. Six units run on the write gate, each
+Issue #2669 landed follow-up tasks 9 and 10.
+
+### Task 9: the write path on the write gate
+
+Six units run on the write gate, each
 under its own site label, and `ravel-server` attaches its write gate to every
 production instance of each:
 
@@ -712,3 +719,52 @@ INTERNAL or UNAVAILABLE on a stream that stays open.
 
 No write-gate job submits another one. A flush encode, a decompression and a
 Remote Write decode are each a synchronous codec call with no gate in reach.
+
+### Task 10: maintenance on the read gate
+
+`ravel-maintain` takes the read gate through `CompactorConfig::read_gate`,
+`SnapshotReachability::with_read_gate` and `scrub_one_object_on_gate`;
+`ravel-server` installs its read gate on the maintenance supervisor's
+compactor config (every compactor config it derives is a clone of it), on
+the scrub loop, and on both on-demand fold route states. These units run on
+it:
+
+- `compaction`, RSEG: each input's catalog decode, with its range planning
+  and its exemplar decode, as one job sized by the section bytes it decodes;
+  each output series' decode, merge and re-encode, sized by the series' input
+  page bytes; and each output part's encode, sized by the part's stored-size
+  estimate.
+- `compaction`, RLOG: each part's encode, both the stored-target probe's and
+  the closing one, sized by the part's stored-size estimate, and the part's
+  footer read-back with its content hash, sized by the object.
+- `compaction`, RSPAN: each block's decode, sized by its raw bytes, and each
+  part's encode with its footer read-back and content hash, sized by the
+  part's record estimate.
+- `reachability`: the snapshot HEAD's decode, and each snapshot part's hash
+  check and decode, for retention, the sweep and the maintenance scan.
+- `scrub`: the content tier's full-object blake3.
+- `fold`: the on-demand fold route's snapshot part decodes, which classify
+  the outcome by comparing the old and new snapshots' entries.
+
+The erasure rewrite and the format migration share the compaction code, so
+their units run on the gate under `compaction` too.
+
+These maintenance decodes still run on the awaiting task:
+
+- The scheduled and on-demand catalog fold's own decodes and encodes, which
+  `Catalog::fold` performs inside `ravel-catalog` without consulting the
+  catalog's read gate. Gating them is a change to that crate.
+- RLOG compaction's block decode. Its decoded view borrows the input's range
+  reader, and `ravel-logseg` exposes no decode that returns an owned block.
+- RLOG and RSPAN compaction's input directory decodes, and the RSEG footer
+  probes.
+- Scrub's footer reads, its postings decode, and its segment-name fetch.
+- The on-demand fold route's HEAD decodes.
+
+No gated maintenance unit carries a byte charge, before this change or after
+it: `MemoryBudget` is not used in `ravel-maintain`, the merge memory tracker
+counts without refusing, and RLOG's merge cursor budget charges the block
+decode, which stays inline. Each job owns the fetched bytes it reads and
+returns its output, so its input stays resident until it returns, as it did
+inline. A read-gate job here is a synchronous codec call with no gate in
+reach, so none waits on another job.

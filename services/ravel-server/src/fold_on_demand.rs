@@ -111,7 +111,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_cache::{Role, SingleFlight, SingleFlightError};
-use ravel_catalog::{Catalog, CatalogError, FoldReport, PartLimits, decode_head, decode_part};
+use ravel_catalog::{
+    Catalog, CatalogError, FoldReport, PartLimits, SnapshotFormatError, decode_head, decode_part,
+};
+use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_ingest::Clock;
 use ravel_maintain::RetentionConfig;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -263,6 +266,10 @@ pub struct OnDemandFoldState {
     /// rate, so a caller issuing sequential calls cannot drive one full
     /// `Catalog::fold` (a LIST, GETs, and PUTs) per call.
     pub fold_interval: Duration,
+    /// The ADR-1702 read gate the outcome classification's snapshot part
+    /// decodes run on under the `fold` site. `None` decodes them inline. The
+    /// fold itself runs on the catalog, which carries its own gate.
+    pub read_gate: Option<Arc<ReadGate>>,
 }
 
 /// The `/api/v1/admin/fold` router.
@@ -344,7 +351,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
     let (outcome, role) = state
         .in_flight
         .run((tenant_hash, signal), || async {
-            fold_once(
+            fold_once_on_gate(
                 state.catalog.as_ref(),
                 state.store.as_ref(),
                 &tenant_hash,
@@ -353,6 +360,7 @@ async fn run(state: &OnDemandFoldState, req: Request<Body>) -> Result<Response, 
                 now_ns,
                 default_retention_ns,
                 state.fold_interval,
+                state.read_gate.as_deref(),
             )
             .await
             .map(Arc::new)
@@ -471,6 +479,35 @@ pub async fn fold_once(
     default_retention_ns: Option<i64>,
     fold_interval: Duration,
 ) -> Result<OnDemandFold, CatalogError> {
+    fold_once_on_gate(
+        catalog,
+        store,
+        tenant,
+        signal,
+        folder_id,
+        now_ns,
+        default_retention_ns,
+        fold_interval,
+        None,
+    )
+    .await
+}
+
+/// [`fold_once`], decoding the snapshot parts the outcome classification
+/// compares on `read_gate` under the `fold` site (ADR-1702), each part one job
+/// sized by its length that owns the fetched bytes.
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_once_on_gate(
+    catalog: &Catalog,
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    folder_id: Uuid,
+    now_ns: i64,
+    default_retention_ns: Option<i64>,
+    fold_interval: Duration,
+    read_gate: Option<&ReadGate>,
+) -> Result<OnDemandFold, CatalogError> {
     let mut gets = 0u64;
     let before = read_head(store, tenant, signal, &mut gets)
         .await
@@ -536,6 +573,7 @@ pub async fn fold_once(
                 before.as_deref(),
                 after.as_deref(),
                 &mut gets,
+                read_gate,
             )
             .await;
             let outcome = if changed {
@@ -638,6 +676,7 @@ async fn snapshot_content_changed(
     before: Option<&[u8]>,
     after: Option<&[u8]>,
     gets: &mut u64,
+    read_gate: Option<&ReadGate>,
 ) -> bool {
     let after = match after.map(decode_head) {
         Some(Ok(head)) => head,
@@ -692,8 +731,8 @@ async fn snapshot_content_changed(
         return true;
     }
     let (Some(before_entries), Some(after_entries)) = (
-        read_entry_ids(store, tenant, signal, &before_only, gets).await,
-        read_entry_ids(store, tenant, signal, &after_only, gets).await,
+        read_entry_ids(store, tenant, signal, &before_only, gets, read_gate).await,
+        read_entry_ids(store, tenant, signal, &after_only, gets, read_gate).await,
     ) else {
         return true;
     };
@@ -734,8 +773,8 @@ async fn read_entry_ids(
     signal: Signal,
     parts: &[&SnapshotPartRef],
     gets: &mut u64,
+    read_gate: Option<&ReadGate>,
 ) -> Option<BTreeSet<EntryId>> {
-    let limits = PartLimits::default();
     let mut ids = BTreeSet::new();
     for part in parts {
         *gets += 1;
@@ -752,7 +791,16 @@ async fn read_entry_ids(
                 return None;
             }
         };
-        let decoded = match decode_part(&bytes, &limits) {
+        let size = bytes.len() as u64;
+        let decode = move || decode_part(&bytes, &PartLimits::default());
+        let decoded = match read_gate {
+            Some(gate) => gate
+                .run(ReadSite::Fold, JobSize::Bytes(size), decode)
+                .await
+                .unwrap_or_else(|err| Err(SnapshotFormatError::DecodeJob(err))),
+            None => decode(),
+        };
+        let decoded = match decoded {
             Ok(decoded) => decoded,
             Err(err) => {
                 tracing::warn!(
@@ -1236,6 +1284,94 @@ mod tests {
         );
     }
 
+    /// The parts of `head` (raw HEAD bytes) as their blake3 set.
+    fn part_hashes(head: &[u8]) -> BTreeSet<Vec<u8>> {
+        ravel_catalog::decode_head(head)
+            .expect("decode HEAD")
+            .parts
+            .into_iter()
+            .map(|part| part.blake3)
+            .collect()
+    }
+
+    /// ADR-1702 task 10: the outcome classification's snapshot part decodes run
+    /// on the read gate under `fold`, one job per part present on only one side
+    /// of the comparison, and the outcome is the inline one. The cancelling
+    /// fixture above is what makes the classification read parts at all.
+    ///
+    /// Fails with `read_entry_ids` decoding inline whatever gate it is given:
+    /// the count reads `(0, 0)`.
+    #[tokio::test]
+    async fn snapshot_part_comparison_decodes_run_through_the_read_gate() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("fold-on-demand-gated");
+        let tenant_hash = tenant.hash();
+        let base_hour = NOW_NS / NS_PER_HOUR;
+        let retired_hour = (base_hour - 5) as u32;
+        seed_log_commit(store.as_ref(), &tenant, retired_hour, 0).await;
+        seed_log_commit(store.as_ref(), &tenant, (base_hour - 4) as u32, 1).await;
+        let catalog = catalog(store.clone());
+        fold_once(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS,
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .expect("first fold");
+        let head_key = crate::fold::head_key(&tenant_hash, Signal::Logs);
+        let before = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+
+        seed_log_commit(store.as_ref(), &tenant, (base_hour - 2) as u32, 2).await;
+        publish_retention_tombstone(store.as_ref(), &tenant_hash, 0, retired_hour).await;
+        let gate = Arc::new(ReadGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes: 0,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ));
+        let second = fold_once_on_gate(
+            catalog.as_ref(),
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Logs,
+            Uuid::from_u128(1),
+            NOW_NS + 2 * NS_PER_HOUR,
+            None,
+            Duration::ZERO,
+            Some(gate.as_ref()),
+        )
+        .await
+        .expect("second fold");
+        assert_eq!(second.outcome, FoldOutcome::Published);
+
+        let after = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let (before, after) = (part_hashes(&before), part_hashes(&after));
+        let one_sided = before.symmetric_difference(&after).count() as u64;
+        assert!(one_sided >= 2, "both sides hold a part the other lacks");
+        for site in gate.snapshot().sites {
+            let expected = if site.site == ReadSite::Fold {
+                (one_sided, 0)
+            } else {
+                (0, 0)
+            };
+            assert_eq!((site.jobs, site.inline), expected, "{:?}", site.site);
+        }
+    }
+
     /// Concurrent-CAS path: two folds race on the same tenant. A `FaultStore`
     /// hold gate makes the interleaving deterministic (`MemoryStore` never
     /// yields, so without it the first fold would simply run to completion
@@ -1428,6 +1564,7 @@ mod tests {
             // store with no prior HEAD, so the rate gate never trips; a zero
             // interval keeps that explicit and independent of the wall clock.
             fold_interval: Duration::ZERO,
+            read_gate: None,
         }
     }
 

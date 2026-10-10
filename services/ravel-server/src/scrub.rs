@@ -164,9 +164,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ravel_commit::keys;
+use ravel_maintain::read_gate::MaintainReadGate;
 use ravel_maintain::{
     Clock, RetentionConfig, SCRUB_REQUESTS_PER_OBJECT, ScrubLevel, ScrubResult, ScrubTarget,
-    UnreadableReason, WorkerSet, scrub_one_object,
+    UnreadableReason, WorkerSet, scrub_one_object_on_gate,
 };
 use ravel_maintain::{ScrubCursor, TailTally};
 use ravel_object_store::{
@@ -469,6 +470,7 @@ pub fn spawn(
     worker: Arc<WorkerSet>,
     retention: Arc<RetentionConfig>,
     clock: Arc<dyn Clock>,
+    read_gate: MaintainReadGate,
 ) -> Result<ScrubTask, SpawnError> {
     check_spawnable(period)?;
     let restrict = if restrict.is_empty() {
@@ -512,7 +514,7 @@ pub fn spawn(
                     );
                     worker.solo_live_set()
                 });
-            run_cycle(
+            run_cycle_on_gate(
                 store.as_ref(),
                 restrict.as_deref(),
                 shard_count,
@@ -523,6 +525,7 @@ pub fn spawn(
                 &live_set,
                 Some(retention.as_ref()),
                 clock.as_ref(),
+                &read_gate,
             )
             .await;
         }
@@ -551,6 +554,37 @@ pub async fn run_cycle(
     live_set: &[Uuid],
     retention: Option<&RetentionConfig>,
     clock: &dyn Clock,
+) {
+    run_cycle_on_gate(
+        store,
+        restrict,
+        shard_count,
+        period_secs,
+        tick_secs,
+        metrics,
+        worker,
+        live_set,
+        retention,
+        clock,
+        &MaintainReadGate::default(),
+    )
+    .await;
+}
+
+/// [`run_cycle`], hashing each verified object on `read_gate` (ADR-1702).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cycle_on_gate(
+    store: &dyn ObjectStoreBackend,
+    restrict: Option<&[TenantHash]>,
+    shard_count: u32,
+    period_secs: u64,
+    tick_secs: u64,
+    metrics: &ScrubMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    retention: Option<&RetentionConfig>,
+    clock: &dyn Clock,
+    read_gate: &MaintainReadGate,
 ) {
     let outcome = match discover_and_restrict(store, restrict).await {
         Ok(outcome) => outcome,
@@ -633,7 +667,7 @@ pub async fn run_cycle(
                 if !worker.owns_unit(live_set, tenant, signal, shard) {
                     continue;
                 }
-                let held = run_shard_tick(
+                let held = run_shard_tick_on_gate(
                     store,
                     clock,
                     tenant,
@@ -644,6 +678,7 @@ pub async fn run_cycle(
                     retention_secs,
                     covering.as_ref(),
                     metrics,
+                    read_gate,
                 )
                 .await;
                 let index = signal_index(signal);
@@ -748,6 +783,37 @@ async fn scan_shards(
     }
 }
 
+/// [`run_shard_tick_on_gate`] with no read gate.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_shard_tick(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    period_secs: u64,
+    tick_secs: u64,
+    retention_secs: Option<u64>,
+    covering: Option<&ravel_catalog::LoadedCoveringPostings>,
+    metrics: &ScrubMetrics,
+) -> Option<u32> {
+    run_shard_tick_on_gate(
+        store,
+        clock,
+        tenant,
+        signal,
+        shard,
+        period_secs,
+        tick_secs,
+        retention_secs,
+        covering,
+        metrics,
+        &MaintainReadGate::default(),
+    )
+    .await
+}
+
 /// One content-tier tick over one `(tenant, signal, shard)` (ADR-1686): load
 /// the shard's persisted cursor, open a rotation with a LIST-only entry count
 /// when it needs one or count the tail's appends when it does not, plan the
@@ -762,7 +828,7 @@ async fn scan_shards(
 /// when the tick was skipped after loading the cursor; `None` when the cursor
 /// could not be read at all.
 #[allow(clippy::too_many_arguments)]
-async fn run_shard_tick(
+async fn run_shard_tick_on_gate(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     tenant: &TenantHash,
@@ -773,6 +839,7 @@ async fn run_shard_tick(
     retention_secs: Option<u64>,
     covering: Option<&ravel_catalog::LoadedCoveringPostings>,
     metrics: &ScrubMetrics,
+    read_gate: &MaintainReadGate,
 ) -> Option<u32> {
     let prefix = match keys::commit_shard_prefix(tenant, signal, shard) {
         Ok(prefix) => prefix,
@@ -904,6 +971,7 @@ async fn run_shard_tick(
             &outcome.targets,
             covering_postings,
             exhausted,
+            read_gate,
         )
         .await
         {
@@ -1003,6 +1071,7 @@ async fn verify_slice(
     slice: &[SliceEntry],
     covering_postings: Option<ravel_maintain::CoveringPostings<'_>>,
     exhausted: bool,
+    read_gate: &MaintainReadGate,
 ) -> Result<Vec<ScrubResult>, Vec<ScrubResult>> {
     let mut verdicts = Vec::with_capacity(slice.len());
     for entry in slice {
@@ -1019,7 +1088,9 @@ async fn verify_slice(
         } else {
             None
         };
-        let verdict = scrub_one_object(store, clock, &entry.record, postings_for_object).await;
+        let verdict =
+            scrub_one_object_on_gate(store, clock, &entry.record, postings_for_object, read_gate)
+                .await;
         if let ScrubResult::ReadError {
             detail,
             retryable: true,
@@ -1148,7 +1219,7 @@ fn record_verdicts(
 }
 
 /// One object a tick's slice verifies: its key and size, the record
-/// [`scrub_one_object`] checks it against, and the level a mismatch counts
+/// [`scrub_one_object_on_gate`] checks it against, and the level a mismatch counts
 /// under. The level lives here alone, so it has one owner.
 struct SliceEntry {
     target: ScrubTarget,
@@ -2125,6 +2196,7 @@ mod tests {
             Arc::new(solo_worker()),
             Arc::new(RetentionConfig::default()),
             Arc::new(FixedClock(NS_PER_HOUR)),
+            MaintainReadGate::default(),
         )
         .err()
         .expect("a zero scrub period must be refused at spawn");

@@ -1492,7 +1492,7 @@ pub async fn scan_and_maintain_with_memo(
     // (ADR-0020) reads the catalog HEAD at most once and each covering snapshot
     // part at most once across every bucket of this (tenant, signal, shard),
     // never once per bucket (ADR-0076 request cost).
-    let mut reach = SnapshotReachability::new();
+    let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
 
     let mut report = MaintainReport::default();
     for hour in hours {
