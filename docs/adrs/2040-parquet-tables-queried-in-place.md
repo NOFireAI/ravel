@@ -1327,7 +1327,8 @@ still there is named only when no key the encoding changes sits at a page
 boundary, as above (every one, since the counted skip amendment below).
 An operator removes an undeletable key, which no request Ravel sends
 reaches unchanged, by deleting the exact key with the Maintain credential
-through an S3 tool. With nothing listed it says so and deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
+through an S3 tool. With nothing listed it says so and deletes nothing.
+`--delete-version` stays table-scoped. `--table --delete`
 (`repair::delete_flagged`) applies the same store-path check to the keys it
 flags: a flagged key under the table's own `v/` prefix that changes under
 `Path::from`, such as a slot of 20 tildes, or `hits/v//<20 digits>.pqm`,
@@ -1457,10 +1458,12 @@ of its tenant, go on past one.
 **Repair.** `parquet repair --stray` lists every stray key of the tenant,
 unaddressable ones included, and names an unaddressable one
 `StrayClass::Undeletable`: its delete would reach a different key, so the
-command never deletes it, and `--delete` naming it refuses the whole call
-with `RepairError::Undeletable` before any delete. The check after
+command never deletes it. `--stray --delete` skips it, deletes the other
+stray keys, and then exits non-zero naming it, since the check after
 `--delete` names every such key still listed, wherever the page boundaries
-fall. `--table` marks an unaddressable flagged key undeletable and its
+fall. `repair::delete_stray` itself refuses the whole call with
+`RepairError::Undeletable` before any delete when a caller names such a
+key; the command never names one. `--table` marks an unaddressable flagged key undeletable and its
 `--delete` skips it, as the invalid table segment amendment describes. An
 operator removes such a key, as before, by deleting the exact key with the
 Maintain credential through an S3 tool.
