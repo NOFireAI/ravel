@@ -573,6 +573,19 @@ impl QueryService {
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
     ) -> Result<ravel_sql::SqlOutcome, ServiceError> {
+        self.sql_execute_timed(tenant_hash, request)
+            .await
+            .map(|timed| timed.outcome)
+    }
+
+    /// [`Self::sql_execute`], plus the wall time spent awaiting the audit
+    /// submission, which the JSON response reports as `stats.timings.auditMs`.
+    #[cfg(feature = "sql")]
+    pub async fn sql_execute_timed(
+        &self,
+        tenant_hash: TenantHash,
+        request: &ravel_sql::SqlRequest,
+    ) -> Result<SqlExecution, ServiceError> {
         let state = self
             .sql
             .as_ref()
@@ -597,6 +610,7 @@ impl QueryService {
             (outcome.accounting, outcome.estimate)
         });
 
+        let audit_started = std::time::Instant::now();
         self.controls
             .audit(
                 tenant_hash,
@@ -607,6 +621,7 @@ impl QueryService {
                 status,
             )
             .await?;
+        let audit_elapsed = audit_started.elapsed();
         let outcome = result?;
 
         // The SQL surface has no federated fan-out and therefore no partial
@@ -615,7 +630,10 @@ impl QueryService {
         record_span_cost(&span, &outcome.accounting);
         self.controls
             .record_cost(tenant_hash, &outcome.accounting, &outcome.estimate);
-        Ok(outcome)
+        Ok(SqlExecution {
+            outcome,
+            audit_elapsed,
+        })
     }
 
     /// The plan and cost of a statement, without running it. The MCP adapter
@@ -666,6 +684,14 @@ impl QueryService {
             .record_cost(tenant_hash, &live.snapshot(), &core::zero_estimate());
         Ok(report)
     }
+}
+
+/// What [`QueryService::sql_execute_timed`] returns: the executor's outcome
+/// and the wall time of the audit wait that preceded releasing it.
+#[cfg(feature = "sql")]
+pub struct SqlExecution {
+    pub outcome: ravel_sql::SqlOutcome,
+    pub audit_elapsed: std::time::Duration,
 }
 
 /// `ravel-sql`'s live accounting view, as the service layer's [`LiveUsage`].
