@@ -8,10 +8,15 @@
 //! ```
 //!
 //! It starts an in-process query server through
-//! `ravel_server::start_with_heartbeat`, as `ravel-server`'s `main` does, with
-//! the health listener bound on a loopback port. The fixture is one metrics
+//! `ravel_server::start_with_heartbeat`, in the call order `ravel-server`'s
+//! `main` uses and under the same jemalloc global allocator and background
+//! thread setting, with the health listener bound on a loopback port. The fixture is one metrics
 //! segment whose catalog decode is one decode unit: 256 MiB divided by the
-//! scale divisor (see `--scale-divisor`). The bin issues one PromQL instant
+//! scale divisor (see `--scale-divisor`). The default divisor rests on an
+//! assumed 4 bytes of process memory per byte of decode unit, an assumption
+//! rather than a measurement. A run at a divisor above 1 names the divisor and
+//! the scaled unit on its RESULT line, since `decode_unit_size` checks against
+//! the scaled target, not the published 256 MiB. The bin issues one PromQL instant
 //! query per core at once; each query decodes the whole catalog of that
 //! segment through the server's query path, the decode ADR-1702 task 7 places
 //! on the read gate at site `segment_sparse_catalog`. The `decode_jobs` band
@@ -25,8 +30,10 @@
 //! The bands, fixed before the first run:
 //!
 //! - `probes_issued`: exactly `floor(window_ms / 100)` probes in the decode
-//!   window. A probe that overruns its 100 ms slot delays the rest, so a
-//!   slow listener reads as a short count.
+//!   window. Probes are counted by due slot (slot `k` is due `k * 100` ms
+//!   after the window starts), the same definition the expected count uses.
+//!   A probe that overruns its slot skips the slots that came due while it
+//!   ran, so a slow listener reads as a short count.
 //! - `probes_answered`: every one of those probes answered 200.
 //! - `probe_latency_max`: the slowest probe took under 250 ms.
 //! - `inline_jobs`: `ravel_cpu_gate_inline_total` moved by exactly 0 over the
@@ -49,9 +56,14 @@
 //! not measure at all.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+// The allocator the shipped ravel-server binary installs, so the measured
+// server allocates as it does.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -68,8 +80,8 @@ use uuid::Uuid;
 
 /// Bytes of process memory one decode is assumed to hold per byte of decode
 /// unit: the fetched object, the charged decode, and the decoded entries'
-/// structs and strings. Only sizes the scale divisor; the run prints the
-/// divisor it used.
+/// structs and strings. An assumption, not a measurement. Only sizes the
+/// scale divisor; the run prints the divisor it used on its RESULT line.
 const MEMORY_PER_UNIT_BYTE: u64 = 4;
 /// The one series the queries select: enough samples that its evaluation is
 /// above the read gate's 100,000-sample evaluation floor.
@@ -79,8 +91,8 @@ const TARGET_SAMPLES: usize = 120_000;
 #[command(about = "ADR-1702 task 11 scenario 1: health probes during one catalog decode per core")]
 struct Args {
     /// Divide the 256 MiB decode unit by this. Default: the smallest power of
-    /// two at which one decode per core fits in half of MemAvailable, at 4
-    /// bytes of memory per unit byte.
+    /// two at which one decode per core fits in half of MemAvailable, at an
+    /// assumed (not measured) 4 bytes of memory per unit byte.
     #[arg(long)]
     scale_divisor: Option<u64>,
     /// Concurrent decodes. Default: one per core.
@@ -164,6 +176,7 @@ fn build_fixture(
 
 fn run_scenario() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
+    run::configure_allocator();
     let host = HostStamp::detect();
     println!("{}", host.line());
     let decodes = args.decodes.unwrap_or(host.cores).max(1);
@@ -214,7 +227,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let health = server.health_addr();
     let client = reqwest::Client::builder().build()?;
 
-    let before = client_rt.block_on(run::scrape(&client, http))?;
+    let before = client_rt.block_on(run::scrape(&client, http, run::PROBE_TIMEOUT))?;
     if let Err(err) = run::require_families(&before) {
         println!("RESULT: FAIL {err}");
         return Ok(ExitCode::from(2));
@@ -224,7 +237,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let time_s = (hour + 1) * 3_600;
     let url = format!("http://{http}/api/v1/query?query={query}&time={time_s}");
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = run::WindowStop::new();
     let start = Instant::now();
     let prober = run::spawn_prober(
         format!("http://{health}/healthz"),
@@ -260,46 +273,43 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         failures
     });
     let window = start.elapsed();
-    stop.store(true, Ordering::Release);
+    stop.close(window);
     let probes = run::join_prober(prober)?;
-    let after = client_rt.block_on(run::scrape(&client, http))?;
+    let after = client_rt.block_on(run::scrape(&client, http, run::PROBE_TIMEOUT))?;
     for failure in failures.iter().take(3) {
         println!("query failure: {failure}");
     }
 
-    let in_window: Vec<_> = probes.iter().filter(|p| p.issued_at <= window).collect();
-    let inline = |body: &str| saturation::family_sum(body, "ravel_cpu_gate_inline_total", &[]);
-    let decode_jobs = |body: &str| {
-        saturation::family_sum(
-            body,
-            "ravel_cpu_gate_jobs_total",
-            &["gate=\"read\"", "site=\"segment_sparse_catalog\""],
-        )
+    let deltas = saturation::family_delta(&before, &after, "ravel_cpu_gate_inline_total", &[])
+        .and_then(|inline| {
+            saturation::family_delta(
+                &before,
+                &after,
+                "ravel_cpu_gate_jobs_total",
+                &["gate=\"read\"", "site=\"segment_sparse_catalog\""],
+            )
+            .map(|jobs| (inline, jobs))
+        });
+    let (inline_jobs, decode_jobs) = match deltas {
+        Ok(deltas) => deltas,
+        Err(err) => {
+            println!("RESULT: FAIL {err}");
+            server_rt.block_on(server.shutdown())?;
+            return Ok(ExitCode::from(2));
+        }
     };
     let mut figs = FigureSet::new();
-    figs.record(fig::WINDOW_MS, window.as_millis() as f64);
-    figs.record(fig::PROBES_ISSUED, in_window.len() as f64);
-    figs.record(
-        fig::PROBES_ANSWERED_200,
-        in_window.iter().filter(|p| p.status == Some(200)).count() as f64,
-    );
-    figs.record_series(
-        fig::PROBE_LATENCY_MS,
-        in_window
-            .iter()
-            .map(|p| p.latency.as_secs_f64() * 1000.0)
-            .collect(),
-    );
-    figs.record(fig::INLINE_JOBS, inline(&after) - inline(&before));
+    saturation::record_decode_probes(&mut figs, window, &probes);
+    figs.record(fig::INLINE_JOBS, inline_jobs);
     figs.record(fig::DECODES_ISSUED, decodes as f64);
-    figs.record(fig::DECODE_JOBS, decode_jobs(&after) - decode_jobs(&before));
+    figs.record(fig::DECODE_JOBS, decode_jobs);
     figs.record(fig::DECODE_UNIT_BYTES, decode_bytes as f64);
     figs.record(fig::DECODE_UNIT_TARGET_BYTES, target as f64);
     figs.record(fig::QUERIES_FAILED, failures.len() as f64);
     println!(
-        "window: {} ms, probes after the window (not counted): {}",
-        window.as_millis(),
-        probes.len() - in_window.len()
+        "window: {:.3} ms, probes due after the window (not counted): {}",
+        saturation::window_ms(window),
+        probes.len() - saturation::probes_in_window(&probes, window).len()
     );
 
     let outcomes = saturation::evaluate_decode_liveness(&figs);
@@ -307,13 +317,14 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         println!("{}", outcome.line());
     }
     server_rt.block_on(server.shutdown())?;
+    let scaled = saturation::scale_note(divisor).map_or(String::new(), |n| format!(" ({n})"));
     match saturation::first_miss(&outcomes) {
         None => {
-            println!("RESULT: PASS");
+            println!("RESULT: PASS{scaled}");
             Ok(ExitCode::SUCCESS)
         }
         Some(miss) => {
-            println!("RESULT: FAIL first band missed: {}", miss.band);
+            println!("RESULT: FAIL first band missed: {}{scaled}", miss.band);
             Ok(ExitCode::from(1))
         }
     }

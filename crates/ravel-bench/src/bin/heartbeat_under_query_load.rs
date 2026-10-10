@@ -8,19 +8,22 @@
 //! ```
 //!
 //! It starts an in-process query server through
-//! `ravel_server::start_with_heartbeat`, as `ravel-server`'s `main` does, with
-//! the health listener bound on a loopback port. One load task per core (or
+//! `ravel_server::start_with_heartbeat`, in the call order `ravel-server`'s
+//! `main` uses and under the same jemalloc global allocator and background
+//! thread setting, with the health listener bound on a loopback port. One load task per core (or
 //! `--queries`) runs queries back to back for at least `--seconds` (default
 //! 60): even tasks a PromQL range query, odd tasks a SQL aggregate over
 //! `samples` on `POST /api/v1/sql`. Each task queries its own fixture tenant
 //! (`--segments` segments of `--series-per-segment` series, one sample a
 //! second for an hour), so the per-tenant SQL memory ceiling applies to one
 //! query at a time. Meanwhile a task on the client runtime scrapes
-//! `ravel_health_heartbeat_age_seconds` from `/metrics` every 250 ms and a
+//! `ravel_health_heartbeat_age_seconds` from `/metrics` every 250 ms, with a
+//! 15 s deadline per scrape and each scrape's latency recorded beside the age
+//! it returned, and a
 //! dedicated thread sends `GET /readyz` to the health listener every 100 ms.
 //!
-//! No SQL scan holds a read gate on this tree (ADR-1702 task 8 has not
-//! landed), so SQL decode runs on the server's runtime workers.
+//! The SQL queries read `samples`, whose scan holds no read gate, so their
+//! decode runs on the server's runtime workers.
 //!
 //! Before any load it scrapes `/metrics` once and exits 2 when one of
 //! `ravel_health_heartbeat_age_seconds`, `ravel_cpu_gate_jobs_total` or
@@ -30,7 +33,9 @@
 //!
 //! - `heartbeat_age_adr_bound`: the largest scraped heartbeat age is under
 //!   10 s, ADR-1702 decision 9's bound (a third of the 30 s readiness
-//!   threshold). At or above 10 s is a hard miss.
+//!   threshold). At or above 10 s is a hard miss. `/metrics` is served by
+//!   the runtime being measured, so a scrape that returned no age counts its
+//!   own latency as an age here.
 //! - `heartbeat_age_expected`: the same maximum is under 2 s, the expected
 //!   band. Between 2 s and 10 s the run is outside the expected band and
 //!   inside the ADR's, and is reported as such.
@@ -47,13 +52,18 @@
 //! not measure at all.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+// The allocator the shipped ravel-server binary installs, so the measured
+// server allocates as it does.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use ravel_bench::saturation::{self, FigureSet, HostStamp, PROBE_INTERVAL_MS, fig};
+use ravel_bench::saturation::{self, FigureSet, HostStamp, PROBE_INTERVAL_MS, Scrape, fig};
 use ravel_bench::saturation_run::{self as run, NS_PER_HOUR, encode_param, labels, series};
 use ravel_object_store::memory::MemoryStore;
 use ravel_types::Sample;
@@ -97,6 +107,7 @@ struct LoadTally {
 
 fn run_scenario() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
+    run::configure_allocator();
     let host = HostStamp::detect();
     println!("{}", host.line());
     let workers = args.queries.unwrap_or(host.cores).max(1);
@@ -160,7 +171,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let health = server.health_addr();
     let client = reqwest::Client::builder().build()?;
 
-    let first = client_rt.block_on(run::scrape(&client, http))?;
+    let first = client_rt.block_on(run::scrape(&client, http, run::PROBE_TIMEOUT))?;
     if let Err(err) = run::require_families(&first) {
         println!("RESULT: FAIL {err}");
         return Ok(ExitCode::from(2));
@@ -180,7 +191,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     });
     let sql_url = format!("http://{http}/api/v1/sql");
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = run::WindowStop::new();
     let start = Instant::now();
     let prober = run::spawn_prober(
         format!("http://{health}/readyz"),
@@ -193,24 +204,24 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         let stop = Arc::clone(&stop);
         let client = client.clone();
         client_rt.spawn(async move {
-            let mut ages = Vec::new();
-            let mut failed = 0u64;
+            let mut scrapes = Vec::new();
             let mut tick = tokio::time::interval(SCRAPE_PERIOD);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            while !stop.load(Ordering::Acquire) {
+            while !stop.is_closed() {
                 tick.tick().await;
-                match run::scrape(&client, http).await {
-                    Ok(body) => {
-                        match saturation::single_value(&body, "ravel_health_heartbeat_age_seconds")
-                        {
-                            Some(age) => ages.push(age),
-                            None => failed += 1,
-                        }
-                    }
-                    Err(_) => failed += 1,
-                }
+                let sent = Instant::now();
+                let age_s = run::scrape(&client, http, run::HEARTBEAT_SCRAPE_TIMEOUT)
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        saturation::single_value(&body, "ravel_health_heartbeat_age_seconds")
+                    });
+                scrapes.push(Scrape {
+                    latency: sent.elapsed(),
+                    age_s,
+                });
             }
-            (ages, failed)
+            scrapes
         })
     };
 
@@ -262,32 +273,27 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         total
     });
     let window = start.elapsed();
-    stop.store(true, Ordering::Release);
+    stop.close(window);
     let probes = run::join_prober(prober)?;
-    let (ages, scrapes_failed) = client_rt.block_on(scraper)?;
+    let scrapes = client_rt.block_on(scraper)?;
     for failure in tally.failures.iter().take(3) {
         println!("query failure: {failure}");
     }
 
-    let in_window: Vec<_> = probes.iter().filter(|p| p.issued_at <= window).collect();
     println!(
-        "window: {} ms, heartbeat scrapes: {}, readyz probes: {}",
-        window.as_millis(),
-        ages.len(),
-        in_window.len()
+        "window: {:.3} ms, heartbeat scrapes: {}, readyz probes due in the window: {}",
+        saturation::window_ms(window),
+        scrapes.len(),
+        saturation::probes_in_window(&probes, window).len()
     );
+    println!("{}", saturation::scrape_summary(&scrapes));
     let mut figs = FigureSet::new();
-    figs.record(fig::WINDOW_MS, window.as_millis() as f64);
+    figs.record(fig::WINDOW_MS, saturation::window_ms(window));
     figs.record(fig::PROMQL_QUERIES_OK, tally.promql_ok as f64);
     figs.record(fig::SQL_QUERIES_OK, tally.sql_ok as f64);
     figs.record(fig::QUERIES_FAILED, tally.failures.len() as f64);
-    figs.record(fig::HEARTBEAT_SCRAPES_FAILED, scrapes_failed as f64);
-    figs.record_series(fig::HEARTBEAT_AGE_S, ages);
-    figs.record(fig::READYZ_PROBES_ISSUED, in_window.len() as f64);
-    figs.record(
-        fig::READYZ_ANSWERED_200,
-        in_window.iter().filter(|p| p.status == Some(200)).count() as f64,
-    );
+    saturation::record_heartbeat_scrapes(&mut figs, &scrapes);
+    saturation::record_readyz_probes(&mut figs, window, &probes);
 
     let outcomes = saturation::evaluate_heartbeat_under_load(&figs);
     for outcome in &outcomes {

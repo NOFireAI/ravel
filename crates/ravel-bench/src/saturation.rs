@@ -14,6 +14,7 @@
 //! `/metrics` with, and the host stamp each run prints.
 
 use std::fmt;
+use std::time::Duration;
 
 /// Scenario 1: the health listener is probed on this period.
 pub const PROBE_INTERVAL_MS: u64 = 100;
@@ -54,6 +55,8 @@ pub mod fig {
     pub const SQL_QUERIES_OK: &str = "sql_queries_ok";
     pub const HEARTBEAT_AGE_S: &str = "heartbeat_age_s";
     pub const HEARTBEAT_SCRAPES_FAILED: &str = "heartbeat_scrapes_failed";
+    pub const HEARTBEAT_SCRAPE_LATENCY_S: &str = "heartbeat_scrape_latency_s";
+    pub const HEARTBEAT_UNANSWERED_LATENCY_S: &str = "heartbeat_unanswered_latency_s";
     pub const READYZ_PROBES_ISSUED: &str = "readyz_probes_issued";
     pub const READYZ_ANSWERED_200: &str = "readyz_answered_200";
 }
@@ -126,19 +129,24 @@ impl FigureSet {
         }
     }
 
-    /// The largest sample of a series. Max, not mean: one slow probe among
-    /// many fast ones is exactly what the latency band exists to catch.
-    pub fn series_max(&self, name: &'static str) -> Result<f64, FigureError> {
+    /// The samples of a series, which may be empty.
+    pub fn series_values(&self, name: &'static str) -> Result<&[f64], FigureError> {
         let mut found = self.series.iter().filter(|(n, _)| *n == name);
         match (found.next(), found.next()) {
             (None, _) => Err(FigureError::Absent(name)),
             (Some(_), Some(_)) => Err(FigureError::Duplicated(name)),
-            (Some((_, values)), None) => values
-                .iter()
-                .copied()
-                .reduce(f64::max)
-                .ok_or(FigureError::Absent(name)),
+            (Some((_, values)), None) => Ok(values),
         }
+    }
+
+    /// The largest sample of a series. Max, not mean: one slow probe among
+    /// many fast ones is exactly what the latency band exists to catch.
+    pub fn series_max(&self, name: &'static str) -> Result<f64, FigureError> {
+        self.series_values(name)?
+            .iter()
+            .copied()
+            .reduce(f64::max)
+            .ok_or(FigureError::Absent(name))
     }
 }
 
@@ -344,14 +352,17 @@ pub fn evaluate_decode_liveness(figs: &FigureSet) -> Vec<BandOutcome> {
 ///   sample was lost.
 /// - `heartbeat_age_adr_bound`: the largest scraped
 ///   `ravel_health_heartbeat_age_seconds` is under 10 s. At or above is a
-///   hard miss of ADR-1702 decision 9's bound.
+///   hard miss of ADR-1702 decision 9's bound. A scrape that returned no age
+///   counts its own latency as an age: `/metrics` is served by the runtime
+///   being measured, so an unanswered scrape is a stall of at least that
+///   long that no age sample saw.
 /// - `heartbeat_age_expected`: the same maximum is under 2 s. Between 2 s and
 ///   10 s it is outside the expected band and inside the ADR's.
 /// - `readyz_probes`: at least one `/readyz` probe was issued.
 /// - `readyz_all_200`: every `/readyz` probe on the health listener answered
 ///   200.
 pub fn evaluate_heartbeat_under_load(figs: &FigureSet) -> Vec<BandOutcome> {
-    let heartbeat = figs.series_max(fig::HEARTBEAT_AGE_S);
+    let heartbeat = heartbeat_age_max(figs);
     let readyz_issued = figs.scalar(fig::READYZ_PROBES_ISSUED);
     let readyz_all = match both(figs.scalar(fig::READYZ_ANSWERED_200), readyz_issued) {
         Ok((answered, issued)) => BandOutcome::new(
@@ -428,6 +439,164 @@ pub fn evaluate_heartbeat_under_load(figs: &FigureSet) -> Vec<BandOutcome> {
         ),
         readyz_all,
     ]
+}
+
+/// The figure both heartbeat bands read: the largest scraped age, or the
+/// latency of a scrape that returned no age when that is larger.
+fn heartbeat_age_max(figs: &FigureSet) -> Result<f64, FigureError> {
+    let age = figs.series_max(fig::HEARTBEAT_AGE_S)?;
+    let unanswered = figs.series_values(fig::HEARTBEAT_UNANSWERED_LATENCY_S)?;
+    Ok(unanswered.iter().copied().fold(age, f64::max))
+}
+
+/// One probe the prober issued.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probe {
+    /// The slot it was issued for: slot `k` is due `k` probe intervals after
+    /// the window start, counting from 1.
+    pub slot: u64,
+    /// When it was issued, from the window start.
+    pub issued_at: Duration,
+    pub latency: Duration,
+    pub status: Option<u16>,
+}
+
+/// The number of probe slots due within `window`: slots `1..=slots_due` are
+/// due at or before its end. Equal to `floor(window_ms / 100)`, the count the
+/// `probes_issued` band expects.
+pub fn slots_due(window: Duration) -> u64 {
+    let period = u128::from(PROBE_INTERVAL_MS) * 1_000_000;
+    u64::try_from(window.as_nanos() / period).unwrap_or(u64::MAX)
+}
+
+/// The probes whose slot was due within `window`, whenever the prober
+/// actually woke to send them.
+pub fn probes_in_window(probes: &[Probe], window: Duration) -> Vec<&Probe> {
+    let due = slots_due(window);
+    probes.iter().filter(|p| p.slot <= due).collect()
+}
+
+/// The window in milliseconds, unrounded.
+pub fn window_ms(window: Duration) -> f64 {
+    window.as_nanos() as f64 / 1e6
+}
+
+/// Records scenario 1's window and probe figures from the probes the prober
+/// returned.
+pub fn record_decode_probes(figs: &mut FigureSet, window: Duration, probes: &[Probe]) {
+    let in_window = probes_in_window(probes, window);
+    figs.record(fig::WINDOW_MS, window_ms(window));
+    figs.record(fig::PROBES_ISSUED, in_window.len() as f64);
+    figs.record(
+        fig::PROBES_ANSWERED_200,
+        in_window.iter().filter(|p| p.status == Some(200)).count() as f64,
+    );
+    figs.record_series(
+        fig::PROBE_LATENCY_MS,
+        in_window
+            .iter()
+            .map(|p| p.latency.as_secs_f64() * 1000.0)
+            .collect(),
+    );
+}
+
+/// Records scenario 2's `/readyz` probe figures.
+pub fn record_readyz_probes(figs: &mut FigureSet, window: Duration, probes: &[Probe]) {
+    let in_window = probes_in_window(probes, window);
+    figs.record(fig::READYZ_PROBES_ISSUED, in_window.len() as f64);
+    figs.record(
+        fig::READYZ_ANSWERED_200,
+        in_window.iter().filter(|p| p.status == Some(200)).count() as f64,
+    );
+}
+
+/// One heartbeat scrape: how long `/metrics` took to answer (or to fail),
+/// and the age it returned, if any.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scrape {
+    pub latency: Duration,
+    pub age_s: Option<f64>,
+}
+
+/// Records scenario 2's heartbeat figures: the ages returned, every scrape's
+/// latency, the failed count, and the latency of each scrape that returned no
+/// age, which the heartbeat bands read as an age.
+pub fn record_heartbeat_scrapes(figs: &mut FigureSet, scrapes: &[Scrape]) {
+    figs.record_series(
+        fig::HEARTBEAT_AGE_S,
+        scrapes.iter().filter_map(|s| s.age_s).collect(),
+    );
+    figs.record_series(
+        fig::HEARTBEAT_SCRAPE_LATENCY_S,
+        scrapes.iter().map(|s| s.latency.as_secs_f64()).collect(),
+    );
+    let unanswered: Vec<f64> = scrapes
+        .iter()
+        .filter(|s| s.age_s.is_none())
+        .map(|s| s.latency.as_secs_f64())
+        .collect();
+    figs.record(fig::HEARTBEAT_SCRAPES_FAILED, unanswered.len() as f64);
+    figs.record_series(fig::HEARTBEAT_UNANSWERED_LATENCY_S, unanswered);
+}
+
+/// The scrape figures a reader needs to tell a stalled heartbeat from a slow
+/// scrape: the slowest scrape, and the latency of the scrape that returned
+/// the largest age.
+pub fn scrape_summary(scrapes: &[Scrape]) -> String {
+    let slowest = scrapes
+        .iter()
+        .map(|s| s.latency.as_secs_f64())
+        .reduce(f64::max);
+    let at_max_age = scrapes
+        .iter()
+        .filter_map(|s| s.age_s.map(|a| (a, s.latency.as_secs_f64())))
+        .reduce(|a, b| if b.0 > a.0 { b } else { a });
+    let slowest = slowest.map_or("none".to_string(), |s| format!("{s:.3} s"));
+    let at_max_age = at_max_age.map_or("none".to_string(), |(age, latency)| {
+        format!("age {age:.3} s returned by a scrape of {latency:.3} s")
+    });
+    format!("heartbeat scrapes: slowest {slowest}, largest {at_max_age}")
+}
+
+/// The change in the sum of `family` (filtered as [`family_sum`] filters)
+/// between two scrapes. Fails naming the family when either scrape has no
+/// sample of exactly that name, so a family that vanished reads as a failure
+/// rather than as 0.
+pub fn family_delta(
+    before: &str,
+    after: &str,
+    family: &'static str,
+    label_filter: &[&str],
+) -> Result<f64, String> {
+    for (body, when) in [(before, "before"), (after, "after")] {
+        if !missing_families(body, &[family]).is_empty() {
+            return Err(format!(
+                "metric family {family} missing from /metrics {when} the window"
+            ));
+        }
+    }
+    Ok(family_sum(after, family, label_filter) - family_sum(before, family, label_filter))
+}
+
+/// The note a scaled-down decode run carries on its RESULT line, so a result
+/// at a reduced decode unit cannot be read as the published scenario's.
+/// `None` at divisor 1.
+pub fn scale_note(divisor: u64) -> Option<String> {
+    if divisor <= 1 {
+        return None;
+    }
+    let mib = |bytes: u64| {
+        if bytes.is_multiple_of(1024 * 1024) {
+            format!("{} MiB", bytes / (1024 * 1024))
+        } else {
+            format!("{bytes} bytes")
+        }
+    };
+    Some(format!(
+        "scaled: decode unit {}, divisor {divisor}; the published scenario is {}",
+        mib(DECODE_UNIT_BYTES / divisor),
+        mib(DECODE_UNIT_BYTES)
+    ))
 }
 
 /// One sample line of a Prometheus text exposition: the metric name, the raw
@@ -593,6 +762,7 @@ mod tests {
         f.record(fig::QUERIES_FAILED, 0.0);
         f.record(fig::HEARTBEAT_SCRAPES_FAILED, 0.0);
         f.record_series(fig::HEARTBEAT_AGE_S, vec![0.1, 1.999, 0.5]);
+        f.record_series(fig::HEARTBEAT_UNANSWERED_LATENCY_S, Vec::new());
         f.record(fig::READYZ_PROBES_ISSUED, 600.0);
         f.record(fig::READYZ_ANSWERED_200, 600.0);
         f
@@ -768,6 +938,7 @@ mod tests {
             fig::QUERIES_FAILED,
             fig::HEARTBEAT_SCRAPES_FAILED,
             fig::HEARTBEAT_AGE_S,
+            fig::HEARTBEAT_UNANSWERED_LATENCY_S,
             fig::READYZ_PROBES_ISSUED,
             fig::READYZ_ANSWERED_200,
         ] {
@@ -873,5 +1044,159 @@ ravel_health_heartbeat_age_seconds{mode=\"query\"} 0.25
         // Half of 31 GiB does not hold 16 GiB; 8 GiB does.
         assert_eq!(decode_scale_divisor(16, 4, 31 * gib), 2);
         assert_eq!(decode_scale_divisor(16, 4, 8 * gib), 4);
+    }
+
+    /// Probe `slot`, issued `late_us` microseconds after its due time.
+    fn probe(slot: u64, late_us: u64, status: Option<u16>) -> Probe {
+        Probe {
+            slot,
+            issued_at: Duration::from_millis(slot * PROBE_INTERVAL_MS)
+                + Duration::from_micros(late_us),
+            latency: Duration::from_millis(2),
+            status,
+        }
+    }
+
+    /// Scenario 1 figures with the window and probe figures taken from
+    /// `probes` the way the bin takes them.
+    fn decode_with_probes(window: Duration, probes: &[Probe]) -> FigureSet {
+        let mut f = decode_inside();
+        for name in [
+            fig::WINDOW_MS,
+            fig::PROBES_ISSUED,
+            fig::PROBES_ANSWERED_200,
+            fig::PROBE_LATENCY_MS,
+        ] {
+            f = without(&f, name);
+        }
+        record_decode_probes(&mut f, window, probes);
+        f
+    }
+
+    /// A 1200.4 ms window has 12 slots due. Probe 12 woke 0.6 ms late, after
+    /// the window ended, and is still slot 12's probe.
+    #[test]
+    fn probe_due_in_the_window_counts_however_late_it_woke() {
+        let window = Duration::from_micros(1_200_400);
+        let probes: Vec<Probe> = (1..=12)
+            .map(|k| probe(k, if k == 12 { 600 } else { 50 }, Some(200)))
+            .collect();
+        assert_eq!(slots_due(window), 12);
+        let f = decode_with_probes(window, &probes);
+        let outcomes = evaluate_decode_liveness(&f);
+        let issued = outcomes
+            .iter()
+            .find(|o| o.band == band::PROBES_ISSUED)
+            .expect("probes_issued band");
+        assert_eq!(issued.value, Ok(12.0));
+        assert!(issued.inside, "{}", issued.line());
+        assert_eq!(first_miss(&outcomes), None);
+    }
+
+    #[test]
+    fn probe_missing_from_slot_7_misses_probes_issued() {
+        let window = Duration::from_micros(1_200_400);
+        let probes: Vec<Probe> = (1..=12)
+            .filter(|k| *k != 7)
+            .map(|k| probe(k, 50, Some(200)))
+            .collect();
+        let f = decode_with_probes(window, &probes);
+        let outcomes = evaluate_decode_liveness(&f);
+        let miss = first_miss(&outcomes).expect("a miss");
+        assert_eq!(miss.band, band::PROBES_ISSUED);
+        assert_eq!(miss.value, Ok(11.0));
+    }
+
+    /// A probe for slot 13, due after the 1200.4 ms window, is not counted
+    /// even if it was issued.
+    #[test]
+    fn probe_due_after_the_window_is_not_counted() {
+        let window = Duration::from_micros(1_200_400);
+        let probes: Vec<Probe> = (1..=13).map(|k| probe(k, 50, Some(200))).collect();
+        assert_eq!(probes_in_window(&probes, window).len(), 12);
+        assert_eq!(decode_miss(&decode_with_probes(window, &probes)), None);
+    }
+
+    /// A scrape that timed out after 15 s returned no age. The ages that did
+    /// come back are all small, and the ADR bound still reads as a hard miss.
+    #[test]
+    fn scrape_timed_out_above_10_s_is_a_hard_miss_of_the_adr_bound() {
+        let mut f = without(&heartbeat_inside(), fig::HEARTBEAT_AGE_S);
+        f = without(&f, fig::HEARTBEAT_UNANSWERED_LATENCY_S);
+        f = without(&f, fig::HEARTBEAT_SCRAPES_FAILED);
+        let scrapes = [
+            Scrape {
+                latency: Duration::from_millis(3),
+                age_s: Some(0.1),
+            },
+            Scrape {
+                latency: Duration::from_secs(15),
+                age_s: None,
+            },
+            Scrape {
+                latency: Duration::from_millis(4),
+                age_s: Some(0.2),
+            },
+        ];
+        record_heartbeat_scrapes(&mut f, &scrapes);
+        let outcomes = evaluate_heartbeat_under_load(&f);
+        let named = |band| {
+            outcomes
+                .iter()
+                .find(|o| o.band == band)
+                .expect("band present")
+        };
+        assert!(!named(band::HEARTBEAT_SCRAPES).inside);
+        let adr = named(band::HEARTBEAT_ADR_BOUND);
+        assert!(!adr.inside, "{}", adr.line());
+        assert!(adr.hard);
+        assert_eq!(adr.value, Ok(15.0));
+        assert!(!named(band::HEARTBEAT_EXPECTED).inside);
+    }
+
+    #[test]
+    fn scrape_summary_names_the_latency_beside_the_largest_age() {
+        let scrapes = [
+            Scrape {
+                latency: Duration::from_millis(12_500),
+                age_s: Some(12.0),
+            },
+            Scrape {
+                latency: Duration::from_millis(3),
+                age_s: Some(0.5),
+            },
+        ];
+        assert_eq!(
+            scrape_summary(&scrapes),
+            "heartbeat scrapes: slowest 12.500 s, largest age 12.000 s returned by a scrape of 12.500 s"
+        );
+    }
+
+    #[test]
+    fn after_window_scrape_missing_inline_family_fails_by_name() {
+        let after: String = EXPOSITION
+            .lines()
+            .filter(|l| !l.starts_with("ravel_cpu_gate_inline_total{"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let err = family_delta(EXPOSITION, &after, "ravel_cpu_gate_inline_total", &[])
+            .expect_err("an absent family is a failure, not 0");
+        assert_eq!(
+            err,
+            "metric family ravel_cpu_gate_inline_total missing from /metrics after the window"
+        );
+        assert_eq!(
+            family_delta(EXPOSITION, EXPOSITION, "ravel_cpu_gate_inline_total", &[]),
+            Ok(0.0)
+        );
+    }
+
+    #[test]
+    fn scale_note_names_the_divisor_and_the_published_size() {
+        assert_eq!(scale_note(1), None);
+        assert_eq!(
+            scale_note(2).as_deref(),
+            Some("scaled: decode unit 128 MiB, divisor 2; the published scenario is 256 MiB")
+        );
     }
 }
