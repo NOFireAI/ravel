@@ -584,7 +584,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::manifest::encode_manifest;
-    use crate::test_util::{CountingStore, S3KeyStore, TENANT_A, TENANT_B, live_manifest};
+    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, live_manifest};
 
     #[test]
     fn only_a_manifest_above_the_ceiling_is_newer() {
@@ -909,13 +909,11 @@ pub(crate) mod tests {
         for (i, rest) in STRAY_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x60 + i as u8; 16]);
             let (logs, _guard) = capture_logs();
-            let store = S3KeyStore {
-                inner: MemoryStore::with_page_size(2),
-            };
+            let store = MemoryStore::with_page_size(2);
             for v in [1, 2] {
-                put_version(&store.inner, &tenant, v).await;
+                put_version(&store, &tenant, v).await;
             }
-            let stray = put_stray(&store.inner, &tenant, rest).await;
+            let stray = put_stray(&store, &tenant, rest).await;
             for _ in 0..2 {
                 assert_eq!(
                     tables(&store, &tenant).await.expect("tables"),
@@ -946,12 +944,10 @@ pub(crate) mod tests {
     async fn the_invalid_table_counter_counts_listings_not_keys() {
         const TENANT: TenantHash = TenantHash([0x78; 16]);
         let (logs, _guard) = capture_logs();
-        let store = S3KeyStore {
-            inner: MemoryStore::new(),
-        };
-        put_version(&store.inner, &TENANT, 1).await;
-        let first = put_stray(&store.inner, &TENANT, STRAY_SHAPES[0]).await;
-        put_stray(&store.inner, &TENANT, STRAY_SHAPES[2]).await;
+        let store = MemoryStore::new();
+        put_version(&store, &TENANT, 1).await;
+        let first = put_stray(&store, &TENANT, STRAY_SHAPES[0]).await;
+        put_stray(&store, &TENANT, STRAY_SHAPES[2]).await;
         let listing = tenant_listing(&store, &TENANT).await.expect("listing");
         assert_eq!(listing.invalid_table_keys.len(), 2);
         assert_eq!(invalid_table_listings(&TENANT), 1);
@@ -971,11 +967,9 @@ pub(crate) mod tests {
         const TENANT: TenantHash = TenantHash([0x66; 16]);
         let rest = "Hits/v/\"\\xxxxxxxxxxxxxxxxxx.pqm";
         let (logs, _guard) = capture_logs();
-        let store = S3KeyStore {
-            inner: MemoryStore::new(),
-        };
-        put_version(&store.inner, &TENANT, 1).await;
-        let stray = put_stray(&store.inner, &TENANT, rest).await;
+        let store = MemoryStore::new();
+        put_version(&store, &TENANT, 1).await;
+        let stray = put_stray(&store, &TENANT, rest).await;
         assert_eq!(
             tables(&store, &TENANT).await.expect("tables"),
             BTreeMap::from([("hits".to_string(), vec![1])])
@@ -1005,16 +999,14 @@ pub(crate) mod tests {
     /// key in `unaddressable` rather than among the invalid-table keys, and is
     /// counted in [`unaddressable_listings`].
     #[tokio::test]
-    async fn a_stray_key_the_s3_adapter_cannot_address_is_skipped_and_counted() {
+    async fn an_unaddressable_stray_key_is_skipped_and_counted() {
         for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x70 + i as u8; 16]);
-            let store = S3KeyStore {
-                inner: MemoryStore::with_page_size(2),
-            };
+            let store = MemoryStore::with_page_size(2);
             for v in [1, 2] {
-                put_version(&store.inner, &tenant, v).await;
+                put_version(&store, &tenant, v).await;
             }
-            let stray = put_stray(&store.inner, &tenant, rest).await;
+            let stray = put_stray(&store, &tenant, rest).await;
             assert_eq!(
                 tables(&store, &tenant).await.expect("tables"),
                 BTreeMap::from([("hits".to_string(), vec![1, 2])]),
@@ -1050,7 +1042,7 @@ pub(crate) mod tests {
     /// that meets it, the table's own included, and each of those listings is
     /// counted in [`unaddressable_listings`], not as a key naming no version.
     #[tokio::test]
-    async fn a_key_naming_no_version_the_s3_adapter_cannot_address_is_skipped_and_counted() {
+    async fn an_unaddressable_key_naming_no_version_is_skipped_and_counted() {
         for (i, slot) in [
             "\u{1b}[2J\u{7}xxxxxxxxxxxxxxx",
             "/00000000000000000003",
@@ -1061,13 +1053,11 @@ pub(crate) mod tests {
         .enumerate()
         {
             let tenant = TenantHash([0x90 + i as u8; 16]);
-            let store = S3KeyStore {
-                inner: MemoryStore::with_page_size(2),
-            };
+            let store = MemoryStore::with_page_size(2);
             for v in [1, 2] {
-                put_version(&store.inner, &tenant, v).await;
+                put_version(&store, &tenant, v).await;
             }
-            put_invalid(&store.inner, &tenant, slot).await;
+            put_invalid(&store, &tenant, slot).await;
             assert_eq!(
                 versions(&store, &tenant, "hits").await.expect("versions"),
                 vec![1, 2],
@@ -1097,15 +1087,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_tenant_with_three_unaddressable_keys_resolves_and_counts_all_three() {
         const TENANT: TenantHash = TenantHash([0x3c; 16]);
-        let store = S3KeyStore {
-            inner: MemoryStore::with_page_size(2),
-        };
+        let store = MemoryStore::with_page_size(2);
         for v in [1, 2] {
-            put_version(&store.inner, &TENANT, v).await;
+            put_version(&store, &TENANT, v).await;
         }
         let mut seeded = Vec::new();
         for rest in ACCEPTANCE_UNADDRESSABLE {
-            seeded.push(put_stray(&store.inner, &TENANT, rest).await);
+            seeded.push(put_stray(&store, &TENANT, rest).await);
         }
         seeded.sort();
         assert_eq!(
@@ -1132,13 +1120,20 @@ pub(crate) mod tests {
         );
         // One tenant-wide listing; the resolve of `hits` met none of them.
         assert_eq!(unaddressable_listings(&TENANT), 1);
-        for key in &seeded {
-            store
-                .inner
-                .head(key)
+        let after =
+            ravel_object_store::list_all_reporting(&store, &tenant_manifest_prefix(&TENANT))
                 .await
-                .expect_err("refused, not deleted");
-        }
+                .expect("list");
+        assert_eq!(
+            after
+                .unaddressable
+                .sample
+                .iter()
+                .map(|k| k.key.clone())
+                .collect::<Vec<_>>(),
+            seeded,
+            "the three keys are still in the store"
+        );
     }
 
     #[tokio::test]
