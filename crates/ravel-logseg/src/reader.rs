@@ -340,6 +340,65 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         Ok(reader)
     }
 
+    /// [`RlogReader::from_source`] for a caller that already decoded SKIP_IDX,
+    /// PAGE_DIR and possibly FIELD_DIR from this object (ADR-2773 decision 5):
+    /// only the sections not passed in are decoded from `source`, and the
+    /// passed PAGE_DIR gets the same cross-checks against the block framing
+    /// and FIELD_DIR a fresh decode would. The reader's scans seed
+    /// [`ScanStats::decompressed_bytes`] with the sections decoded here only;
+    /// the caller charged its own decodes.
+    pub fn from_source_reusing(
+        source: &'a S,
+        cfg: &RlogConfig,
+        skip: Arc<SkipIndex>,
+        page_dir: Arc<PageDir>,
+        field_dir: Option<Arc<FieldDir>>,
+    ) -> Result<Self, LogSegError> {
+        let footer = open_source(source)?;
+        let mut open_decompressed_bytes = 0u64;
+        let stream_desc = *section(&footer, kind::STREAM_DIR)?;
+        let stream_raw = read_section_from(source, &stream_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
+        let mut decoded_bytes = stream_raw.len() as u64;
+        let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
+        let field_desc = *section(&footer, kind::FIELD_DIR)?;
+        let field_dir = match field_dir {
+            Some(field_dir) => {
+                decoded_bytes = decoded_bytes.saturating_add(field_desc.uncomp_len);
+                field_dir
+            }
+            None => {
+                let field_raw = read_section_from(source, &field_desc, cfg)?;
+                open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
+                decoded_bytes += field_raw.len() as u64;
+                Arc::new(FieldDir::decode(&field_raw, MAX_FIELDS)?)
+            }
+        };
+        let skip_desc = *section(&footer, kind::SKIP_IDX)?;
+        let page_desc = *footer
+            .section(kind::PAGE_DIR)
+            .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
+        decoded_bytes = decoded_bytes
+            .saturating_add(skip_desc.uncomp_len)
+            .saturating_add(page_desc.uncomp_len);
+        let blocks = *section(&footer, kind::BLOCKS)?;
+        page_dir.validate_framing(blocks.len, skip.l0.len(), &field_dir)?;
+        let dirs = SegmentDirectories {
+            stream_dir: Arc::new(stream_dir),
+            field_dir,
+            skip,
+            blocks_offset: blocks.offset,
+            page_dir,
+            bloom: *section(&footer, kind::BLOOM)?,
+            postings: footer.section(kind::POSTINGS).copied(),
+            open_decompressed_bytes,
+            decoded_bytes,
+        };
+        let mut reader = Self::from_decoded(source, &dirs);
+        reader.open_decompressed_bytes = open_decompressed_bytes;
+        Ok(reader)
+    }
+
     /// This reader's already-decoded directories, as a [`SegmentDirectories`]
     /// a later open of the same (immutable) object can reuse via
     /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). Shares the sections

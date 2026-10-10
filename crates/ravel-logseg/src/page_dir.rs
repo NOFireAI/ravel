@@ -320,16 +320,27 @@ impl PageDir {
         field_dir: &FieldDir,
     ) -> Result<Self, LogSegError> {
         let dir = PageDir::decode(raw)?;
-        dir.validate_extents(blocks_len)?;
-        if dir.block_count() != l0_len as u64 {
+        dir.validate_framing(blocks_len, l0_len, field_dir)?;
+        Ok(dir)
+    }
+
+    /// The cross-checks [`Self::decode_validated`] runs after decoding, for a
+    /// directory some other caller already decoded.
+    pub(crate) fn validate_framing(
+        &self,
+        blocks_len: u64,
+        l0_len: usize,
+        field_dir: &FieldDir,
+    ) -> Result<(), LogSegError> {
+        self.validate_extents(blocks_len)?;
+        if self.block_count() != l0_len as u64 {
             return Err(LogSegError::Corrupted(format!(
                 "page_dir covers {} blocks but skip index has {}",
-                dir.block_count(),
+                self.block_count(),
                 l0_len
             )));
         }
-        dir.validate_dict_columns(field_dir)?;
-        Ok(dir)
+        self.validate_dict_columns(field_dir)
     }
 
     /// Rejects a tag 12 or tag 13 page in a chunk whose column is not a string
