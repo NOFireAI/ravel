@@ -846,7 +846,10 @@ first GET needs no probe), `bucket_bits`, `entry_count` and `part_blake3`
               part_entry_count (the covered part's SnapshotEntry count;
               coverage = part_entry_count minus the uncovered ordinals),
               repeated uncovered_entry_ordinals (each below
-              part_entry_count), body_len
+              part_entry_count), body_len, prefix_len (the bytes from the
+              object start through dir_crc32c, which must equal
+              4 + 4 + header_len + 4 + 4 x 2^bucket_bits + 4; the ref's
+              copy sizes GET 1, this one is the authoritative value)
   u32 LE      header_crc32c       (over magic, header_len and header)
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
   u32 LE      dir_crc32c
@@ -900,7 +903,9 @@ verified by their crcs). The ref's copies of `field`, `key_type`, `key8_lo`,
 serve only to pick the slice and size GET 1; the header is authoritative,
 being under the leaf's blake3, and after GET 1 the reader compares the two
 and rejects the leaf as `Corrupted` on any disagreement (the part reads as
-uncovered), never selecting a bucket from the ref's `bucket_bits`. GET 2 is
+uncovered), never selecting a bucket from the ref's `bucket_bits`; a GET 1
+shorter than the header's `prefix_len` is the same rejection, so a short
+ref copy can only stop the probe, never truncate the directory. GET 2 is
 the one bucket the header's `bucket_bits` and the mix select: its declared
 `uncompressed_len` is checked against the body ceiling before any buffer
 is allocated, then the frame crc and the exact decompressed length are
@@ -935,7 +940,10 @@ directory. The leaf's corruption conditions, each a typed `Corrupted` that
 makes the reader treat the part as uncovered for that field (never a panic,
 never wrong data): a magic other than `RKI1`; a `header_len` past the
 object; a header, directory or frame crc32c mismatch; `bucket_bits` outside
-1..=16; a directory whose ends are not non-decreasing or whose last end
+1..=16; a header `prefix_len` not equal to
+`4 + 4 + header_len + 4 + 4 x 2^bucket_bits + 4`, or a GET 1 (sized by the
+ref's copy) shorter than it, so a truncated directory is never read; a
+directory whose ends are not non-decreasing or whose last end
 differs from `body_len`; a frame whose declared `uncompressed_len` exceeds
 the body ceiling (refused before decompression allocates anything), or
 whose decompressed length differs from it, or whose decompressed bytes are
@@ -945,8 +953,14 @@ the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `(key8, entry ordinal)` pairs; a block delta list that is empty or that
 overflows `u32`. The body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
 (256 MiB) in that constant's own meaning, a cap on declared decompressed
-size applied before allocation: it bounds the sum of a leaf's frames'
-`uncompressed_len`, not `body_len` (the stored bytes, which are smaller).
+size applied before allocation, and the reader applies it per frame, the
+only bound a single-bucket probe can check (a frame declaring up to the
+ceiling is allocated, decompressed and then rejected by its crc or length,
+bounded but far above the 32 KB mean bucket the balance rule sizes). The
+whole-leaf rule, that the frames' `uncompressed_len` sum to at most the
+ceiling, is the writer's obligation, kept by the slice split and verified
+over the whole object by `inspect kidx`; it is not a bound on `body_len`
+(the stored bytes, which are smaller).
 A (part, field) whose decompressed body would exceed it is split by key
 range into several leaves under the ceiling, each with its own ref and
 slice, so a lookup opens exactly one leaf per (part, field). A per-entry

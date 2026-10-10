@@ -336,13 +336,17 @@ flowchart LR
     object, about 6% of a spans object), never from rows and never
     whole-object, written before the part PUT so a refusal writes no object
     (the ADR-1413 order). `bucket_bits` balances the directory against the
-    mean bucket, clamped to 12..=16 (13 at the Stage 0 day as one part,
+    mean bucket, both in decompressed bytes (the directory is stored
+    uncompressed, the bucket's wire bytes are at most its decompressed
+    bytes), clamped to 12..=16 (13 at the Stage 0 day as one part,
     derived: a 32 KB directory and a 29 KB mean bucket at that body, 32 KB
     at the ceiling); the body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
     (256 MiB) in that constant's own meaning, a cap on the declared
     decompressed body: every bucket frame declares its `uncompressed_len`,
-    the reader checks it against the ceiling before it allocates and
-    requires the decompressed length to equal it, and a (part, field)
+    the reader checks it against the ceiling before it allocates (per
+    frame, the only bound one probe can check; the whole-leaf sum is the
+    writer's obligation, kept by the slice split) and requires the
+    decompressed length to equal it, and a (part, field)
     whose decompressed body would exceed the ceiling is sliced by key
     range, one leaf per slice, so a lookup opens exactly one leaf per
     (part, field).
@@ -382,12 +386,14 @@ flowchart LR
     part's entries)` ranged GETs. The default is 250,000, the fold's
     `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, and that is a seal threshold, not
     a cap: `partition_parts` splits only at hour boundaries, so one ingest
-    hour larger than it yields one part above it, and the Stage 0 load
-    (24 h of event time in one ingest hour) is such an input. The ceiling
-    is therefore `2 x batch_entries` only while no unindexed part exceeds
-    the setting, and `2 x` the largest part otherwise; the report states
-    the largest unindexed part's entries up front so the operator can
-    compute the ceiling before the run. Each batch is one HEAD CAS,
+    hour larger than it yields one part above it (the Stage 0 load, at
+    80,000 entries in one ingest hour, stays under it; a bulk load three
+    times that size with the pre-decision 9 loader defaults would not).
+    The ceiling is therefore `2 x batch_entries` only while no unindexed
+    part exceeds the setting, and `2 x` the largest part otherwise; the
+    report states the largest unindexed part's entries up front so the
+    operator can compute the ceiling before the run. Each batch is one
+    HEAD CAS,
     bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the
     attempt re-reads HEAD, keeps the refs for the batch parts whose blake3
     the new HEAD still names (a leaf is keyed by `part_blake3`, so it is
@@ -780,7 +786,7 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes per covering part = `4 x 2^bucket_bits` (the directory) plus one bucket, where the balance rule `4 x 2^b = body / 2^b` at the 256 MiB body ceiling gives `bucket_bits` = 13 (a 32 KB directory and a 32 KB mean bucket): at most about 64 KB per covering part, about 64 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 128 KB per covering part (2x the balanced figure) |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` bytes per covering part, counted as decompressed bytes (the uncompressed directory plus one bucket's declared `uncompressed_len`; wire bytes are at most this, since the directory is stored as is and the bucket frame is zstd), = `4 x 2^bucket_bits` plus one bucket, where the balance rule `4 x 2^b = body / 2^b` over the same decompressed quantity at the 256 MiB body ceiling gives `bucket_bits` = 13 (a 32 KB directory and a 32 KB mean bucket): at most about 64 KB per covering part, about 64 MB at the 1,024-part ceiling; the per-part figure is reported beside the count, with wire bytes beside it | more than 2 per part, index GETs in any other phase, or `keyIndex` decompressed bytes over 128 KB per covering part (2x the balanced figure) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages; `keyIndex` wire bytes per probed object = `prefix_len` (about 1 KB per field at 8 bits) plus one bucket (2 to 8 KB at Stage 0 entry counts), so under 16 KB per object with up to four declared fields, about 6.5 MB over the 410-object corpus | a whole-object GET, or `keyIndex` bytes over 32 KB per probed object |
