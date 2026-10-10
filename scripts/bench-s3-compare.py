@@ -13,7 +13,10 @@ percent. A latency figure therefore warns only past the envelope max plus 25
 percent. Request and byte counts are not timings, but they move between runs
 too: GET spans 47,205 to 78,279, by 66 percent, stepping up between the
 2026-09-21 and 2026-09-28 runs (one of the envelope's unexplained items), and
-bytes read by 10 percent. They warn past the max plus 10 percent. PUTs,
+bytes read by 10 percent. They warn past the max plus 10 percent, and so do
+the billed attempt counts (put_attempts, get_attempts, list_attempts), which
+S3 charges on and which a retry regression moves while the call counts stay
+put. PUTs,
 accepted points and matched series, identical across every run, must equal the
 envelope exactly.
 
@@ -56,6 +59,12 @@ FIGURES = (
     ("s3_requests.put", ("s3_requests", "put"), ("s3_requests", "put"), "exact"),
     ("s3_requests.get", ("s3_requests", "get"), ("s3_requests", "get"), "count"),
     ("s3_requests.list", ("s3_requests", "list"), ("s3_requests", "list"), "count"),
+    ("s3_requests.put_attempts", ("s3_requests", "put_attempts"),
+     ("s3_requests", "put_attempts"), "count"),
+    ("s3_requests.get_attempts", ("s3_requests", "get_attempts"),
+     ("s3_requests", "get_attempts"), "count"),
+    ("s3_requests.list_attempts", ("s3_requests", "list_attempts"),
+     ("s3_requests", "list_attempts"), "count"),
     ("bytes.read", ("bytes", "read"), ("bytes", "read"), "count"),
     ("bytes.written", ("bytes", "written"), ("bytes", "written"), "count"),
     ("ingest.accepted_points", ("ingest", "accepted_points"), ("accepted_points",), "exact"),

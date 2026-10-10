@@ -166,8 +166,9 @@ an `unexplained` list of what the runs show that nobody has explained yet.
 
 The weekly lane's "Compare against the committed real-S3 envelope" step runs
 `scripts/bench-s3-compare.py` against it after every run. Latency figures warn
-past the envelope max plus 25 percent; GET, LIST and both byte counts past the
-max plus 10 percent; PUT, accepted points and matched series must equal the
+past the envelope max plus 25 percent; GET, LIST, the three billed attempt counts
+(`*_attempts`, what S3 charges on) and both byte counts past the max plus 10
+percent; PUT, accepted points and matched series must equal the
 envelope exactly. A pair whose environment differs is refused as not a
 comparison (exit 2). The step never fails the job; `--enforce` exits 1 on a
 figure outside its band, for a local run.
