@@ -115,8 +115,9 @@ report as success. So `--fold-after-load` reads the signal's HEAD before it
 reads a row and refuses when the watermark is at or above the current hour
 (a natural-margin watermark is never that high, so only an earlier
 operator-asserted seal trips it). After the load, a fold that seals nothing
-while the load holds commit tokens is an error, not a success: the load
-exits non-zero, says the objects are durable and which hours are not in
+while the load holds commit tokens is an error (the fold coverage amendment
+below replaces this rule and judges the snapshot instead), not a success: the
+load exits non-zero, says the objects are durable and which hours are not in
 the snapshot, and names `catalog verify` and the HEAD rebuild. A load that
 wrote nothing runs no fold and says so.
 
@@ -477,3 +478,29 @@ ranked entry; T7 shares `logs_scan.rs` and `log_fetcher.rs` with it and
 goes first. The high-risk-solo wave rule is relaxed for wave 1 on the
 owner's days-not-weeks instruction; T1 compensates with its own reviewer
 and `effort: high`.
+
+## Amendment (2026-10-09): the fold coverage check replaces the no-op rule
+
+<!-- amendment-applies: sections="1. The loader seals what it wrote" pointer="fold coverage amendment" -->
+<!-- amendment-supersedes: phrase="a fold that seals nothing" pointer="fold coverage amendment" -->
+
+Refs: #2679.
+
+Decision 1 made a no-op fold after a load that holds commit tokens an error.
+That rule fails a load whose commits are all visible: another writers-stopped
+fold can seal the load's hours after its last commit and before its own fold,
+and the load's fold then has nothing left to seal. It also passes a load whose
+commits are not all visible: a fold that seals a later hour is not a no-op,
+yet a commit published into an hour another fold sealed while the load was
+writing is outside the snapshot all the same.
+
+The rule `--fold-after-load` implements instead judges the snapshot. After
+its fold, every commit the load holds must be in the snapshot the new HEAD
+names: a level-0 entry, or superseded by a compaction or rewrite whose parts
+the snapshot holds as level-1 entries. A no-op fold with every commit covered
+is a success. Any commit not covered fails the load, naming its hours and up
+to ten of the missing commits, and so does coverage that cannot be read (no
+HEAD after the fold, or a HEAD or part that cannot be fetched or decoded). A
+rewrite with no output parts, and a retention tombstone, leave no level-1
+entry for their inputs, so a load whose commits one of them removed fails
+closed. Every other part of decision 1 stands.

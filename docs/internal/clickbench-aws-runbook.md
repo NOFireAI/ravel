@@ -353,24 +353,30 @@ state a query benchmark should measure.
 Folding builds the catalog the query planner reads. **A fold seals an ingest
 hour only after `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`
 has elapsed past the end of that hour**, so a fold run immediately after a load
-seals nothing. Force it with `--max-flush-lifetime 0s`:
+seals nothing on its own. Once the load and the compaction have both exited,
+nothing else writes to this tenant, so assert that with `--writers-stopped`: the
+fold then seals through the hour it runs in, without waiting out the margin.
+
+Do not use `load --fold-after-load` in this sequence. It seals at the end of the
+load, before compaction, and a later fold in the same hour has nothing left to
+seal, so it does not pick up the compaction records and the pass measures the
+uncompacted layout. The watermark advances only once the natural seal margin
+passes the next hour, or on another `--writers-stopped` fold (or
+`--fold-after-load` load) run in a later hour. A second `--fold-after-load` into the tenant in the same hour is refused
+before it writes anything.
+`--fold-after-load` fits a sequence with no compaction after the load, such as
+the `--compaction pre` flow in `docs/internal/clickbench.md`.
 
 ```sh
 $CLI --store s3 catalog fold \
-  --tenant "$TENANT" --shards 8 --signal logs --max-flush-lifetime 0s
+  --tenant "$TENANT" --shards 8 --signal logs --writers-stopped \
+  > /root/fold.out 2>&1
+grep -E "watermark_hour|seal_through_hour|buckets_folded|entry_count|part_bytes" /root/fold.out
 ```
 
 Check the output before continuing. `--signal` is not optional in practice: a
 fold defaulting to the wrong signal on a logs-only tenant succeeds and seals
-nothing.
-
-```sh
-$CLI --store s3 catalog fold \
-  --tenant "$TENANT" --shards 8 --signal logs --max-flush-lifetime 0s \
-  > /root/fold.out 2>&1
-grep -E "watermark_hour|buckets_folded|entry_count|part_bytes" /root/fold.out
-```
-
+nothing. `seal_through_hour` names the hour the fold sealed through, and
 `entry_count` should be close to the number of objects the load wrote. If the
 fold covered under 80% of them, the shard count or signal is wrong.
 
@@ -1035,7 +1041,7 @@ An idle instance bills at its full on-demand rate. Stop it when a run finishes.
 | Symptom | Cause |
 |---|---|
 | `linking with cc failed` mid-build | Out of disk. Check free space; the error names the wrong cause. |
-| Fold reports zero entries | Ran too soon after the load, or the wrong `--signal`/`--shards`. Use `--max-flush-lifetime 0s` and pass the tenant's real shard count. |
+| Fold reports zero entries | Ran too soon after the load, or the wrong `--signal`/`--shards`. Use `--writers-stopped` once every writer has exited, and pass the tenant's real shard count. |
 | Warm runs read the whole corpus | `--cache-bytes` is below the corpus size. Every run is cold. |
 | Every declared column projects NULL | Queried before the declaration was visible. The staleness horizon applies to anything going through `ravel-server`. |
 | `InvalidAccessKeyId` | The shell has no exported credentials, or SSM returned an empty value. Re-run the export block. |

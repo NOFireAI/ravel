@@ -84,7 +84,8 @@ ravel-cli --store <your-store-flags> load \
   --pipeline-depth 4 \
   --max-inflight-flushes 4 \
   --decode-queue-batches 2 \
-  --target-bytes 1
+  --target-bytes 1 \
+  --fold-after-load
 ```
 
 The two write-concurrency flags are spelled out here only because this is a
@@ -285,32 +286,50 @@ the numbers.
 
 ### Fold the catalog before measuring anything
 
-The load's writer process has exited by this point, so nothing can publish
-another commit record into the hours it wrote. Fold them immediately instead of
-waiting out the seal margin:
+`--fold-after-load` on the load command above does this: once every write has
+been acknowledged and the load's writers have shut down, the loader folds the
+tenant's logs catalog through the latest ingest hour it wrote, including the
+hour still in progress. Passing it asserts that the load is the tenant's only
+writer, which is true here (see the UNSAFE paragraph in `ravel-cli load
+--help`). The fold's time is part of the summary's `elapsed`, and the summary
+prints one more line:
+
+```
+  fold after load  : sealed, seal_through_hour 482110, watermark_hour 482110, entries 8424, parts read 1, buckets listed 0, records read 0, elapsed 1.203s (included in elapsed)
+```
+
+Check it before going further. On a fresh tenant `entries` must equal the
+`objects written` figure two lines above it: that equality is the bench
+precondition. `parts read`, `buckets listed` and `records read` are the cost of
+the check that every commit the load wrote is in the snapshot; a bucket is
+listed only for a commit found in no level-0 entry, so a nonzero figure there
+means part of the load reached the snapshot through a compaction or rewrite, or
+not at all. `no-op, HEAD already sealed` in place of `sealed` means another
+writers-stopped fold sealed these hours after the load's last commit; the load
+still succeeded only because that snapshot holds every commit it wrote. When a
+commit is missing, or the check cannot read the snapshot, the line says the
+commits were not confirmed and the load exits non-zero naming the hours. Load
+into a fresh tenant instead.
+
+If the load ran without the flag, or its fold failed (the load then exits
+non-zero, but every loaded object is already durable), seal the loaded hours by
+hand once the load has exited:
 
 ```sh
 ravel-cli --store <your-store-flags> catalog fold \
   --tenant clickbench \
   --shards 4 \
   --signal logs \
-  --max-flush-lifetime 0s
+  --writers-stopped
 ```
 
-`--shards` must be the value the load ran with, and `--signal logs` is
-mandatory: the fold defaults to metrics, and folding metrics on this
-logs-only tenant seals nothing and publishes an empty metrics HEAD.
-
-Check the report before going further. `seal_margin: 20m` confirms the
-override took effect (the default is `1h 20m`), and that residual margin is
-also why `entry_count` may still be below the `objects written` figure the
-load printed: `0s` removes only the flush-lifetime term, so an ingest hour
-seals 20 minutes after it ends, and the hour the load finished in (plus the
-previous one, for 20 minutes) stays hot. The equality `entry_count == objects
-written` is the bench precondition, not the load's exit check: re-run the fold
-once 20 minutes have passed since the last loaded hour ended, and only then
-measure. Anything still lower at that point means part of the load is outside
-the snapshot.
+`--writers-stopped` makes the same assertion for the hour the fold runs in and
+every earlier one, so run it only when no load or server is writing to the
+tenant. `--shards` must be the value the load ran with, and `--signal logs` is
+mandatory: the fold defaults to metrics, and folding metrics on this logs-only
+tenant seals nothing and publishes an empty metrics HEAD. The report's
+`seal_through_hour` names the hour it sealed through and `entry_count` must
+equal `objects written`.
 
 This is not optional tuning. Without a snapshot covering these hours, every
 query resolves by listing and reading commit records directly: one
@@ -318,7 +337,7 @@ commit-record GET per segment, per statement. On a 100M-row `hits` load that
 is 8,424 GETs for a single statement, and a 43-statement pass measured that
 way reads as a format or engine regression when it is only an unfolded
 catalog. A tenant loaded from 14:54Z to 16:08Z cannot be folded by the default
-margin until 18:21Z, which is exactly the window this flag removes.
+margin until 18:21Z, which is exactly the window these flags remove.
 
 ## 3. Declare the typed columns
 

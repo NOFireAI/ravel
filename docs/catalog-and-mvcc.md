@@ -928,6 +928,36 @@ be raised for writers after every folder's seal computation uses the raised
 values (deployment ordering: folders before writers). Lowering them is
 always safe for sealing.
 
+Operator-asserted seal (ADR-2677 decision 1). A fold may also be given a
+seal-through hour S, in which case it seals every bucket up to and including
+`max(S, margin hour)`, where the margin hour is the last bucket the definition
+above seals at the fold's real wall time. HEAD is still stamped with that real
+time; the clock is not moved forward. Two callers pass S, and the assertion is
+theirs, not the catalog's: `ravel-cli catalog fold --writers-stopped` passes the
+hour the fold itself runs in, and `ravel-cli load --fold-after-load` (logs only)
+passes the latest ingest hour among the commits the load published, after its
+own writers have shut down. An S later than the hour bucket of the fold's own
+clock is refused with `CatalogError::InvalidConfig` before anything is read:
+no caller can assert anything about an hour that has not begun. Each caller
+asserts that no writer will publish into S or any earlier hour, so only an
+operator or loader that knows every writer of the tenant and signal has
+stopped may pass it. The loader also refuses to write into a sealed hour: with
+`--fold-after-load` it reads the logs HEAD before reading any row, and stops
+when the watermark is at or above the current hour. The seal lemma then rests on that
+assertion rather than on `max_flush_lifetime`, and it is unsafe under a live
+writer: a commit published into a bucket at or below the sealed watermark is
+never folded incrementally (the next fold's watermark is already at or past
+it), so it is invisible to a read without a commit token until HEAD is rebuilt
+from the commit records. A later fold that is not given S, including the
+scheduled fold, computes a target at or below the asserted watermark and
+no-ops until the natural margin passes it; a fold given an S at or below the
+watermark no-ops too. A no-op fold also skips the reconcile window below, so a
+compaction record or tombstone landing in a sealed hour after the asserted seal
+is applied only by the first later fold that advances the watermark: compact
+before sealing, not after. `FoldReport.seal_through_hour` carries S when S was above
+the margin hour and so set the target, including on such a no-op, and is absent
+when no S was given or the margin already sealed it.
+
 (ADR-0020.)
 
 ## Who folds a tenant and signal (ADR-1693)

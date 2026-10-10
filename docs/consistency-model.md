@@ -481,6 +481,29 @@ query sees. Guarantees:
   `--mode maintain`, on the replica that owns shard 0 of a signal, and covers
   the maintained signals (metrics, logs, spans). A single-process `--mode all`
   deployment runs no scrub task, so nothing detects this case there.
+- The operator-asserted seal sits beside that exception. `ravel-cli catalog
+  fold --writers-stopped` and `ravel-cli load --fold-after-load` seal through
+  the current hour (the fold's hour, or the latest ingest hour the load
+  wrote) instead of waiting for the seal margin, on the operator's assertion
+  that no writer for the tenant and signal will publish into that hour or
+  any earlier one (docs/catalog-and-mvcc.md "Operator-asserted seal"). The
+  loader does not write into an hour it finds sealed: with
+  `--fold-after-load`, a load whose current ingest hour the logs HEAD has
+  already sealed is refused before any row is read or any object written.
+  After its own fold, the load reads back the snapshot of the HEAD that fold
+  left and checks that every commit it published is in it, as a level-0
+  entry or replaced by a compaction or rewrite whose parts the snapshot
+  holds. It exits non-zero naming the hours, the count of missing commits
+  and up to ten of them when one is not (for example because another fold
+  sealed its hour while the load was writing, or because a rewrite with no
+  output parts or a retention tombstone removed it, which leaves no level-1
+  entry to cover it), and also when that HEAD or
+  one of its parts cannot be read, since coverage was then not checked. Any other writer that publishes into the
+  asserted hours, whether a live server or a load run without the flag, is
+  not refused: its commit succeeds and is invisible to non-token queries the
+  same way as the folder-fast case above, until a HEAD rebuild (see
+  docs/guides/operations/troubleshooting.md "Rebuild the snapshot"). A
+  `min_commit_token` read still sees it.
 
 The fold protocol (the CAS'd HEAD pointer, watermark computation, and how
 each degraded path resolves) is in docs/catalog-and-mvcc.md.
