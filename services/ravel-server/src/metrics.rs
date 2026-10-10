@@ -5773,14 +5773,14 @@ fn render_memory_gate_family(
         (
             "ravel_memory_gate_resident_bytes",
             "jemalloc stats.resident as the memory gate sampler last read it, after the forced purge \
-             when one ran; 0 when the gate is off.",
+             when one ran; 0 when the gate is off or before its first sample.",
             "gauge",
             budget.gate_resident(),
         ),
         (
             "ravel_memory_gate_high_water_bytes",
             "The memory gate's high-water mark (--memory-gate-high-water-percent of the memory \
-             budget); 0 when the gate is off.",
+             budget); 0 when the gate is off or before its first sample.",
             "gauge",
             budget.gate_high_water(),
         ),

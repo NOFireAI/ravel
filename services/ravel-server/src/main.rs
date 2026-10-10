@@ -775,6 +775,9 @@ mod tests {
     fn binary_runs_under_jemalloc() {
         use tikv_jemalloc_ctl::{epoch, stats};
 
+        let _jemalloc = JEMALLOC_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         epoch::advance().expect("jemalloc epoch mallctl must succeed under jemalloc");
         let before = stats::allocated::read().expect("jemalloc stats.allocated read must succeed");
 
@@ -791,6 +794,11 @@ mod tests {
         );
         std::hint::black_box(big);
     }
+
+    /// Serialises the tests that read or change process-global jemalloc
+    /// state, which `cargo test` otherwise runs on concurrent threads.
+    #[cfg(not(target_env = "msvc"))]
+    static JEMALLOC_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Every initialised arena's `(dirty_decay_ms, muzzy_decay_ms)`, by index.
     #[cfg(not(target_env = "msvc"))]
@@ -838,6 +846,9 @@ mod tests {
         const MIB: usize = 1 << 20;
         const FREED_MIB: usize = 256;
 
+        let _jemalloc = JEMALLOC_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original = arena_decays();
         assert!(!original.is_empty(), "arena 0 is always initialised");
         let pinned: Vec<_> = original

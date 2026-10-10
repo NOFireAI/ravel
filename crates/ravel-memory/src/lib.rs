@@ -107,8 +107,8 @@ impl MemoryBudget {
         self.gate.resident.store(resident, Ordering::Relaxed);
         self.gate.high_water.store(high_water, Ordering::Relaxed);
         // Release pairs with the acquire fence on the refusal path, so a
-        // refusal reads each figure from this call or a later one. The two
-        // figures may come from different calls.
+        // refusal reads each figure from this call or a later one; see the
+        // `ResidentGate` doc for why the pair stays consistent.
         self.gate
             .open
             .store(resident < high_water, Ordering::Release);
@@ -278,9 +278,8 @@ impl MemoryBudget {
     #[inline(never)]
     fn refuse_resident(&self, n: u64) -> Option<MemoryExhausted> {
         // Pairs with the release store in `set_resident_gate`: each figure
-        // below is from the write that closed the gate or a later one, not
-        // necessarily both from the same write (the mark is fixed for the
-        // process's life, which is what keeps the pair consistent).
+        // below is from the write that closed the gate or a later one; see
+        // the `ResidentGate` doc for why the pair stays consistent.
         fence(Ordering::Acquire);
         let resident = self.gate_resident();
         let high_water = self.gate_high_water();

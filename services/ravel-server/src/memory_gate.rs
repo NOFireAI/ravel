@@ -400,7 +400,10 @@ fn run_sampler(budget: &MemoryBudget, high_water: u64, interval: Duration) {
                  until a reading succeeds"
             );
         }
-        std::thread::sleep(interval.saturating_sub(started.elapsed()));
+        // A pass that outruns the interval (a long purge at the 10 ms
+        // minimum) still sleeps half an interval, so purges never run back
+        // to back and the duty cycle ADR-2633 section 2 budgets holds.
+        std::thread::sleep(interval.saturating_sub(started.elapsed()).max(interval / 2));
     }
 }
 
