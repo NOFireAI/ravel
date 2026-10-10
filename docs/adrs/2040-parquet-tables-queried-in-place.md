@@ -1262,24 +1262,23 @@ only the shape the Query grant can write is skipped.
 
 **Listings.** `resolve::tables` (through `resolve::tenant_listing`, which
 also returns the skipped keys) and the sweep's listing skip such a key when
-the store lists it. The S3 adapter does not list every such key:
-`object_store` parses each key of a listing response with `Path::parse`,
-which refuses a key holding a control character, an empty segment (such as
-`hits//v/...`, or an empty table segment) or a `.` or `..` segment, and one
-such key fails the whole listing with a store error before Ravel sees it
-(the counted skip amendment below replaces this on S3). On
-S3 those shapes therefore still fail `parquet ls`, `parquet sweep` and
-`parquet repair --stray` for the whole tenant. Ravel cannot list such a key,
-so an operator removes it by deleting the exact key with the Maintain
-credential through an S3 tool. The same holds for a key under a valid
-table's own `v/` prefix whose slot names no version: the version bound
-amendment's listings skip and never fail on one only when the store lists
-it, and on S3 one holding a control character, an empty segment (such as
-`hits/v//<20 digits>.pqm`) or a `.` or `..` segment fails
-`resolve::versions`, and so every query and DDL statement on that table, as
-well as the tenant-wide listings. The adapter failing a listing on one key
-it cannot parse is a defect in `ravel-object-store`, tracked as issue #2637,
-and fixed as the counted skip amendment below records.
+the store lists it. Until the counted skip amendment below, the S3 adapter
+did not list every such key: `object_store` parsed each key of a listing
+response with `Path::parse`, which refuses a key holding a control
+character, an empty segment (such as `hits//v/...`, or an empty table
+segment) or a `.` or `..` segment, and one such key fails the whole listing
+with a store error before Ravel sees it (the counted skip amendment below
+replaces this on S3). Those shapes then failed `parquet ls`, `parquet sweep`
+and `parquet repair --stray` for the whole tenant on S3 (no longer: see the
+counted skip amendment below). The same held for a key under a valid table's
+own `v/` prefix whose slot names no version, such as
+`hits/v//<20 digits>.pqm`: on S3 it failed `resolve::versions`, every query
+(no longer: see the counted skip amendment below) and DDL statement on that
+table, and the tenant-wide listings. The adapter failing a listing on one key
+it cannot parse was a defect in `ravel-object-store`, tracked as issue #2637,
+and fixed as the counted skip amendment below records. An operator removes
+such a key by deleting the exact key with the Maintain credential through an
+S3 tool, since no request Ravel sends reaches it unchanged.
 Each listing that finds a key it skips is counted once per tenant,
 however many such keys it finds (`resolve::invalid_table_listings`, a sibling
 of the per-table `resolve::above_bound_resolves`, so neither counter's key
@@ -1325,8 +1324,8 @@ non-zero naming every such key still listed, skipped ones included, or
 exits non-zero with the error of that listing if it fails. Every such key
 still there is named only when no key the encoding changes sits at a page
 boundary, as above (every one, since the counted skip amendment below). An operator removes an undeletable
-key, as one the store cannot list, by deleting the exact key with the
-Maintain credential through an S3 tool. With nothing listed it says so and
+key, which no request Ravel sends reaches unchanged, by deleting the exact
+key with the Maintain credential through an S3 tool. With nothing listed it says so and
 deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
 (`repair::delete_flagged`) applies the same store-path check to the keys it
 flags: a flagged key under the table's own `v/` prefix that changes under
@@ -1419,6 +1418,8 @@ rollout, the unkeyed-bucket fallback, and the quiescent-table consequence.
 <!-- amendment-supersedes: phrase="sits at a list page boundary" pointer="counted skip amendment" -->
 <!-- amendment-supersedes: phrase="sits at a page boundary" pointer="counted skip amendment" -->
 <!-- amendment-supersedes: phrase="fails those listings outright" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="Those shapes then failed `parquet ls`" pointer="counted skip amendment" -->
+<!-- amendment-supersedes: phrase="on S3 it failed `resolve::versions`" pointer="counted skip amendment" -->
 
 The version bound amendment and the invalid table segment amendment record
 two failures of the S3 adapter's listing, both tracked as issue #2637: a key
