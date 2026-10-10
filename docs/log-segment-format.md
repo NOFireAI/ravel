@@ -1366,6 +1366,11 @@ key_idx (stored uncompressed; bucket payloads zstd):
   u8       version            (= 1: this section's own grammar version)
   u8       bucket_bits        (writer 8; reader accepts 1..=16)
   u16 LE   reserved           (= 0; non-zero is Corrupted)
+  u32 LE   prefix_len         (bytes from the section start through the last
+                               directory's dir_crc32c: the header, its crc
+                               and every field's directory; fixed-width so a
+                               reader sizes its first GET from the section
+                               entry alone)
   uvarint  field_count        (1..=64; ascending by name bytes, unique)
   fields[field_count]:
     uvarint  name_len
@@ -1391,19 +1396,29 @@ key_idx (stored uncompressed; bucket payloads zstd):
                                    (decompresses to exactly entry_count x 12)
 ```
 
-An empty bucket is the 8-byte frame header with no payload. Per-field
-directories and bucket areas may be laid out in any order inside the
-section; readers use the header's offsets only.
+An empty bucket is the 8-byte frame header with no payload. The writer
+lays the section out as the header, then every field's directory in field
+order, each directly after the previous one's `dir_crc32c`, then every
+field's bucket area: `prefix_len` names the end of the last directory, and
+a reader whose first GET covers `[0, prefix_len)` holds every directory. A
+`dir_offset` outside `[0, prefix_len)`, or a `buckets_offset` below
+`prefix_len`, is `Corrupted`. Readers still address every directory and
+bucket by the header's offsets, never by assumed adjacency; the placement
+rule fixes the probe cost, not the parser.
 
 ### Reading
 
-A probe reads the header (and verifies `header_crc32c`) to find the field,
-the field's directory (verifying `dir_crc32c`) to find the bucket, and that
-one bucket (verifying `frame_crc32c`, then the decompressed length). Each
-read is a range inside the section. The section sits between BLOCKS and
-SKIP_IDX, so the 256 KiB tail probe (ADR-0699 decision 5) does not carry it:
-a key probe on an opened object costs one ranged GET for the header and
-directory (about 1 KB at 8 bits, plus the header) and one for the bucket.
+A probe reads `[0, prefix_len)` of the section in one ranged GET (the
+footer's section entry gives the start; the first 8 bytes give
+`prefix_len`, and a reader that does not know it yet reads a fixed 4 KiB
+and extends once if `prefix_len` is larger), verifies `header_crc32c`,
+finds the field, verifies its `dir_crc32c`, finds the bucket, then reads
+that one bucket (verifying `frame_crc32c`, then the decompressed length).
+The section sits between BLOCKS and SKIP_IDX, so the 256 KiB tail probe
+(ADR-0699 decision 5) does not carry it: a key probe on an opened object
+costs one ranged GET for the header and every directory (about 1 KB per
+field at 8 bits, plus the header) and one for the bucket; the placement
+rule above is what makes that two GETs for every conformant writer.
 At the measured sizes (p50 49,899 entries per 25 MB ClickBench object, about
 2% of object bytes) a bucket holds about 200 entries, a few KB (derived from
 the Stage 0 figures on ADR-2707).

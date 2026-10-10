@@ -497,15 +497,19 @@ set that the range test excludes holds only a colliding trace and is
 skipped, and a block the range test admits that KEY_IDX does not name holds
 no span of either trace and is skipped. Neither disagreement is an error:
 both are the two indexes pruning on different evidence. The intersection is
-read as its contiguous runs: `RspanRangeReader::trace_block_span` takes one
-contiguous run and returns its byte range, so the reader issues one ranged
-GET per run of the intersection and decodes each run with `decode_trace`.
-Spans of one trace sort contiguously (the object sorts by `(trace_id,
-start_ts)`), so the intersection is one run in every case but a prefix
-collision whose other trace sits between this trace's blocks, which yields
-two runs and two GETs; a non-contiguous candidate set is therefore not
-`Corrupted` on this path, and `trace_block_span` is called per run rather
-than over the whole set. A prefix collision (two traces sharing 8 leading
+read as its contiguous runs. Today's `RspanRangeReader::trace_block_span`
+derives its own candidate set from SKIP_IDX and refuses a non-contiguous
+one, so it cannot take the intersection; ADR-2707's T3 adds
+`RspanRangeReader::block_run_span(&self, blocks: &[usize])`, which takes
+one explicit contiguous run of block ordinals (adjacent, ascending, in
+range; anything else is `Corrupted`) and returns its byte range, and
+`trace_block_span` stays as the SKIP_IDX-only convenience that calls it on
+its own run. The reader splits the intersection into maximal contiguous
+runs, issues one ranged GET per run through `block_run_span`, and decodes
+each with `decode_trace`. Spans of one trace sort contiguously (the object
+sorts by `(trace_id, start_ts)`), so the intersection is one run in every
+case but a prefix collision whose other trace sits between this trace's
+blocks, which yields two runs and two GETs. A prefix collision (two traces sharing 8 leading
 bytes) is thus at most one extra block read and at most one extra GET, and
 the per-row `trace_id` equality the reader already applies removes it from
 the result. An empty intersection with a present key is also legal and

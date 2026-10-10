@@ -959,9 +959,14 @@ leaf writer: before deleting an `idx/*.kidx` object past the protection
 horizon it reads the leaf header's `part_blake3`; if HEAD names a live part
 with that hash and no `key_index` ref for the leaf's field, the leaf is
 orphaned by an old folder, is kept, and is counted in
-`ravel_catalog_sweep_orphaned_leaves_total`, and the next new-format fold
-re-attaches it from its header instead of rebuilding it. A leaf whose
-`part_blake3` names no live part is swept as before. The fold report also
+`ravel_catalog_sweep_orphaned_leaves_total`. A leaf whose `part_blake3`
+names no live part is swept as before. The fold recovers the kept leaf:
+when it carries forward a part with no `key_index` ref for a declared
+field, it LISTs `idx/` once in that fold, opens the header of each leaf not
+named by HEAD, re-attaches every leaf whose `part_blake3` and field match
+a carried part (the ref is reconstructed from the header and validated as
+a reader would), and rebuilds from the sections only a part that still has
+no leaf; the fold report counts re-attached and rebuilt leaves separately. The fold report also
 counts leaves rebuilt from scratch, so a rebuild the previous fold did not
 need is a figure outside its band. The mixed-version combinations (old
 folder then new sweeper, old sweeper against a new HEAD, new folder after

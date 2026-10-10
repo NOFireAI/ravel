@@ -173,9 +173,15 @@ POSTINGS carries one.
   stored bytes, then zstd bytes that decompress to exactly `entry_count x 12`
   bytes. An empty bucket is the 8-byte header with no payload. The section is
   a container, uncompressed as a whole, so one bucket is readable alone.
-- **Header.** `version` (1), `bucket_bits`, a reserved u16, then per field
-  its name, key type, entry count, directory offset and bucket area, all
-  under a header crc32c. **The indexed set is written here and never
+- **Header.** `version` (1), `bucket_bits`, a reserved u16, a fixed-width
+  `prefix_len`, then per field its name, key type, entry count, directory
+  offset and bucket area, all under a header crc32c. The writer lays every
+  field's directory directly after the header in field order and every
+  bucket area after them, and `prefix_len` names the end of the last
+  directory, so a probe's first ranged GET, `[0, prefix_len)`, holds the
+  header and every directory for any conformant writer; a directory or
+  bucket area on the wrong side of `prefix_len` is `Corrupted`. Readers
+  still address by the header's offsets, never by adjacency. **The indexed set is written here and never
   inferred from live config at read time** (ADR-0849 section 3): a field the
   header does not name is uncovered in this object for that field.
 
@@ -186,6 +192,7 @@ key_idx (stored uncompressed; bucket payloads zstd):
   u8       version            (= 1)
   u8       bucket_bits        (writer 8; reader accepts 1..=16)
   u16 LE   reserved           (= 0)
+  u32 LE   prefix_len         (through the last directory's crc; sizes GET 1)
   uvarint  field_count        (1..=64; ascending by name, unique)
   fields[field_count]:
     uvarint name_len; name; u8 key_type; uvarint entry_count;
@@ -280,107 +287,67 @@ flowchart LR
 
 - **Object.** `t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.kidx`,
   immutable, `CreateIfAbsent`, `hash16` = the blake3 of the leaf's own
-  bytes (the `.cstat` rule, docs/catalog-and-mvcc.md "Per-part column
-  statistics": keying by the part's hash would let two folds that degraded
-  differently collide under `AlreadyExists`). The envelope is magic `RKI1`,
-  a `KeyIndexLeafHeader` protobuf under a header crc32c, a bucket directory
-  under its own crc32c, then bucket frames framed as in tier 1. Entries are
-  `(key8, entry ordinal, block set)`: the part-local ordinal of the
-  `SnapshotEntry` (ADR-0849 section 1, "ordinals part-local") and a
-  delta-coded ascending list of block ordinals, the block bitmap ADR-0849
-  section 1b requires in the encoding that is small for the sets measured
-  (p50 one object per key). The normative layout is in
-  docs/catalog-and-mvcc.md, "Per-part key-index leaves"; in outline:
-
-  ```
-  .kidx:
-    magic "RKI1"; u32 LE header_len
-    KeyIndexLeafHeader: format_version (1), tenant_hash, signal,
-      part_blake3, field, key_type, key8_lo, key8_hi, bucket_bits,
-      entry_count (index entries in this leaf),
-      part_entry_count (SnapshotEntry count of the covered part),
-      uncovered_entry_ordinals[], body_len
-    u32 LE header_crc32c
-    u32 LE ends[2^bucket_bits]; u32 LE dir_crc32c
-    body: frames tiling [0, body_len):
-      u32 LE entry_count; u32 LE frame_crc32c;
-      zstd entries[entry_count]: key8 [8], uvarint entry_ordinal,
-        uvarint block_count, uvarint block_delta[block_count]
-  ```
-- **Binding.** The header carries the covered part's `blake3`, the field,
-  the key type, the key slice `[key8_lo, key8_hi]`, `bucket_bits`, the
-  part's entry count, and `uncovered_entry_ordinals`: the entries the fold
-  could not index for this field (no KEY_IDX section, a section whose header
-  does not name the field, a failed or refused GET, a corrupt section). A
-  reader subtracts exactly those from coverage (ADR-0849 section 3, "a leaf
-  that fails validation subtracts its own coverage"), and treats a leaf whose
-  header `blake3` differs from the part's, or whose version it does not
-  support, as absent for the whole part. A leaf whose `tenant_hash` differs
-  from the requesting tenant's is not a degrade: it is the hard
-  `CatalogError::FieldMismatch` ADR-0050 decision 2 assigns to every
-  tenant-hash mismatch on the resolve path, counted in
-  `ravel_catalog_isolation_breach_total`, with no fallback to scanning. Same
-  `watermark_hour`, different part bytes, leaf rejected: the regression test
-  ADR-0849 names.
-- **Reference.** `SnapshotPartRef` gains `repeated SnapshotKeyIndexLeafRef
-  key_index = 8` beside `column_stats = 7`: `key`, `blake3`, `size`,
-  `field`, `key_type`, `key8_lo`, `key8_hi`, `prefix_len` (the bytes through
-  the directory crc, so the first GET needs no probe), `bucket_bits`,
-  `entry_count`, `part_blake3`. Absent means uncovered and is never an
-  error. `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field 7
-  precedent (ADR-0063, ADR-1413): an older reader ignores the field and
-  scans. A new message `SnapshotKeyIndexLeafRef` and a `KeyIndexLeafHeader`
-  are added to proto/ravel/catalog.proto by the implementing task. The ref
-  carries the same fields as the leaf header so a reader can pick the slice
-  and size its first GET without opening the leaf; **the leaf header is
-  authoritative**, since it is under the leaf's blake3 and the ref is not.
-  After GET 1 the reader compares `field`, `key_type`, `key8_lo`, `key8_hi`,
-  `bucket_bits`, `entry_count` and `part_blake3` between the two, and any
-  disagreement rejects the leaf as `Corrupted` for that part (uncovered,
-  never a wrong-slot lookup); the reader never selects a bucket from the
-  ref's `bucket_bits`.
-- **Build.** The fold builds leaves for exactly the parts it re-encodes this
-  fold (a part carried forward keeps its refs), from the tier-1 sections and
-  never from rows and never from whole-object reads: per entry, a suffix GET
-  for the footer and a ranged GET of the KEY_IDX section (about 2% of a
-  logs object, about 6% of a spans object; the Storage consequence has the
-  arithmetic), merged across the part's entries, sorted, bucketed, and
-  written before the part PUT, so a refusal writes no object (the ADR-1413
-  order). `bucket_bits` is chosen so that the directory and the mean bucket
-  are about equal in bytes, clamped to 12..=16: at 20 M entries of about
-  12 B each (the Stage 0 day as one part, derived) that is 13 bits, a 32 KB
-  directory and 37 KB buckets. The leaf body ceiling reuses
-  `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB); a (part, field) whose body
-  would exceed it is sliced by key range into several leaves, each under
-  the ceiling, each with its own ref. A lookup opens exactly one leaf per
-  (part, field): the one whose slice holds its `key8`.
-- **Lifecycle.** `sweep_unreferenced_catalog_objects`
-  (`crates/ravel-maintain/src/sweep.rs`) lists the whole `idx/` prefix and
-  deletes what HEAD does not name past the protection horizon, so
-  `parts[].key_index[].key` joins its reference set in the same change as
-  the first leaf writer (ADR-0849 section 1a). A fold process that predates
-  this change strips field 8 from every part it carries forward, and the
-  sweeper then reaps the live leaves past the protection horizon; the
-  lookup stays correct (the parts read as uncovered and are scanned) and
-  the next fold pays a full section-read rebuild, so the cost is silent.
-  No field in HEAD can constrain that folder: it predates every field this
-  ADR adds, and the fold builds HEAD as a fresh struct
-  (`crates/ravel-catalog/src/fold.rs`, prost keeps no unknown fields), so
-  its first CAS would drop any stamp for good. The guard therefore sits in
-  the process that would do the damage, the sweeper, which is in the same
-  change as the first leaf writer: before deleting an `idx/*.kidx` object
-  past the protection horizon, it reads the leaf header's `part_blake3`,
-  and if HEAD still names a part with that hash and no `key_index` ref for
-  that field, the leaf is live and orphaned by an old folder; the sweeper
-  keeps it, counts it in `ravel_catalog_sweep_orphaned_leaves_total`, and
-  the next new-format fold re-attaches it by hash instead of rebuilding
-  (the ref is reconstructed from the header, which carries every field the
-  ref holds). A leaf whose `part_blake3` names no live part is swept as
-  before. The fold report also counts leaves rebuilt from scratch, so a
-  rebuild the previous fold did not need shows as a figure outside its
-  band. The mixed-version combinations (old folder then new sweeper, old
-  sweeper against a new HEAD, new folder after an old folder) are a required
-  test of the guard, not an intention.
+  bytes (the `.cstat` rule: keying by the part's hash would let two folds
+  that degraded differently collide under `AlreadyExists`). The envelope is
+  magic `RKI1`, a `KeyIndexLeafHeader` protobuf under a header crc32c, a
+  bucket directory under its own crc32c, then bucket frames framed as in
+  tier 1, holding `(key8, entry ordinal, block set)` entries: the
+  part-local `SnapshotEntry` ordinal (ADR-0849 section 1) and a delta-coded
+  block list, the block bitmap ADR-0849 section 1b requires in the encoding
+  that is small for the sets measured (p50 one object per key). **The
+  byte layout, the header fields, the corruption list, the binding and
+  coverage rules, the reader procedure, the fold build and the rollout
+  guard are normative in docs/catalog-and-mvcc.md, "Per-part key-index
+  leaves", and are not restated here**; the same convention decision 1
+  uses for the section grammar, so a later correction lands in one place.
+  What this decision fixes, and that document carries:
+  - **Binding** to the part's exact `blake3`, never its `watermark_hour`.
+    A `tenant_hash` mismatch is the hard `CatalogError::FieldMismatch` of
+    ADR-0050 decision 2, counted in `ravel_catalog_isolation_breach_total`,
+    no fallback. A `part_blake3` mismatch or an unsupported version rejects
+    the leaf and the part reads as uncovered for that field only. The
+    header lists `uncovered_entry_ordinals`, the entries the fold could not
+    index, and a reader subtracts exactly those from coverage (ADR-0849
+    section 3). Same `watermark_hour`, different part bytes, leaf rejected:
+    the regression test ADR-0849 names.
+  - **Reference.** `SnapshotPartRef` gains `repeated SnapshotKeyIndexLeafRef
+    key_index = 8` beside `column_stats = 7`, carrying the header's slice
+    and sizing fields plus `key`, `blake3`, `size` and `prefix_len`, so a
+    reader picks the slice and sizes its first GET without opening the
+    leaf. The header is authoritative (it is under the leaf's blake3; the
+    ref is not): after GET 1 the reader compares the duplicated fields and
+    any disagreement rejects the leaf as `Corrupted`, never a wrong-slot
+    lookup. Absent means uncovered and is never an error.
+    `HEAD_FORMAT_VERSION` (1) is not bumped, by the field 6 and field 7
+    precedent (ADR-0063, ADR-1413): an older reader ignores the field and
+    scans. `SnapshotKeyIndexLeafRef` and `KeyIndexLeafHeader` are added to
+    proto/ravel/catalog.proto by the implementing task.
+  - **Build.** The fold builds leaves for exactly the parts it re-encodes
+    this fold, from the tier-1 sections by ranged GET (about 2% of a logs
+    object, about 6% of a spans object), never from rows and never
+    whole-object, written before the part PUT so a refusal writes no object
+    (the ADR-1413 order). `bucket_bits` balances the directory against the
+    mean bucket, clamped to 12..=16 (13 at the Stage 0 day as one part,
+    derived: a 32 KB directory and 37 KB buckets); the body ceiling reuses
+    `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB), and a larger (part, field)
+    is sliced by key range, one leaf per slice, so a lookup opens exactly
+    one leaf per (part, field).
+  - **Lifecycle.** `sweep_unreferenced_catalog_objects` names
+    `parts[].key_index[].key` in its reference set in the same change as
+    the first leaf writer (ADR-0849 section 1a). A fold process that
+    predates this change strips field 8 from every part it carries
+    forward; no HEAD field can constrain it (it predates every field here,
+    and the fold rebuilds HEAD as a fresh prost struct, so a stamp would
+    not survive its CAS). The guard is in the sweeper: a leaf whose
+    `part_blake3` names a live part with no `key_index` ref for its field
+    is kept and counted (`ravel_catalog_sweep_orphaned_leaves_total`),
+    not swept. The recovery is the fold's, as an exception to its scope
+    rule: a fold that carries forward a part lacking a ref for a declared
+    field LISTs `idx/` once, re-attaches every unreferenced leaf whose
+    header matches a carried part (validated as a reader would), and
+    rebuilds from sections only what still has no leaf; the report counts
+    re-attached and rebuilt leaves separately. The mixed-version
+    combinations are a required test of the guard, not an intention.
 - **Class.** The leaf is a Class B derived catalog object (ADR-0066
   decision 4): rebuilt by the fold, superseded leaves swept, a reader meeting
   an unsupported version treating the leaf as absent (ADR-0849 section 4).
@@ -655,10 +622,10 @@ this trace") is narrow, and it is filed as a follow-up once spans ship.
   its window: index buckets plus one or two blocks. The folded Stage 0
   tenant goes from 4.35 GB and 60 GETs per lookup to a few hundred KB
   (target, below). A lookup with no range still grows with the number of
-  covering parts, by one directory and one bucket per part (tens to a few
-  hundred KB each): the trillion-span extrapolation goes from 22 TB of
-  data to at most about 512 KB of index per covering part, and the
-  acceptance table bands that figure rather than the count alone.
+  covering parts, by one directory and one bucket per part (about 69 KB at
+  the balanced 13 bits): the trillion-span extrapolation goes from 22 TB
+  of data to about 70 KB of index per covering part, and the acceptance
+  table bands that figure rather than the count alone.
 - **Storage.** Tier 1 holds one `(key8, block)` entry per distinct pair,
   about 12 B before the bucket's zstd. On the Stage 0 spans corpus that is
   one entry per trace per object: 20 M entries, about 240 MB raw against
@@ -703,7 +670,7 @@ cache state) and stamped into the report.
 | check | target | miss |
 |---|---|---|
 | spans 1 h lookup, cold, folded tenant | under 1 s; bytes read = index buckets + 1-2 blocks, about 200 KB | over 1 s, or over 1 MB |
-| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes at most `parts x (directory + one bucket)`, where the directory is `4 x 2^bucket_bits` bytes (16 KB to 256 KB) and the bucket about equals it by the balance rule, so at most about 512 KB per covering part and about 500 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 512 KB per covering part |
+| spans lookup without a range, month-scale tenant (hour-ranged parts) | 2 leaf GETs per covering part, `keyIndex` phase only; `keyIndex` wire bytes per covering part = `4 x 2^bucket_bits` (the directory) plus one bucket, where the balance rule at the 256 MiB body ceiling picks `bucket_bits` = 13 (a 32 KB directory, about 37 KB of bucket): about 69 KB per covering part, about 70 MB at the 1,024-part ceiling; the per-part figure is reported beside the count | more than 2 per part, index GETs in any other phase, or `keyIndex` bytes over 140 KB per covering part (2x the balanced figure) |
 | spans 1 h lookup, warm | served from the read cache: 0 data GETs after the first run | any data GET |
 | q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | over 100 GETs or over 100 MB |
 | q20, cold, unfolded tail only | per candidate object: 2 ranged GETs plus the named block's pages | a whole-object GET |
