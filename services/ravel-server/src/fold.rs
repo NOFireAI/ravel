@@ -250,9 +250,17 @@ struct RefoldPending {
 /// per-fold cap (`frontier_reconcile_max_hours`) of a pair's oldest hours with
 /// [`Self::peek`], passes them to [`Catalog::fold_with_refold_request`], and
 /// removes those hours with [`Self::remove_hours`] only after a fold that
-/// returned `Ok` and was not a no-op, so a request survives a no-op fold, a
-/// fresh skip, and a failed fold, and the hours past the cap stay queued for
-/// the pair's next fold that advances the watermark.
+/// returned `Ok` and actually reconciled them: on `!no_op` (a first fold, a
+/// rebuild, or an ordinary advancing fold) unconditionally, since all three
+/// derive every hour they touch from the commit layout; on `no_op` only when
+/// `report.refold_hours_reconciled > 0`. `no_op` alone is not the removal
+/// signal: the held-open-only path runs the targeted re-fold pass before
+/// deciding `no_op` and can still report `no_op: true` when nothing was newly
+/// sealed, so a request can be fully reconciled on a no-op fold. A fresh
+/// skip, a failed fold, and a no-op fold that never reached the targeted pass
+/// for these hours (no held-open window covering them) all leave the request
+/// queued, and the hours past the cap stay queued for the pair's next fold
+/// that reconciles them.
 ///
 /// A queued hour is a hint, never a durability dependency. The queue lives in
 /// memory and is bounded at `capacity` pairs: a send for a new pair that finds
@@ -822,12 +830,16 @@ async fn run_loop(
 /// catalog's `frontier_reconcile_max_hours` of its oldest pending hours, read
 /// with [`RefoldQueue::peek`] and left queued (empty when none is pending),
 /// since the catalog reconciles no more than that per fold. Those hours are
-/// removed with [`RefoldQueue::remove_hours`] only after a fold that returned
-/// `Ok` and was not a no-op; a no-op fold, a fresh skip, or a failed fold
-/// leaves them for the next tick, and the hours past the cap stay queued for
-/// the pair's next fold that is not a no-op. A first fold and a rebuild are
-/// not no-ops and reconcile none of the request's hours, yet the hours passed
-/// to them are removed too: both derive every hour from the commit layout.
+/// removed with [`RefoldQueue::remove_hours`] only once the fold result shows
+/// they were actually reconciled: on a `!no_op` fold (a first fold, a
+/// rebuild, or an ordinary advancing fold) unconditionally, since all three
+/// derive every hour they touch from the commit layout; on a `no_op` fold
+/// only when `refold_hours_reconciled > 0`, since the held-open-only path
+/// runs the targeted re-fold pass before deciding `no_op` and can fully
+/// reconcile a request while writing nothing new. A failed fold, a fresh
+/// skip, or a no-op fold with `refold_hours_reconciled == 0` leaves the
+/// request queued for the next tick, and the hours past the cap stay queued
+/// for the pair's next fold that reconciles them.
 ///
 /// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
 /// one deterministic cycle with an injected clock and an explicit live set,
@@ -913,8 +925,18 @@ pub async fn run_tick(
                 no_op,
                 refold_hours_reconciled,
             } => {
+                // `!no_op` (a first fold, a rebuild, or an ordinary advancing
+                // fold) derives every hour it touches from the commit layout,
+                // so the request is reconciled unconditionally. A `no_op`
+                // fold only reconciled the request if the held-open-only
+                // path's targeted re-fold pass actually ran over it
+                // (`refold_hours_reconciled > 0`); otherwise this fold never
+                // reached these hours and the request must stay queued.
                 if no_op {
                     report.no_op.push(tenant);
+                    if refold_hours_reconciled > 0 && !refold_request.is_empty() {
+                        refold.remove_hours(&tenant, signal, &refold_request);
+                    }
                 } else if !refold_request.is_empty() {
                     refold.remove_hours(&tenant, signal, &refold_request);
                 }
