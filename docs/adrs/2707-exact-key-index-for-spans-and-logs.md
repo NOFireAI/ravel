@@ -393,10 +393,10 @@ flowchart LR
     part exceeds the setting, and `2 x` the largest part otherwise; the
     report states the largest unindexed part's entries up front so the
     operator can compute the ceiling before the run. Each batch is one
-    HEAD CAS,
-    bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the
-    attempt re-reads HEAD, keeps the refs for the batch parts whose blake3
-    the new HEAD still names (a leaf is keyed by `part_blake3`, so it is
+    HEAD CAS, bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a
+    lost CAS the attempt re-reads HEAD, keeps the refs for the batch parts
+    whose blake3 the new HEAD still names (a leaf is keyed by
+    `part_blake3`, so it is
     still that part's) and drops the rest, whose leaves the catalog sweep
     deletes. The report carries the largest unindexed part's entries,
     parts rebuilt, leaves written, section bytes read, ranged GETs issued
