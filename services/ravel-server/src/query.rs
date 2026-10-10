@@ -1235,7 +1235,7 @@ fn build_sql_state_inner(
         .with_memory_budget(process_memory_budget.clone());
     // ADR-1702 decision 7: the `logs` and `spans` scans decode each block on
     // the read gate the fetcher carries, and the logs fetcher's opens run on
-    // it too. The `metrics` scan's RSEG catalog decodes run on it as well.
+    // it too. The `samples` scan's RSEG catalog decodes run on it as well.
     if let Some(gate) = read_gate {
         metrics_fetcher = metrics_fetcher.with_read_gate(gate.clone());
         logs_fetcher = logs_fetcher.with_read_gate(gate.clone());

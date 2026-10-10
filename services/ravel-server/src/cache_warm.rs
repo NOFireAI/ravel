@@ -669,6 +669,54 @@ mod tests {
         assert_eq!(section, Some((0, 1)));
     }
 
+    /// The warm pass's logs fetcher carries the same read gate: warming one
+    /// recent RLOG part decodes it through the gate.
+    #[tokio::test]
+    async fn warms_a_published_tenants_most_recent_log_part_on_the_read_gate() {
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        publish_log_segment(&memory, tenant, now).await;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let catalog = catalog_for(store.clone());
+        let cache = Arc::new(Cache::new(CacheLimits::new(
+            16 * 1024 * 1024,
+            1024,
+            1024 * 1024,
+        )));
+        let gate = crate::cpu_gates::CpuGates::new(Default::default()).read;
+
+        warm_cache(
+            store,
+            catalog,
+            ReadCache::Ram(cache.clone()),
+            &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            gate.clone(),
+        )
+        .await;
+
+        assert_eq!(cache.len(), 1, "the one recent log part is warmed");
+        let counted: Vec<_> = gate
+            .snapshot()
+            .sites
+            .iter()
+            .filter(|counts| counts.jobs + counts.inline > 0)
+            .map(|counts| (counts.site, counts.jobs, counts.inline))
+            .collect();
+        // One postings block and one block decode, each inline under the
+        // byte floor (ADR-1702 decision 4).
+        assert_eq!(
+            counted,
+            vec![
+                (ravel_cpu_gate::ReadSite::LogBlock, 0, 1),
+                (ravel_cpu_gate::ReadSite::LogPostings, 0, 1),
+            ]
+        );
+    }
+
     /// Issue #1255: the warm pass reserves against the budget it is handed. A
     /// log part's fetch reserves the whole object before its GET, so a 1-byte
     /// budget refuses it and nothing reaches the cache, while an unlimited

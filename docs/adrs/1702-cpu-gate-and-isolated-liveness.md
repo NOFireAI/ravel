@@ -126,7 +126,9 @@ rule on thread placement.
    inline. The evaluation floor defaults to 100,000 samples, is a gate
    setting like the byte floor, and is measured in task 11 rather than
    trusted. Decision 12 lists the CPU work the rule leaves on the
-   workers. The rule goes into `docs/architecture.md`.
+   workers. The rule goes into `docs/architecture.md`. (Narrowed by the
+   inline open-decode amendment below: it names the codec decodes on the
+   read path that still run on a worker whatever their size.)
 
 2. **The CPU gate is a capped `spawn_blocking`.** A new workspace crate,
    `ravel-cpu-gate`, holds `CpuGate`: a `tokio::sync::Semaphore` with a fixed
@@ -261,6 +263,8 @@ rule on thread placement.
     cheapest queries never queue behind a large part decode. The isolated health listener is the
     backstop for what remains.
     A later ADR can move them if the busy metrics show they matter.
+    (Extended by the inline open-decode amendment below, which lists the
+    read-path codec decodes that also stay on the workers.)
 
 ```mermaid
 flowchart LR
@@ -459,8 +463,8 @@ change, shown by reverting the change under test.
    (`ravel-query`, `ravel-promql`): `decode_selected` and
    `decode_sparse_catalog` in `fetcher.rs`, the LogQL and span fetcher
    paths, and PromQL evaluation at or above the evaluation floor. Two
-   open-time decodes stay inline (see the inline open-decode amendment
-   below).
+   open-time fetcher decodes, the exemplars read and RSEG page decodes
+   stay inline (see the inline open-decode amendment below).
    Acceptance tests: the same floor-0 per-site counter test over a fixture
    RSEG, RLOG and RSPAN object, and
    `promql_evaluation_over_the_floor_runs_through_the_read_gate`, which
@@ -615,15 +619,15 @@ typed budget error logged. The shipped server still never calls
 
 ## Amendment (2026-10-10): the inline open-decode amendment
 
-<!-- amendment-applies: sections="Follow-up tasks, in order" pointer="inline open-decode amendment" -->
+<!-- amendment-applies: sections="Decision|Follow-up tasks, in order" pointer="inline open-decode amendment" -->
 
 Issue #2695 put the server's query engine, its SQL `samples` fetcher, the
 distributed fragment worker's fetcher and the cache warmup's fetchers on the
-read gate. Two decodes on those gated fetchers still run inline on the
-awaiting task, whatever gate the fetcher carries. Each needs either a codec
-crate API that decodes one section at a time or a site label for a set of
-sections, and decision 4 has the gate wrap one section per `log_section` or
-`span_section` job, so neither is wrapped under an existing label.
+read gate. Decision 1 says codec work at or above the floor never runs on a
+runtime worker, and decision 12 lists only DataFusion operators and tonic's
+gzip as what the gate leaves there. The read-path decodes below are further
+exceptions: they run inline on the awaiting task whatever their size and
+whatever gate the fetcher carries.
 
 - **RLOG plan-phase directories.**
   `BlockRangeFetcher::fetch_plan_directories` decodes STREAM_DIR, FIELD_DIR,
@@ -633,6 +637,22 @@ sections, and decision 4 has the gate wrap one section per `log_section` or
 - **RSPAN open.** `SpanSegmentFetcher::plan_candidates` opens each object
   with `RspanReader::new`, which decodes the footer, SKIP_IDX and BLOOM in
   one call. No caller submits `span_section` jobs.
+- **Exemplars.** `read_segment_exemplars` in
+  `services/ravel-server/src/exemplars.rs` fetches a whole RSEG object and
+  decodes it on the request task with no gate: `open_from_full` (line 673),
+  `decode_catalog_v5` (line 706) and `decode_exemplars_section` (line 730).
+  Gating it is tracked separately, as issue #2768.
+
+Decision 4 does not stand in the way of either of the first two: a gate job
+may wrap a whole section or a whole part, and decision 11 leaves the site
+label to the call. Each decodes several sections in one codec call, so
+running it as per-section `log_section` or `span_section` jobs needs a codec
+API in `ravel-logseg` or `ravel-rspan` that decodes one section at a time,
+and running it as one job needs a gate wrap and site label that issue #2695
+did not take on. Both are left to a follow-up.
 
 RSEG page decodes stay inline as before, as `QueryEngine::with_read_gate`
-documents.
+documents. The alert evaluator's alert-state fold, which decodes each alert
+commit's RLOG object with `RlogReader::new` and `scan` in
+`services/ravel-server/src/alerting.rs`, runs inline too; it reads through
+the store directly, not through a fetcher.
