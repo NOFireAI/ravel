@@ -122,8 +122,9 @@ jobs:
 
       # Bring up the SAME compose stack the reader runs (ADR-0081 decisions 1-3).
       # `--pull always` forces the freshest published images so this lane tests
-      # what a reader actually pulls today, not a cached layer. The `latest` leg overrides RAVEL_IMAGE; the
-      # `pinned-default` leg leaves it unset so the compose file's pin is used.
+      # what a reader actually pulls today, not a cached layer. The `latest` leg
+      # overrides RAVEL_IMAGE; the `pinned-default` leg leaves it unset so the
+      # compose file's pin is used.
       - name: Bring up the compose stack
         env:
           RAVEL_IMAGE_OVERRIDE: ${{ matrix.image }}

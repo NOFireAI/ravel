@@ -34,8 +34,8 @@ COPY . .
 # (OpenTelemetry Arrow metrics ingest, registered only when the process is
 # started with `--otap`). The README
 # support matrix names this feature set, and the CI lanes that assemble images
-# from host-built binaries (ci.yml k8s-integration, k8s-nightly.yml) build the
-# same one. ravel-cli has no feature flags and is
+# from host-built binaries (ci.yml k8s-build, k8s-nightly.yml) build the same
+# one. ravel-cli has no feature flags and is
 # built plain. --locked builds against the committed Cargo.lock.
 #
 # CARGO_BUILD_JOBS is capped, not left at cargo's default (one job per host

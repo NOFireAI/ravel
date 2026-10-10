@@ -157,12 +157,14 @@ This job must be exempt from that gate, because a README-only edit is precisely
 the change it exists to catch. It carries its own path filter: `README.md`,
 `deploy/docker-compose/**`, `demo/**`, `scripts/check-readme-commands.sh`,
 `Dockerfile.prebuilt`, and `services/ravel-server/**`. A5 in the Amendments
-section below narrows when the last of those paths triggers the job.
+section below narrows when the last of those paths triggers the job, and A6
+removes the job.
 
 **8. A weekly lane runs the same script against the published image.**
 
-The per-PR job proves the README matches `HEAD`. It cannot prove the README
-matches what a reader actually pulls, because a merged doc change ships before
+The per-PR job proves the README matches `HEAD` (until A6 in the Amendments
+section below removes it, leaving this lane as the only one). It cannot prove
+the README matches what a reader actually pulls, because a merged doc change ships before
 the next release tag does. A scheduled run of the same script with `RAVEL_IMAGE`
 set to `ghcr.io/nofireai/ravel-server:latest` closes that window, plus the
 unmodified-default run from decision 1.
@@ -195,8 +197,8 @@ loudly on its own; the GIF is a recording of a passing run. Recording is a local
 step, not a CI step — CI runs the assertions.
 
 The job that runs it is the per-PR `quickstart` job from decision 6, as a step
-after the marked README blocks (removed by A6 in the Amendments section below). Its path filter already covers `demo/**`, it
-already has the stack up, and it is the only lane that both has docker and gates
+after the marked README blocks (removed by A6 in the Amendments section
+below). Its path filter already covers `demo/**`, it already has the stack up, and it is the only lane that both has docker and gates
 a merge. Naming it here is not a formality: the fleet executors that write this
 script cannot run docker, so without an explicit job attachment the script would
 merge unproven, which is precisely the failure mode this ADR exists to close for
@@ -363,6 +365,7 @@ the same way. Reported, not fixed here.
   was introduced. Promotion should be faster than Tier B's, and the probation is
   for budget only: Tier B's caution was timing noise, and this job's assertions
   are deterministic, so a red run here is a defect rather than a measurement.
+  The job was never promoted, and A6 in the Amendments section removes it.
 - A documentation-only pull request that touches `README.md` stops being nearly
   free in CI. Today `docs_only` skips all 14 compile lanes — PR #171, the stub
   that claimed this ADR number, skipped every one of them. Once this job is
