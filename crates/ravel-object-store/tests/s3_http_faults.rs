@@ -4366,7 +4366,7 @@ async fn a_repeated_continuation_token_is_refused() {
 }
 
 /// Responses that stay truncated and empty with a fresh token each time stop
-/// after the 16 empty responses a page allows.
+/// after the 16 empty responses in a row a page allows.
 #[tokio::test]
 async fn a_listing_that_never_ends_stops_at_the_response_ceiling() {
     let fake = FakeS3::start().await;
@@ -4450,6 +4450,33 @@ async fn listed_keys_are_url_decoded_only_when_the_response_says_so() {
     let literal = store.list("l/", None).await.expect("literal listing");
     assert_eq!(object_keys(&literal), ["l/a+b"]);
     assert_eq!(unaddressable_keys(&literal), ["l/a%2Bb"]);
+}
+
+/// A key under `EncodingType=url` holding a `%` not followed by two hex
+/// digits does not decode: it is reported under its listed text and counted,
+/// and the keys around it still come back.
+#[tokio::test]
+async fn a_key_that_does_not_url_decode_is_reported_and_counted() {
+    let fake = FakeS3::start().await;
+    fake.script_list([list_body(
+        Some("url"),
+        &["u/a", "u/100%", "u/b"],
+        &[],
+        false,
+        None,
+    )]);
+    let store = InstrumentedStore::new(fake.store());
+
+    let page = store
+        .list("u/", None)
+        .await
+        .expect("an undecodable key does not fail the listing");
+
+    assert_eq!(object_keys(&page), ["u/a", "u/b"]);
+    assert_eq!(unaddressable_keys(&page), ["u/100%"]);
+    assert_eq!(page.unaddressable[0].addresses, "u/100%25");
+    assert!(page.next.is_none());
+    assert_eq!(store.metrics().list_unaddressable(), 1);
 }
 
 /// The status table of decision 1, with the attempt count the retry rules
