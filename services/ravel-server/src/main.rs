@@ -304,7 +304,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let alert_rule_tenants: Vec<ravel_types::TenantHash> = alert_rules.keys().copied().collect();
     // A remote cluster's credential belongs to one local tenant. Refuse a spec
-    // that names none on a coordinator that runs queries for more than one,
+    // that names none on a coordinator that runs queries for more than one
+    // (durable sys/auth tokens on a keyed bucket count as more than one),
     // before any listener binds, rather than silently fanning every tenant's
     // queries out under the same credential.
     ravel_server::ensure_federation_tenant_mapping(
@@ -312,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         &tenant_tokens,
         &alert_rule_tenants,
         cli.dev_insecure_tenant_header,
+        ravel_server::durable_auth_enabled(cli.mode, deployment_key.is_some()),
         &auth,
     )?;
     ravel_server::warn_plaintext_federation(&remote_clusters);
