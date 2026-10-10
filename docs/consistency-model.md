@@ -427,7 +427,13 @@ query sees. Guarantees:
 
 - Without a `min_commit_token`, freshness of recent commits above the fold
   watermark is listing-immediate, and sealed history below it is complete by
-  the seal lemma, so staleness there is zero in healthy operation.
+  the seal lemma, so staleness there is zero in healthy operation. An hour
+  sealed early by an operator-asserted seal (below) is the one bounded
+  exception: until the seal margin alone seals it, a commit published into it
+  is visible from the next fold tick on, not immediately. The scheduled fold
+  ticks every `--fold-interval-secs` (300 s by default, plus up to 10% jitter)
+  and skips a tick while HEAD is younger than that interval, so the wait is
+  at most about two intervals.
 - Every index failure mode (HEAD or snapshot part missing, corrupt, stale, or
   a folder down for hours) degrades to wider listing, never to missing or
   wrong data. A snapshot entry whose object was since retired resolves to
@@ -495,15 +501,24 @@ query sees. Guarantees:
   entry or replaced by a compaction or rewrite whose parts the snapshot
   holds. It exits non-zero naming the hours, the count of missing commits
   and up to ten of them when one is not (for example because another fold
-  sealed its hour while the load was writing, or because a rewrite with no
+  sealed its hour while the load was writing and the load's own fold ran only
+  after that hour's natural seal, or because a rewrite with no
   output parts or a retention tombstone removed it, which leaves no level-1
   entry to cover it), and also when that HEAD or
-  one of its parts cannot be read, since coverage was then not checked. Any other writer that publishes into the
-  asserted hours, whether a live server or a load run without the flag, is
-  not refused: its commit succeeds and is invisible to non-token queries the
-  same way as the folder-fast case above, until a HEAD rebuild (see
+  one of its parts cannot be read, since coverage was then not checked. Any
+  writer may publish into the asserted hours after the seal, whether a live
+  server, another load, or a load run without the flag: it is not refused, and
+  its commit succeeds. Every fold, the scheduled fold and a load's own fold
+  included, holds an hour above its seal margin hour and at or below HEAD's
+  watermark open, re-lists it, and folds any commit HEAD does not hold. Such a
+  commit is therefore visible to non-token queries from the next fold tick
+  until the hour's natural seal, `max_flush_lifetime + clock_skew_allowance +
+  fold_safety_margin` (1h20m by default) after the hour ends. Only a commit
+  that no fold picks up before that natural seal, because it lands after it or
+  because no fold runs in between, is invisible to non-token queries the same
+  way as the folder-fast case above, until a HEAD rebuild (see
   docs/guides/operations/troubleshooting.md "Rebuild the snapshot"). A
-  `min_commit_token` read still sees it.
+  `min_commit_token` read sees it either way.
 
 The fold protocol (the CAS'd HEAD pointer, watermark computation, and how
 each degraded path resolves) is in docs/catalog-and-mvcc.md.

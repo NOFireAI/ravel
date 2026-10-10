@@ -175,8 +175,9 @@ pub struct FoldReport {
     pub watermark_hour: Option<u32>,
     /// HEAD's watermark_hour before this call.
     pub previous_watermark_hour: Option<u32>,
-    /// `true` if nothing was sealed beyond `previous_watermark_hour`: HEAD
-    /// was left untouched, no part was written.
+    /// `true` if nothing was sealed beyond `previous_watermark_hour` and no
+    /// hour an operator-asserted seal holds open listed a commit HEAD does
+    /// not hold: HEAD was left untouched, no part was written.
     pub no_op: bool,
     /// `true` if this fold discovered entries by listing every commit
     /// prefix up to the watermark (HEAD absent, corrupt, or its parts
@@ -836,7 +837,10 @@ type BucketContribution = Vec<(SnapshotEntry, bool)>;
 /// unchanged and can be skipped without a GET. A compaction record, a
 /// retention tombstone, or a selective-erasure rewrite record (ADR-0064
 /// decision 3) can all land after an hour was sealed and folded, so those
-/// three shapes are the reconcile triggers.
+/// three shapes are the reconcile triggers. An hour sealed only by an
+/// operator-asserted seal is not yet sealed in the lemma's sense, so the
+/// reconcile pass also folds an unrecognised L0 record there (see
+/// [`held_open_hours`]).
 ///
 /// A rewrite record is load-bearing here, not an incidental addition: the
 /// rewrite pass targets already-sealed (already-folded) buckets by
@@ -859,6 +863,45 @@ fn bucket_needs_reconcile(listing: &[ObjectMeta]) -> bool {
                 | Ok(BucketEntry::Tombstone(_))
                 | Ok(BucketEntry::RewriteRecord(_))
         )
+    })
+}
+
+/// The hours a HEAD with watermark `head_watermark` covers only through an
+/// operator-asserted seal at a fold whose margin hour is `margin_hour`: every
+/// hour above the margin hour up to the watermark, inclusive (ADR-2677
+/// decision 1). The seal lemma does not hold for these hours yet, since a
+/// writer that started after the seal may still publish into them, so the
+/// fold keeps re-listing them until the margin alone seals them. `None` when
+/// the margin already seals the watermark, which is every HEAD no seal-through
+/// hour raised.
+fn held_open_hours(head_watermark: u32, margin_hour: Option<u32>) -> Option<(u32, u32)> {
+    match margin_hour {
+        Some(margin) if margin >= head_watermark => None,
+        Some(margin) => Some((margin + 1, head_watermark)),
+        None => Some((0, head_watermark)),
+    }
+}
+
+/// Whether `listing` names a level-0 commit record whose identity
+/// `is_folded` does not recognise, reading only the keys: a commit key carries
+/// its full entry identity, so no record GET is needed to tell a commit
+/// already in the snapshot from one published after the fold that sealed its
+/// hour.
+fn lists_an_unfolded_commit(
+    listing: &[ObjectMeta],
+    is_folded: impl Fn(&EntryIdentity) -> bool,
+) -> bool {
+    listing.iter().any(|meta| {
+        let Ok(BucketEntry::CommitRecord(parsed)) = keys::partition_bucket_entry(&meta.key) else {
+            return false;
+        };
+        !is_folded(&(
+            parsed.ingest_hour_bucket,
+            parsed.shard,
+            parsed.writer_id.as_bytes().to_vec(),
+            parsed.epoch,
+            parsed.seq,
+        ))
     })
 }
 
@@ -983,7 +1026,9 @@ impl Catalog {
     /// extension point ([`Transaction`] has no public constructor).
     ///
     /// Returns `Ok` with `no_op: true` if no hour has newly sealed since the
-    /// last fold. Every other failure mode that the metric index is allowed
+    /// last fold and no hour an operator-asserted seal holds open (see
+    /// [`Catalog::fold_with_seal_through`]) lists a commit HEAD does not
+    /// hold. Every other failure mode that the metric index is allowed
     /// to degrade from (absent/corrupt HEAD, an unreadable previous part)
     /// falls back to a full rebuild from the commit layout rather than
     /// erroring. An unrecognized bucket-key shape or a duplicate commit
@@ -1049,9 +1094,11 @@ impl Catalog {
     /// 4's carve-outs: a first fold and a rebuild do no reconcile work at all,
     /// so a request made against either is ignored rather than adding LISTs to
     /// a fold that already derives every hour from the commit layout, and a
-    /// no-op fold (the watermark did not advance) returns before the reconcile
-    /// block, so a request made against one is ignored too. The requester
-    /// resubmits a still-held hour on its next sweep.
+    /// fold that does not advance the watermark ignores a request too: it
+    /// either returns before the reconcile block or reconciles only the hours
+    /// an operator-asserted seal holds open (see
+    /// [`Catalog::fold_with_seal_through`]). The requester resubmits a
+    /// still-held hour on its next sweep.
     #[allow(clippy::too_many_arguments)]
     pub async fn fold_with_refold_request(
         &self,
@@ -1083,12 +1130,19 @@ impl Catalog {
     /// seals at `now_ns` and `seal_through_hour`. Supplying an hour is an
     /// operator assertion that no writer will publish a commit into that hour
     /// or any earlier one: the margin exists because a live writer may still
-    /// do so, and a commit published into an hour after it is sealed is
-    /// skipped by every later fold's reconcile and stays invisible to queries
-    /// that carry no commit token until a HEAD rebuild. `now_ns` stays the
-    /// real time for everything else: HEAD's `created_unix_ns`, the retention
-    /// frontier, and the outcome metrics. A target at or below HEAD's
-    /// watermark is a no-op, exactly as for [`Catalog::fold`].
+    /// do so. The assertion is not trusted past the margin, though: every
+    /// later fold, with or without a seal-through hour, re-lists each hour
+    /// above the margin hour at its own `now_ns` and at or below HEAD's
+    /// watermark, one LIST per shard, and folds any level-0 commit record
+    /// there that HEAD does not hold, so a commit published into such an hour
+    /// is visible to queries that carry no commit token from the next fold
+    /// on. Once the margin passes an hour it is sealed like any other, and a
+    /// commit published into it after that stays invisible to those queries
+    /// until a HEAD rebuild. `now_ns` stays the real time for everything else:
+    /// HEAD's `created_unix_ns`, the retention frontier, and the outcome
+    /// metrics. A target at or below HEAD's watermark is a no-op, exactly as
+    /// for [`Catalog::fold`], unless that re-listing finds a commit HEAD does
+    /// not hold, in which case the fold writes a HEAD at the same watermark.
     ///
     /// A `seal_through_hour` later than the hour bucket of `now_ns` is
     /// refused with [`CatalogError::InvalidConfig`] before anything is read:
@@ -1267,22 +1321,49 @@ impl Catalog {
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
 
-            let Some(watermark_hour) = target_hour else {
-                return Ok(no_op_report(
-                    head_state.watermark_hour(),
-                    applied_seal_through,
-                    counters,
-                ));
+            // Hours the HEAD covers only through an operator-asserted seal
+            // (ADR-2677 decision 1), from its watermark and this fold's real
+            // clock alone: the seal-through hour of an earlier fold is not
+            // recorded anywhere, and the seal-through hour of this one says
+            // nothing about what the HEAD already holds.
+            let held_open = match &head_state {
+                HeadState::Valid { head, .. } => held_open_hours(head.watermark_hour, margin_hour),
+                _ => None,
             };
-            if let Some(watermark_hour_old) = head_state.watermark_hour()
-                && watermark_hour_old >= watermark_hour
-            {
-                return Ok(no_op_report(
-                    Some(watermark_hour_old),
-                    applied_seal_through,
-                    counters,
-                ));
-            }
+            let advance_to = target_hour
+                .filter(|target| head_state.watermark_hour().is_none_or(|old| *target > old));
+            // `held_listings` is `Some` only on a fold that does not advance
+            // the watermark and runs solely to fold a late commit into a
+            // held-open hour: its reconcile pass is those listings and
+            // nothing else.
+            let (watermark_hour, held_listings) = match (advance_to, held_open, &head_state) {
+                (Some(target), _, _) => (target, None),
+                (None, Some(held), HeadState::Valid { head, .. }) => {
+                    let held_buckets = hour_range_buckets(&generations, held.0, held.1);
+                    let listings = self
+                        .discover_bucket_listings(tenant, signal, &held_buckets)
+                        .await?;
+                    counters.list_requests += held_buckets.len() as u64;
+                    if !self
+                        .held_open_has_unfolded(head, held, &listings, &mut counters)
+                        .await
+                    {
+                        return Ok(no_op_report(
+                            Some(head.watermark_hour),
+                            applied_seal_through,
+                            counters,
+                        ));
+                    }
+                    (head.watermark_hour, Some(listings))
+                }
+                _ => {
+                    return Ok(no_op_report(
+                        head_state.watermark_hour(),
+                        applied_seal_through,
+                        counters,
+                    ));
+                }
+            };
 
             let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
                 HeadState::Valid { head, .. } => match self
@@ -1436,9 +1517,35 @@ impl Catalog {
             // time (issue #526).
             let mut frontier_listed_hours: HashSet<u32> = HashSet::new();
             let mut refold_hours_reconciled: u64 = 0;
-            if let Some(watermark_hour_old) = reconcile_watermark {
+            if let (Some(listings), Some(_)) = (&held_listings, reconcile_watermark) {
+                // A fold that does not advance the watermark re-lists only
+                // the held-open hours: every other hour is reconciled by the
+                // next fold that does advance it, exactly as on a no-op fold.
+                for (shard, hour, listing) in listings {
+                    self.reconcile_one_bucket(
+                        tenant,
+                        signal,
+                        *shard,
+                        *hour,
+                        listing,
+                        &accounting,
+                        &mut entries,
+                        &mut seen,
+                        &mut dirty_hours,
+                        &mut counters,
+                        &mut layout_drift_count,
+                        &mut coverage,
+                        true,
+                    )
+                    .await?;
+                }
+            } else if let Some(watermark_hour_old) = reconcile_watermark {
                 let window = self.config().fold_reconcile_window_hours;
-                let lo = watermark_hour_old.saturating_sub(window);
+                // The window always reaches the held-open hours, which sit at
+                // or below the old watermark.
+                let lo = held_open.map_or(watermark_hour_old.saturating_sub(window), |held| {
+                    watermark_hour_old.saturating_sub(window).min(held.0)
+                });
                 // Inclusive at both ends: `watermark_hour_old` is the boundary
                 // `incremental_buckets` already excludes, so the reconcile
                 // window and the incremental range are adjacent, not
@@ -1463,6 +1570,7 @@ impl Catalog {
                         &mut counters,
                         &mut layout_drift_count,
                         &mut coverage,
+                        held_open.is_some_and(|held| (held.0..=held.1).contains(hour)),
                     )
                     .await?;
                 }
@@ -1552,6 +1660,7 @@ impl Catalog {
                                 &mut counters,
                                 &mut layout_drift_count,
                                 &mut coverage,
+                                false,
                             )
                             .await?;
                         }
@@ -1648,6 +1757,7 @@ impl Catalog {
                                 &mut counters,
                                 &mut layout_drift_count,
                                 &mut coverage,
+                                false,
                             )
                             .await?;
                         }
@@ -1660,6 +1770,15 @@ impl Catalog {
                     hours = refold_hours_reconciled,
                     "fold reconciled the ingest hours a re-fold request named"
                 );
+            }
+            // A fold run only for the held-open hours whose reconcile found
+            // every listed commit already folded writes nothing.
+            if held_listings.is_some() && !rebuilt && dirty_hours.is_empty() {
+                return Ok(no_op_report(
+                    Some(watermark_hour),
+                    applied_seal_through,
+                    counters,
+                ));
             }
             // A reconcile that changed any hour invalidates the append-only,
             // stable-ordinal assumption the forward postings merge relies on
@@ -2485,21 +2604,77 @@ impl Catalog {
     ) -> Result<Vec<SnapshotEntry>, CatalogError> {
         let mut entries = Vec::new();
         for part_ref in &head.parts {
-            let got = self.store().get(&part_ref.key, GetRange::Full).await?;
-            counters.get_requests += 1;
-            let digest = blake3::hash(&got.data);
-            if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
-                return Err(CatalogError::FieldMismatch {
-                    key: part_ref.key.clone(),
-                    field: "blake3",
-                    expected: hex_encode(&part_ref.blake3),
-                    actual: digest.to_hex().to_string(),
-                });
-            }
-            let decoded = snapshot_format::decode_part(&got.data, &PartLimits::default())?;
-            entries.extend(decoded.entries);
+            entries.extend(self.load_part_entries(part_ref, counters).await?);
         }
         Ok(entries)
+    }
+
+    /// Load one part HEAD names, verifying its bytes against the recorded
+    /// blake3 before decoding them.
+    async fn load_part_entries(
+        &self,
+        part_ref: &SnapshotPartRef,
+        counters: &mut RequestCounters,
+    ) -> Result<Vec<SnapshotEntry>, CatalogError> {
+        let got = self.store().get(&part_ref.key, GetRange::Full).await?;
+        counters.get_requests += 1;
+        let digest = blake3::hash(&got.data);
+        if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
+            return Err(CatalogError::FieldMismatch {
+                key: part_ref.key.clone(),
+                field: "blake3",
+                expected: hex_encode(&part_ref.blake3),
+                actual: digest.to_hex().to_string(),
+            });
+        }
+        let decoded = snapshot_format::decode_part(&got.data, &PartLimits::default())?;
+        Ok(decoded.entries)
+    }
+
+    /// Whether the held-open hours `held` (see [`held_open_hours`]) list a
+    /// level-0 commit record HEAD's parts do not hold. LISTs nothing itself:
+    /// `listings` is the caller's re-listing of exactly those hours. GETs only
+    /// the parts whose hour range meets `held`, and none at all when the
+    /// listings name no commit record. A part that cannot be read answers
+    /// true, so the caller takes the full fold path, whose own load of the
+    /// same part fails and rebuilds.
+    async fn held_open_has_unfolded(
+        &self,
+        head: &SnapshotHead,
+        held: (u32, u32),
+        listings: &[BucketListing],
+        counters: &mut RequestCounters,
+    ) -> bool {
+        let names_a_commit = listings.iter().any(|(_, _, listing)| {
+            listing.iter().any(|meta| {
+                matches!(
+                    keys::partition_bucket_entry(&meta.key),
+                    Ok(BucketEntry::CommitRecord(_))
+                )
+            })
+        });
+        if !names_a_commit {
+            return false;
+        }
+        let mut folded: HashSet<EntryIdentity> = HashSet::new();
+        for part_ref in head
+            .parts
+            .iter()
+            .filter(|part| part.min_hour <= held.1 && part.watermark_hour >= held.0)
+        {
+            match self.load_part_entries(part_ref, counters).await {
+                Ok(entries) => folded.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| (held.0..=held.1).contains(&entry.ingest_hour_bucket))
+                        .map(entry_identity),
+                ),
+                Err(_) => return true,
+            }
+        }
+        listings
+            .iter()
+            .any(|(_, _, listing)| lists_an_unfolded_commit(listing, |id| folded.contains(id)))
     }
 
     /// Load and verify the previous fold's postings object before trusting
@@ -2815,12 +2990,17 @@ impl Catalog {
         counters: &mut RequestCounters,
         layout_drift_count: &mut u64,
         coverage: &mut declared_stats::StampCoverage,
+        held_open: bool,
     ) -> Result<(), CatalogError> {
         // A bucket with only immutable L0 records cannot have changed since it
         // was folded (seal lemma). Skip it with no GET; only a late compaction
         // record, rewrite record, or retention tombstone triggers real
-        // reconcile work.
-        if !bucket_needs_reconcile(listing) {
+        // reconcile work. In a held-open hour (`held_open`, see
+        // [`held_open_hours`]) the lemma does not hold yet, so a commit
+        // record the snapshot does not hold triggers it too.
+        if !bucket_needs_reconcile(listing)
+            && !(held_open && lists_an_unfolded_commit(listing, |id| seen.contains_key(id)))
+        {
             return Ok(());
         }
         let contribution = self
@@ -9318,8 +9498,9 @@ mod tests {
             assert_eq!(again.seal_through_hour, Some(ceiling));
         }
 
-        // Without a ceiling the scheduled fold no-ops on the asserted hours
-        // until the margin alone passes them.
+        // Without a ceiling the scheduled fold re-lists the asserted hours
+        // until the margin alone passes them, and with nothing new there it
+        // no-ops.
         for later in [now_at_seal(H) - 1, now_at_seal(H)] {
             let scheduled = fold_sealing(&catalog, later, None).await;
             assert!(scheduled.no_op, "at {later}: {scheduled:?}");
@@ -9432,56 +9613,184 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn late_commit_into_a_sealed_hour_is_invisible_until_rebuild() {
-        const H: u32 = 480_000;
-        let store = Arc::new(MemoryStore::new());
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        let now = now_inside(H);
-        let on_time = publish_segment(&store, 0, Uuid::new_v4(), 1, H, now).await;
-        let sealed = fold_sealing(&catalog, now, Some(H)).await;
-        assert_eq!(sealed.watermark_hour, Some(H));
+    /// The store's LIST requests of either kind, for a fold-cost delta.
+    fn list_calls(store: &InstrumentedStore<Arc<MemoryStore>>) -> u64 {
+        let snapshot = store.metrics().snapshot();
+        snapshot.list.calls + snapshot.list_delimited.calls
+    }
 
-        // A writer the operator asserted was stopped publishes into hour H
-        // after the seal.
-        let late = publish_segment(&store, 0, Uuid::new_v4(), 2, H, now + 1).await;
+    /// The `writer_seq`s a fresh catalog's non-token resolve of hour `hour`
+    /// serves, sorted.
+    async fn resolved_seqs(store: &Arc<MemoryStore>, shard_count: u32, hour: u32) -> Vec<u64> {
         let window = ravel_types::TimeRange {
-            start_ns: i64::from(H) * NS_PER_HOUR,
-            end_ns: i64::from(H + 1) * NS_PER_HOUR,
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: i64::from(hour + 1) * NS_PER_HOUR,
         };
-        let query_now = i64::from(H + 1) * NS_PER_HOUR + 1;
-        let seqs = |snapshot: &crate::Snapshot| {
-            let mut seqs: Vec<u64> = snapshot.segments.iter().map(|s| s.writer_seq).collect();
-            seqs.sort_unstable();
-            seqs
-        };
-        let fresh = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let query_now = i64::from(hour + 1) * NS_PER_HOUR + 1;
+        let fresh = Catalog::new(store.clone(), config(shard_count)).expect("catalog");
         let resolved = fresh
             .resolve(&tenant(), Signal::Metrics, window, &[], query_now)
             .await
             .expect("resolve");
-        assert_eq!(
-            seqs(&resolved),
-            vec![on_time.writer_seq],
-            "the late commit is invisible to a query carrying no token"
-        );
-        // The next scheduled fold does not pick it up either.
-        let next = fold_sealing(&fresh, now_at_seal(H + 1), None).await;
-        assert_eq!(next.entry_count, 1, "{next:?}");
+        let mut seqs: Vec<u64> = resolved.segments.iter().map(|s| s.writer_seq).collect();
+        seqs.sort_unstable();
+        seqs
+    }
 
-        // A HEAD rebuild lists the sealed hours again and finds it.
-        store
-            .delete(&head_object_key(&tenant(), Signal::Metrics))
-            .await
-            .expect("delete HEAD");
-        let rebuilt_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        let rebuilt = fold_sealing(&rebuilt_catalog, now_at_seal(H + 1), None).await;
-        assert!(rebuilt.rebuilt, "{rebuilt:?}");
-        assert_eq!(rebuilt.entry_count, 2);
-        let after = rebuilt_catalog
-            .resolve(&tenant(), Signal::Metrics, window, &[], query_now)
-            .await
-            .expect("resolve");
-        assert_eq!(seqs(&after), vec![on_time.writer_seq, late.writer_seq]);
+    /// The reference tenant's shard count, which every per-fold LIST figure
+    /// below is a multiple of.
+    const REFERENCE_SHARDS: u32 = 4;
+
+    #[tokio::test]
+    async fn late_commit_into_an_operator_sealed_hour_is_visible_after_the_next_fold() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(REFERENCE_SHARDS)).expect("catalog");
+        let now = now_inside(H);
+        let on_time = publish_segment(&inner, 0, Uuid::new_v4(), 1, H, now).await;
+        let sealed = fold_sealing(&catalog, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+
+        // A writer that started after the seal publishes into hour H.
+        let late = publish_segment(&inner, 1, Uuid::new_v4(), 2, H, now + 1).await;
+        assert_eq!(
+            resolved_seqs(&inner, REFERENCE_SHARDS, H).await,
+            vec![on_time.writer_seq],
+            "before the next fold the late commit is not in the snapshot"
+        );
+
+        // A plain fold five minutes later, with no seal-through hour and still
+        // well inside H's natural margin, re-lists the held-open hours H-2..=H
+        // (the margin hour is H-3 until twenty past): three hours, one LIST
+        // per shard.
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert!(later < now_at_seal(H));
+        assert_eq!(catalog.margin_watermark_hour(later), Some(H - 3));
+        let before = list_calls(&store);
+        let next = fold_sealing(&catalog, later, None).await;
+        let listed = list_calls(&store) - before;
+        assert!(!next.no_op, "{next:?}");
+        assert!(!next.rebuilt, "{next:?}");
+        assert_eq!(next.watermark_hour, Some(H), "the watermark does not move");
+        assert_eq!(next.previous_watermark_hour, Some(H));
+        assert_eq!(next.entry_count, 2, "{next:?}");
+        assert_eq!(listed, u64::from(3 * REFERENCE_SHARDS));
+        assert_eq!(next.list_requests, listed);
+        assert_eq!(
+            resolved_seqs(&inner, REFERENCE_SHARDS, H).await,
+            vec![on_time.writer_seq, late.writer_seq],
+            "a query carrying no token sees the late commit after the fold"
+        );
+
+        // With nothing new published the same re-listing finds nothing and
+        // the fold is a no-op.
+        let before = list_calls(&store);
+        let quiet = fold_sealing(&catalog, later + 60 * 1_000_000_000, None).await;
+        assert!(quiet.no_op, "{quiet:?}");
+        assert_eq!(quiet.watermark_hour, Some(H));
+        assert_eq!(list_calls(&store) - before, u64::from(3 * REFERENCE_SHARDS));
+        // HEAD and the tenant config, then each snapshot part, since the
+        // listing names commit records.
+        assert_eq!(quiet.get_requests, 2 + next.parts_total, "{quiet:?}");
+    }
+
+    #[test]
+    fn held_open_hours_number_three_then_two_then_one_then_none() {
+        const H: u32 = 480_000;
+        let catalog =
+            Catalog::new(Arc::new(MemoryStore::new()), config(REFERENCE_SHARDS)).expect("catalog");
+        let minute = 60 * 1_000_000_000;
+        let start = i64::from(H) * NS_PER_HOUR;
+        let held = |now: i64| {
+            held_open_hours(H, catalog.margin_watermark_hour(now)).map_or(0, |(lo, hi)| hi - lo + 1)
+        };
+        assert_eq!(held(start), 3);
+        assert_eq!(held(start + 20 * minute - 1), 3);
+        assert_eq!(held(start + 20 * minute), 2);
+        assert_eq!(held(start + 80 * minute - 1), 2);
+        assert_eq!(held(start + 80 * minute), 1);
+        assert_eq!(held(now_at_seal(H) - 1), 1);
+        assert_eq!(held(now_at_seal(H)), 0);
+        assert_eq!(held(now_at_seal(H + 5)), 0);
+    }
+
+    #[tokio::test]
+    async fn after_the_natural_seal_the_skip_applies_again() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(REFERENCE_SHARDS)).expect("catalog");
+        let now = now_inside(H);
+        let on_time = publish_segment(&inner, 0, Uuid::new_v4(), 1, H, now).await;
+        fold_sealing(&catalog, now, Some(H)).await;
+
+        // From H's natural seal on, the margin alone seals the watermark, so
+        // a fold that does not advance it lists nothing.
+        let before = list_calls(&store);
+        let at_seal = fold_sealing(&catalog, now_at_seal(H), None).await;
+        assert!(at_seal.no_op, "{at_seal:?}");
+        assert_eq!(list_calls(&store) - before, 0);
+
+        let late = publish_segment(&inner, 1, Uuid::new_v4(), 2, H, now_at_seal(H)).await;
+        let before = list_calls(&store);
+        let after_seal =
+            fold_sealing(&catalog, now_at_seal(H) + 30 * 60 * 1_000_000_000, None).await;
+        assert!(after_seal.no_op, "{after_seal:?}");
+        assert_eq!(list_calls(&store) - before, 0);
+
+        // The next advancing fold lists hour H+1 and the 27-hour reconcile
+        // window [H-26, H]; the window skips H's L0-only bucket as for any
+        // naturally sealed hour, so the late commit stays out.
+        let before = list_calls(&store);
+        let advanced = fold_sealing(&catalog, now_at_seal(H + 1), None).await;
+        assert!(!advanced.no_op, "{advanced:?}");
+        assert_eq!(advanced.watermark_hour, Some(H + 1));
+        assert_eq!(advanced.entry_count, 1, "{advanced:?}");
+        assert_eq!(
+            list_calls(&store) - before,
+            u64::from((1 + 27) * REFERENCE_SHARDS)
+        );
+        assert_eq!(
+            resolved_seqs(&inner, REFERENCE_SHARDS, H).await,
+            vec![on_time.writer_seq],
+            "a commit published after the natural seal is invisible: {late:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_fold_with_no_operator_seal_lists_nothing_extra() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(REFERENCE_SHARDS)).expect("catalog");
+        let now = now_inside(H);
+        publish_segment(&inner, 0, Uuid::new_v4(), 1, H - 3, now - 3 * NS_PER_HOUR).await;
+        let first = fold_sealing(&catalog, now, None).await;
+        assert_eq!(first.watermark_hour, Some(H - 3), "{first:?}");
+
+        // Same margin hour: a no-op that lists nothing and GETs only HEAD and
+        // the tenant config.
+        let before = store.metrics().snapshot();
+        let quiet = fold_sealing(&catalog, now + 5 * 60 * 1_000_000_000, None).await;
+        let after = store.metrics().snapshot();
+        assert!(quiet.no_op, "{quiet:?}");
+        assert_eq!(
+            after.list.calls + after.list_delimited.calls,
+            before.list.calls + before.list_delimited.calls
+        );
+        assert_eq!(after.get.calls - before.get.calls, 2);
+
+        // An advancing fold lists the new hour and the 27-hour reconcile
+        // window [H-29, H-3], one LIST per shard each.
+        let before = list_calls(&store);
+        let advanced = fold_sealing(&catalog, now_at_seal(H - 2), None).await;
+        assert!(!advanced.no_op, "{advanced:?}");
+        assert_eq!(advanced.watermark_hour, Some(H - 2));
+        assert_eq!(
+            list_calls(&store) - before,
+            u64::from((1 + 27) * REFERENCE_SHARDS)
+        );
+        assert_eq!(advanced.list_requests, list_calls(&store) - before);
     }
 }
