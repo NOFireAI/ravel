@@ -1961,7 +1961,8 @@ running is refused at once when it does not fit, as before. The internal
 slice fetches of a distributed scan do not wait either.
 
 Waiting queries are not queued. When the reserved bytes drop below the
-threshold, every waiting query is admitted at its next re-check, so several
+threshold, every waiting query whose re-check lands before the bytes rise
+again is admitted, so several
 can start together and still fail their first fetch with "query memory
 budget exhausted: the process could not reserve memory to fetch segment
 data; retry".

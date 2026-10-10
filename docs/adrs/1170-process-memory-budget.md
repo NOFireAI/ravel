@@ -1212,9 +1212,12 @@ fraction is calibrated on one workload and one host size and is a starting
 value, not a measured optimum.
 
 The refusal class and the bound on the wait are interim. ADR-2633, accepted
-after this design was dispatched, caps the same wait at
-`--memory-gate-wait-ms` (decision 3) and answers every fetch-memory refusal
-with 422 (decision 5). Neither is applied here. Until ADR-2633's tasks land,
+after this design was dispatched, adds its own wait at the same admission
+sites, comparing resident memory to a high-water mark and capped at
+`--memory-gate-wait-ms` (decision 3), and answers every fetch-memory refusal
+with 422 (decision 5). Neither is applied here. Its decision 3 lists
+`slice_do_get` among the sites that wait; the slice exemption above must
+carry over when it lands, or the hold-and-wait returns. Until ADR-2633's tasks land,
 this wait is bounded only by the statement's deadline, and a client sees a
 memory refusal as a 503 from the wait or a fetch, or a 422 from the sort or
 SQL memory pool.

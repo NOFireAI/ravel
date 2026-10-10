@@ -1415,8 +1415,9 @@ query memory budget exhausted: no headroom freed before the statement deadline; 
 SQL statement that waits at both calls counts twice) and
 `ravel_memory_admission_wait_refusals_total` the waits that were refused.
 
-The 503 class and the deadline-only bound are interim: ADR-2633 caps this
-wait and moves every memory refusal to 422, and is not applied yet.
+The 503 class and the deadline-only bound are interim: ADR-2633 adds a
+capped wait on resident memory at the same sites and moves every memory
+refusal to 422, and is not applied yet.
 
 A fetch the budget refuses after admission (`FetchError`, `LogFetchError` or
 `SpanFetchError::FetchMemoryExhausted`) answers SQL and PromQL clients with
