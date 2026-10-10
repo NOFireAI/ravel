@@ -30,7 +30,8 @@ use common::{TestClock, make_point, tenant};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_ingest::{
-    IngestConfig, IngestRouter, MAX_FLUSH_CLOCK_HOLD_NS, WriteError, WriteMode, WriteReceipt,
+    IngestConfig, IngestRouter, MAX_FLUSH_CLOCK_HOLD_NS, PendingAckBudget, WriteError, WriteMode,
+    WriteReceipt,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -285,6 +286,7 @@ async fn a_dead_shard_is_respawned_and_serves_the_next_write() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -378,6 +380,7 @@ async fn exhausting_the_respawn_budget_condemns_the_shard_and_drops_readiness() 
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -473,6 +476,7 @@ async fn a_shard_that_never_dies_is_unaffected_and_counts_zero_deaths() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -524,6 +528,7 @@ async fn concurrent_observers_of_one_death_count_it_once() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -647,7 +652,13 @@ async fn a_respawn_budget_decays_after_a_clean_run() {
     let deaths = (IngestRouter::MAX_SHARD_RESPAWNS * 2 + 1) as usize;
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(SplitBrainNTimes::new(deaths));
     let clock = TestClock::new(BASE_NS);
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let victim_shard = 0;
@@ -761,6 +772,7 @@ async fn the_flush_open_floor_survives_a_respawn() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

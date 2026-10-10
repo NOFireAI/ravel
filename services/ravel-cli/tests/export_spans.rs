@@ -31,7 +31,7 @@ use ravel_cli::export::{self, SpansExportReport};
 use ravel_cli::load::{self, SpansMapping};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::store::{StoreKind, StoreSelection};
-use ravel_ingest::{Clock, IngestConfig, SpanIngestRouter, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, PendingAckBudget, SpanIngestRouter, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
@@ -744,6 +744,7 @@ async fn ingest_otlp(store: &Arc<dyn ObjectStoreBackend>, tenant: &str, spans: V
         },
         Arc::clone(store),
         Arc::new(FixedClock(LOAD_NS)),
+        Arc::new(PendingAckBudget::new(0)),
     );
     router
         .write(

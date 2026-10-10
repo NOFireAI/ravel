@@ -113,7 +113,8 @@ use crate::metrics_workload::{Profile, WorkloadFile};
 use prost::Message;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{
-    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, SystemClock, WriteMode,
+    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, PendingAckBudget, SystemClock,
+    WriteMode,
 };
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetrics, list_all};
 use ravel_promql::Value;
@@ -978,6 +979,7 @@ pub async fn replay_into_ravel(
         Arc::clone(&store),
         ravel_types::Signal::Metrics,
         Arc::clone(&clock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     // Client-side admission: partition into valid points (carrying their

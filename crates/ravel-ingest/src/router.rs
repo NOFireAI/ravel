@@ -21,7 +21,8 @@ use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_generations,
 };
-use crate::metrics::IngestMetrics;
+use crate::metrics::{IngestMetrics, IngestMetricsSnapshot};
+use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::shard::{ShardActor, ShardMsg};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
@@ -41,6 +42,123 @@ pub enum WriteMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteReceipt {
     pub tokens: Vec<CommitToken>,
+}
+
+/// A write enqueued to every involved shard but not yet acknowledged
+/// (ADR-2793 decision 4), returned by [`IngestRouter::submit`] and its
+/// `submit_*` siblings. [`Self::acks`] is the other half of what
+/// [`IngestRouter::write`] used to do in one step.
+///
+/// Holds the strict-mode pending-ack permit this submit took, and releases
+/// it -- a plain RAII permit gives all three -- when [`Self::acks`]
+/// resolves (either way), when its ack deadline passes, and when `self` is
+/// dropped without calling [`Self::acks`] at all.
+pub struct Submitted<'a> {
+    router: &'a IngestRouter,
+    state: SubmittedState,
+}
+
+enum SubmittedState {
+    /// Buffered mode, or a write with no points and no exemplars: already
+    /// resolved, nothing to await.
+    Done(WriteReceipt),
+    /// Strict mode with at least one shard's ack outstanding.
+    Pending {
+        /// Parallel to `ack_rxs`: the (shard, incarnation) each receiver
+        /// belongs to.
+        ack_shards: Vec<(u32, u64)>,
+        ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, WriteError>>>,
+        ack_deadline: Duration,
+        set: Arc<Vec<ShardHandle>>,
+        /// Held until `acks()` resolves, its deadline elapses, or this value
+        /// is dropped unawaited; never read directly.
+        _permit: Option<PendingAckPermit>,
+    },
+}
+
+impl Submitted<'_> {
+    /// Awaits every involved shard's strict ack within the deadline captured
+    /// at submit time, exactly as [`IngestRouter::write`] used to inline.
+    /// Returns a receipt with one token per shard that acked durable, maps a
+    /// deadline elapse to [`WriteError::AckTimeout`], and otherwise applies
+    /// the same partial-write classification `write` always has (issue
+    /// #1130/#296). A buffered submit's `acks()` returns the empty receipt
+    /// immediately: there was never anything to await.
+    pub async fn acks(self) -> Result<WriteReceipt, WriteError> {
+        let router = self.router;
+        let (ack_shards, ack_rxs, ack_deadline, set, _permit) = match self.state {
+            SubmittedState::Done(receipt) => return Ok(receipt),
+            SubmittedState::Pending {
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                set,
+                _permit,
+            } => (ack_shards, ack_rxs, ack_deadline, set, _permit),
+        };
+
+        // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
+        // On a deadline elapse the whole `join_all` future is dropped, so no
+        // per-shard ack is observed: `AckTimeout` carries no recovered tokens
+        // (a sibling that committed inside the elapsed window is unknowable
+        // here, and reporting an unresolved ack as durable would be wrong).
+        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
+            .await
+            .map_err(|_| WriteError::AckTimeout)?;
+
+        // Every ack resolved. Scan them all: collect every shard that acked a
+        // durable commit (issue #1130), and record the first failure in shard
+        // order so the returned classification and the death side effect match
+        // the pre-split behavior. A shard whose ack failed to resolve
+        // (`RecvError`: the actor panicked mid-flush) is NOT a durable write
+        // and contributes no token; its (shard, incarnation) is remembered so
+        // the death is observed against the exact incarnation this write sent
+        // on.
+        let mut durable = Vec::with_capacity(joined.len());
+        let mut first_error: Option<WriteError> = None;
+        let mut dead_shard: Option<(u32, u64)> = None;
+        for ((shard, incarnation), result) in ack_shards.into_iter().zip(joined) {
+            match result {
+                Ok(Ok(token)) => durable.push(token),
+                Ok(Err(shard_error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(shard_error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(WriteError::ShardUnavailable);
+                        dead_shard = Some((shard, incarnation));
+                    }
+                }
+            }
+        }
+
+        if let Some(inner) = first_error {
+            // Observe the death only when the first failure in shard order is
+            // a dropped ack (a resolved shard-level error is not a death).
+            // This counts the death once for this incarnation and respawns
+            // the shard within its budget, or condemns it past the budget.
+            if let Some((shard, incarnation)) = dead_shard {
+                router.observe_shard_death(shard, &set[shard as usize], incarnation);
+            }
+            // Carry the durably-acked sibling tokens only when there are any;
+            // a failure with no partial success surfaces as the bare
+            // variant, unchanged from before the submit/acks split.
+            let error = if durable.is_empty() {
+                inner
+            } else {
+                router.metrics.record_partial_write();
+                WriteError::PartialWrite {
+                    inner: Box::new(inner),
+                    durable,
+                }
+            };
+            return Err(error);
+        }
+
+        Ok(WriteReceipt { tokens: durable })
+    }
 }
 
 /// The router's live handle to one shard actor. Interior-mutable because a
@@ -175,6 +293,14 @@ pub struct IngestRouter {
     /// limit. Written by [`IngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
+    /// Process-wide pending-strict-ack budget (ADR-2793 decision 4). Shared by
+    /// `Arc` with the log and span routers so one ceiling bounds the sum of
+    /// outstanding strict acks across every signal. A strict
+    /// [`IngestRouter::submit`] takes a permit from this before the byte
+    /// budget is charged; the permit releases when [`Submitted::acks`]
+    /// resolves, its deadline passes, or the `Submitted` is dropped
+    /// unawaited.
+    pending_ack_budget: Arc<PendingAckBudget>,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
     /// bench reporter reads via [`IngestRouter::stage_timings`]. Present only
@@ -241,8 +367,16 @@ impl IngestRouter {
         store: Arc<dyn ObjectStoreBackend>,
         signal: Signal,
         clock: Arc<dyn Clock>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
-        Self::with_rng(config, store, signal, clock, Arc::new(SystemRng))
+        Self::with_rng(
+            config,
+            store,
+            signal,
+            clock,
+            Arc::new(SystemRng),
+            pending_ack_budget,
+        )
     }
 
     /// Construct with an injected [`RngSource`]. The simulation harness passes
@@ -255,6 +389,7 @@ impl IngestRouter {
         signal: Signal,
         clock: Arc<dyn Clock>,
         rng: Arc<dyn RngSource>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         // Preallocate the lock-free per-shard skew accumulators for this
         // router's fixed shard set (issue #865), so the per-message enqueue and
@@ -326,6 +461,7 @@ impl IngestRouter {
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             backstop_ceiling,
+            pending_ack_budget,
             #[cfg(feature = "stage-timing")]
             stage_timings,
         }
@@ -366,6 +502,19 @@ impl IngestRouter {
     /// and holds this rather than a second, invisible `IngestMetrics`.
     pub fn metrics_handle(&self) -> Arc<IngestMetrics> {
         self.metrics.clone()
+    }
+
+    /// Composes the counter registry's snapshot with this router's
+    /// pending-ack budget gauge and shed counter (ADR-2793 decision 4), since
+    /// [`IngestMetrics::snapshot`] has no access to the budget this router
+    /// holds and so always reports both fields as 0. Prefer this over
+    /// `metrics().snapshot()` wherever the pending-ack figures matter.
+    pub fn metrics_snapshot(&self) -> IngestMetricsSnapshot {
+        IngestMetricsSnapshot {
+            pending_strict_acks: self.pending_ack_budget.held(),
+            pending_ack_shed: self.pending_ack_budget.shed_total(),
+            ..self.metrics.snapshot()
+        }
     }
 
     /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
@@ -438,6 +587,13 @@ impl IngestRouter {
     /// involved shard, and (in strict mode) awaits every involved shard's
     /// ack within `ack_deadline`. Sending blocks on a full channel: that
     /// backpressure is intentional (docs/ingest.md "Channel").
+    ///
+    /// Equivalent to [`Self::submit`] followed immediately by
+    /// [`Submitted::acks`] (ADR-2793 decision 4): this method's signature,
+    /// errors, and receipts are unchanged by that split, so every existing
+    /// caller compiles and behaves exactly as before. A caller that wants the
+    /// two phases separately -- enqueue now, await the ack later -- uses
+    /// [`Self::submit`] directly.
     pub async fn write(
         &self,
         tenant: TenantId,
@@ -445,7 +601,24 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
-        self.write_points(
+        self.submit(tenant, points, mode, ack_deadline)
+            .await?
+            .acks()
+            .await
+    }
+
+    /// The submit half of [`Self::write`] (ADR-2793 decision 4): enqueues
+    /// `points` to every involved shard and returns as soon as they are
+    /// enqueued, without awaiting any strict ack. Call [`Submitted::acks`] on
+    /// the result to get what `write` used to return in one step.
+    pub async fn submit(
+        &self,
+        tenant: TenantId,
+        points: Vec<NormalizedPoint>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<Submitted<'_>, WriteError> {
+        self.submit_points(
             tenant,
             points.into_iter().map(IngestPoint::from).collect(),
             Vec::new(),
@@ -468,7 +641,22 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
-        self.write_points(tenant, points, Vec::new(), mode, ack_deadline)
+        self.submit_values(tenant, points, mode, ack_deadline)
+            .await?
+            .acks()
+            .await
+    }
+
+    /// The submit half of [`Self::write_values`] (ADR-2793 decision 4); see
+    /// [`Self::submit`].
+    pub async fn submit_values(
+        &self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<Submitted<'_>, WriteError> {
+        self.submit_points(tenant, points, Vec::new(), mode, ack_deadline)
             .await
     }
 
@@ -486,23 +674,55 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
-        self.write_points(tenant, points, exemplars, mode, ack_deadline)
+        self.submit_values_with_exemplars(tenant, points, exemplars, mode, ack_deadline)
+            .await?
+            .acks()
             .await
     }
 
-    async fn write_points(
+    /// The submit half of [`Self::write_values_with_exemplars`] (ADR-2793
+    /// decision 4); see [`Self::submit`].
+    pub async fn submit_values_with_exemplars(
         &self,
         tenant: TenantId,
         points: Vec<IngestPoint>,
         exemplars: Vec<IngestExemplar>,
         mode: WriteMode,
         ack_deadline: Duration,
-    ) -> Result<WriteReceipt, WriteError> {
+    ) -> Result<Submitted<'_>, WriteError> {
+        self.submit_points(tenant, points, exemplars, mode, ack_deadline)
+            .await
+    }
+
+    async fn submit_points(
+        &self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<Submitted<'_>, WriteError> {
         // An empty write never routes and never fails: nothing to flush, so a
         // stale provisioning view is irrelevant to it.
         if points.is_empty() && exemplars.is_empty() {
-            return Ok(WriteReceipt::default());
+            return Ok(Submitted {
+                router: self,
+                state: SubmittedState::Done(WriteReceipt::default()),
+            });
         }
+
+        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): take
+        // the permit, strict mode only, before the byte budget below is
+        // charged and before any shard is touched, so a submit this refuses
+        // holds no charge and sends nothing.
+        let permit = match mode {
+            WriteMode::Strict => Some(
+                self.pending_ack_budget
+                    .try_acquire()
+                    .ok_or(WriteError::PendingAckLimitReached)?,
+            ),
+            WriteMode::Buffered => None,
+        };
 
         // Global ingest byte budget (ADR-0069 decision 1). Charge the estimated
         // buffered bytes here -- after decode/normalize/admission (the caller
@@ -643,76 +863,33 @@ impl IngestRouter {
             // enqueued-minus-processed is the shard's current queue depth.
             self.metrics.record_shard_enqueued(shard);
         }
-        // Routing ends at dispatch: the strict-mode ack wait below is downstream
-        // durability (merge/encode/PUT happen in the shard), not a router stage.
+        // Routing ends at dispatch: the strict-mode ack wait is downstream
+        // durability (merge/encode/PUT happen in the shard), not a router
+        // stage, and now lives in `Submitted::acks` rather than here.
         #[cfg(feature = "stage-timing")]
         self.stage_timings
             .record(MetricStage::Route, route_start.elapsed());
 
         if mode == WriteMode::Buffered {
-            return Ok(WriteReceipt::default());
+            // Buffered mode acks at enqueue (docs/consistency-model.md): no
+            // permit was ever taken (see the `match mode` above), so there is
+            // nothing to release here.
+            return Ok(Submitted {
+                router: self,
+                state: SubmittedState::Done(WriteReceipt::default()),
+            });
         }
 
-        // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
-        // On a deadline elapse the whole `join_all` future is dropped, so no
-        // per-shard ack is observed: `AckTimeout` carries no recovered tokens
-        // (a sibling that committed inside the elapsed window is unknowable
-        // here, and reporting an unresolved ack as durable would be wrong).
-        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
-            .await
-            .map_err(|_| WriteError::AckTimeout)?;
-
-        // Every ack resolved. Scan them all: collect every shard that acked a
-        // durable commit (issue #1130), and record the first failure in shard
-        // order so the returned classification and the death side effect match
-        // the pre-fix early-return. A shard whose ack failed to resolve
-        // (`RecvError`: the actor panicked mid-flush) is NOT a durable write and
-        // contributes no token; its (shard, incarnation) is remembered so the
-        // death is observed against the exact incarnation this write sent on.
-        let mut durable = Vec::with_capacity(joined.len());
-        let mut first_error: Option<WriteError> = None;
-        let mut dead_shard: Option<(u32, u64)> = None;
-        for ((shard, incarnation), result) in ack_shards.into_iter().zip(joined) {
-            match result {
-                Ok(Ok(token)) => durable.push(token),
-                Ok(Err(shard_error)) => {
-                    if first_error.is_none() {
-                        first_error = Some(shard_error);
-                    }
-                }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error = Some(WriteError::ShardUnavailable);
-                        dead_shard = Some((shard, incarnation));
-                    }
-                }
-            }
-        }
-
-        if let Some(inner) = first_error {
-            // Observe the death only when the first failure in shard order is a
-            // dropped ack (a resolved shard-level error is not a death). This
-            // counts the death once for this incarnation and respawns the shard
-            // within its budget, or condemns it past the budget.
-            if let Some((shard, incarnation)) = dead_shard {
-                self.observe_shard_death(shard, &set[shard as usize], incarnation);
-            }
-            // Carry the durably-acked sibling tokens only when there are any; a
-            // failure with no partial success surfaces as the bare variant,
-            // unchanged from before this fix.
-            let error = if durable.is_empty() {
-                inner
-            } else {
-                self.metrics.record_partial_write();
-                WriteError::PartialWrite {
-                    inner: Box::new(inner),
-                    durable,
-                }
-            };
-            return Err(error);
-        }
-
-        Ok(WriteReceipt { tokens: durable })
+        Ok(Submitted {
+            router: self,
+            state: SubmittedState::Pending {
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                set,
+                _permit: permit,
+            },
+        })
     }
 
     /// Observe one death report for `shard`'s actor at `observed_incarnation`
@@ -996,6 +1173,7 @@ mod tests {
             Arc::clone(&store),
             Signal::Metrics,
             clock.clone(),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
 
         let tenant = TenantId::new("acme");

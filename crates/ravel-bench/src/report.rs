@@ -39,7 +39,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, PendingAckBudget, SystemClock, WriteMode};
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetricsSnapshot};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
@@ -521,6 +521,7 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
         Arc::clone(&store),
         signal,
         Arc::clone(&clock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let catalog = Arc::new(
         Catalog::new(

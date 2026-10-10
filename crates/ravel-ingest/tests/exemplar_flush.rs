@@ -13,7 +13,8 @@ use common::{TestClock, build_labels, tenant};
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_ingest::{
-    IngestConfig, IngestExemplar, IngestPoint, IngestRouter, IngestValue, WriteMode,
+    IngestConfig, IngestExemplar, IngestPoint, IngestRouter, IngestValue, PendingAckBudget,
+    WriteMode,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_segment::{ExemplarRecord, ReaderLimits};
@@ -136,6 +137,7 @@ fn router_with(store: &Arc<dyn ObjectStoreBackend>) -> IngestRouter {
         Arc::clone(store),
         Signal::Metrics,
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     )
 }
 
@@ -361,6 +363,7 @@ async fn an_exemplar_only_shard_does_not_fail_a_strict_write() {
         Arc::clone(&store),
         Signal::Metrics,
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let t = tenant("acme");
 

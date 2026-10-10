@@ -27,7 +27,7 @@ use std::time::Duration;
 use common::{SplitBrainOnFirstCommit, TestClock, make_point, tenant};
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, LogIngestRouter,
-    LogWriteError, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
+    LogWriteError, PendingAckBudget, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::{ColumnarLogBatch, LogRecord, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
@@ -125,7 +125,13 @@ macro_rules! deferral_cap_tests {
             let cap_ns = config.flush_deferral_cap_ns();
             assert_eq!(cap_ns, 3_159_990_000_000);
             let router = Arc::new(
-                <$router>::new(config, Arc::clone(&store), clock.clone()).with_budget(unlimited()),
+                <$router>::new(
+                    config,
+                    Arc::clone(&store),
+                    clock.clone(),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_budget(unlimited()),
             );
             let acme = tenant("acme");
             let globex = tenant("globex");
@@ -243,8 +249,13 @@ macro_rules! deferral_cap_tests {
             let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
             let clock = TestClock::new(BASE_NS);
             let router = Arc::new(
-                <$router>::new(queue_order_config(TENANTS), Arc::clone(&store), clock.clone())
-                    .with_budget(unlimited()),
+                <$router>::new(
+                    queue_order_config(TENANTS),
+                    Arc::clone(&store),
+                    clock.clone(),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_budget(unlimited()),
             );
             let buffered = || router.metrics().snapshot().$buffered;
             let in_flight = || -> u64 {
@@ -378,7 +389,13 @@ macro_rules! deferral_cap_order_tests {
             let config = one_slot_config();
             let cap_ns = config.flush_deferral_cap_ns();
             let router = Arc::new(
-                <$router>::new(config, Arc::clone(&store), clock.clone()).with_budget(unlimited()),
+                <$router>::new(
+                    config,
+                    Arc::clone(&store),
+                    clock.clone(),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_budget(unlimited()),
             );
             let acme = tenant("acme");
             let globex = tenant("globex");
@@ -460,7 +477,13 @@ macro_rules! deferral_cap_order_tests {
             let config = queue_order_config(2);
             let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
             let router = Arc::new(
-                <$router>::new(config, Arc::clone(&store), clock.clone()).with_budget(unlimited()),
+                <$router>::new(
+                    config,
+                    Arc::clone(&store),
+                    clock.clone(),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .with_budget(unlimited()),
             );
             let buffered = || router.metrics().snapshot().$buffered;
             let flushes = || router.metrics().snapshot().flushes_by_age;
@@ -579,7 +602,13 @@ async fn log_write_columnar_at_the_deferral_cap_is_refused() {
     let config = one_slot_config();
     let cap_ns = config.flush_deferral_cap_ns();
     let router = Arc::new(
-        LogIngestRouter::new(config, Arc::clone(&store), clock.clone()).with_budget(unlimited()),
+        LogIngestRouter::new(
+            config,
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(unlimited()),
     );
     let acme = tenant("acme");
     let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
@@ -766,7 +795,14 @@ fn new_metrics_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> IngestRouter {
-    IngestRouter::new(config, store, Signal::Metrics, clock).with_budget(unlimited())
+    IngestRouter::new(
+        config,
+        store,
+        Signal::Metrics,
+        clock,
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(unlimited())
 }
 
 fn new_log_router(
@@ -774,7 +810,8 @@ fn new_log_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> LogIngestRouter {
-    LogIngestRouter::new(config, store, clock).with_budget(unlimited())
+    LogIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
+        .with_budget(unlimited())
 }
 
 fn new_span_router(
@@ -782,7 +819,8 @@ fn new_span_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> SpanIngestRouter {
-    SpanIngestRouter::new(config, store, clock).with_budget(unlimited())
+    SpanIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
+        .with_budget(unlimited())
 }
 
 fn spawn_metric_write(

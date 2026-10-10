@@ -15,7 +15,8 @@ use std::time::Duration;
 use axum::Router;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{
-    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteError, WriteMode,
+    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, PendingAckBudget, WriteError,
+    WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -81,7 +82,13 @@ impl RavelStack {
         let clock: Arc<dyn Clock> = Arc::new(FixedClock(now_ns));
         let ingest_config = IngestConfig::default();
         let shard_count = ingest_config.shard_count;
-        let ingest = IngestRouter::new(ingest_config, Arc::clone(&store), Signal::Metrics, clock);
+        let ingest = IngestRouter::new(
+            ingest_config,
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock,
+            Arc::new(PendingAckBudget::new(0)),
+        );
 
         let points = to_points(&tenant, dataset)?;
         ingest

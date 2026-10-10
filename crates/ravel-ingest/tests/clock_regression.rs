@@ -27,8 +27,8 @@ use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_ingest::{
     IngestConfig, IngestExemplar, IngestPoint, IngestRouter, LogIngestRouter, LogWriteError,
-    MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, SpanIngestRouter, SpanWriteError, WriteError,
-    WriteMode,
+    MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, PendingAckBudget, SpanIngestRouter,
+    SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
@@ -167,6 +167,7 @@ async fn metrics_backward_step_holds_correction_above_stale_sample() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -253,6 +254,7 @@ async fn metrics_forward_step_stamps_raw_and_counts_nothing() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -323,7 +325,12 @@ async fn metrics_forward_step_stamps_raw_and_counts_nothing() {
 async fn logs_forward_step_stamps_raw_and_counts_nothing() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     let first = router
@@ -381,7 +388,12 @@ async fn logs_forward_step_stamps_raw_and_counts_nothing() {
 async fn spans_forward_step_stamps_raw_and_counts_nothing() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     let first = router
@@ -456,6 +468,7 @@ async fn restart_resets_the_floor_and_a_spanning_step_still_inverts() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let first = router1
         .write(
@@ -482,6 +495,7 @@ async fn restart_resets_the_floor_and_a_spanning_step_still_inverts() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let second = router2
         .write(
@@ -533,7 +547,12 @@ async fn restart_resets_the_floor_and_a_spanning_step_still_inverts() {
 async fn logs_backward_step_holds_correction_above_stale_record() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     let original = router
@@ -581,7 +600,12 @@ async fn logs_backward_step_holds_correction_above_stale_record() {
 async fn spans_backward_step_holds_correction_above_stale_span() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     let original = router
@@ -644,6 +668,7 @@ async fn sub_floor_reading_after_floor_armed_fails_before_the_floor() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -733,6 +758,7 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -869,6 +895,7 @@ async fn metrics_refused_flush_re_buffers_rows_for_the_next_flush() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -979,7 +1006,13 @@ async fn deadline_derives_from_raw_reading_not_the_floor() {
         max_flush_lifetime: Duration::ZERO,
         ..flush_per_write_config()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     // Deadline == raw == now at open, so this abandons at once; it still arms
@@ -1050,7 +1083,12 @@ async fn deadline_derives_from_raw_reading_not_the_floor() {
 async fn logs_forward_glitch_beyond_bound_is_refused_and_retryable() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     router
@@ -1134,7 +1172,12 @@ async fn logs_forward_glitch_beyond_bound_is_refused_and_retryable() {
 async fn logs_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     router
@@ -1191,7 +1234,12 @@ async fn logs_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
 async fn spans_forward_glitch_beyond_bound_is_refused_and_retryable() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     router
@@ -1270,7 +1318,12 @@ async fn spans_forward_glitch_beyond_bound_is_refused_and_retryable() {
 async fn spans_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     router
@@ -1332,7 +1385,12 @@ async fn spans_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
 async fn logs_refused_flush_re_buffers_records_for_the_next_flush() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     router
@@ -1410,7 +1468,12 @@ async fn logs_refused_flush_re_buffers_records_for_the_next_flush() {
 async fn spans_refused_flush_re_buffers_spans_for_the_next_flush() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(T0);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     router
@@ -1497,6 +1560,7 @@ async fn metrics_flush_all_retries_a_refusal_during_the_drain() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
     // The refusal is counted during `shutdown`, which consumes the router, so
@@ -1574,7 +1638,12 @@ async fn logs_flush_all_retries_a_refusal_during_the_drain() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let armed_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
     let clock = TestClock::new(armed_ns);
-    let router = LogIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
 
@@ -1631,7 +1700,12 @@ async fn spans_flush_all_retries_a_refusal_during_the_drain() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let armed_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
     let clock = TestClock::new(armed_ns);
-    let router = SpanIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
 
@@ -1698,6 +1772,7 @@ async fn metrics_invalid_reading_arm_counts_dropped_exemplars() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -1779,6 +1854,7 @@ async fn metrics_teardown_drain_reports_residue_after_the_pass_cap() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
@@ -1871,6 +1947,7 @@ async fn metrics_flush_now_drain_does_not_report_residue_and_retries_it() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
@@ -1962,7 +2039,12 @@ async fn logs_teardown_drain_reports_residue_after_the_pass_cap() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let armed_ns = T0 + RECEDING_STEP_NS;
     let clock = RecedingClock::new(armed_ns);
-    let router = LogIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
 
@@ -2018,7 +2100,12 @@ async fn logs_flush_now_drain_does_not_report_residue_and_retries_it() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let armed_ns = T0 + RECEDING_STEP_NS;
     let clock = RecedingClock::new(armed_ns);
-    let router = LogIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
 
@@ -2082,7 +2169,12 @@ async fn spans_teardown_drain_reports_residue_after_the_pass_cap() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let armed_ns = T0 + RECEDING_STEP_NS;
     let clock = RecedingClock::new(armed_ns);
-    let router = SpanIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
 
@@ -2138,7 +2230,12 @@ async fn spans_flush_now_drain_does_not_report_residue_and_retries_it() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let armed_ns = T0 + RECEDING_STEP_NS;
     let clock = RecedingClock::new(armed_ns);
-    let router = SpanIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     let metrics = router.metrics_handle();
 

@@ -30,7 +30,7 @@ use ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
 use ravel_commit::{keys, record};
 use ravel_ingest::{
     IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, MAX_FLUSH_ALL_PASSES,
-    SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
+    PendingAckBudget, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::{Predicate, RlogConfig, RlogReader, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
@@ -263,6 +263,7 @@ async fn writer_clock_lagging_the_store_refuses_the_flush() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -345,6 +346,7 @@ async fn lag_exactly_at_the_allowance_passes_and_one_ns_past_is_refused() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let at = tenant("at-bound");
     write_metric(&router, &at, 1_000)
@@ -360,6 +362,7 @@ async fn lag_exactly_at_the_allowance_passes_and_one_ns_past_is_refused() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let past = tenant("past-bound");
     let err = write_metric(&router, &past, 1_000)
@@ -390,6 +393,7 @@ async fn lag_is_measured_from_the_raw_reading_not_the_floor() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
     write_metric(&router, &tenant, 1_000)
@@ -424,6 +428,7 @@ async fn no_observation_publishes_and_counts_each_flush_unchecked() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
     for (i, ts_ns) in [1_000, 2_000, 3_000].into_iter().enumerate() {
@@ -453,6 +458,7 @@ async fn observed_clock_within_the_allowance_counts_nothing() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     write_metric(&router, &tenant("acme"), 1_000)
         .await
@@ -494,7 +500,12 @@ async fn write_log_body(
 async fn logs_writer_clock_lagging_the_store_refuses_the_flush() {
     let (_memory, store) = observed_store(Some(STORE_NS));
     let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     let err = write_log_body(&router, &tenant, 1_000, "refused")
@@ -537,7 +548,12 @@ async fn logs_writer_clock_lagging_the_store_refuses_the_flush() {
 async fn logs_no_observation_counts_each_flush_unchecked() {
     let (_memory, store) = observed_store(None);
     let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     for (i, ts_ns) in [1_000, 2_000].into_iter().enumerate() {
         write_log(&router, &tenant, ts_ns)
@@ -572,7 +588,12 @@ async fn write_span(
 async fn spans_writer_clock_lagging_the_store_refuses_the_flush() {
     let (_memory, store) = observed_store(Some(STORE_NS));
     let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
 
     let err = write_span(&router, &tenant, 1_000)
@@ -615,7 +636,12 @@ async fn spans_writer_clock_lagging_the_store_refuses_the_flush() {
 async fn spans_no_observation_counts_each_flush_unchecked() {
     let (_memory, store) = observed_store(None);
     let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     for (i, start_ns) in [1_000, 2_000].into_iter().enumerate() {
         write_span(&router, &tenant, start_ns)
@@ -638,7 +664,12 @@ async fn spans_no_observation_counts_each_flush_unchecked() {
 async fn logs_lag_is_measured_from_the_raw_reading_not_the_floor() {
     let (memory, store) = observed_store(None);
     let clock = TestClock::new(STORE_NS);
-    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     write_log(&router, &tenant, 1_000)
         .await
@@ -664,7 +695,12 @@ async fn logs_lag_is_measured_from_the_raw_reading_not_the_floor() {
 async fn spans_lag_is_measured_from_the_raw_reading_not_the_floor() {
     let (memory, store) = observed_store(None);
     let clock = TestClock::new(STORE_NS);
-    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = tenant("acme");
     write_span(&router, &tenant, 1_000)
         .await
@@ -729,6 +765,7 @@ async fn shutdown_publishes_what_the_lag_check_refused_and_counts_the_bypass() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -797,6 +834,7 @@ async fn flush_now_is_still_refused_with_a_lagging_clock() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -863,6 +901,7 @@ async fn logs_shutdown_publishes_what_the_lag_check_refused() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -899,6 +938,7 @@ async fn spans_shutdown_publishes_what_the_lag_check_refused() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -958,6 +998,7 @@ async fn shutdown_publishes_when_a_lag_refusal_hid_a_backwards_step() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     // Arm the floor: this flush's reading is the store's own time, so it is
@@ -1051,6 +1092,7 @@ async fn logs_shutdown_publishes_when_a_lag_refusal_hid_a_backwards_step() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let floor_tenant = tenant(FLOOR_TENANT);
@@ -1115,6 +1157,7 @@ async fn spans_shutdown_publishes_when_a_lag_refusal_hid_a_backwards_step() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let floor_tenant = tenant(FLOOR_TENANT);
@@ -1182,6 +1225,7 @@ async fn logs_flush_now_is_still_refused_with_a_lagging_clock() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -1239,6 +1283,7 @@ async fn spans_flush_now_is_still_refused_with_a_lagging_clock() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -1304,6 +1349,7 @@ async fn channel_close_publishes_what_the_lag_check_refused() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -1396,6 +1442,7 @@ async fn logs_channel_close_publishes_what_the_lag_check_refused() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -1475,6 +1522,7 @@ async fn spans_channel_close_publishes_what_the_lag_check_refused() {
         buffer_until_drain_config(),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 

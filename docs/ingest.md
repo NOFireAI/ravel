@@ -13,6 +13,15 @@ gateway handler (axum / tonic)
   -> IngestRouter::write(tenant, points, mode) -> WriteReceipt
 ```
 
+`write` is `submit(..).await?.acks().await` (ADR-2793 decision 4): `submit`
+enqueues to every involved shard and returns once that is done, without
+waiting on any ack; the returned `Submitted` value's `acks()` then awaits
+strict-mode acks under the original deadline (buffered mode's `acks()`
+returns immediately). A strict `submit` takes a pending-ack permit from a
+process-wide budget before it charges the byte budget or touches a shard,
+and the permit is released whichever way the wait ends: `acks()` resolving,
+the deadline elapsing, or `Submitted` being dropped unawaited.
+
 Remote Write (`POST /api/v1/write`, ADR-0015) is a second gateway handler
 in front of the same router, decode/normalize swapped for the RW-specific
 crate:
@@ -1537,6 +1546,18 @@ carries max token per shard).
 `mode=buffered`: ack at enqueue. Config per tenant; header override
 `x-ravel-ingest-mode: buffered` allowed only when tenant config permits.
 
+## Pending strict-ack budget (ADR-2793 decision 4)
+
+`PendingAckBudget` bounds how many strict-mode `submit`s may have an
+outstanding ack wait at once, process-wide across all three pipelines
+(`IngestConfig::max_pending_strict_acks`, 0 = unlimited). A strict `submit`
+takes the permit before it charges the byte budget and before it sends to
+any shard, so a refusal here holds no byte charge and touches no shard; it
+is a refusal after decode, not a head shed like the in-flight request
+ceiling above. The permit is released when the returned `Submitted`'s
+`acks()` resolves, when its deadline elapses, or when it is dropped
+unawaited.
+
 ## Sizing defaults (config, all overridable)
 
 | knob | default |
@@ -1551,6 +1572,7 @@ carries max token per shard).
 | idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
+| max_pending_strict_acks (process-wide, all signals) | 8,192 (the in-flight ingest ceiling times eight, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
 | max_inflight_flushes (per shard, all three pipelines) | 4 on `ravel-server` and on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
 | max_inflight_flushes_per_tenant (per shard and tenant, all three pipelines) | `max(1, N - 1)` on `ravel-server`, so 3 (`--max-inflight-flushes-per-tenant`, rejects 0 and values above `--max-inflight-flushes`); N on `ravel-cli load` |
@@ -1814,6 +1836,12 @@ Counters recorded today:
   Unlike every other counter here it is per-shard underneath
   (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
   flat total; a shard with no flush in flight contributes 0.
+- `pending_strict_acks`: gauge, `PendingAckBudget::held()` -- strict-mode
+  `submit`s currently holding a pending-ack permit, process-wide and shared
+  across all three pipelines, not per-router.
+- `pending_ack_shed`: counter, `PendingAckBudget::shed_total()` -- strict
+  `submit`s refused because the pending-ack budget was already at its
+  ceiling. Cumulative since process start, shared the same way.
 
 ### Per-shard skew
 

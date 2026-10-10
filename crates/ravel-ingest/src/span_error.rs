@@ -63,6 +63,16 @@ pub enum SpanWriteError {
     /// with [`Self::DeferralCapReached`] instead.
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
+    /// The process-wide pending-strict-ack budget
+    /// (`IngestConfig::max_pending_strict_acks`, ADR-2793 decision 4) is at its
+    /// ceiling: `submit` could not take a pending-ack permit, so the write is
+    /// refused before the byte budget is charged and before any shard is
+    /// touched, with no commit token issued. Retryable, classified the same as
+    /// [`Self::BufferBudgetExceeded`]: a permit frees as soon as any in-flight
+    /// strict write's `acks()` resolves. Gateway status mapping is not yet
+    /// wired to this variant.
+    #[error("pending strict-ack budget reached")]
+    PendingAckLimitReached,
     /// A span shard this write routes to has a flush that has stayed deferred
     /// for the whole flush deferral cap, so the write is refused before
     /// anything is buffered, in either write mode; the span-side counterpart
@@ -111,6 +121,7 @@ impl SpanWriteError {
             | SpanWriteError::Abandoned(_)
             | SpanWriteError::StaleProvisioningView
             | SpanWriteError::BufferBudgetExceeded
+            | SpanWriteError::PendingAckLimitReached
             | SpanWriteError::DeferralCapReached => true,
             SpanWriteError::SegmentBuild(_) => false,
             SpanWriteError::PartialWrite { inner, .. } => inner.is_retryable(),

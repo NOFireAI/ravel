@@ -22,7 +22,7 @@ use ravel_catalog::{
 };
 use ravel_commit::declared_stats::read_commit_record;
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, PendingAckBudget, WriteMode};
 use ravel_logseg::{ColumnarLogBatch, LogRecord};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -222,7 +222,12 @@ async fn refused_columnar_write_leaves_the_row_buffers_stamp_exact() {
     let clock = TestClock::new(BASE_NS);
     declare_i64_column(store.as_ref()).await;
 
-    let router = LogIngestRouter::new(never_flush(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        never_flush(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     // Seed: row-major, buffered (no flush trigger fires under `never_flush`).
     router
@@ -264,7 +269,12 @@ async fn refused_row_write_leaves_the_columnar_buffers_stamp_exact() {
     let clock = TestClock::new(BASE_NS);
     declare_i64_column(store.as_ref()).await;
 
-    let router = LogIngestRouter::new(never_flush(), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        never_flush(),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     // Seed: columnar, buffered.
     router

@@ -18,7 +18,7 @@ use std::time::Duration;
 use common::{TestClock, make_point, tenant};
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestMetricsSnapshot, IngestRouter,
-    WriteMode,
+    PendingAckBudget, WriteMode,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectMeta, ObjectStoreBackend, list_all};
@@ -171,8 +171,14 @@ async fn run_batches_under_ceiling(
 ) -> (IngestMetricsSnapshot, Vec<ObjectMeta>) {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_TS_NS);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock)
-        .with_budget(IngestByteBudget::shared(ceiling));
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock,
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(IngestByteBudget::shared(ceiling));
     let tenant = tenant("acme");
 
     for index in 0..batches {
@@ -318,8 +324,14 @@ async fn memory_gauge_still_charges_the_conservative_estimate() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_TS_NS);
     let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock)
-        .with_budget(Arc::clone(&budget));
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock,
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(Arc::clone(&budget));
     let tenant = tenant("acme");
 
     for index in 0..BATCHES_BELOW_TARGET {

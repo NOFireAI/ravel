@@ -709,6 +709,13 @@ pub struct IngestConfig {
     /// POSTINGS term blocks of each RLOG object a log flush writes. Metrics and
     /// span flushes do not read it.
     pub rlog_zstd_level: RlogZstdLevel,
+    /// Process-wide ceiling on pending strict-mode acks a `submit` may hold
+    /// outstanding at once, shared by `Arc` across the metrics, log, and span
+    /// routers (ADR-2793 decision 4; [`crate::PendingAckBudget`]). `0` disables
+    /// the ceiling. Default 8,192: the in-flight ingest ceiling times eight,
+    /// generous headroom above ordinary strict-mode concurrency so the ceiling
+    /// only fires under a genuine pending-ack pile-up, not normal load.
+    pub max_pending_strict_acks: u64,
 }
 
 impl Default for IngestConfig {
@@ -762,6 +769,7 @@ impl Default for IngestConfig {
             strict_visibility_budget_ns: max_flush_delay.as_nanos() as i64
                 + STRICT_VISIBILITY_RESERVE_NS,
             rlog_zstd_level: RlogZstdLevel::DEFAULT,
+            max_pending_strict_acks: 8_192,
         }
     }
 }
@@ -1156,6 +1164,8 @@ mod tests {
             cfg.strict_visibility_budget_ns,
             cfg.max_flush_delay.as_nanos() as i64 + STRICT_VISIBILITY_RESERVE_NS
         );
+        // ADR-2793 decision 4: in-flight ingest ceiling times eight.
+        assert_eq!(cfg.max_pending_strict_acks, 8_192);
     }
 
     /// ADR-1737 decision 1: 0 disables the floor and is always accepted, a

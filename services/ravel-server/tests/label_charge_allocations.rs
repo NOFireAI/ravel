@@ -33,8 +33,8 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use ravel_ingest::{
     AdmissionController, AdmissionLimits, IngestByteBudget, IngestByteBudgetLimit, IngestConfig,
-    IngestRouter, LogIngestRouter, LogWriteError, SpanIngestRouter, SpanWriteError, SystemClock,
-    WriteError, WriteMode,
+    IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget, SpanIngestRouter,
+    SpanWriteError, SystemClock, WriteError, WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -172,6 +172,7 @@ fn metrics_state(budget: Arc<IngestByteBudget>) -> IngestState {
             store,
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         )),
         limits: IngestLimits::default(),
         ack_deadline: Duration::from_secs(5),
@@ -191,6 +192,7 @@ fn logs_state(budget: Arc<IngestByteBudget>) -> LogIngestState {
             config(),
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         )),
         limits: LogIngestLimits::default(),
         ack_deadline: Duration::from_secs(5),
@@ -210,6 +212,7 @@ fn spans_state(budget: Arc<IngestByteBudget>) -> SpanIngestState {
             config(),
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         )),
         limits: SpanIngestLimits::default(),
         ack_deadline: Duration::from_secs(5),

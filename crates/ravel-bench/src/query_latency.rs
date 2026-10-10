@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, PendingAckBudget, SystemClock, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
@@ -157,6 +157,7 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
         Arc::clone(&store),
         signal,
         Arc::clone(&clock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let catalog = Arc::new(
         Catalog::new(

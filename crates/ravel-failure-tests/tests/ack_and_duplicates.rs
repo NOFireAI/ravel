@@ -19,7 +19,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_otlp::{IngestLimits, normalize_metrics};
@@ -48,7 +48,13 @@ fn config() -> IngestConfig {
 async fn ack_lost_after_commit_then_client_retry_dedups_to_one_value() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let event_ts = BASE_NS - NS_PER_MIN;
@@ -183,7 +189,13 @@ fn gauge_request(metric_name: &str, ts_ns: i64, value: f64) -> ExportMetricsServ
 async fn duplicate_otlp_delivery_normalized_twice_does_not_double_count() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let event_ts = BASE_NS - NS_PER_MIN;

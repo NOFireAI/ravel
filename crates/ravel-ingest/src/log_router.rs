@@ -30,8 +30,9 @@ use crate::generation::{
 };
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
-use crate::log_metrics::LogIngestMetrics;
+use crate::log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 use crate::log_shard::{LogShardActor, LogShardMsg, est_columnar_bytes, est_record_bytes};
+use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::router::WriteMode;
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
@@ -68,6 +69,61 @@ impl LogIndexedFields for NoIndexedFields {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogWriteReceipt {
     pub tokens: Vec<CommitToken>,
+}
+
+/// A log write enqueued to every involved shard but not yet acknowledged
+/// (ADR-2793 decision 4), returned by [`LogIngestRouter::submit`] and its
+/// `submit_columnar*` siblings. [`Self::acks`] is the other half of what
+/// [`LogIngestRouter::write`] used to do in one step.
+///
+/// Holds the strict-mode pending-ack permit this submit took, and releases
+/// it -- a plain RAII permit gives all three -- when [`Self::acks`] resolves
+/// (either way), when its ack deadline passes, and when `self` is dropped
+/// without calling [`Self::acks`] at all.
+pub struct LogSubmitted<'a> {
+    router: &'a LogIngestRouter,
+    state: LogSubmittedState,
+}
+
+enum LogSubmittedState {
+    /// Buffered mode, or a write with no records: already resolved, nothing
+    /// to await.
+    Done(LogWriteReceipt),
+    /// Strict mode with at least one shard's ack outstanding.
+    Pending {
+        set: Arc<Vec<LogShardHandle>>,
+        ack_shards: Vec<u32>,
+        ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, LogWriteError>>>,
+        ack_deadline: Duration,
+        /// Held until `acks()` resolves, its deadline elapses, or this value
+        /// is dropped unawaited; never read directly.
+        _permit: Option<PendingAckPermit>,
+    },
+}
+
+impl LogSubmitted<'_> {
+    /// Awaits every involved shard's strict ack within the deadline captured
+    /// at submit time, exactly as [`LogIngestRouter::write`] used to inline
+    /// via the shared `await_strict_acks` helper. A buffered submit's
+    /// `acks()` returns the empty receipt immediately: there was never
+    /// anything to await.
+    pub async fn acks(self) -> Result<LogWriteReceipt, LogWriteError> {
+        let router = self.router;
+        match self.state {
+            LogSubmittedState::Done(receipt) => Ok(receipt),
+            LogSubmittedState::Pending {
+                set,
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                _permit,
+            } => {
+                router
+                    .await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
+                    .await
+            }
+        }
+    }
 }
 
 /// The log pipeline's counterpart of [`crate::router`]'s private
@@ -123,6 +179,11 @@ pub struct LogIngestRouter {
     /// limit. Written by [`LogIngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
+    /// Process-wide ceiling on outstanding strict acks (ADR-2793 decision 4),
+    /// shared by `Arc` with the metrics and span routers. A strict
+    /// [`Self::submit`] takes a permit here before the byte budget is charged;
+    /// [`LogSubmitted::acks`] releases it.
+    pending_ack_budget: Arc<PendingAckBudget>,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
     /// bench reporter reads via [`LogIngestRouter::stage_timings`]. Present only
@@ -140,12 +201,14 @@ impl LogIngestRouter {
         config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         Self::new_with_indexed_fields(
             config,
             store,
             clock,
             Arc::new(IndexedFieldsOverlay::new(Arc::new(NoIndexedFields))),
+            pending_ack_budget,
         )
     }
 
@@ -160,13 +223,21 @@ impl LogIngestRouter {
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         // Production OS-entropy source for writer ids and PUT-retry jitter
         // (ADR-0068 decision 2). The log pipeline is not exercised by the
         // seeded simulation driver, so this router has no injected variant on
         // the production path; routing every draw through the seam still keeps
         // `rand::rng()` and `Uuid::new_v4()` off it.
-        Self::with_rng(config, store, clock, indexed_fields, Arc::new(SystemRng))
+        Self::with_rng(
+            config,
+            store,
+            clock,
+            indexed_fields,
+            Arc::new(SystemRng),
+            pending_ack_budget,
+        )
     }
 
     /// Like [`Self::new_with_indexed_fields`] but with an injected
@@ -180,6 +251,7 @@ impl LogIngestRouter {
         clock: Arc<dyn Clock>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
         rng: Arc<dyn RngSource>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::new(config.shard_count));
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
@@ -246,6 +318,7 @@ impl LogIngestRouter {
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             backstop_ceiling,
+            pending_ack_budget,
             #[cfg(feature = "stage-timing")]
             stage_timings,
         }
@@ -279,6 +352,19 @@ impl LogIngestRouter {
     /// drain counts into it).
     pub fn metrics_handle(&self) -> Arc<LogIngestMetrics> {
         self.metrics.clone()
+    }
+
+    /// Composes the counter registry's snapshot with this router's
+    /// pending-ack budget gauge and shed counter (ADR-2793 decision 4), since
+    /// [`LogIngestMetrics::snapshot`] has no access to the budget this router
+    /// holds and so always reports both fields as 0. Prefer this over
+    /// `metrics().snapshot()` wherever the pending-ack figures matter.
+    pub fn metrics_snapshot(&self) -> LogIngestMetricsSnapshot {
+        LogIngestMetricsSnapshot {
+            pending_strict_acks: self.pending_ack_budget.held(),
+            pending_ack_shed: self.pending_ack_budget.shed_total(),
+            ..self.metrics.snapshot()
+        }
     }
 
     /// Whether every shard actor this router owns is live enough to serve:
@@ -363,10 +449,9 @@ impl LogIngestRouter {
         self.indexed_fields.evict_idle(now_ns, ttl_ns)
     }
 
-    /// Groups `records` by `shard_for_log`, sends one `LogShardMsg::Write` per
-    /// involved shard, and (in strict mode) awaits every involved shard's ack
-    /// within `ack_deadline`. Sending blocks on a full channel: that
-    /// backpressure is intentional (docs/ingest.md "Channel").
+    /// `submit(..).await?.acks().await`, kept as one call for every production
+    /// caller today (ravel-server's admission path, task #2797, is the only
+    /// caller that will split the two).
     pub async fn write(
         &self,
         tenant: ravel_types::TenantId,
@@ -374,9 +459,43 @@ impl LogIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<LogWriteReceipt, LogWriteError> {
+        self.submit(tenant, records, mode, ack_deadline)
+            .await?
+            .acks()
+            .await
+    }
+
+    /// Groups `records` by `shard_for_log` and sends one `LogShardMsg::Write`
+    /// per involved shard, returning once every message is enqueued rather
+    /// than awaiting any shard's ack (ADR-2793 decision 4). Sending blocks on
+    /// a full channel: that backpressure is intentional (docs/ingest.md
+    /// "Channel"). A strict submit takes a pending-ack permit before the byte
+    /// budget is charged, so a refused submit holds no charge; call
+    /// [`LogSubmitted::acks`] to await the shard acks this returns.
+    pub async fn submit(
+        &self,
+        tenant: ravel_types::TenantId,
+        records: Vec<NormalizedLogRecord>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<LogSubmitted<'_>, LogWriteError> {
         if records.is_empty() {
-            return Ok(LogWriteReceipt::default());
+            return Ok(LogSubmitted {
+                router: self,
+                state: LogSubmittedState::Done(LogWriteReceipt::default()),
+            });
         }
+
+        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): taken
+        // before the byte budget below, so a refused submit holds no charge.
+        let permit = match mode {
+            WriteMode::Strict => Some(
+                self.pending_ack_budget
+                    .try_acquire()
+                    .ok_or(LogWriteError::PendingAckLimitReached)?,
+            ),
+            WriteMode::Buffered => None,
+        };
 
         // Global ingest byte budget (ADR-0069 decision 1): charge the estimated
         // buffered bytes and shed at the ceiling before routing, so a shed
@@ -412,7 +531,10 @@ impl LogIngestRouter {
             by_shard.entry(shard).or_default().push(record);
         }
         if by_shard.is_empty() {
-            return Ok(LogWriteReceipt::default());
+            return Ok(LogSubmitted {
+                router: self,
+                state: LogSubmittedState::Done(LogWriteReceipt::default()),
+            });
         }
 
         let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
@@ -454,18 +576,29 @@ impl LogIngestRouter {
             // enqueued-minus-processed is the shard's current queue depth.
             self.metrics.record_shard_enqueued(shard);
         }
-        // Routing ends at dispatch: the strict-mode ack wait below is downstream
+        // Routing ends at dispatch: the strict-mode ack wait is downstream
         // durability (merge/encode/PUT happen in the shard), not a router stage.
         #[cfg(feature = "stage-timing")]
         self.stage_timings
             .record(LogStage::Route, route_start.elapsed());
 
         if mode == WriteMode::Buffered {
-            return Ok(LogWriteReceipt::default());
+            return Ok(LogSubmitted {
+                router: self,
+                state: LogSubmittedState::Done(LogWriteReceipt::default()),
+            });
         }
 
-        self.await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
-            .await
+        Ok(LogSubmitted {
+            router: self,
+            state: LogSubmittedState::Pending {
+                set,
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                _permit: permit,
+            },
+        })
     }
 
     /// Awaits the strict-mode acks of a dispatched write and folds them into a
@@ -559,8 +692,30 @@ impl LogIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<LogWriteReceipt, LogWriteError> {
-        self.write_columnar_partitioned(tenant, batch, mode, ack_deadline, None, partition_columnar)
+        self.submit_columnar(tenant, batch, mode, ack_deadline)
+            .await?
+            .acks()
             .await
+    }
+
+    /// [`Self::submit`] for a [`ColumnarLogBatch`]; the submit half of
+    /// [`Self::write_columnar`].
+    pub async fn submit_columnar(
+        &self,
+        tenant: ravel_types::TenantId,
+        batch: ColumnarLogBatch,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<LogSubmitted<'_>, LogWriteError> {
+        self.submit_columnar_partitioned(
+            tenant,
+            batch,
+            mode,
+            ack_deadline,
+            None,
+            partition_columnar,
+        )
+        .await
     }
 
     /// [`Self::write_columnar`] for a caller that already holds a charge for
@@ -599,7 +754,23 @@ impl LogIngestRouter {
         ack_deadline: Duration,
         charge: IngestByteCharge,
     ) -> Result<LogWriteReceipt, LogWriteError> {
-        self.write_columnar_partitioned(
+        self.submit_columnar_charged(tenant, batch, mode, ack_deadline, charge)
+            .await?
+            .acks()
+            .await
+    }
+
+    /// [`Self::submit`] for [`Self::write_columnar_charged`]'s already-charged
+    /// batch.
+    pub async fn submit_columnar_charged(
+        &self,
+        tenant: ravel_types::TenantId,
+        batch: ColumnarLogBatch,
+        mode: WriteMode,
+        ack_deadline: Duration,
+        charge: IngestByteCharge,
+    ) -> Result<LogSubmitted<'_>, LogWriteError> {
+        self.submit_columnar_partitioned(
             tenant,
             batch,
             mode,
@@ -610,11 +781,12 @@ impl LogIngestRouter {
         .await
     }
 
-    /// [`Self::write_columnar`] with the partition step supplied, so a test can
-    /// run the same write through a reference partition and compare objects.
-    /// `held` is a caller's existing charge ([`Self::write_columnar_charged`]);
-    /// `None` charges the router's budget the batch's estimate.
-    async fn write_columnar_partitioned<P>(
+    /// [`Self::submit_columnar`] with the partition step supplied, so a test
+    /// can run the same write through a reference partition and compare
+    /// objects. `held` is a caller's existing charge
+    /// ([`Self::submit_columnar_charged`]); `None` charges the router's
+    /// budget the batch's estimate.
+    async fn submit_columnar_partitioned<P>(
         &self,
         tenant: ravel_types::TenantId,
         batch: ColumnarLogBatch,
@@ -622,7 +794,7 @@ impl LogIngestRouter {
         ack_deadline: Duration,
         held: Option<IngestByteCharge>,
         partition: P,
-    ) -> Result<LogWriteReceipt, LogWriteError>
+    ) -> Result<LogSubmitted<'_>, LogWriteError>
     where
         P: FnOnce(ColumnarLogBatch, u32) -> Result<Vec<(u32, ColumnarLogBatch)>, LogSegError>,
     {
@@ -639,14 +811,30 @@ impl LogIngestRouter {
             .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))?;
 
         if batch.is_empty() {
-            return Ok(LogWriteReceipt::default());
+            return Ok(LogSubmitted {
+                router: self,
+                state: LogSubmittedState::Done(LogWriteReceipt::default()),
+            });
         }
+
+        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): taken
+        // before the byte budget below, so a refused submit holds no charge.
+        // A caller that already holds its own charge (`held`) still takes a
+        // pending-ack permit here: the two budgets are independent.
+        let permit = match mode {
+            WriteMode::Strict => Some(
+                self.pending_ack_budget
+                    .try_acquire()
+                    .ok_or(LogWriteError::PendingAckLimitReached)?,
+            ),
+            WriteMode::Buffered => None,
+        };
 
         // Global ingest byte budget (ADR-0069 decision 1): the columnar estimate
         // equals the row path's `est_record_bytes` sum for the same records
         // exactly, so the shared ceiling means the same thing on both paths. As
-        // in `write`, the charge is cloned into every shard message and refunded
-        // when the flush(es) holding these bytes complete or fail.
+        // in `submit`, the charge is cloned into every shard message and
+        // refunded when the flush(es) holding these bytes complete or fail.
         let charge = Arc::new(match held {
             Some(charge) => charge,
             None => self
@@ -655,19 +843,22 @@ impl LogIngestRouter {
                 .map_err(|_| LogWriteError::BufferBudgetExceeded)?,
         });
 
-        // Route against the tenant's current generation view, exactly as `write`.
+        // Route against the tenant's current generation view, exactly as `submit`.
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
         let shard_count = set.len() as u32;
 
         // Partition into per-shard column selections. `partition_columnar`
         // returns ascending-shard order and omits a shard with no rows, matching
-        // `write`'s sorted `by_shard` keys. It consumes the batch, so the parent
+        // `submit`'s sorted `by_shard` keys. It consumes the batch, so the parent
         // is freed before any shard is sent its part. The batch validated above,
         // so a refusal here is a partition bug; dropping `charge` refunds it.
         let by_shard = partition(batch, shard_count)
             .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))?;
         if by_shard.is_empty() {
-            return Ok(LogWriteReceipt::default());
+            return Ok(LogSubmitted {
+                router: self,
+                state: LogSubmittedState::Done(LogWriteReceipt::default()),
+            });
         }
         let shard_ids: Vec<u32> = by_shard.iter().map(|(shard, _)| *shard).collect();
         self.refuse_dead_or_capped(&set, &shard_ids)?;
@@ -704,11 +895,22 @@ impl LogIngestRouter {
         }
 
         if mode == WriteMode::Buffered {
-            return Ok(LogWriteReceipt::default());
+            return Ok(LogSubmitted {
+                router: self,
+                state: LogSubmittedState::Done(LogWriteReceipt::default()),
+            });
         }
 
-        self.await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
-            .await
+        Ok(LogSubmitted {
+            router: self,
+            state: LogSubmittedState::Pending {
+                set,
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                _permit: permit,
+            },
+        })
     }
 
     /// Refuses the whole write, before any shard is sent anything, when one of
@@ -1226,6 +1428,7 @@ mod tests {
             },
             store,
             Arc::new(crate::clock::SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         )
     }
 
@@ -1559,6 +1762,7 @@ mod tests {
             Arc::clone(&clock),
             overlay(),
             Arc::new(SeededRng::new(seed)),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
 
         let store_col: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1568,6 +1772,7 @@ mod tests {
             Arc::clone(&clock),
             overlay(),
             Arc::new(SeededRng::new(seed)),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
 
         let tenant = TenantId::new("acme");
@@ -1700,6 +1905,7 @@ mod tests {
                 Arc::clone(&clock),
                 overlay(),
                 Arc::new(SeededRng::new(seed)),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
             )
         };
 
@@ -1817,6 +2023,7 @@ mod tests {
                 Arc::clone(&clock),
                 overlay(),
                 Arc::new(SeededRng::new(seed)),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
             );
             router
                 .write(
@@ -2355,12 +2562,13 @@ mod tests {
                 Arc::clone(&clock),
                 overlay(),
                 Arc::new(SeededRng::new(seed)),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
             )
         };
         let store_ref: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router_ref = router(&store_ref);
         router_ref
-            .write_columnar_partitioned(
+            .submit_columnar_partitioned(
                 tenant.clone(),
                 batch.clone(),
                 WriteMode::Buffered,
@@ -2554,13 +2762,14 @@ mod tests {
                 Arc::clone(&clock),
                 overlay(),
                 Arc::new(SeededRng::new(seed)),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
             )
         };
         let store_ref: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router_ref = router(&store_ref);
         for batch in &writes {
             router_ref
-                .write_columnar_partitioned(
+                .submit_columnar_partitioned(
                     tenant.clone(),
                     batch.clone(),
                     WriteMode::Buffered,

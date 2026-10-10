@@ -17,7 +17,8 @@ use common::{TestClock, build_labels, tenant};
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_ingest::{
-    IngestConfig, IngestPoint, IngestRouter, IngestValue, SEGMENT_FORMAT_VERSION, WriteMode,
+    IngestConfig, IngestPoint, IngestRouter, IngestValue, PendingAckBudget, SEGMENT_FORMAT_VERSION,
+    WriteMode,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_segment::{
@@ -100,6 +101,7 @@ async fn histogram_and_scalar_points_ingest_and_read_back_as_v5() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -233,6 +235,7 @@ async fn multiple_histogram_points_for_one_series_merge() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

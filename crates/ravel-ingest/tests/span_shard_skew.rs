@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SlowStore, TestClock, span_on_shard, tenant};
-use ravel_ingest::{IngestConfig, ShardSkewStats, SpanIngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, PendingAckBudget, ShardSkewStats, SpanIngestRouter, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 
@@ -70,7 +70,12 @@ async fn span_router_and_actor_record_enqueued_processed_and_queue_depth() {
         max_flush_lifetime: Duration::from_secs(86_400),
         ..IngestConfig::default()
     };
-    let router = SpanIngestRouter::new(config, Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        config,
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let t = tenant("acme");
     let write = |i: i64| {
         router.write(

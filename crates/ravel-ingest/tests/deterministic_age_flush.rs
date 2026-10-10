@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, span_on_shard, tenant};
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
+use ravel_ingest::{
+    IngestConfig, IngestRouter, LogIngestRouter, PendingAckBudget, SpanIngestRouter, WriteMode,
+};
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -49,7 +51,13 @@ async fn advancing_the_injected_clock_drives_an_age_flush() {
         flush_tick: Duration::from_millis(10),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -124,7 +132,13 @@ async fn a_tick_below_max_flush_delay_does_not_flush() {
         flush_tick: Duration::from_millis(10),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -186,7 +200,13 @@ async fn idle_buffer_defers_age_trigger() {
         flush_tick: Duration::from_millis(10),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -334,11 +354,20 @@ impl AnyRouter {
                 store,
                 Signal::Metrics,
                 clock.clone(),
+                Arc::new(PendingAckBudget::new(0)),
             )),
-            Pipeline::Logs => AnyRouter::Logs(LogIngestRouter::new(config, store, clock.clone())),
-            Pipeline::Spans => {
-                AnyRouter::Spans(SpanIngestRouter::new(config, store, clock.clone()))
-            }
+            Pipeline::Logs => AnyRouter::Logs(LogIngestRouter::new(
+                config,
+                store,
+                clock.clone(),
+                Arc::new(PendingAckBudget::new(0)),
+            )),
+            Pipeline::Spans => AnyRouter::Spans(SpanIngestRouter::new(
+                config,
+                store,
+                clock.clone(),
+                Arc::new(PendingAckBudget::new(0)),
+            )),
         }
     }
 

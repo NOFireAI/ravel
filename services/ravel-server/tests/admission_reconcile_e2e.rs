@@ -42,8 +42,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ravel_ingest::{
-    AdmissionController, AdmissionLimits, Clock, CountLimit, IngestConfig, IngestRouter, RateLimit,
-    SystemClock, WriteMode, reconcile_once,
+    AdmissionController, AdmissionLimits, Clock, CountLimit, IngestConfig, IngestRouter,
+    PendingAckBudget, RateLimit, SystemClock, WriteMode, reconcile_once,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -142,6 +142,7 @@ fn build_process(store: Arc<dyn ObjectStoreBackend>) -> (Arc<AdmissionController
         store,
         Signal::Metrics,
         Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let state = IngestState {
         router,
