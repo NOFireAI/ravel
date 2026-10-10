@@ -1,6 +1,6 @@
 //! The `GroupValues` under-count compensation (issue #740, findings 2 and 3).
 //!
-//! DataFusion 54's `GroupValues::size()` reports `capacity() * entry_size`,
+//! DataFusion 55's `GroupValues::size()` reports `capacity() * entry_size`,
 //! where `capacity()` is the hashbrown table's usable slot count at the 7/8
 //! load factor and no control bytes are counted. The real allocation is the
 //! full bucket count (`capacity / (7/8)`, a power of two) times the entry

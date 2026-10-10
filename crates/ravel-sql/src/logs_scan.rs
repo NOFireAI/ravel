@@ -324,6 +324,7 @@ use datafusion::physical_expr::expressions::{
 };
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
@@ -2230,10 +2231,10 @@ impl LogsScanExec {
     /// record's own row count before the type existed.
     ///
     /// Resolving every column in one segment walk instead of one full walk per
-    /// column keeps `partition_statistics` cost at
+    /// column keeps `statistics_from_inputs` cost at
     /// `O(segments x columns_per_segment)` rather than
     /// `O(segments x declared x columns_per_segment)`; DataFusion may call
-    /// `partition_statistics` several times per plan, so the per-call cost
+    /// `statistics_from_inputs` several times per plan, so the per-call cost
     /// matters.
     fn declared_min_max_all(&self) -> Vec<Option<DeclaredExactStats>> {
         let n = self.declared.len();
@@ -2855,6 +2856,13 @@ impl ExecutionPlan for LogsScanExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2948,7 +2956,12 @@ impl ExecutionPlan for LogsScanExec {
     ///
     /// A pushed `fetch` narrows all of this to what the scan emits under it,
     /// as [`Self::apply_fetch_to_statistics`] describes.
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
+        let partition = args.partition();
         // Validate the partition index exactly as the trait default does, so an
         // out-of-range request is an internal error, never a silent answer.
         if let Some(idx) = partition {
@@ -2999,7 +3012,7 @@ impl ExecutionPlan for LogsScanExec {
             // report `None`, leaving the column `Absent`); this loop only
             // decides which output index to fill.
             // Skip the whole walk when the projection carries no declared
-            // column: partition_statistics runs several times per plan, and a
+            // column: statistics_from_inputs runs several times per plan, and a
             // ts-only statement must not pay one lookup per (segment, column).
             let projects_declared = self.projection.iter().any(|&i| i >= FIRST_DECLARED_COL);
             let declared_min_max = if projects_declared {
@@ -7261,7 +7274,7 @@ mod cstat_reconcile_tests {
     //! [`LogsScanExec::declared_group_counts`] and
     //! [`LogsScanExec::declared_column_sum`] directly rather than through a
     //! statement, because a planned statement also resolves
-    //! `partition_statistics`, which reads the same entry again through
+    //! `statistics_from_inputs`, which reads the same entry again through
     //! [`cstat_coverage`]: the metric has observation semantics (one increment
     //! per read, no per-entry dedup), so an exact-delta assertion means
     //! something only when the test knows how many reads it performed. The
