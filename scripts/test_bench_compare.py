@@ -8,6 +8,7 @@ imported normally; load it by path.
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -232,15 +233,16 @@ class CommittedTierBBaseline(unittest.TestCase):
     """The bench-compare workflow's pinned knobs equal the committed baseline's."""
 
     def test_workflow_pins_equal_the_baseline_knobs(self):
-        import re
-
         root = os.path.dirname(_HERE)
         with open(os.path.join(root, "bench", "baselines", "tier-b.json"), encoding="utf-8") as fh:
             knobs = json.load(fh)["_meta"]["knobs"]
         with open(os.path.join(root, ".github", "workflows", "bench-compare.yml"), encoding="utf-8") as fh:
             workflow = fh.read()
-        pinned = dict(re.findall(r'^\s+(BENCH_SAMPLE_SIZE|BENCH_WARMUP|BENCH_MEASURE|RAVEL_BENCH_MAX_SERIES): "([^"]*)"', workflow, re.M))
-        self.assertEqual(sorted(pinned), sorted(knobs))
+        # Only the compare step's env block, so a comment elsewhere in the
+        # file spelling a knob cannot stand in for the pin.
+        step = workflow[workflow.index("- name: Run the tier B compare"):]
+        env = step[step.index("env:"):step.index("run: scripts/bench-tier-b.sh compare")]
+        pinned = dict(re.findall(r'^\s+(BENCH_SAMPLE_SIZE|BENCH_WARMUP|BENCH_MEASURE|RAVEL_BENCH_MAX_SERIES): "([^"]*)"', env, re.M))
         self.assertEqual(pinned, knobs)
 
 

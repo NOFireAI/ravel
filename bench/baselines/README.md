@@ -37,11 +37,16 @@ byte/request gates (tier A), which are deterministic and hard-fail.
 # record a baseline (raise the sampling env knobs for a real reference run)
 scripts/bench-tier-b.sh record bench/baselines/tier-b.json "<environment label>"
 
-# compare a working tree to it (advisory: never fails)
-scripts/bench-tier-b.sh compare bench/baselines/tier-b.json
+# compare a working tree to it (advisory: never fails), at the knobs the
+# committed baseline was recorded at; the script's defaults (10/1/3) differ,
+# and a knob mismatch makes the pair not comparable
+BENCH_SAMPLE_SIZE=30 BENCH_WARMUP=2 BENCH_MEASURE=5 RAVEL_BENCH_MAX_SERIES=2000 \
+  scripts/bench-tier-b.sh compare bench/baselines/tier-b.json
 
-# the same, enforcing: exits non-zero on a regression past +15%
-scripts/bench-tier-b.sh compare bench/baselines/tier-b.json --enforce
+# the same, enforcing: exits non-zero on a regression past +15%, or on a
+# knob mismatch
+BENCH_SAMPLE_SIZE=30 BENCH_WARMUP=2 BENCH_MEASURE=5 RAVEL_BENCH_MAX_SERIES=2000 \
+  scripts/bench-tier-b.sh compare bench/baselines/tier-b.json --enforce
 ```
 
 The comparison reads criterion's `estimates.json` files, never criterion's
@@ -114,7 +119,7 @@ missing one exits 64 naming it before anything is launched.
 ```sh
 scripts/bench/fresh-box.sh --dry-run \
   --instance-type c6a.4xlarge --ami ami-... --subnet subnet-... \
-  --security-group sg-... --region eu-central-1 \
+  --security-group sg-... --region us-east-1 \
   --access ssh --key-name KEY --identity-file ~/.ssh/KEY.pem --ssh-user ubuntu \
   --volume-gb 120 --max-minutes 180 --repo-url https://github.com/OWNER/ravel.git \
   --commit <40-character sha> --out bench/baselines/tier-b.json \
