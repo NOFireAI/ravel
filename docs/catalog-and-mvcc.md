@@ -934,21 +934,44 @@ clock is refused with `CatalogError::InvalidConfig` before anything is read:
 no caller can assert anything about an hour that has not begun. Each caller
 asserts that no writer will publish into S or any earlier hour, so only an
 operator or loader that knows every writer of the tenant and signal has
-stopped may pass it. The loader also refuses to write into a sealed hour: with
-`--fold-after-load` it reads the logs HEAD before reading any row, and stops
-when the watermark is at or above the current hour. The seal lemma then rests on that
-assertion rather than on `max_flush_lifetime`, and it is unsafe under a live
-writer: a commit published into a bucket at or below the sealed watermark is
-not folded by a later fold, because the reconcile window re-lists hours below
-the watermark but skips a bucket holding only level-0 commit records, so it is
+stopped should pass it. The loader also refuses to write into a sealed hour:
+with `--fold-after-load` it reads the logs HEAD before reading any row, and
+stops when the watermark is at or above the current hour.
+
+The fold does not take the assertion on trust past the natural margin. Every
+hour above the margin hour at a fold's own wall time and at or below HEAD's
+watermark is held open: the hour was sealed by an assertion only, so the seal
+lemma does not hold for it yet. Which hours those are is derived from HEAD's
+`watermark_hour` and the fold's real clock alone, so every later fold holds
+them open, whether or not it was given an S itself and whoever wrote the HEAD.
+Every fold, the scheduled one included, re-lists each held-open hour's buckets,
+one LIST per shard, and folds any level-0 commit record HEAD does not hold. A
+commit published into a held-open hour by any writer (a live server, another
+load, a load run without the flag) is therefore visible to a read without a
+commit token from the next fold on (the scheduled fold runs every
+`--fold-interval-secs`, 300 s by default), at the same watermark if the fold
+does not advance it. A fold that finds nothing new there is a no-op, as
+before, and so is one given an S at or below the watermark. Held-open hours
+number at most the watermark minus the margin hour. Right after an assertion
+whose S is the fold's own hour that is three in the first twenty minutes of
+the hour and two after that, falling to one and then none as the margin
+catches up. A fold therefore issues at most that many LISTs per shard beyond
+what a fold over the same HEAD without held-open hours issues (twelve on a
+four-shard tenant), plus a GET of each snapshot part covering those hours
+when their listing names any commit record; a fold over a HEAD no assertion
+raised issues no extra request. The query resolve path is unchanged. Once the margin passes an hour it is sealed by
+the lemma like any other, and a commit published into it after that is not
+folded by a later fold, because the reconcile window re-lists hours below the
+watermark but skips a bucket holding only level-0 commit records, so it is
 invisible to a read without a commit token until HEAD is rebuilt from the
-commit records. A later fold that is not given S, including the
-scheduled fold, computes a target at or below the asserted watermark and
-no-ops until the natural margin passes it; a fold given an S at or below the
-watermark no-ops too. A no-op fold also skips the reconcile window below, so a
-compaction record or tombstone landing in a sealed hour after the asserted seal
-is applied only by the first later fold that advances the watermark: compact
-before sealing, not after. `FoldReport.seal_through_hour` carries S when S was above
+commit records. The assertion is therefore
+still unsafe under a live writer whose commit lands after the natural seal,
+or when no fold runs between that commit and the natural seal. A fold that
+does not advance the watermark reconciles only the held-open hours, and only
+when one lists a commit HEAD does not hold, so a compaction record or
+tombstone landing in a sealed hour after the asserted seal may wait for the
+first later fold that advances the watermark: compact before sealing, not
+after. `FoldReport.seal_through_hour` carries S when S was above
 the margin hour and so set the target, including on such a no-op, and is absent
 when no S was given or the margin already sealed it.
 
@@ -1057,7 +1080,9 @@ already-sealed hours:
   holding only immutable L0 records cannot have changed since it was folded
   (seal lemma above), so it is skipped with no record GET. Only a bucket whose
   listing contains a compaction record, a tombstone, or a rewrite record is
-  classified and diffed. When nothing late has landed, the pass costs only
+  classified and diffed, plus, in an hour an operator-asserted seal holds open
+  (see "Operator-asserted seal" above), a bucket whose listing names a commit
+  record the in-progress entry set does not hold. When nothing late has landed, the pass costs only
   the window LISTs and every unchanged sealed part is still carried forward
   by reference.
 - **Diff and apply.** A triggered bucket is classified by the same
