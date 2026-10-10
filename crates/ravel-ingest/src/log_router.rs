@@ -35,6 +35,8 @@ use crate::log_shard::{LogShardActor, LogShardMsg, est_columnar_bytes, est_recor
 use crate::router::WriteMode;
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
+use crate::write_gate::WriteGateSlot;
+use ravel_cpu_gate::WriteGate;
 
 /// Resolves the POSTINGS indexed-field list for a tenant at flush time
 /// (ADR-0049 decision 3). The shard actor calls this once per
@@ -123,6 +125,9 @@ pub struct LogIngestRouter {
     /// limit. Written by [`LogIngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
+    /// The write gate every shard actor's flush encode runs on, shared the same
+    /// way. Written by [`LogIngestRouter::with_write_gate`].
+    write_gate: WriteGateSlot,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
     /// bench reporter reads via [`LogIngestRouter::stage_timings`]. Present only
@@ -183,6 +188,7 @@ impl LogIngestRouter {
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::new(config.shard_count));
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
+        let write_gate = WriteGateSlot::default();
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(LogStageTimings::new());
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<LogShardHandle>>| {
@@ -195,6 +201,7 @@ impl LogIngestRouter {
             let metrics = Arc::clone(&metrics);
             let indexed_fields = Arc::clone(&indexed_fields);
             let backstop_ceiling = backstop_ceiling.clone();
+            let write_gate = write_gate.clone();
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             let factory = move |shard_count: u32| -> Vec<LogShardHandle> {
@@ -221,6 +228,7 @@ impl LogIngestRouter {
                             backstop_ceiling.clone(),
                             cap_flag.clone(),
                             Arc::clone(&scope),
+                            write_gate.clone(),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
@@ -246,6 +254,7 @@ impl LogIngestRouter {
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             backstop_ceiling,
+            write_gate,
             #[cfg(feature = "stage-timing")]
             stage_timings,
         }
@@ -267,6 +276,17 @@ impl LogIngestRouter {
     pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
         self.backstop_ceiling.set(budget.limit());
         self.budget = budget;
+        self
+    }
+
+    /// Runs every shard's flush encode on the ADR-1702 write gate under the
+    /// `log_flush` site, sized by the flushed buffer's bytes so the gate's
+    /// inline floor applies. Without it the encode runs inline on the flush
+    /// task. Like [`Self::with_budget`] it reaches actors that already exist
+    /// and every actor a later generation spawns.
+    #[must_use]
+    pub fn with_write_gate(self, gate: Arc<WriteGate>) -> Self {
+        self.write_gate.set(gate);
         self
     }
 
@@ -1616,6 +1636,121 @@ mod tests {
             objs_row, objs_col,
             "row and columnar paths must produce byte-identical stored objects"
         );
+    }
+
+    fn floor_zero_write_gate() -> Arc<WriteGate> {
+        Arc::new(WriteGate::new(
+            ravel_cpu_gate::CpuGateConfig {
+                inline_floor_bytes: 0,
+                ..ravel_cpu_gate::CpuGateConfig::with_permits(2)
+            },
+            Arc::new(ravel_cpu_gate::InstantClock::new()),
+        ))
+    }
+
+    /// ADR-1702 task 9: an RLOG flush encoded on the write gate stores the same
+    /// bytes as one encoded inline. Two routers share one pinned clock and one
+    /// seed, as in the row/columnar anchor above; only one has the gate. The
+    /// gate's `log_flush` count equals the number of shards the records span,
+    /// one flush each, so the gated router really encoded every object there.
+    #[tokio::test]
+    async fn gated_log_flush_stores_the_same_objects_as_inline() {
+        let seed = 0x00C0_FFEE_u64;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+        let gate = floor_zero_write_gate();
+        let routers = [None, Some(Arc::clone(&gate))].map(|gate| {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let router = LogIngestRouter::with_rng(
+                buffer_all(),
+                Arc::clone(&store),
+                Arc::clone(&clock),
+                overlay(),
+                Arc::new(SeededRng::new(seed)),
+            );
+            let router = match gate {
+                Some(gate) => router.with_write_gate(gate),
+                None => router,
+            };
+            (store, router)
+        });
+        let records = diverse_records();
+        let shards: std::collections::HashSet<u32> = records
+            .iter()
+            .map(|r| shard_for_log(&r.stream_id, 4))
+            .collect();
+        let mut stored = Vec::new();
+        for (store, router) in &routers {
+            router
+                .write(
+                    TenantId::new("acme"),
+                    records.clone(),
+                    WriteMode::Buffered,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("buffered write enqueues");
+            router.flush_all().await;
+            stored.push(collect_objects(store.as_ref()).await);
+        }
+        assert!(!stored[0].is_empty(), "the inline router wrote objects");
+        assert_eq!(
+            stored[0], stored[1],
+            "the gated encode must store byte-identical objects"
+        );
+        let site = gate
+            .snapshot()
+            .sites
+            .into_iter()
+            .find(|s| s.site == ravel_cpu_gate::WriteSite::LogFlush)
+            .expect("log_flush site");
+        assert_eq!((site.jobs, site.inline), (shards.len() as u64, 0));
+    }
+
+    /// A gated encode that panics fails its flush: the strict write gets the
+    /// typed `SegmentBuild` error rather than the `ShardUnavailable` a dropped
+    /// ack would produce, nothing is stored, the shard stays alive, and the
+    /// next write commits.
+    #[tokio::test]
+    async fn panicked_gated_log_encode_fails_the_strict_write() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = LogIngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            Arc::clone(&store),
+            Arc::new(FixedClock(1_700_000_000_000_000_000)),
+        )
+        .with_write_gate(floor_zero_write_gate());
+        router.write_gate.panic_next_encode();
+        let record = diverse_records().remove(0);
+        let err = router
+            .write(
+                TenantId::new("acme"),
+                vec![record.clone()],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a panicked encode fails the write");
+        assert!(
+            matches!(err, LogWriteError::SegmentBuild(_)),
+            "expected SegmentBuild, got {err:?}"
+        );
+        assert!(collect_objects(store.as_ref()).await.is_empty());
+        let snapshot = router.metrics.snapshot();
+        assert_eq!(snapshot.abandoned_input_rejected, 1);
+        assert_eq!(snapshot.shard_deaths, 0);
+        router
+            .write(
+                TenantId::new("acme"),
+                vec![record],
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("the shard survives and the next write commits");
     }
 
     /// The row/columnar byte-identity anchor above, for a keyed tenant: a
