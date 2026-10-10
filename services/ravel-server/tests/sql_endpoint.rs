@@ -2310,6 +2310,129 @@ async fn sql_response_carries_phase_and_io_shape_stats() {
     );
 }
 
+/// An audit sink that holds every submission for [`SLOW_AUDIT`] before
+/// accepting it, so the time a request spends awaiting its audit is known
+/// from below.
+struct SlowAuditSink;
+
+const SLOW_AUDIT: Duration = Duration::from_millis(60);
+
+#[async_trait::async_trait]
+impl ravel_maintain::QueryAuditSink for SlowAuditSink {
+    async fn submit(&self, _event: ravel_maintain::AuditEvent) -> ravel_maintain::Result<()> {
+        tokio::time::sleep(SLOW_AUDIT).await;
+        Ok(())
+    }
+}
+
+/// The object under `stats.<name>`, checked to hold exactly `expected` keys,
+/// each spelled exactly once in the raw response bytes (a duplicated key
+/// would parse to one entry and pass a key-set check alone).
+fn stats_object<'a>(raw: &[u8], value: &'a Value, name: &str, expected: &[&str]) -> &'a Value {
+    let object = value["stats"][name]
+        .as_object()
+        .unwrap_or_else(|| panic!("stats.{name} is an object: {value}"));
+    let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let want: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
+    assert_eq!(keys, want, "stats.{name}: {value}");
+    // Both objects are flat, so the object's own text runs from its key to
+    // the first closing brace after it.
+    let text = String::from_utf8_lossy(raw);
+    let opener = format!("\"{name}\":{{");
+    assert_eq!(text.matches(&opener).count(), 1, "one stats.{name}: {text}");
+    let start = text.find(&opener).expect("located above");
+    let own = &text[start..];
+    let own = &own[..own.find('}').expect("object closes")];
+    for key in expected {
+        assert_eq!(
+            own.matches(&format!("\"{key}\":")).count(),
+            1,
+            "{key} appears exactly once in stats.{name}: {own}"
+        );
+    }
+    &value["stats"][name]
+}
+
+const TIMINGS_KEYS: &[&str] = &[
+    "attempts",
+    "resolveMs",
+    "planMs",
+    "startMs",
+    "firstBatchMs",
+    "drainMs",
+    "auditMs",
+    "planInitMs",
+    "planningWaitMaxMs",
+    "openMaxMs",
+    "decodeBuildMaxMs",
+    "firstBatchMinMs",
+    "streamMaxMs",
+];
+
+const PRUNING_KEYS: &[&str] = &[
+    "segments",
+    "segmentsPrunedByStats",
+    "blocksTotal",
+    "blocksScanned",
+    "blocksPrunedByPostings",
+];
+
+/// ADR-2677 decision 4: the JSON response carries `stats.timings` and
+/// `stats.pruning` beside `phases` and `io`, every key exactly once. The
+/// resolve stamp is a real nonzero measurement, and `auditMs` is the audit
+/// await itself: present with the no-op sink (which accepts at once, so the
+/// figure is small) and at least the configured sink's hold when that sink is
+/// slow, which a stamp around anything after the await cannot reach.
+#[tokio::test]
+async fn sql_response_carries_timings_and_pruning_stats() {
+    let query = "SELECT ts, value FROM samples ORDER BY ts";
+
+    let app = one_tenant_app("m", &[(100, 1.0), (200, 2.5)]).await;
+    let (status, raw) = post(&app, Some("acme-token"), None, body(query)).await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&raw).expect("JSON body");
+    let timings = stats_object(&raw, &value, "timings", TIMINGS_KEYS);
+    assert_eq!(timings["attempts"], 1, "{value}");
+    let resolve_ms = timings["resolveMs"].as_f64().expect("resolveMs");
+    assert!(resolve_ms > 0.0, "resolve took measurable time: {value}");
+    for key in TIMINGS_KEYS {
+        assert!(
+            timings[*key].as_f64().is_some_and(|ms| ms >= 0.0),
+            "{key} is a non-negative number: {value}"
+        );
+    }
+    assert!(
+        timings["auditMs"].as_f64().expect("auditMs") < SLOW_AUDIT.as_secs_f64() * 1_000.0,
+        "the no-op sink accepts without holding: {value}"
+    );
+    let pruning = stats_object(&raw, &value, "pruning", PRUNING_KEYS);
+    assert_eq!(pruning["segments"], 1, "{value}");
+    assert_eq!(pruning["segmentsPrunedByStats"], 0, "{value}");
+    assert_eq!(
+        pruning["blocksTotal"], 0,
+        "a metrics scan has no logs blocks: {value}"
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let slow = build_router_with_sink(
+        store,
+        tokens(&[("acme-token", "acme")]),
+        Arc::new(SlowAuditSink),
+    );
+    let (status, raw) = post(&slow, Some("acme-token"), None, body(query)).await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&raw).expect("JSON body");
+    let timings = stats_object(&raw, &value, "timings", TIMINGS_KEYS);
+    let audit_ms = timings["auditMs"].as_f64().expect("auditMs");
+    assert!(
+        audit_ms >= SLOW_AUDIT.as_secs_f64() * 1_000.0,
+        "auditMs covers the sink's {SLOW_AUDIT:?} hold, got {audit_ms}: {value}"
+    );
+    stats_object(&raw, &value, "pruning", PRUNING_KEYS);
+}
+
 /// The `samples` table has no column that can hold a native histogram, so a
 /// histogram sample never becomes a row and every count over the table is
 /// short by the whole histogram population. That undercount must be visible in

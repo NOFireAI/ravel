@@ -2882,6 +2882,70 @@ public `phase_accounting`/`io_shape` types rather than reusing this crate's
 `SqlOutcome` and has no stats envelope to extend, so neither surface renders
 `stats.phases`/`stats.io`.
 
+`/api/v1/sql`'s JSON response also carries two objects PromQL has no
+counterpart for (ADR-2677 decision 4), rendered by
+`crates/ravel-sql/src/stats_json.rs`'s `timings_json` and `pruning_json`.
+
+`stats.timings` holds wall times in fractional milliseconds, taken from
+monotonic stamps. They are wall-clock stages, not the request accounting
+buckets `stats.phases` names, and they live in their own object so the
+`stats.phases` key set stays at parity with PromQL:
+
+- `attempts`: plan-and-execute attempts, 2 when the snapshot retry fired.
+- `resolveMs`: the snapshot resolve (`SqlExecutor::resolve`: the catalog
+  listing and HEAD reads, plus any Parquet table resolution).
+- `planMs`: logical planning against the pinned snapshot.
+- `startMs`: physical plan creation plus starting the stream.
+- `firstBatchMs`: from the stream starting to its first batch; 0 when the
+  statement returned no batch.
+- `drainMs`: from the first batch (or the stream starting, when there was
+  none) to the end of the stream.
+- `auditMs`: the wait on the query's audit submission, which runs after the
+  executor returns and before the response is released. Always present: a
+  query-serving server always installs its audit pipeline, and a SQL router
+  built over the no-op sink reports that sink's immediate accept.
+- `planInitMs`: the logs scan's shared plan barrier, counted once per query.
+- `planningWaitMaxMs`: the longest single scan partition's wait on that
+  barrier.
+- `openMaxMs`: the longest single scan partition's segment-open stall.
+- `decodeBuildMaxMs`: the longest single scan partition's synchronous decode
+  and Arrow build.
+- `firstBatchMinMs`: from scan creation to the earliest batch any partition
+  emitted; 0 when none emitted one.
+- `streamMaxMs`: from scan creation to the last partition finishing.
+
+The last six are the logs scan's own timers (`SqlStats::scan_timing`) and
+read 0 for a statement with no logs scan. Only the figures that hold across
+partitions are rendered: the scan's per-partition sums add overlapping
+intervals and are not rendered, nor are its per-segment timeline rows.
+
+The stages overlap and do not sum to the latency a client sees.
+`drainMs` covers the scan, decode and every operator above it. The six
+scan figures are measured inside the scan, which is created during `startMs`
+and runs on through `firstBatchMs` and `drainMs`, so they overlap those
+three. Admission, request parsing and response encoding are in no field. A retried statement reports the stages of its
+successful attempt only, with `attempts` saying a retry happened, so the
+discarded attempt's time is in no field either.
+
+`stats.pruning` holds the successful attempt's pruning counts, object-level
+and block-level reported independently:
+
+- `segments`: segments in the resolved snapshot.
+- `segmentsPrunedByStats`: of those, segments the logs scan skipped before
+  any fetch because a typed attribute column's stamped statistics excluded a
+  pushed-down predicate (ADR-2121 D1).
+- `blocksTotal`: blocks the logs scan saw in the segments it read.
+- `blocksScanned`: of those, blocks it read.
+- `blocksPrunedByPostings`: blocks POSTINGS ruled out.
+
+All four counts after `segments` are 0 for a statement with no logs scan.
+`services/ravel-server/tests/sql_declared_prune_reachability_e2e.rs` drives
+both pruning levels through `POST /api/v1/sql`.
+
+Neither object reaches the Arrow-IPC encoding or Flight SQL, for the reasons
+given above. The MCP `sql_execute` tool's envelope renders neither, and it
+does not render `stats.phases` or `stats.io` either.
+
 ### I/O dependency shape
 
 `stats.phases` above answers "how many requests and bytes did each phase

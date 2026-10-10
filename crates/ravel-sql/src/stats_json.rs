@@ -20,10 +20,14 @@
 //! is a decode-time output size no request paid for. The three are never
 //! comparable or summable with each other.
 
+use std::time::Duration;
+
 use ravel_query::io_shape::QueryIoShape;
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
 use ravel_types::accounting::AccountedOp;
 use serde_json::{Value as Json, json};
+
+use crate::SqlStats;
 
 /// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
 /// exactly once: a phase added to the enum cannot be silently dropped from
@@ -60,6 +64,53 @@ pub fn io_shape_json(shape: &QueryIoShape) -> Json {
         "unfoldedSegmentsResolved": shape.unfolded_segments_resolved,
         "unfoldedRecordsServedFromCache": shape.unfolded_records_served_from_cache,
         "planClass": shape.plan_class.name(),
+    })
+}
+
+/// Nanoseconds as fractional milliseconds.
+fn ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+/// The statement's wall time per stage, rendered under `stats.timings`
+/// (ADR-2677 decision 4). These are wall-clock stages, not the request
+/// accounting buckets `stats.phases` names, and they overlap: the scan
+/// figures are measured inside a scan created during `startMs` and drained
+/// during `drainMs`. `audit` is the caller's wait on its audit submission,
+/// which runs outside the executor.
+///
+/// Only the scan figures that hold across partitions are rendered: the
+/// per-partition extremes and the once-per-query barrier cost, never a sum
+/// over partitions (their intervals overlap) and never the per-segment rows.
+pub fn timings_json(stats: &SqlStats, audit: Duration) -> Json {
+    let wall = &stats.wall;
+    let scan = &stats.scan_timing;
+    json!({
+        "attempts": stats.attempts,
+        "resolveMs": ms(wall.resolve_ns),
+        "planMs": ms(wall.plan_ns),
+        "startMs": ms(wall.start_ns),
+        "firstBatchMs": ms(wall.first_batch_ns),
+        "drainMs": ms(wall.drain_ns),
+        "auditMs": audit.as_secs_f64() * 1_000.0,
+        "planInitMs": ms(scan.plan_init_elapsed_ns),
+        "planningWaitMaxMs": ms(scan.planning_wait_elapsed_max_ns),
+        "openMaxMs": ms(scan.open_elapsed_max_ns),
+        "decodeBuildMaxMs": ms(scan.decode_build_elapsed_max_ns),
+        "firstBatchMinMs": ms(scan.first_batch_elapsed_min_ns),
+        "streamMaxMs": ms(scan.stream_elapsed_max_ns),
+    })
+}
+
+/// The successful attempt's object- and block-level pruning counts, rendered
+/// under `stats.pruning`. See [`SqlStats`] for what each counter means.
+pub fn pruning_json(stats: &SqlStats) -> Json {
+    json!({
+        "segments": stats.segments,
+        "segmentsPrunedByStats": stats.segments_pruned_by_stats,
+        "blocksTotal": stats.blocks_total,
+        "blocksScanned": stats.blocks_scanned,
+        "blocksPrunedByPostings": stats.blocks_pruned_by_postings,
     })
 }
 
@@ -190,5 +241,116 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(keys, expected);
+    }
+
+    fn keys(rendered: &Json) -> std::collections::BTreeSet<&str> {
+        rendered
+            .as_object()
+            .expect("renders an object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// A stats value whose every rendered source field holds a distinct
+    /// value, so a field wired to the wrong source shows up as a wrong
+    /// number below.
+    fn distinct_stats() -> SqlStats {
+        let mut stats = SqlStats {
+            attempts: 2,
+            segments: 7,
+            segments_pruned_by_stats: 3,
+            blocks_total: 40,
+            blocks_scanned: 11,
+            blocks_pruned_by_postings: 5,
+            ..SqlStats::default()
+        };
+        stats.wall = crate::PhaseWallTiming {
+            resolve_ns: 1_000_000,
+            plan_ns: 2_000_000,
+            start_ns: 3_000_000,
+            first_batch_ns: 4_000_000,
+            drain_ns: 5_000_000,
+        };
+        let scan = &mut stats.scan_timing;
+        scan.plan_init_elapsed_ns = 6_000_000;
+        scan.planning_wait_elapsed_max_ns = 7_000_000;
+        scan.open_elapsed_ns = 900_000_000;
+        scan.open_elapsed_max_ns = 8_000_000;
+        scan.decode_build_elapsed_ns = 910_000_000;
+        scan.decode_build_elapsed_max_ns = 9_000_000;
+        scan.first_batch_elapsed_min_ns = 10_000_000;
+        scan.stream_elapsed_max_ns = 11_000_000;
+        stats
+    }
+
+    /// `timings_json`'s key set is exactly the thirteen fields below, and
+    /// each reads its own source: the scan figures are the per-partition
+    /// maxima and minimum, never the overlapping sums the fixture sets far
+    /// larger. Exact set equality, so a stray key fails like a missing one.
+    #[test]
+    fn timings_json_names_every_field_exactly_once() {
+        let rendered = timings_json(&distinct_stats(), Duration::from_millis(12));
+        let expected: std::collections::BTreeSet<&str> = [
+            "attempts",
+            "resolveMs",
+            "planMs",
+            "startMs",
+            "firstBatchMs",
+            "drainMs",
+            "auditMs",
+            "planInitMs",
+            "planningWaitMaxMs",
+            "openMaxMs",
+            "decodeBuildMaxMs",
+            "firstBatchMinMs",
+            "streamMaxMs",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys(&rendered), expected);
+        assert_eq!(rendered["attempts"], 2);
+        for (key, value) in [
+            ("resolveMs", 1.0),
+            ("planMs", 2.0),
+            ("startMs", 3.0),
+            ("firstBatchMs", 4.0),
+            ("drainMs", 5.0),
+            ("planInitMs", 6.0),
+            ("planningWaitMaxMs", 7.0),
+            ("openMaxMs", 8.0),
+            ("decodeBuildMaxMs", 9.0),
+            ("firstBatchMinMs", 10.0),
+            ("streamMaxMs", 11.0),
+            ("auditMs", 12.0),
+        ] {
+            assert_eq!(rendered[key].as_f64(), Some(value), "{key}: {rendered}");
+        }
+    }
+
+    /// `pruning_json`'s key set is exactly the five counters below, each
+    /// carrying its own `SqlStats` field.
+    #[test]
+    fn pruning_json_names_every_field_exactly_once() {
+        let rendered = pruning_json(&distinct_stats());
+        let expected: std::collections::BTreeSet<&str> = [
+            "segments",
+            "segmentsPrunedByStats",
+            "blocksTotal",
+            "blocksScanned",
+            "blocksPrunedByPostings",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys(&rendered), expected);
+        for (key, value) in [
+            ("segments", 7),
+            ("segmentsPrunedByStats", 3),
+            ("blocksTotal", 40),
+            ("blocksScanned", 11),
+            ("blocksPrunedByPostings", 5),
+        ] {
+            assert_eq!(rendered[key].as_u64(), Some(value), "{key}: {rendered}");
+        }
     }
 }
