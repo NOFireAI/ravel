@@ -267,7 +267,8 @@ it can no longer report, and the metrics in decision 5 need both numbers.
   with no configuration. This is the single most common first-contact failure
   the project has, and it stops being one.
 - The quickstart returns to a stock Collector config, and #209's
-  delivery assertion becomes a standing regression test for this path.
+  delivery assertion becomes a standing regression test for this path. That
+  assertion was later removed; see the collector-delivery amendment below.
 - A new dependency for gzip decompression (`flate2`, which is not currently in
   the workspace). Rust gzip decoders are well-audited and `flate2` is the
   ecosystem default, but it is a genuinely new dependency and is flagged as one.
@@ -307,7 +308,7 @@ it can no longer report, and the metrics in decision 5 need both numbers.
 
 ## Amendment (2026-10-09): the collector-delivery amendment, decision 6 without its regression test
 
-<!-- amendment-applies: sections="Decision" pointer="collector-delivery amendment" -->
+<!-- amendment-applies: sections="Decision|Consequences" pointer="collector-delivery amendment" -->
 
 ADR-0081 amendment A6 removed the per-PR `quickstart` job and, with it,
 `scripts/check-collector-delivery.sh`. Decision 6's workaround removal still
