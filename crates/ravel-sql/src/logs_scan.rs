@@ -7197,7 +7197,10 @@ where
         });
     };
     let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
-        return Ok(PrimitiveArray::try_new(ScalarBuffer::from(Vec::new()), None)?);
+        return Ok(PrimitiveArray::try_new(
+            ScalarBuffer::from(Vec::new()),
+            None,
+        )?);
     };
     let span = values.get(first..=last).ok_or_else(out_of_range)?;
     let nulls = match col.validity() {
@@ -7255,7 +7258,9 @@ fn build_columnar_batch(
             >(&view.ts_values(), start, end, false)?),
             LOG_COL_OBSERVED_TS => Arc::new(int_column_array::<
                 datafusion::arrow::datatypes::TimestampNanosecondType,
-            >(&view.observed_ts_values(), start, end, false)?),
+            >(
+                &view.observed_ts_values(), start, end, false
+            )?),
             LOG_COL_SEVERITY_NUM => {
                 let raw = int_column_array::<datafusion::arrow::datatypes::Int64Type>(
                     &view.severity_num_values(),

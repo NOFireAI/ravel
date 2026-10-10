@@ -2628,7 +2628,9 @@ mod tests {
         /// column builds no buffer of its own, so it adds nothing.
         #[test]
         fn integer_page_decode_writes_block_length_values_and_validity() {
-            let presence = [false, true, true, false, true, true, true, true, true, false];
+            let presence = [
+                false, true, true, false, true, true, true, true, true, false,
+            ];
             let n = presence.len();
             let present_count = presence.iter().filter(|p| **p).count();
             let other: Vec<i64> = (0..present_count as i64).collect();

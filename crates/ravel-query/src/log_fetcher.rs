@@ -3191,7 +3191,10 @@ impl LogSegmentFetcher {
 
     /// The reader over `bytes`, taking the directories a ranged fetch already
     /// decoded from it when it carries them (ADR-2773 decision 5).
-    fn open_reader<'a>(&self, bytes: &'a LogObjectBytes) -> Result<RlogReader<'a, LogObjectBytes>, LogSegError> {
+    fn open_reader<'a>(
+        &self,
+        bytes: &'a LogObjectBytes,
+    ) -> Result<RlogReader<'a, LogObjectBytes>, LogSegError> {
         match bytes.fetched_directories() {
             Some(dirs) => RlogReader::from_source_reusing(
                 bytes,
@@ -3224,8 +3227,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            self.open_reader(bytes).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         // `prune` is passed as the reader's prune-only channel, never folded
         // into `pred`: an arm there would become an exact per-row filter and
         // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
@@ -3254,8 +3258,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            self.open_reader(bytes).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_subset(&pred, &query.prune, columns, indices)
             .map_err(|source| corrupt(key, source))
@@ -3280,8 +3285,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            self.open_reader(bytes).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_raw_subset(&pred, &query.prune, columns, indices, expected_survivors)
             .map_err(|source| corrupt(key, source))
@@ -3328,8 +3334,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<(BlockScan, Arc<SegmentDirectories>), LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            self.open_reader(bytes).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         let dirs = Arc::new(reader.directories());
         let scan = reader
             .scan_blocks(&pred, &query.prune, columns)

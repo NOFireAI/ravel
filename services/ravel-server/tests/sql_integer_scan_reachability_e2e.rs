@@ -322,9 +322,7 @@ fn aggregate_row(value: &serde_json::Value) -> &[serde_json::Value] {
         .as_array()
         .unwrap_or_else(|| panic!("rows: {value}"));
     assert_eq!(rows.len(), 1, "one aggregate row: {value}");
-    rows[0]
-        .as_array()
-        .unwrap_or_else(|| panic!("row: {value}"))
+    rows[0].as_array().unwrap_or_else(|| panic!("row: {value}"))
 }
 
 fn int_values_buffers(value: &serde_json::Value) -> u64 {
@@ -358,7 +356,9 @@ async fn declared_integer_aggregates_match_the_written_records_through_http() {
     };
     for (filter, keep) in [
         ("", (|_: &Row| true) as fn(&Row) -> bool),
-        (" WHERE \"Weight\" > 3", |r: &Row| r.weight.is_some_and(|w| w > 3)),
+        (" WHERE \"Weight\" > 3", |r: &Row| {
+            r.weight.is_some_and(|w| w > 3)
+        }),
     ] {
         let kept: Vec<Row> = all.iter().copied().filter(keep).collect();
         let amount: Vec<Option<i64>> = kept.iter().map(|r| r.amount).collect();
