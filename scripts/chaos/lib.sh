@@ -317,7 +317,6 @@ check_dependencies() {
     oracle_strict_ack_implies_durable \
     oracle_sibling_takeover_within_bound \
     oracle_no_orphaned_lease \
-    oracle_conservation_holds \
     oracle_conservation_or_unmeasured \
     oracle_custody_and_catalog_verify_clean \
     oracle_no_partial_output_leak; do
@@ -838,12 +837,16 @@ wait_for_metric_at_least() {
 # the load is OTLP metrics, and a logs or traces flush in the same process
 # would otherwise fire the kill outside any flush this scenario's writes are in.
 #
-# Scenario 2 keys off the compaction lifecycle: a compaction is observed
-# in-flight when the maintain worker owns units and has begun a run but has
-# not yet emitted the `"compaction record published"` log line
-# (crates/ravel-maintain/src/publish.rs:200) for that unit. The kill fires
-# after parts have begun landing but before that publish, so the compaction
-# is genuinely interrupted mid-flight.
+# Scenario 2 keys off the compaction lifecycle as worker A's log shows it.
+# Neither crates/ravel-maintain nor the server emits a per-bucket "compaction
+# started" line or metric that rises before the publish, so the closest
+# readable boundary is the end of a pass: the server logs
+# `"maintenance: retention + compaction pass complete"` with `compacted=N`
+# for each owned shard once the signal's pass is over
+# (services/ravel-server/src/maintain.rs:2710), after every publish of that
+# pass (`"compaction record published"`,
+# crates/ravel-maintain/src/publish.rs:331). See
+# compaction_unfinished_in_log for what this can and cannot distinguish.
 # ---------------------------------------------------------------------------
 
 CHAOS_FLUSH_METRICS=(
@@ -858,6 +861,14 @@ CHAOS_FLUSH_SELECTOR="signal=metrics"
 # inside one second, so this polls faster than wait_for_metric_at_least.
 CHAOS_FLUSH_POLLS_PER_SECOND="${CHAOS_FLUSH_POLLS_PER_SECOND:-5}"
 CHAOS_COMPACTION_PUBLISH_MARKER="compaction record published"
+CHAOS_COMPACTION_PASS_MARKER="maintenance: retention + compaction pass complete"
+# Flush-attempt count read by the poll that saw the rise; empty until then.
+CHAOS_FLUSH_ATTEMPTS_SEEN=""
+# curl exit codes for a request the server never answered: 7 (connect
+# refused), 18 (transfer closed early), 28 (timed out), 52 (empty reply),
+# 55 (send failed), 56 (receive failed, including a reset connection).
+# run_capture and drive_one_export return curl's code unchanged.
+CHAOS_CURL_UNANSWERED_CODES=(7 18 28 52 55 56)
 
 # Print the metrics pipeline's flush-attempt count from a /metrics body: the
 # sum of CHAOS_FLUSH_METRICS under CHAOS_FLUSH_SELECTOR. Prints the empty
@@ -884,7 +895,9 @@ flush_attempts() {
 # Wait until the flush-attempt count has risen past `baseline`, i.e. a flush
 # of any trigger has started since the baseline was read. This is the
 # scenario-1 "mid-flush" trigger. Args: base_url baseline deadline_seconds.
-# Returns 0 on the rise, 1 when the deadline passes first.
+# Returns 0 on the rise, with the count that poll read in
+# CHAOS_FLUSH_ATTEMPTS_SEEN, so the caller can kill without another scrape;
+# 1 when the deadline passes first.
 wait_for_flush_started() {
   local base_url="$1"
   local baseline="$2"
@@ -896,6 +909,7 @@ wait_for_flush_started() {
   for (( i = 0; i < polls; i++ )); do
     value="$(flush_attempts "$base_url")" || value=""
     if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -gt "$baseline" ]]; then
+      CHAOS_FLUSH_ATTEMPTS_SEEN="$value"
       return 0
     fi
     sleep "$interval"
@@ -903,25 +917,77 @@ wait_for_flush_started() {
   return 1
 }
 
+# Print 1 when the in-flight export's exit code means the server answered it
+# before the kill (a success, an HTTP error status such as curl's 22, or a
+# response with no commit token), 0 when it is one of
+# CHAOS_CURL_UNANSWERED_CODES. Args: the export's exit code. Pure.
+chaos_inflight_answered() {
+  local rc="$1" code
+  for code in "${CHAOS_CURL_UNANSWERED_CODES[@]}"; do
+    if [[ "$rc" == "$code" ]]; then
+      echo 0
+      return 0
+    fi
+  done
+  echo 1
+}
+
 # The scenario-1 summary line for where the kill landed. Args: flush_observed
-# (0|1), inflight_export_acked (0|1), baseline, attempts at the kill. The kill
-# landed mid-flush when a flush had started and the export sent to fill it
-# was still unacknowledged when the server died.
+# (0|1), inflight_export_answered (0|1, see chaos_inflight_answered),
+# baseline, attempts read when the rise was detected. The kill landed
+# mid-flush when a flush had started and the export sent to fill it was still
+# unanswered when the server died.
 kill_timing_line() {
-  local observed="$1" acked="$2" baseline="$3" at_kill="$4"
-  if [[ "$observed" -eq 1 && "$acked" -eq 0 ]]; then
+  local observed="$1" answered="$2" baseline="$3" at_kill="$4"
+  if [[ "$observed" -eq 1 && "$answered" -eq 0 ]]; then
     echo "KILL-TIMING: mid-flush=yes (flush attempts ${baseline} -> ${at_kill}, in-flight export unacknowledged at the kill)"
   elif [[ "$observed" -eq 1 ]]; then
-    echo "KILL-TIMING: mid-flush=no (flush attempts ${baseline} -> ${at_kill}, but the in-flight export was acknowledged before the kill)"
+    echo "KILL-TIMING: mid-flush=no (flush attempts ${baseline} -> ${at_kill}, but the server answered the in-flight export before the kill)"
   else
     echo "KILL-TIMING: mid-flush=no (no flush attempt observed; attempts stayed at ${baseline})"
   fi
 }
 
-# Wait until a compaction has begun for the worker whose log is `log_file`,
-# but before it publishes its record. We detect "begun" as the worker owning
-# at least one unit AND its log not yet carrying the publish marker for the
-# current run. This is the scenario-2 "mid-compaction" trigger.
+# Return 0 when a maintain worker's log shows compaction work it had not
+# finished, 1 when its last publish is covered by a finished pass. Args: the
+# log body. Pure.
+#
+# Unfinished means the log carries no CHAOS_COMPACTION_PUBLISH_MARKER, or its
+# last one is not followed by a CHAOS_COMPACTION_PASS_MARKER line with
+# `compacted=N`, N >= 1. The pass lines are logged only after every shard of
+# the signal's pass has returned, so one after the last publish means no
+# merge of that pass was still running. With no start signal to read, this
+# cannot tell a pass still merging a bucket from one that published its last
+# bucket and is still in retention or sweep work (both read as unfinished),
+# and it cannot see a merge begun by a later pass that has not published
+# (that reads as finished).
+compaction_unfinished_in_log() {
+  local body="$1"
+  local positions
+  positions="$(CHAOS_PUB="$CHAOS_COMPACTION_PUBLISH_MARKER" \
+    CHAOS_PASS="$CHAOS_COMPACTION_PASS_MARKER" awk '
+    BEGIN { pub = ENVIRON["CHAOS_PUB"]; pass = ENVIRON["CHAOS_PASS"]; p = 0; c = 0 }
+    {
+      line = $0
+      gsub(/\033\[[0-9;]*m/, "", line)
+      if (index(line, pub) > 0) p = NR
+      if (index(line, pass) > 0 && match(line, /[ \t]compacted=[0-9]+/)) {
+        n = substr(line, RSTART + 11, RLENGTH - 11) + 0
+        if (n >= 1) c = NR
+      }
+    }
+    END { print p, c }' <<<"$body")"
+  local last_publish="${positions% *}" last_pass="${positions#* }"
+  if [[ "$last_publish" -eq 0 || "$last_publish" -gt "$last_pass" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Wait until worker A owns at least one unit and its log shows unfinished
+# compaction work (compaction_unfinished_in_log). This is the scenario-2
+# "mid-compaction" trigger. Args: base_url log_file deadline_seconds. Returns
+# 0 when seen, 1 when the deadline passes first.
 wait_for_compaction_in_flight() {
   local base_url="$1"
   local log_file="$2"
@@ -936,43 +1002,14 @@ wait_for_compaction_in_flight() {
     if [[ -r "$log_file" ]]; then
       body="$(cat "$log_file")"
     fi
-    if [[ "${owned%.*}" =~ ^[0-9]+$ ]] && [[ "${owned%.*}" -ge 1 ]]; then
-      # A run is in flight the moment a unit is owned and being worked; the
-      # kill must land before the publish marker for a true mid-compaction.
-      if [[ "$body" != *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
-        return 0
-      fi
+    if [[ "${owned%.*}" =~ ^[0-9]+$ ]] && [[ "${owned%.*}" -ge 1 ]] \
+      && compaction_unfinished_in_log "$body"; then
+      return 0
     fi
     sleep 1
     waited=$(( waited + 1 ))
   done
   return 1
-}
-
-# Conservation, unless the kill provably missed the compaction. Args:
-# observed (1 when worker A was seen mid-compaction before the kill, else 0),
-# worker A's log file, then the oracle_conservation_holds arguments
-# (survivor_base_url, conservation_aborts_baseline, survivor_log_file).
-#
-# When A was not observed mid-compaction AND its own log carries the publish
-# marker, the unit finished before the kill and no takeover of an interrupted
-# compaction happened: return CHAOS_UNMEASURED_EXIT and record no oracle
-# outcome. Every other case runs oracle_conservation_holds and returns its
-# result, so a missing publish after a real mid-flight kill stays a FAIL.
-oracle_conservation_or_unmeasured() {
-  local observed="$1"
-  local worker_a_log="$2"
-  shift 2
-  local a_body=""
-  if [[ -r "$worker_a_log" ]]; then
-    a_body="$(cat "$worker_a_log")"
-  fi
-  if [[ "$observed" -ne 1 && "$a_body" == *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
-    ORACLE_UNMEASURED+=("conservation-holds: could not measure: compaction finished before the kill")
-    log "could not measure: compaction finished before the kill (worker A was not observed mid-compaction and its log carries '${CHAOS_COMPACTION_PUBLISH_MARKER}')"
-    return "$CHAOS_UNMEASURED_EXIT"
-  fi
-  oracle_conservation_holds "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -1211,17 +1248,26 @@ oracle_no_orphaned_lease() {
   return 0
 }
 
-# 4. conservation-holds.
-#    The interrupted compaction completes under the conservation gate: the
-#    conservation-abort counter did not advance across the interruption (the
-#    gate never had to reject a record-dropping compaction), and the unit
-#    reaches a published/compacted terminal state after takeover.
+# 4. conservation-holds, with a could-not-measure outcome.
+#    The conservation-abort counter on the survivor did not advance across
+#    the interruption (the gate never had to reject a record-dropping
+#    compaction), and the survivor published a compaction record after
+#    takeover.
 #
-#    Args: survivor_base_url, conservation_aborts_baseline, survivor_log_file
-oracle_conservation_holds() {
-  local survivor_url="$1"
-  local aborts_baseline="$2"
-  local survivor_log="$3"
+#    Args: worker_a_log_file (read after the SIGKILL, so it is A's state at
+#    the kill), survivor_base_url, conservation_aborts_baseline,
+#    survivor_log_file.
+#
+#    The abort counter is checked first, and an unreadable or risen counter
+#    is a FAIL whatever A's log shows. Only a missing survivor publish
+#    depends on A: a FAIL when A's log shows unfinished work
+#    (compaction_unfinished_in_log), else could-not-measure, recorded in
+#    ORACLE_UNMEASURED with CHAOS_UNMEASURED_EXIT returned.
+oracle_conservation_or_unmeasured() {
+  local worker_a_log="$1"
+  local survivor_url="$2"
+  local aborts_baseline="$3"
+  local survivor_log="$4"
   local name="conservation-holds"
 
   local aborts_now
@@ -1237,21 +1283,26 @@ oracle_conservation_holds() {
     return 1
   fi
 
-  # The interrupted unit must actually finish: the survivor must publish a
-  # compaction record after taking over. The publish marker is captured from
-  # the survivor's log into a variable and tested from the variable.
-  local survivor_body=""
+  # Logs are captured into variables and tested from the variables.
+  local survivor_body="" a_body=""
   if [[ -r "$survivor_log" ]]; then
     survivor_body="$(cat "$survivor_log")"
   fi
-  if [[ "$survivor_body" != *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
+  if [[ "$survivor_body" == *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
+    oracle_ok "$name"
+    return 0
+  fi
+  if [[ -r "$worker_a_log" ]]; then
+    a_body="$(cat "$worker_a_log")"
+  fi
+  if compaction_unfinished_in_log "$a_body"; then
     oracle_bad "$name" \
       "no '${CHAOS_COMPACTION_PUBLISH_MARKER}' after takeover: interrupted compaction did not complete"
     return 1
   fi
-
-  oracle_ok "$name"
-  return 0
+  ORACLE_UNMEASURED+=("${name}: could not measure: worker A finished its compaction pass before the kill")
+  log "could not measure: worker A's log shows its last '${CHAOS_COMPACTION_PUBLISH_MARKER}' followed by a '${CHAOS_COMPACTION_PASS_MARKER}' line with compacted>=1, and the survivor published nothing"
+  return "$CHAOS_UNMEASURED_EXIT"
 }
 
 # 5. custody-and-catalog-verification-clean.
