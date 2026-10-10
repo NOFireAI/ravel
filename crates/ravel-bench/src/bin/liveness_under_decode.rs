@@ -25,21 +25,26 @@
 //!
 //! Before any load it scrapes `/metrics` once and exits 2 when one of
 //! `ravel_health_heartbeat_age_seconds`, `ravel_cpu_gate_jobs_total` or
-//! `ravel_cpu_gate_inline_total` is missing, naming it.
+//! `ravel_cpu_gate_inline_total` is missing, naming it, or when the heartbeat
+//! family carries other than exactly one sample, naming the count.
 //!
 //! The bands, fixed before the first run:
 //!
 //! - `probes_issued`: exactly `floor(window_ms / 100)` probes in the decode
 //!   window. Probes are counted by due slot (slot `k` is due `k * 100` ms
 //!   after the window starts), the same definition the expected count uses.
-//!   A probe that overruns its slot skips the slots that came due while it
-//!   ran, so a slow listener reads as a short count.
+//!   A probe whose own duration crosses later slots' due times skips them,
+//!   so a slow listener reads as a short count. A prober that wakes late
+//!   skips nothing; its largest wake lateness prints once, with no band. The
+//!   window starts once the prober thread is ready to send its first probe.
 //! - `probes_answered`: every one of those probes answered 200.
 //! - `probe_latency_max`: the slowest probe took under 250 ms.
 //! - `inline_jobs`: `ravel_cpu_gate_inline_total` moved by exactly 0 over the
 //!   window, summed over every gate and site.
 //!
-//! Three more bands check that the load happened as stated:
+//! Four more bands check that the load happened as stated: `decode_window`
+//! (the decode window is at least 1000 ms, 10 probe slots, so a decode too
+//! short to probe is a miss rather than a pass that probed nothing),
 //! `decode_jobs` (one `segment_sparse_catalog` read gate job per query),
 //! `decode_unit_size` (the decode unit is at least its target) and
 //! `queries_failed` (0).
@@ -238,13 +243,12 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
     let url = format!("http://{http}/api/v1/query?query={query}&time={time_s}");
 
     let stop = run::WindowStop::new();
-    let start = Instant::now();
     let prober = run::spawn_prober(
         format!("http://{health}/healthz"),
-        start,
         Duration::from_millis(PROBE_INTERVAL_MS),
         Arc::clone(&stop),
     )?;
+    let start = prober.start;
     let failures = client_rt.block_on(async {
         let mut tasks = Vec::with_capacity(decodes);
         for _ in 0..decodes {
@@ -311,6 +315,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         saturation::window_ms(window),
         probes.len() - saturation::probes_in_window(&probes, window).len()
     );
+    println!("{}", saturation::wake_lateness_line(&probes, window));
 
     let outcomes = saturation::evaluate_decode_liveness(&figs);
     for outcome in &outcomes {

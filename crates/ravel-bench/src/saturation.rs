@@ -18,6 +18,11 @@ use std::time::Duration;
 
 /// Scenario 1: the health listener is probed on this period.
 pub const PROBE_INTERVAL_MS: u64 = 100;
+/// Scenario 1: the decode window covers at least this many probe slots.
+pub const MIN_DECODE_PROBE_SLOTS: u64 = 10;
+/// Scenario 1: the shortest decode window inside the band, the window
+/// [`MIN_DECODE_PROBE_SLOTS`] probe slots take.
+pub const MIN_DECODE_WINDOW_MS: f64 = (MIN_DECODE_PROBE_SLOTS * PROBE_INTERVAL_MS) as f64;
 /// Scenario 1: the largest probe latency inside the band is just under this.
 pub const MAX_PROBE_LATENCY_MS: f64 = 250.0;
 /// Scenario 2: the expected band is a heartbeat age under this.
@@ -30,10 +35,13 @@ pub const MIN_LOAD_WINDOW_MS: f64 = 60_000.0;
 /// Scenario 1: the decode unit ADR-1702 task 11 names, before any scale-down.
 pub const DECODE_UNIT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The heartbeat age family scenario 2 scrapes, one sample per scrape.
+pub const HEARTBEAT_FAMILY: &str = "ravel_health_heartbeat_age_seconds";
+
 /// The metric families both bins depend on, checked by exact name before any
 /// load is driven.
 pub const REQUIRED_FAMILIES: [&str; 3] = [
-    "ravel_health_heartbeat_age_seconds",
+    HEARTBEAT_FAMILY,
     "ravel_cpu_gate_jobs_total",
     "ravel_cpu_gate_inline_total",
 ];
@@ -45,6 +53,7 @@ pub mod fig {
     pub const PROBES_ISSUED: &str = "probes_issued";
     pub const PROBES_ANSWERED_200: &str = "probes_answered_200";
     pub const PROBE_LATENCY_MS: &str = "probe_latency_ms";
+    pub const PROBE_WAKE_LATENESS_MS: &str = "probe_wake_lateness_ms";
     pub const INLINE_JOBS: &str = "inline_jobs";
     pub const DECODES_ISSUED: &str = "decodes_issued";
     pub const DECODE_JOBS: &str = "decode_jobs";
@@ -224,7 +233,9 @@ fn both(
 
 /// Scenario 1, decode saturation versus liveness. Bands, in order:
 ///
-/// - `decode_window`: the measured window is positive.
+/// - `decode_window`: the measured window is at least 1000 ms, so it covers
+///   at least 10 probe slots. A decode too short to probe is a miss here
+///   rather than a pass with nothing probed.
 /// - `probes_issued`: exactly `floor(window_ms / 100)` probes were issued in
 ///   the window. A probe that overruns its 100 ms slot delays every later
 ///   one, so a slow listener shows here as a short count.
@@ -311,9 +322,16 @@ pub fn evaluate_decode_liveness(figs: &FigureSet) -> Vec<BandOutcome> {
         ),
     };
     vec![
-        BandOutcome::new(band::DECODE_WINDOW, "> 0".to_string(), window, false, |v| {
-            v > 0.0
-        }),
+        BandOutcome::new(
+            band::DECODE_WINDOW,
+            format!(
+                ">= {} ms ({MIN_DECODE_PROBE_SLOTS} probe slots)",
+                fmt_num(MIN_DECODE_WINDOW_MS)
+            ),
+            window,
+            false,
+            |v| v >= MIN_DECODE_WINDOW_MS,
+        ),
         probes_issued,
         probes_answered,
         BandOutcome::new(
@@ -469,6 +487,53 @@ pub fn slots_due(window: Duration) -> u64 {
     u64::try_from(window.as_nanos() / period).unwrap_or(u64::MAX)
 }
 
+/// The slot the prober sends after `probe`, with slots `period` apart. Only
+/// the probe's own latency, from issue to answer, measured from its slot's
+/// due time, decides how many slots it skips: a slot is skipped when that
+/// duration crossed the slot's due time, never because the prober woke late
+/// to send it. A probe answered exactly at a later slot's due time does not
+/// skip that slot.
+pub fn next_probe_slot(probe: &Probe, period: Duration) -> u64 {
+    let crossed = probe.latency.as_nanos().div_ceil(period.as_nanos().max(1));
+    probe
+        .slot
+        .saturating_add(u64::try_from(crossed).unwrap_or(u64::MAX).max(1))
+}
+
+/// How late the prober woke to send `probe`: its issue time minus its slot's
+/// due time, zero when it was on time.
+pub fn wake_lateness(probe: &Probe) -> Duration {
+    let due = u32::try_from(probe.slot)
+        .ok()
+        .and_then(|slot| Duration::from_millis(PROBE_INTERVAL_MS).checked_mul(slot))
+        .unwrap_or(Duration::MAX);
+    probe.issued_at.saturating_sub(due)
+}
+
+/// The line a bin prints once per run with the prober's largest wake
+/// lateness over the probes due in `window`. No band reads it: it describes
+/// the prober, not the server.
+pub fn wake_lateness_line(probes: &[Probe], window: Duration) -> String {
+    let max = probes_in_window(probes, window)
+        .into_iter()
+        .map(|p| wake_lateness(p).as_secs_f64() * 1000.0)
+        .reduce(f64::max);
+    match max {
+        Some(ms) => format!("prober wake lateness: max {ms:.3} ms (no band)"),
+        None => "prober wake lateness: no probes (no band)".to_string(),
+    }
+}
+
+fn record_wake_lateness(figs: &mut FigureSet, in_window: &[&Probe]) {
+    figs.record_series(
+        fig::PROBE_WAKE_LATENESS_MS,
+        in_window
+            .iter()
+            .map(|p| wake_lateness(p).as_secs_f64() * 1000.0)
+            .collect(),
+    );
+}
+
 /// The probes whose slot was due within `window`, whenever the prober
 /// actually woke to send them.
 pub fn probes_in_window(probes: &[Probe], window: Duration) -> Vec<&Probe> {
@@ -498,6 +563,7 @@ pub fn record_decode_probes(figs: &mut FigureSet, window: Duration, probes: &[Pr
             .map(|p| p.latency.as_secs_f64() * 1000.0)
             .collect(),
     );
+    record_wake_lateness(figs, &in_window);
 }
 
 /// Records scenario 2's `/readyz` probe figures.
@@ -508,6 +574,7 @@ pub fn record_readyz_probes(figs: &mut FigureSet, window: Duration, probes: &[Pr
         fig::READYZ_ANSWERED_200,
         in_window.iter().filter(|p| p.status == Some(200)).count() as f64,
     );
+    record_wake_lateness(figs, &in_window);
 }
 
 /// One heartbeat scrape: how long `/metrics` took to answer (or to fail),
@@ -636,6 +703,30 @@ pub fn missing_families<'r>(body: &str, required: &[&'r str]) -> Vec<&'r str> {
         .copied()
         .filter(|family| !samples.iter().any(|s| s.name == *family))
         .collect()
+}
+
+/// The start-of-run check on a `/metrics` body: every family of
+/// [`REQUIRED_FAMILIES`] present by exact name, and the heartbeat family
+/// carrying exactly one sample, since a scrape reads its age with
+/// [`single_value`].
+pub fn check_start_families(body: &str) -> Result<(), String> {
+    let missing = missing_families(body, &REQUIRED_FAMILIES);
+    if !missing.is_empty() {
+        return Err(format!(
+            "metric families missing from /metrics: {}",
+            missing.join(", ")
+        ));
+    }
+    let samples = parse_samples(body)
+        .iter()
+        .filter(|s| s.name == HEARTBEAT_FAMILY)
+        .count();
+    if samples != 1 {
+        return Err(format!(
+            "metric family {HEARTBEAT_FAMILY} carries {samples} samples in /metrics, expected exactly 1"
+        ));
+    }
+    Ok(())
 }
 
 /// The sum of every sample of exactly `name` whose label block contains every
@@ -1188,6 +1279,122 @@ ravel_health_heartbeat_age_seconds{mode=\"query\"} 0.25
         assert_eq!(
             family_delta(EXPOSITION, EXPOSITION, "ravel_cpu_gate_inline_total", &[]),
             Ok(0.0)
+        );
+    }
+
+    /// A 450 ms decode window has 4 slots due and 4 probes answered, so every
+    /// probe band holds; the window band is the miss.
+    #[test]
+    fn decode_window_under_1000_ms_misses_decode_window() {
+        let window = Duration::from_millis(450);
+        let probes: Vec<Probe> = (1..=4).map(|k| probe(k, 50, Some(200))).collect();
+        let f = decode_with_probes(window, &probes);
+        let outcomes = evaluate_decode_liveness(&f);
+        let miss = first_miss(&outcomes).expect("a miss");
+        assert_eq!(miss.band, band::DECODE_WINDOW);
+        assert_eq!(miss.value, Ok(450.0));
+        assert_eq!(
+            miss.line(),
+            "band decode_window: 450 (band: >= 1000 ms (10 probe slots)) MISS"
+        );
+        let missed: Vec<_> = outcomes.iter().filter(|o| !o.inside).collect();
+        assert_eq!(missed.len(), 1, "{missed:?}");
+    }
+
+    /// The window that leaves no slot to probe at all, the case the band
+    /// exists for: 0 probes issued matches its expected 0.
+    #[test]
+    fn decode_window_with_no_probe_slot_misses_decode_window() {
+        let f = decode_with_probes(Duration::from_millis(90), &[]);
+        assert_eq!(decode_miss(&f), Some(band::DECODE_WINDOW));
+    }
+
+    #[test]
+    fn decode_window_of_1000_ms_with_10_probes_is_inside() {
+        let window = Duration::from_millis(1000);
+        let probes: Vec<Probe> = (1..=10).map(|k| probe(k, 50, Some(200))).collect();
+        let f = decode_with_probes(window, &probes);
+        assert_eq!(decode_miss(&f), None);
+    }
+
+    const PERIOD: Duration = Duration::from_millis(PROBE_INTERVAL_MS);
+
+    /// Slot 5 was due at 500 ms; the prober woke at 610 ms and the probe
+    /// answered in 2 ms. The listener did not overrun slot 6, so slot 6 is
+    /// next, not 7.
+    /// Probe `slot`, issued `late` after its due time, answered `latency`
+    /// after it was issued.
+    fn timed(slot: u64, late: Duration, latency: Duration) -> Probe {
+        Probe {
+            slot,
+            issued_at: PERIOD * u32::try_from(slot).unwrap() + late,
+            latency,
+            status: Some(200),
+        }
+    }
+
+    #[test]
+    fn late_wake_with_a_fast_probe_advances_one_slot() {
+        let late = timed(5, Duration::from_millis(110), Duration::from_millis(2));
+        assert_eq!(late.issued_at, Duration::from_millis(610));
+        assert_eq!(next_probe_slot(&late, PERIOD), 6);
+        assert_eq!(wake_lateness(&late), Duration::from_millis(110));
+    }
+
+    /// A probe for slot 5 whose own duration is 230 ms ran past the due times
+    /// of slots 6 (600 ms) and 7 (700 ms), so both are skipped, whether it
+    /// was sent on time or late.
+    #[test]
+    fn probe_whose_duration_crosses_two_slots_skips_them() {
+        let slow = Duration::from_millis(230);
+        assert_eq!(next_probe_slot(&timed(5, Duration::ZERO, slow), PERIOD), 8);
+        assert_eq!(
+            next_probe_slot(&timed(5, Duration::from_millis(110), slow), PERIOD),
+            8
+        );
+    }
+
+    #[test]
+    fn probe_answered_exactly_at_the_next_due_time_skips_nothing() {
+        let at = |latency| next_probe_slot(&timed(5, Duration::ZERO, latency), PERIOD);
+        assert_eq!(at(PERIOD), 6);
+        assert_eq!(at(PERIOD + Duration::from_nanos(1)), 7);
+        assert_eq!(at(Duration::ZERO), 6);
+    }
+
+    #[test]
+    fn wake_lateness_is_recorded_and_printed_without_a_band() {
+        let window = Duration::from_millis(1000);
+        let probes: Vec<Probe> = (1..=10)
+            .map(|k| probe(k, if k == 3 { 110_000 } else { 50 }, Some(200)))
+            .collect();
+        let f = decode_with_probes(window, &probes);
+        assert_eq!(f.series_max(fig::PROBE_WAKE_LATENESS_MS), Ok(110.0));
+        assert_eq!(decode_miss(&f), None);
+        assert_eq!(
+            wake_lateness_line(&probes, window),
+            "prober wake lateness: max 110.000 ms (no band)"
+        );
+    }
+
+    #[test]
+    fn start_of_run_check_names_a_heartbeat_family_with_two_samples() {
+        let body = format!(
+            "{EXPOSITION}ravel_cpu_gate_jobs_total{{gate=\"read\"}} 1\n\
+             ravel_health_heartbeat_age_seconds{{mode=\"ingest\"}} 0.5\n"
+        );
+        assert_eq!(
+            check_start_families(&body),
+            Err(
+                "metric family ravel_health_heartbeat_age_seconds carries 2 samples in /metrics, expected exactly 1"
+                    .to_string()
+            )
+        );
+        let one = format!("{EXPOSITION}ravel_cpu_gate_jobs_total{{gate=\"read\"}} 1\n");
+        assert_eq!(check_start_families(&one), Ok(()));
+        assert_eq!(
+            check_start_families(EXPOSITION),
+            Err("metric families missing from /metrics: ravel_cpu_gate_jobs_total".to_string())
         );
     }
 

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use crate::saturation::Probe;
-use crate::saturation::slots_due;
+use crate::saturation::{next_probe_slot, slots_due};
 use anyhow::{Context, bail};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
@@ -66,6 +66,8 @@ const SERIES_IDS: u32 = 5;
 const SERIES_META: u32 = 6;
 const SERIES_IDX: u32 = 8;
 const SERIES_META_CHUNKS: u32 = 9;
+/// `Compression.COMPRESSION_NONE` from proto/ravel/segment.proto.
+const COMPRESSION_NONE: i32 = 0;
 
 pub fn wall_now_ns() -> i64 {
     std::time::SystemTime::now()
@@ -177,21 +179,13 @@ pub async fn publish_segment(
 pub fn catalog_decode_bytes(bytes: &[u8]) -> anyhow::Result<u64> {
     let limits = ReaderLimits::default();
     let located = open_from_full(bytes, limits).context("open fixture segment")?;
-    let footer: &Footer = &located.footer;
-    let mut inflated_chunks = None;
-    if let Some(idx) = footer.sections.iter().find(|s| s.kind == SERIES_IDX) {
-        let start = usize::try_from(idx.offset)?;
-        let end = start + usize::try_from(idx.len)?;
-        let section = bytes.get(start..end).context("SERIES_IDX in bounds")?;
-        let index = parse_series_idx(section).context("parse SERIES_IDX")?;
-        inflated_chunks = Some(
-            index
-                .chunk_frame_uncompressed_lens()
-                .map(|len| ravel_memory::decoded_charge(len, limits.max_section_uncompressed_bytes))
-                .fold(0u64, u64::saturating_add),
-        );
-    }
-    Ok(footer
+    Ok(catalog_decode_len(&located.footer, bytes, limits))
+}
+
+/// [`catalog_decode_bytes`] over an already parsed `footer` of `bytes`.
+pub fn catalog_decode_len(footer: &Footer, bytes: &[u8], limits: ReaderLimits) -> u64 {
+    let inflated_chunks = meta_chunks_inflated_len(footer, bytes, limits);
+    footer
         .sections
         .iter()
         .filter(|s| {
@@ -207,7 +201,33 @@ pub fn catalog_decode_bytes(bytes: &[u8]) -> anyhow::Result<u64> {
                 limits.max_section_uncompressed_bytes,
             ),
         })
-        .fold(0, u64::saturating_add))
+        .fold(0, u64::saturating_add)
+}
+
+/// The inflated SERIES_META chunk length the fetcher's
+/// `meta_chunks_inflated_len` charges, with its filters: `None`, and so the
+/// footer figure, when there is no SERIES_IDX, the section is stored
+/// compressed, its stored bytes are out of bounds or fail the section crc32c,
+/// or the directory does not parse.
+fn meta_chunks_inflated_len(footer: &Footer, bytes: &[u8], limits: ReaderLimits) -> Option<u64> {
+    let idx = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SERIES_IDX)
+        .filter(|s| s.comp == COMPRESSION_NONE)?;
+    let start = usize::try_from(idx.offset).ok()?;
+    let end = start.checked_add(usize::try_from(idx.len).ok()?)?;
+    let section = bytes.get(start..end)?;
+    if crc32c::crc32c(section) != idx.crc32c {
+        return None;
+    }
+    let index = parse_series_idx(section).ok()?;
+    Some(
+        index
+            .chunk_frame_uncompressed_lens()
+            .map(|len| ravel_memory::decoded_charge(len, limits.max_section_uncompressed_bytes))
+            .fold(0u64, u64::saturating_add),
+    )
 }
 
 /// A started server with its health listener and heartbeat task.
@@ -366,17 +386,10 @@ pub async fn scrape(
 }
 
 /// Fails, naming every missing family, when the server's `/metrics` lacks one
-/// of [`crate::saturation::REQUIRED_FAMILIES`] by exact name.
+/// of [`crate::saturation::REQUIRED_FAMILIES`] by exact name, and naming the
+/// count when the heartbeat family does not carry exactly one sample.
 pub fn require_families(body: &str) -> anyhow::Result<()> {
-    let missing = crate::saturation::missing_families(body, &crate::saturation::REQUIRED_FAMILIES);
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        bail!(
-            "metric families missing from /metrics: {}",
-            missing.join(", ")
-        )
-    }
+    crate::saturation::check_start_families(body).map_err(anyhow::Error::msg)
 }
 
 /// Whether a query API answer is a success: HTTP 200 and, for a
@@ -427,28 +440,41 @@ impl WindowStop {
     }
 }
 
-/// Probes `url` sequentially, one probe per slot, from `start` until `stop`
-/// closes the window, on a dedicated thread with its own `current_thread`
-/// runtime. Slot `k` is due at `start + k * period`. A probe whose slot was due
-/// in the window is sent even when the prober wakes after the window closed,
-/// so every slot counted as due has its probe. A probe that overruns its slot
-/// skips every slot that came due while it ran, so a slow listener shows up as
-/// fewer probes in a window.
+/// A prober thread and the window start it took once it was ready.
+pub struct Prober {
+    handle: std::thread::JoinHandle<anyhow::Result<Vec<Probe>>>,
+    /// The window start: taken by the prober thread after its runtime and
+    /// HTTP client are built, so its setup is not counted in the window.
+    pub start: Instant,
+}
+
+/// Probes `url` sequentially, one probe per slot, until `stop` closes the
+/// window, on a dedicated thread with its own `current_thread` runtime.
+/// Returns once the prober is ready to send its first probe, with the window
+/// start it took then. Slot `k` is due at `start + k * period`. A probe whose
+/// slot was due in the window is sent even when the prober wakes after the
+/// window closed, so every slot counted as due has its probe. A probe whose
+/// own duration crossed later slots' due times skips them
+/// ([`crate::saturation::next_probe_slot`]), so a slow listener shows up as
+/// fewer probes in a window; a prober that wakes late does not.
 pub fn spawn_prober(
     url: String,
-    start: Instant,
     period: Duration,
     stop: Arc<WindowStop>,
-) -> anyhow::Result<std::thread::JoinHandle<anyhow::Result<Vec<Probe>>>> {
-    let period_ns = period.as_nanos().max(1);
+) -> anyhow::Result<Prober> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    Ok(std::thread::Builder::new()
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Instant>(1);
+    let handle = std::thread::Builder::new()
         .name("saturation-prober".to_string())
         .spawn(move || {
             runtime.block_on(async move {
                 let client = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?;
+                let start = Instant::now();
+                ready_tx
+                    .send(start)
+                    .map_err(|_| anyhow::anyhow!("prober start not received"))?;
                 let mut probes = Vec::new();
                 let mut slot = 1u64;
                 loop {
@@ -468,26 +494,35 @@ pub fn spawn_prober(
                         }
                         Err(_) => None,
                     };
-                    let done = Instant::now();
-                    probes.push(Probe {
+                    let probe = Probe {
                         slot,
                         issued_at: issued.duration_since(start),
-                        latency: done.duration_since(issued),
+                        latency: issued.elapsed(),
                         status,
-                    });
-                    let next = done.duration_since(start).as_nanos().div_ceil(period_ns);
-                    slot = (slot + 1).max(u64::try_from(next)?);
+                    };
+                    slot = next_probe_slot(&probe, period);
+                    probes.push(probe);
                 }
                 Ok(probes)
             })
-        })?)
+        })?;
+    match ready_rx.recv() {
+        Ok(start) => Ok(Prober { handle, start }),
+        // The thread dropped its sender before it was ready: its error says why.
+        Err(_) => match join_prober(Prober {
+            handle,
+            start: Instant::now(),
+        }) {
+            Err(err) => Err(err.context("prober setup")),
+            Ok(_) => bail!("prober exited before it was ready"),
+        },
+    }
 }
 
 /// Joins a prober thread.
-pub fn join_prober(
-    handle: std::thread::JoinHandle<anyhow::Result<Vec<Probe>>>,
-) -> anyhow::Result<Vec<Probe>> {
-    handle
+pub fn join_prober(prober: Prober) -> anyhow::Result<Vec<Probe>> {
+    prober
+        .handle
         .join()
         .map_err(|_| anyhow::anyhow!("prober thread panicked"))?
 }
@@ -521,4 +556,109 @@ pub fn client_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .enable_all()
         .thread_name("saturation-client")
         .build()?)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A segment with enough series that the writer emits the chunked
+    /// catalog (SERIES_IDX and SERIES_META_CHUNKS).
+    fn chunked_segment() -> (Vec<u8>, Footer) {
+        let tenant = tenant(0);
+        let hour = 400_000;
+        let input = (0..ravel_segment::V5_SPARSE_THRESHOLD)
+            .map(|i| {
+                let instance = format!("i-{i:06}");
+                series(
+                    &tenant,
+                    "sat_t",
+                    labels(&[("__name__", "sat_t"), ("instance", &instance)]).unwrap(),
+                    vec![Sample {
+                        ts_ns: hour * NS_PER_HOUR + 1,
+                        value: 1.0,
+                    }],
+                )
+                .unwrap()
+            })
+            .collect();
+        let written = write_segment(&tenant.hash(), Uuid::nil(), hour, input).unwrap();
+        let bytes = written.bytes.to_vec();
+        let footer = open_from_full(&bytes, ReaderLimits::default())
+            .unwrap()
+            .footer;
+        (bytes, footer)
+    }
+
+    fn section(footer: &Footer, kind: u32) -> usize {
+        footer
+            .sections
+            .iter()
+            .position(|s| s.kind == kind)
+            .expect("section present")
+    }
+
+    /// The SERIES_META_CHUNKS figure at its footer length.
+    fn chunks_footer_charge(footer: &Footer, limits: ReaderLimits) -> u64 {
+        let chunks = &footer.sections[section(footer, SERIES_META_CHUNKS)];
+        ravel_memory::decoded_charge(
+            chunks.uncompressed_len,
+            limits.max_section_uncompressed_bytes,
+        )
+    }
+
+    /// The footer figures of the other catalog sections.
+    fn other_catalog_charge(footer: &Footer, limits: ReaderLimits) -> u64 {
+        footer
+            .sections
+            .iter()
+            .filter(|s| matches!(s.kind, LABEL_DICT | SERIES_IDS | SERIES_META | SERIES_IDX))
+            .map(|s| {
+                ravel_memory::decoded_charge(
+                    s.uncompressed_len,
+                    limits.max_section_uncompressed_bytes,
+                )
+            })
+            .sum()
+    }
+
+    #[test]
+    fn uncompressed_series_idx_charges_the_inflated_chunks() {
+        let limits = ReaderLimits::default();
+        let (bytes, footer) = chunked_segment();
+        let inflated = meta_chunks_inflated_len(&footer, &bytes, limits).expect("inflated");
+        assert_ne!(inflated, chunks_footer_charge(&footer, limits));
+        assert_eq!(
+            catalog_decode_bytes(&bytes).unwrap(),
+            other_catalog_charge(&footer, limits) + inflated
+        );
+    }
+
+    /// The fetcher reads the chunk directory only from an uncompressed
+    /// SERIES_IDX; a compressed one takes the footer figure.
+    #[test]
+    fn compressed_series_idx_takes_the_footer_figure() {
+        let limits = ReaderLimits::default();
+        let (bytes, footer) = chunked_segment();
+        let rest = other_catalog_charge(&footer, limits);
+        let mut compressed = footer.clone();
+        compressed.sections[section(&footer, SERIES_IDX)].comp = 1;
+        assert_eq!(meta_chunks_inflated_len(&compressed, &bytes, limits), None);
+        assert_eq!(
+            catalog_decode_len(&compressed, &bytes, limits),
+            rest + chunks_footer_charge(&footer, limits)
+        );
+    }
+
+    #[test]
+    fn series_idx_failing_its_crc_takes_the_footer_figure() {
+        let limits = ReaderLimits::default();
+        let (bytes, footer) = chunked_segment();
+        let mut bad_crc = footer.clone();
+        let idx = section(&footer, SERIES_IDX);
+        bad_crc.sections[idx].crc32c ^= 1;
+        assert_eq!(meta_chunks_inflated_len(&bad_crc, &bytes, limits), None);
+        assert!(meta_chunks_inflated_len(&footer, &bytes, limits).is_some());
+    }
 }
