@@ -40,6 +40,10 @@ ravel-promql = { workspace = true }
 # tests that decode written objects); this promotes the same workspace pin to
 # a normal dependency so the query handler can call those functions.
 ravel-segment = { workspace = true }
+# The startup format-window check (ADR-2708 D5c) reads RSPAN's reader window
+# (`footer::SUPPORTED_VERSIONS`). Also used by the trace ingest end-to-end
+# test, which decodes the RSPAN object the write flushed.
+ravel-rspan = { workspace = true }
 ravel-analytics = { workspace = true }
 # Prost types for the sys/tenancy marker and the recovery manifest
 # (ADR-0050 section 3, proto/ravel/sys.proto).
@@ -171,8 +175,8 @@ blake3 = { workspace = true }
 reqwest = { version = "0.13", features = ["json"] }
 
 # ravel-alerting is declared here as a version-pinned path dependency rather
-# than through `[workspace.dependencies]` for the same reason ravel-sql and
-# ravel-rspan below are: the workspace root Cargo.toml is outside this task's
+# than through `[workspace.dependencies]` for the same reason ravel-sql below
+# is: the workspace root Cargo.toml is outside this task's
 # scope. The pin keeps cargo-deny from counting it as a wildcard path
 # dependency.
 ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.23.0" }
@@ -283,12 +287,6 @@ snap = { workspace = true }
 # (`tokio::time::pause`/`advance`) to prove a `tokio::time::timeout` fires
 # without the test actually waiting out the real deadline.
 tokio = { workspace = true, features = ["test-util"] }
-# Test-only, same reason for spans: the trace ingest end-to-end test decodes the
-# RSPAN object the write flushed. ravel-rspan (ADR-0041) is new and not yet
-# listed in the workspace [workspace.dependencies]; the root Cargo.toml is out
-# of this task's scope, so this is a version-pinned path dependency (the pin
-# keeps cargo-deny from counting it as a wildcard).
-ravel-rspan = { path = "../../crates/ravel-rspan", version = "0.23.0" }
 uuid = { workspace = true }
 # Real-authn end-to-end test (tests/real_authn_e2e.rs): mint a JWT and build a
 # local oct (HMAC) JWKS so the OIDC resolver runs through a real HTTP request

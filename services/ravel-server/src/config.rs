@@ -352,6 +352,19 @@ impl AuditModeArg {
     }
 }
 
+/// The `--format-window-check` values (ADR-2708 decision D5c): what startup
+/// does when a known tenant's catalog names an entry whose format version is
+/// outside this build's reader window. See [`crate::format_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum FormatWindowCheck {
+    /// Log one warning per (signal, version) with its count, and start.
+    #[default]
+    Warn,
+    /// Exit non-zero before any listener binds, naming each signal and
+    /// version, or saying the check could not run.
+    Refuse,
+}
+
 /// The `--audit-text` values (ADR-0062 decision 2e). Selects how a query's
 /// text is recorded on its audit record's `query.text` attribute;
 /// [`resolve_audit_text_policy`] turns it into the policy `start` installs.
@@ -641,6 +654,27 @@ pub struct Cli {
     /// production deployment impossible to start.
     #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
     pub require_bucket_protection: bool,
+
+    /// Startup check of stored format versions against this build's reader
+    /// window (ADR-2708 decision D5c). Before any listener binds, reads the
+    /// catalog HEAD and its snapshot parts for each statically known tenant
+    /// (`--tenant-token`, `--tenant-token-file`, `--maintain-tenant`, and the
+    /// tenants in `--alert-rules-file`) and each of metrics, logs, spans,
+    /// alerts and audit, and counts the entries whose
+    /// `segment_format_version` is outside the window. It issues no LIST, so
+    /// commit records not yet folded into a HEAD are not checked.
+    /// `warn` (default) logs one line per (signal, version) with the count
+    /// and starts; `refuse` exits non-zero naming the signal and version. A
+    /// store or decode error is reported as a check that could not run, and
+    /// `refuse` exits non-zero on it too. Advisory: the version is the
+    /// writer's stamp, not the object's own trailer.
+    #[arg(
+        long = "format-window-check",
+        value_enum,
+        default_value = "warn",
+        env = "RAVEL_FORMAT_WINDOW_CHECK"
+    )]
+    pub format_window_check: FormatWindowCheck,
 
     /// Whether the query-audit pipeline runs, and its failure posture
     /// (ADR-0062 decision 2b and its opt-in amendment): `off` (default)

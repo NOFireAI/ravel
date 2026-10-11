@@ -328,6 +328,17 @@ async fn main() -> anyhow::Result<()> {
     )?;
     ravel_server::warn_plaintext_federation(&remote_clusters);
 
+    // ADR-2708 D5c: count catalog entries outside this build's reader window
+    // for every statically known tenant, before any listener binds, so
+    // `--format-window-check refuse` stops startup here.
+    let mut format_window_tenants = fold_tenants.clone();
+    format_window_tenants.extend(alert_rule_tenants.iter().copied());
+    format_window_tenants.sort_by_key(|tenant| tenant.0);
+    format_window_tenants.dedup();
+    let format_window_report =
+        ravel_server::format_window::check(store.as_ref(), &format_window_tenants).await;
+    ravel_server::format_window::enforce(cli.format_window_check, &format_window_report)?;
+
     let resolver_bundle = ravel_server::tenant::build_auth_resolver_with_principals(
         tenant_principals,
         cli.dev_insecure_tenant_header,
