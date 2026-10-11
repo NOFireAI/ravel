@@ -811,6 +811,8 @@ async fn metrics_render_cpu_gate_and_runtime_families_once() {
             ("ravel_cpu_gate_abandoned_total", "counter"),
             ("ravel_cpu_gate_jobs_total", "counter"),
             ("ravel_cpu_gate_inline_total", "counter"),
+            ("ravel_cpu_gate_handoff_seconds", "summary"),
+            ("ravel_cpu_gate_return_seconds", "summary"),
             ("ravel_runtime_workers", "gauge"),
             ("ravel_runtime_alive_tasks", "gauge"),
             ("ravel_runtime_global_queue_depth", "gauge"),

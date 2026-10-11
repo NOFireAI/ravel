@@ -2529,6 +2529,8 @@ stay at 0 until that decode or encode moves onto a gate.
 | `ravel_cpu_gate_abandoned_total` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
 | `ravel_cpu_gate_jobs_total{site}` | Counter. Jobs a call site ran through a permit. |
 | `ravel_cpu_gate_inline_total{site}` | Counter. Jobs a call site ran inline, below the inline floor. |
+| `ravel_cpu_gate_handoff_seconds_sum{site}`, `ravel_cpu_gate_handoff_seconds_count{site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means the blocking pool, not the permit count, is slow to pick jobs up. |
+| `ravel_cpu_gate_return_seconds_sum{site}`, `ravel_cpu_gate_return_seconds_count{site}` | Summary with no quantiles. Time from a job's last instruction to its caller resuming, and the number of jobs that returned to a waiting caller. A growing mean points at the async runtime being slow to reschedule the caller; a panicked or abandoned job is not counted, and inline jobs add to neither family. |
 | `ravel_runtime_workers` | Gauge. Worker threads of the tokio runtime serving the process. |
 | `ravel_runtime_alive_tasks` | Gauge. Tasks alive on the runtime. |
 | `ravel_runtime_global_queue_depth` | Gauge. Tasks waiting in the runtime's global queue. |
