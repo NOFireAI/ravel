@@ -150,7 +150,9 @@ larger of `block_range_threshold` and the effective projection break-even,
 which differ only under `cost-based`). An object at or under that bound is
 read whole by the scan whatever the plan says, so planning it is a
 whole-object read whose bytes are then dropped at the barrier. Rule: a
-segment at or under `plan_whole_object_bound()` is not planned. The scan
+segment at or under `plan_whole_object_bound()` is not planned (narrowed to
+scans that hold at least as many such segments as target partitions: see the
+partition-count amendment below). The scan
 opens it once and prunes blocks from the directory it has in hand
 (`RlogReader::scan_pruned`, which the planned route already uses).
 Segments above the bound keep the planned route: a tail probe, block
@@ -433,7 +435,9 @@ and its result stays separate from stock.
 - `stats.timings` is a documented field of the JSON SQL response
   (`docs/query-engine.md`, `docs/guides/query.md`). The ADR-2509 after-stamp
   protocol reads it directly from the next measurement on.
-- Segments at or under `plan_whole_object_bound()` no longer run a plan phase; the accounting
+- Segments at or under `plan_whole_object_bound()` no longer run a plan phase
+  when the scan holds at least as many of them as target partitions (see the
+  partition-count amendment below); the accounting
   `plan` bucket drops to the probe-and-stats cost for those segments, and
   `docs/query-engine.md`'s description of the planned route says which
   segments it covers.
@@ -618,3 +622,40 @@ What stays exposed: a commit that lands after its hour's natural seal, or
 with no fold running between its publish and that seal, is not folded and
 stays invisible to non-token queries until a HEAD rebuild. The flags' help
 text and the consistency model say so in those terms.
+
+## Amendment (2026-10-11): sub-bound segments skip the plan only when they fill the partitions
+
+<!-- amendment-applies: sections="2. A segment is read once: no plan phase for an object the scan reads whole anyway|Consequences" pointer="partition-count amendment" -->
+
+Refs: #2682.
+
+Task T4 narrowed decision 2's rule. A SQL logs scan opens its segments at
+or under `plan_whole_object_bound()` unplanned only when it holds at least
+as many of them, relevant to the query window, as it has target
+partitions. With fewer, every segment keeps the planned route. The count
+is taken once per scan over its whole segment list, so every partition
+routes a segment the same way (`skips_sub_bound_plans` in
+`crates/ravel-sql/src/logs_scan.rs`).
+
+The reason is partition use. An unplanned segment is read whole by one
+partition, so with fewer such segments than partitions the unplanned route
+would leave partitions idle that the planned route stripes blocks over
+when a read cache is wired (ADR-0102). The plan carry budget is the
+partition count, so in that case it covers every object the plan reads
+whole, and a scan made only of such segments still issues no second GET in
+its scan phase (`fewer_sub_break_even_segments_than_partitions_keep_the_plan`
+in `crates/ravel-sql/tests/logs_selective_scan_amplification.rs`). With at
+least as many such segments as partitions, each is read once
+(`sub_break_even_segments_are_read_once`, same file).
+
+Decision 2's measured target is unaffected at any partition count up to its
+object count: its q20-shaped statement reads 2,617 objects, all at or under
+the bound, so a scan of it at 2,617 partitions or fewer still reads each
+one once.
+
+One test changed premise. Without a read cache a scan declares at most one
+partition per segment, so a scan made only of sub-bound segments always
+takes the read-once route there and the cache has no second read to absorb
+within a run. `cache_flag_cuts_store_gets_within_a_run` in `ravel-bench`
+measured that saving on sub-bound segments; it now measures it on segments
+above the bound, which keep the planned route.
