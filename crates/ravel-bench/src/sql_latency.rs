@@ -4256,11 +4256,25 @@ mod tests {
         let store = empty_store();
         let tenant = TenantId::new("cache-tenant");
         let th = tenant.hash();
-        write_matching_objects(&store, &tenant, 0, CARRY_BUDGET + SURPLUS_SEGMENTS).await;
+        let objects =
+            write_matching_objects(&store, &tenant, 0, CARRY_BUDGET + SURPLUS_SEGMENTS).await;
         let settings = ExecutorSettings {
+            logs_block_range_threshold: 0,
+            logs_projection_break_even_bytes: None,
             fetch_concurrency: CARRY_BUDGET,
             ..ExecutorSettings::default()
         };
+        let bound = LogSegmentFetcher::new(Arc::clone(&store))
+            .with_block_range_threshold(settings.logs_block_range_threshold)
+            .with_request_cost_bytes(settings.logs_request_cost_bytes)
+            .with_projection_break_even_bytes(settings.logs_projection_break_even_bytes)
+            .plan_whole_object_bound();
+        assert!(
+            objects[0].len() as u64 > bound,
+            "fixture: every object must sit above plan_whole_object_bound ({bound}) so \
+             the scan plans it; got {} bytes",
+            objects[0].len()
+        );
         let req = SqlRequest {
             sql: "SELECT body FROM logs WHERE has_word(body, 'timeout')".to_string(),
             window: TimeRange {
@@ -4293,6 +4307,12 @@ mod tests {
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
         let get_off = off.accounting.s3_requests(AccountedOp::Get);
+        eprintln!(
+            "DEBUG get_on={get_on} get_off={get_off} hits_on={} hits_off={} len={} bound={bound}",
+            on.accounting.cache_hits,
+            off.accounting.cache_hits,
+            objects[0].len()
+        );
 
         assert!(
             get_on < get_off,
