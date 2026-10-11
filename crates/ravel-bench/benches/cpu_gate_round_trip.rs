@@ -422,17 +422,48 @@ impl Report {
         self.figures.push(name);
     }
 
-    /// Every figure appears on exactly one line of the rendered text.
+    /// Every expected figure, and every figure recorded, appears on exactly
+    /// one line of the rendered text.
     fn check_present_once(&self) -> Result<(), String> {
-        for name in &self.figures {
+        let expected = expected_figures();
+        for name in expected.iter().chain(&self.figures) {
             let key = format!("{} {name} ", self.label);
             let n = self.text.lines().filter(|l| l.starts_with(&key)).count();
             if n != 1 {
                 return Err(format!("{}: figure {name} printed {n} times", self.label));
             }
         }
+        if self.figures.len() != expected.len() {
+            return Err(format!(
+                "{}: {} figures recorded, {} expected",
+                self.label,
+                self.figures.len(),
+                expected.len()
+            ));
+        }
         Ok(())
     }
+}
+
+/// The figures every configuration must print, listed independently of the
+/// code that prints them.
+fn expected_figures() -> Vec<String> {
+    let mut names = Vec::new();
+    for arm in ["inline", "gated", "bare"] {
+        for figure in ["jobs", "p50_us", "p99_us"] {
+            names.push(format!("{arm}.{figure}"));
+        }
+    }
+    names.push("gated_minus_inline.p50_us".to_string());
+    names.push("bare_minus_inline.p50_us".to_string());
+    for arm in ["gated", "bare"] {
+        for handoff in ["handoff_in", "handoff_out"] {
+            for q in ["p50_us", "p99_us"] {
+                names.push(format!("{arm}.{handoff}.{q}"));
+            }
+        }
+    }
+    names
 }
 
 struct Settings {
@@ -641,6 +672,7 @@ fn main() {
         spin_iterations,
     };
     let mut buffer_c1 = None;
+    let mut verdicts = 0usize;
     for callers in CALLERS {
         for shape in Shape::ALL {
             let (gmi, gated_p50) =
@@ -655,6 +687,7 @@ fn main() {
                         } else {
                             "dispatch: partial"
                         };
+                        verdicts += 1;
                         println!(
                             "empty/c1 verdict {verdict} (gated minus inline p50 {gmi:.1} us; \
                              band <= {DISPATCH_NOT_CAUSE_US} not, >= {DISPATCH_SHARED_CAUSE_US} \
@@ -663,8 +696,12 @@ fn main() {
                     }
                     Shape::Buffer => buffer_c1 = Some(gated_p50),
                     Shape::BufferSelfDrop => {
-                        let c = buffer_c1.unwrap_or(0.0);
+                        let Some(c) = buffer_c1 else {
+                            failures.push("buffer/c1 gated p50 missing for the verdict".into());
+                            continue;
+                        };
                         let diff = c - gated_p50;
+                        verdicts += 1;
                         let verdict = if diff > CROSS_THREAD_FREE_US {
                             "cross-thread free: matters"
                         } else {
@@ -680,6 +717,9 @@ fn main() {
             }
             println!();
         }
+    }
+    if verdicts != 2 {
+        failures.push(format!("{verdicts} verdict lines printed, expected 2"));
     }
     println!("loadavg after: {}", loadavg());
     drop(rt);
