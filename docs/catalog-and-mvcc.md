@@ -1761,13 +1761,15 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    actively-queried tenant; at the 10,000-entry floor (which is also what
    `--disable-cache` holds) it is 9 MB. `0` disables the cache. On the
    listing path each L0 commit record is read at most once per resolve: the
-   prewarm looks every listed record up in the cache first, fetches the
-   misses once, and hands the decoded records to the include pass, so a
-   resolve over N uncached records issues N record GETs whatever the cap.
-   The cap bounds the cache's memory, not the GET count, and not what a
-   resolve holds while it runs: the records it found resident stay
-   referenced for the resolve's lifetime (at most the cache budget, since
-   they were resident when it started), and each in-flight bucket holds its
+   resolve looks every listed record up in the cache once, before any
+   bucket runs (per bucket, one bucket's misses would evict another's
+   hits), fetches the misses once, and hands the decoded records to the
+   include pass, so a resolve over N uncached records issues N record GETs
+   whatever the cap. The cap bounds the cache's memory, not the GET count,
+   and not what a resolve holds while it runs: the records it found
+   resident stay referenced for the listing pass's lifetime (at most the
+   cache budget, since they were resident when it started), and each
+   in-flight bucket holds its
    own fetched records until that bucket's include pass ends, with
    `resolve_get_concurrency` (default 128) buckets in flight at once. So
    one resolve peaks at about the cache budget plus `resolve_get_concurrency`

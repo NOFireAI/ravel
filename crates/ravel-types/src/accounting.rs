@@ -447,13 +447,15 @@ pub struct QueryAccountingSnapshot {
     pub cache_bytes: u64,
     /// Commit records whose decoded bytes were served from the catalog's local
     /// decoded commit-record cache during this resolve, counted **once per
-    /// record** no matter how many times its key was touched: the resolve path
-    /// touches each commit-record key twice (a concurrent prewarm, then a
-    /// sequential include), and both together count once. A record the resolve
-    /// fetched itself does not count; only one already resident when the resolve
-    /// began is a serve. It replaces the inference
-    /// `(cache_hits - (cache_misses - 1)) / 2` over the pooled counters, which
-    /// reads one too high whenever a snapshot HEAD exists.
+    /// record**, at the resolve-wide cache lookup that runs before any record
+    /// GET; the include pass reads the decoded record it is handed and touches
+    /// the cache no further, and a later `resolve_min_token` lookup credits
+    /// nothing. A record the resolve fetched itself does not count; only one
+    /// already resident when the resolve began is a serve. Historical note: it
+    /// replaced the inference `(cache_hits - (cache_misses - 1)) / 2` over the
+    /// pooled counters, whose `/ 2` assumed the old two-touch resolve (a
+    /// prewarm then an include re-read) and which read one too high whenever
+    /// a snapshot HEAD existed.
     ///
     /// **This counts records prewarmed, not segments resolved, and the two
     /// differ.** The listing window is padded by `max_ingest_lag_ns` and runs to
