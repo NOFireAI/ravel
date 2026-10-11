@@ -254,10 +254,10 @@ pub enum LogsFetchPolicyArg {
     /// #1196): an intent, not a tuning constant. Measured at `740f94b97` over
     /// 3 reps, it traded 5.30x the GET requests for 52% less cold wall-clock
     /// (per-rep range 50.3% to 54.2%) on the reference corpus,
-    /// at a raised object-store GET concurrency the operator sets explicitly
-    /// (this policy carries no concurrency default of its own). In-flight
-    /// fetch memory at that concurrency is not yet bounded by a process-wide
-    /// budget (ADR-1196, #1170, #1007).
+    /// at an object-store GET concurrency of 256. The unset default on a
+    /// loopback store (ADR-2677 decision 7); the GET permit count is derived
+    /// from the memory budget, not from this policy, and in-flight fetch
+    /// reservations draw on that budget (#2086).
     LatencyFirst,
 }
 
@@ -1367,10 +1367,10 @@ pub struct Cli {
     /// The expert escape hatch of ADR-0996 decision 2: SET, it WINS over
     /// `--logs-fetch-policy`'s derived rate and the deployment keeps exactly
     /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate:
-    /// under `cost-based` (the unset policy, on every deployment including a
-    /// loopback `--s3-endpoint`, ADR-2023) from the active store cost
-    /// profile, and under an explicit `byte-minimal` or `latency-first` as
-    /// the compiled-in default.
+    /// under `cost-based` (the unset policy on every deployment except a
+    /// loopback `--s3-endpoint`, ADR-2023 and ADR-2677) from the active store
+    /// cost profile, and under `byte-minimal` or `latency-first` (the unset
+    /// policy on a loopback `--s3-endpoint`) as the compiled-in default.
     /// `Option`-typed for that reason: "the operator asked for this many bytes"
     /// and "nobody asked, use the compiled-in default" are different inputs to
     /// the resolution, and a `default_value_t` would erase the difference.
@@ -1381,9 +1381,10 @@ pub struct Cli {
     /// at startup into the byte quantities the fetch layer runs on
     /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
     /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it
-    /// resolves `cost-based` (ADR-1196), on every deployment including a
-    /// `--store s3` deployment against a loopback `--s3-endpoint` (ADR-2023
-    /// decision 1).
+    /// resolves `latency-first` on a `--store s3` deployment against a
+    /// loopback `--s3-endpoint` (ADR-2677 decision 7, amending ADR-2023
+    /// decision 1 for loopback only) and `cost-based` (ADR-1196) on every
+    /// other deployment.
     ///
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
@@ -1404,18 +1405,20 @@ pub struct Cli {
     /// An explicit flag always wins, including an explicit `byte-minimal` or
     /// `cost-based` on a loopback endpoint.
     /// [`crate::config::Cli::resolve_logs_fetch_policy`] is the one place this
-    /// is decided; the resolved policy's source (`flag` or `default`) is on
-    /// the `logs fetch policy resolved` startup log line.
+    /// is decided; the resolved policy's source (`flag`, `default` or
+    /// `default-loopback`) is on the `logs fetch policy resolved` startup log
+    /// line.
     ///
     /// `latency-first` is an intent, not a tuning constant: it says spend
     /// requests to save wall time, and carries no concurrency default of its
     /// own. Measured at `740f94b97` over 3 reps on the reference corpus it
     /// traded 5.30x the GET requests for 52% less cold wall-clock than
     /// `cost-based` (per-rep range 50.3% to 54.2%), at
-    /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256) -- set
-    /// explicitly with `--fetch-concurrency` or with `--store-get-concurrency`
-    /// plus `--sql-partition-count`, since both the GET permits and the SQL
-    /// scan width need to move together to reach it. At a lower concurrency
+    /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256). Unset,
+    /// `--store-get-concurrency` derives from the memory budget and reaches
+    /// 256 on a 32 GB host (ADR-2677 decision 7); `--sql-partition-count`
+    /// still derives from cores, so reaching the measured shape for SQL also
+    /// needs `--sql-partition-count` set explicitly. At a lower concurrency
     /// the trade does not pay off, and selecting this policy alone is not
     /// inert: the byte quantities already change, so a logs read is routed the
     /// way `byte-minimal` routes it, taking ranged reads wherever they save
@@ -1423,10 +1426,8 @@ pub struct Cli {
     /// not. On the reference corpus that shape at the default concurrency
     /// measured 712.4 s against `cost-based`'s 525.0 s, 36% SLOWER, which is
     /// why the concurrency is a precondition and not a tuning suggestion.
-    /// In-flight fetch memory at the
-    /// measured concurrency is not yet bounded by a process-wide budget (see
-    /// #1170 and #1007), so raising concurrency without watching process
-    /// memory can end in an out-of-memory kill instead of a faster query.
+    /// In-flight fetch reservations draw on the process memory budget
+    /// (#2086), which refuses a fetch it cannot hold.
     #[arg(long = "logs-fetch-policy", value_enum)]
     pub logs_fetch_policy: Option<LogsFetchPolicyArg>,
 
@@ -1483,7 +1484,8 @@ pub struct Cli {
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
     /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
     /// cores)`, which is 32 on the 16-core reference host and never below the
-    /// compiled-in 8 on a small one.
+    /// compiled-in 8 on a small one. `--store-get-concurrency` alone derives
+    /// from the memory budget instead (ADR-2677 decision 7).
     #[arg(long = "fetch-concurrency", value_name = "N")]
     pub fetch_concurrency: Option<usize>,
 
@@ -1491,9 +1493,13 @@ pub struct Cli {
     /// process-wide (ADR-1195), threaded into
     /// `ravel_query::EngineConfig::store_get_concurrency` and from there into
     /// the single process-owned `GetLimiter` every fetcher (RSEG, RLOG, RSPAN)
-    /// shares. Default when unset: derived,
-    /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
-    /// cores)`.
+    /// shares. Default when unset (ADR-2677 decision 7): derived from the
+    /// memory budget, as many 64 MiB permits (`STORE_GET_PERMIT_BYTES`, the
+    /// fetcher's default fetch bound) as fit in 60% of `memory_budget_bytes`
+    /// (`STORE_GET_MEMORY_PERCENT`), clamped to 8..=256: 256 on a 32 GB
+    /// host, fewer at 16 GB and below. With the budget unknown or not
+    /// applicable (`--mode gateway`), `max(MIN_DERIVED_FETCH_CONCURRENCY,
+    /// FETCH_CONCURRENCY_PER_CORE * cores)`. An explicit flag always wins.
     ///
     /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
     /// flags below) when neither is given explicitly. Setting both
@@ -2696,7 +2702,7 @@ pub struct QueryBudgets {
     pub fetch_concurrency: usize,
     /// The resolved GET concurrency (ADR-1195): the operator's explicit
     /// `--store-get-concurrency`, else the legacy `--fetch-concurrency`
-    /// value, else the derived default -- already resolved by
+    /// value, else the memory-derived default (ADR-2677 decision 7) -- already resolved by
     /// [`resolve_performance_defaults`], never re-derived here. Reaches
     /// `EngineConfig::store_get_concurrency` as `Some(self.store_get_concurrency)`,
     /// which is what makes the accessor return exactly this value regardless
@@ -4682,12 +4688,28 @@ impl ResolvedPerformanceDefaults {
             source = self.sources.fetch_concurrency,
             "performance default resolved"
         );
-        tracing::info!(
-            setting = "store_get_concurrency",
-            value = self.store_get_concurrency,
-            source = self.sources.store_get_concurrency,
-            "performance default resolved"
-        );
+        // ADR-2677 decision 7: a budget-derived permit count names the inputs
+        // it was derived from, so the operator can check it against the budget
+        // line without knowing the rule.
+        if self.sources.store_get_concurrency == PERF_SOURCE_BUDGET_SHARE {
+            tracing::info!(
+                setting = "store_get_concurrency",
+                value = self.store_get_concurrency,
+                source = self.sources.store_get_concurrency,
+                memory_budget_bytes = self.memory_budget_bytes,
+                share_percent = STORE_GET_MEMORY_PERCENT,
+                per_permit_bytes = STORE_GET_PERMIT_BYTES,
+                ceiling = MAX_DERIVED_STORE_GET_CONCURRENCY,
+                "performance default resolved"
+            );
+        } else {
+            tracing::info!(
+                setting = "store_get_concurrency",
+                value = self.store_get_concurrency,
+                source = self.sources.store_get_concurrency,
+                "performance default resolved"
+            );
+        }
         tracing::info!(
             setting = "sql_partition_count",
             value = self.sql_partition_count,
@@ -7588,7 +7610,7 @@ impl Cli {
         if self.store_get_concurrency == Some(0) {
             anyhow::bail!(
                 "--store-get-concurrency '0' would admit no concurrent object-store GETs; omit \
-                 the flag to derive the default from host cores, or set a positive count"
+                 the flag to derive the default from the memory budget, or set a positive count"
             );
         }
         if self.sql_partition_count == Some(0) {
