@@ -577,8 +577,11 @@ pub(crate) fn decode_footer<E>(
     let estimate = check_footer_shape(footer).map_err(DecodeError::Refused)?;
     let reservation = reserve(estimate).map_err(DecodeError::Reserve)?;
     // A decoder panic on a malformed footer is refused like a decoder error.
-    let metadata = match std::panic::catch_unwind(|| ParquetMetaDataReader::decode_metadata(footer))
-    {
+    let metadata = match std::panic::catch_unwind(|| {
+        #[cfg(test)]
+        decode_panic_seam::fire();
+        ParquetMetaDataReader::decode_metadata(footer)
+    }) {
         Ok(Ok(metadata)) => metadata,
         Ok(Err(err)) => return Err(DecodeError::Refused(format!("footer: {err}"))),
         Err(_) => {
@@ -595,6 +598,29 @@ pub(crate) fn decode_footer<E>(
         estimate,
         reservation,
     })
+}
+
+/// A test-only way into [`decode_footer`]'s panic guard: no footer known to
+/// panic the parquet 59 decoder has been found, so a test arms this to make
+/// the decode closure panic instead.
+#[cfg(test)]
+pub(crate) mod decode_panic_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make the next decode on this thread panic.
+    pub(crate) fn arm() {
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn fire() {
+        if ARMED.with(|armed| armed.replace(false)) {
+            panic!("decode_panic_seam fired");
+        }
+    }
 }
 
 /// Why [`PinnedParquetReader::read_footer`] could not hand a footer out.
@@ -1041,6 +1067,30 @@ mod tests {
         let (fixture, _, file) = recorded_file(limits).await;
         let metadata = fixture.reader(file).metadata().await.expect("decodes");
         assert_eq!(metadata.file_metadata().num_rows(), 3);
+    }
+
+    /// Guards: the `catch_unwind` around the parquet decoder in
+    /// `decode_footer`. A decoder panic is refused with its own message, and
+    /// the next decode of the same footer, with the seam disarmed, succeeds.
+    #[test]
+    fn a_decoder_panic_refuses_the_footer() {
+        let bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]);
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let footer = &bytes[end - footer_len_of(&bytes) as usize..end];
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+
+        decode_panic_seam::arm();
+        match decode_footer(footer, 0, |bytes| memory.reserve(bytes)) {
+            Err(DecodeError::Refused(message)) => {
+                assert_eq!(message, "the footer panicked the parquet decoder");
+            }
+            Err(DecodeError::Reserve(err)) => panic!("expected a refusal, got {err:?}"),
+            Ok(_) => panic!("expected a refusal, got a decoded footer"),
+        }
+        let decoded = decode_footer(footer, (end - footer.len()) as u64, |bytes| {
+            memory.reserve(bytes)
+        });
+        assert!(decoded.is_ok(), "the seam fires once");
     }
 
     /// Guards: the estimate `MetadataCache::insert` charges. A writer
