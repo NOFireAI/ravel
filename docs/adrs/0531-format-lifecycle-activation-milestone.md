@@ -170,7 +170,9 @@ in force at HEAD (Reading B, point 2 above):
   ordering that makes that safe (a version's read support is deleted only once
   every bucket's format floor exceeds it) is exercised end to end in
   `crates/ravel-maintain/src/migrate.rs`; that machinery is ready, but it is not
-  the governing posture until v1.0 ships.
+  the governing posture until v1.0 ships. (What a rolled-back writer does in a
+  bucket whose recorded format floor is above the version it writes: see the
+  2026-10-11 amendment below.)
 
 ## Consequences
 
@@ -243,3 +245,34 @@ window for those two is no longer bounded by the retention horizon. The cost
 is the one ADR-0066's 2026-09-13 amendment names for metrics: a held bucket is
 kept past its retention window until the upgrade finishes, `maintain migrate`
 converges it, or the build that reads it runs again.
+
+## Amendment (2026-10-11, #2675): a rolled-back writer refuses below a recorded floor
+
+<!-- amendment-applies: sections="Rollback stance (issue #530 / #1775, the second unlanded bullet)" pointer="2026-10-11 amendment" -->
+
+The rollback stance above names the first write at a new version as the
+irreversible step and says what a rolled-back build can read. ADR-1746's
+writer policy now adds what a rolled-back build may write. Once `migrate` has
+raised a bucket's format floor to N+1, a build that writes N:
+
+- starts, and warns once per (tenant, signal, family) whose floor is above
+  what it writes, for the tenants its flags name; it sets
+  `ravel_format_floor_above_writer{family}` to the count;
+- refuses every ingest flush into that bucket at flush open, before any store
+  call, and answers a strict write with a retryable error; the flush's rows
+  are dropped;
+- in a `maintain` process, refuses a compaction, erasure rewrite or migration
+  of that bucket before it claims or writes anything, and moves on; an erasure
+  request whose rewrite is refused stays pending;
+- counts every refusal under `ravel_format_floor_refused_total{family}`.
+
+Queries, the fold and retention run as before, so the stance on reading is
+unchanged. The way back is to roll forward. An operator who must keep
+ingesting on the rolled-back build sets `--write-below-format-floor`, which
+writes below the floor, counts each such publish under
+`ravel_format_floor_writes_below_total{family}`, and leaves the floor
+`contradicted` for `ravel-cli maintain audit-versions` until a later
+`migrate` rewrites those objects. Under the pre-v1.0 single-version regime a
+floor above the writer means a writer older than the build whose `migrate`
+raised the floor, which across a bump is the rollback the stance above
+already calls unsafe; the policy keeps the floor true when it happens.

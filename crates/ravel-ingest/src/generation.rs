@@ -61,9 +61,8 @@ use std::time::Duration;
 
 use prost::Message;
 use ravel_catalog::{
-    DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, current_floor,
-    provisioning_key, read_floors_checked, read_generations_checked, scan_count,
-    stable_generation_for_hour,
+    DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, current_floor, provisioning_key,
+    read_floors_checked, read_generations_checked, scan_count, stable_generation_for_hour,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::sys::v1 as sysproto;

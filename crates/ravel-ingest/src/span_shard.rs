@@ -1929,10 +1929,8 @@ impl SpanShardActor {
             }
             FloorCheck::Refuse(refused) => {
                 warn_flush_refused(Signal::Spans, self.shard, tenant_hash, &refused);
-                self.ctx.ack_waiters(
-                    buf.waiters,
-                    Err(SpanWriteError::BelowFormatFloor(refused)),
-                );
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(SpanWriteError::BelowFormatFloor(refused)));
                 return;
             }
             FloorCheck::NoView => {

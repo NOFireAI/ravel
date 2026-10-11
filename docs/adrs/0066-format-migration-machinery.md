@@ -93,7 +93,7 @@ repeated FormatFloor format_floors = 7;  // CAS append, like generations
 
 A recorded floor F for family X asserts that no live object of family X below version F exists for this (tenant, signal). Floors are raised only by the verification step of the migration job (Decision 5) after an audit-versions enumeration over current commit and compaction records comes back clean at >= F, and never lower. The load-bearing consumer is release engineering: deleting version V's read support is legal only when every bucket's floor exceeds V — a checkable fact, where today there is only ADR-0027's wipe-and-hope. This is deliberately the ADR-0052 shape: version facts live in the per-(tenant, signal) durable record, appended under CAS, never rewritten.
 
-ADR-1746 amends this decision: a floor also records the basis of the audit that raised it, a stored floor counts as evidence only when re-classified `Current` against current records, and a writer below a floor warns at startup and refuses in the write path. `family` shipped as a lowercase string rather than the enum sketched above; see the `family` string amendment below.
+ADR-1746 amends this decision: a floor also records the basis of the audit that raised it, a stored floor counts as evidence only when re-classified `Current` against current records, and a writer below a floor warns at startup and refuses in the write path. That writer policy (ADR-1746 decisions 3 to 5: the startup warning, the write-path refusal, and the `--write-below-format-floor` override) has shipped; ADR-1746's writer policy shipped amendment records where each check sits. `family` shipped as a lowercase string rather than the enum sketched above; see the `family` string amendment below.
 
 ### 4. Convergence, by migration class
 
