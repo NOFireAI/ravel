@@ -1063,6 +1063,10 @@ pub struct IngestPipelineSnapshot {
     /// `end(pinned hour) + max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
+    /// Flushes whose ADR-1702 write gate encode returned no result (the job
+    /// panicked or was cancelled), answered `ShardUnavailable`. Not an
+    /// `abandoned_*` cause, and not a shard death.
+    pub flush_gate_faults: u64,
     pub buffered_bytes_total: u64,
     pub buffered_items_total: u64,
     pub acks_ok: u64,
@@ -1271,6 +1275,7 @@ impl IngestPipelineSnapshot {
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_hour_bound: snapshot.abandoned_hour_bound,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
+            flush_gate_faults: snapshot.flush_gate_faults,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_points_total,
             acks_ok: snapshot.acks_ok,
@@ -1327,6 +1332,7 @@ impl IngestPipelineSnapshot {
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_hour_bound: snapshot.abandoned_hour_bound,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
+            flush_gate_faults: snapshot.flush_gate_faults,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_records_total,
             acks_ok: snapshot.acks_ok,
@@ -1382,6 +1388,7 @@ impl IngestPipelineSnapshot {
             abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_hour_bound: snapshot.abandoned_hour_bound,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
+            flush_gate_faults: snapshot.flush_gate_faults,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_spans_total,
             acks_ok: snapshot.acks_ok,
@@ -1583,6 +1590,22 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_abandoned_input_rejected_total",
             &labels(mode, pipeline.signal),
             pipeline.abandoned_input_rejected,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_flush_gate_faults_total",
+        "Flushes whose write gate encode panicked or was cancelled, failing \
+         their writes retryably with nothing stored, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_flush_gate_faults_total",
+            &labels(mode, pipeline.signal),
+            pipeline.flush_gate_faults,
         );
     }
 
@@ -11648,6 +11671,43 @@ mod tests {
         // present in `ingest` still yields no `signal="spans"` collisions
         // sample; not exercised further here since no span pipeline was
         // constructed in this test.
+    }
+
+    /// Each pipeline's `flush_gate_faults` reaches its own `signal` sample of
+    /// `ravel_ingest_flush_gate_faults_total`, under one declaration. The
+    /// three values differ, so a snapshot mapping that drops or swaps the
+    /// field fails.
+    #[test]
+    fn flush_gate_faults_render_per_signal() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                flush_gate_faults: 2,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                flush_gate_faults: 3,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                flush_gate_faults: 7,
+                ..Default::default()
+            }),
+        ];
+        let mut body = String::new();
+        render_ingest_family(&mut body, Mode::Gateway, &ingest);
+
+        assert_eq!(
+            body.matches("# TYPE ravel_ingest_flush_gate_faults_total counter\n")
+                .count(),
+            1,
+            "{body}"
+        );
+        for (signal, value) in [("metrics", 2), ("logs", 3), ("spans", 7)] {
+            let sample = format!(
+                "ravel_ingest_flush_gate_faults_total{{mode=\"gateway\",signal=\"{signal}\"}} {value}\n"
+            );
+            assert_eq!(body.matches(&sample).count(), 1, "{sample}:\n{body}");
+        }
     }
 
     /// EC7 (ADR-0050 section 7): the store-reachability family renders on this
