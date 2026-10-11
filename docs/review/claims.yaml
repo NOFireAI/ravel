@@ -58,13 +58,14 @@
 
 - id: guide-query-audit-pipeline-installed
   doc: docs/guides/query.md
-  quote: "every query surface writes a query-audit record for each query that it executes"
+  quote: "writes a query-audit record for each query that it executes"
   kind: positive
   binds:
     - crates/ravel-maintain/src/audit_pipeline.rs::AuditPipeline
     - services/ravel-server/src/config.rs::Mode::installs_query_audit_pipeline
+    - services/ravel-server/src/config.rs::Cli::query_audit_enabled
   status: verified
-  note: "services/ravel-server/src/lib.rs start spawns the real pipeline and wires every query surface's audit sink to it when Mode::installs_query_audit_pipeline holds (--mode all and --mode query)."
+  note: "services/ravel-server/src/lib.rs start spawns the real pipeline and wires every query surface's audit sink to it when Mode::installs_query_audit_pipeline holds (--mode all and --mode query) and Cli::query_audit_enabled holds (--audit-mode required or best-effort; the default off leaves the NoopQueryAuditSink). The guide sentence is qualified with that condition."
 
 - id: guide-audit-required-fails-closed
   doc: docs/guides/audit.md

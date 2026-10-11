@@ -792,10 +792,13 @@ Resolution is per tenant hash, so a tenant reads only its own records.
 The maintenance process writes legal-hold and reshard records, so any
 deployment that took those actions has them.
 
-In the query-serving modes (`all` and `query`), every query surface writes a
-query-audit record for each query that it executes. [The audit guide](audit.md)
-describes when a record is written and what it carries. A query over `audit`
-is itself audited and appears in the trail that a later query reads.
+With the query audit enabled (`--audit-mode required` or `best-effort`; it is
+off by default), every query surface in the query-serving modes (`all` and
+`query`) writes a query-audit record for each query that it executes. [The
+audit guide](audit.md) describes when a record is written and what it carries.
+A query over `audit` is itself audited and appears in the trail that a later
+query reads. Under the default `--audit-mode off` the `audit` table holds no
+`kind = query` rows for this process.
 
 ### Typed attribute columns
 

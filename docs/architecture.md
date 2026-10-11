@@ -371,14 +371,15 @@ is the single place where the per-query controls live:
   ceiling.
 - The usage record, folded on every exit path including a client disconnect.
 - The evidential audit event, whose durability is awaited before an answer is
-  released.
+  released, when `--audit-mode` enables the audit (it is off by default, and
+  the layer then holds a no-op sink).
 - The partial-coverage consent gate.
 - The redaction that a failure passes through on the way out.
 
 A transport parses its request, authenticates it, calls one operation, and
 encodes the outcome. It holds none of those controls. So a new transport
 cannot add a surface that queries outside the ceiling, spends without
-recording, or answers without an audit trail.
+recording, or, with the audit enabled, answers without an audit trail.
 
 Authentication stays on the transport side and runs before admission, so an
 unauthenticated request cannot consume a permit. Authentication is also the

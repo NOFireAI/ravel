@@ -291,32 +291,32 @@ record:
 "$CLI" --store s3 --s3-auth instance-role store qualify
 ```
 
-**A key for the default audit policy.** `--audit-text` defaults to `redacted`,
-which needs a tokenization key, and this benchmark passes
-`--tenant-hash-unkeyed` precisely so it holds no deployment secret, so there is
-nothing to derive one from:
+**The query audit is off by default.** Since #2791 `--audit-mode` defaults to
+`off`: the server writes no query-audit record, awaits no audit PUT per
+statement, and needs no tokenization key, so an unkeyed benchmark server
+starts with no audit setting at all. Runs before #2791 measured the audited
+path, two sequential audit PUTs per statement, so a figure compared across
+that change must say which basis it used.
 
-```
-Error: failed to resolve --audit-text
-  ... needs a tokenization key and none is configured: set
-  RAVEL_AUDIT_TOKEN_KEY to 64 hex characters (32 bytes), or configure
-  --tenant-hash-key-file ..., or pass --audit-text plaintext ...
-```
-
-Pick one and keep it for the whole run, because the choice decides what the
-audit trail records:
+To measure the audited path, enable the audit and give its default `redacted`
+text policy a key; this benchmark passes `--tenant-hash-unkeyed` so there is
+no deployment secret to derive one from. Pick one and keep it for the whole
+run, because the choice decides what the audit trail records:
 
 ```sh
-# Either: keep the stock redacted default and give it a key.
+# Either: the redacted default with a key.
+#   ... --audit-mode required
 export RAVEL_AUDIT_TOKEN_KEY=$(openssl rand -hex 32)
 
 # Or: record query text verbatim, defensible here because the corpus is public
 # and the statements are the published ClickBench set.
-#   ... --audit-text plaintext
+#   ... --audit-mode required --audit-text plaintext
 ```
 
-Say which one a published run used: `--audit-text plaintext` is a deviation
-from the stock defaults such a run otherwise measures.
+`--audit-text plaintext` without `--audit-mode required` is refused at
+startup: it tunes a pipeline `off` never installs. Say which setting a
+published run used: `--audit-mode required` and `--audit-text plaintext` are
+each a deviation from the stock defaults such a run otherwise measures.
 
 ### Load
 

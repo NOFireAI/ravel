@@ -542,10 +542,15 @@ compaction reasoning, and the sweeper's re-verify LIST.
      deployment that sets it explicitly. A keyed deployment that does not set
      it derives it from the deployment key, but an explicitly set key takes
      precedence over that derivation. An unkeyed deployment has nothing to
-     derive it from, and a server that serves queries refuses to start under
-     the default `--audit-text redacted` without it. Restoring with a
-     different key starts the server but tokenizes new audit text differently
-     from the audit records already in the bucket.
+     derive it from, and a server that serves queries with the audit enabled
+     refuses to start under the default `--audit-text redacted` without it.
+     Restoring with a different key starts the server but tokenizes new
+     audit text differently from the audit records already in the bucket.
+     The query audit is off by default: a restored query-serving
+     process must set `--audit-mode required` (or
+     `RAVEL_AUDIT_MODE=required`), as the DR scripts do, or the `kind =
+     query` trail stops at the restore point while the bucket's existing
+     records say it was running.
 
    All of it must be held somewhere that survives the loss of the primary
    cluster: a separate secrets manager, a cross-region vault, or an offline
