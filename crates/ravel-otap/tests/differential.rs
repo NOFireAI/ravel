@@ -28,12 +28,13 @@ use opentelemetry_proto::tonic::metrics::v1::{
     NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
     metric::Data as MetricData, summary_data_point::ValueAtQuantile,
 };
+use opentelemetry_proto::tonic::resource::v1::Resource;
 use proptest::prelude::*;
 
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, ExemplarRow, ExemplarValue, HistogramMetricRow,
-    HistogramPointRow, MetricKind, MetricRow, MetricsStreamEncoder, SummaryMetricRow,
-    SummaryPointRow,
+    HistogramPointRow, MetricKind, MetricRow, MetricsStreamEncoder, ResourceAssignment,
+    SummaryMetricRow, SummaryPointRow,
 };
 use ravel_otap::normalize::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
@@ -2600,4 +2601,503 @@ fn quasi_delta_attrs_alongside_delta_ids_in_one_batch() {
         rejection_multiset(&otap_out.rejected),
         "rejection classes differ"
     );
+}
+
+// --- resources (ADR-2708 D4) -------------------------------------------
+
+#[derive(Debug, Clone)]
+enum WorkloadResourceValue {
+    Scalar(WorkloadValue),
+    /// A map value: no label representation, so it rejects the resource when
+    /// the builder reads its key.
+    Complex,
+}
+
+/// One OTLP `ResourceMetrics`, or one OTAP `resource.id` with its
+/// `RESOURCE_ATTRS` rows. `attrs: None` is no resource at all.
+#[derive(Debug, Clone)]
+struct WorkloadResource {
+    attrs: Option<Vec<(String, WorkloadResourceValue)>>,
+    metrics: Vec<WorkloadMetric>,
+    summaries: Vec<WorkloadSummaryMetric>,
+}
+
+/// Limits for the resource tests: a two-key allowlist whose order differs
+/// from the order the keys arrive in, and a resource attribute cap the
+/// strategy below crosses.
+fn resource_limits() -> IngestLimits {
+    IngestLimits {
+        resource_attribute_allowlist: vec!["host.name".to_string(), "cloud.region".to_string()],
+        max_resource_attributes: 4,
+        ..IngestLimits::default()
+    }
+}
+
+fn resource_attr_strategy() -> impl Strategy<Value = (String, WorkloadResourceValue)> {
+    // A small key pool, so a resource repeats a key often: the builder takes
+    // the first occurrence, which a reimplementation reading in arrival order
+    // gets wrong.
+    let key = prop_oneof![
+        Just("service.name".to_string()),
+        Just("service.namespace".to_string()),
+        Just("service.instance.id".to_string()),
+        Just("cloud.region".to_string()),
+        Just("host.name".to_string()),
+        Just("os.type".to_string()),
+    ];
+    let value = prop_oneof![
+        8 => "[a-c]{1,3}".prop_map(|s| WorkloadResourceValue::Scalar(WorkloadValue::Str(s))),
+        1 => (-5i64..5).prop_map(|i| WorkloadResourceValue::Scalar(WorkloadValue::Int(i))),
+        1 => any::<bool>().prop_map(|b| WorkloadResourceValue::Scalar(WorkloadValue::Bool(b))),
+        1 => Just(WorkloadResourceValue::Scalar(WorkloadValue::Double(0.5))),
+        1 => Just(WorkloadResourceValue::Scalar(WorkloadValue::Str(String::new()))),
+        1 => Just(WorkloadResourceValue::Scalar(WorkloadValue::Str("v".repeat(4097)))),
+        1 => Just(WorkloadResourceValue::Complex),
+    ];
+    (key, value)
+}
+
+/// Summaries whose quantile count sometimes passes the default
+/// `max_summary_quantiles` of 64.
+fn wide_summary_metric_strategy() -> impl Strategy<Value = WorkloadSummaryMetric> {
+    let point = (
+        summary_point_strategy(),
+        prop::option::weighted(0.3, 63usize..=67),
+    )
+        .prop_map(|(mut point, wide)| {
+            if let Some(n) = wide {
+                point.quantiles = quantile_ladder(n);
+            }
+            point
+        });
+    (metric_name_strategy(), prop::collection::vec(point, 1..=2))
+        .prop_map(|(name, points)| WorkloadSummaryMetric { name, points })
+}
+
+fn quantile_ladder(n: usize) -> Vec<WorkloadQuantile> {
+    (0..n)
+        .map(|i| WorkloadQuantile {
+            quantile: i as f64 / n as f64,
+            value: i as f64,
+        })
+        .collect()
+}
+
+fn resource_workload_strategy() -> impl Strategy<Value = Vec<WorkloadResource>> {
+    let resource = (
+        prop::option::weighted(0.8, prop::collection::vec(resource_attr_strategy(), 0..=5)),
+        prop::collection::vec(metric_strategy(), 0..=3),
+        prop::collection::vec(wide_summary_metric_strategy(), 0..=1),
+    )
+        .prop_map(|(attrs, metrics, summaries)| WorkloadResource {
+            attrs,
+            metrics,
+            summaries,
+        });
+    prop::collection::vec(resource, 1..=3)
+}
+
+fn otlp_resource_kv(key: &str, value: &WorkloadResourceValue) -> KeyValue {
+    match value {
+        WorkloadResourceValue::Scalar(v) => otlp_kv(&WorkloadAttr {
+            key: key.to_string(),
+            value: v.clone(),
+        }),
+        WorkloadResourceValue::Complex => KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::KvlistValue(Default::default())),
+            }),
+            ..Default::default()
+        },
+    }
+}
+
+fn build_otlp_resource_request(workload: &[WorkloadResource]) -> ExportMetricsServiceRequest {
+    let resource_metrics = workload
+        .iter()
+        .map(|r| {
+            let mut metrics = build_otlp_request(&r.metrics).resource_metrics[0].scope_metrics[0]
+                .metrics
+                .clone();
+            metrics.extend(
+                build_otlp_summary_request(&r.summaries).resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .clone(),
+            );
+            ResourceMetrics {
+                resource: r.attrs.as_ref().map(|attrs| Resource {
+                    attributes: attrs.iter().map(|(k, v)| otlp_resource_kv(k, v)).collect(),
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        })
+        .collect();
+    ExportMetricsServiceRequest { resource_metrics }
+}
+
+fn otap_resource_attr(key: &str, value: &WorkloadResourceValue) -> AttrRow {
+    match value {
+        WorkloadResourceValue::Scalar(v) => otap_attr(&WorkloadAttr {
+            key: key.to_string(),
+            value: v.clone(),
+        }),
+        WorkloadResourceValue::Complex => AttrRow {
+            key: key.to_string(),
+            value: AttrValue::Complex(ANY_VALUE_TYPE_MAP),
+        },
+    }
+}
+
+fn build_otap_resource_batch(
+    workload: &[WorkloadResource],
+    encoder: &mut MetricsStreamEncoder,
+) -> BatchArrowRecords {
+    let mut resources: Vec<Vec<AttrRow>> = Vec::new();
+    let mut flat_metrics: Vec<WorkloadMetric> = Vec::new();
+    let mut flat_summaries: Vec<WorkloadSummaryMetric> = Vec::new();
+    let mut metric_slots = Vec::new();
+    let mut summary_slots = Vec::new();
+    for r in workload {
+        let slot = r.attrs.as_ref().map(|attrs| {
+            resources.push(
+                attrs
+                    .iter()
+                    .map(|(k, v)| otap_resource_attr(k, v))
+                    .collect(),
+            );
+            resources.len() - 1
+        });
+        flat_metrics.extend(r.metrics.iter().cloned());
+        metric_slots.extend(r.metrics.iter().map(|_| slot));
+        flat_summaries.extend(r.summaries.iter().cloned());
+        summary_slots.extend(r.summaries.iter().map(|_| slot));
+    }
+
+    // Reuse the per-kind builders' row construction, then re-encode the rows
+    // under their resources.
+    let metrics = metric_rows(&flat_metrics);
+    let summaries = summary_rows(&flat_summaries);
+    let units: Vec<&str> = flat_metrics.iter().map(|m| m.unit.as_str()).collect();
+    encoder
+        .encode_batch_resources(
+            0,
+            &metrics,
+            &units,
+            &[],
+            &[],
+            &summaries,
+            &[],
+            &ResourceAssignment {
+                resources: &resources,
+                metrics: &metric_slots,
+                histograms: &[],
+                summaries: &summary_slots,
+            },
+        )
+        .expect("encode resource workload")
+}
+
+fn metric_rows(workload: &[WorkloadMetric]) -> Vec<MetricRow> {
+    workload
+        .iter()
+        .map(|m| MetricRow {
+            name: m.name.clone(),
+            kind: match &m.kind {
+                WorkloadKind::Gauge => MetricKind::Gauge,
+                WorkloadKind::Sum {
+                    temporality,
+                    is_monotonic,
+                } => MetricKind::Sum {
+                    temporality: *temporality,
+                    is_monotonic: *is_monotonic,
+                },
+            },
+            data_points: m
+                .points
+                .iter()
+                .map(|p| DataPointRow {
+                    exemplars: vec![],
+                    time_unix_nano: INGEST_TS_NS + p.ts_offset_ns,
+                    value: p.value,
+                    flags: p.flags,
+                    attrs: p.attrs.iter().map(otap_attr).collect(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn summary_rows(workload: &[WorkloadSummaryMetric]) -> Vec<SummaryMetricRow> {
+    workload
+        .iter()
+        .map(|m| SummaryMetricRow {
+            name: m.name.clone(),
+            data_points: m
+                .points
+                .iter()
+                .map(|p| SummaryPointRow {
+                    time_unix_nano: INGEST_TS_NS + p.ts_offset_ns,
+                    count: p.count,
+                    sum: p.sum,
+                    quantiles: p.quantiles.iter().map(|q| (q.quantile, q.value)).collect(),
+                    flags: p.flags,
+                    attrs: p.attrs.iter().map(otap_attr).collect(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Run `workload` through both paths under `limits`, assert they agree on
+/// series ids, samples and rejections, and return the OTAP output.
+#[allow(clippy::expect_used)]
+fn assert_resource_paths_agree(
+    workload: &[WorkloadResource],
+    limits: &IngestLimits,
+) -> NormalizeOutput {
+    let tenant = TenantId::new("acme");
+    let otlp_out = normalize_metrics(
+        &tenant,
+        build_otlp_resource_request(workload),
+        limits,
+        INGEST_TS_NS,
+    );
+    let mut encoder = MetricsStreamEncoder::new("differential-resource").expect("new encoder");
+    let raw_batch = build_otap_resource_batch(workload, &mut encoder);
+    let mut state = StreamState::new(StreamConfig::default());
+    let decoded = state.decode(raw_batch).expect("decode otap batch");
+    let otap_out = normalize_decoded(&tenant, &decoded, limits, INGEST_TS_NS);
+
+    assert_eq!(
+        series_ids(&otlp_out),
+        series_ids(&otap_out),
+        "series id sets differ"
+    );
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
+    otap_out
+}
+
+proptest! {
+    #[test]
+    fn otlp_and_otap_agree_on_random_resource_workloads(workload in resource_workload_strategy()) {
+        assert_resource_paths_agree(&workload, &resource_limits());
+    }
+}
+
+fn str_resource(pairs: &[(&str, &str)]) -> Option<Vec<(String, WorkloadResourceValue)>> {
+    Some(
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    WorkloadResourceValue::Scalar(WorkloadValue::Str(v.to_string())),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn gauge_metric(name: &str, points: usize) -> WorkloadMetric {
+    WorkloadMetric {
+        name: name.to_string(),
+        unit: String::new(),
+        kind: WorkloadKind::Gauge,
+        points: (0..points)
+            .map(|i| WorkloadPoint {
+                ts_offset_ns: i as i64,
+                value: 1.0,
+                flags: 0,
+                attrs: vec![WorkloadAttr {
+                    key: "host".to_string(),
+                    value: WorkloadValue::Str("h1".to_string()),
+                }],
+            })
+            .collect(),
+    }
+}
+
+fn label_pairs(out: &NormalizeOutput) -> BTreeSet<Vec<(String, String)>> {
+    out.points
+        .iter()
+        .map(|p| {
+            p.labels
+                .iter()
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect()
+        })
+        .collect()
+}
+
+fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+/// The same metric with the same point attributes under two resources is two
+/// series on both paths, each carrying its own resource's `job`.
+#[test]
+fn two_resources_same_point_attrs_split_series() {
+    let workload = vec![
+        WorkloadResource {
+            attrs: str_resource(&[("service.name", "a")]),
+            metrics: vec![gauge_metric("up", 1)],
+            summaries: vec![],
+        },
+        WorkloadResource {
+            attrs: str_resource(&[("service.name", "b")]),
+            metrics: vec![gauge_metric("up", 1)],
+            summaries: vec![],
+        },
+    ];
+    let otap_out = assert_resource_paths_agree(&workload, &resource_limits());
+    assert!(otap_out.rejected.is_empty(), "{:?}", otap_out.rejected);
+    assert_eq!(series_ids(&otap_out).len(), 2);
+    assert_eq!(
+        label_pairs(&otap_out),
+        BTreeSet::from([
+            owned(&[("__name__", "up"), ("host", "h1"), ("job", "a")]),
+            owned(&[("__name__", "up"), ("host", "h1"), ("job", "b")]),
+        ])
+    );
+}
+
+/// A map value on a key the builder reads rejects every point under that
+/// resource as one `Grouped` rejection, and leaves the other resource alone.
+#[test]
+fn complex_resource_attribute_rejects_whole_resource_on_both_paths() {
+    let workload = vec![
+        WorkloadResource {
+            attrs: Some(vec![(
+                "service.name".to_string(),
+                WorkloadResourceValue::Complex,
+            )]),
+            metrics: vec![gauge_metric("up", 2), gauge_metric("down", 1)],
+            summaries: vec![],
+        },
+        WorkloadResource {
+            attrs: str_resource(&[("service.name", "b")]),
+            metrics: vec![gauge_metric("up", 1)],
+            summaries: vec![],
+        },
+    ];
+    let otap_out = assert_resource_paths_agree(&workload, &resource_limits());
+    assert_eq!(
+        otap_out.rejected,
+        vec![Rejection::Grouped {
+            reason: Box::new(Rejection::ComplexAttributeValue),
+            count: 3,
+        }]
+    );
+    assert_eq!(
+        label_pairs(&otap_out),
+        BTreeSet::from([owned(&[("__name__", "up"), ("host", "h1"), ("job", "b")])])
+    );
+}
+
+/// The allowlist picks `host.name` and `cloud.region` (first occurrence of a
+/// repeated key wins), `service.namespace`/`service.name` join into `job`,
+/// and the two attributes nothing reads are one `ResourceAttributesDropped`.
+#[test]
+fn resource_allowlist_and_dropped_count_agree() {
+    let limits = IngestLimits {
+        max_resource_attributes: 16,
+        ..resource_limits()
+    };
+    let workload = vec![WorkloadResource {
+        attrs: Some(vec![
+            (
+                "cloud.region".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Str("eu".to_string())),
+            ),
+            (
+                "os.type".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Str("linux".to_string())),
+            ),
+            (
+                "host.name".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Str("h-first".to_string())),
+            ),
+            (
+                "service.name".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Str("svc".to_string())),
+            ),
+            (
+                "host.name".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Str("h-second".to_string())),
+            ),
+            (
+                "service.namespace".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Str("ns".to_string())),
+            ),
+            (
+                "pid".to_string(),
+                WorkloadResourceValue::Scalar(WorkloadValue::Int(7)),
+            ),
+        ]),
+        metrics: vec![gauge_metric("up", 1)],
+        summaries: vec![],
+    }];
+    let otap_out = assert_resource_paths_agree(&workload, &limits);
+    assert_eq!(
+        otap_out.rejected,
+        vec![Rejection::ResourceAttributesDropped { count: 2 }]
+    );
+    assert_eq!(
+        label_pairs(&otap_out),
+        BTreeSet::from([owned(&[
+            ("__name__", "up"),
+            ("cloud_region", "eu"),
+            ("host", "h1"),
+            ("host_name", "h-first"),
+            ("job", "ns/svc"),
+        ])])
+    );
+}
+
+/// A summary point with 65 quantiles is rejected on both paths with
+/// `TooManySummaryQuantiles`; one with exactly 64 is admitted.
+#[test]
+fn summary_over_quantile_cap_rejected_on_both_paths() {
+    let point = |quantiles: usize, ts_offset_ns: i64| WorkloadSummaryPoint {
+        ts_offset_ns,
+        count: 10,
+        sum: 5.0,
+        quantiles: quantile_ladder(quantiles),
+        flags: 0,
+        attrs: vec![],
+    };
+    let workload = vec![WorkloadResource {
+        attrs: str_resource(&[("service.name", "svc")]),
+        metrics: vec![],
+        summaries: vec![WorkloadSummaryMetric {
+            name: "latency".to_string(),
+            points: vec![point(65, 0), point(64, 1)],
+        }],
+    }];
+    let limits = resource_limits();
+    assert_eq!(limits.max_summary_quantiles, 64);
+    let otap_out = assert_resource_paths_agree(&workload, &limits);
+    assert_eq!(
+        otap_out.rejected,
+        vec![Rejection::TooManySummaryQuantiles {
+            quantiles: 65,
+            max: 64,
+        }]
+    );
+    // 64 quantile series plus `_sum` and `_count` from the admitted point.
+    assert_eq!(otap_out.points.len(), 66);
 }

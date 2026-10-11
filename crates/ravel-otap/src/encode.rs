@@ -13,7 +13,13 @@
 //!   `is_monotonic` (Boolean, nullable, same condition). The data model
 //!   marks these last two "optional" as nullable columns on the shared
 //!   METRICS table, not as omitted columns -- unlike the AnyValue arms
-//!   below, a `Gauge` row simply carries nulls in them.
+//!   below, a `Gauge` row simply carries nulls in them. The root also
+//!   carries `unit` (Utf8) and `resource` (a nullable struct holding a
+//!   UInt16 `id`, null for a metric outside any resource).
+//! - `RESOURCE_ATTRS`: emitted only by [`MetricsStreamEncoder::encode_batch_resources`].
+//!   `parent_id` (UInt16, FK to the root's `resource.id`), `key` and `str`
+//!   as `Dictionary<UInt16, Utf8>`, and the same `type`/value columns as the
+//!   data-point attrs below.
 //! - `NUMBER_DATA_POINTS`: `id` (UInt32, populated whenever the point has
 //!   attrs, so `NUMBER_DP_ATTRS` has something to reference), `parent_id`
 //!   (UInt16, FK to the root table's `id`), `time_unix_nano`
@@ -48,12 +54,12 @@
 //!   histogram exemplar tables share one schema and one builder, since the
 //!   data model gives them identical columns.
 //!
-//! All `id`/`parent_id` columns are emitted as plain absolute values (no
-//! delta or quasi-delta transport encoding, see otap-spec.md section 6.4):
-//! `StreamState` does not decode those transforms, so encoding otherwise
-//! would produce data the decoder cannot round-trip. Every such column carries
-//! field metadata `("encoding", "plain")` to say so explicitly on the wire,
-//! matching the spec's own vocabulary for the encodings it allows.
+//! Every `id`/`parent_id` column except the resource ones is emitted as plain
+//! absolute values and carries field metadata `("encoding", "plain")` to say
+//! so on the wire, matching the spec's own vocabulary for the encodings it
+//! allows (otap-spec.md section 6.4). The resource columns carry no metadata
+//! and take the spec defaults a real exporter relies on: DELTA for the root's
+//! `resource.id` and QUASI-DELTA for `RESOURCE_ATTRS.parent_id`.
 //!
 //! `NUMBER_DATA_POINTS` and `NUMBER_DP_ATTRS` payloads are omitted from a
 //! batch entirely when they would have zero rows, per otap-spec.md section
@@ -80,8 +86,8 @@ use arrow::array::{
     RecordBatch, StringArray, StringDictionaryBuilder, StructArray, TimestampNanosecondArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit, UInt8Type};
+use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit, UInt8Type, UInt16Type};
 use arrow_ipc::writer::StreamWriter;
 
 use crate::normalize::{
@@ -257,6 +263,29 @@ fn root_schema() -> Schema {
         // empty for a metric that carries none; the normalizer maps it to the
         // Prometheus name suffix (ADR-0085 Decision 2).
         Field::new("unit", DataType::Utf8, true),
+        Field::new("resource", DataType::Struct(resource_fields()), true),
+    ])
+}
+
+/// The root table's `resource` struct: only its `id` (otap-spec.md section
+/// 5.3.1), with no `encoding` metadata, so it takes the spec's DELTA default.
+fn resource_fields() -> Fields {
+    Fields::from(vec![Field::new("id", DataType::UInt16, true)])
+}
+
+/// `RESOURCE_ATTRS` (otap-spec.md section 5.4.2): a `UInt16` `parent_id` with
+/// no `encoding` metadata (the spec's QUASI-DELTA default) and
+/// dictionary-encoded `key` and `str`, the shape a real exporter sends.
+fn resource_attrs_schema() -> Schema {
+    let dict16 = || DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
+    Schema::new(vec![
+        Field::new("parent_id", DataType::UInt16, false),
+        Field::new("key", dict16(), false),
+        Field::new("type", DataType::UInt8, false),
+        Field::new("str", dict16(), true),
+        Field::new("bool", DataType::Boolean, true),
+        Field::new("int", DataType::Int64, true),
+        Field::new("double", DataType::Float64, true),
     ])
 }
 
@@ -481,6 +510,133 @@ impl AttrColumnBuilder {
     }
 }
 
+/// The scalar a `RESOURCE_ATTRS` row is compared on for quasi-delta encoding
+/// (otap-spec.md section 6.4.3: `type`, `key`, and the type's Active Field).
+/// `None` for a complex value, which has no Active Field and is always
+/// written absolute.
+#[derive(PartialEq)]
+enum QuasiDeltaValue<'a> {
+    Str(&'a str),
+    Bool(bool),
+    Int(i64),
+    Double(u64),
+}
+
+fn quasi_delta_value(value: &AttrValue) -> Option<QuasiDeltaValue<'_>> {
+    match value {
+        AttrValue::Str(s) => Some(QuasiDeltaValue::Str(s)),
+        AttrValue::Bool(b) => Some(QuasiDeltaValue::Bool(*b)),
+        AttrValue::Int(i) => Some(QuasiDeltaValue::Int(*i)),
+        AttrValue::Double(d) => Some(QuasiDeltaValue::Double(d.to_bits())),
+        AttrValue::Complex(_) => None,
+    }
+}
+
+/// Build the `RESOURCE_ATTRS` batch for `resources`, resource `i` taking
+/// batch-scoped id `i`. Rows go out grouped by resource and in each resource's
+/// attribute order; a row equal on (type, key, value) to the row before it
+/// carries its `parent_id` as a delta from that row's, every other row as an
+/// absolute id, which is what a quasi-delta decoder reconstructs.
+fn resource_attrs_batch(resources: &[Vec<AttrRow>]) -> Result<RecordBatch, EncodeError> {
+    let mut parent_ids = Vec::new();
+    let mut keys = StringDictionaryBuilder::<UInt16Type>::new();
+    let mut strs = StringDictionaryBuilder::<UInt16Type>::new();
+    let mut types = Vec::new();
+    let mut bools = Vec::new();
+    let mut ints = Vec::new();
+    let mut doubles = Vec::new();
+    let mut previous: Option<(&str, u8, QuasiDeltaValue<'_>, u16)> = None;
+    for (index, attrs) in resources.iter().enumerate() {
+        let resource_id = u16::try_from(index).unwrap_or(u16::MAX);
+        for attr in attrs {
+            let (ty, str_v, bool_v, int_v, double_v) = match &attr.value {
+                AttrValue::Str(s) => (ANY_VALUE_TYPE_STRING, Some(s.as_str()), None, None, None),
+                AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
+                AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
+                AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
+                AttrValue::Complex(ty) => (*ty, None, None, None, None),
+            };
+            let current = quasi_delta_value(&attr.value);
+            let encoded = match (&previous, &current) {
+                (Some((key, prev_ty, prev_value, prev_id)), Some(value))
+                    if *key == attr.key && *prev_ty == ty && prev_value == value =>
+                {
+                    resource_id.wrapping_sub(*prev_id)
+                }
+                _ => resource_id,
+            };
+            previous = current.map(|value| (attr.key.as_str(), ty, value, resource_id));
+            parent_ids.push(encoded);
+            keys.append(&attr.key)?;
+            match str_v {
+                Some(s) => strs.append(s).map(|_| ())?,
+                None => strs.append_null(),
+            }
+            types.push(ty);
+            bools.push(bool_v);
+            ints.push(int_v);
+            doubles.push(double_v);
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(resource_attrs_schema()),
+        vec![
+            Arc::new(UInt16Array::from(parent_ids)),
+            Arc::new(keys.finish()),
+            Arc::new(UInt8Array::from(types)),
+            Arc::new(strs.finish()),
+            Arc::new(BooleanArray::from(bools)),
+            Arc::new(Int64Array::from(ints)),
+            Arc::new(Float64Array::from(doubles)),
+        ],
+    )?)
+}
+
+/// The root table's `resource` column: a null struct for a metric with no
+/// resource, otherwise its id, delta-encoded against the previous non-null id
+/// in the batch.
+fn resource_column(resource_ids: &[Option<u16>]) -> Result<StructArray, EncodeError> {
+    let mut previous = 0u16;
+    let deltas: Vec<Option<u16>> = resource_ids
+        .iter()
+        .map(|id| {
+            id.map(|id| {
+                let delta = id.wrapping_sub(previous);
+                previous = id;
+                delta
+            })
+        })
+        .collect();
+    let validity: Vec<bool> = resource_ids.iter().map(Option::is_some).collect();
+    Ok(StructArray::try_new(
+        resource_fields(),
+        vec![Arc::new(UInt16Array::from(deltas))],
+        Some(NullBuffer::from(validity)),
+    )?)
+}
+
+/// Which resource each metric of an [`MetricsStreamEncoder::encode_batch_resources`]
+/// call sits under. `resources[i]` is resource `i`'s attributes, in order;
+/// `metrics[j]`, `histograms[j]` and `summaries[j]` name the resource of the
+/// `j`th metric of each kind (`None`, or past the slice's end, for no
+/// resource). A resource no metric names is still written, so its rows are
+/// orphans.
+#[derive(Default)]
+pub struct ResourceAssignment<'a> {
+    pub resources: &'a [Vec<AttrRow>],
+    pub metrics: &'a [Option<usize>],
+    pub histograms: &'a [Option<usize>],
+    pub summaries: &'a [Option<usize>],
+}
+
+fn assigned(slots: &[Option<usize>], index: usize) -> Option<u16> {
+    slots
+        .get(index)
+        .copied()
+        .flatten()
+        .and_then(|r| u16::try_from(r).ok())
+}
+
 /// Accumulates `NUMBER_DP_EXEMPLARS`/`HISTOGRAM_DP_EXEMPLARS` rows
 /// column-by-column, and the `*_EXEMPLAR_ATTRS` rows that hang off them.
 /// Factored out for the same reason as [`AttrColumnBuilder`]: both exemplar
@@ -599,6 +755,7 @@ pub enum EncodeError {
 /// calls. See the module docs for exactly which columns are emitted.
 pub struct MetricsStreamEncoder {
     root: PayloadStream,
+    resource_attrs: PayloadStream,
     data_points: PayloadStream,
     attrs: PayloadStream,
     number_exemplars: PayloadStream,
@@ -627,6 +784,11 @@ impl MetricsStreamEncoder {
                 ArrowPayloadType::UnivariateMetrics,
                 format!("ravel-otap-metrics-root-{stream_version}"),
                 &root_schema(),
+            )?,
+            resource_attrs: PayloadStream::try_new(
+                ArrowPayloadType::ResourceAttrs,
+                format!("ravel-otap-resource-attrs-{stream_version}"),
+                &resource_attrs_schema(),
             )?,
             data_points: PayloadStream::try_new(
                 ArrowPayloadType::NumberDataPoints,
@@ -714,7 +876,16 @@ impl MetricsStreamEncoder {
         histograms: &[HistogramMetricRow],
         summaries: &[SummaryMetricRow],
     ) -> Result<BatchArrowRecords, EncodeError> {
-        self.encode_ext_inner(batch_id, metrics, &[], histograms, &[], summaries, &[])
+        self.encode_ext_inner(
+            batch_id,
+            metrics,
+            &[],
+            histograms,
+            &[],
+            summaries,
+            &[],
+            &ResourceAssignment::default(),
+        )
     }
 
     /// Encode gauge/sum `metrics` with a parallel `metric_units` slice
@@ -728,7 +899,16 @@ impl MetricsStreamEncoder {
         metrics: &[MetricRow],
         metric_units: &[&str],
     ) -> Result<BatchArrowRecords, EncodeError> {
-        self.encode_ext_inner(batch_id, metrics, metric_units, &[], &[], &[], &[])
+        self.encode_ext_inner(
+            batch_id,
+            metrics,
+            metric_units,
+            &[],
+            &[],
+            &[],
+            &[],
+            &ResourceAssignment::default(),
+        )
     }
 
     /// Encode gauge/sum, histogram, and summary metrics with their parallel
@@ -752,6 +932,34 @@ impl MetricsStreamEncoder {
             histogram_units,
             summaries,
             summary_units,
+            &ResourceAssignment::default(),
+        )
+    }
+
+    /// [`Self::encode_batch_ext_units`] with every metric placed under the
+    /// resource `resources` assigns it, written as the root table's
+    /// `resource.id` and a `RESOURCE_ATTRS` payload (ADR-2708 D4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_batch_resources(
+        &mut self,
+        batch_id: i64,
+        metrics: &[MetricRow],
+        metric_units: &[&str],
+        histograms: &[HistogramMetricRow],
+        histogram_units: &[&str],
+        summaries: &[SummaryMetricRow],
+        summary_units: &[&str],
+        resources: &ResourceAssignment<'_>,
+    ) -> Result<BatchArrowRecords, EncodeError> {
+        self.encode_ext_inner(
+            batch_id,
+            metrics,
+            metric_units,
+            histograms,
+            histogram_units,
+            summaries,
+            summary_units,
+            resources,
         )
     }
 
@@ -765,8 +973,10 @@ impl MetricsStreamEncoder {
         histogram_units: &[&str],
         summaries: &[SummaryMetricRow],
         summary_units: &[&str],
+        resources: &ResourceAssignment<'_>,
     ) -> Result<BatchArrowRecords, EncodeError> {
         let mut root_ids = Vec::new();
+        let mut root_resources: Vec<Option<u16>> = Vec::new();
         let mut root_units: Vec<String> = Vec::new();
         let mut root_types = Vec::new();
         let mut root_names = Vec::new();
@@ -785,6 +995,7 @@ impl MetricsStreamEncoder {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
+            root_resources.push(assigned(resources.metrics, mi));
             root_names.push(metric.name.clone());
             root_units.push(metric_units.get(mi).copied().unwrap_or("").to_string());
             match metric.kind {
@@ -844,6 +1055,7 @@ impl MetricsStreamEncoder {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
+            root_resources.push(assigned(resources.histograms, mi));
             root_types.push(METRIC_TYPE_HISTOGRAM);
             root_names.push(metric.name.clone());
             root_units.push(histogram_units.get(mi).copied().unwrap_or("").to_string());
@@ -890,6 +1102,7 @@ impl MetricsStreamEncoder {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
+            root_resources.push(assigned(resources.summaries, mi));
             root_types.push(METRIC_TYPE_SUMMARY);
             root_names.push(metric.name.clone());
             root_units.push(summary_units.get(mi).copied().unwrap_or("").to_string());
@@ -930,8 +1143,10 @@ impl MetricsStreamEncoder {
                 Arc::new(Int32Array::from(root_temporalities)),
                 Arc::new(BooleanArray::from(root_monotonic)),
                 Arc::new(StringArray::from_iter_values(root_units.iter())),
+                Arc::new(resource_column(&root_resources)?),
             ],
         )?;
+        let resource_attrs = resource_attrs_batch(resources.resources)?;
 
         let dp_batch = RecordBatch::try_new(
             Arc::new(data_points_schema()),
@@ -992,6 +1207,9 @@ impl MetricsStreamEncoder {
 
         let mut arrow_payloads = Vec::new();
         if let Some(p) = self.root.write_batch(&root_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.resource_attrs.write_batch(&resource_attrs)? {
             arrow_payloads.push(p);
         }
         if let Some(p) = self.data_points.write_batch(&dp_batch)? {

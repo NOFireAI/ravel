@@ -18,16 +18,16 @@
 //! canonical `ravel_otlp::normalize::metadata_unit_word` rather than re-derived
 //! here, so a single edit to that table changes both ingest paths at once.
 //!
-//! Known scope gap (flagged, not silently worked around): the OTAP test
-//! encoder in `encode.rs` never emits `RESOURCE_ATTRS` or `SCOPE_ATTRS`
-//! payloads, and the `METRICS` table it produces carries no
-//! `resource_id`/`scope_id` columns to join them against even if it did.
-//! Every point normalized here therefore gets an empty resource label set
-//! (equivalent to OTLP's `resource: None` case: no `job`/`instance`
-//! synthesis, no allowlisted resource attributes). Wiring resource/scope
-//! identity through `StreamState`/`encode.rs` is follow-up work; until then
-//! the "group by distinct (resource identity, metric, attr-set)" dimension
-//! from docs/otap-ingest.md collapses to (metric, attr-set) here.
+//! Resource labels (ADR-2708 D4): the METRICS table's `resource.id` joins
+//! each metric to its `RESOURCE_ATTRS` rows, and the resource's label prefix
+//! (`job`, `instance`, allowlisted attributes) is built by
+//! [`ravel_otlp::admit_resource_labels`], the same function the OTLP path
+//! calls, so one resource yields the same prefix, the same dropped count and
+//! the same rejections on both paths. The prefix is built once per resource
+//! id per batch. A metric whose `resource` is null gets an empty prefix, as
+//! OTLP's `resource: None` does; `RESOURCE_ATTRS` rows no metric references
+//! are ignored, and `SCOPE_ATTRS` is not read (OTLP builds no label from
+//! scope attributes either).
 //!
 //! Performance shape (docs/otap-ingest.md): data points join their attrs
 //! table by `parent_id` via a sort-and-binary-search over "sorted runs"
@@ -69,7 +69,7 @@
 //! counted as dropped by [`push_exp_histogram_exemplar_drops`], which also
 //! records the attachment rule waiting for them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -77,13 +77,20 @@ use arrow::array::{
     Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampNanosecondArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::UInt8Type;
+use arrow::datatypes::{UInt8Type, UInt16Type};
+use ravel_otlp::label_projection::{
+    RESOLVED_LABEL_OVERHEAD_BYTES, explode_name_label_bytes, histogram_point_bytes, label_bytes,
+    name_label_bytes, resource_value_label_len, summary_point_bytes,
+};
 use ravel_otlp::metadata::{MetricKind as PromMetricKind, MetricMetadata};
 use ravel_otlp::normalize::{
     MetricsNormalizeResult, NormalizedExemplar, metadata_unit_word, prometheus_family_name,
 };
 use ravel_otlp::promcompat::format_float;
-use ravel_otlp::{IngestLimits, NormalizeOutput, NormalizedPoint, Rejection};
+use ravel_otlp::{
+    IngestLimits, NormalizeOutput, NormalizedPoint, ProjectedLabelBytes, Rejection,
+    ResourceAttrValue, admit_resource_labels, resource_prefix_bytes,
+};
 use ravel_types::{
     Exemplar, ExemplarCap, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId,
     TypeError,
@@ -181,6 +188,12 @@ const UNRECOGNIZED_ID_ENCODING: &str = "unrecognized_id_encoding";
 /// also means the column is missing (caller already checked for this).
 fn id_encoding(rb: &RecordBatch, column: &str) -> Result<IdEncoding, ()> {
     let field = rb.schema_ref().field_with_name(column).map_err(|_| ())?;
+    field_id_encoding(field)
+}
+
+/// [`id_encoding`] for a field already in hand, such as the `id` child of the
+/// METRICS `resource` struct, whose encoding metadata sits on the child.
+fn field_id_encoding(field: &arrow::datatypes::Field) -> Result<IdEncoding, ()> {
     match field.metadata().get("encoding").map(String::as_str) {
         None => Ok(IdEncoding::Delta),
         Some("plain") => Ok(IdEncoding::Plain),
@@ -307,22 +320,19 @@ enum AttrEqValue<'b> {
 /// spec's "Map and Slice ... and null values" exceptions. The running sum wraps rather than panics
 /// on adversarial input, matching [`decode_delta_u32`]; a null `parent_id`
 /// carries the accumulator through unchanged, as delta decoding does.
-fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32> {
+fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &ParentIds<'_>) -> Vec<u32> {
     let types = column_as::<UInt8Array>(rb, "type");
-    let keys = column_as::<StringArray>(rb, "key");
-    let strs = column_as::<StringArray>(rb, "str");
+    let keys = StrCol::from_column(rb, "key");
+    let strs = StrCol::from_column(rb, "str");
     let bools = column_as::<BooleanArray>(rb, "bool");
-    let ints = column_as::<Int64Array>(rb, "int");
+    let ints = IntCol::from_column(rb, "int");
     let doubles = column_as::<Float64Array>(rb, "double");
 
     // The row's (type, key, Active Field value), or `None` when the row is
     // ineligible for delta encoding (missing key/type column, null key, a
     // non-scalar type, or a null active value).
     let eq_key = |i: usize| -> Option<(u8, &str, AttrEqValue)> {
-        let keys = keys?;
-        if keys.is_null(i) {
-            return None;
-        }
+        let key = keys.as_ref()?.get(i)?;
         // A null `type` discriminant has no in-contract Active Field, so the
         // row is ineligible for delta encoding and reads absolute, exactly like
         // the null-active-value scalar arms below and the non-scalar arm. Read
@@ -336,13 +346,13 @@ fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32>
         // `type` column is absent entirely (the prior `let types = types?`).
         let ty = opt_u8(types, i)?;
         let value = match ty {
-            ANY_VALUE_TYPE_STRING => AttrEqValue::Str(opt_str(strs, i)?),
+            ANY_VALUE_TYPE_STRING => AttrEqValue::Str(strs.as_ref()?.get(i)?),
             ANY_VALUE_TYPE_BOOL => AttrEqValue::Bool(opt_bool(bools, i)?),
-            ANY_VALUE_TYPE_INT => AttrEqValue::Int(opt_i64(ints, i)?),
+            ANY_VALUE_TYPE_INT => AttrEqValue::Int(ints.as_ref()?.get(i)?),
             ANY_VALUE_TYPE_DOUBLE => AttrEqValue::Double(opt_f64(doubles, i)?.to_bits()),
             _ => return None,
         };
-        Some((ty, keys.value(i), value))
+        Some((ty, key, value))
     };
 
     let mut acc: u32 = 0;
@@ -350,19 +360,183 @@ fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32>
     let mut out = Vec::with_capacity(encoded.len());
     for i in 0..encoded.len() {
         let key = eq_key(i);
-        if encoded.is_null(i) {
+        let Some(value) = encoded.get(i) else {
             out.push(acc);
             prev = key;
             continue;
-        }
+        };
         match (prev, key) {
-            (Some(p), Some(k)) if p == k => acc = acc.wrapping_add(encoded.value(i)),
-            _ => acc = encoded.value(i),
+            (Some(p), Some(k)) if p == k => acc = encoded.wrapping_add(acc, value),
+            _ => acc = value,
         }
         out.push(acc);
         prev = key;
     }
     out
+}
+
+/// A `*Attrs.parent_id` column in any shape otap-spec.md section 5.4 allows:
+/// `UInt16` for the u16-parent tables (5.4.2, `RESOURCE_ATTRS` among them),
+/// and `UInt32`, plain or dictionary-encoded with `UInt8`/`UInt16` keys, for
+/// the u32-parent tables (5.4.1). Delta and quasi-delta running sums wrap at
+/// the column's own width.
+enum ParentIds<'b> {
+    U16(&'b UInt16Array),
+    U32(&'b UInt32Array),
+    U32Dict8(&'b DictionaryArray<UInt8Type>, &'b UInt32Array),
+    U32Dict16(&'b DictionaryArray<UInt16Type>, &'b UInt32Array),
+}
+
+impl<'b> ParentIds<'b> {
+    fn from_column(rb: &'b RecordBatch, name: &str) -> Option<Self> {
+        let col = rb.column_by_name(name)?.as_any();
+        if let Some(a) = col.downcast_ref::<UInt16Array>() {
+            return Some(Self::U16(a));
+        }
+        if let Some(a) = col.downcast_ref::<UInt32Array>() {
+            return Some(Self::U32(a));
+        }
+        if let Some(d) = col.downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let values = d.values().as_any().downcast_ref::<UInt32Array>()?;
+            return Some(Self::U32Dict8(d, values));
+        }
+        if let Some(d) = col.downcast_ref::<DictionaryArray<UInt16Type>>() {
+            let values = d.values().as_any().downcast_ref::<UInt32Array>()?;
+            return Some(Self::U32Dict16(d, values));
+        }
+        None
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U16(a) => a.len(),
+            Self::U32(a) => a.len(),
+            Self::U32Dict8(d, _) => d.len(),
+            Self::U32Dict16(d, _) => d.len(),
+        }
+    }
+
+    /// The encoded value at row `i`, or `None` for a null slot (a dictionary
+    /// key that is null or out of range included).
+    fn get(&self, i: usize) -> Option<u32> {
+        match self {
+            Self::U16(a) => (!a.is_null(i)).then(|| u32::from(a.value(i))),
+            Self::U32(a) => (!a.is_null(i)).then(|| a.value(i)),
+            Self::U32Dict8(d, values) => dict_value(d.key(i), values),
+            Self::U32Dict16(d, values) => dict_value(d.key(i), values),
+        }
+    }
+
+    /// The PLAIN-encoded value at row `i`: the buffer value for a primitive
+    /// column, as the decode always read it, and 0 for a null dictionary slot.
+    fn plain(&self, i: usize) -> u32 {
+        match self {
+            Self::U16(a) => u32::from(a.values()[i]),
+            Self::U32(a) => a.values()[i],
+            Self::U32Dict8(..) | Self::U32Dict16(..) => self.get(i).unwrap_or(0),
+        }
+    }
+
+    fn wrapping_add(&self, acc: u32, value: u32) -> u32 {
+        match self {
+            Self::U16(_) => u32::from((acc as u16).wrapping_add(value as u16)),
+            _ => acc.wrapping_add(value),
+        }
+    }
+
+    fn decode_plain(&self) -> Vec<u32> {
+        (0..self.len()).map(|i| self.plain(i)).collect()
+    }
+
+    /// DELTA decode (otap-spec.md section 6.4.2), as [`decode_delta_u32`].
+    fn decode_delta(&self) -> Vec<u32> {
+        let mut acc: u32 = 0;
+        (0..self.len())
+            .map(|i| {
+                if let Some(value) = self.get(i) {
+                    acc = self.wrapping_add(acc, value);
+                }
+                acc
+            })
+            .collect()
+    }
+}
+
+fn dict_value(key: Option<usize>, values: &UInt32Array) -> Option<u32> {
+    let k = key?;
+    (k < values.len() && !values.is_null(k)).then(|| values.value(k))
+}
+
+/// A string column of an `*Attrs` table, plain or dictionary-encoded with
+/// `UInt8`/`UInt16` keys (otap-spec.md section 5.4: `key` may be either,
+/// `str` is a `UInt16` dictionary by default). Also the METRICS `name`,
+/// `unit` and `description` columns.
+enum StrCol<'b> {
+    Plain(&'b StringArray),
+    Dict8(&'b DictionaryArray<UInt8Type>, &'b StringArray),
+    Dict16(&'b DictionaryArray<UInt16Type>, &'b StringArray),
+}
+
+impl<'b> StrCol<'b> {
+    fn from_array(col: &'b dyn Array) -> Option<Self> {
+        let col = col.as_any();
+        if let Some(a) = col.downcast_ref::<StringArray>() {
+            return Some(Self::Plain(a));
+        }
+        if let Some(d) = col.downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let values = d.values().as_any().downcast_ref::<StringArray>()?;
+            return Some(Self::Dict8(d, values));
+        }
+        if let Some(d) = col.downcast_ref::<DictionaryArray<UInt16Type>>() {
+            let values = d.values().as_any().downcast_ref::<StringArray>()?;
+            return Some(Self::Dict16(d, values));
+        }
+        None
+    }
+
+    fn from_column(rb: &'b RecordBatch, name: &str) -> Option<Self> {
+        Self::from_array(rb.column_by_name(name)?.as_ref())
+    }
+
+    /// The string at row `i`, or `None` for a null slot or a dictionary key
+    /// that is null or out of range.
+    fn get(&self, i: usize) -> Option<&'b str> {
+        let (values, idx) = match self {
+            Self::Plain(a) => (*a, Some(i)),
+            Self::Dict8(d, values) => (*values, d.key(i)),
+            Self::Dict16(d, values) => (*values, d.key(i)),
+        };
+        let idx = idx?;
+        (idx < values.len() && !values.is_null(idx)).then(|| values.value(idx))
+    }
+}
+
+/// The `int` column of an `*Attrs` table, plain or a `UInt16` dictionary
+/// (otap-spec.md section 5.4's default for it).
+enum IntCol<'b> {
+    Plain(&'b Int64Array),
+    Dict16(&'b DictionaryArray<UInt16Type>, &'b Int64Array),
+}
+
+impl<'b> IntCol<'b> {
+    fn from_column(rb: &'b RecordBatch, name: &str) -> Option<Self> {
+        let col = rb.column_by_name(name)?.as_any();
+        if let Some(a) = col.downcast_ref::<Int64Array>() {
+            return Some(Self::Plain(a));
+        }
+        let d = col.downcast_ref::<DictionaryArray<UInt16Type>>()?;
+        let values = d.values().as_any().downcast_ref::<Int64Array>()?;
+        Some(Self::Dict16(d, values))
+    }
+
+    fn get(&self, i: usize) -> Option<i64> {
+        let (values, idx) = match self {
+            Self::Plain(a) => (*a, Some(i)),
+            Self::Dict16(d, values) => (*values, d.key(i)),
+        };
+        let idx = idx?;
+        (idx < values.len() && !values.is_null(idx)).then(|| values.value(idx))
+    }
 }
 
 /// Decode a QUASI-DELTA `*DpExemplars.parent_id` column (otap-spec.md section
@@ -374,7 +548,7 @@ fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32>
 /// "if the column ... is not present, the value ... is empty" rule. Wraps
 /// rather than panics, and carries a null `parent_id` through unchanged, like
 /// [`decode_quasi_delta_attrs`].
-fn decode_quasi_delta_exemplars(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32> {
+fn decode_quasi_delta_exemplars(rb: &RecordBatch, encoded: &ParentIds<'_>) -> Vec<u32> {
     let ints = column_as::<Int64Array>(rb, "int_value");
     let doubles = column_as::<Float64Array>(rb, "double_value");
 
@@ -383,14 +557,14 @@ fn decode_quasi_delta_exemplars(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<
     let mut out = Vec::with_capacity(encoded.len());
     for i in 0..encoded.len() {
         let key = (opt_i64(ints, i), opt_f64(doubles, i).map(f64::to_bits));
-        if encoded.is_null(i) {
+        let Some(value) = encoded.get(i) else {
             out.push(acc);
             prev = Some(key);
             continue;
-        }
+        };
         match prev {
-            Some(p) if p == key => acc = acc.wrapping_add(encoded.value(i)),
-            _ => acc = encoded.value(i),
+            Some(p) if p == key => acc = encoded.wrapping_add(acc, value),
+            _ => acc = value,
         }
         out.push(acc);
         prev = Some(key);
@@ -406,13 +580,13 @@ fn decode_quasi_delta_exemplars(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<
 /// `None` if the declaration is not recognized, never guessing.
 fn decode_quasi_delta_column(
     rb: &RecordBatch,
-    encoded: &UInt32Array,
+    encoded: &ParentIds<'_>,
     rejected: &mut Vec<Rejection>,
-    quasi: impl Fn(&RecordBatch, &UInt32Array) -> Vec<u32>,
+    quasi: impl Fn(&RecordBatch, &ParentIds<'_>) -> Vec<u32>,
 ) -> Option<Vec<u32>> {
     match quasi_delta_default_encoding(rb, "parent_id") {
-        Ok(IdEncoding::Plain) => Some(encoded.values().to_vec()),
-        Ok(IdEncoding::Delta) => Some(decode_delta_u32(encoded)),
+        Ok(IdEncoding::Plain) => Some(encoded.decode_plain()),
+        Ok(IdEncoding::Delta) => Some(encoded.decode_delta()),
         Ok(IdEncoding::QuasiDelta) => Some(quasi(rb, encoded)),
         Err(()) => {
             rejected.push(Rejection::UnsupportedMetricType {
@@ -481,7 +655,16 @@ pub fn normalize_decoded_with_exemplars(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
-    normalize_impl(tenant, batch, limits, ingest_ts_ns, exemplar_cap, false).0
+    normalize_impl(
+        tenant,
+        batch,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        false,
+        None,
+    )
+    .0
 }
 
 /// Normalize exactly like [`normalize_decoded_with_exemplars`], and additionally
@@ -517,13 +700,45 @@ pub fn normalize_decoded_with_metadata(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    normalize_impl(tenant, batch, limits, ingest_ts_ns, exemplar_cap, true)
+    normalize_impl(
+        tenant,
+        batch,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        true,
+        None,
+    )
 }
 
-/// Shared body of the two exemplar-carrying entry points. `collect_metadata` is
-/// true only for [`normalize_decoded_with_metadata`]; the points, exemplars, and
+/// [`normalize_decoded_with_metadata`] with the batch's
+/// [`project_resolved_label_bytes`] already computed, for a caller that charged
+/// it to a budget before normalizing (ADR-2708 D2) and must not walk the batch
+/// twice for the same figure.
+pub fn normalize_decoded_with_metadata_projected(
+    tenant: &TenantId,
+    batch: &DecodedBatch,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+    projected: ProjectedLabelBytes,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    normalize_impl(
+        tenant,
+        batch,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        true,
+        Some(projected),
+    )
+}
+
+/// Shared body of the exemplar-carrying entry points. `collect_metadata` is
+/// true only for the metadata entry points; the points, exemplars, and
 /// rejections it produces do not depend on it, so the older entry points are
-/// behaviorally unchanged.
+/// behaviorally unchanged. `projected` is the batch's label-byte projection
+/// when the caller already has it, computed here otherwise.
 fn normalize_impl(
     tenant: &TenantId,
     batch: &DecodedBatch,
@@ -531,6 +746,7 @@ fn normalize_impl(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     collect_metadata: bool,
+    projected: Option<ProjectedLabelBytes>,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
@@ -547,13 +763,6 @@ fn normalize_impl(
     push_unsupported_type_rejections(batch, &mut rejected);
     push_exp_histogram_exemplar_drops(batch, &mut rejected);
 
-    let root_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::UnivariateMetrics);
-    let dp_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::NumberDataPoints);
-    let attr_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::NumberDpAttrs);
-    let hist_dp_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::HistogramDataPoints);
-    let hist_attr_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::HistogramDpAttrs);
     let hist_exemplar_batches: Vec<&RecordBatch> =
         payloads_of(batch, ArrowPayloadType::HistogramDpExemplars);
     let hist_exemplar_attr_batches: Vec<&RecordBatch> =
@@ -562,17 +771,16 @@ fn normalize_impl(
         payloads_of(batch, ArrowPayloadType::NumberDpExemplars);
     let number_exemplar_attr_batches: Vec<&RecordBatch> =
         payloads_of(batch, ArrowPayloadType::NumberDpExemplarAttrs);
-    let summary_dp_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::SummaryDataPoints);
-    let summary_attr_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::SummaryDpAttrs);
 
-    let flat_dp = flatten_dp(&dp_batches, &mut rejected);
-    let flat_attrs = flatten_attrs(&attr_batches, &mut rejected);
-    let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches, &mut rejected);
-    let flat_hist_attrs = flatten_attrs(&hist_attr_batches, &mut rejected);
-    let flat_summary_dp = flatten_summary_dp(&summary_dp_batches, &mut rejected);
-    let flat_summary_attrs = flatten_attrs(&summary_attr_batches, &mut rejected);
+    let flat = flatten_points(batch, &mut rejected);
+    let FlatPoints {
+        dp: flat_dp,
+        attrs: flat_attrs,
+        hist_dp: flat_hist_dp,
+        hist_attrs: flat_hist_attrs,
+        summary_dp: flat_summary_dp,
+        summary_attrs: flat_summary_attrs,
+    } = &flat;
 
     // Second bound, on what the request expands to rather than on what it
     // carries on the wire, mirroring `ravel_otlp::normalize_impl`. One classic
@@ -594,7 +802,7 @@ fn normalize_impl(
     // `dropped_exemplar_rows` restores the count from the columnar row counts,
     // which is metadata rather than a decode. Parity with OTLP is a property
     // here, not a documented divergence.
-    let exploded_points = count_exploded_points(&flat_dp, &flat_hist_dp, &flat_summary_dp);
+    let exploded_points = count_exploded_points(flat_dp, flat_hist_dp, flat_summary_dp);
     if exploded_points > limits.max_data_points_per_request {
         return whole_request_rejection(
             Rejection::TooManyExplodedPoints {
@@ -606,43 +814,48 @@ fn normalize_impl(
         );
     }
 
+    let tables = resolve_metrics(batch, &flat, limits, &mut rejected);
+
+    // Third bound, on the label bytes the points would carry (ADR-2708 D2),
+    // mirroring `ravel_otlp::normalize_impl`: checked before any label set
+    // exists, and before the exemplar payloads are decoded, for the reason
+    // the exploded check above gives.
+    let projected = match projected {
+        Some(p) => p.get(),
+        None => project_flat(&flat, &tables, limits),
+    };
+    if projected > limits.max_resolved_label_bytes_per_request {
+        return whole_request_rejection(
+            Rejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: limits.max_resolved_label_bytes_per_request,
+                count: total_points,
+            },
+            dropped_exemplar_rows(batch),
+        );
+    }
+
     let hist_exemplar_rows = group_exemplars_by_parent_id(&hist_exemplar_batches, &mut rejected);
     let flat_hist_exemplar_attrs = flatten_attrs(&hist_exemplar_attr_batches, &mut rejected);
     let number_exemplar_rows =
         group_exemplars_by_parent_id(&number_exemplar_batches, &mut rejected);
     let flat_number_exemplar_attrs = flatten_attrs(&number_exemplar_attr_batches, &mut rejected);
 
-    let root_ids = decode_root_ids(&root_batches, &mut rejected);
-    let dense_size = dense_size_for(
-        &root_ids,
-        flat_dp
-            .iter()
-            .map(|d| d.parent_id)
-            .chain(flat_hist_dp.iter().map(|d| d.parent_id))
-            .chain(flat_summary_dp.iter().map(|d| d.parent_id)),
-    );
-    let root = build_root_table(&root_batches, &root_ids, dense_size);
-    let (metric_decision, unknown_number_count) =
-        build_metric_decisions(&root, &flat_dp, limits, dense_size, &mut rejected);
-    let (hist_decision, unknown_hist_count) =
-        build_histogram_decisions(&root, &flat_hist_dp, limits, dense_size, &mut rejected);
-    let (summary_decision, unknown_summary_count) =
-        build_summary_decisions(&root, &flat_summary_dp, limits, dense_size, &mut rejected);
-    let unknown_metric_count = unknown_number_count + unknown_hist_count + unknown_summary_count;
-    if unknown_metric_count > 0 {
-        rejected.push(Rejection::UnsupportedMetricType {
-            metric_type: UNKNOWN_OTAP_METRIC_TYPE,
-            count: unknown_metric_count,
-        });
-    }
+    let MetricTables {
+        root,
+        resources,
+        metric_decision,
+        hist_decision,
+        summary_decision,
+    } = &tables;
 
     // Which metric ids actually contributed a point. Read only by the metadata
     // build below (a family whose every point was rejected describes nothing),
     // and one bool write per admitted point regardless, so the metadata-free
     // entry points pay nothing measurable for it.
-    let mut produced = vec![false; dense_size];
+    let mut produced = vec![false; root.len()];
 
-    let attr_order = sort_attrs_by_parent(&flat_attrs);
+    let attr_order = sort_attrs_by_parent(flat_attrs);
     let mut points = Vec::with_capacity(flat_dp.len());
     let mut group_cache: GroupCache = HashMap::new();
     let mut exemplars = Vec::new();
@@ -655,7 +868,7 @@ fn normalize_impl(
         out: &mut exemplars,
     };
 
-    for dp in &flat_dp {
+    for dp in flat_dp {
         let Some(decision) = metric_decision
             .get(dp.parent_id as usize)
             .and_then(|d| d.as_ref())
@@ -663,7 +876,7 @@ fn normalize_impl(
             continue;
         };
 
-        let range = attr_range_for(&flat_attrs, &attr_order, dp.id);
+        let range = attr_range_for(flat_attrs, &attr_order, dp.id);
         if range.len() > limits.max_attributes_per_point {
             rejected.push(Rejection::TooManyAttributes {
                 attribute_count: range.len(),
@@ -733,10 +946,13 @@ fn normalize_impl(
         group_key.sort_by(|a, b| a.0.cmp(&b.0));
 
         let metric_name = &decision.name;
+        // One metric id belongs to exactly one resource (its root row's
+        // `resource.id`), so a per-metric cache is already per resource.
+        let prefix = resources.prefix_for(root, dp.parent_id);
         let metric_cache = group_cache.entry(dp.parent_id as u32).or_default();
-        let outcome = metric_cache
-            .entry(group_key)
-            .or_insert_with_key(|raw_key| build_group(raw_key, metric_name, tenant, limits));
+        let outcome = metric_cache.entry(group_key).or_insert_with_key(|raw_key| {
+            build_group(raw_key, metric_name, prefix, tenant, limits)
+        });
 
         match outcome {
             Ok((label_set, series_id)) => {
@@ -771,7 +987,7 @@ fn normalize_impl(
     // without this they would vanish uncounted.
     number_exemplar_admission.count_orphans(flat_dp.iter().map(|dp| dp.id), &mut rejected);
 
-    let hist_attr_order = sort_attrs_by_parent(&flat_hist_attrs);
+    let hist_attr_order = sort_attrs_by_parent(flat_hist_attrs);
     let hist_exemplar_attr_order = sort_attrs_by_parent(&flat_hist_exemplar_attrs);
     let mut exemplar_admission = ExemplarAdmission {
         rows: &hist_exemplar_rows,
@@ -781,23 +997,24 @@ fn normalize_impl(
         out: &mut exemplars,
     };
     let mut hist_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
-    for dp in &flat_hist_dp {
+    for dp in flat_hist_dp {
         let Some(decision) = hist_decision
             .get(dp.parent_id as usize)
             .and_then(|d| d.as_ref())
         else {
             continue;
         };
-        let range = attr_range_for(&flat_hist_attrs, &hist_attr_order, dp.id);
+        let range = attr_range_for(flat_hist_attrs, &hist_attr_order, dp.id);
         let memo = hist_memos
             .entry(dp.parent_id)
             .or_insert_with(SeriesIdMemo::new);
         match explode_histogram_point(
             tenant,
             &decision.name,
+            resources.prefix_for(root, dp.parent_id),
             dp,
             range,
-            &flat_hist_attrs,
+            flat_hist_attrs,
             limits,
             ingest_ts_ns,
             &mut exemplar_admission,
@@ -817,25 +1034,26 @@ fn normalize_impl(
     }
     exemplar_admission.count_orphans(flat_hist_dp.iter().map(|dp| dp.id), &mut rejected);
 
-    let summary_attr_order = sort_attrs_by_parent(&flat_summary_attrs);
+    let summary_attr_order = sort_attrs_by_parent(flat_summary_attrs);
     let mut summary_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
-    for dp in &flat_summary_dp {
+    for dp in flat_summary_dp {
         let Some(decision) = summary_decision
             .get(dp.parent_id as usize)
             .and_then(|d| d.as_ref())
         else {
             continue;
         };
-        let range = attr_range_for(&flat_summary_attrs, &summary_attr_order, dp.id);
+        let range = attr_range_for(flat_summary_attrs, &summary_attr_order, dp.id);
         let memo = summary_memos
             .entry(dp.parent_id)
             .or_insert_with(SeriesIdMemo::new);
         match explode_summary_point(
             tenant,
             &decision.name,
+            resources.prefix_for(root, dp.parent_id),
             dp,
             range,
-            &flat_summary_attrs,
+            flat_summary_attrs,
             limits,
             ingest_ts_ns,
             memo,
@@ -854,10 +1072,10 @@ fn normalize_impl(
 
     let metadata = if collect_metadata {
         build_metadata(
-            &root,
-            &metric_decision,
-            &hist_decision,
-            &summary_decision,
+            root,
+            metric_decision,
+            hist_decision,
+            summary_decision,
             &produced,
         )
     } else {
@@ -877,6 +1095,382 @@ fn normalize_impl(
         },
         metadata,
     )
+}
+
+/// Upper bound on the resolved-label bytes [`normalize_decoded`] and its
+/// siblings would build for `batch` (ADR-2708 D2), the OTAP twin of
+/// [`ravel_otlp::label_projection::project_resolved_label_bytes`]: per admitted
+/// resource, its label prefix once; per number point, the label set it builds
+/// (unless its attributes equal the previous counted point's under the same
+/// metric) and the copy every admitted point carries; per classic histogram or
+/// summary point, every exploded series. Built from the same per-label helpers,
+/// so the charge per label cannot drift between the formats.
+///
+/// Builds no point label set. It does decode the batch's payloads and build
+/// each resource's prefix, which is bounded by `max_resource_attributes`.
+pub fn project_resolved_label_bytes(
+    batch: &DecodedBatch,
+    limits: &IngestLimits,
+) -> ProjectedLabelBytes {
+    let mut scratch = Vec::new();
+    let flat = flatten_points(batch, &mut scratch);
+    let tables = resolve_metrics(batch, &flat, limits, &mut scratch);
+    ProjectedLabelBytes::from_walk(project_flat(&flat, &tables, limits))
+}
+
+/// The flattened data-point and attribute rows of one batch, decoded once and
+/// shared by the projection and the build.
+struct FlatPoints<'b> {
+    dp: Vec<FlatDp>,
+    attrs: Vec<FlatAttr<'b>>,
+    hist_dp: Vec<FlatHistogramDp>,
+    hist_attrs: Vec<FlatAttr<'b>>,
+    summary_dp: Vec<FlatSummaryDp>,
+    summary_attrs: Vec<FlatAttr<'b>>,
+}
+
+fn flatten_points<'b>(batch: &'b DecodedBatch, rejected: &mut Vec<Rejection>) -> FlatPoints<'b> {
+    FlatPoints {
+        dp: flatten_dp(
+            &payloads_of(batch, ArrowPayloadType::NumberDataPoints),
+            rejected,
+        ),
+        attrs: flatten_attrs(
+            &payloads_of(batch, ArrowPayloadType::NumberDpAttrs),
+            rejected,
+        ),
+        hist_dp: flatten_histogram_dp(
+            &payloads_of(batch, ArrowPayloadType::HistogramDataPoints),
+            rejected,
+        ),
+        hist_attrs: flatten_attrs(
+            &payloads_of(batch, ArrowPayloadType::HistogramDpAttrs),
+            rejected,
+        ),
+        summary_dp: flatten_summary_dp(
+            &payloads_of(batch, ArrowPayloadType::SummaryDataPoints),
+            rejected,
+        ),
+        summary_attrs: flatten_attrs(
+            &payloads_of(batch, ArrowPayloadType::SummaryDpAttrs),
+            rejected,
+        ),
+    }
+}
+
+/// Everything resolved per metric id before any point is built: the root
+/// table, the admitted resource prefixes, and the three decision tables.
+struct MetricTables {
+    root: Vec<Option<RootEntry>>,
+    resources: ResourcePrefixes,
+    metric_decision: Vec<Option<MetricDecision>>,
+    hist_decision: Vec<Option<HistogramDecision>>,
+    summary_decision: Vec<Option<SummaryDecision>>,
+}
+
+fn resolve_metrics(
+    batch: &DecodedBatch,
+    flat: &FlatPoints<'_>,
+    limits: &IngestLimits,
+    rejected: &mut Vec<Rejection>,
+) -> MetricTables {
+    let root_batches = payloads_of(batch, ArrowPayloadType::UnivariateMetrics);
+    let root_ids = decode_root_ids(&root_batches, rejected);
+    let dense_size = dense_size_for(
+        &root_ids,
+        flat.dp
+            .iter()
+            .map(|d| d.parent_id)
+            .chain(flat.hist_dp.iter().map(|d| d.parent_id))
+            .chain(flat.summary_dp.iter().map(|d| d.parent_id)),
+    );
+    let root = build_root_table(&root_batches, &root_ids, dense_size);
+
+    let resource_attrs = flatten_attrs(
+        &payloads_of(batch, ArrowPayloadType::ResourceAttrs),
+        rejected,
+    );
+    let resources = admit_resources(&root, &resource_attrs, flat, limits, rejected);
+    let blocked = &resources.blocked;
+
+    let (metric_decision, unknown_number_count) =
+        build_metric_decisions(&root, &flat.dp, limits, dense_size, blocked, rejected);
+    let (hist_decision, unknown_hist_count) =
+        build_histogram_decisions(&root, &flat.hist_dp, limits, dense_size, blocked, rejected);
+    let (summary_decision, unknown_summary_count) = build_summary_decisions(
+        &root,
+        &flat.summary_dp,
+        limits,
+        dense_size,
+        blocked,
+        rejected,
+    );
+    let unknown_metric_count = unknown_number_count + unknown_hist_count + unknown_summary_count;
+    if unknown_metric_count > 0 {
+        rejected.push(Rejection::UnsupportedMetricType {
+            metric_type: UNKNOWN_OTAP_METRIC_TYPE,
+            count: unknown_metric_count,
+        });
+    }
+
+    MetricTables {
+        root,
+        resources,
+        metric_decision,
+        hist_decision,
+        summary_decision,
+    }
+}
+
+/// The resource label prefixes of one batch, keyed by the batch-scoped
+/// `resource.id` (ADR-2708 D4), and which metric ids sit under a rejected
+/// resource.
+struct ResourcePrefixes {
+    /// Admitted resources: the prefix and its projected bytes.
+    prefixes: HashMap<u16, (Vec<Label>, usize)>,
+    /// Indexed by metric id: true when the metric's resource was rejected, so
+    /// its points are already accounted for and must not be built or counted
+    /// again.
+    blocked: Vec<bool>,
+}
+
+impl ResourcePrefixes {
+    fn admitted(&self, root: &[Option<RootEntry>], metric_id: u16) -> Option<&(Vec<Label>, usize)> {
+        let resource_id = root
+            .get(metric_id as usize)
+            .and_then(|e| e.as_ref())
+            .and_then(|e| e.resource_id)?;
+        self.prefixes.get(&resource_id)
+    }
+
+    /// The label prefix every point of `metric_id` starts with: empty for a
+    /// metric with no resource.
+    fn prefix_for(&self, root: &[Option<RootEntry>], metric_id: u16) -> &[Label] {
+        self.admitted(root, metric_id)
+            .map_or(&[], |(labels, _)| labels.as_slice())
+    }
+
+    fn prefix_bytes_for(&self, root: &[Option<RootEntry>], metric_id: u16) -> usize {
+        self.admitted(root, metric_id)
+            .map_or(0, |(_, bytes)| *bytes)
+    }
+}
+
+/// Admit every resource a metric with points refers to, through the same
+/// [`admit_resource_labels`] OTLP calls per `ResourceMetrics`, so one resource
+/// yields the same prefix, the same dropped count, and the same rejection on
+/// both paths. A resource's point count is the number, histogram, and summary
+/// points of every metric under it. Its attributes are its `RESOURCE_ATTRS`
+/// rows in row order; rows whose `parent_id` no metric refers to are ignored.
+fn admit_resources(
+    root: &[Option<RootEntry>],
+    resource_attrs: &[FlatAttr<'_>],
+    flat: &FlatPoints<'_>,
+    limits: &IngestLimits,
+    rejected: &mut Vec<Rejection>,
+) -> ResourcePrefixes {
+    let mut metric_points = vec![0usize; root.len()];
+    let parents = flat
+        .dp
+        .iter()
+        .map(|d| d.parent_id)
+        .chain(flat.hist_dp.iter().map(|d| d.parent_id))
+        .chain(flat.summary_dp.iter().map(|d| d.parent_id));
+    for parent_id in parents {
+        if let Some(n) = metric_points.get_mut(parent_id as usize) {
+            *n += 1;
+        }
+    }
+    let mut resource_points: BTreeMap<u16, usize> = BTreeMap::new();
+    for (entry, points) in root.iter().zip(&metric_points) {
+        if let Some(resource_id) = entry.as_ref().and_then(|e| e.resource_id) {
+            *resource_points.entry(resource_id).or_default() += points;
+        }
+    }
+
+    let order = sort_attrs_by_parent(resource_attrs);
+    let mut prefixes = HashMap::new();
+    let mut rejected_resources = HashSet::new();
+    for (&resource_id, &points) in &resource_points {
+        if points == 0 {
+            continue;
+        }
+        let pairs: Vec<(&str, ResourceAttrValue<'_>)> =
+            attr_range_for(resource_attrs, &order, u32::from(resource_id))
+                .iter()
+                .map(|&i| {
+                    let a = &resource_attrs[i as usize];
+                    (a.key, resource_attr_value(a))
+                })
+                .collect();
+        match admit_resource_labels(&pairs, points, limits, rejected) {
+            Some(labels) => {
+                let bytes = resource_prefix_bytes(&pairs, limits).unwrap_or(0);
+                prefixes.insert(resource_id, (labels, bytes));
+            }
+            None => {
+                rejected_resources.insert(resource_id);
+            }
+        }
+    }
+
+    let blocked = root
+        .iter()
+        .map(|e| {
+            e.as_ref()
+                .and_then(|e| e.resource_id)
+                .is_some_and(|r| rejected_resources.contains(&r))
+        })
+        .collect();
+    ResourcePrefixes { prefixes, blocked }
+}
+
+/// One attribute row as the resource-label builder reads it. Agrees with
+/// [`raw_cell`] on every type, including a null or complex discriminant.
+fn resource_attr_value<'b>(a: &FlatAttr<'b>) -> ResourceAttrValue<'b> {
+    match a.ty {
+        Some(ANY_VALUE_TYPE_EMPTY) => ResourceAttrValue::Empty,
+        Some(ANY_VALUE_TYPE_STRING) => ResourceAttrValue::Str(a.str_val.unwrap_or("")),
+        Some(ANY_VALUE_TYPE_BOOL) => ResourceAttrValue::Bool(a.bool_val.unwrap_or(false)),
+        Some(ANY_VALUE_TYPE_INT) => ResourceAttrValue::Int(a.int_val.unwrap_or(0)),
+        Some(ANY_VALUE_TYPE_DOUBLE) => ResourceAttrValue::Double(a.double_val.unwrap_or(0.0)),
+        None | Some(_) => ResourceAttrValue::Complex,
+    }
+}
+
+/// The bytes one point's attribute labels take, as `(kept, reserved)`: `kept`
+/// for the labels a set holds, `reserved` adding the slot an empty value leaves
+/// allocated in a set whose `Vec` was sized before the drop ([`build_group`]).
+/// `None` when an attribute has no label form, which rejects the point before
+/// any set is kept.
+fn flat_attr_bytes(range: &[u32], attrs: &[FlatAttr<'_>]) -> Option<(usize, usize)> {
+    let mut kept = 0usize;
+    let mut reserved = 0usize;
+    for &i in range {
+        let a = &attrs[i as usize];
+        let len = resource_value_label_len(resource_attr_value(a))?;
+        if len > 0 {
+            let bytes = label_bytes(a.key.len(), len);
+            kept = kept.saturating_add(bytes);
+            reserved = reserved.saturating_add(bytes);
+        } else {
+            reserved = reserved.saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES);
+        }
+    }
+    Some((kept, reserved))
+}
+
+/// Whether two points' attribute rows are equal in order, the condition under
+/// which the second point's group is already in the build's cache.
+fn same_flat_attrs(a: &[u32], b: &[u32], attrs: &[FlatAttr<'_>]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(&x, &y)| {
+            let (x, y) = (&attrs[x as usize], &attrs[y as usize]);
+            x.key == y.key
+                && x.ty == y.ty
+                && x.str_val == y.str_val
+                && x.bool_val == y.bool_val
+                && x.int_val == y.int_val
+                && x.double_val.map(f64::to_bits) == y.double_val.map(f64::to_bits)
+        })
+}
+
+/// The projection walk behind [`project_resolved_label_bytes`], over rows
+/// already flattened and decisions already made. A point the build would reject
+/// before keeping a set (no decision, a blocked resource, over the attribute or
+/// bucket or quantile cap, an attribute with no label form) is not charged.
+fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLimits) -> usize {
+    let MetricTables {
+        root,
+        resources,
+        metric_decision,
+        hist_decision,
+        summary_decision,
+    } = tables;
+    let max_attrs = limits.max_attributes_per_point;
+    let mut total = resources
+        .prefixes
+        .values()
+        .map(|(_, bytes)| *bytes)
+        .fold(0usize, usize::saturating_add);
+
+    let order = sort_attrs_by_parent(&flat.attrs);
+    let mut previous: HashMap<u16, &[u32]> = HashMap::new();
+    for dp in &flat.dp {
+        let Some(decision) = metric_decision
+            .get(dp.parent_id as usize)
+            .and_then(|d| d.as_ref())
+        else {
+            continue;
+        };
+        let range = attr_range_for(&flat.attrs, &order, dp.id);
+        if range.len() > max_attrs {
+            continue;
+        }
+        let Some((kept, reserved)) = flat_attr_bytes(range, &flat.attrs) else {
+            continue;
+        };
+        let base = resources
+            .prefix_bytes_for(root, dp.parent_id)
+            .saturating_add(name_label_bytes(decision.name.len()));
+        // The copy of the set every admitted point carries, which clones to
+        // exact capacity.
+        total = total.saturating_add(base.saturating_add(kept));
+        let repeat = previous
+            .insert(dp.parent_id, range)
+            .is_some_and(|p| same_flat_attrs(p, range, &flat.attrs));
+        if !repeat {
+            total = total.saturating_add(base.saturating_add(reserved));
+        }
+    }
+
+    let order = sort_attrs_by_parent(&flat.hist_attrs);
+    for dp in &flat.hist_dp {
+        let Some(decision) = hist_decision
+            .get(dp.parent_id as usize)
+            .and_then(|d| d.as_ref())
+        else {
+            continue;
+        };
+        let range = attr_range_for(&flat.hist_attrs, &order, dp.id);
+        if dp.explicit_bounds.len() > limits.max_histogram_buckets || range.len() > max_attrs {
+            continue;
+        }
+        let Some((kept, _)) = flat_attr_bytes(range, &flat.hist_attrs) else {
+            continue;
+        };
+        let per_series = resources
+            .prefix_bytes_for(root, dp.parent_id)
+            .saturating_add(kept)
+            .saturating_add(explode_name_label_bytes(decision.name.len()));
+        total = total.saturating_add(histogram_point_bytes(per_series, &dp.explicit_bounds));
+    }
+
+    let order = sort_attrs_by_parent(&flat.summary_attrs);
+    for dp in &flat.summary_dp {
+        let Some(decision) = summary_decision
+            .get(dp.parent_id as usize)
+            .and_then(|d| d.as_ref())
+        else {
+            continue;
+        };
+        let range = attr_range_for(&flat.summary_attrs, &order, dp.id);
+        if dp.quantiles.len() > limits.max_summary_quantiles || range.len() > max_attrs {
+            continue;
+        }
+        let Some((kept, _)) = flat_attr_bytes(range, &flat.summary_attrs) else {
+            continue;
+        };
+        let per_series = resources
+            .prefix_bytes_for(root, dp.parent_id)
+            .saturating_add(kept)
+            .saturating_add(explode_name_label_bytes(decision.name.len()));
+        total = total.saturating_add(summary_point_bytes(
+            per_series,
+            dp.quantiles.iter().map(|q| q.0),
+        ));
+    }
+    total
 }
 
 /// One [`MetricMetadata`] per metric id that contributed a point, in metric-id
@@ -1154,6 +1748,9 @@ struct RootEntry {
     /// has no effect on points, names, or rejections, so a producer that omits
     /// the column normalizes exactly as before with an empty help.
     description: String,
+    /// The batch-scoped `resource.id` this metric's resource label prefix is
+    /// built from, or `None` for a metric with no resource (an empty prefix).
+    resource_id: Option<u16>,
 }
 
 enum RootKind {
@@ -1287,10 +1884,10 @@ enum RawCell {
 type GroupCache =
     HashMap<u32, HashMap<Vec<(String, RawCell)>, Result<(LabelSet, SeriesId), Rejection>>>;
 
-fn dense_size_for(root_ids: &[Option<Vec<u16>>], parent_ids: impl Iterator<Item = u16>) -> usize {
+fn dense_size_for(root_ids: &[Option<RootIds>], parent_ids: impl Iterator<Item = u16>) -> usize {
     let mut max_id: u32 = 0;
     for ids in root_ids.iter().flatten() {
-        for &v in ids {
+        for &v in &ids.ids {
             max_id = max_id.max(u32::from(v));
         }
     }
@@ -1311,14 +1908,78 @@ fn dense_size_for(root_ids: &[Option<Vec<u16>>], parent_ids: impl Iterator<Item 
 fn decode_root_ids(
     root_batches: &[&RecordBatch],
     rejected: &mut Vec<Rejection>,
-) -> Vec<Option<Vec<u16>>> {
+) -> Vec<Option<RootIds>> {
     root_batches
         .iter()
         .map(|rb| {
             let ids = column_as::<UInt16Array>(rb, "id")?;
-            decode_id_column_u16(rb, "id", ids, rejected)
+            let ids = decode_id_column_u16(rb, "id", ids, rejected)?;
+            let resource_ids = decode_root_resource_ids(rb, rejected)?;
+            Some(RootIds { ids, resource_ids })
         })
         .collect()
+}
+
+/// One METRICS batch's decoded `id` column and, per row, the `resource.id` it
+/// joins to `RESOURCE_ATTRS` by.
+struct RootIds {
+    ids: Vec<u16>,
+    resource_ids: Vec<Option<u16>>,
+}
+
+/// Decode the METRICS `resource.id` column (otap-spec.md section 5.3.1: a
+/// `UInt16` child of the `resource` struct, DELTA by default, its encoding
+/// declared on the child field). `None` at a row means the metric carries no
+/// resource: the `resource` column, its `id` child, the struct slot or the id
+/// slot is absent or null. Null slots are left out of the delta running sum,
+/// as [`decode_delta_u16`] leaves them out. An unrecognized encoding rejects
+/// the batch as [`decode_id_column_u16`] does.
+fn decode_root_resource_ids(
+    rb: &RecordBatch,
+    rejected: &mut Vec<Rejection>,
+) -> Option<Vec<Option<u16>>> {
+    let rows = rb.num_rows();
+    let Some(resource) = column_as::<StructArray>(rb, "resource") else {
+        return Some(vec![None; rows]);
+    };
+    let child = resource.fields().iter().position(|f| f.name() == "id");
+    let Some((field, ids)) = child.and_then(|idx| {
+        let ids = resource
+            .column(idx)
+            .as_any()
+            .downcast_ref::<UInt16Array>()?;
+        Some((&resource.fields()[idx], ids))
+    }) else {
+        return Some(vec![None; rows]);
+    };
+    let present = |i: usize| !resource.is_null(i) && !ids.is_null(i);
+    match field_id_encoding(field) {
+        Ok(IdEncoding::Plain) => Some(
+            (0..rows)
+                .map(|i| present(i).then(|| ids.value(i)))
+                .collect(),
+        ),
+        Ok(IdEncoding::Delta) => {
+            let mut acc: u16 = 0;
+            Some(
+                (0..rows)
+                    .map(|i| {
+                        present(i).then(|| {
+                            acc = acc.wrapping_add(ids.value(i));
+                            acc
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        Ok(IdEncoding::QuasiDelta) | Err(()) => {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: UNRECOGNIZED_ID_ENCODING,
+                count: rows,
+            });
+            None
+        }
+    }
 }
 
 fn column_as<'b, T: 'static>(rb: &'b RecordBatch, name: &str) -> Option<&'b T> {
@@ -1326,22 +1987,7 @@ fn column_as<'b, T: 'static>(rb: &'b RecordBatch, name: &str) -> Option<&'b T> {
 }
 
 fn name_at(col: &Arc<dyn Array>, i: usize) -> Option<String> {
-    if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
-        let keys = dict.keys();
-        if keys.is_null(i) {
-            return None;
-        }
-        let idx = keys.value(i) as usize;
-        let values = dict.values().as_any().downcast_ref::<StringArray>()?;
-        return Some(values.value(idx).to_string());
-    }
-    if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
-        if s.is_null(i) {
-            return None;
-        }
-        return Some(s.value(i).to_string());
-    }
-    None
+    StrCol::from_array(col.as_ref())?.get(i).map(str::to_string)
 }
 
 fn opt_u8(col: Option<&UInt8Array>, i: usize) -> Option<u8> {
@@ -1356,10 +2002,6 @@ fn opt_bool(col: Option<&BooleanArray>, i: usize) -> Option<bool> {
     col.filter(|c| !c.is_null(i)).map(|c| c.value(i))
 }
 
-fn opt_str(col: Option<&StringArray>, i: usize) -> Option<&str> {
-    col.filter(|c| !c.is_null(i)).map(|c| c.value(i))
-}
-
 fn opt_i64(col: Option<&Int64Array>, i: usize) -> Option<i64> {
     col.filter(|c| !c.is_null(i)).map(|c| c.value(i))
 }
@@ -1370,12 +2012,12 @@ fn opt_f64(col: Option<&Float64Array>, i: usize) -> Option<f64> {
 
 fn build_root_table(
     root_batches: &[&RecordBatch],
-    root_ids: &[Option<Vec<u16>>],
+    root_ids: &[Option<RootIds>],
     dense_size: usize,
 ) -> Vec<Option<RootEntry>> {
     let mut entries: Vec<Option<RootEntry>> = (0..dense_size).map(|_| None).collect();
     for (rb, ids) in root_batches.iter().zip(root_ids) {
-        let Some(ids) = ids else {
+        let Some(RootIds { ids, resource_ids }) = ids else {
             continue;
         };
         let Some(types) = column_as::<UInt8Array>(rb, "metric_type") else {
@@ -1425,6 +2067,7 @@ fn build_root_table(
                     kind,
                     unit,
                     description,
+                    resource_id: resource_ids.get(i).copied().flatten(),
                 });
             }
         }
@@ -1483,40 +2126,42 @@ fn flatten_attrs<'b>(
 ) -> Vec<FlatAttr<'b>> {
     let mut out = Vec::new();
     for rb in attr_batches {
-        let Some(parents) = column_as::<UInt32Array>(rb, "parent_id") else {
+        let Some(parents) = ParentIds::from_column(rb, "parent_id") else {
             continue;
         };
-        let Some(keys) = column_as::<StringArray>(rb, "key") else {
+        let Some(keys) = StrCol::from_column(rb, "key") else {
             continue;
         };
         let Some(types) = column_as::<UInt8Array>(rb, "type") else {
             continue;
         };
-        let strs = column_as::<StringArray>(rb, "str");
+        let strs = StrCol::from_column(rb, "str");
         let bools = column_as::<BooleanArray>(rb, "bool");
-        let ints = column_as::<Int64Array>(rb, "int");
+        let ints = IntCol::from_column(rb, "int");
         let doubles = column_as::<Float64Array>(rb, "double");
         // otap-spec.md section 6.4.3: `*Attrs.parent_id` defaults to
         // QUASI-DELTA (equality columns `type`, `key`, and the type's Active
         // Field value), not the DELTA default of the core id chain.
         let Some(decoded_parents) =
-            decode_quasi_delta_column(rb, parents, rejected, decode_quasi_delta_attrs)
+            decode_quasi_delta_column(rb, &parents, rejected, decode_quasi_delta_attrs)
         else {
             continue;
         };
         for (i, &parent_id) in decoded_parents.iter().enumerate() {
             out.push(FlatAttr {
                 parent_id,
-                key: keys.value(i),
+                // A null key reads as the empty string, as the plain column's
+                // empty slot always did.
+                key: keys.get(i).unwrap_or(""),
                 // Read the discriminant through the null-checking `opt_u8`, like
                 // the sibling value columns: a null `type` (validity bit unset,
                 // even with a scalar byte still in the buffer) is out of
                 // contract and must reach `raw_cell`'s rejection fallback, not
                 // be read as that stale byte.
                 ty: opt_u8(Some(types), i),
-                str_val: opt_str(strs, i),
+                str_val: strs.as_ref().and_then(|c| c.get(i)),
                 bool_val: opt_bool(bools, i),
-                int_val: opt_i64(ints, i),
+                int_val: ints.as_ref().and_then(|c| c.get(i)),
                 double_val: opt_f64(doubles, i),
             });
         }
@@ -1549,6 +2194,7 @@ fn build_metric_decisions(
     flat_dp: &[FlatDp],
     limits: &IngestLimits,
     dense_size: usize,
+    blocked: &[bool],
     rejected: &mut Vec<Rejection>,
 ) -> (Vec<Option<MetricDecision>>, usize) {
     let mut dp_count = vec![0u32; dense_size];
@@ -1563,7 +2209,9 @@ fn build_metric_decisions(
 
     for id in 0..dense_size {
         let count = dp_count[id] as usize;
-        if count == 0 {
+        // A blocked metric's points were already rejected with its resource,
+        // which is all OTLP reports for a metric under a rejected resource.
+        if count == 0 || blocked.get(id).copied().unwrap_or(false) {
             continue;
         }
         match root.get(id).and_then(|e| e.as_ref()) {
@@ -1727,14 +2375,16 @@ fn check_attrs_in_input_order(
 fn build_group(
     raw: &[(String, RawCell)],
     metric_name: &str,
+    prefix: &[Label],
     tenant: &TenantId,
     limits: &IngestLimits,
 ) -> Result<(LabelSet, SeriesId), Rejection> {
-    let mut labels = Vec::with_capacity(raw.len() + 1);
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: metric_name.to_string(),
-    });
+    let mut labels = Vec::with_capacity(prefix.len() + raw.len() + 1);
+    labels.extend_from_slice(prefix);
+    labels.push(kept_label(
+        METRIC_NAME_LABEL.to_string(),
+        metric_name.to_string(),
+    ));
     for (raw_key, cell) in raw {
         let name = sanitize_label_name(raw_key);
         let value = raw_cell_value(cell)?;
@@ -1778,8 +2428,18 @@ fn push_checked(
             max: limits.max_label_value_len,
         });
     }
-    labels.push(Label { name, value });
+    labels.push(kept_label(name, value));
     Ok(())
+}
+
+/// Every label a kept set holds is built here or in [`push_checked`], so its
+/// name and value carry no spare capacity and the projection's per-label
+/// charge ([`label_bytes`]) bounds what it allocates. Mirrors
+/// `ravel_otlp::normalize`'s private `kept_label`.
+fn kept_label(mut name: String, mut value: String) -> Label {
+    name.shrink_to_fit();
+    value.shrink_to_fit();
+    Label { name, value }
 }
 
 fn sanitize_metric_name(name: &str) -> String {
@@ -2052,9 +2712,10 @@ fn group_exemplars_by_parent_id(
 ) -> HashMap<u32, Vec<FlatExemplar>> {
     let mut grouped: HashMap<u32, Vec<FlatExemplar>> = HashMap::new();
     for rb in batches {
-        let Some(parents) = column_as::<UInt32Array>(rb, "parent_id") else {
+        let Some(parents) = column_as::<UInt32Array>(rb, "parent_id").map(ParentIds::U32) else {
             continue;
         };
+        let parents = &parents;
         // otap-spec.md section 6.4.3: `*DpExemplars.parent_id` defaults to
         // QUASI-DELTA with `int_value`/`double_value` as its equality columns.
         let Some(decoded_parents) =
@@ -2133,6 +2794,7 @@ fn build_histogram_decisions(
     flat_dp: &[FlatHistogramDp],
     limits: &IngestLimits,
     dense_size: usize,
+    blocked: &[bool],
     rejected: &mut Vec<Rejection>,
 ) -> (Vec<Option<HistogramDecision>>, usize) {
     let mut dp_count = vec![0u32; dense_size];
@@ -2147,7 +2809,9 @@ fn build_histogram_decisions(
 
     for id in 0..dense_size {
         let count = dp_count[id] as usize;
-        if count == 0 {
+        // A blocked metric's points were already rejected with its resource,
+        // which is all OTLP reports for a metric under a rejected resource.
+        if count == 0 || blocked.get(id).copied().unwrap_or(false) {
             continue;
         }
         match root.get(id).and_then(|e| e.as_ref()) {
@@ -2186,6 +2850,7 @@ fn build_summary_decisions(
     flat_dp: &[FlatSummaryDp],
     limits: &IngestLimits,
     dense_size: usize,
+    blocked: &[bool],
     rejected: &mut Vec<Rejection>,
 ) -> (Vec<Option<SummaryDecision>>, usize) {
     let mut dp_count = vec![0u32; dense_size];
@@ -2200,7 +2865,9 @@ fn build_summary_decisions(
 
     for id in 0..dense_size {
         let count = dp_count[id] as usize;
-        if count == 0 {
+        // A blocked metric's points were already rejected with its resource,
+        // which is all OTLP reports for a metric under a rejected resource.
+        if count == 0 || blocked.get(id).copied().unwrap_or(false) {
             continue;
         }
         match root.get(id).and_then(|e| e.as_ref()) {
@@ -2254,15 +2921,13 @@ fn checked_event_ts(
     Ok(ts_ns)
 }
 
-/// Build the attribute-derived label prefix shared by every series exploded
-/// from one histogram/summary data point (everything but the `__name__`
-/// label and the synthesized `le`/`quantile` label, which differ per
+/// Build the resource-plus-attribute label prefix shared by every series
+/// exploded from one histogram/summary data point (everything but the
+/// `__name__` label and the synthesized `le`/`quantile` label, which differ per
 /// series). Mirrors `ravel_otlp::normalize`'s private
-/// `build_explode_base_labels`, minus the resource-label prefix: as the
-/// module docs explain, this crate's test encoder never emits
-/// `RESOURCE_ATTRS`/`SCOPE_ATTRS`, so every point here already carries an
-/// empty resource label set.
+/// `build_explode_base_labels`.
 fn build_base_labels(
+    prefix: &[Label],
     range: &[u32],
     attrs: &[FlatAttr],
     limits: &IngestLimits,
@@ -2273,7 +2938,8 @@ fn build_base_labels(
             max: limits.max_attributes_per_point,
         });
     }
-    let mut labels = Vec::with_capacity(range.len());
+    let mut labels = Vec::with_capacity(prefix.len() + range.len());
+    labels.extend_from_slice(prefix);
     for &i in range {
         let a = &attrs[i as usize];
         let name = sanitize_label_name(a.key);
@@ -2300,10 +2966,10 @@ fn finish_exploded_point(
 ) -> Result<NormalizedPoint, Rejection> {
     let mut labels = Vec::with_capacity(base_labels.len() + 2);
     labels.extend_from_slice(base_labels);
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: metric_name.to_string(),
-    });
+    labels.push(kept_label(
+        METRIC_NAME_LABEL.to_string(),
+        metric_name.to_string(),
+    ));
     if let Some((name, value)) = extra_label {
         push_checked(&mut labels, name.to_string(), value, limits)?;
     }
@@ -2343,6 +3009,7 @@ fn finish_exploded_point(
 fn explode_histogram_point(
     tenant: &TenantId,
     metric_name: &str,
+    prefix: &[Label],
     dp: &FlatHistogramDp,
     range: &[u32],
     attrs: &[FlatAttr],
@@ -2378,7 +3045,7 @@ fn explode_histogram_point(
         });
     }
 
-    let base_labels = build_base_labels(range, attrs, limits)?;
+    let base_labels = build_base_labels(prefix, range, attrs, limits)?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{metric_name}_bucket");
 
@@ -2655,6 +3322,7 @@ impl ExemplarAdmission<'_, '_> {
 fn explode_summary_point(
     tenant: &TenantId,
     metric_name: &str,
+    prefix: &[Label],
     dp: &FlatSummaryDp,
     range: &[u32],
     attrs: &[FlatAttr],
@@ -2673,8 +3341,17 @@ fn explode_summary_point(
             return Err(Rejection::DuplicateQuantile);
         }
     }
+    // Same place as `ravel_otlp::explode_summary`: after the per-quantile
+    // validity checks and before `build_base_labels`, since everything below
+    // allocates one series per quantile.
+    if dp.quantiles.len() > limits.max_summary_quantiles {
+        return Err(Rejection::TooManySummaryQuantiles {
+            quantiles: dp.quantiles.len(),
+            max: limits.max_summary_quantiles,
+        });
+    }
 
-    let base_labels = build_base_labels(range, attrs, limits)?;
+    let base_labels = build_base_labels(prefix, range, attrs, limits)?;
     let stale = has_no_recorded_value(dp.flags);
 
     let mut series = Vec::with_capacity(dp.quantiles.len() + 2);
@@ -2736,6 +3413,7 @@ mod tests {
             kind: RootKind::Gauge,
             unit: unit.to_string(),
             description: String::new(),
+            resource_id: None,
         })];
         let decisions = vec![Some(MetricDecision {
             name: "m".to_string(),
@@ -2829,6 +3507,7 @@ mod tests {
                 },
                 unit: "By".to_string(),
                 description: "first help".to_string(),
+                resource_id: None,
             }),
             Some(RootEntry {
                 name: "requests".to_string(),
@@ -2838,12 +3517,14 @@ mod tests {
                 },
                 unit: "By".to_string(),
                 description: "second help".to_string(),
+                resource_id: None,
             }),
             Some(RootEntry {
                 name: "silent".to_string(),
                 kind: RootKind::Gauge,
                 unit: String::new(),
                 description: "never stored".to_string(),
+                resource_id: None,
             }),
         ];
         let decisions = vec![
@@ -2884,5 +3565,398 @@ mod tests {
                 unit: "bytes".to_string(),
             }]
         );
+    }
+
+    use crate::encode::{
+        AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
+        ResourceAssignment,
+    };
+    use crate::proto::experimental::arrow::v1::BatchArrowRecords;
+    use crate::stream::{StreamConfig, StreamState};
+    use arrow::array::{ArrayRef, Int64Builder, StringDictionaryBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    fn str_attr(key: &str, value: &str) -> AttrRow {
+        AttrRow {
+            key: key.to_string(),
+            value: AttrValue::Str(value.to_string()),
+        }
+    }
+
+    fn gauge(name: &str, attrs: Vec<AttrRow>) -> MetricRow {
+        MetricRow {
+            name: name.to_string(),
+            kind: MetricKind::Gauge,
+            data_points: vec![DataPointRow {
+                time_unix_nano: TS,
+                value: 1.0,
+                flags: 0,
+                attrs,
+                exemplars: vec![],
+            }],
+        }
+    }
+
+    fn encode(
+        encoder: &mut MetricsStreamEncoder,
+        metrics: &[MetricRow],
+        resources: &[Vec<AttrRow>],
+        assigned: &[Option<usize>],
+    ) -> BatchArrowRecords {
+        encoder
+            .encode_batch_resources(
+                1,
+                metrics,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &ResourceAssignment {
+                    resources,
+                    metrics: assigned,
+                    ..ResourceAssignment::default()
+                },
+            )
+            .expect("encode")
+    }
+
+    fn run(batch: &DecodedBatch, limits: &IngestLimits) -> NormalizeOutput {
+        normalize_decoded(&TenantId::new("acme"), batch, limits, TS)
+    }
+
+    /// Each point's labels as sorted `(name, value)` pairs, keyed by `__name__`.
+    fn labels_by_name(out: &NormalizeOutput) -> BTreeMap<String, Vec<(String, String)>> {
+        out.points
+            .iter()
+            .map(|p| {
+                let pairs: Vec<(String, String)> = p
+                    .labels
+                    .iter()
+                    .map(|l| (l.name.clone(), l.value.clone()))
+                    .collect();
+                let name = p.labels.get(METRIC_NAME_LABEL).unwrap_or("").to_string();
+                (name, pairs)
+            })
+            .collect()
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The root `resource.id` travels DELTA-encoded (no metadata), and ids are
+    /// scoped to one batch: the same id names a different resource in the next.
+    #[test]
+    fn delta_encoded_resource_ids_resolve_per_batch() {
+        let limits = IngestLimits::default();
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+        let resources = vec![
+            vec![str_attr("service.name", "a")],
+            vec![str_attr("service.name", "b")],
+        ];
+        let metrics = vec![
+            gauge("m0", vec![]),
+            gauge("m1", vec![]),
+            gauge("m2", vec![]),
+        ];
+        let first = state
+            .decode(encode(
+                &mut encoder,
+                &metrics,
+                &resources,
+                &[Some(0), Some(1), Some(0)],
+            ))
+            .expect("decode");
+
+        let root = payloads_of(&first, ArrowPayloadType::UnivariateMetrics)[0];
+        let ids = root
+            .column_by_name("resource")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+            .and_then(|s| s.column_by_name("id"))
+            .and_then(|c| c.as_any().downcast_ref::<UInt16Array>())
+            .expect("resource.id column");
+        assert_eq!(ids.values().to_vec(), vec![0, 1, u16::MAX], "wire is delta");
+
+        let out = run(&first, &limits);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        let got = labels_by_name(&out);
+        assert_eq!(got["m0"], pairs(&[("__name__", "m0"), ("job", "a")]));
+        assert_eq!(got["m1"], pairs(&[("__name__", "m1"), ("job", "b")]));
+        assert_eq!(got["m2"], pairs(&[("__name__", "m2"), ("job", "a")]));
+
+        let second = state
+            .decode(encode(
+                &mut encoder,
+                &[gauge("m0", vec![])],
+                &[vec![str_attr("service.name", "c")]],
+                &[Some(0)],
+            ))
+            .expect("decode");
+        let got = labels_by_name(&run(&second, &limits));
+        assert_eq!(got["m0"], pairs(&[("__name__", "m0"), ("job", "c")]));
+    }
+
+    /// A data-point attrs table with every column dictionary-encoded (u32
+    /// `parent_id` as `Dictionary<UInt16, UInt32>`, `key` with `UInt8` keys,
+    /// `str` and `int` with `UInt16` keys) yields the same labels as the plain
+    /// encoding of the same rows. The encoder's `RESOURCE_ATTRS` already sends
+    /// dictionary `key`/`str`, so the resource side is covered too.
+    #[test]
+    fn dictionary_encoded_keys_and_values_decode() {
+        let limits = IngestLimits::default();
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+        let metrics = vec![gauge(
+            "m",
+            vec![
+                str_attr("host", "h1"),
+                AttrRow {
+                    key: "code".to_string(),
+                    value: AttrValue::Int(200),
+                },
+            ],
+        )];
+        let mut batch = state
+            .decode(encode(
+                &mut encoder,
+                &metrics,
+                &[vec![str_attr("service.name", "svc")]],
+                &[Some(0)],
+            ))
+            .expect("decode");
+        let plain = labels_by_name(&run(&batch, &limits));
+        assert_eq!(
+            plain["m"],
+            pairs(&[
+                ("__name__", "m"),
+                ("code", "200"),
+                ("host", "h1"),
+                ("job", "svc")
+            ])
+        );
+
+        let original = payloads_of(&batch, ArrowPayloadType::NumberDpAttrs)[0].clone();
+        let parent = original
+            .column_by_name("parent_id")
+            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
+            .expect("plain parent_id")
+            .value(0);
+
+        let parent_ids: ArrayRef = Arc::new(
+            DictionaryArray::<UInt16Type>::try_new(
+                UInt16Array::from(vec![0, 0]),
+                Arc::new(UInt32Array::from(vec![parent])),
+            )
+            .expect("parent dict"),
+        );
+        let mut keys = StringDictionaryBuilder::<UInt8Type>::new();
+        keys.append_value("host");
+        keys.append_value("code");
+        let mut strs = StringDictionaryBuilder::<UInt16Type>::new();
+        strs.append_value("h1");
+        strs.append_null();
+        let mut int_values = Int64Builder::new();
+        int_values.append_value(200);
+        let ints: ArrayRef = Arc::new(
+            DictionaryArray::<UInt16Type>::try_new(
+                UInt16Array::from(vec![None, Some(0)]),
+                Arc::new(int_values.finish()),
+            )
+            .expect("int dict"),
+        );
+        let parent_field = original
+            .schema()
+            .field_with_name("parent_id")
+            .expect("parent field")
+            .clone();
+        let dict = |k: DataType, v: DataType| DataType::Dictionary(Box::new(k), Box::new(v));
+        let schema = Schema::new(vec![
+            parent_field.with_data_type(dict(DataType::UInt16, DataType::UInt32)),
+            Field::new("key", dict(DataType::UInt8, DataType::Utf8), false),
+            Field::new("type", DataType::UInt8, false),
+            Field::new("str", dict(DataType::UInt16, DataType::Utf8), true),
+            Field::new("int", dict(DataType::UInt16, DataType::Int64), true),
+        ]);
+        let dictionary_attrs = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                parent_ids,
+                Arc::new(keys.finish()),
+                Arc::new(UInt8Array::from(vec![
+                    ANY_VALUE_TYPE_STRING,
+                    ANY_VALUE_TYPE_INT,
+                ])),
+                Arc::new(strs.finish()),
+                ints,
+            ],
+        )
+        .expect("dictionary attrs batch");
+        for (ty, rb) in &mut batch.payloads {
+            if *ty == ArrowPayloadType::NumberDpAttrs {
+                *rb = dictionary_attrs.clone();
+            }
+        }
+        let out = run(&batch, &limits);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(labels_by_name(&out), plain);
+    }
+
+    /// A metric whose `resource` struct is null gets no resource labels, and
+    /// the same series id as a batch carrying no resources at all.
+    #[test]
+    fn null_resource_id_is_an_empty_prefix() {
+        let limits = IngestLimits::default();
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+        let metrics = vec![
+            gauge("m0", vec![]),
+            gauge("m1", vec![str_attr("host", "h")]),
+        ];
+        let batch = state
+            .decode(encode(
+                &mut encoder,
+                &metrics,
+                &[vec![str_attr("service.name", "a")]],
+                &[Some(0), None],
+            ))
+            .expect("decode");
+        let out = run(&batch, &limits);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        let got = labels_by_name(&out);
+        assert_eq!(got["m0"], pairs(&[("__name__", "m0"), ("job", "a")]));
+        assert_eq!(got["m1"], pairs(&[("__name__", "m1"), ("host", "h")]));
+
+        let mut bare_encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let bare = StreamState::new(StreamConfig::default())
+            .decode(
+                bare_encoder
+                    .encode_batch(1, &[gauge("m1", vec![str_attr("host", "h")])])
+                    .expect("encode"),
+            )
+            .expect("decode");
+        let bare_out = run(&bare, &limits);
+        let id_of = |o: &NormalizeOutput, name: &str| {
+            o.points
+                .iter()
+                .find(|p| p.labels.get(METRIC_NAME_LABEL) == Some(name))
+                .map(|p| p.series_id)
+                .expect("point present")
+        };
+        assert_eq!(id_of(&out, "m1"), id_of(&bare_out, "m1"));
+    }
+
+    /// `RESOURCE_ATTRS` rows whose `parent_id` no metric references are never
+    /// admitted: a complex value or an over-limit attribute count on them
+    /// rejects nothing.
+    #[test]
+    fn orphan_resource_attr_rows_are_ignored() {
+        let limits = IngestLimits {
+            max_resource_attributes: 1,
+            ..IngestLimits::default()
+        };
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+        let resources = vec![
+            vec![str_attr("service.name", "a")],
+            vec![
+                str_attr("service.name", "b"),
+                AttrRow {
+                    key: "blob".to_string(),
+                    value: AttrValue::Complex(ANY_VALUE_TYPE_MAP),
+                },
+            ],
+        ];
+        let batch = state
+            .decode(encode(
+                &mut encoder,
+                &[gauge("m0", vec![])],
+                &resources,
+                &[Some(0)],
+            ))
+            .expect("decode");
+        assert_eq!(
+            payloads_of(&batch, ArrowPayloadType::ResourceAttrs)[0].num_rows(),
+            3
+        );
+        let out = run(&batch, &limits);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(
+            labels_by_name(&out)["m0"],
+            pairs(&[("__name__", "m0"), ("job", "a")])
+        );
+    }
+
+    /// otap-spec.md section 5.5.1's AnyValue discriminants, which pcommon's
+    /// `ValueType` and the Go encoder share. The tables in sections 5.4.1 and
+    /// 5.4.2 of the vendored spec list a different order; 5.5.1 is the one the
+    /// reference implementation follows.
+    #[test]
+    fn attribute_type_constants_match_the_spec() {
+        assert_eq!(ANY_VALUE_TYPE_EMPTY, 0);
+        assert_eq!(ANY_VALUE_TYPE_STRING, 1);
+        assert_eq!(ANY_VALUE_TYPE_INT, 2);
+        assert_eq!(ANY_VALUE_TYPE_DOUBLE, 3);
+        assert_eq!(ANY_VALUE_TYPE_BOOL, 4);
+        assert_eq!(ANY_VALUE_TYPE_MAP, 5);
+        assert_eq!(ANY_VALUE_TYPE_SLICE, 6);
+        assert_eq!(ANY_VALUE_TYPE_BYTES, 7);
+    }
+
+    /// A request whose projected resolved-label bytes exceed the bound is
+    /// rejected whole, with one `ResolvedLabelBytesExceeded` carrying every
+    /// point; one byte more of budget admits all of it. The projection covers
+    /// at least the bytes of the labels the admitted points keep.
+    #[test]
+    fn otap_request_over_label_byte_bound_is_rejected_whole() {
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+        let batch = state
+            .decode(encode(
+                &mut encoder,
+                &[
+                    gauge("m0", vec![str_attr("host", "h1")]),
+                    gauge("m1", vec![str_attr("host", "h2")]),
+                ],
+                &[vec![str_attr("service.name", "a")]],
+                &[Some(0), Some(0)],
+            ))
+            .expect("decode");
+        let projected = project_resolved_label_bytes(&batch, &IngestLimits::default()).get();
+
+        let tight = IngestLimits {
+            max_resolved_label_bytes_per_request: projected - 1,
+            ..IngestLimits::default()
+        };
+        let out = run(&batch, &tight);
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResolvedLabelBytesExceeded {
+                projected,
+                max: projected - 1,
+                count: 2,
+            }]
+        );
+
+        let exact = IngestLimits {
+            max_resolved_label_bytes_per_request: projected,
+            ..IngestLimits::default()
+        };
+        let out = run(&batch, &exact);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 2);
+        let kept: usize = out
+            .points
+            .iter()
+            .flat_map(|p| p.labels.iter())
+            .map(|l| label_bytes(l.name.len(), l.value.len()))
+            .sum();
+        assert!(projected >= kept, "projected {projected} < kept {kept}");
     }
 }
