@@ -430,6 +430,98 @@ mod tests {
         assert_eq!(p.metrics().refused(FormatFamily::Rlog), 0);
     }
 
+    async fn provision(store: &dyn ObjectStoreBackend, tenant: TenantHash, signal: Signal) {
+        ravel_catalog::validate_or_adopt(
+            store,
+            &tenant,
+            signal,
+            1,
+            1,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+    }
+
+    async fn raise(store: &dyn ObjectStoreBackend, tenant: TenantHash, family: FormatFamily, v: u32) {
+        let signal = match family {
+            FormatFamily::Rseg => Signal::Metrics,
+            FormatFamily::Rlog => Signal::Logs,
+            FormatFamily::Rspan => Signal::Spans,
+        };
+        ravel_catalog::raise_format_floor(
+            store,
+            &tenant,
+            signal,
+            family.as_str(),
+            v,
+            ravel_catalog::FloorBasis {
+                observed_entries: 0,
+                observed_newest_created_unix_ns: 0,
+                observed_shards: 1,
+            },
+            "test",
+            2,
+        )
+        .await
+        .expect("raise floor");
+    }
+
+    /// The startup check warns once per (tenant, signal, family) whose floor is
+    /// above the writable version, naming both numbers, and counts it in the
+    /// gauge; a floor at the writable version, a family with no floor and a
+    /// tenant with no record produce neither.
+    #[tokio::test]
+    async fn the_startup_check_warns_and_gauges_only_floors_above_the_writer() {
+        let store = ravel_object_store::memory::MemoryStore::new();
+        let above = TenantHash([1; 16]);
+        let at = TenantHash([2; 16]);
+        let absent = TenantHash([3; 16]);
+        for signal in FLOORED_SIGNALS {
+            provision(&store, above, signal).await;
+            provision(&store, at, signal).await;
+        }
+        let rseg = FormatFamily::Rseg.writable_version();
+        let rspan = FormatFamily::Rspan.writable_version();
+        raise(&store, above, FormatFamily::Rseg, rseg + 1).await;
+        raise(&store, above, FormatFamily::Rspan, rspan + 2).await;
+        raise(&store, at, FormatFamily::Rseg, rseg).await;
+        let metrics = FormatFloorMetrics::default();
+        let warns = crate::generation::WarnCapture::default();
+        let _guard = warns.install();
+
+        let found =
+            warn_floors_above_writer(&store, &[above, at, absent], "ingest", false, &metrics).await;
+
+        assert_eq!(
+            found,
+            vec![
+                FloorAboveWriter {
+                    tenant: above,
+                    signal: Signal::Metrics,
+                    family: FormatFamily::Rseg,
+                    floor: rseg + 1,
+                    writable: rseg,
+                },
+                FloorAboveWriter {
+                    tenant: above,
+                    signal: Signal::Spans,
+                    family: FormatFamily::Rspan,
+                    floor: rspan + 2,
+                    writable: rspan,
+                },
+            ]
+        );
+        assert_eq!(
+            warns.count("a recorded format floor is above the newest version this build writes"),
+            2,
+            "one warning per bucket above the writer, none for the floor at it"
+        );
+        assert_eq!(metrics.above_writer(FormatFamily::Rseg), 1);
+        assert_eq!(metrics.above_writer(FormatFamily::Rlog), 0);
+        assert_eq!(metrics.above_writer(FormatFamily::Rspan), 1);
+    }
+
     #[test]
     fn families_map_from_their_signals_and_write_their_crates_newest_version() {
         assert_eq!(
