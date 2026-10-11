@@ -5073,8 +5073,9 @@ fn render_maintain_ownership_family(
         out,
         "ravel_maintain_compactions_in_flight",
         "Bucket merges this process has started and not yet published, failed, or \
-         abandoned. A merge starts once its claim is held, before its first input \
-         read.",
+         abandoned. A merge starts once its bucket has passed its gates and, for a \
+         run that takes a claim, its claim is held, before its first catalog or \
+         block read.",
         "gauge",
     );
     write_sample(

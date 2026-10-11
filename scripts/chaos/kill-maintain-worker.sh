@@ -24,19 +24,22 @@
 #
 # MID-COMPACTION TRIGGER (named explicitly): worker A's
 # ravel_maintain_compactions_in_flight gauge. The SIGKILL fires on the first
-# scrape that reads it >= 1: a bucket merge has started (claim held, inputs
-# listed) and has not yet published, failed, or been abandoned. A is scraped
-# every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the scrape itself,
-# expected under 100 ms a poll (the run logs scrapes and seconds waited), and
-# the scenario 2 fixture (CHAOS_MAINTAIN_* in lib.sh) is sized for a merge of
-# at least 1 s. If the gauge never reads >= 1 within the
-# window the kill still happens, with a warning. The conservation oracle
-# still decides could-not-measure from A's log: when A published nothing
-# before the kill and the survivor publishes nothing after it, or A's last
-# publish is followed by a finished pass, a missing survivor publish is not a
-# verdict. The oracle waits for that publish up to the takeover bound (3 * H
-# plus one tick) from the kill, since the survivor picks up the dead worker's
-# unit only once its lease expires.
+# scrape that reads it >= 1: a bucket merge has started (gates passed, the
+# claim held where the run takes one, commit records read) and has not yet
+# published, failed, or been abandoned.
+# A is scraped every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the scrape
+# itself; the run logs the scrapes it made and the seconds it waited. If the
+# gauge never reads >= 1 within the window the kill still happens, with a
+# warning, and CHAOS_KILL_ON_GAUGE is 0.
+#
+# CONSERVATION: after the kill, A's log names the bucket it was merging: its
+# last "compaction merge started" line whose bucket has no later "compaction
+# record published" line. The oracle passes only on a survivor publish of
+# that bucket after the kill, and waits for it up to
+# chaos_conservation_wait_seconds from the kill (the takeover bound, one more
+# tick, and CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS; 1080 s at the
+# defaults). With the gauge seen and the bucket known, no such publish by
+# then is a FAIL; without either, the run could not measure conservation.
 #
 # SEAL WAIT: an ingest hour is compactable once the compactor's seal margin
 # has passed the end of the hour (CompactorConfig::seal_margin_ns, 3900 s at
@@ -55,11 +58,10 @@
 # Exit status: 0 when every pinned oracle assertion held; 2 when any failed
 # (release-blocking); 3 on a setup error, when the server log carries no
 # parseable `seal_margin_secs=`, or when conservation could not be measured
-# and no other assertion failed. Could-not-measure means the survivor
-# published no compaction record, its conservation-abort counter did not
-# rise, and worker A's log at the kill shows its last publish followed by a
-# finished pass (oracle_conservation_or_unmeasured in lib.sh); 64 on a usage
-# error.
+# and no other assertion failed. Could-not-measure means the survivor's
+# conservation-abort counter did not rise and either the kill did not fire on
+# the gauge or worker A's log at the kill names no interrupted bucket
+# (oracle_conservation_or_unmeasured in lib.sh); 64 on a usage error.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
 # RustFS, spawning workers, or issuing a real kill. That is the only proof
@@ -138,7 +140,7 @@ if [[ "$MODE" == "check" ]]; then
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
   echo "mid-compaction trigger: worker A ravel_maintain_compactions_in_flight>=1, scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape"
-  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_takeover_bound_seconds)}s after the kill for a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
+  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance) for a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}' of the bucket worker A's last unmatched '${CHAOS_COMPACTION_START_MARKER}' names"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
   echo "load: ${EXPORT_COUNT} exports of ${CHAOS_MAINTAIN_FIXTURE_SERIES} series x ${CHAOS_MAINTAIN_FIXTURE_POINTS} points, at most one per ${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS}s"
   echo "seal wait: end of the ingest server's exit hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
@@ -154,6 +156,7 @@ fi
 WORKER_A_PID=""
 WORKER_B_PID=""
 INGEST_PID=""
+PACE_PID=""
 WORKER_A_LOG="$(chaos_logfile maintain-worker worker-a)"
 WORKER_B_LOG="$(chaos_logfile maintain-worker worker-b)"
 INGEST_LOG="$(chaos_logfile maintain-worker ingest)"
@@ -167,7 +170,7 @@ cleanup() {
   trap - ERR
   set +e
   local pid
-  for pid in "$WORKER_A_PID" "$WORKER_B_PID" "$INGEST_PID"; do
+  for pid in "$WORKER_A_PID" "$WORKER_B_PID" "$INGEST_PID" "$PACE_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -236,8 +239,9 @@ chaos_wait_for "ingest server to accept connections" 60 ingest_reachable
 SENT=0
 LAST_ACK_UNIX_S=""
 # The pacing sleep runs beside each export, so an iteration lasts at least
-# CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS and the load stays under the ingest
-# byte rate.
+# CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS. A strict-ack export normally takes
+# longer than that (see the sizing note in lib.sh), so this is a floor that
+# keeps the load under the ingest byte rate, not the load's pace.
 for _ in $(seq 1 "$EXPORT_COUNT"); do
   sleep "$CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS" &
   PACE_PID=$!
@@ -247,6 +251,7 @@ for _ in $(seq 1 "$EXPORT_COUNT"); do
     LAST_ACK_UNIX_S="$(chaos_now_unix_s)"
   fi
   wait "$PACE_PID"
+  PACE_PID=""
 done
 # Every export must land: the seal wait is paid for a known compaction input,
 # and a rejected export (a 429 under the ingest byte rate, say) would shrink
@@ -306,9 +311,11 @@ INFLIGHT_WAIT_START="$(date +%s)"
 if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"; then
   KILL_EPOCH="$(date +%s)"
   sigkill_pid "$WORKER_A_PID"
+  CHAOS_KILL_ON_GAUGE=1
   log "worker A observed mid-compaction -- SIGKILL issued"
 else
   KILL_EPOCH="$(date +%s)"
+  CHAOS_KILL_ON_GAUGE=0
   sigkill_pid "$WORKER_A_PID"
   log "did not observe worker A mid-compaction within budget; SIGKILL issued anyway"
   echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
@@ -317,13 +324,14 @@ WORKER_A_PID=""
 B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"
 log "worker A max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}; /metrics scrapes: ${CHAOS_COMPACTION_POLLS:-0} in $(( KILL_EPOCH - INFLIGHT_WAIT_START ))s"
 log "$(chaos_worker_activity_line worker-a "$WORKER_A_LOG")"
+log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; worker A's interrupted bucket: $(chaos_interrupted_bucket "$WORKER_A_LOG" || echo none)"
 
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
 oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
-# Worker A is dead, so its log is its state at the kill: whether it shows
-# unfinished compaction work decides whether a survivor that published
-# nothing by the takeover bound is a failure or could not be measured.
+# Worker A is dead, so its log is its state at the kill: the bucket it was
+# merging, read from it, is the one the survivor must publish. The oracle
+# also reads CHAOS_KILL_ON_GAUGE, set above.
 oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
   "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true

@@ -186,9 +186,9 @@ pub fn buckets_held_out_of_window_total() -> u64 {
 
 /// Gauge seam for `ravel_maintain_compactions_in_flight`: bucket merges this
 /// process has started and not yet finished. A merge starts once the bucket
-/// passed every gate and its claim is held, before the first input catalog or
-/// block read, and ends when its pipeline returns (published, abandoned, or
-/// failed) or its future is dropped.
+/// passed every gate and, for a run that takes a claim, its claim is held,
+/// before the first input catalog or block read, and ends when its pipeline
+/// returns (published, abandoned, or failed) or its future is dropped.
 static COMPACTIONS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// Read [`COMPACTIONS_IN_FLIGHT`]. Zero whenever no bucket is merging.
@@ -202,9 +202,19 @@ pub fn compactions_in_flight() -> u64 {
 struct MergeInFlight;
 
 impl MergeInFlight {
-    fn start() -> Self {
+    /// Count the merge and log the bucket's commit prefix. A published record's
+    /// key is that prefix plus its file name, which is how the chaos oracle
+    /// (scripts/chaos/lib.sh) matches a publish to the merge it ends.
+    fn start(bucket: &Bucket) -> Result<Self> {
+        let prefix = ravel_commit::keys::commit_shard_hour_prefix(
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            bucket.ingest_hour_bucket,
+        )?;
         COMPACTIONS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-        MergeInFlight
+        tracing::info!(bucket = %prefix, "compaction merge started");
+        Ok(MergeInFlight)
     }
 }
 
@@ -501,7 +511,7 @@ async fn compact_bucket_scoped(
     // signal and run the identical shared pipeline (canonical ordering,
     // input_set_hash, publish) around it (ADR-0032).
     let planned = &listing;
-    let in_flight = MergeInFlight::start();
+    let in_flight = MergeInFlight::start(bucket)?;
     let outcome = match bucket.signal {
         Signal::Metrics => {
             run_pipeline::<RsegCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)
