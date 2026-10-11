@@ -594,10 +594,12 @@ impl IngestRouter {
         }
     }
 
-    /// Update a tenant's cached shard-generation view (ADR-0052 section 2). The
-    /// server's background refresher calls this on interval `C` with the
-    /// tenant's decoded provisioning history so an activation is observed before
-    /// it takes effect and the staleness guard stays satisfied.
+    /// Update a tenant's cached shard-generation view (ADR-0052 section 2) with
+    /// a decoded provisioning history. It installs no format floor, so a
+    /// tenant with no cached view gets one with no floor until the next
+    /// re-read (see [`GenerationSwitch::refresh`]): a test seam that must not
+    /// be used on a production path, where a write's own re-read installs the
+    /// floor with the generations.
     pub fn refresh_generations(
         &self,
         tenant: ravel_types::TenantHash,
