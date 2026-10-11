@@ -3534,7 +3534,8 @@ pub const STORE_GET_PERMIT_BYTES: u64 = ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_B
 /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256), the permit count
 /// W1 was measured at. A larger budget derives no more permits than were
 /// measured.
-pub const MAX_DERIVED_STORE_GET_CONCURRENCY: usize = ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY;
+pub const MAX_DERIVED_STORE_GET_CONCURRENCY: usize =
+    ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY;
 
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
 /// SEPARATE ceiling from [`CACHE_MEMORY_PERCENT`]. The fetcher cache
@@ -3985,9 +3986,10 @@ fn resolve_knob(
 pub fn derive_store_get_concurrency(memory_budget_bytes: u64) -> usize {
     let share = u128::from(memory_budget_bytes) * u128::from(STORE_GET_MEMORY_PERCENT) / 100;
     let permits = share / u128::from(STORE_GET_PERMIT_BYTES.max(1));
-    usize::try_from(permits)
-        .unwrap_or(usize::MAX)
-        .clamp(MIN_DERIVED_FETCH_CONCURRENCY, MAX_DERIVED_STORE_GET_CONCURRENCY)
+    usize::try_from(permits).unwrap_or(usize::MAX).clamp(
+        MIN_DERIVED_FETCH_CONCURRENCY,
+        MAX_DERIVED_STORE_GET_CONCURRENCY,
+    )
 }
 
 /// Resolve the six performance settings from the host and the operator's flags
@@ -10150,7 +10152,10 @@ mod tests {
         let resolved = tiny
             .resolve_performance(reference_host())
             .expect("performance defaults resolve");
-        assert_eq!(resolved.store_get_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+        assert_eq!(
+            resolved.store_get_concurrency,
+            MIN_DERIVED_FETCH_CONCURRENCY
+        );
 
         // An explicit flag wins over the derivation on every host, and so
         // does the legacy combined knob.
@@ -13005,10 +13010,8 @@ mod tests {
             "policy_source must appear exactly once on the resolved-policy line, lines: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("policy=\"latency-first\"")
-                    && l.contains("policy_source=\"default-loopback\"")),
+            lines.iter().any(|l| l.contains("policy=\"latency-first\"")
+                && l.contains("policy_source=\"default-loopback\"")),
             "the resolved policy and its source must appear together on the same line, lines: {lines:?}"
         );
     }
