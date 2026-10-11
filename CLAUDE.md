@@ -428,6 +428,8 @@ workspace-clippy rule is the one that applies only there.
 `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the worktree rule;
 `ALLOW_DESTRUCTIVE=1`, written inline at the front of the command (shell
 state does not survive between tool calls), is the one for the git rules.
+`RAVEL_GATES_ALLOW_UNSCOPED=1`, spelled the same way, is the one for the
+workspace-clippy rule, for a deliberate unscoped run in a fleet clone.
 `ALLOW_LITERAL_SHA=1`, spelled the same way, is the one for the hex rule,
 and which answer is right depends on where the literal came from. A SHA
 typed or finished from a prefix read off earlier output gets resolved in

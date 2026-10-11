@@ -507,6 +507,10 @@ check deny  "global flag with a value before clippy, fleet" \
   "$(bash_in 'cargo --color never clippy --workspace --all-targets -- -D warnings' "$fleet")"
 check deny  "--config value before clippy, fleet" \
   "$(bash_in 'cargo --config build.jobs=2 clippy --all-targets --workspace' "$fleet")"
+check allow "unscoped escape hatch inline, fleet" \
+  "$(bash_in 'RAVEL_GATES_ALLOW_UNSCOPED=1 cargo clippy --workspace --all-targets -- -D warnings' "$fleet")"
+check deny  "unscoped escape hatch set to 0, fleet" \
+  "$(bash_in 'RAVEL_GATES_ALLOW_UNSCOPED=0 cargo clippy --workspace --all-targets' "$fleet")"
 check allow "global flag with a value, crate-scoped, fleet" \
   "$(bash_in 'cargo --color never clippy -p ravel-types --all-targets' "$fleet")"
 check allow "workspace clippy in a linked worktree"     "$(bash_in "$ws_clippy" "$cliproot/linked")"

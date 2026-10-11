@@ -84,6 +84,11 @@ const MASKING_ECHO = /&&\s*echo\b/;
 const CLIPPY_HEAD =
   /^cargo(\s+(\+[A-Za-z0-9._-]+|(--color|--config|-C|-Z)\s+[^\s-]\S*|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+clippy(\s|$)/;
 const WORKSPACE_FLAG = /\s--(workspace|all)(\s|$)/;
+// The escape hatch for a deliberate unscoped run in a fleet clone (ADR-2867
+// change 5), spelled inline at the front of the command like ALLOW_DESTRUCTIVE
+// and for the same reason: shell state does not survive between tool calls.
+const ALLOW_UNSCOPED_GATE =
+  /(^|[\s;&|(])RAVEL_GATES_ALLOW_UNSCOPED=(1|true|yes)(\s|$)/;
 
 // zsh marks these read-only; assigning to one kills the enclosing loop with
 // no output that looks like a failure.
@@ -524,6 +529,12 @@ function scanTexts(command) {
 // Each `&&`, `||` or `|` part of a statement is its own command here, so a
 // workspace clippy chained after `cargo fmt --all &&` is still seen.
 function checkWorkspaceClippy(stmt) {
+  if (
+    ALLOW_UNSCOPED_GATE.test(stmt) ||
+    process.env.RAVEL_GATES_ALLOW_UNSCOPED === "1"
+  ) {
+    return;
+  }
   for (const part of blankSubstitutions(stmt).split(/&&|\|\|?/)) {
     const stripped = part.replace(HARMLESS_PREFIX, "").trim();
     if (!CLIPPY_HEAD.test(stripped)) continue;
@@ -536,7 +547,8 @@ function checkWorkspaceClippy(stmt) {
         "them, plus the `sql` lane when ravel-server is in that closure and " +
         "the `flight-sql` lane when ravel-sql or ravel-server is. A hand-run " +
         "workspace clippy compiles neither lane, which is how a sql-gated " +
-        "break reached CI on #2833.",
+        "break reached CI on #2833. A deliberate unscoped run spells " +
+        "RAVEL_GATES_ALLOW_UNSCOPED=1 inline at the front of the command.",
     );
   }
 }
