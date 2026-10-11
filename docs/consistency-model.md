@@ -150,7 +150,17 @@ Buffered mode (opt-in per request, named "buffered"):
   elapses before its encode on the write gate returns, most likely because
   the encode is still queued for a gate permit. The flush is abandoned with
   no store call, any strict waiter is acked with the retryable `Abandoned`
-  (503), and `abandoned_queue_deadline` counts it. The
+  (503), and `abandoned_queue_deadline` counts it. Seven: the bucket's
+  recorded format floor (ADR-1746) rose above the version this writer encodes
+  after the rows were admitted, so the admission check, which reads the
+  cached provisioning view, let them in and the flush-open check, which reads
+  the view again once it is refreshed, refuses them. The flush is dropped
+  before its sequence is pinned and before any PUT, any strict waiter is
+  acked with the retryable `BelowFormatFloor` (503), and
+  `ravel_format_floor_refused_total{family}` counts it. Writes that arrive
+  after the router has seen the raised floor are refused at admission with
+  the same error and are never acknowledged. `--write-below-format-floor`
+  turns both refusals into a counted write. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
   bypass passes disable that check precisely so it cannot drop acknowledged
   rows, and what it costs instead is visibility until a HEAD rebuild (see
