@@ -112,8 +112,8 @@ pub enum WriteError {
     /// The flush would have published an object below the tenant's recorded
     /// format floor for its family (ADR-1746 decision 4), so it was refused at
     /// flush open, before any store call, and its rows were dropped. Retryable:
-    /// the refusal is a property of the writer's build, and a retry routed to a
-    /// writer that can write at the floor succeeds.
+    /// the refusal is a property of the writer's build, so a writer that can
+    /// write at the floor does not refuse the retry.
     #[error(transparent)]
     BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
     /// A multi-shard Strict write in which at least one shard failed *after*

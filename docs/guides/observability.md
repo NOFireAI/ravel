@@ -921,15 +921,15 @@ Labels: `mode`.
 ### Format floors (`ravel_format_floor_*`)
 
 Labels: `mode`, `family`. Every process renders one sample per format family
-for each metric. Ingest flushes and maintenance compactions, erasure rewrites
-and migrations in one process count into the same samples. The
+for each metric. Ingest flushes, and the compactions and erasure rewrites of
+the maintenance loop, count into these samples. The
 [maintenance guide](operations/maintenance.md#a-writer-below-a-recorded-format-floor)
 says what to do when they move.
 
 | Metric | Meaning |
 |---|---|
 | `ravel_format_floor_above_writer` | Gauge. (tenant, signal) buckets whose recorded floor for the family is above the newest version this build writes, as found once at startup by an ingest or maintenance process. It covers only the tenants named by `--tenant-token`, `--tenant-token-file` and `--maintain-tenant`. A nonzero value means this build refuses that family's writes into those buckets. |
-| `ravel_format_floor_refused_total` | Publishes refused because the object would be written below the bucket's recorded floor for its family. An ingest flush refused this way drops its rows, and answers a strict write with a retryable error. A refused compaction, erasure rewrite or migration builds and publishes nothing. Alert on any increase. |
+| `ravel_format_floor_refused_total` | Publishes refused because the object would be written below the bucket's recorded floor for its family. An ingest flush refused this way drops its rows, and answers a strict write with a retryable error. A refused compaction or erasure rewrite builds and publishes nothing. Alert on any increase. |
 | `ravel_format_floor_writes_below_total` | Publishes written below the bucket's recorded floor under `--write-below-format-floor`. Each one contradicts the floor, and `ravel-cli maintain audit-versions` reports it `contradicted`. |
 
 ### Store reachability
