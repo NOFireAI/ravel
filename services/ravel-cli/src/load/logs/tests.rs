@@ -2102,8 +2102,7 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
     let geometry = layout.geometry.expect("geometry resolved");
     assert_eq!(geometry.target_source, TargetSource::Flag);
     assert_eq!(geometry.pipeline_depth, DEPTH);
-    assert!(!geometry.depth_flush_enabled());
-    let expected = parks + usize::from(GEOMETRY_BATCHES % DEPTH != 0);
+    let expected = parks + usize::from(!GEOMETRY_BATCHES.is_multiple_of(DEPTH));
     assert_eq!(expected, 11);
     assert_eq!(list_data_objects(store.as_ref()).await.len(), expected);
     assert_eq!(
@@ -2116,6 +2115,7 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
         },
         "every 5-batch buffer closes on age, the tail on the end-of-input flush"
     );
+    assert!(!geometry.depth_flush_enabled());
 }
 
 /// The batch numbers (1-based) at which a lone shard's buffer reaches
@@ -2255,7 +2255,7 @@ async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
     let depth = geometry.pipeline_depth;
     assert_eq!(depth, 25);
     let depth_flushes = (GEOMETRY_BATCHES / depth) as u64;
-    let manual = u64::from(GEOMETRY_BATCHES % depth != 0);
+    let manual = u64::from(!GEOMETRY_BATCHES.is_multiple_of(depth));
     assert_eq!(
         list_data_objects(store.as_ref()).await.len() as u64,
         depth_flushes + manual
@@ -2466,9 +2466,8 @@ async fn a_derived_depth_above_the_cap_is_capped() {
 /// buffer). A yield count would bound neither, since yields on this task
 /// do not wait on the blocking decode thread.
 ///
-/// Prove-the-test: pass `1` as `target_bytes` to the
-/// `build_ingest_config` call in `load_instrumented` (that function has
-/// other callers, so change the call, not the function) and every write
+/// Prove-the-test: pass `Some(1)` as the target to the
+/// `load_instrumented_at` call in `load_instrumented` and every write
 /// triggers its own flush, so the
 /// acks are answered, the load runs to completion while the driver is
 /// still waiting for the router to go quiet, and the `biased` select hits

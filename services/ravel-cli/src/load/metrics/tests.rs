@@ -1107,7 +1107,7 @@ mod default_geometry {
         let depth = geometry.pipeline_depth;
         assert_eq!(depth, 25);
         let depth_flushes = (BATCHES / depth) as u64;
-        let manual = u64::from(BATCHES % depth != 0);
+        let manual = u64::from(!BATCHES.is_multiple_of(depth));
         assert_eq!(
             stored_objects(store.as_ref()).await as u64,
             depth_flushes + manual
