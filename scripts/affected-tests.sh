@@ -11,6 +11,17 @@
 # Uses the `ci` cargo build profile (no debug info: faster codegen, smaller
 # artifacts) and cargo-nextest when installed, plain `cargo test` otherwise.
 # Doctests run separately: nextest does not execute them.
+#
+# ravel-server's `sql` and `flight-sql` surfaces compile only under their
+# features, which are off by default, so the plain closure run does not test
+# them with the feature selected on its own. When ravel-server is in the
+# closure this also runs
+# `-p ravel-server --features sql`, and when ravel-sql or ravel-server is, `-p
+# ravel-server -p ravel-sql --features flight-sql`, both on the `ci` profile.
+# The exit code is the first failing run's, after every run has finished.
+#
+# scripts/gates.sh reads its scoped closure from `-n`, so `-n` prints the
+# `affected crates:` line and nothing else.
 set -u
 
 dry=0
@@ -80,20 +91,47 @@ if [ "$dry" -eq 1 ]; then
   exit 0
 fi
 
-rc=0
 if command -v cargo-nextest >/dev/null 2>&1; then
-  # shellcheck disable=SC2086
-  cargo nextest run --cargo-profile ci $crate_args || rc=$?
+  have_nextest=1
 else
-  # shellcheck disable=SC2086
-  cargo test --profile ci $crate_args || rc=$?
+  have_nextest=0
 fi
+
+# run_tests <extra cargo args...>: the closure's test runner with the given
+# selection, on the `ci` profile.
+run_tests() {
+  if [ "$have_nextest" -eq 1 ]; then
+    cargo nextest run --cargo-profile ci "$@"
+  else
+    cargo test --profile ci "$@"
+  fi
+}
+
+rc=0
+# shellcheck disable=SC2086
+run_tests $crate_args || rc=$?
 
 doc_rc=0
 # shellcheck disable=SC2086
 cargo test --doc --profile ci $crate_args || doc_rc=$?
 
-if [ "$rc" -ne 0 ]; then
-  exit "$rc"
-fi
-exit "$doc_rc"
+sql_rc=0
+case "$affected" in
+  *" ravel-server "*)
+    run_tests -p ravel-server --features sql || sql_rc=$?
+    ;;
+esac
+
+flight_rc=0
+case "$affected" in
+  *" ravel-server "* | *" ravel-sql "*)
+    run_tests -p ravel-server -p ravel-sql --features flight-sql || flight_rc=$?
+    ;;
+esac
+
+for code in "$rc" "$doc_rc" "$sql_rc" "$flight_rc"; do
+  if [ "$code" -ne 0 ]; then
+    exit "$code"
+  fi
+done
+exit 0

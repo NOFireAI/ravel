@@ -5,8 +5,18 @@
 #   scripts/gates.sh                 # workspace-wide -- run this once,
 #                                     # right before a commit that touches
 #                                     # more than one crate
-#   scripts/gates.sh -p CRATE ...     # scope clippy/test to one or more
-#                                     # crates -- fast local iteration
+#   scripts/gates.sh -p CRATE ...     # scoped: clippy/test/doctests over
+#                                     # the named crates and every workspace
+#                                     # crate that depends on them,
+#                                     # transitively, plus the feature lanes
+#                                     # that closure reaches (see below)
+#   scripts/gates.sh [-p CRATE ...] --dry-run
+#                                     # print the crates and the feature
+#                                     # lanes the same arguments would gate,
+#                                     # then exit 0 without building
+#                                     # anything (scoped mode still reads
+#                                     # `cargo metadata --no-deps` for the
+#                                     # closure)
 #   scripts/gates.sh --flag-doc-guard-only [FILE]
 #                                     # run only the ingest-memory flag-doc
 #                                     # overclaim guard, against FILE or the
@@ -15,6 +25,7 @@
 set -euo pipefail
 
 crate_args=()
+dry_run=0
 flag_doc_guard_only=0
 flag_doc_guard_file=""
 while [[ $# -gt 0 ]]; do
@@ -27,6 +38,10 @@ while [[ $# -gt 0 ]]; do
       fi
       crate_args+=("-p" "$1")
       shift
+      ;;
+    --dry-run)
+      shift
+      dry_run=1
       ;;
     --flag-doc-guard-only)
       shift
@@ -125,6 +140,188 @@ if [[ ${flag_doc_guard_only} -eq 1 ]]; then
   guard_code=0
   check_ingest_memory_flag_docs "${config_rs}" || guard_code=$?
   exit "${guard_code}"
+fi
+
+# Scoped mode gates the reverse-dependency closure of the named crates, not
+# only the crates themselves: a change to ravel-query can break ravel-sql and
+# ravel-server, and a gate that never compiles them reports green on a tree CI
+# rejects. The closure comes from `affected-tests.sh -n`, so the two scripts
+# share one implementation and cannot disagree about what a change reaches.
+gate_crates=()
+gate_args=()
+if [[ ${#crate_args[@]} -gt 0 ]]; then
+  closure_rc=0
+  closure_out="$("$(dirname "$0")/affected-tests.sh" -n "${crate_args[@]}")" || closure_rc=$?
+  if [[ ${closure_rc} -ne 0 ]]; then
+    echo "gates.sh: could not compute the reverse-dependency closure of ${crate_args[*]} (affected-tests.sh -n exited ${closure_rc})" >&2
+    exit "${closure_rc}"
+  fi
+  closure_line="$(printf '%s\n' "${closure_out}" | sed -n 's/^affected crates://p')"
+  read -r -a gate_crates <<<"${closure_line}"
+  if [[ ${#gate_crates[@]} -eq 0 ]]; then
+    echo "gates.sh: affected-tests.sh -n printed no closure for ${crate_args[*]}:" >&2
+    printf '%s\n' "${closure_out}" >&2
+    exit 70
+  fi
+  for c in "${gate_crates[@]}"; do
+    gate_args+=("-p" "${c}")
+  done
+fi
+
+# Feature-gated surfaces (issues #609, #616, #714, #732). ravel-server's `sql`
+# and `flight-sql` features, and ravel-bench's bench-lane features, are off by
+# default, so the plain clippy and test runs below compile neither the Flight
+# SQL service, the bench lanes, nor their tests. The workspace run below does
+# build ravel-server with `sql` on, through ravel-cli's dev-dependency, but only
+# together with the
+# dependency features the rest of the workspace adds: a break that shows with
+# `sql` selected on its own passes it. Without these lanes a local run prints "All
+# gates passed" on a tree CI rejects. That happened while rebasing #511: the
+# workspace gate was green and `--features sql` failed with E0061 on a call
+# site that had gone stale under a textually clean merge. It happened again for
+# ravel-bench: #712 merged on a receipt but went red in CI's features job
+# because gates.sh never built ravel-bench's sql-latency tests, and #724's
+# `flight-lane` feature left main uncompilable under
+# `--features sql-latency,profiling,flight-lane` because nothing gated it.
+#
+# Mirrors CI's `lint`, `flight-sql`, and `features` jobs. In scoped mode each
+# lane runs when a crate it covers is in the closure computed above, so
+# `-p ravel-query` runs the sql and flight-sql lanes (ravel-sql and
+# ravel-server depend on it) and `-p ravel-affinity` runs none.
+#
+# Under --dry-run every cargo command below is printed by `run` and not
+# executed, so the printed list is the list a real run executes.
+run() {
+  echo "==> $*"
+  if [[ ${dry_run} -eq 1 ]]; then
+    return 0
+  fi
+  "$@"
+}
+
+# The same tests as CI's `check` job, on the `ci` profile. CI runs them on
+# `ci-opt`, which is `ci` with third-party dependencies at opt-level 2
+# (ADR-0053, "check on ci-opt" amendment): CI restores a dependency cache
+# and pays for that optimisation once, a local or fleet run builds cold and
+# would pay it every time. So this run and CI's do not share artifacts, and
+# a test whose result depends on how dependencies are compiled can pass
+# here and fail there. To reproduce such a failure, run
+# `cargo nextest run --locked --workspace --cargo-profile ci-opt`.
+# Use nextest when it is installed; fall back to `cargo
+# test` (which every dev machine has) otherwise. nextest cannot run
+# doctests, so those always go through `cargo test --doc`, pinned to the
+# `ci` profile for consistency. `command -v` in an `if` condition does not
+# trip `set -e` when nextest is absent.
+if command -v cargo-nextest >/dev/null 2>&1; then
+  have_nextest=1
+else
+  have_nextest=0
+fi
+
+run_cargo_gates() {
+  if [[ ${#crate_args[@]} -eq 0 ]]; then
+    run cargo clippy --locked --workspace --all-targets -- -D warnings
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run cargo nextest run --locked --workspace --cargo-profile ci
+    else
+      run cargo test --locked --workspace
+    fi
+    run cargo test --locked --doc --profile ci --workspace
+  else
+    echo "==> closure of ${crate_args[*]}: ${gate_crates[*]}"
+    run cargo clippy --locked "${gate_args[@]}" --all-targets -- -D warnings
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run cargo nextest run --locked "${gate_args[@]}" --cargo-profile ci
+    else
+      run cargo test --locked "${gate_args[@]}"
+    fi
+    run cargo test --locked --doc --profile ci "${gate_args[@]}"
+  fi
+}
+
+run_feature_lane() {
+  local feature="$1"
+  shift
+  run cargo clippy --locked "$@" --features "${feature}" --all-targets -- -D warnings
+  if [[ ${have_nextest} -eq 1 ]]; then
+    run cargo nextest run --locked "$@" --features "${feature}"
+  else
+    run cargo test --locked "$@" --features "${feature}"
+  fi
+}
+
+want_sql=0
+want_flight_sql=0
+want_bench=0
+want_stage_timing=0
+if [[ ${#crate_args[@]} -eq 0 ]]; then
+  want_sql=1
+  want_flight_sql=1
+  want_bench=1
+  want_stage_timing=1
+else
+  for c in "${gate_crates[@]}"; do
+    case "${c}" in
+      ravel-server) want_sql=1 ;;
+    esac
+    case "${c}" in
+      ravel-server | ravel-sql) want_flight_sql=1 ;;
+    esac
+    # ravel-bench's feature tests exercise these crates, so any of them in
+    # scope should pay for the bench lanes.
+    case "${c}" in
+      ravel-bench | ravel-sql | ravel-query | ravel-ingest) want_bench=1 ;;
+    esac
+    # The crates that DECLARE stage-timing, and whose own cfg-gated tests the
+    # ravel-bench lane below cannot reach.
+    case "${c}" in
+      ravel-bench | ravel-ingest | ravel-logseg) want_stage_timing=1 ;;
+    esac
+  done
+fi
+
+run_feature_lanes() {
+  if [[ ${want_sql} -eq 1 ]]; then
+    run_feature_lane sql -p ravel-server
+  fi
+  if [[ ${want_flight_sql} -eq 1 ]]; then
+    run_feature_lane flight-sql -p ravel-server -p ravel-sql
+  fi
+
+  # ravel-bench bench lanes. The ClickBench box builds
+  # `--features sql-latency,profiling` and `--features
+  # sql-latency,profiling,flight-lane`; gate the widest combination so a break
+  # in any of the three features (SQL corpus, profiling, Flight SQL bench) is
+  # caught locally. stage-timing is a separate lane CI checks and runs, kept at
+  # parity. saturation builds the ADR-1702 task 11 bins, which carry
+  # `required-features = ["saturation"]`, and runs their band tests; no other
+  # local gate compiles them.
+  if [[ ${want_bench} -eq 1 ]]; then
+    run_feature_lane sql-latency,profiling,flight-lane -p ravel-bench
+    run_feature_lane saturation -p ravel-bench
+    run cargo check --locked -p ravel-bench --features stage-timing --all-targets
+    run cargo test --locked -p ravel-bench --features stage-timing
+  fi
+
+  # stage-timing tests in the crates that declare the feature. The ravel-bench
+  # lane above enables ravel-logseg/stage-timing and ravel-ingest/stage-timing
+  # transitively, so it type-checks their production code, but a `-p
+  # ravel-bench` selection builds both as library dependencies and cargo never
+  # compiles a dependency's `#[cfg(test)]` module. Every `#[cfg(feature =
+  # "stage-timing")]` test in those two crates was therefore unreachable from
+  # any lane. This runs them. Not extended to services/ravel-cli: its
+  # stage-timing test is broken on main under issue #1522, and a lane running
+  # it would be red for an unrelated reason.
+  if [[ ${want_stage_timing} -eq 1 ]]; then
+    run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
+  fi
+}
+
+if [[ ${dry_run} -eq 1 ]]; then
+  echo "gates.sh: dry run; the cargo commands below are printed, not run, and fmt and the source guards are skipped"
+  run_cargo_gates
+  run_feature_lanes
+  exit 0
 fi
 
 # Linker OOM guard. On low-memory hosts (fleet executors run with 8 GB)
@@ -298,142 +495,8 @@ echo "==> scripts/guards/check-test-suites-run.sh"
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
 check_ingest_memory_flag_docs "${config_rs}"
 
-# The same tests as CI's `check` job, on the `ci` profile. CI runs them on
-# `ci-opt`, which is `ci` with third-party dependencies at opt-level 2
-# (ADR-0053, "check on ci-opt" amendment): CI restores a dependency cache
-# and pays for that optimisation once, a local or fleet run builds cold and
-# would pay it every time. So this run and CI's do not share artifacts, and
-# a test whose result depends on how dependencies are compiled can pass
-# here and fail there. To reproduce such a failure, run
-# `cargo nextest run --locked --workspace --cargo-profile ci-opt`.
-# Use nextest when it is installed; fall back to `cargo
-# test` (which every dev machine has) otherwise. nextest cannot run
-# doctests, so those always go through `cargo test --doc`, pinned to the
-# `ci` profile for consistency. `command -v` in an `if` condition does not
-# trip `set -e` when nextest is absent.
-if command -v cargo-nextest >/dev/null 2>&1; then
-  have_nextest=1
-else
-  have_nextest=0
-fi
-
-if [[ ${#crate_args[@]} -eq 0 ]]; then
-  echo "==> cargo clippy --locked --workspace --all-targets -- -D warnings"
-  cargo clippy --locked --workspace --all-targets -- -D warnings
-  if [[ ${have_nextest} -eq 1 ]]; then
-    echo "==> cargo nextest run --locked --workspace --cargo-profile ci"
-    cargo nextest run --locked --workspace --cargo-profile ci
-  else
-    echo "==> cargo test --locked --workspace"
-    cargo test --locked --workspace
-  fi
-  echo "==> cargo test --locked --doc --profile ci --workspace"
-  cargo test --locked --doc --profile ci --workspace
-else
-  echo "==> cargo clippy --locked ${crate_args[*]} --all-targets -- -D warnings"
-  cargo clippy --locked "${crate_args[@]}" --all-targets -- -D warnings
-  if [[ ${have_nextest} -eq 1 ]]; then
-    echo "==> cargo nextest run --locked ${crate_args[*]} --cargo-profile ci"
-    cargo nextest run --locked "${crate_args[@]}" --cargo-profile ci
-  else
-    echo "==> cargo test --locked ${crate_args[*]}"
-    cargo test --locked "${crate_args[@]}"
-  fi
-  echo "==> cargo test --locked --doc --profile ci ${crate_args[*]}"
-  cargo test --locked --doc --profile ci "${crate_args[@]}"
-fi
-
-# Feature-gated surfaces (issues #609, #616, #714, #732). ravel-server's `sql`
-# and `flight-sql` features, and ravel-bench's bench-lane features, are off by
-# default, so nothing above compiles the Flight SQL service, the bench lanes,
-# or their tests. The workspace run above does build ravel-server with `sql`
-# on, through ravel-cli's dev-dependency, but only together with the
-# dependency features the rest of the workspace adds: a break that shows with
-# `sql` selected on its own passes it. Without these lanes a local run prints "All
-# gates passed" on a tree CI rejects. That happened while rebasing #511: the
-# workspace gate was green and `--features sql` failed with E0061 on a call
-# site that had gone stale under a textually clean merge. It happened again for
-# ravel-bench: #712 merged on a receipt but went red in CI's features job
-# because gates.sh never built ravel-bench's sql-latency tests, and #724's
-# `flight-lane` feature left main uncompilable under
-# `--features sql-latency,profiling,flight-lane` because nothing gated it.
-#
-# Mirrors CI's `lint`, `flight-sql`, and `features` jobs. In scoped mode these
-# run only when the affected crates are named, so `-p ravel-logseg` does not
-# pay for a ravel-server build it did not ask for.
-run_feature_lane() {
-  local feature="$1"
-  shift
-  echo "==> cargo clippy --locked $* --features ${feature} --all-targets -- -D warnings"
-  cargo clippy --locked "$@" --features "${feature}" --all-targets -- -D warnings
-  if [[ ${have_nextest} -eq 1 ]]; then
-    echo "==> cargo nextest run --locked $* --features ${feature}"
-    cargo nextest run --locked "$@" --features "${feature}"
-  else
-    echo "==> cargo test --locked $* --features ${feature}"
-    cargo test --locked "$@" --features "${feature}"
-  fi
-}
-
-want_features=0
-want_bench=0
-want_stage_timing=0
-if [[ ${#crate_args[@]} -eq 0 ]]; then
-  want_features=1
-  want_bench=1
-  want_stage_timing=1
-else
-  for arg in "${crate_args[@]}"; do
-    case "${arg}" in
-      ravel-server | ravel-sql) want_features=1 ;;
-    esac
-    # ravel-bench's feature tests exercise these crates, so any of them in
-    # scope should pay for the bench lanes.
-    case "${arg}" in
-      ravel-bench | ravel-sql | ravel-query | ravel-ingest) want_bench=1 ;;
-    esac
-    # The crates that DECLARE stage-timing, and whose own cfg-gated tests the
-    # ravel-bench lane below cannot reach.
-    case "${arg}" in
-      ravel-bench | ravel-ingest | ravel-logseg) want_stage_timing=1 ;;
-    esac
-  done
-fi
-
-if [[ ${want_features} -eq 1 ]]; then
-  run_feature_lane sql -p ravel-server
-  run_feature_lane flight-sql -p ravel-server -p ravel-sql
-fi
-
-# ravel-bench bench lanes. The ClickBench box builds
-# `--features sql-latency,profiling` and `--features
-# sql-latency,profiling,flight-lane`; gate the widest combination so a break in
-# any of the three features (SQL corpus, profiling, Flight SQL bench) is caught
-# locally. stage-timing is a separate lane CI checks and runs, kept at parity.
-# saturation builds the ADR-1702 task 11 bins, which carry
-# `required-features = ["saturation"]`, and runs their band tests; no other
-# local gate compiles them.
-if [[ ${want_bench} -eq 1 ]]; then
-  run_feature_lane sql-latency,profiling,flight-lane -p ravel-bench
-  run_feature_lane saturation -p ravel-bench
-  echo "==> cargo check --locked -p ravel-bench --features stage-timing --all-targets"
-  cargo check --locked -p ravel-bench --features stage-timing --all-targets
-  echo "==> cargo test --locked -p ravel-bench --features stage-timing"
-  cargo test --locked -p ravel-bench --features stage-timing
-fi
-
-# stage-timing tests in the crates that declare the feature. The ravel-bench
-# lane above enables ravel-logseg/stage-timing and ravel-ingest/stage-timing
-# transitively, so it type-checks their production code, but a `-p ravel-bench`
-# selection builds both as library dependencies and cargo never compiles a
-# dependency's `#[cfg(test)]` module. Every `#[cfg(feature = "stage-timing")]`
-# test in those two crates was therefore unreachable from any lane. This runs
-# them. Not extended to services/ravel-cli: its stage-timing test is broken on
-# main under issue #1522, and a lane running it would be red for an unrelated
-# reason.
-if [[ ${want_stage_timing} -eq 1 ]]; then
-  run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
-fi
+run_cargo_gates
+run_feature_lanes
 
 # --- Gates-pass receipt ---------------------------------------------------
 # Record the tree this run passed. fleet-result-merge.sh honors

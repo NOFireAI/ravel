@@ -44,6 +44,11 @@
 # (the default, and the right choice whenever the merge touches more than
 # one crate). CI re-runs the full required checks on the PR regardless.
 #
+# After the gates (run or skipped) and before the push, the cleaned history
+# goes through scripts/guards/assert-struct-literals-current.sh <cleaned head>
+# origin/main. A non-zero exit stops the script there with the guard's output,
+# and nothing is pushed; ALLOW_STALE_SHAPE_SITES=1 lets an exit 1 through.
+#
 # FLEET_MERGE_DRY_RUN=1 stops after the history-cleaning step and prints the
 # cleaned commits without running gates, pushing, or opening a PR. Useful for
 # previewing the cleaned history; harmless in production but never lands
@@ -560,6 +565,29 @@ else
   git checkout -q --detach "${clean_ref}"
   "${script_dir}/gates.sh" "$@"
   git checkout -q "${start_checkout}"
+fi
+
+# The post-fork shape guard (issue #2811): a struct literal or call site that
+# landed on main after the result branch forked, written against a shape the
+# branch changes, breaks only once the merge queue rebases. Checked here,
+# before anything is pushed, so a hit costs no CI cycle and leaves no PR
+# branch behind. Exit 1 is a stale site; ALLOW_STALE_SHAPE_SITES=1 lets it
+# through for hits verified by hand as false positives, the same override
+# pr-review-status.sh honours. Any other non-zero means the guard could not
+# answer, and refuses too: no PR exists yet, so stopping loses nothing.
+echo "==> Checking post-fork struct literals and call sites against origin/main"
+shape_rc=0
+shape_out="$("${script_dir}/guards/assert-struct-literals-current.sh" "${clean_ref}" origin/main 2>&1)" || shape_rc=$?
+printf '%s\n' "${shape_out}"
+if [[ ${shape_rc} -eq 1 && "${ALLOW_STALE_SHAPE_SITES:-}" == "1" ]]; then
+  echo "==> NOTE: the shape guard's refusal was overridden with ALLOW_STALE_SHAPE_SITES=1; the sites above are unverified by this script"
+elif [[ ${shape_rc} -ne 0 ]]; then
+  echo "fleet-result-merge.sh: assert-struct-literals-current.sh exited ${shape_rc}; refusing to open a PR." >&2
+  if [[ ${shape_rc} -eq 1 ]]; then
+    echo "  Rebase the result branch onto origin/main and update each site above," >&2
+    echo "  or re-run with ALLOW_STALE_SHAPE_SITES=1 if every one is a false positive." >&2
+  fi
+  exit "${shape_rc}"
 fi
 
 echo "==> Pushing cleaned history to ${pr_branch}"
