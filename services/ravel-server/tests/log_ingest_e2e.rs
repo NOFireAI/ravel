@@ -568,13 +568,14 @@ async fn strict_arrival_header_acks_without_the_age_tick() {
     server.shutdown().await;
 }
 
-/// `strict` and an absent header mean "strict under the process default":
-/// both flush on arrival under `--strict-flush-policy arrival`, and neither
-/// opens a flush before the age threshold under the default `aged` policy.
+/// `strict`, an absent header and an unknown value mean "strict under the
+/// process default": each flushes on arrival under `--strict-flush-policy
+/// arrival`, and none opens a flush before the age threshold under the
+/// default `aged` policy.
 #[tokio::test]
 async fn strict_header_follows_the_process_default() {
     let server = strict_flush::start(StrictFlushPolicy::Arrival, Signal::Logs).await;
-    for (flushes, mode) in [(1, Some("strict")), (2, None)] {
+    for (flushes, mode) in [(1, Some("strict")), (2, None), (3, Some("not-a-mode"))] {
         let export = spawn_export(&server, mode, "process default log line");
         server.wait_for_data_put().await;
         assert_eq!(
@@ -595,17 +596,25 @@ async fn strict_header_follows_the_process_default() {
     server.assert_no_flush_yet(1).await;
     let absent = spawn_export(&server, None, "aged log line");
     server.assert_no_flush_yet(2).await;
+    let unknown = spawn_export(&server, Some("not-a-mode"), "aged log line");
+    server.assert_no_flush_yet(3).await;
 
-    let (strict, absent) = release_until(&server.gate, async {
+    let (strict, absent, unknown) = release_until(&server.gate, async {
         (
             strict.await.expect("export task"),
             absent.await.expect("export task"),
+            unknown.await.expect("export task"),
         )
     })
     .await;
     assert_strict_ack(&strict);
     assert_strict_ack(&absent);
-    assert_eq!(server.flushes_by_age().await, 1, "both rode one age flush");
+    assert_strict_ack(&unknown);
+    assert_eq!(
+        server.flushes_by_age().await,
+        1,
+        "all three rode one age flush"
+    );
     assert_eq!(server.flushes_by_arrival().await, 0);
     server.shutdown().await;
 }
