@@ -48,7 +48,11 @@
 //! buffer capacity: a round-robin `RepartitionExec`, a `SortExec` (TopK
 //! included) or a `SortPreservingMergeExec`, looking through the
 //! `ProjectionExec`, `FilterExec` and `CoalescePartitionsExec` nodes that sit
-//! between them, and above nothing else. The exec copies each over-charged
+//! between them, and above nothing else. The build (left) input of a
+//! `NestedLoopJoinExec` or a `CrossJoinExec` is one of those inputs too: both
+//! collect it and reserve `get_array_memory_size` per batch, while a
+//! `HashJoinExec` counts its build batches with a counter that charges a
+//! shared buffer once and is left alone. The exec copies each over-charged
 //! batch into new buffers that hold the bytes its rows reference, except for
 //! the columns named below that the copy keeps whole: the consumer then
 //! charges about the slice's own bytes.
@@ -130,6 +134,7 @@ use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -192,6 +197,16 @@ fn charges_by_capacity(node: &Arc<dyn ExecutionPlan>) -> bool {
     node.is::<SortExec>() || node.is::<SortPreservingMergeExec>()
 }
 
+/// True for a join that charges each batch of its child `index` by the
+/// capacity of the buffers it references. `NestedLoopJoinExec` and
+/// `CrossJoinExec` both collect their left (build) input, child 0, and
+/// reserve `get_array_memory_size` per batch; the right input is streamed.
+/// `HashJoinExec` is left out: it sizes its build batches through
+/// `RecordBatchMemoryCounter::count_batch`, which counts a shared buffer once.
+fn join_charges_child(node: &Arc<dyn ExecutionPlan>, index: usize) -> bool {
+    index == 0 && (node.is::<NestedLoopJoinExec>() || node.is::<CrossJoinExec>())
+}
+
 /// True for an operator above which a charge is a charge on the batches below
 /// it. A `ProjectionExec` passes the columns it does not compute on as the
 /// same arrays. A `FilterExec` whose predicate keeps every row of a batch
@@ -207,7 +222,8 @@ fn passes_batches_through(node: &Arc<dyn ExecutionPlan>) -> bool {
 
 /// Rewrite `node` and its subtree. `charged_above` is whether the nearest
 /// ancestor that is not a pass-through is a consumer that charges by
-/// capacity, which is the only thing the decision at an aggregate depends on.
+/// capacity, on the input this node feeds, which is the only thing the
+/// decision at an aggregate depends on.
 fn rewrite(node: Arc<dyn ExecutionPlan>, charged_above: bool) -> DFResult<Arc<dyn ExecutionPlan>> {
     let charged_below = if charges_by_capacity(&node) {
         true
@@ -220,8 +236,9 @@ fn rewrite(node: Arc<dyn ExecutionPlan>, charged_above: bool) -> DFResult<Arc<dy
     let children = node.children();
     let mut rewritten = Vec::with_capacity(children.len());
     let mut changed = false;
-    for child in children {
-        let new_child = rewrite(Arc::clone(child), charged_below)?;
+    for (index, child) in children.into_iter().enumerate() {
+        let charged = charged_below || join_charges_child(&node, index);
+        let new_child = rewrite(Arc::clone(child), charged)?;
         changed |= !Arc::ptr_eq(child, &new_child);
         rewritten.push(new_child);
     }
@@ -679,6 +696,7 @@ mod tests {
     use datafusion::physical_expr::expressions::{binary, col, lit};
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::{collect, displayable};
 
     /// Rows per batch in the sliced-batch tests, and the number of pieces
@@ -1604,5 +1622,128 @@ mod tests {
             LexOrdering::new([PhysicalSortExpr::new_default(col("v", &schema).expect("v"))])
                 .expect("one sort key");
         Arc::new(SortExec::new(ordering, input).with_fetch(Some(10)))
+    }
+
+    /// Which side of a two-input join an aggregate sits on.
+    #[derive(Clone, Copy, Debug)]
+    enum Side {
+        Left,
+        Right,
+    }
+
+    /// `(left, right)` join inputs: a single aggregate on `side` (behind a
+    /// `CoalescePartitionsExec`, as the planner gives a collected build side
+    /// one partition) and a plain scan on the other.
+    fn join_inputs(side: Side) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
+        let aggregated: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(single(scan(4))));
+        match side {
+            Side::Left => (aggregated, scan(1)),
+            Side::Right => (scan(1), aggregated),
+        }
+    }
+
+    /// The number of execs the rule places in `plan`, and whether the one
+    /// it places (if any) sits directly above the `AggregateExec`.
+    fn execs_above_the_aggregate(plan: Arc<dyn ExecutionPlan>) -> (usize, bool) {
+        let after = plan_text(&optimize(plan));
+        let execs = lines_starting_with(&after, "CompactSlicesExec");
+        let aggregate = lines_starting_with(&after, "AggregateExec: mode=Single");
+        assert_eq!(aggregate.len(), 1, "{after}");
+        let adjacent = execs.len() == 1 && aggregate == vec![execs[0] + 1];
+        (execs.len(), adjacent)
+    }
+
+    fn nested_loop_join(side: Side) -> Arc<dyn ExecutionPlan> {
+        let (left, right) = join_inputs(side);
+        Arc::new(
+            NestedLoopJoinExec::try_new(
+                left,
+                right,
+                None,
+                &datafusion::common::JoinType::Inner,
+                None,
+            )
+            .expect("nested loop join"),
+        )
+    }
+
+    fn cross_join(side: Side) -> Arc<dyn ExecutionPlan> {
+        let (left, right) = join_inputs(side);
+        Arc::new(CrossJoinExec::new(left, right))
+    }
+
+    /// A nested loop join collects its left input and charges each batch by
+    /// capacity, so an aggregate there gets one exec directly above it; its
+    /// right input is streamed, and an aggregate there gets none.
+    ///
+    /// FLIP: make `join_charges_child` return `false` for a
+    /// `NestedLoopJoinExec` and the left count is 0; make it ignore `index`
+    /// and the right count is 1.
+    #[test]
+    fn an_aggregate_on_a_nested_loop_joins_build_side_gets_one_exec() {
+        assert_eq!(
+            execs_above_the_aggregate(nested_loop_join(Side::Left)),
+            (1, true),
+            "the left (build) side"
+        );
+        assert_eq!(
+            execs_above_the_aggregate(nested_loop_join(Side::Right)),
+            (0, false),
+            "the right (probe) side"
+        );
+    }
+
+    /// A cross join collects its left input and charges each batch by
+    /// capacity, so an aggregate there gets one exec directly above it; its
+    /// right input is streamed, and an aggregate there gets none.
+    ///
+    /// FLIP: make `join_charges_child` return `false` for a `CrossJoinExec`
+    /// and the left count is 0; make it ignore `index` and the right count
+    /// is 1.
+    #[test]
+    fn an_aggregate_on_a_cross_joins_build_side_gets_one_exec() {
+        assert_eq!(
+            execs_above_the_aggregate(cross_join(Side::Left)),
+            (1, true),
+            "the left (build) side"
+        );
+        assert_eq!(
+            execs_above_the_aggregate(cross_join(Side::Right)),
+            (0, false),
+            "the right (probe) side"
+        );
+    }
+
+    /// A hash join counts its build batches with `count_batch`, which
+    /// charges a shared buffer once, so an aggregate on either side gets
+    /// nothing.
+    ///
+    /// FLIP: make `join_charges_child` return `true` for child 0 of a
+    /// `HashJoinExec` and the left count is 1.
+    #[test]
+    fn an_aggregate_under_a_hash_join_gets_nothing() {
+        for side in [Side::Left, Side::Right] {
+            let (left, right) = join_inputs(side);
+            let on = vec![(
+                col("k", &left.schema()).expect("left k"),
+                col("k", &right.schema()).expect("right k"),
+            )];
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(
+                HashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    None,
+                    &datafusion::common::JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    datafusion::common::NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .expect("hash join"),
+            );
+            assert_eq!(execs_above_the_aggregate(plan), (0, false), "{side:?}");
+        }
     }
 }
