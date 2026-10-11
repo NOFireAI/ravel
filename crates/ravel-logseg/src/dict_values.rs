@@ -108,10 +108,7 @@ impl DictValues {
     pub(crate) fn from_entries(entries: &[Vec<u8>]) -> Result<Self, LogSegError> {
         let total: usize = entries.iter().map(Vec::len).sum();
         check_offset_range(entries.len(), total)?;
-        let texts: Vec<Option<&str>> = entries
-            .iter()
-            .map(|e| validate_entry(e))
-            .collect();
+        let texts: Vec<Option<&str>> = entries.iter().map(|e| validate_entry(e)).collect();
         let mut valid = Validity::unset(entries.len());
         for (k, t) in texts.iter().enumerate() {
             if t.is_some() {

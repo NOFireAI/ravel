@@ -2538,8 +2538,7 @@ mod tests {
         }
 
         // A block's own (tag 7) dictionary is charged in full.
-        let own = DictColumn::new(Arc::clone(&values), &[true; 2], vec![0, 0], false)
-            .expect("own");
+        let own = DictColumn::new(Arc::clone(&values), &[true; 2], vec![0, 0], false).expect("own");
         assert_eq!(own.heap_bytes(), 2 * 4 + 8 + values.heap_bytes());
     }
 
