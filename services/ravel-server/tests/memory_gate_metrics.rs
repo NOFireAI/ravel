@@ -106,17 +106,60 @@ async fn scrape(client: &reqwest::Client, base: &str) -> String {
     response.text().await.expect("metrics body is text")
 }
 
-const FAMILIES: [(&str, &str); 10] = [
-    ("ravel_memory_gate_available_bytes", "gauge"),
-    ("ravel_memory_gate_available_floor_bytes", "gauge"),
-    ("ravel_memory_gate_purge_floor_bytes", "gauge"),
-    ("ravel_memory_gate_resident_bytes", "gauge"),
-    ("ravel_memory_gate_purges_total", "counter"),
-    ("ravel_memory_gate_samples_total", "counter"),
-    ("ravel_memory_gate_epoch_refresh_seconds_total", "counter"),
-    ("ravel_memory_gate_purge_seconds", "histogram"),
-    ("ravel_memory_gate_refusals_total", "counter"),
-    ("ravel_memory_budget_refusals_total", "counter"),
+/// Each family, its type, and a phrase its HELP line must carry: the one
+/// that tells it from its neighbour (the two floors, the two refusal
+/// counters), so a renderer that swaps two families' text fails here.
+const FAMILIES: [(&str, &str, &str); 10] = [
+    (
+        "ravel_memory_gate_available_bytes",
+        "gauge",
+        "Host available memory as the memory gate sampler last read it",
+    ),
+    (
+        "ravel_memory_gate_available_floor_bytes",
+        "gauge",
+        "close floor (--memory-gate-min-available-bytes)",
+    ),
+    (
+        "ravel_memory_gate_purge_floor_bytes",
+        "gauge",
+        "purge floor (--memory-gate-purge-available-bytes)",
+    ),
+    (
+        "ravel_memory_gate_resident_bytes",
+        "gauge",
+        "jemalloc stats.resident as the memory gate sampler last read it",
+    ),
+    (
+        "ravel_memory_gate_purges_total",
+        "counter",
+        "Forced jemalloc purges the memory gate sampler ran",
+    ),
+    (
+        "ravel_memory_gate_samples_total",
+        "counter",
+        "Memory gate samples that read host available memory",
+    ),
+    (
+        "ravel_memory_gate_epoch_refresh_seconds_total",
+        "counter",
+        "Wall time the memory gate sampler spent reading host available memory",
+    ),
+    (
+        "ravel_memory_gate_purge_seconds",
+        "histogram",
+        "Wall time of each forced jemalloc purge",
+    ),
+    (
+        "ravel_memory_gate_refusals_total",
+        "counter",
+        "refused because the memory gate was closed on host available memory",
+    ),
+    (
+        "ravel_memory_budget_refusals_total",
+        "counter",
+        "refused because the process memory budget's ledger was full",
+    ),
 ];
 
 /// The value of the one `name{mode="query"}` sample in `body`.
@@ -132,11 +175,29 @@ fn value(body: &str, name: &str) -> f64 {
 }
 
 fn assert_every_family(body: &str) {
-    for (name, kind) in FAMILIES {
+    for (name, kind, help_mentions) in FAMILIES {
         assert_eq!(
             body.matches(&format!("# TYPE {name} {kind}\n")).count(),
             1,
             "{name}:\n{body}"
+        );
+        let help_prefix = format!("# HELP {name} ");
+        let help_lines: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix(&help_prefix))
+            .collect();
+        assert_eq!(help_lines.len(), 1, "{name} HELP:\n{body}");
+        assert!(
+            help_lines[0].contains(help_mentions),
+            "{name} HELP {:?} does not mention {help_mentions:?}",
+            help_lines[0]
+        );
+        assert!(
+            body.contains(&format!(
+                "{help_prefix}{}\n# TYPE {name} {kind}\n",
+                help_lines[0]
+            )),
+            "{name} HELP is not directly above its TYPE line:\n{body}"
         );
     }
     for site in ["admission", "reserve", "grow"] {
@@ -152,11 +213,14 @@ fn assert_every_family(body: &str) {
 
 /// Floors above any host's available memory put every reading below both,
 /// so each sample closes the gate, the first one purges, and the scrape
-/// shows the purge, the readings and both floors.
+/// shows the purge, the readings and both floors. The floors are 4 and 8
+/// PiB: above any host, and each exactly representable as an f64 and
+/// distinct from the other once rendered, so a renderer that swaps the two
+/// floor families fails the value assertions below.
 #[tokio::test]
 async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
-    const CLOSE_FLOOR: u64 = u64::MAX - 1;
-    const PURGE_FLOOR: u64 = u64::MAX;
+    const CLOSE_FLOOR: u64 = 1 << 52;
+    const PURGE_FLOOR: u64 = 1 << 53;
 
     let running = start_test_server().await;
     let base = format!("http://{}", running.http_addr);
@@ -186,7 +250,7 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         interval_ms: 10,
         wait_ms: memory_gate::DEFAULT_WAIT_MS,
         memory_budget_bytes: 100,
-        host_memory_source: HostMemorySource::MemInfo,
+        available_source: HostMemorySource::MemInfo,
         source: memory_gate::SOURCE_FLAG,
     };
     let budget = running.process_memory_budget();
@@ -206,6 +270,9 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_every_family(&body);
+    // Each family's value: the two floors as set (and distinct from each
+    // other), the two readings real figures below both floors, the counters
+    // moved, and the purge histogram's count equal to the purge counter.
     assert_eq!(
         value(&body, "ravel_memory_gate_available_floor_bytes"),
         CLOSE_FLOOR as f64
@@ -214,20 +281,38 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         value(&body, "ravel_memory_gate_purge_floor_bytes"),
         PURGE_FLOOR as f64
     );
+    assert_ne!(CLOSE_FLOOR as f64, PURGE_FLOOR as f64);
+    let available = value(&body, "ravel_memory_gate_available_bytes");
     assert!(
-        value(&body, "ravel_memory_gate_available_bytes") >= 1.0,
+        available >= 1.0 && available < CLOSE_FLOOR as f64,
+        "available {available}:\n{body}"
+    );
+    let resident = value(&body, "ravel_memory_gate_resident_bytes");
+    assert!(
+        resident >= 1.0 && resident < CLOSE_FLOOR as f64,
+        "resident {resident}:\n{body}"
+    );
+    let purges = value(&body, "ravel_memory_gate_purges_total");
+    assert!(purges >= 1.0, "{body}");
+    assert_eq!(
+        value(&body, "ravel_memory_gate_purge_seconds_count"),
+        purges,
         "{body}"
     );
     assert!(
-        value(&body, "ravel_memory_gate_resident_bytes") >= 1.0,
+        value(&body, "ravel_memory_gate_purge_seconds_sum") >= 0.0,
         "{body}"
     );
+    let inf_bucket = "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"+Inf\"} ";
+    let inf_count: f64 = body
+        .lines()
+        .find_map(|line| line.strip_prefix(inf_bucket))
+        .expect("the +Inf bucket renders")
+        .parse()
+        .expect("bucket count parses");
+    assert_eq!(inf_count, purges, "{body}");
     assert!(
-        value(&body, "ravel_memory_gate_purges_total") >= 1.0,
-        "{body}"
-    );
-    assert!(
-        value(&body, "ravel_memory_gate_samples_total") >= 1.0,
+        value(&body, "ravel_memory_gate_samples_total") >= purges,
         "{body}"
     );
     assert!(
@@ -236,6 +321,30 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
     );
     assert!(!budget.gate_open());
     assert_eq!(budget.gate_floor(), CLOSE_FLOOR);
+
+    // A reservation against the closed gate counts on the reserve site of
+    // the gate's refusal family, and not on the ledger's.
+    let refused = budget
+        .try_reserve(1)
+        .expect_err("a closed gate refuses one byte");
+    assert!(matches!(
+        refused.cause,
+        ravel_memory::ExhaustionCause::HostMemory {
+            floor: CLOSE_FLOOR,
+            ..
+        }
+    ));
+    let body = scrape(&client, &base).await;
+    let site = |family: &str, site: &str| -> f64 {
+        let prefix = format!("{family}{{mode=\"query\",site=\"{site}\"}} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("{prefix} in {body}"))
+            .parse()
+            .expect("refusal count parses")
+    };
+    assert!(site("ravel_memory_gate_refusals_total", "reserve") >= 1.0);
+    assert_eq!(site("ravel_memory_budget_refusals_total", "reserve"), 0.0);
 
     running.shutdown().await.expect("graceful shutdown");
 }
