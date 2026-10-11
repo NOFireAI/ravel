@@ -366,39 +366,74 @@ check "scenario 2 never seals from the last ack" "0" \
 # a baseline of 0 is a rise.
 # ---------------------------------------------------------------------------
 
-# Modelled on tracing's default fmt output for publish.rs:331 and the pass
-# line in services/ravel-server/src/maintain.rs.
-PUB_LINE='2026-10-10T05:30:00Z  INFO ravel_maintain::publish: compaction record published key=k parts=1'
+# Modelled on tracing's default fmt output for MergeInFlight::start in
+# crates/ravel-maintain/src/compact.rs, the publish line in publish.rs, and
+# the pass line in services/ravel-server/src/maintain.rs. The bucket= / key=
+# relation is pinned on the Rust side by
+# merge_start_line_names_the_prefix_of_the_published_key.
+BUCKET_X='t/0123456789abcdef/m/c/0001/2026101004/'
+BUCKET_Y='t/0123456789abcdef/m/c/0002/2026101004/'
+BUCKET_Z='t/0123456789abcdef/m/c/0003/2026101004/'
+start_line() { printf '2026-10-10T05:30:00Z  INFO ravel_maintain::compact: compaction merge started bucket=%s\n' "$1"; }
+pub_line() { printf '2026-10-10T05:30:01Z  INFO ravel_maintain::publish: compaction record published key=%sl1.00112233445566ff.cmt parts=1\n' "$1"; }
+PUB_LINE="$(pub_line "${BUCKET_X}")"
+OTHER_LINE='2026-10-10T05:29:00Z  INFO ravel_server: other work'
 pass_line() { printf '2026-10-10T05:30:0%sZ  INFO ravel_server::maintain: maintenance: retention + compaction pass complete tenant=ab signal=Metrics shard=%s retired=0 compacted=%s already_done=0 not_sealed=0\n' "$1" "$1" "$2"; }
-LOG_PUBLISHED="${SCRATCH}/published.log"
-LOG_SILENT="${SCRATCH}/silent.log"
-LOG_A_FINISHED="${SCRATCH}/a-finished.log"
-LOG_A_UNIT2="${SCRATCH}/a-unit2.log"
-printf '%s\n' "${PUB_LINE}" >"${LOG_PUBLISHED}"
-printf '2026-10-10T05:30:00Z  INFO ravel_maintain: maintain pass compacted=0\n' >"${LOG_SILENT}"
-# A published every unit it started: the pass ended after its publish.
-{ printf '%s\n' "${PUB_LINE}"; pass_line 0 1; pass_line 1 0; } >"${LOG_A_FINISHED}"
-# A published unit 1 and was still merging unit 2 at the kill: its pass had
-# not ended, so no pass line follows the publish.
-{ printf '%s\n' "${PUB_LINE}"; printf '2026-10-10T05:30:01Z  INFO ravel_server: other work\n'; } >"${LOG_A_UNIT2}"
-LOG_A_LATER_PUBLISH="${SCRATCH}/a-later-publish.log"
-{ printf '%s\n' "${PUB_LINE}"; pass_line 0 1; printf '%s\n' "${PUB_LINE}"; } >"${LOG_A_LATER_PUBLISH}"
+# A published X, then started Y and was killed merging it.
+LOG_A_MERGING="${SCRATCH}/a-merging.log"
+{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; } >"${LOG_A_MERGING}"
+# A was killed in its first merge, Y, having published nothing.
+LOG_A_FIRST="${SCRATCH}/a-first.log"
+{ printf '%s\n' "${OTHER_LINE}"; start_line "${BUCKET_Y}"; } >"${LOG_A_FIRST}"
+# A published every merge it started.
+LOG_A_ALL_DONE="${SCRATCH}/a-all-done.log"
+{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; pass_line 0 1; } >"${LOG_A_ALL_DONE}"
+# A started no merge at all.
+LOG_A_NO_START="${SCRATCH}/a-no-start.log"
+{ printf '%s\n' "${OTHER_LINE}"; pass_line 0 0; } >"${LOG_A_NO_START}"
+# B's logs carry one line before the kill (line count 1), then: nothing; a
+# publish of Z, its own bucket; a publish of Y, A's interrupted bucket.
+LOG_B_SILENT="${SCRATCH}/b-silent.log"
+printf '%s\n' "${OTHER_LINE}" >"${LOG_B_SILENT}"
+LOG_B_OTHER="${SCRATCH}/b-other.log"
+{ printf '%s\n' "${OTHER_LINE}"; pub_line "${BUCKET_Z}"; } >"${LOG_B_OTHER}"
+LOG_B_SAME="${SCRATCH}/b-same.log"
+{ printf '%s\n' "${OTHER_LINE}"; pub_line "${BUCKET_Y}"; } >"${LOG_B_SAME}"
+# B published Y only before the kill.
+LOG_B_PRE_KILL="${SCRATCH}/b-pre-kill.log"
+{ pub_line "${BUCKET_Y}"; printf '%s\n' "${OTHER_LINE}"; } >"${LOG_B_PRE_KILL}"
 
-unfinished() { rc_of compaction_unfinished_in_log "$1"; }
-check "unfinished: no publish at all" "0" "$(unfinished "$(cat "${LOG_SILENT}")")"
-check "unfinished: a publish with no pass line after it" "0" "$(unfinished "${PUB_LINE}")"
-check "unfinished: a publish followed by a compacted>=1 pass line is finished" "1" \
-  "$(unfinished "$(cat "${LOG_A_FINISHED}")")"
-check "unfinished: a compacted=0 pass line after the publish does not finish it" "0" \
-  "$(unfinished "${PUB_LINE}"$'\n'"$(pass_line 0 0)")"
-check "unfinished: a publish with its pass still running" "0" \
-  "$(unfinished "$(cat "${LOG_A_UNIT2}")")"
-check "unfinished: a publish after the last finished pass" "0" \
-  "$(unfinished "$(cat "${LOG_A_LATER_PUBLISH}")")"
-check "unfinished: already_done=1 is not compacted=1" "0" \
-  "$(unfinished "${PUB_LINE}"$'\n''x maintenance: retention + compaction pass complete compacted=0 already_done=1')"
-check "unfinished: pass line read through ANSI colouring" "1" \
-  "$(unfinished "${PUB_LINE}"$'\n\e[32m INFO\e[0m maintenance: retention + compaction pass complete \e[3mcompacted\e[0m\e[2m=\e[0m2')"
+interrupted() { local out rc=0; out="$(chaos_interrupted_bucket "$@")" || rc=$?; printf 'rc=%s %s\n' "${rc}" "${out}"; }
+check "interrupted: the last start with no publish after it" "rc=0 ${BUCKET_Y}" \
+  "$(interrupted "${LOG_A_MERGING}")"
+check "interrupted: a first merge with no publish at all" "rc=0 ${BUCKET_Y}" \
+  "$(interrupted "${LOG_A_FIRST}")"
+check "interrupted: every start published is none" "rc=1 " "$(interrupted "${LOG_A_ALL_DONE}")"
+check "interrupted: no start line is none" "rc=1 " "$(interrupted "${LOG_A_NO_START}")"
+check "interrupted: a missing log is none" "rc=1 " "$(interrupted "${SCRATCH}/no-such.log")"
+LOG_A_CONCURRENT="${SCRATCH}/a-concurrent.log"
+{ start_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; pub_line "${BUCKET_Y}"; } >"${LOG_A_CONCURRENT}"
+check "interrupted: concurrent merges, the later one published, the earlier is interrupted" \
+  "rc=0 ${BUCKET_X}" "$(interrupted "${LOG_A_CONCURRENT}")"
+LOG_A_RESTART="${SCRATCH}/a-restart.log"
+{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; start_line "${BUCKET_X}"; } >"${LOG_A_RESTART}"
+check "interrupted: a publish before a later start of the same bucket does not match it" \
+  "rc=0 ${BUCKET_X}" "$(interrupted "${LOG_A_RESTART}")"
+LOG_A_ANSI="${SCRATCH}/a-ansi.log"
+printf '\e[32m INFO\e[0m \e[2mravel_maintain::compact\e[0m\e[2m:\e[0m compaction merge started \e[3mbucket\e[0m\e[2m=\e[0m%s\n' \
+  "${BUCKET_Y}" >"${LOG_A_ANSI}"
+check "interrupted: a start line read through ANSI colouring" "rc=0 ${BUCKET_Y}" \
+  "$(interrupted "${LOG_A_ANSI}")"
+published() { rc_of chaos_published_bucket_since "$@"; }
+check "published: a publish of the bucket past the line count" "0" \
+  "$(published "${LOG_B_SAME}" 1 "${BUCKET_Y}")"
+check "published: a publish of another bucket does not count" "1" \
+  "$(published "${LOG_B_OTHER}" 1 "${BUCKET_Y}")"
+check "published: a publish before the line count does not count" "1" \
+  "$(published "${LOG_B_PRE_KILL}" 1 "${BUCKET_Y}")"
+check "published: a prefix of a longer bucket does not count" "1" \
+  "$(published "${LOG_B_SAME}" 1 't/0123456789abcdef/m/c/')"
+check "published: an empty bucket never counts" "1" "$(published "${LOG_B_SAME}" 0 "")"
 
 # The scenario-2 trigger reads ravel_maintain_compactions_in_flight, as
 # render_maintain_ownership_family renders it.
@@ -409,6 +444,8 @@ inflight_body() {
 inflight_wait() { METRICS_SAMPLE="$1" rc_of wait_for_compaction_in_flight http://stub 1; }
 check "in-flight trigger fires on the gauge at 1" "0" "$(inflight_wait "$(inflight_body 1)")"
 check "in-flight trigger does not fire on the gauge at 0" "1" "$(inflight_wait "$(inflight_body 0)")"
+check "in-flight trigger scrapes once before it reads a deadline already past" "0" \
+  "$(METRICS_SAMPLE="$(inflight_body 1)" rc_of wait_for_compaction_in_flight http://stub 0)"
 check "in-flight trigger does not fire with the gauge absent" "1" "$(inflight_wait "${METRICS_SAMPLE}")"
 check "in-flight trigger does not fire on an unreachable worker" "1" \
   "$(CURL_MODE=unreachable rc_of wait_for_compaction_in_flight http://stub 1)"
@@ -422,26 +459,37 @@ check "in-flight trigger scrapes more than once a second at the poll interval" "
 check "in-flight trigger records the units owned it read" "4" \
   "$(METRICS_SAMPLE="$(inflight_body 1)" wait_for_compaction_in_flight http://stub 1 >/dev/null 2>&1; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
 
-# Args: A's log, B's log, aborts baseline.
-cons() { rc_of oracle_conservation_or_unmeasured "$1" http://stub "${3:-1}" "$2"; }
-check "classifier: A finished its pass, B silent is could-not-measure (3)" "3" \
-  "$(cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
-check "classifier: B published passes conservation" "0" \
-  "$(cons "${LOG_SILENT}" "${LOG_PUBLISHED}")"
-check "classifier: A published nothing, B silent is could-not-measure (3)" "3" \
-  "$(cons "${LOG_SILENT}" "${LOG_SILENT}")"
-check "classifier: A published nothing, B aborts rose still fails" "1" \
-  "$(cons "${LOG_SILENT}" "${LOG_SILENT}" 0)"
-check "classifier: A published with no pass end, B silent fails conservation" "1" \
-  "$(cons "${LOG_PUBLISHED}" "${LOG_SILENT}")"
-check "classifier: A published unit 1, started unit 2, B silent fails conservation" "1" \
-  "$(cons "${LOG_A_UNIT2}" "${LOG_SILENT}")"
-check "classifier: B aborts rose (1 against 0), A finished, B silent fails" "1" \
-  "$(cons "${LOG_A_FINISHED}" "${LOG_SILENT}" 0)"
-check "classifier: B aborts rose (1 against 0), B published still fails" "1" \
-  "$(cons "${LOG_SILENT}" "${LOG_PUBLISHED}" 0)"
-check "classifier: unreadable aborts counter fails even when A finished" "1" \
-  "$(CURL_MODE=unreachable cons "${LOG_A_FINISHED}" "${LOG_SILENT}")"
+# Args: A's log, B's log, aborts baseline, CHAOS_KILL_ON_GAUGE. B's line
+# count at the kill is 1, and the wait is 0 (one read).
+cons() {
+  CHAOS_KILL_ON_GAUGE="${4:-1}" rc_of oracle_conservation_or_unmeasured "$1" http://stub "${3:-1}" "$2" 1
+}
+check "classifier: B published another bucket after the kill, not A's, fails" "1" \
+  "$(cons "${LOG_A_MERGING}" "${LOG_B_OTHER}")"
+check "classifier: B published A's interrupted bucket after the kill passes" "0" \
+  "$(cons "${LOG_A_MERGING}" "${LOG_B_SAME}")"
+check "classifier: gauge seen, A killed in its first merge, B silent fails" "1" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_SILENT}")"
+check "classifier: gauge seen, A killed in its first merge, B published it passes" "0" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_SAME}")"
+check "classifier: gauge never seen is could-not-measure (3)" "3" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_SILENT}" 1 0)"
+check "classifier: gauge never seen is could-not-measure even with a B publish" "3" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_SAME}" 1 0)"
+check "classifier: A's log has no unmatched start is could-not-measure (3)" "3" \
+  "$(cons "${LOG_A_ALL_DONE}" "${LOG_B_SILENT}")"
+check "classifier: A's log has no start at all is could-not-measure (3)" "3" \
+  "$(cons "${LOG_A_NO_START}" "${LOG_B_OTHER}")"
+check "classifier: B published A's bucket only before the kill fails" "1" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_PRE_KILL}")"
+check "classifier: B aborts rose (1 against 0), gauge never seen, still fails" "1" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_SILENT}" 0 0)"
+check "classifier: B aborts rose (1 against 0), B published A's bucket still fails" "1" \
+  "$(cons "${LOG_A_FIRST}" "${LOG_B_SAME}" 0)"
+check "classifier: unreadable aborts counter fails even when unmeasurable" "1" \
+  "$(CURL_MODE=unreachable cons "${LOG_A_ALL_DONE}" "${LOG_B_SILENT}")"
+check "classifier: a non-integer line count fails conservation" "1" \
+  "$(CHAOS_KILL_ON_GAUGE=1 rc_of oracle_conservation_or_unmeasured "${LOG_A_FIRST}" http://stub 1 "${LOG_B_SAME}" x)"
 
 LOG_ACTIVITY="${SCRATCH}/activity.log"
 { printf '%s\n' "${PUB_LINE}"; pass_line 0 1; pass_line 1 0; printf '%s\n' "${PUB_LINE}"; pass_line 2 3; } >"${LOG_ACTIVITY}"
@@ -487,21 +535,6 @@ flush_wait_seconds() {
 check "flush wait: a slow /metrics stops at the deadline (at most 4 s for a 1 s deadline)" "yes" \
   "$([[ "$(flush_wait_seconds)" -le 4 ]] && echo yes || echo no)"
 
-# Both workers run before the kill: B's publish counts only past its line
-# count at the kill. Args: A's log, B's log, B's line count at the kill.
-cons_from() { rc_of oracle_conservation_or_unmeasured "$1" http://stub 1 "$2" "$3"; }
-LOG_B_PRE_KILL="${SCRATCH}/b-pre-kill.log"
-{ printf '%s\n' "${PUB_LINE}"; printf '2026-10-10T05:31:00Z  INFO ravel_server: other work\n'; } >"${LOG_B_PRE_KILL}"
-LOG_B_POST_KILL="${SCRATCH}/b-post-kill.log"
-{ printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n'; printf '%s\n' "${PUB_LINE}"; } >"${LOG_B_POST_KILL}"
-check "classifier: B published only before the kill, A unfinished fails conservation" "1" \
-  "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_PRE_KILL}" 1)"
-check "classifier: B published only before the kill, A finished is could-not-measure" "3" \
-  "$(cons_from "${LOG_A_FINISHED}" "${LOG_B_PRE_KILL}" 1)"
-check "classifier: B published after the kill passes" "0" \
-  "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_POST_KILL}" 1)"
-check "classifier: a non-integer line count fails conservation" "1" \
-  "$(cons_from "${LOG_A_UNIT2}" "${LOG_B_POST_KILL}" x)"
 check "chaos_line_count counts lines" "2" "$(chaos_line_count "${LOG_B_PRE_KILL}")"
 check "chaos_line_count of a missing file is 0" "0" "$(chaos_line_count "${SCRATCH}/no-such.log")"
 printf 'a\nb' >"${SCRATCH}/no-final-newline.log"
@@ -518,22 +551,22 @@ scenario2_summary() {
   ORACLE_FAIL=()
   ORACLE_UNMEASURED=()
   [[ -n "$4" ]] && ORACLE_FAIL=("$4")
-  oracle_conservation_or_unmeasured "$1" http://stub "$3" "$2" >/dev/null 2>&1
+  CHAOS_KILL_ON_GAUGE=1 oracle_conservation_or_unmeasured "$1" http://stub "$3" "$2" 1 >/dev/null 2>&1
   local rc=0
   print_oracle_summary scenario blocking >"${SCRATCH}/summary.out" 2>&1 || rc=$?
   printf 'rc=%s conservation-fail=%s\n' "${rc}" \
     "$(grep -c '^  FAIL  conservation-holds' "${SCRATCH}/summary.out")"
 }
 check "summary: could-not-measure with nothing failed exits 3" "rc=3 conservation-fail=0" \
-  "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 1 "")"
+  "$(scenario2_summary "${LOG_A_ALL_DONE}" "${LOG_B_SILENT}" 1 "")"
 check "summary: could-not-measure never hides a failure (exit 2)" "rc=2 conservation-fail=0" \
-  "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 1 "no-orphaned-lease: detail")"
+  "$(scenario2_summary "${LOG_A_ALL_DONE}" "${LOG_B_SILENT}" 1 "no-orphaned-lease: detail")"
 check "summary: B aborts rose while A finished and published is exit 2, conservation FAIL" \
-  "rc=2 conservation-fail=1" "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 0 "")"
-check "summary: A started unit 2, B published nothing is exit 2" "rc=2 conservation-fail=1" \
-  "$(scenario2_summary "${LOG_A_UNIT2}" "${LOG_SILENT}" 1 "")"
-check "summary: A published every unit it started, B nothing is exit 3" "rc=3 conservation-fail=0" \
-  "$(scenario2_summary "${LOG_A_FINISHED}" "${LOG_SILENT}" 1 "")"
+  "rc=2 conservation-fail=1" "$(scenario2_summary "${LOG_A_ALL_DONE}" "${LOG_B_SILENT}" 0 "")"
+check "summary: A interrupted in Y, B published only Z is exit 2" "rc=2 conservation-fail=1" \
+  "$(scenario2_summary "${LOG_A_MERGING}" "${LOG_B_OTHER}" 1 "")"
+check "summary: A interrupted in Y, B published Y is exit 0" "rc=0 conservation-fail=0" \
+  "$(scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SAME}" 1 "")"
 
 scenario2_body="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"
 universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"
@@ -551,18 +584,19 @@ check "scenario 2 headers make no 'provably' claim" "no" \
 check "scenario 2 triggers on the gauge, not on worker A's log" "yes" \
   "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
 
-# The conservation oracle waits, from the kill, for a survivor publish that
-# lands after the kill line. Args: A's log, B's log, wait seconds. B's log
-# starts as one pre-kill line, so the kill line count is 1.
+# The conservation oracle waits, from the kill, for a survivor publish of A's
+# interrupted bucket that lands after the kill line. Args: A's log, B's log,
+# wait seconds. B's log starts as one pre-kill line, so the kill line count
+# is 1. The gauge was seen unless a case says otherwise.
 LOG_B_WAIT="${SCRATCH}/b-wait.log"
 cons_wait() {
-  CHAOS_CONSERVATION_WAIT_SECONDS="$3" \
+  CHAOS_KILL_ON_GAUGE="${CHAOS_KILL_ON_GAUGE:-1}" CHAOS_CONSERVATION_WAIT_SECONDS="$3" \
     rc_of oracle_conservation_or_unmeasured "$1" http://stub 1 "$2" 1 "$(date +%s)"
 }
-printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n' >"${LOG_B_WAIT}"
-( sleep 1; printf '%s\n' "${PUB_LINE}" >>"${LOG_B_WAIT}" ) &
-check "conservation wait: a publish landing during the wait passes" "0" \
-  "$(cons_wait "${LOG_A_UNIT2}" "${LOG_B_WAIT}" 5)"
+printf '%s\n' "${OTHER_LINE}" >"${LOG_B_WAIT}"
+( sleep 1; pub_line "${BUCKET_Y}" >>"${LOG_B_WAIT}" ) &
+check "conservation wait: a publish of A's bucket landing during the wait passes" "0" \
+  "$(CHAOS_KILL_ON_GAUGE=1 cons_wait "${LOG_A_FIRST}" "${LOG_B_WAIT}" 5)"
 wait
 cons_wait_timed() {
   local t0 rc
@@ -570,35 +604,43 @@ cons_wait_timed() {
   rc="$(cons_wait "$1" "$2" "$3")"
   printf 'rc=%s waited=%s\n' "${rc}" "$([[ $(( $(date +%s) - t0 )) -ge "$3" ]] && echo yes || echo no)"
 }
-printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n' >"${LOG_B_WAIT}"
-check "conservation wait: no publish by the bound, A unfinished, fails after waiting" "rc=1 waited=yes" \
-  "$(cons_wait_timed "${LOG_A_UNIT2}" "${LOG_B_WAIT}" 2)"
-check "conservation wait: no publish by the bound, A finished, could-not-measure after waiting" \
-  "rc=3 waited=yes" "$(cons_wait_timed "${LOG_A_FINISHED}" "${LOG_B_WAIT}" 2)"
+printf '%s\n' "${OTHER_LINE}" >"${LOG_B_WAIT}"
+check "conservation wait: no publish of A's bucket by the bound fails after waiting" "rc=1 waited=yes" \
+  "$(CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: B's own publishes do not end the wait" "rc=1 waited=yes" \
+  "$(CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_MERGING}" "${LOG_B_OTHER}" 2)"
 check "conservation wait: a pre-kill publish does not end the wait" "rc=1 waited=yes" \
-  "$(cons_wait_timed "${LOG_A_UNIT2}" "${LOG_B_PRE_KILL}" 2)"
+  "$(CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_PRE_KILL}" 2)"
+check "conservation wait: could-not-measure does not wait" "rc=3 waited=no" \
+  "$(CHAOS_KILL_ON_GAUGE=0 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_WAIT}" 2)"
 aborts_first() {
   local t0 rc
   t0="$(date +%s)"
-  rc="$(CHAOS_CONSERVATION_WAIT_SECONDS=3 rc_of oracle_conservation_or_unmeasured \
-    "${LOG_A_UNIT2}" http://stub 0 "${LOG_B_WAIT}" 1 "$(date +%s)")"
+  rc="$(CHAOS_KILL_ON_GAUGE=1 CHAOS_CONSERVATION_WAIT_SECONDS=3 rc_of oracle_conservation_or_unmeasured \
+    "${LOG_A_FIRST}" http://stub 0 "${LOG_B_WAIT}" 1 "$(date +%s)")"
   printf 'rc=%s waited=%s\n' "${rc}" "$([[ $(( $(date +%s) - t0 )) -ge 3 ]] && echo yes || echo no)"
 }
 check "conservation wait: aborts that rose before the wait fail without waiting" "rc=1 waited=no" \
   "$(aborts_first)"
 METRICS_FILE="${SCRATCH}/metrics-file"
 printf '%s\n' "${METRICS_SAMPLE}" >"${METRICS_FILE}"
-printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n' >"${LOG_B_WAIT}"
+printf '%s\n' "${OTHER_LINE}" >"${LOG_B_WAIT}"
 (
   sleep 1
   sed 's/^\(ravel_maintain_conservation_aborts_total{mode="maintain",signal="metrics"}\) 1$/\1 2/' \
     "${METRICS_FILE}" >"${METRICS_FILE}.new"
   command mv "${METRICS_FILE}.new" "${METRICS_FILE}"
-  printf '%s\n' "${PUB_LINE}" >>"${LOG_B_WAIT}"
+  pub_line "${BUCKET_Y}" >>"${LOG_B_WAIT}"
 ) &
 check "conservation wait: an abort during the wait fails even with a publish" "1" \
-  "$(CURL_MODE=metrics-file cons_wait "${LOG_A_UNIT2}" "${LOG_B_WAIT}" 5)"
+  "$(CURL_MODE=metrics-file CHAOS_KILL_ON_GAUGE=1 cons_wait "${LOG_A_FIRST}" "${LOG_B_WAIT}" 5)"
 wait
+check "conservation wait: the default is the takeover bound plus one tick plus the merge allowance" \
+  "1080" "$(CHAOS_H_SECONDS=60 CHAOS_MAINTAIN_TICK_SECONDS=300 CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS=300 chaos_conservation_wait_seconds)"
+check "scenario 2 passes the gauge observation to the oracle" "yes" \
+  "$([[ "${scenario2_body}" == *'CHAOS_KILL_ON_GAUGE=1'* && "${scenario2_body}" == *'CHAOS_KILL_ON_GAUGE=0'* ]] && echo yes || echo no)"
+check "scenario 2 reaps the pacing sleep on exit" "yes" \
+  "$([[ "${scenario2_body}" == *'"$INGEST_PID" "$PACE_PID"; do'* ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 # Fixture arguments reach gen_otlp_fixture, and none are added by default.

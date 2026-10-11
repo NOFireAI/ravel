@@ -551,26 +551,42 @@ CHAOS_FIXTURE_POINTS="${CHAOS_FIXTURE_POINTS:-100}"
 # fixture.
 CHAOS_EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
 
-# Scenario 2's load, sized so one bucket merge lasts long enough for the
-# in-flight poll (CHAOS_COMPACTION_POLL_SECONDS) to land a kill inside it.
+# Scenario 2's load. Chosen from the chaos job's time budget, not from a
+# measured merge duration.
 #
-# Measured (nightly run 38050587878): 20 exports of 1000 x 100 points, 2 * 10^6
-# points, compacted as three shard-hours of 20 inputs each in about 15 ms in
-# total, about 1.3 * 10^8 points/s, or 5 ms per merge. The target is a merge of
-# at least 1 s, ten poll periods of 100 ms. Scaling the measured rate
-# linearly, three merges of 1 s each need about 4 * 10^8 points: 1350 exports
-# of 1000 x 300 points. An export is then about 11.4 MB (38 bytes a point,
-# from 3.8 MB per 10^5), 68% of the 16 MiB body limit. Exports are paced at
-# one per CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS at most, 0.75 s by default,
-# about 15 MB/s against the default 32 MiB/s ingest byte rate, so the load
-# takes at least 17 minutes. Every fixture is generated just before its export
-# and spans the two minutes before that, far inside the 2-hour ingest lag
-# limit. Linear scaling is an assumption: a merge whose cost is mostly fixed
-# per run grows faster than this, one that grows with fan-in more slowly.
-# These are defaults to tune from a real nightly, not measured results.
+# Time: a strict-ack export is answered once the flush holding it lands, and
+# the ingest age trigger (max_flush_delay, 2 s by default) fires that flush,
+# so the load runs at about the flush cadence, not at the pacing below.
+# Scenario 2 in nightly run 38050587878 sent 20 exports of 1000 x 100 points
+# in 45.3 s, about 2.27 s each. The load is held to 25 minutes of the job's
+# budget (.github/workflows/k8s-nightly.yml), at most about 660 exports at
+# that rate: 650 exports take about 1476 s, 24.6 minutes. Each export keeps
+# the measured shape, 1000 x 100 points, about 3.8 MB of OTLP protobuf (23%
+# of the 16 MiB body limit), so the 2.27 s applies as measured rather than
+# extrapolated to a larger body. That is about 1.7 MB/s against the default
+# 32 MiB/s ingest byte rate, and 5.1 MB/s if every export took only the
+# 0.75 s pacing floor.
+#
+# Fan-in: in that run each export reached each shard bucket it touched as
+# one L0 input (20 exports, buckets of 20 inputs), and nothing in
+# ravel-maintain caps a merge's fan-in. A shard-hour bucket therefore holds
+# one input per export whose flush fell in its ingest hour: 650 if the load
+# fits in one hour, at least 325 in one of the two hours it straddles
+# otherwise. At the 0.65 B per point the L0 objects held, a shard's share of
+# the 6.5 * 10^7 points is about 11 MB of L0, if the series spread evenly
+# over the 4 shards.
+#
+# Merge duration at that fan-in is NOT measured. The same run logged three
+# publishes 15 ms apart, but those merges ran in parallel, so the spacing is
+# not a merge duration; and a merge reads each input's commit record and
+# catalog on its own, so one of hundreds of inputs takes longer than that
+# spacing suggests. The kill script logs the /metrics scrapes it made and the
+# seconds it waited before the gauge read >= 1, and the conservation oracle
+# logs how long after the kill the survivor's publish came; the first nightly
+# with this fixture sets the final figures.
 CHAOS_MAINTAIN_FIXTURE_SERIES="${CHAOS_MAINTAIN_FIXTURE_SERIES:-1000}"
-CHAOS_MAINTAIN_FIXTURE_POINTS="${CHAOS_MAINTAIN_FIXTURE_POINTS:-300}"
-CHAOS_MAINTAIN_EXPORT_COUNT="${CHAOS_MAINTAIN_EXPORT_COUNT:-1350}"
+CHAOS_MAINTAIN_FIXTURE_POINTS="${CHAOS_MAINTAIN_FIXTURE_POINTS:-100}"
+CHAOS_MAINTAIN_EXPORT_COUNT="${CHAOS_MAINTAIN_EXPORT_COUNT:-650}"
 CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS="${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS:-0.75}"
 
 # Write a fresh OTLP metrics fixture to stdout. With no arguments it is one
@@ -869,14 +885,15 @@ wait_for_metric_at_least() {
 # would otherwise fire the kill outside any flush this scenario's writes are in.
 #
 # Scenario 2 kills on `ravel_maintain_compactions_in_flight >= 1` on worker
-# A: the gauge rises when a bucket merge starts, after its claim and before
-# its first input read, and falls when the merge publishes, fails, or is
-# abandoned (crates/ravel-maintain/src/compact.rs, MergeInFlight). Its
-# conservation oracle still reads the logs: the server logs
-# `"maintenance: retention + compaction pass complete"` with `compacted=N`
-# for each owned shard once the signal's pass is over, after every publish of
-# that pass (`"compaction record published"`,
-# crates/ravel-maintain/src/publish.rs). See compaction_unfinished_in_log.
+# A: the gauge rises when a bucket merge starts, after its gates and, for a
+# claimed run, its claim, before its first catalog or block read, and falls
+# when the merge publishes, fails, or is abandoned
+# (crates/ravel-maintain/src/compact.rs, MergeInFlight). The same point logs
+# `"compaction merge started"` with `bucket=<commit prefix>`, and a publish
+# logs `"compaction record published"` with `key=<commit prefix><file>`
+# (crates/ravel-maintain/src/publish.rs). The conservation oracle pairs the
+# two to find the bucket A was merging at the kill; see
+# chaos_interrupted_bucket.
 # ---------------------------------------------------------------------------
 
 CHAOS_FLUSH_METRICS=(
@@ -894,9 +911,9 @@ CHAOS_FLUSH_POLLS_PER_SECOND="${CHAOS_FLUSH_POLLS_PER_SECOND:-5}"
 # period is this plus one loopback scrape and its parse, expected to stay
 # under 100 ms; /metrics has no rate limit of its own, and the scenario logs
 # the scrapes it made and how long it waited, so a run shows the period it
-# reached. The scenario 2 fixture is sized for a merge of at least ten
-# 100 ms periods.
+# reached.
 CHAOS_COMPACTION_POLL_SECONDS="${CHAOS_COMPACTION_POLL_SECONDS:-0.05}"
+CHAOS_COMPACTION_START_MARKER="compaction merge started"
 CHAOS_COMPACTION_PUBLISH_MARKER="compaction record published"
 CHAOS_COMPACTION_PASS_MARKER="maintenance: retention + compaction pass complete"
 # Flush-attempt count read by the poll that saw the rise; empty until then.
@@ -995,40 +1012,73 @@ kill_timing_line() {
   fi
 }
 
-# Return 0 when a maintain worker's log shows compaction work it had not
-# finished, 1 when its last publish is covered by a finished pass. Args: the
-# log body. Pure.
-#
-# Unfinished means the log carries no CHAOS_COMPACTION_PUBLISH_MARKER, or its
-# last one is not followed by a CHAOS_COMPACTION_PASS_MARKER line with
-# `compacted=N`, N >= 1. The pass lines are logged only after every shard of
-# the signal's pass has returned, so one after the last publish means no
-# merge of that pass was still running. With no start signal to read, this
-# cannot tell a pass still merging a bucket from one that published its last
-# bucket and is still in retention or sweep work (both read as unfinished),
-# and it cannot see a merge begun by a later pass that has not published
-# (that reads as finished).
-compaction_unfinished_in_log() {
-  local body="$1"
-  local positions
-  positions="$(CHAOS_PUB="$CHAOS_COMPACTION_PUBLISH_MARKER" \
-    CHAOS_PASS="$CHAOS_COMPACTION_PASS_MARKER" awk '
-    BEGIN { pub = ENVIRON["CHAOS_PUB"]; pass = ENVIRON["CHAOS_PASS"]; p = 0; c = 0 }
+# Print the bucket a maintain worker was merging when its log ends: the
+# `bucket=` of its last CHAOS_COMPACTION_START_MARKER line that no later
+# CHAOS_COMPACTION_PUBLISH_MARKER line matches. A publish matches a start
+# when its `key=` minus the file name equals the start's `bucket=`, the
+# bucket's commit prefix. Returns 1 and prints nothing when every start has a
+# publish after it, or the log has none. Args: log_file [from_line]. A merge
+# that failed or was abandoned also leaves an unmatched start, so with merges
+# running concurrently this is the latest-started unmatched one.
+chaos_interrupted_bucket() {
+  local file="$1" from="${2:-0}" body="" bucket
+  if [[ -r "$file" ]]; then
+    body="$(tail -n "+$(( from + 1 ))" "$file")"
+  fi
+  bucket="$(CHAOS_START="$CHAOS_COMPACTION_START_MARKER" CHAOS_PUB="$CHAOS_COMPACTION_PUBLISH_MARKER" awk '
+    BEGIN { start = ENVIRON["CHAOS_START"]; pub = ENVIRON["CHAOS_PUB"]; n = 0 }
     {
       line = $0
       gsub(/\033\[[0-9;]*m/, "", line)
-      if (index(line, pub) > 0) p = NR
-      if (index(line, pass) > 0 && match(line, /[ \t]compacted=[0-9]+/)) {
-        n = substr(line, RSTART + 11, RLENGTH - 11) + 0
-        if (n >= 1) c = NR
+      if ((i = index(line, start)) > 0) {
+        rest = substr(line, i + length(start))
+        if (match(rest, / bucket=[^ ]+/)) {
+          n++
+          sb[n] = substr(rest, RSTART + 8, RLENGTH - 8)
+          sl[n] = NR
+        }
+      } else if ((i = index(line, pub)) > 0) {
+        rest = substr(line, i + length(pub))
+        if (match(rest, / key=[^ ]+/)) {
+          k = substr(rest, RSTART + 5, RLENGTH - 5)
+          sub(/[^\/]*$/, "", k)
+          published[k] = NR
+        }
       }
     }
-    END { print p, c }' <<<"$body")"
-  local last_publish="${positions% *}" last_pass="${positions#* }"
-  if [[ "$last_publish" -eq 0 || "$last_publish" -gt "$last_pass" ]]; then
-    return 0
+    END {
+      for (j = n; j >= 1; j--) {
+        if (!(sb[j] in published) || published[sb[j]] < sl[j]) { print sb[j]; exit }
+      }
+    }' <<<"$body")"
+  [[ -n "$bucket" ]] || return 1
+  printf '%s\n' "$bucket"
+}
+
+# Return 0 when the log past line `from` carries a CHAOS_COMPACTION_PUBLISH_MARKER
+# line whose `key=` is a record directly under `bucket` (a commit prefix, as
+# chaos_interrupted_bucket prints it). Args: log_file from_line bucket.
+chaos_published_bucket_since() {
+  local file="$1" from="$2" bucket="$3" body=""
+  [[ -n "$bucket" ]] || return 1
+  if [[ -r "$file" ]]; then
+    body="$(tail -n "+$(( from + 1 ))" "$file")"
   fi
-  return 1
+  CHAOS_PUB="$CHAOS_COMPACTION_PUBLISH_MARKER" CHAOS_BUCKET="$bucket" awk '
+    BEGIN { pub = ENVIRON["CHAOS_PUB"]; want = ENVIRON["CHAOS_BUCKET"]; found = 0 }
+    {
+      line = $0
+      gsub(/\033\[[0-9;]*m/, "", line)
+      if ((i = index(line, pub)) > 0) {
+        rest = substr(line, i + length(pub))
+        if (match(rest, / key=[^ ]+/)) {
+          k = substr(rest, RSTART + 5, RLENGTH - 5)
+          sub(/[^\/]*$/, "", k)
+          if (k == want) found = 1
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }' <<<"$body"
 }
 
 # One line summarising what a maintain worker did, from its log past line
@@ -1060,16 +1110,17 @@ chaos_worker_activity_line() {
 # (`ravel_maintain_compactions_in_flight >= 1`), scraping every
 # CHAOS_COMPACTION_POLL_SECONDS. This is the scenario-2 "mid-compaction"
 # trigger. Args: base_url deadline_seconds. Returns 0 when seen, 1 when the
-# deadline passes first. Also keeps the highest `ravel_maintain_units_owned`
-# read in CHAOS_A_MAX_UNITS_OWNED and the number of scrapes in
-# CHAOS_COMPACTION_POLLS, from the same scrape.
+# deadline passes first; it scrapes at least once whatever the deadline.
+# Also keeps the highest `ravel_maintain_units_owned` read in
+# CHAOS_A_MAX_UNITS_OWNED and the number of scrapes in CHAOS_COMPACTION_POLLS,
+# from the same scrape.
 wait_for_compaction_in_flight() {
   local base_url="$1"
   local deadline_seconds="$2"
   local start body owned inflight
   CHAOS_COMPACTION_POLLS=0
   start="$(date +%s)"
-  while (( $(date +%s) - start < deadline_seconds )); do
+  while :; do
     body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || body=""
     CHAOS_COMPACTION_POLLS=$(( CHAOS_COMPACTION_POLLS + 1 ))
     owned="$(metric_value_from_body "$body" ravel_maintain_units_owned)"
@@ -1080,9 +1131,9 @@ wait_for_compaction_in_flight() {
     if [[ "${inflight%.*}" =~ ^[0-9]+$ ]] && [[ "${inflight%.*}" -ge 1 ]]; then
       return 0
     fi
+    (( $(date +%s) - start < deadline_seconds )) || return 1
     sleep "$CHAOS_COMPACTION_POLL_SECONDS"
   done
-  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1332,22 +1383,31 @@ chaos_line_count() {
   fi
 }
 
+# Seconds past the takeover window the conservation oracle allows for the
+# survivor's own merge of the interrupted bucket. Not measured: no merge at
+# the scenario 2 fan-in has been timed (see the fixture note above). 300 s is
+# one more maintenance tick; the chaos job's worst case with it is in the
+# comment above `timeout-minutes` in .github/workflows/k8s-nightly.yml.
+CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS="${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS:-300}"
 # Seconds the conservation oracle waits, from the kill, for the survivor to
-# publish. Empty means the takeover bound (chaos_takeover_bound_seconds): the
-# survivor takes over the dead worker's unit only once its lease expires, so
-# a publish within that bound is still on its way. The test suite shortens it.
+# publish the interrupted bucket. Empty means
+# chaos_conservation_wait_seconds. The test suite shortens it.
 CHAOS_CONSERVATION_WAIT_SECONDS="${CHAOS_CONSERVATION_WAIT_SECONDS:-}"
 # Seconds between reads of the survivor's log while waiting.
 CHAOS_CONSERVATION_POLL_SECONDS="${CHAOS_CONSERVATION_POLL_SECONDS:-5}"
+# 1 when the kill fired on wait_for_compaction_in_flight seeing the gauge at
+# 1 or more, 0 when it fired without that. The kill script sets it; the
+# conservation oracle reads it.
+CHAOS_KILL_ON_GAUGE="${CHAOS_KILL_ON_GAUGE:-0}"
 
-# Return 0 when the survivor's log past line `from` carries a publish. Args:
-# survivor_log_file from_line.
-chaos_survivor_published_since() {
-  local body=""
-  if [[ -r "$1" ]]; then
-    body="$(tail -n "+$(( $2 + 1 ))" "$1")"
-  fi
-  [[ "$body" == *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]
+# The default conservation wait, from the kill: the takeover bound (the
+# survivor owns the dead worker's unit once its lease expires, within 3 * H
+# plus one tick), one more tick (the survivor's pass that reaches the bucket
+# can start up to a tick after it takes the unit over, and one that runs
+# while A's bucket claim is still inside its 300 s default lease skips the
+# bucket until the next tick), and the merge allowance.
+chaos_conservation_wait_seconds() {
+  echo $(( $(chaos_takeover_bound_seconds) + CHAOS_MAINTAIN_TICK_SECONDS + CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS ))
 }
 
 # Read the survivor's conservation-abort counter and record a FAIL when it is
@@ -1369,27 +1429,33 @@ chaos_conservation_aborts_ok() {
 }
 
 # 4. conservation-holds, with a could-not-measure outcome.
-#    The conservation-abort counter on the survivor did not advance across
-#    the interruption (the gate never had to reject a record-dropping
-#    compaction), and the survivor published a compaction record after
-#    takeover.
+#    The survivor published a compaction record for the bucket worker A was
+#    merging when it was killed, and its conservation-abort counter did not
+#    advance across the interruption (the gate never had to reject a
+#    record-dropping publish).
 #
 #    Args: worker_a_log_file (read after the SIGKILL, so it is A's state at
 #    the kill), survivor_base_url, conservation_aborts_baseline,
 #    survivor_log_file, survivor_log_lines_at_kill (default 0), kill_epoch
-#    (default now). Both workers run before the kill, so only survivor log
-#    lines past that count are a publish after takeover; one B wrote before
-#    the kill does not pass.
+#    (default now). Reads CHAOS_KILL_ON_GAUGE. Both workers run before the
+#    kill, so only survivor log lines past that count are a publish after
+#    takeover.
 #
-#    The abort counter is checked first, and an unreadable or risen counter
-#    is a FAIL whatever A's log shows. Then the survivor's log is read every
-#    CHAOS_CONSERVATION_POLL_SECONDS until it shows a publish past the kill
-#    line or CHAOS_CONSERVATION_WAIT_SECONDS (the takeover bound) have passed
-#    since kill_epoch; it is read at least once. The abort counter is read
-#    again after the wait, so an abort during the takeover fails too. Only a
-#    missing survivor publish depends on A: a FAIL when A's log shows
-#    unfinished work (compaction_unfinished_in_log), else could-not-measure,
-#    recorded in ORACLE_UNMEASURED with CHAOS_UNMEASURED_EXIT returned.
+#    In order:
+#    - the survivor line count is not an integer: FAIL;
+#    - the abort counter is unreadable or above the baseline: FAIL;
+#    - CHAOS_KILL_ON_GAUGE is not 1 (the kill did not fire on the gauge), or
+#      A's log has no merge-start line without a matching publish
+#      (chaos_interrupted_bucket): could-not-measure, recorded in
+#      ORACLE_UNMEASURED with CHAOS_UNMEASURED_EXIT returned, and no wait;
+#    - otherwise the survivor's log is read every
+#      CHAOS_CONSERVATION_POLL_SECONDS, at least once, until it shows a
+#      publish for that bucket past the kill line or the wait
+#      (chaos_conservation_wait_seconds) has passed since kill_epoch; the
+#      abort counter is read again (unreadable or risen: FAIL); then a
+#      publish for the bucket passes and none fails. A publish for another
+#      bucket does not count: both workers merge their own buckets
+#      throughout.
 oracle_conservation_or_unmeasured() {
   local worker_a_log="$1"
   local survivor_url="$2"
@@ -1403,47 +1469,43 @@ oracle_conservation_or_unmeasured() {
     return 1
   fi
   [[ "$kill_epoch" =~ ^[0-9]+$ ]] || kill_epoch="$(date +%s)"
-  local wait_seconds="${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_takeover_bound_seconds)}"
+  local wait_seconds="${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}"
 
   chaos_conservation_aborts_ok "$name" "$survivor_url" "$aborts_baseline" || return 1
 
+  if [[ "$CHAOS_KILL_ON_GAUGE" != 1 ]]; then
+    ORACLE_UNMEASURED+=("${name}: could not measure: the kill did not fire on worker A's compactions_in_flight gauge, so no merge is known to have been interrupted")
+    log "could not measure: the kill fired without the in-flight gauge reading >= 1"
+    return "$CHAOS_UNMEASURED_EXIT"
+  fi
+  local bucket
+  bucket="$(chaos_interrupted_bucket "$worker_a_log")" || bucket=""
+  if [[ -z "$bucket" ]]; then
+    ORACLE_UNMEASURED+=("${name}: could not measure: worker A's log has no '${CHAOS_COMPACTION_START_MARKER}' line without a matching publish, so the interrupted bucket is unknown")
+    log "could not measure: no unmatched '${CHAOS_COMPACTION_START_MARKER}' line in worker A's log"
+    return "$CHAOS_UNMEASURED_EXIT"
+  fi
+  log "conservation: worker A was merging ${bucket} at the kill"
+
   local published=0
   while :; do
-    if chaos_survivor_published_since "$survivor_log" "$survivor_from"; then
+    if chaos_published_bucket_since "$survivor_log" "$survivor_from" "$bucket"; then
       published=1
       break
     fi
     (( $(date +%s) - kill_epoch < wait_seconds )) || break
     sleep "$CHAOS_CONSERVATION_POLL_SECONDS"
   done
-  log "conservation: survivor publish after the kill: $([[ "$published" -eq 1 ]] && echo seen || echo none) within $(( $(date +%s) - kill_epoch ))s of the kill (wait bound ${wait_seconds}s)"
+  log "conservation: survivor publish of ${bucket} after the kill: $([[ "$published" -eq 1 ]] && echo seen || echo none) within $(( $(date +%s) - kill_epoch ))s of the kill (wait bound ${wait_seconds}s)"
 
   chaos_conservation_aborts_ok "$name" "$survivor_url" "$aborts_baseline" || return 1
   if [[ "$published" -eq 1 ]]; then
     oracle_ok "$name"
     return 0
   fi
-
-  local a_body=""
-  if [[ -r "$worker_a_log" ]]; then
-    a_body="$(cat "$worker_a_log")"
-  fi
-  # With no publish in A's log there is no unit it can be shown to have been
-  # merging: it may have been mid-way through its first, or held nothing to
-  # compact. Its log cannot tell the two apart, so this is not a verdict.
-  if [[ "$a_body" != *"$CHAOS_COMPACTION_PUBLISH_MARKER"* ]]; then
-    ORACLE_UNMEASURED+=("${name}: could not measure: worker A published no compaction record before the kill, so its log cannot show an interrupted unit")
-    log "could not measure: worker A's log has no '${CHAOS_COMPACTION_PUBLISH_MARKER}' line, and the survivor published nothing after the kill"
-    return "$CHAOS_UNMEASURED_EXIT"
-  fi
-  if compaction_unfinished_in_log "$a_body"; then
-    oracle_bad "$name" \
-      "no '${CHAOS_COMPACTION_PUBLISH_MARKER}' after takeover: interrupted compaction did not complete"
-    return 1
-  fi
-  ORACLE_UNMEASURED+=("${name}: could not measure: worker A finished its compaction pass before the kill")
-  log "could not measure: worker A's log shows its last '${CHAOS_COMPACTION_PUBLISH_MARKER}' followed by a '${CHAOS_COMPACTION_PASS_MARKER}' line with compacted>=1, and the survivor published nothing"
-  return "$CHAOS_UNMEASURED_EXIT"
+  oracle_bad "$name" \
+    "no '${CHAOS_COMPACTION_PUBLISH_MARKER}' for ${bucket} within ${wait_seconds}s of the kill: the interrupted compaction did not complete"
+  return 1
 }
 
 # 5. custody-and-catalog-verification-clean.
