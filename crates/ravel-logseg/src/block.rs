@@ -2622,10 +2622,11 @@ mod tests {
             }
         }
 
-        /// Per encoding: the value buffer holds one slot per row, the
-        /// validity has one set bit per present row, and the counter counts
-        /// one buffer per integer column decoded from a value page. The tag-11
-        /// column builds no buffer of its own, so it adds nothing.
+        /// Per encoding: the value buffer holds one slot per row, an absent
+        /// row's slot is 0, the validity has one set bit per present row, and
+        /// the counter counts one buffer per integer column decoded from a
+        /// value page. The tag-11 column builds no buffer of its own, so it
+        /// adds nothing.
         #[test]
         fn integer_page_decode_writes_block_length_values_and_validity() {
             let presence = [
@@ -2682,6 +2683,12 @@ mod tests {
                 for (row, &p) in presence.iter().enumerate() {
                     let want = if p { present.next().copied() } else { None };
                     assert_eq!(block.i64_column(VALUE_COL).and_then(|c| c.get(row)), want);
+                    if !p {
+                        for column_id in [VALUE_COL, DECLARED_COL] {
+                            let slot = block.i64_column(column_id).map(|c| c.values()[row]);
+                            assert_eq!(slot, Some(0), "{enc:?} column {column_id} row {row}");
+                        }
+                    }
                 }
                 assert_eq!(block.int_values_buffers(), 2, "{enc:?}");
             }
