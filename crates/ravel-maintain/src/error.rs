@@ -147,6 +147,21 @@ pub enum MaintainError {
         "compaction claim lost at the {at} checkpoint; the run cancelled and published nothing (ADR-1029 decision 3)"
     )]
     ClaimLost { at: &'static str },
+    /// An input object's reader refused its trailer format version
+    /// (`UnsupportedVersion` from RSEG, RLOG or RSPAN), with the object's key
+    /// and the content hash its commit record holds. Compaction checks the
+    /// object's bytes against that hash and holds the bucket
+    /// ([`crate::compact::CompactionOutcome::HeldOutOfWindow`]) on a match, or
+    /// fails with `source` on a mismatch, since the readers check the version
+    /// before the footer CRC and a corrupted version field reads the same.
+    /// Every other rewrite gets `source` back unchanged. Displays as `source`.
+    #[error("{source}")]
+    InputOutOfWindow {
+        object_key: String,
+        version: u16,
+        content_hash: Vec<u8>,
+        source: Box<MaintainError>,
+    },
     /// A renewal at a cancellation checkpoint failed with a genuine store
     /// error (ADR-1029 decision 3): distinct from [`MaintainError::ClaimLost`],
     /// which means the claim was stolen or is gone. Not internal plumbing
@@ -336,6 +351,28 @@ pub enum MaintainError {
         /// The configured [`crate::config::CompactorConfig::orphan_breaker_max_ratio`].
         max_ratio: f64,
     },
+}
+
+impl MaintainError {
+    /// The trailer version an RSEG, RLOG or RSPAN reader refused, when this
+    /// error is that refusal.
+    pub(crate) fn unsupported_version(&self) -> Option<u16> {
+        match self {
+            MaintainError::Segment(SegmentError::UnsupportedVersion(v))
+            | MaintainError::LogSeg(LogSegError::UnsupportedVersion(v))
+            | MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// The reader's own error out of [`MaintainError::InputOutOfWindow`]; any
+    /// other error unchanged.
+    pub(crate) fn without_input_context(self) -> Self {
+        match self {
+            MaintainError::InputOutOfWindow { source, .. } => *source,
+            other => other,
+        }
+    }
 }
 
 impl From<ravel_segment::WriteError> for MaintainError {

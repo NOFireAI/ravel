@@ -10,15 +10,16 @@ use ravel_commit::keys;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::scan::{
     DEFAULT_MEMO_REVERIFY_INTERVAL_NS, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainMemo,
-    TerminalState, Zone, classify_zone, scan_and_maintain_with_memo,
+    ScanReport, TerminalState, Zone, classify_zone, scan_and_maintain_with_memo,
 };
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, NoLeases, RetentionConfig, RetentionPolicy,
-    scan_and_compact,
+    Bucket, CompactorConfig, FixedClock, MaintainError, NoLeases, RetentionConfig, RetentionPolicy,
+    buckets_held_out_of_window_total, scan_and_compact,
 };
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_segment::SegmentError;
 use ravel_types::Signal;
 use uuid::Uuid;
 
@@ -1142,4 +1143,270 @@ async fn invalidate_forces_reevaluation_and_survives_snapshot_round_trip() {
     let after2 = store.metrics().snapshot();
     assert_eq!(report2.skipped_terminal, 0);
     assert!(list_delta(&before2, &after2) >= 1);
+}
+
+/// Serializes the tests that assert on the process-wide held-bucket counter,
+/// so each one's before/after delta covers only its own scans.
+static HELD_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The RSEG version after this build's reader window.
+fn next_rseg_version() -> u16 {
+    ravel_segment::SUPPORTED_VERSIONS.newest() + 1
+}
+
+/// How [`seed_altered_input`] changes an input's bytes before storing them.
+#[derive(Clone, Copy)]
+enum Alteration {
+    /// Trailer version set to [`next_rseg_version`] and the commit record
+    /// hashed over the stamped bytes: an intact object a newer build wrote.
+    OutOfWindow,
+    /// The same version stamp, with the hash of the bytes as built: a flipped
+    /// version byte in an object this build wrote.
+    CorruptVersionByte,
+    /// Trailer magic smashed and the record hashed over the smashed bytes, so
+    /// only the decoder can tell it is unreadable.
+    CorruptMagic,
+}
+
+/// [`seed_input`], with the stored bytes altered as `alteration` says.
+async fn seed_altered_input(
+    store: &dyn ObjectStoreBackend,
+    spec: &InputSpec,
+    alteration: Alteration,
+) {
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::PutOptions;
+
+    let th = tenant_hash();
+    let written = build_v5_l0(
+        &spec.series,
+        spec.hour,
+        (spec.created_unix_ns, spec.epoch, spec.seq),
+    );
+    let mut bytes = written.bytes.to_vec();
+    let trailer = bytes.len() - ravel_segment::TRAILER_LEN as usize;
+    match alteration {
+        Alteration::OutOfWindow | Alteration::CorruptVersionByte => {
+            // The trailer's `version: u16` follows footer_len and footer_crc32c.
+            bytes[trailer + 8..trailer + 10].copy_from_slice(&next_rseg_version().to_le_bytes());
+        }
+        Alteration::CorruptMagic => {
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF;
+        }
+    }
+    let content_hash = match alteration {
+        Alteration::CorruptVersionByte => written.summary.blake3,
+        Alteration::OutOfWindow | Alteration::CorruptMagic => *blake3::hash(&bytes).as_bytes(),
+    };
+    let data_key = keys::data_key(
+        &th,
+        Signal::Metrics,
+        SHARD,
+        spec.writer_id,
+        spec.epoch,
+        spec.seq,
+        &content_hash,
+    )
+    .expect("data key");
+    let object_size = bytes.len() as u64;
+    store
+        .put(&data_key, bytes.into(), PutOptions::default())
+        .await
+        .expect("put data object");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash: th,
+        signal: Signal::Metrics,
+        shard: SHARD,
+        writer_id: spec.writer_id,
+        writer_epoch: spec.epoch,
+        writer_seq: spec.seq,
+        object_size,
+        content_hash,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: spec.created_unix_ns,
+        max_ingest_ts_ns: spec.created_unix_ns,
+        segment_format_version: u32::from(ravel_segment::VERSION_V7),
+        created_unix_ns: spec.created_unix_ns,
+        ingest_hour_bucket: spec.hour,
+    })
+    .expect("build commit record");
+    let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+    store
+        .put(&commit_key, record::encode(&rec), PutOptions::default())
+        .await
+        .expect("put commit record");
+}
+
+/// Seed two L0 inputs at `hour`, the second altered as `alteration` says.
+async fn seed_with_one_altered(
+    store: &dyn ObjectStoreBackend,
+    hour: u32,
+    base: u128,
+    alteration: Alteration,
+) {
+    let specs = two_at(hour, base);
+    seed_input(store, &specs[0]).await;
+    seed_altered_input(store, &specs[1], alteration).await;
+}
+
+async fn compaction_record_count(store: &dyn ObjectStoreBackend, hour: u32) -> usize {
+    let bucket = bucket_at(hour);
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .expect("prefix");
+    ravel_object_store::list_all(store, &prefix)
+        .await
+        .expect("list bucket")
+        .into_iter()
+        .filter(|meta| {
+            matches!(
+                keys::partition_bucket_entry(&meta.key),
+                Ok(keys::BucketEntry::CompactionRecord(_))
+            )
+        })
+        .count()
+}
+
+/// A clock past the seal margin of `hour`.
+fn sealed_through(hour: u32) -> FixedClock {
+    FixedClock::new((i64::from(hour) + 1) * NS_PER_HOUR + 2 * NS_PER_HOUR)
+}
+
+async fn scan(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+) -> ravel_maintain::Result<ScanReport> {
+    scan_and_compact(
+        store,
+        clock,
+        &CompactorConfig::default(),
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_out_of_window_l0_input_is_held_and_later_hours_still_compact() {
+    let _counter = HELD_COUNTER_LOCK.lock().await;
+    let store = MemoryStore::new();
+    for spec in two_at(HOUR - 1, 10) {
+        seed_input(&store, &spec).await;
+    }
+    seed_with_one_altered(&store, HOUR, 20, Alteration::OutOfWindow).await;
+    for spec in two_at(HOUR + 1, 30) {
+        seed_input(&store, &spec).await;
+    }
+
+    let before = buckets_held_out_of_window_total();
+    let report = scan(&store, &sealed_through(HOUR + 1))
+        .await
+        .expect("a held bucket does not fail the scan");
+
+    assert_eq!(
+        report,
+        ScanReport {
+            compacted: 2,
+            already_done: 0,
+            not_sealed: 0,
+            held_out_of_window: 1,
+            cursor_advanced_to: Some(HOUR - 1),
+        },
+        "both readable hours compact and the cursor stops before the held hour"
+    );
+    assert_eq!(buckets_held_out_of_window_total() - before, 1);
+    assert_eq!(compaction_record_count(&store, HOUR - 1).await, 1);
+    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
+    assert_eq!(compaction_record_count(&store, HOUR + 1).await, 1);
+}
+
+#[tokio::test]
+async fn a_held_bucket_is_retried_on_the_next_pass() {
+    let _counter = HELD_COUNTER_LOCK.lock().await;
+    let store = MemoryStore::new();
+    seed_with_one_altered(&store, HOUR, 20, Alteration::OutOfWindow).await;
+    for spec in two_at(HOUR + 1, 30) {
+        seed_input(&store, &spec).await;
+    }
+    let clock = sealed_through(HOUR + 1);
+
+    let before = buckets_held_out_of_window_total();
+    let first = scan(&store, &clock).await.expect("first pass");
+    let second = scan(&store, &clock).await.expect("second pass");
+
+    assert_eq!(
+        first,
+        ScanReport {
+            compacted: 1,
+            already_done: 0,
+            not_sealed: 0,
+            held_out_of_window: 1,
+            cursor_advanced_to: None,
+        }
+    );
+    assert_eq!(
+        second,
+        ScanReport {
+            compacted: 0,
+            already_done: 1,
+            not_sealed: 0,
+            held_out_of_window: 1,
+            cursor_advanced_to: None,
+        },
+        "the cursor did not pass the held hour, so the second pass revisits it"
+    );
+    assert_eq!(
+        buckets_held_out_of_window_total() - before,
+        2,
+        "the held bucket is counted once per pass"
+    );
+    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
+}
+
+#[tokio::test]
+async fn a_corrupt_input_still_fails_the_scan() {
+    let _counter = HELD_COUNTER_LOCK.lock().await;
+    let store = MemoryStore::new();
+    seed_with_one_altered(&store, HOUR, 20, Alteration::CorruptMagic).await;
+
+    let before = buckets_held_out_of_window_total();
+    let err = scan(&store, &sealed_through(HOUR))
+        .await
+        .expect_err("an undecodable input fails the scan");
+
+    assert!(
+        matches!(err, MaintainError::Segment(ref e) if !matches!(e, SegmentError::UnsupportedVersion(_))),
+        "the decoder's own error, not a version refusal: {err:?}"
+    );
+    assert_eq!(buckets_held_out_of_window_total() - before, 0);
+    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
+}
+
+#[tokio::test]
+async fn a_corrupt_version_byte_is_not_held() {
+    let _counter = HELD_COUNTER_LOCK.lock().await;
+    let store = MemoryStore::new();
+    seed_with_one_altered(&store, HOUR, 20, Alteration::CorruptVersionByte).await;
+
+    let before = buckets_held_out_of_window_total();
+    let err = scan(&store, &sealed_through(HOUR))
+        .await
+        .expect_err("a version byte that fails the content hash is corruption");
+
+    let version = next_rseg_version();
+    assert!(
+        matches!(err, MaintainError::Segment(SegmentError::UnsupportedVersion(v)) if v == version),
+        "the reader's own error, unwrapped: {err:?}"
+    );
+    assert_eq!(buckets_held_out_of_window_total() - before, 0);
+    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
 }

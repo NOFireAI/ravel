@@ -41,6 +41,10 @@ pub struct ScanReport {
     pub already_done: usize,
     /// Buckets skipped because they are not yet sealed (scan stops there).
     pub not_sealed: usize,
+    /// Buckets held because an input's format version is outside this
+    /// build's reader window ([`CompactionOutcome::HeldOutOfWindow`]). Later
+    /// hours still compact; the cursor stops before the first held hour.
+    pub held_out_of_window: usize,
     /// The hour the cursor was advanced to, if it moved.
     pub cursor_advanced_to: Option<u32>,
 }
@@ -67,9 +71,12 @@ pub async fn scan_and_compact(
         compacted: 0,
         already_done: 0,
         not_sealed: 0,
+        held_out_of_window: 0,
         cursor_advanced_to: None,
     };
     let mut highest_done: Option<u32> = None;
+    // The cursor must not pass a held hour, or no later pass would revisit it.
+    let mut first_held: Option<u32> = None;
 
     for hour in hours {
         if start_after.is_some_and(|after| hour <= after) {
@@ -82,16 +89,24 @@ pub async fn scan_and_compact(
                 report.not_sealed += 1;
                 break;
             }
+            CompactionOutcome::HeldOutOfWindow { .. } => {
+                report.held_out_of_window += 1;
+                first_held.get_or_insert(hour);
+            }
             CompactionOutcome::Compacted { .. } => {
                 report.compacted += 1;
-                highest_done = Some(hour);
+                if first_held.is_none() {
+                    highest_done = Some(hour);
+                }
             }
             CompactionOutcome::AlreadyCompacted
             | CompactionOutcome::RewritePresent
             | CompactionOutcome::Tombstoned
             | CompactionOutcome::BelowMinInputs { .. } => {
                 report.already_done += 1;
-                highest_done = Some(hour);
+                if first_held.is_none() {
+                    highest_done = Some(hour);
+                }
             }
         }
     }
@@ -121,6 +136,11 @@ pub struct MaintainReport {
     pub already_done: usize,
     /// Buckets skipped because not yet sealed.
     pub not_sealed: usize,
+    /// Buckets whose compaction was held because an input's format version is
+    /// outside this build's reader window
+    /// ([`CompactionOutcome::HeldOutOfWindow`]). Retried every pass; the scan
+    /// continues to later hours.
+    pub held_out_of_window: usize,
     /// Expired buckets whose physical sweep was blocked because the live
     /// catalog HEAD snapshot still names an object inside the bucket
     /// (ADR-0020 delete-blocker, [`RetentionOutcome::BlockedBySnapshot`] with
@@ -1406,6 +1426,9 @@ fn classify_terminal(
                 // A tombstone appeared between the retention and compaction reads:
                 // not a steady state, let the next tick re-evaluate.
                 Some(CompactionOutcome::Tombstoned) => None,
+                // Held for an out-of-window input: retried every tick, so the
+                // bucket compacts on the first tick after the upgrade finishes.
+                Some(CompactionOutcome::HeldOutOfWindow { .. }) => None,
             }
         }
     }
@@ -1623,6 +1646,9 @@ pub async fn scan_and_maintain_with_memo(
                 }
                 Some(ClaimedCompaction::Ran(CompactionOutcome::Compacted { .. })) => {
                     report.compacted += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::HeldOutOfWindow { .. })) => {
+                    report.held_out_of_window += 1
                 }
                 Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
                     report.already_done += 1;

@@ -5,9 +5,10 @@
 //! `CreateIfAbsent`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::Signal;
 
 use crate::bucket::Bucket;
@@ -19,14 +20,15 @@ use crate::error::{MaintainError, Result};
 use crate::publish::{PublishOutcome, conserve_exact};
 use crate::read;
 use crate::read::list_bucket_with_ledger;
+use crate::request_ledger::{RequestPhase, note_get};
 use crate::rewrite::{FencedRewrite, UnwritableInputs};
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
 /// The result of a `compact_bucket` call. Every variant except
 /// [`CompactionOutcome::Compacted`] means the bucket was left untouched, with
-/// the reason; the scan driver treats all of them except `NotSealed` as
-/// "this hour is done" for cursor advancement.
+/// the reason; the scan driver treats all of them except `NotSealed` and
+/// `HeldOutOfWindow` as "this hour is done" for cursor advancement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionOutcome {
     /// Not yet sealed: the writer interlock does not yet guarantee a complete
@@ -49,6 +51,12 @@ pub enum CompactionOutcome {
     /// ([`CompactionInputSkipReason`]) and fewer than the minimum remain;
     /// `count` is then the number of writable inputs left, 0 when none is.
     BelowMinInputs { count: usize },
+    /// An input object carries a format version outside this build's reader
+    /// window, and its bytes match its commit record's content hash, so it is
+    /// intact data another build can read (ADR-2708 D5b). The bucket is left
+    /// as it is and retried on every pass; it is not done, so a cursored scan
+    /// does not advance past it.
+    HeldOutOfWindow { version: u16 },
     /// Built and published (or converged / abandoned): `parts` parts written,
     /// `publish` records how the record PUT resolved.
     Compacted {
@@ -159,6 +167,54 @@ pub(crate) fn note_skipped_input(
         "compaction skipped an input object it cannot rewrite; the object stays in place \
          and no compaction record names it (issue #2554)"
     );
+}
+
+/// Counter seam for `ravel_maintain_buckets_held_out_of_window_total`
+/// (ADR-2708 D5b): compactions that ended in
+/// [`CompactionOutcome::HeldOutOfWindow`]. Process-wide and monotonic, counted
+/// once per bucket per pass, so a held bucket keeps the rate nonzero until the
+/// upgrade finishes or rolls back.
+static BUCKETS_HELD_OUT_OF_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`BUCKETS_HELD_OUT_OF_WINDOW`]. Zero on a healthy deployment.
+pub fn buckets_held_out_of_window_total() -> u64 {
+    BUCKETS_HELD_OUT_OF_WINDOW.load(Ordering::Relaxed)
+}
+
+/// Decide what an input the reader refused for its format version means. The
+/// readers check the trailer version before the footer CRC, so a flipped
+/// version byte reads the same as an object a newer build wrote; only the
+/// commit record's content hash tells them apart. Intact bytes hold the
+/// bucket; anything else fails with the reader's own error, as corruption.
+async fn hold_out_of_window_input(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    object_key: &str,
+    version: u16,
+    content_hash: &[u8],
+    reader_error: MaintainError,
+) -> Result<CompactionOutcome> {
+    let whole = store.get(object_key, GetRange::Full).await;
+    note_get(
+        config.request_ledger.as_ref(),
+        RequestPhase::CatalogRead,
+        &whole,
+    );
+    if blake3::hash(&whole?.data).as_bytes().as_slice() != content_hash {
+        return Err(reader_error);
+    }
+    BUCKETS_HELD_OUT_OF_WINDOW.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        object_key,
+        version,
+        "compaction held a bucket: an input's format version is outside this build's reader \
+         window and its bytes match its content hash; later hours still compact (ADR-2708 D5b)"
+    );
+    Ok(CompactionOutcome::HeldOutOfWindow { version })
 }
 
 /// What a coordinated compaction run did (ADR-1029 decisions 3 and 5).
@@ -432,7 +488,27 @@ async fn compact_bucket_scoped(
         other => Err(MaintainError::Invariant(format!(
             "compaction is not implemented for signal {other:?}"
         ))),
-    }?;
+    };
+    let outcome = match outcome {
+        Err(MaintainError::InputOutOfWindow {
+            object_key,
+            version,
+            content_hash,
+            source,
+        }) => {
+            hold_out_of_window_input(
+                store,
+                &run_config,
+                bucket,
+                &object_key,
+                version,
+                &content_hash,
+                *source,
+            )
+            .await?
+        }
+        other => other?,
+    };
 
     // A run that lost its claim cancelled at a checkpoint and published
     // nothing; only a run that still holds its claim marks it completed

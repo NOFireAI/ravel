@@ -260,6 +260,29 @@ async fn load_then_rewrite<C: SegmentCodec>(
         UnwritableInputs::Fail,
     )
     .await
+    .map_err(MaintainError::without_input_context)
+}
+
+/// [`SegmentCodec::load_input_catalog`], with a reader's refusal of the input's
+/// format version wrapped as [`MaintainError::InputOutOfWindow`] so compaction
+/// can tell which object it was and check that object's content hash.
+async fn load_input_catalog_noting_version<C: SegmentCodec>(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    input: &crate::read::InputRecord,
+) -> Result<C::Catalog> {
+    match C::load_input_catalog(store, config, input).await {
+        Err(err) => match err.unsupported_version() {
+            Some(version) => Err(MaintainError::InputOutOfWindow {
+                object_key: keys::reconstruct_data_key(&input.record)?,
+                version,
+                content_hash: input.record.content_hash.clone(),
+                source: Box::new(err),
+            }),
+            None => Err(err),
+        },
+        ok => ok,
+    }
 }
 
 /// What [`rewrite_and_publish_loaded`] did.
@@ -456,7 +479,7 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     // is not general enough" wherever the maintain loop is `tokio::spawn`ed.
     let mut pending = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        pending.push(C::load_input_catalog(store, config, input));
+        pending.push(load_input_catalog_noting_version::<C>(store, config, input));
     }
     let mut catalogs: Vec<C::Catalog> = stream_iter(pending)
         .buffered(config.input_read_concurrency.max(1))

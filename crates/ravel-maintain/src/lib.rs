@@ -80,7 +80,8 @@ pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{
     COMPACTION_INPUT_SKIP_SIGNALS, ClaimAcquisition, ClaimedCompaction, CompactionInputSkipReason,
-    CompactionOutcome, compact_bucket, compact_bucket_claimed, compaction_inputs_skipped_total,
+    CompactionOutcome, buckets_held_out_of_window_total, compact_bucket, compact_bucket_claimed,
+    compaction_inputs_skipped_total,
 };
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
