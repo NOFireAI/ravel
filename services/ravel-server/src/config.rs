@@ -2096,15 +2096,17 @@ pub struct Cli {
     /// Close the memory gate while the host's available memory is below this many bytes (64 MiB or more); default max(512 MiB, 2% of host memory).
     ///
     /// Every `--memory-gate-interval-ms` the `ravel-memory-gate` sampler
-    /// reads `MemAvailable` from `/proc/meminfo` (under a cgroup memory
-    /// limit, `memory.max` minus `memory.current`) and closes the gate when
-    /// the reading is below this floor; a closed gate refuses memory
-    /// reservations until a reading at or above it (ADR-2633 section 2, as
-    /// amended for issue #2806). Host memory is `MemTotal` capped by the
-    /// cgroup memory limit, the figure the performance defaults resolve.
-    /// Startup refuses a floor at or above host memory. The gate is off in
-    /// `gateway` mode, with a fallback-sized budget, in a build whose
-    /// allocator is not jemalloc, and when host memory cannot be read. See
+    /// reads `MemAvailable` from `/proc/meminfo` and, under a finite cgroup
+    /// memory limit, the cgroup's own headroom (`memory.max` minus
+    /// `memory.current` plus `memory.stat`'s `inactive_file`), takes the
+    /// smaller, and closes the gate when the reading is below this floor; a
+    /// closed gate refuses memory reservations until a reading at or above
+    /// it (ADR-2633 section 2, as amended for issue #2806). Host memory is
+    /// `MemTotal` capped by the cgroup memory limit, the figure the
+    /// performance defaults resolve. Startup refuses a floor at or above
+    /// host memory. The gate is off in `gateway` mode, with a fallback-sized
+    /// budget, in a build whose allocator is not jemalloc, and when
+    /// `MemAvailable` or `MemTotal` cannot be read. See
     /// [`crate::memory_gate`].
     #[arg(
         long,
@@ -3154,17 +3156,18 @@ impl HostProfile {
         None
     }
 
-    /// Read at startup for the budget derivation and again on every memory
-    /// gate sample (`crate::memory_gate::read_available`).
+    /// Read at startup for the budget derivation and for the memory gate's
+    /// resolution; the sampler re-reads the same field on every sample
+    /// through its own file reader (`crate::memory_gate::read_available`).
     #[cfg(target_os = "linux")]
-    pub(crate) fn detect_mem_available_bytes() -> Option<u64> {
+    fn detect_mem_available_bytes() -> Option<u64> {
         std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|meminfo| parse_meminfo_field_bytes(&meminfo, "MemAvailable:"))
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn detect_mem_available_bytes() -> Option<u64> {
+    fn detect_mem_available_bytes() -> Option<u64> {
         None
     }
 
@@ -3172,9 +3175,10 @@ impl HostProfile {
     /// same precedence `ravel_maintain`'s own detector uses, duplicated here
     /// rather than imported because that detector folds the limit into its
     /// already-capped total and exposes neither the limit nor the raw total
-    /// on their own.
+    /// on their own. The memory gate sampler reads the same two files on
+    /// every sample through `crate::memory_gate::HostMemoryFile`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+    fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
         std::fs::read_to_string("/sys/fs/cgroup/memory.max")
             .ok()
             .and_then(|contents| parse_cgroup_memory_limit_bytes(&contents))
@@ -3186,27 +3190,7 @@ impl HostProfile {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
-        None
-    }
-
-    /// The cgroup's current memory usage, the figure the memory gate
-    /// subtracts from the limit on each sample: v2 `memory.current` first,
-    /// then v1 `memory.usage_in_bytes`, in the same precedence as the limit.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn detect_cgroup_memory_current_bytes() -> Option<u64> {
-        std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-            .ok()
-            .and_then(|contents| contents.trim().parse().ok())
-            .or_else(|| {
-                std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-                    .ok()
-                    .and_then(|contents| contents.trim().parse().ok())
-            })
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn detect_cgroup_memory_current_bytes() -> Option<u64> {
+    fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
         None
     }
 
@@ -3226,10 +3210,10 @@ impl HostProfile {
 /// A `/proc/meminfo` field (`MemTotal:` or `MemAvailable:`) in bytes. A
 /// missing line, a non-numeric count, or a unit other than `kB` (or `KB`,
 /// which `ravel_maintain`'s `MemTotal` parser also accepts) is `None`.
-/// `#[cfg(test)]` builds parse it on every target (not only Linux) so the
-/// fixture-string tests run on the CI host that builds this crate.
-#[cfg(any(target_os = "linux", test))]
-fn parse_meminfo_field_bytes(meminfo: &str, prefix: &str) -> Option<u64> {
+/// Compiled on every target: the memory gate sampler parses the same field
+/// through its injected file reader, and the fixture-string tests run on
+/// whatever host builds this crate.
+pub(crate) fn parse_meminfo_field_bytes(meminfo: &str, prefix: &str) -> Option<u64> {
     let line = meminfo.lines().find(|line| line.starts_with(prefix))?;
     let mut fields = line.split_whitespace().skip(1);
     let value: u64 = fields.next()?.parse().ok()?;
@@ -3244,9 +3228,9 @@ fn parse_meminfo_field_bytes(meminfo: &str, prefix: &str) -> Option<u64> {
 /// finite byte limit. `max` (the v2 no-limit spelling), `0`, and any value at
 /// or above `1 << 60` (the v1 no-limit sentinel, the same implausibly-large
 /// convention `ravel_maintain`'s own parser treats as unlimited) are `None`,
-/// as is anything malformed.
-#[cfg(any(target_os = "linux", test))]
-fn parse_cgroup_memory_limit_bytes(contents: &str) -> Option<u64> {
+/// as is anything malformed. Compiled on every target for the same reason as
+/// [`parse_meminfo_field_bytes`].
+pub(crate) fn parse_cgroup_memory_limit_bytes(contents: &str) -> Option<u64> {
     let raw = contents.trim();
     if raw == "max" {
         return None;

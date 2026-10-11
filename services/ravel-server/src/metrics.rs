@@ -5782,8 +5782,9 @@ fn render_memory_gate_family(
     let scalars: [(&str, &str, &str, u64); 6] = [
         (
             "ravel_memory_gate_available_bytes",
-            "Host available memory (MemAvailable, or the cgroup memory limit minus its usage) as \
-             the memory gate sampler last read it, after the forced purge when one ran; 0 when \
+            "Host available memory as the memory gate sampler last read it, after the forced \
+             purge when one ran: MemAvailable, or under a finite cgroup memory limit the smaller \
+             of MemAvailable and the limit minus its usage plus its inactive file cache; 0 when \
              the gate is off or before its first sample.",
             "gauge",
             budget.gate_available(),
@@ -9005,22 +9006,83 @@ mod tests {
         let mut body = String::new();
         render_memory_gate_family(&mut body, Mode::Query, &budget, &stats);
 
-        for (name, kind) in [
-            ("ravel_memory_gate_available_bytes", "gauge"),
-            ("ravel_memory_gate_available_floor_bytes", "gauge"),
-            ("ravel_memory_gate_purge_floor_bytes", "gauge"),
-            ("ravel_memory_gate_resident_bytes", "gauge"),
-            ("ravel_memory_gate_purges_total", "counter"),
-            ("ravel_memory_gate_samples_total", "counter"),
-            ("ravel_memory_gate_epoch_refresh_seconds_total", "counter"),
-            ("ravel_memory_gate_purge_seconds", "histogram"),
-            ("ravel_memory_gate_refusals_total", "counter"),
-            ("ravel_memory_budget_refusals_total", "counter"),
+        for (name, kind, mentions) in [
+            (
+                "ravel_memory_gate_available_bytes",
+                "gauge",
+                "the smaller of MemAvailable and the limit minus its usage plus its inactive \
+                 file cache",
+            ),
+            (
+                "ravel_memory_gate_available_floor_bytes",
+                "gauge",
+                "close floor (--memory-gate-min-available-bytes)",
+            ),
+            (
+                "ravel_memory_gate_purge_floor_bytes",
+                "gauge",
+                "purge floor (--memory-gate-purge-available-bytes)",
+            ),
+            (
+                "ravel_memory_gate_resident_bytes",
+                "gauge",
+                "jemalloc stats.resident",
+            ),
+            (
+                "ravel_memory_gate_purges_total",
+                "counter",
+                "at most one per --memory-gate-purge-min-interval-ms",
+            ),
+            (
+                "ravel_memory_gate_samples_total",
+                "counter",
+                "samples that read host available memory",
+            ),
+            (
+                "ravel_memory_gate_epoch_refresh_seconds_total",
+                "counter",
+                "reading host available memory, refreshing the jemalloc stats epoch",
+            ),
+            (
+                "ravel_memory_gate_purge_seconds",
+                "histogram",
+                "Wall time of each forced jemalloc purge",
+            ),
+            (
+                "ravel_memory_gate_refusals_total",
+                "counter",
+                "closed on host available memory, by check site",
+            ),
+            (
+                "ravel_memory_budget_refusals_total",
+                "counter",
+                "ledger was full, by check site",
+            ),
         ] {
             assert_eq!(
                 body.matches(&format!("# TYPE {name} {kind}\n")).count(),
                 1,
                 "{body}"
+            );
+            // One HELP line per family, naming what the family measures, and
+            // directly above its TYPE line.
+            let help_prefix = format!("# HELP {name} ");
+            let help_lines: Vec<&str> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix(&help_prefix))
+                .collect();
+            assert_eq!(help_lines.len(), 1, "{name} HELP in {body}");
+            assert!(
+                help_lines[0].contains(mentions),
+                "{name} HELP {:?} does not mention {mentions:?}",
+                help_lines[0]
+            );
+            assert!(
+                body.contains(&format!(
+                    "{help_prefix}{}\n# TYPE {name} {kind}\n",
+                    help_lines[0]
+                )),
+                "{name} HELP is not directly above its TYPE line in {body}"
             );
         }
         let expected = [
