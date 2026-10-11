@@ -696,7 +696,10 @@ pub(crate) fn resolve_write_mode(
     headers: &HeaderMap,
     policy: crate::config::StrictFlushPolicy,
 ) -> WriteMode {
-    match headers.get(INGEST_MODE_HEADER).and_then(|v| v.to_str().ok()) {
+    match headers
+        .get(INGEST_MODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
         Some("buffered") => WriteMode::Buffered,
         Some("strict-arrival") => WriteMode::StrictArrival,
         Some("strict-aged") => WriteMode::Strict,
