@@ -122,8 +122,9 @@ mb_short=$(git rev-parse --short "$merge_base") || fail "git rev-parse --short f
 # function signature. Strings, char literals, line comments, one-line
 # attributes and arrows are blanked first so their brackets cannot skew the
 # depth count.
-extract_awk=$(
-  cat <<'AWK'
+# Written to a file rather than captured into a variable: bash 3.2 (macOS)
+# misparses the quotes of a heredoc that sits inside `$( ... )`.
+cat >"$work/extract.awk" <<'AWK'
 function push_item(   t) {
   t = item
   gsub(/[ \t]/, "", t)
@@ -224,7 +225,6 @@ BEGIN { mode = "idle"; q = "'" }
   }
 }
 AWK
-)
 
 # Every file the branch touches, any type: a site in one of these is the
 # branch's own business, and its own CI compiled it.
@@ -241,7 +241,7 @@ while IFS= read -r f; do
     git cat-file -e "${rev}:${f}" 2>/dev/null || rc=$?
     [ "$rc" = 0 ] || continue
     git show "${rev}:${f}" >"$work/blob" || fail "git show ${rev}:${f} failed"
-    awk "$extract_awk" "$work/blob" >>"$work/${side}-items" || fail "item extraction failed on ${f}"
+    awk -f "$work/extract.awk" "$work/blob" >>"$work/${side}-items" || fail "item extraction failed on ${f}"
   done
 done <"$work/branch-files"
 
