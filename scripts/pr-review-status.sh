@@ -53,6 +53,23 @@ merge_base_guard() {
   return "${guard_rc}"
 }
 
+# Runs the post-fork shape guard for the pull request's head against its base,
+# cwd pinned the same way and for the same reason as the merge-base guard. Exit
+# 1 means a struct literal or call site that landed on the base after the fork
+# still uses a shape this pull request changes, which a queue rebase turns into
+# a red CI cycle (issue #2811). Any other non-zero, 127 included, is "could not
+# check", which is not "clean". PR_REVIEW_STATUS_STRUCT_GUARD replaces the guard
+# so this script's own tests can run it offline.
+struct_rc=0
+struct_out=""
+struct_guard="${PR_REVIEW_STATUS_STRUCT_GUARD:-${script_dir}/guards/assert-struct-literals-current.sh}"
+struct_sites_block() {
+  struct_rc=0
+  struct_out="$( { { cd "${script_dir}/.." || exit 2; } && \
+    "${struct_guard}" "refs/pull/${pr}/head" "origin/${base_ref}"; } 2>&1)" || struct_rc=$?
+  [[ "${struct_rc}" == "1" ]]
+}
+
 # Is a merge queue enforced on the pull request's base branch?
 #
 # A queue rebases each entry onto current main and runs full CI on the combined
@@ -388,6 +405,11 @@ elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
     echo "  -> the base is also behind; these are the commits it has not seen:"
     echo "${base_behind_note//guard: /     }"
   fi
+# Last before the merge line, and regardless of any merge queue: the queue's
+# rebase is exactly where this break surfaces, as a failed CI cycle.
+elif struct_sites_block; then
+  echo "  -> code landed on origin/${base_ref} after this PR forked still uses a shape the PR changes; rebase onto origin/${base_ref}, update the site, and let CI re-run before merging"
+  echo "${struct_out//guard: /     }"
 else
   if [[ "${inline_comments}" != "0" && "${outside_diff}" != "0" ]]; then
     echo "  -> clean (operator confirmed all ${inline_comments} inline comment(s) and ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
@@ -397,6 +419,10 @@ else
     echo "  -> clean (operator confirmed all ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
   else
     echo "  -> clean: ${ci_phrase}, review at the current head with zero findings"
+  fi
+  if [[ "${struct_rc}" != "0" ]]; then
+    echo "  -> WARNING: could not check for post-fork struct literals and call sites (guard exit ${struct_rc}), which is not the same as none; check by hand before running the merge line"
+    echo "${struct_out//guard: /     }"
   fi
   # The freshness check above proved the base current at the moment it ran, not
   # for however long the operator takes to run this line; `--match-head-commit`

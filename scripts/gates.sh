@@ -200,6 +200,12 @@ bash "$(dirname "$0")/guards/check-amendment-integrity.test.sh"
 echo "==> scripts/guards/check-amendment-integrity.sh"
 "$(dirname "$0")/guards/check-amendment-integrity.sh"
 
+# The post-fork shape guard (issue #2811) needs a pull request to check, so
+# pr-review-status.sh runs it and this runs only its cases: fixture git
+# repositories, no network, no build.
+echo "==> scripts/guards/assert-struct-literals-current.test.sh"
+bash "$(dirname "$0")/guards/assert-struct-literals-current.test.sh"
+
 # "No wall-clock wait in an injected-clock test helper" cost two gate reruns
 # (issue #1260: the flaky pair test, then its rewrite under #1235). Another
 # check rather than another paragraph, same reasoning as the hygiene guard
