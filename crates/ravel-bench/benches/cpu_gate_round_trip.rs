@@ -35,7 +35,8 @@
 //! In every configuration the arms (or variants) run interleaved: each run
 //! executes all three in an order shuffled by a fixed, printed seed, so
 //! differences are paired run by run. Samples go to fixed-size log-bucketed
-//! histograms (32 buckets per power of two, about 3% resolution).
+//! histograms (1024 buckets per power of two; a reported value is a bucket
+//! middle, within 0.05% of every sample in the bucket).
 //!
 //! Under `cargo bench` the run is 5 paired runs of 1500 ms per configuration.
 //! Run any other way (`cargo test --bench cpu_gate_round_trip`, or the binary
@@ -92,7 +93,7 @@ const ATTR_COUNTS: [usize; 2] = [16, 105];
 const SERIES: usize = 2828;
 const LABELS: usize = 10;
 
-/// Fixed-size latency histogram: exact below 32 ns, then 32 log-linear
+/// Fixed-size latency histogram: exact below 1024 ns, then 1024 log-linear
 /// buckets per power of two.
 #[derive(Clone)]
 struct Histogram {
@@ -100,7 +101,7 @@ struct Histogram {
     total: u64,
 }
 
-const SUB_BITS: u32 = 5;
+const SUB_BITS: u32 = 10;
 const SUB: u64 = 1 << SUB_BITS;
 const BUCKETS: usize = (SUB as usize) * (64 - SUB_BITS as usize);
 
@@ -1041,18 +1042,17 @@ fn check_drop_samples(
 ) -> Result<(), String> {
     let expected_page_reads = if shape.reads_pages() { jobs } else { 0 };
     let s = &run.stats;
-    if s.drop.total != jobs
-        || s.round_trip.total != jobs
-        || s.page_read.total != expected_page_reads
-    {
+    let expected = (jobs, jobs, expected_page_reads);
+    let recorded = (s.drop.total, s.round_trip.total, s.page_read.total);
+    if recorded != expected {
         return Err(format!(
             "{} {}: expected {jobs} drop and round-trip samples and {expected_page_reads} page \
              reads, recorded {} drop, {} round-trip, {} page reads",
             shape.name(),
             variant.name(),
-            s.drop.total,
-            s.round_trip.total,
-            s.page_read.total
+            recorded.0,
+            recorded.1,
+            recorded.2
         ));
     }
     Ok(())
@@ -1225,7 +1225,7 @@ fn self_check(
         h.record(Duration::from_micros(i));
     }
     let p50 = us(h.percentile(0.50));
-    if !(500.0 * 0.97..=500.0 * 1.03).contains(&p50) || h.total != 1000 {
+    if !(500.0 * 0.999..=500.0 * 1.001).contains(&p50) || h.total != 1000 {
         return Err(format!(
             "self-check histogram: p50 of 1..=1000 us read {p50:.1} us"
         ));
