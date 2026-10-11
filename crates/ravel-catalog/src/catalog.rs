@@ -3140,11 +3140,15 @@ impl Catalog {
         // concurrently. resolve_fanout's final deterministic sort makes the
         // result independent of merge order.
         let coords: Vec<((u32, u32), Vec<ObjectMeta>)> = grouped.into_iter().collect();
+        let cached = self.cached_commit_records(tenant, signal, &coords, accounting)?;
+        let cached = &cached;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
                 .map(|((shard, hour), objs)| async move {
-                    self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
-                        .await
+                    self.process_bucket(
+                        tenant, signal, shard, hour, objs, range, cached, accounting,
+                    )
+                    .await
                 })
                 .buffered(self.config.resolve_get_concurrency)
                 .collect()
@@ -3247,7 +3251,8 @@ impl Catalog {
     /// the set of keys in one bucket, so grouping a wider listing by bucket and
     /// running this per group yields the identical snapshot the per-bucket loop
     /// yields -- the property the differential test
-    /// pins.
+    /// pins. `cached` is the resolve's
+    /// [`cached_commit_records`](Self::cached_commit_records).
     #[allow(clippy::too_many_arguments)]
     async fn process_bucket(
         &self,
@@ -3257,6 +3262,7 @@ impl Catalog {
         hour: u32,
         objects: Vec<ObjectMeta>,
         range: TimeRange,
+        cached: &HashMap<String, Arc<CommitRecord>>,
         accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
@@ -3288,12 +3294,14 @@ impl Catalog {
             return Ok(out);
         }
 
-        // Warm the record caches for this bucket concurrently before the
-        // sequential include logic runs: the includes below
-        // then hit the cache instead of each paying a serial GET. A GET
-        // failure surfaces here, exactly as it would have from the first
-        // sequential load.
-        self.prewarm_commit_records(tenant, signal, shard, &l0_keys, accounting)
+        // Load this bucket's records concurrently before the sequential
+        // include logic runs. The L0 records are held here for the include
+        // logic below rather than re-read through the cache, so a bucket
+        // larger than the cache is not read twice; the compaction records are
+        // few per bucket and are re-read from their cache. A GET failure
+        // surfaces here, before any include runs.
+        let l0_records = self
+            .prewarm_commit_records(tenant, signal, shard, &l0_keys, cached, accounting)
             .await?;
         self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys, accounting)
             .await?;
@@ -3303,11 +3311,8 @@ impl Catalog {
         // compaction record does, so its presence alone (even with no
         // compaction record) rules out this fast path.
         if compaction_keys.is_empty() && rewrite_keys.is_empty() {
-            for key in &l0_keys {
-                self.include_l0_if_overlaps(
-                    tenant, signal, shard, key, &range, &mut out, accounting,
-                )
-                .await?;
+            for (key, record) in l0_keys.iter().zip(&l0_records) {
+                Self::include_l0_if_overlaps(key, record, &range, &mut out)?;
             }
             return Ok(out);
         }
@@ -3484,10 +3489,7 @@ impl Catalog {
         // any unlisted one normally, raising the interlock metric if it
         // postdates the newest compaction/rewrite record (docs/catalog-and-mvcc.md
         // step 3).
-        for key in &l0_keys {
-            let record = self
-                .load_and_validate(tenant, signal, shard, key, accounting)
-                .await?;
+        for (key, record) in l0_keys.iter().zip(&l0_records) {
             let identity = (
                 record.writer_id.clone(),
                 record.writer_epoch,
@@ -3510,7 +3512,7 @@ impl Catalog {
                 end_ns: record.max_event_ts_ns,
             };
             if event_range.overlaps(&range) {
-                let segment_ref = build_segment_ref(key, &record)?;
+                let segment_ref = build_segment_ref(key, record)?;
                 out.entry(segment_ref.data_object_key.clone())
                     .or_insert(segment_ref);
             }
@@ -3645,11 +3647,15 @@ impl Catalog {
         // collide across buckets, and resolve_impl's final deterministic sort
         // makes the result independent of merge order.
         let coords: Vec<((u32, u32), Vec<ObjectMeta>)> = grouped.into_iter().collect();
+        let cached = self.cached_commit_records(tenant, signal, &coords, accounting)?;
+        let cached = &cached;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
                 .map(|((shard, hour), objs)| async move {
-                    self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
-                        .await
+                    self.process_bucket(
+                        tenant, signal, shard, hour, objs, range, cached, accounting,
+                    )
+                    .await
                 })
                 .buffered(self.config.resolve_get_concurrency)
                 .collect()
@@ -3747,51 +3753,93 @@ impl Catalog {
         Ok(grouped)
     }
 
-    /// Concurrently load and cache every commit record in `keys` under the
-    /// resolve-wide semaphore, so a later cache-first read of
-    /// each is a hit. Returns the first load error; the sequential include
-    /// logic never re-issues a GET a successful prewarm already cached.
+    /// Look up every listed L0 commit record of every untombstoned bucket in
+    /// the record cache, before any bucket issues a GET, and hold the hits for
+    /// the rest of the resolve. Done resolve-wide because a bucket's misses
+    /// admit records that evict other buckets' entries: looked up bucket by
+    /// bucket, a resolve over more records than the cache holds would evict
+    /// each cached record before reaching it.
+    ///
+    /// The single per-resolve site that decides "served from cache" for a
+    /// commit record: nothing later in the resolve touches the record cache
+    /// for an L0 record, so each is credited exactly once and a record this
+    /// resolve fetched itself is never credited.
+    fn cached_commit_records(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        buckets: &[((u32, u32), Vec<ObjectMeta>)],
+        accounting: &QueryAccounting,
+    ) -> Result<HashMap<String, Arc<CommitRecord>>, CatalogError> {
+        let mut cached: HashMap<String, Arc<CommitRecord>> = HashMap::new();
+        for ((shard, _hour), objects) in buckets {
+            // A tombstoned bucket contributes nothing and drops its cached
+            // records in `process_bucket`, so it is not looked up here.
+            let mut l0_keys: Vec<&str> = Vec::new();
+            let mut has_tombstone = false;
+            for meta in objects {
+                match keys::partition_bucket_entry(&meta.key)? {
+                    BucketEntry::CommitRecord(_) => l0_keys.push(&meta.key),
+                    BucketEntry::Tombstone(_) => has_tombstone = true,
+                    BucketEntry::CompactionRecord(_) | BucketEntry::RewriteRecord(_) => {}
+                }
+            }
+            if has_tombstone {
+                continue;
+            }
+            for key in l0_keys {
+                if let Some(record) = self.cache.get(tenant, key, accounting) {
+                    validate_expected_fields(self, &record, tenant, signal, *shard, key)?;
+                    accounting.record_commit_record_cache_hit();
+                    cached.insert(key.to_string(), record);
+                }
+            }
+        }
+        Ok(cached)
+    }
+
+    /// Load every commit record in `keys`, returned in `keys` order, for the
+    /// include logic to read in place of the cache. A record in `cached` (the
+    /// resolve's [`cached_commit_records`](Self::cached_commit_records)) is
+    /// taken from there; the rest are fetched concurrently under the
+    /// resolve-wide semaphore. Each record therefore costs at most one GET per
+    /// resolve whatever the cache capacity. Returns the first load error.
     async fn prewarm_commit_records(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         shard: u32,
         keys: &[String],
+        cached: &HashMap<String, Arc<CommitRecord>>,
         accounting: &QueryAccounting,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<Vec<Arc<CommitRecord>>, CatalogError> {
+        let mut loaded: Vec<(usize, Arc<CommitRecord>)> = Vec::with_capacity(keys.len());
+        let mut misses: Vec<(usize, String)> = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
+            match cached.get(key) {
+                Some(record) => loaded.push((index, record.clone())),
+                None => misses.push((index, key.clone())),
+            }
+        }
         // Owned key clones, not borrowed slice items: a stream closure that
         // borrows each `&String` makes rustc infer a non-higher-ranked
         // lifetime for the future, which then fails to unify with axum's
         // `Handler` blanket impl at the HTTP router (the same "FnOnce is not
         // general enough" wall the prefetch closure in `ravel-query` hit).
-        let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
-            .map(|key| async move {
-                // The single per-resolve site that decides "served from cache"
-                // for a commit record. Prewarm is the first of the two touches
-                // every commit-record key gets in a resolve (this concurrent
-                // warming pass, then a sequential include), so a record already
-                // resident when prewarm reaches it was resident when the resolve
-                // began and is a cache serve; counting it here, not at the
-                // include touch, credits each record exactly once and never
-                // credits one this resolve fetched itself (a prewarm miss then
-                // an include hit off its own insert). The load reports the
-                // outcome of the lookup it actually performed, so nothing can
-                // fall between deciding and serving.
-                let (_, served_from_cache) = self
-                    .load_and_validate_reporting_cache(tenant, signal, shard, &key, accounting)
-                    .await?;
-                if served_from_cache {
-                    accounting.record_commit_record_cache_hit();
-                }
-                Ok(())
+        let fetches: Vec<Result<(usize, Arc<CommitRecord>), CatalogError>> = stream::iter(misses)
+            .map(|(index, key)| async move {
+                self.fetch_commit_record(tenant, signal, shard, &key, accounting)
+                    .await
+                    .map(|record| (index, record))
             })
             .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
             .await;
-        for load in loads {
-            load?;
+        for fetch in fetches {
+            loaded.push(fetch?);
         }
-        Ok(())
+        loaded.sort_unstable_by_key(|(index, _)| *index);
+        Ok(loaded.into_iter().map(|(_, record)| record).collect())
     }
 
     /// Compaction-record counterpart to
@@ -3819,29 +3867,22 @@ impl Catalog {
         Ok(())
     }
 
-    /// Load one L0 commit record and, if its event range overlaps `range`,
-    /// add its segment ref to `out`. The plain Phase 1 include path, shared
-    /// by the no-compaction fast path.
-    #[allow(clippy::too_many_arguments)]
-    async fn include_l0_if_overlaps(
-        &self,
-        tenant: &TenantHash,
-        signal: Signal,
-        shard: u32,
+    /// Add an L0 commit record's segment ref to `out` if its event range
+    /// overlaps `range`. The plain Phase 1 include path, shared by the
+    /// no-compaction fast path; `record` is the one
+    /// [`prewarm_commit_records`](Self::prewarm_commit_records) loaded.
+    fn include_l0_if_overlaps(
         key: &str,
+        record: &CommitRecord,
         range: &TimeRange,
         out: &mut HashMap<String, SegmentRef>,
-        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
-        let record = self
-            .load_and_validate(tenant, signal, shard, key, accounting)
-            .await?;
         let event_range = TimeRange {
             start_ns: record.min_event_ts_ns,
             end_ns: record.max_event_ts_ns,
         };
         if event_range.overlaps(range) {
-            let segment_ref = build_segment_ref(key, &record)?;
+            let segment_ref = build_segment_ref(key, record)?;
             out.entry(segment_ref.data_object_key.clone())
                 .or_insert(segment_ref);
         }
@@ -4272,30 +4313,24 @@ impl Catalog {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
-        self.load_and_validate_reporting_cache(tenant, signal, shard, key, accounting)
+        if let Some(cached) = self.cache.get(tenant, key, accounting) {
+            validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
+            return Ok(cached);
+        }
+        self.fetch_commit_record(tenant, signal, shard, key, accounting)
             .await
-            .map(|(record, _served_from_cache)| record)
     }
 
-    /// [`Catalog::load_and_validate`], also reporting whether the record came
-    /// from the decoded-record cache rather than a GET.
-    ///
-    /// The flag is the same lookup that decides the outcome, not a separate
-    /// prediction of it, which is what makes it exact: a peek followed by a
-    /// load can be falsified in between by an eviction or an invalidation, and
-    /// would then count a serve for a record this call fetched.
-    pub(crate) async fn load_and_validate_reporting_cache(
+    /// GET, decode, and validate one commit record and admit it to the
+    /// record cache, without consulting the cache first.
+    async fn fetch_commit_record(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         shard: u32,
         key: &str,
         accounting: &QueryAccounting,
-    ) -> Result<(Arc<CommitRecord>, bool), CatalogError> {
-        if let Some(cached) = self.cache.get(tenant, key, accounting) {
-            validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
-            return Ok((cached, true));
-        }
+    ) -> Result<Arc<CommitRecord>, CatalogError> {
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
         let record = record::decode(&got.data)?;
@@ -4309,7 +4344,7 @@ impl Catalog {
             self.config.cache_capacity_per_tenant,
             self.config.commit_cache_max_bytes_per_tenant(),
         );
-        Ok((record, false))
+        Ok(record)
     }
 }
 
@@ -5782,7 +5817,7 @@ mod tests {
     /// its delta is exactly K.
     ///
     /// FLIP: delete the `record_commit_record_cache_hit()` call in
-    /// `prewarm_commit_records` and the `full ..., 2` assertion fails (the
+    /// `cached_commit_records` and the `full ..., 2` assertion fails (the
     /// counter stays 0).
     #[tokio::test]
     async fn commit_record_cache_serves_are_counted_exactly_without_a_snapshot() {
@@ -5820,9 +5855,7 @@ mod tests {
         let now_ns = i64::from(base_hour + record_count - 1) * NS_PER_HOUR + 30 * 60_000_000_000;
 
         // Warm the two most-recent hours (K = 2). Cold, so nothing is served
-        // from the cache yet: the new counter's delta is 0 even though the
-        // pooled cache_hits is not (each prewarmed key is hit on its include
-        // touch).
+        // from the cache yet: the new counter's delta is 0.
         let warm_start_hour = base_hour + record_count - 2; // covers the last two hours
         let warm_range = TimeRange {
             start_ns: i64::from(warm_start_hour) * NS_PER_HOUR,
@@ -5973,17 +6006,16 @@ mod tests {
             .expect("second resolve");
         let hit_snap = hit_acc.snapshot();
         // Exactly why the pooled counter cannot serve as a commit-record figure.
-        // Six pooled hits: four from the two commit records, which each cost TWO
-        // pooled hits (the prewarm's `load_and_validate` and the sequential
-        // include both call `cache.get`), plus the decoded snapshot-HEAD probe
-        // and the folded part read. A `>` against the commit-record counter
-        // would be cleared by the record cache's double touch alone and could
-        // not show this; the exact total fails if any term moves.
+        // Four pooled hits: one per commit record (the resolve-wide lookup in
+        // `cached_commit_records` is the only `cache.get` an L0 record gets),
+        // plus the decoded snapshot-HEAD probe and the folded part read. The
+        // exact total fails if any term moves, including a second touch per
+        // commit record.
         assert_eq!(
-            hit_snap.cache_hits, 6,
-            "pooled hits are 2 per commit record plus the HEAD probe and the part \
-             cache, none of which the commit-record counter counts; got {} against \
-             {} commit-record serves",
+            hit_snap.cache_hits, 4,
+            "pooled hits are 1 per commit record plus the HEAD probe and the part \
+             cache, the last two of which the commit-record counter does not count; \
+             got {} against {} commit-record serves",
             hit_snap.cache_hits, hit_snap.commit_record_cache_hits
         );
         assert_eq!(
@@ -10443,6 +10475,195 @@ mod tests {
             },
             other => panic!("expected CompactionRecordDecode, got {other:?}"),
         }
+    }
+
+    /// Publish `per_bucket` commit records into each of `shards` shards in
+    /// each of `hours` consecutive ingest hours starting at `base_hour`, seed
+    /// a provisioning record for `shards`, and return the `(range, now_ns)`
+    /// that covers every record.
+    async fn publish_record_grid(
+        store: &MemoryStore,
+        shards: u32,
+        hours: u32,
+        per_bucket: u64,
+        base_hour: u32,
+    ) -> (TimeRange, i64) {
+        for hour in base_hour..base_hour + hours {
+            let event = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+            for shard in 0..shards {
+                for seq in 1..=per_bucket {
+                    publish_segment(store, shard, seq, hour, event, event - 1_000, event).await;
+                }
+            }
+        }
+        seed_provisioning_record(store, shards).await;
+        let now_ns = i64::from(base_hour + hours - 1) * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        (range, now_ns)
+    }
+
+    fn is_commit_record_key(key: &str) -> bool {
+        let file = key.rsplit('/').next().unwrap_or(key);
+        file.ends_with(".cmt") && !file.starts_with("l1.") && !file.starts_with("rw.")
+    }
+
+    /// Issue #2752: a resolve reads each commit record at most once, whatever
+    /// the record-cache cap. 40 unfolded records over 2 shards x 2 hours, with
+    /// the per-tenant cap below the record count. A cold resolve issues
+    /// exactly one GET per record plus three fixed GETs: the provisioning
+    /// enforcement read, the scan-generation read (both of the `prov` key),
+    /// and the HEAD probe. A warm resolve issues no GET for a record still in
+    /// the cache and exactly one for each record the cap evicted, plus the
+    /// scan-generation read (HEAD's absence and the enforcement result are
+    /// cached).
+    ///
+    /// FLIP (raised cap): in `fetch_commit_record`, pass
+    /// `MAX_CACHE_CAPACITY_PER_TENANT` instead of
+    /// `self.config.cache_capacity_per_tenant`; the warm resolve then fetches
+    /// no record and the `warm record GETs` assertion fails.
+    /// FLIP (re-read warm): make `cached_commit_records` return an empty map;
+    /// the warm resolve fetches all 40 and the same assertion fails.
+    /// Against the pre-#2752 tree the cold assertion fails (2N + 3).
+    #[tokio::test]
+    async fn resolve_issues_one_get_per_commit_record_above_the_cache_cap() {
+        const SHARDS: u32 = 2;
+        const HOURS: u32 = 2;
+        const PER_BUCKET: u64 = 10;
+        let records = (SHARDS * HOURS) as usize * PER_BUCKET as usize;
+        assert_eq!(records, 40);
+
+        for cap in [0usize, 8, 13, 39] {
+            let store = Arc::new(KeyLoggingStore::new(MemoryStore::new()));
+            let (range, now_ns) =
+                publish_record_grid(&store.inner, SHARDS, HOURS, PER_BUCKET, 500_000).await;
+            let catalog = Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    cache_capacity_per_tenant: cap,
+                    ..config(SHARDS)
+                },
+            )
+            .expect("catalog")
+            .with_monotonic_clock(Arc::new(FrozenMono))
+            .with_provisioning_enforcement();
+            let prov_key = crate::provisioning::provisioning_key(&tenant(), Signal::Metrics);
+            let head_key = crate::fold::head_object_key(&tenant(), Signal::Metrics);
+
+            let resolve = |acc: QueryAccounting| {
+                let catalog = &catalog;
+                async move {
+                    let snapshot = catalog
+                        .resolve_with_accounting(
+                            &tenant(),
+                            Signal::Metrics,
+                            range,
+                            &[],
+                            now_ns,
+                            &acc,
+                        )
+                        .await
+                        .expect("resolve");
+                    assert_eq!(snapshot.segments.len(), records, "cap {cap}");
+                    acc.snapshot().s3_requests[AccountedOp::Get.index()]
+                }
+            };
+            // Split the GETs logged since `from` into per-record counts and
+            // the sorted non-record keys.
+            let split = |from: usize| {
+                let keys = store.get_keys();
+                let mut per_record: HashMap<String, usize> = HashMap::new();
+                let mut other = Vec::new();
+                for key in &keys[from..] {
+                    if is_commit_record_key(key) {
+                        *per_record.entry(key.clone()).or_default() += 1;
+                    } else {
+                        other.push(key.clone());
+                    }
+                }
+                other.sort();
+                (per_record, other, keys.len())
+            };
+
+            let cold_gets = resolve(QueryAccounting::new()).await;
+            let (cold_records, cold_other, cold_end) = split(0);
+            assert_eq!(cold_gets, records as u64 + 3, "cap {cap}: cold GETs");
+            assert_eq!(cold_records.len(), records, "cap {cap}: every record read");
+            assert!(
+                cold_records.values().all(|&n| n == 1),
+                "cap {cap}: no record read twice cold: {cold_records:?}"
+            );
+            let mut fixed = vec![head_key.clone(), prov_key.clone(), prov_key.clone()];
+            fixed.sort();
+            assert_eq!(cold_other, fixed, "cap {cap}: the three fixed GETs");
+
+            let warm_gets = resolve(QueryAccounting::new()).await;
+            let (warm_records, warm_other, _) = split(cold_end);
+            let evicted = records - cap.min(records);
+            assert_eq!(
+                warm_records.values().sum::<usize>(),
+                evicted,
+                "cap {cap}: warm record GETs are exactly the evicted records"
+            );
+            assert!(
+                warm_records.values().all(|&n| n == 1),
+                "cap {cap}: no record read twice warm: {warm_records:?}"
+            );
+            assert_eq!(warm_other, vec![prov_key], "cap {cap}: warm fixed GET");
+            assert_eq!(warm_gets, evicted as u64 + 1, "cap {cap}: warm GETs");
+        }
+    }
+
+    /// Issue #2752: a commit-record GET that fails during the prewarm surfaces
+    /// as the typed store error, and the include pass does not read the record
+    /// again: every record key is attempted at most once.
+    ///
+    /// FLIP (silent retry): in `prewarm_commit_records`, fall back to
+    /// `load_and_validate` when `fetch_commit_record` fails; the resolve then
+    /// succeeds and `expect_err` fails.
+    #[tokio::test]
+    async fn prewarm_record_get_failure_surfaces_without_an_include_retry() {
+        let mem = MemoryStore::new();
+        let (range, now_ns) = publish_record_grid(&mem, 1, 1, 10, 500_000).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("record get".into()))
+                .with_key_contains(".cmt")
+                .with_occurrence(Occurrence::Nth(4)),
+        );
+        let store = Arc::new(KeyLoggingStore::new(FaultStore::new(mem, plan)));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_monotonic_clock(Arc::new(FrozenMono));
+
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("the faulted record GET fails the resolve");
+        assert!(
+            matches!(err, CatalogError::Store(StoreError::Permanent(ref m)) if m == "record get"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.inner.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the fault fired exactly once"
+        );
+        let mut per_record: HashMap<String, usize> = HashMap::new();
+        for key in store.get_keys() {
+            if is_commit_record_key(&key) {
+                *per_record.entry(key).or_default() += 1;
+            }
+        }
+        assert!(
+            per_record.len() >= 4,
+            "the fault was reached: {per_record:?}"
+        );
+        assert!(
+            per_record.values().all(|&n| n == 1),
+            "no record GET was retried by the include pass: {per_record:?}"
+        );
     }
 
     /// Test-only decorator that records every `get()` key, in call order, so

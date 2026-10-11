@@ -114,6 +114,16 @@ impl Calls {
         self.record_gets().len()
     }
 
+    /// The most GETs any one commit-record key received; 0 when none did.
+    fn max_gets_per_key(&self) -> usize {
+        let mut per_key: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for key in self.record_gets() {
+            *per_key.entry(key).or_default() += 1;
+        }
+        per_key.into_values().max().unwrap_or(0)
+    }
+
     fn list_count(&self) -> usize {
         self.lists.lock().unwrap().len()
     }
@@ -349,10 +359,10 @@ async fn repeat_resolve_over_unsealed_buckets_costs_the_lists_only() {
 }
 
 /// The `0` bound disables the cache, which is this file's standing red for
-/// the test above: every resolve then re-reads every record. Twenty-four, not
-/// twelve, because `process_bucket` reads each record twice with nothing
-/// cached in between (the concurrent `prewarm_commit_records` pass, then the
-/// sequential include pass).
+/// the test above: every resolve then re-reads every record. Twelve, once
+/// each: `process_bucket`'s include logic reads the records
+/// `prewarm_commit_records` returned, not the cache, so a disabled cache costs
+/// no second read.
 ///
 /// This asserts the resolve cost of a disabled cache, which a bound of 1
 /// would also produce; that `0` specifically admits nothing rather than
@@ -370,10 +380,10 @@ async fn cache_disabled_refetches_every_record_every_resolve() {
     calls.reset();
     let second = resolve(&catalog).await.expect("second resolve");
 
-    assert_eq!(first_gets, 24);
+    assert_eq!(first_gets, 12);
     assert_eq!(
         calls.record_get_count(),
-        24,
+        12,
         "with the cache disabled the second resolve must re-read every record"
     );
     assert_eq!(
@@ -412,16 +422,16 @@ async fn record_published_between_resolves_is_fetched_exactly_once() {
 }
 
 /// The bound is enforced: set below the hot region's size it cannot hold it,
-/// so the saving disappears and every resolve pays full price again.
+/// so the saving shrinks to what the bound holds and every resolve pays for
+/// the rest.
 ///
-/// The exact count is 24 per resolve, not 8, and the shape is worth stating.
-/// With a bound below a bucket's record count, `process_bucket`'s two passes
-/// evict each other: the concurrent prewarm admits all six of a bucket's
-/// records and keeps the four it touched last, then the sequential include
-/// pass walks all six in listing order, missing on the ones the prewarm
-/// dropped and evicting the ones it kept as it refills. Neither pass ever
-/// serves the other, so both buckets pay 6 + 6. Sizing the bound at or above
-/// the hot region (the default, 10,000 entries) is what avoids this: raising
+/// The exact counts are 12 cold and 8 warm. Each record is read at most once
+/// per resolve: the include logic reads the records the prewarm returned, not
+/// the cache, so the cold resolve pays one GET per record whatever the bound.
+/// The warm resolve looks up all twelve keys before issuing any GET, so the
+/// four the bound kept are served even though the eight misses then evict
+/// them, and only those eight are fetched. Sizing the bound at or above the
+/// hot region (the default, 10,000 entries) is what avoids the eight: raising
 /// this test's bound to 12 takes the second resolve to 0.
 ///
 /// Which four entries a bound of 4 retains is an LRU question, pinned
@@ -436,18 +446,24 @@ async fn a_bound_below_the_hot_region_loses_the_saving() {
     let catalog = Catalog::new(store, config(4)).expect("catalog");
 
     let first = resolve(&catalog).await.expect("first resolve");
-    assert_eq!(calls.record_get_count(), 24);
+    assert_eq!(
+        calls.record_get_count(),
+        12,
+        "a cold resolve reads each record once whatever the bound"
+    );
     calls.reset();
 
     let second = resolve(&catalog).await.expect("second resolve");
-    let second_gets = calls.record_get_count();
     assert_eq!(
-        second_gets, 24,
-        "a bound of 4 cannot hold the twelve-record hot set, so every pass misses"
+        calls.record_get_count(),
+        8,
+        "a bound of 4 holds four of the twelve-record hot set: those four are served and \
+         the other eight are fetched once each"
     );
-    assert!(
-        second_gets >= 8,
-        "a cache holding at most 4 of 12 can never serve more than 4 of a pass's reads"
+    assert_eq!(
+        calls.max_gets_per_key(),
+        1,
+        "no record is fetched twice in one resolve"
     );
     assert_eq!(
         first, second,
@@ -479,8 +495,9 @@ async fn a_bound_at_the_hot_region_size_keeps_the_saving() {
 /// One GET, not eight: `prewarm_commit_records` issues all six of the
 /// bucket's GETs concurrently and only then returns the first error, so the
 /// five that succeeded are already cached and only the faulted record is
-/// missing. The second resolve's prewarm re-reads exactly that one, and its
-/// include pass is served from the cache.
+/// missing. The second resolve's prewarm re-reads exactly that one, serves
+/// the other eleven from the cache, and its include logic reads the records
+/// the prewarm returned.
 #[tokio::test]
 async fn a_faulted_record_get_leaves_the_other_records_cached() {
     let inner = Arc::new(MemoryStore::new());
@@ -528,14 +545,14 @@ async fn a_faulted_record_get_leaves_the_other_records_cached() {
 /// Issue #1735: the per-tenant record cache is sized from the shipped ingest
 /// defaults (`shard_count: 4`, `max_flush_delay: 2s`), not the old flat
 /// 10,000-entry bound. At the old bound, a 16,800-record unsealed tail is
-/// larger than the cache, so it thrashes exactly like
-/// `a_bound_below_the_hot_region_loses_the_saving` above (both passes evict
-/// each other). The red lever is `config(10_000)` in place of
-/// `config(derived)` below, and it goes red on the COLD assertion, not the
-/// second-resolve one: a real run reports `left: 33600, right: 16800` there,
-/// because both of `process_bucket`'s passes re-read every record once the
-/// bound is exceeded. The second-resolve assertion is never reached under the
-/// lever. At `derive_cache_capacity_per_tenant(4, 2s)` (25,000, the 45 MB
+/// larger than the cache, so like
+/// `a_bound_below_the_hot_region_loses_the_saving` above every resolve pays
+/// for the records the bound could not hold. The red lever is `config(10_000)`
+/// in place of `config(derived)` below. The cold assertion still holds under
+/// it, since a resolve reads each record once whatever the bound; the
+/// second-resolve assertion goes red with `left: 6800, right: 0`, the records
+/// past the 10,000 the bound kept. At
+/// `derive_cache_capacity_per_tenant(4, 2s)` (25,000, the 45 MB
 /// per-tenant cap that binds at the shipped defaults), the tail fits and the
 /// second resolve issues none.
 #[tokio::test]
@@ -588,9 +605,9 @@ async fn second_resolve_over_a_16800_record_unsealed_tail_issues_no_record_gets(
 /// The red lever is one line: delete `.saturating_mul(SIGNAL_STREAMS)` from
 /// `derive_cache_capacity_per_tenant` in crates/ravel-catalog/src/config.rs.
 /// The capacity is then the 10,000 floor, the three tails evict each other,
-/// and this test's second-resolve assertion on the first signal reports 4,000
-/// record GETs (its whole tail, since the two passes evict each other once
-/// the bound does not fit) where it demands zero. Measured by running this
+/// and this test's second-resolve assertion on the first signal reports 2,000
+/// record GETs (the half of its tail the later two signals' 8,000 records
+/// pushed out of the 10,000) where it demands zero. Measured by running this
 /// fixture at `single_signal_derived` rather than `derived`.
 #[tokio::test]
 async fn a_multi_signal_tenant_resolves_its_unsealed_tail_without_record_gets() {
