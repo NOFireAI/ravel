@@ -138,7 +138,7 @@ impl From<QueryError> for ApiError {
             // A memory-budget refusal on the fetch path or the catalog decode
             // path is a budget refusal of a well-formed query, not a storage
             // fault: the same 422 "execution" the SQL surface answers for its
-            // own memory pool (ADR-2633 decision 3, superseding the 503 of
+            // own memory pool (ADR-2633 section 5, superseding the 503 of
             // ADR-1170). The text is the budget's own message, class included
             // (the ledger's limit, or the host-memory gate), carrying only
             // byte figures, so it is echoed rather than redacted.
@@ -1515,7 +1515,7 @@ mod tests {
         assert_eq!(status_code(QueryError::Fetch(cancelled)), 503);
     }
 
-    /// ADR-2633 decision 3: a fetch-memory refusal and a catalog decode
+    /// ADR-2633 section 5: a fetch-memory refusal and a catalog decode
     /// refusal answer 422 `execution` with the budget's own message, class
     /// included, on the PromQL surface; before this they redacted to
     /// `MSG_UNAVAILABLE` and answered 503. Both classes of both refusals are

@@ -58,9 +58,11 @@
 //! set at all, never by the text it sent.
 //!
 //! One `BudgetExceeded` is NOT a cap refusal: a remote out of fetch memory
-//! reports the same status, and it stays a retryable 503 on purpose. That is
-//! backpressure rather than a verdict on the query, so the same slice can
-//! succeed once the remote has room, exactly as on the intra-cluster path.
+//! reports the same status, and `typed_budget_refusal` turns it back into the
+//! remote's own memory refusal, which answers 422 with the budget's message
+//! (ADR-2633 section 5), exactly as on the intra-cluster path. It is still
+//! backpressure rather than a verdict on the query: the same slice can
+//! succeed once the remote has room.
 //!
 //! Every request carries the query's own deadline, and a remote stops
 //! reading for the query when it passes on the remote's clock. A remote that

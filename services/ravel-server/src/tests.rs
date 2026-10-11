@@ -935,7 +935,7 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
 /// ADR-1170 process-wide memory budget is refused typed
 /// (`FetchError::FetchMemoryExhausted`), and, through the real HTTP router,
 /// as `StatusCode::UNPROCESSABLE_ENTITY` / `errorType: "execution"` with the
-/// budget's own message (ADR-2633 decision 3; before it, 503 `unavailable`
+/// budget's own message (ADR-2633 section 5; before it, 503 `unavailable`
 /// with the storage outage message). This is the PromQL-path counterpart of
 /// `a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving`
 /// above: it exercises `crate::query::build_app_state`'s

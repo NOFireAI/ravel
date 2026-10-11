@@ -562,7 +562,7 @@ impl SqlError {
             // Safe to echo: a memory-budget refusal carries only the budget's
             // figures and its class (the ledger's limit, or the host-memory
             // gate), never an object key or tenant identity, and the class is
-            // what the caller needs to see (ADR-2633 decision 3). The same
+            // what the caller needs to see (ADR-2633 section 5). The same
             // treatment as the budget errors below, on every path a refusal
             // reaches this surface by: a catalog or column-statistics decode
             // charge, and a metrics, log or span fetch reservation.
@@ -799,7 +799,7 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
         CatalogError::Store(StoreError::Corrupted(_)) => MSG_CORRUPT,
 
         // Never reached: `client_message` echoes a memory refusal before
-        // calling in (ADR-2633 decision 3). Matched only for exhaustiveness.
+        // calling in (ADR-2633 section 5). Matched only for exhaustiveness.
         CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
 
         // Transient storage faults and fold progress/liveness failures: a
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
-    /// ADR-2633 decision 3: every memory-budget refusal this surface answers
+    /// ADR-2633 section 5: every memory-budget refusal this surface answers
     /// (a column-statistics or catalog decode charge, ADR-1702 decision 6; a
     /// metrics, log or span fetch reservation, ADR-1170 decision 2) is a
     /// budget refusal of a well-formed request, the 422 class the SQL memory

@@ -373,7 +373,7 @@ async fn distributed_promql_fetches_reserve_against_the_process_budget() {
     // A 4 KiB budget is far below the >512 KiB range this segment reserves, so
     // the coordinator's no-hop fragment fetch is refused and the refusal folds
     // to the PromQL API's 422 with the budget's own message against this
-    // server's limit (ADR-2633 decision 3).
+    // server's limit (ADR-2633 section 5).
     let small = start_server(seeded_store(&tenant, now).await, 4 * 1024).await;
     let (status, body) = promql_response(small.http_addr, query_time_s).await;
     assert_eq!(

@@ -311,7 +311,7 @@ mod tests {
         }
     }
 
-    /// ADR-2633 decision 3 on Flight SQL: a fetch-memory refusal and a
+    /// ADR-2633 section 5 on Flight SQL: a fetch-memory refusal and a
     /// catalog decode refusal, of either budget class, take the gRPC code the
     /// SQL memory pool's own refusal takes (`FailedPrecondition`, the 422
     /// class), with the budget's own message. Before this they were

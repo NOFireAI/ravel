@@ -4549,7 +4549,7 @@ fn fetch_memory_exhausted_message_round_trips() {
     );
 }
 
-/// ADR-2633 decision 3 on the coordinator path: a worker's fetch-memory
+/// ADR-2633 section 5 on the coordinator path: a worker's fetch-memory
 /// refusal, of either class, folds to the typed `Fetch(FetchMemoryExhausted)`
 /// and answers HTTP 422 `execution` with the worker's own message, the same
 /// status and text the local path gives. FLIP: map `FetchMemoryExhausted` back

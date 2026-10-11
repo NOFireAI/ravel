@@ -948,8 +948,8 @@ and RSPAN span fetchers with both `with_get_limiter` and `with_memory_budget`,
 passing the identical `Arc<MemoryBudget>` instance the SQL executor itself
 uses. A SQL fetch that would exceed the shared budget is refused with the same
 typed `FetchMemoryExhausted` (`SqlError::Fetch`/`LogFetch`/`SpanFetch`), which
-the HTTP layer maps to 503 `unavailable`, same as every other class of
-`ErrorClass::Unavailable`. It is the only RSPAN fetcher `ravel-server` builds.
+the HTTP layer maps to 422 `execution` with the budget's own message
+(ADR-2633 section 5). It is the only RSPAN fetcher `ravel-server` builds.
 
 Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
@@ -985,9 +985,10 @@ fetch reservation and the consumer's reservation coexist for the buffer's life
 with no double-free.
 
 **Refusal.** When the budget cannot cover a reservation the fetch fails with a
-typed `FetchMemoryExhausted { requested, reserved, limit }` (on each fetcher's
-error enum), mapped onto the query error path. The refusal carries only byte
-counts -- never an object key or tenant identity -- and is never a smaller fetch
+typed `FetchMemoryExhausted { requested, reserved, limit, cause }` (on each
+fetcher's error enum), mapped onto the query error path. The refusal carries
+only byte counts and the budget class that refused (the ledger's limit or the
+host-memory gate) -- never an object key or tenant identity -- and is never a smaller fetch
 or a partial result: no GET is issued for the refused bytes, and the budget is
 left unchanged. This holds before any GET for the RSEG range, whole-object and
 covering reservations. A ranged RLOG read reserves per placement, so a refusal
@@ -1032,7 +1033,7 @@ budget: PromQL evaluation (`QueryEngine::with_memory_budget`, wired in
 `ravel-server`), cache warming (`ravel-server`'s `cache_warm.rs`) and
 distributed query fragments (`ravel-server`'s `distrib.rs`). A read whose
 decode does not fit is refused with the 422 `FetchMemoryExhausted` maps to
-(ADR-2633 decision 3).
+(ADR-2633 section 5).
 The SQL samples scan reaches the same `decode_selected`, and its fetcher now
 reserves against the same process budget (see the SQL-path paragraph above),
 so its decodes are charged and refused by the same code as the PromQL path's.
@@ -1174,7 +1175,7 @@ back into `TooManyBytesScanned`, `TooManySeries`, `TooManySamples`, or
 `TooManySegments`, or into `FetchMemoryExhausted` with the class the worker's
 budget reported (its ledger's limit, or its host-memory gate), so it renders
 as the same 422 a local refusal does, with the worker's own budget message
-(ADR-2633 decision 3). A 503 means the fan-out itself failed, never that one
+(ADR-2633 section 5). A 503 means the fan-out itself failed, never that one
 of the query caps (bytes, series, samples, requests) was hit and never that a
 worker was out of fetch memory.
 
@@ -1328,7 +1329,7 @@ reservation made or dropped between them can also make one reading low by its
 size. A PromQL or SQL fetch that needs more than the budget's remainder fails
 with `FetchMemoryExhausted`, which both HTTP APIs answer as 422 with the
 budget's own message, the same status the SQL memory pool's own refusal,
-`ResourcesExhausted`, takes (ADR-2633 decision 3; ADR-1170 had these at
+`ResourcesExhausted`, takes (ADR-2633 section 5; ADR-1170 had these at
 503); the refused query holds no reservation afterwards, so the next query is
 admitted against the same remainder as before.
 

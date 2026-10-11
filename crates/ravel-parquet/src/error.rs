@@ -54,7 +54,7 @@ pub enum ParquetReadError {
     /// `ravel_query::FetchError::FetchMemoryExhausted`, which the SQL layer
     /// maps it to: the budget's figures and the class of the refusal
     /// (`cause`), rendered as the budget's own message so the client sees
-    /// which class refused (ADR-2633 decision 3).
+    /// which class refused (ADR-2633 section 5).
     #[error("fetch {}", memory_exhausted(.requested, .reserved, .limit, .cause))]
     MemoryExhausted {
         requested: u64,

@@ -819,7 +819,7 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "bad_data",
             ),
-            // ADR-2633 decision 3: a memory-budget refusal on the fetch path
+            // ADR-2633 section 5: a memory-budget refusal on the fetch path
             // (metrics, logs, spans) or on a catalog or column-statistics
             // decode is the budget class, 422, the status the SQL memory
             // pool's own refusal takes, in both budget classes. ADR-1170 had
