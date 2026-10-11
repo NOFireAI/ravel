@@ -483,8 +483,10 @@ smaller of that and the cgroup's headroom) every 100 ms, forces a jemalloc
 purge while the reading is below a purge floor (default the smaller of twice
 the close floor and a quarter of host memory, at most once per 5 s), and
 refuses admission and reservation growth with the budget's 422 and the
-`HostMemory` cause while the reading is below a close floor (default
-`min(max(512 MiB, 2 % of host memory), host memory / 8)`). Constraint 4 and
+`HostMemory` cause once `--memory-gate-close-after-samples` consecutive
+readings (default 3) are below a close floor (default
+`min(max(512 MiB, 2 % of host memory), host memory / 8)`), until one reading
+is back at or above it (#2838 amendment). Constraint 4 and
 the rejected "RSS as the ceiling" alternative stand for the ceiling itself:
 the gate is a bound under the kill boundary, not a ceiling. The acceptance
 is ADR-2633's criteria (a) to (d): the ClickBench concurrent error ratio at
@@ -667,9 +669,11 @@ ravel-server)
 - Acceptance: in the binary's own test module, where jemalloc is the global
   allocator (beside `binary_runs_under_jemalloc`), freeing a 256 MiB
   allocation and running the purge lowers `stats::resident` by at least
-  200 MiB and restores every arena's decay values to what they were; an
-  available reading below the close floor closes the gate and one at or
-  above it opens it; the purge counter counts, at most once per minimum
+  200 MiB and restores every arena's decay values to what they were;
+  `--memory-gate-close-after-samples` consecutive available readings below
+  the close floor close the gate and one at or above it opens it (#2838
+  amendment; with the value 1 a single reading closes it); the purge
+  counter counts, at most once per minimum
   interval while below the purge floor; the stamp reports each `source`;
   a purge floor not above the close floor, or either floor at or above
   host memory, is refused with a message naming both figures; the gate is
