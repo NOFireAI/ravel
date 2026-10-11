@@ -438,7 +438,8 @@ mod tests {
 
         // Every phase's every figure, at the exact value this fixture produces.
         // What the split buys is visible in these rows and in no pooled total:
-        // the two catalog GETs are `resolve`, the segment's one whole-object
+        // the two catalog GETs are `resolve` (the commit record, read once and
+        // so never cache-served, and the HEAD probe), the segment's one whole-object
         // read is `plan`, and `probe`/`scan` issue no request at all because
         // they are served from the region the plan read already fetched
         // (`reusedRegionBytes`). Wire bytes, cache-served bytes, reused bytes,
@@ -450,9 +451,9 @@ mod tests {
                 gets: 2,
                 wire_bytes: 288,
                 lists: 2,
-                hits: 1,
+                hits: 0,
                 misses: 2,
-                cache_bytes: 288,
+                cache_bytes: 0,
                 decompressed: 0,
                 reused: 0,
                 opened: 0,

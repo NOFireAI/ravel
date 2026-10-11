@@ -109,8 +109,7 @@ struct TenantCache {
     /// Recency index, least-recently-used first: `use_tick -> key`, in step
     /// with `entries`. A monotonic tick keeps a touch O(log n) rather than
     /// the O(n) a queue would cost, which matters because a single resolve
-    /// over a hot ingest hour touches every entry twice (the concurrent
-    /// prewarm, then the sequential include pass).
+    /// over a hot ingest hour touches every entry.
     by_use: std::collections::BTreeMap<u64, String>,
     next_tick: u64,
     /// Summed [`RecordEntry::resident_bytes`] of everything in `entries`.
@@ -1321,9 +1320,9 @@ mod tests {
     }
 
     /// A re-insert of a key already held refreshes its recency rather than
-    /// being ignored: the resolve's prewarm and include passes both go
-    /// through `insert`/`get` for the same key, so an ignored re-insert would
-    /// leave a record the resolve just used looking stale to eviction.
+    /// being ignored: two concurrent resolves that both miss a key both
+    /// insert it, so an ignored re-insert would leave a record the later
+    /// resolve just used looking stale to eviction.
     #[test]
     fn reinsert_refreshes_recency() {
         let cache = RecordCache::default();
