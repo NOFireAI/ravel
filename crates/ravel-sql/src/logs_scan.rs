@@ -7034,8 +7034,9 @@ fn declared_i64_from_buffers(
 /// surviving rows `start..end` (ADR-0099 decision 5, ADR-2773 decision D3).
 ///
 /// The block's first chunk builds the column's keys for every surviving row of
-/// the block and its one values array ([`build_str_block`]); every chunk is a
-/// slice of those keys over that values array, so no chunk copies a string.
+/// the block and its one values array ([`build_str_block`]); every chunk
+/// copies its rows' keys ([`chunk_keys`]) over that values array, so no chunk
+/// copies a string.
 /// The logical values are the ones [`declared_column_array`]'s `Str` arm
 /// produces on the row path, so a fast-path batch and a fallback batch
 /// validate against the one schema DataFusion checks.
@@ -9839,7 +9840,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
-        /// ADR-2773 D3's contract: the declared `Str` column built as slices of
+        /// ADR-2773 D3's contract: the declared `Str` column built as chunks of
         /// one block-wide key array over shared values equals the pre-change
         /// per-cell build ([`per_cell_reference`]) chunk by chunk: the same NULL
         /// keys and the same resolved values. On top of that, a record row on a
@@ -9854,8 +9855,7 @@ mod tests {
         ///
         /// Flipped: `DictValues::from_entries` marking a non-UTF-8 entry valid
         /// fails "keys a NULL or missing value"; the chunk slice in
-        /// `build_declared_str_columnar` starting one row early fails the key
-        /// NULL comparison.
+        /// `chunk_keys` starting one row early fails the key NULL comparison.
         #[test]
         fn declared_str_column_equals_the_per_cell_build((src, chunk) in str_source()) {
             let (obj, cfg, pred, _) = str_object(&src);
