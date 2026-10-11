@@ -1817,6 +1817,14 @@ pub struct CompactorConfig {
     /// `..CompactorConfig::default()` call sites are unaffected. Default
     /// `None`.
     pub request_ledger: Option<RequestLedger>,
+    /// The format-floor policy a compaction, erasure rewrite or migration
+    /// checks its output version against before it builds or PUTs anything
+    /// (ADR-1746 decisions 4 and 5): refuse below the bucket's recorded floor,
+    /// or write and count under `--write-below-format-floor`. `None` skips the
+    /// check and its provisioning-record read; `ravel-server`'s maintain role
+    /// installs one, and [`crate::migrate::migrate_family`] uses the refusing
+    /// default when none is installed. Default `None`.
+    pub format_floor: Option<ravel_ingest::FormatFloorPolicy>,
     /// Slow safety-net re-verify cadence for the interior zone (ADR-0065
     /// decision 3, config `maintain_interior_reverify`). A terminal interior
     /// bucket is re-evaluated no later than this after its last verification,
@@ -1906,6 +1914,7 @@ impl Default for CompactorConfig {
             dry_run: false,
             merge_memory_tracker: None,
             request_ledger: None,
+            format_floor: None,
             read_gate: MaintainReadGate::default(),
             interior_reverify_ns: DEFAULT_INTERIOR_REVERIFY_NS,
             coordination: Coordination::On,

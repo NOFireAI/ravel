@@ -370,6 +370,11 @@ async fn compact_bucket_scoped(
         ));
     }
 
+    // ADR-1746 decision 4: the parts this run would write are checked against
+    // the bucket's format floor before the claim, the first catalog read, and
+    // every PUT.
+    crate::format_floor::check_output_floor(store, config, bucket, "compaction").await?;
+
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
     // claim is acquired. A participating run claims every bucket whatever its
     // size, because the claim fences this publish against an erasure rewrite of
