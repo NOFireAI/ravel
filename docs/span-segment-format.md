@@ -11,6 +11,18 @@ events into nested columns). Trailer version history:
 | 2 | ADR-0045 decision 2 | per-block duration bounds and a status mask in SKIP_IDX |
 | 3 | ADR-0054 | mandatory BLOOM section and the `service_name` column |
 | 4 | ADR-0045 decision 3 | per-key attribute columns (`attrs_raw` overflow) and nested span-event columns |
+| 5 | ADR-2707 (proposed) | mandatory KEY_IDX section (kind 4): the exact per-object `trace_id` index |
+
+**Proposed: trailer version 5 (ADR-2707).** Version 5 adds one mandatory
+section, KEY_IDX (kind 4), and changes no other byte. No shipped writer emits
+it yet: the implementing task lands the v5 writer, the v5 reader, the
+compactor's output version and the marker below together, and until then the
+reader accepts exactly 4. Every "v5" statement in this document describes
+that pending change. Making a kind mandatory changes what a valid object is,
+which is the case the versioning rule reserves the trailer bump for (see
+docs/log-segment-format.md, "Version", for the rule and its carve-out), so
+v5 retires v4 the way v4 retired v3: one supported version, no dual reader,
+a v4 object refused with `UnsupportedVersion` from the trailer alone.
 
 Ravel is pre-release: one supported version at a time, earlier versions
 rejected with a typed `UnsupportedVersion` error, never carried by a dual
@@ -122,23 +134,30 @@ attribute, a named gap, not an oversight).
 ```
 +---------------------------------------------------+
 | BLOCKS       row blocks (column pages)            |  kind 1
+| KEY_IDX      exact (trace_id prefix, block) index |  kind 4 (v5, ADR-2707 proposed)
 | SKIP_IDX     interval + trace_id min/max index    |  kind 2
 | BLOOM        per-block service/name token bloom   |  kind 3
 | footer: SpanFooter protobuf bytes                 |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 4)                       |
+|   version:      u16   (= 4; 5 under ADR-2707)     |
 |   signal:       u8    (3 = spans)                 |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RSP1"                   |
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in kind order (1..3); readers rely only on
+Writers emit the sections physically in kind order today (1..3). Under v5
+the order is BLOCKS, KEY_IDX, SKIP_IDX, BLOOM: KEY_IDX sits between BLOCKS
+and SKIP_IDX, the placement RLOG uses for the same kind, so a suffix probe
+that covers the footer, BLOOM and SKIP_IDX does not have to span KEY_IDX's
+bucket frames (about 6% of the object) to reach them. Readers rely only on
 the footer's section offsets, never on adjacency. Bytes between sections are
 permitted and MUST be `0x00`; readers never interpret them. All three sections
 are mandatory: the reader rejects an object missing any of them as `Corrupted`.
+Under v5 all four are: a v5 object missing KEY_IDX is `Corrupted` the same
+way.
 
 `footer_crc32c` is computed over: the `SpanFooter` bytes, then `footer_len`
 (u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic`. Every trailer byte
@@ -156,9 +175,11 @@ Identical in shape to RLOG/RSEG:
    GET.
 4. Verify `footer_crc32c` (over the bytes defined above) before decoding the
    footer.
-5. Validate the section table: all three mandatory kinds present, at most one
-   of each, every range inside the section area, every `uncompressed_len`
-   within the cap.
+5. Validate the section table: all three mandatory kinds present (four under
+   v5), at most one of each, every range inside the section area, every
+   `uncompressed_len` within the cap. `validate_sections` does not refuse a
+   kind it does not know; it checks presence of the mandatory kinds and the
+   range and compression tag of every entry.
 
 ## SpanFooter
 
@@ -440,6 +461,78 @@ whole-section crc mismatch, a per-entry crc mismatch, a truncated container, or
 an entry count that disagrees with the block count is a typed `Corrupted`
 error, never a silent degrade and never a panic.
 
+## KEY_IDX (trailer version 5, ADR-2707, proposed)
+
+The exact per-object `trace_id` index: every distinct `(key8, block ordinal)`
+pair in the object, where `key8` is the first 8 bytes of the 16-byte
+`trace_id` and the block ordinal is the SKIP_IDX entry index. The grammar is
+the one docs/log-segment-format.md defines under "KEY_IDX" and is not
+restated here: it is built and read through `ravel-codec`'s `key_index`
+module, shared with RLOG exactly as BLOOM is shared through `bloom_section`
+(ADR-0054), and the section's own `version` byte (1) is separate from the
+trailer version. RSPAN fixes the parameters the shared grammar leaves to the
+writer:
+
+- exactly one field, named `trace_id`, key type `Id16` (1); a header naming
+  any other field set is `Corrupted`;
+- `bucket_bits = 8` at the writer, 1 to 16 accepted by the reader;
+- the section is mandatory (v5) and sits between BLOCKS and SKIP_IDX, the
+  RLOG placement, so the suffix probe that covers the footer, BLOOM and
+  SKIP_IDX (a reader choice, as RLOG's probe length is) never has to span
+  the bucket frames. A `trace_id =` lookup then issues one ranged GET for
+  `[0, prefix_len)` of the section, where `prefix_len` is the additive
+  `uint32 prefix_len = 7` on the footer's `ravel.rspan.v1.Section` entry
+  for kind 4 (the same field ADR-2707 adds to the RLOG footer; fields 1 to
+  6 are frozen and unchanged), so the read is exact, about 1 KB for the
+  one-field header and directory at `bucket_bits = 8`, and one for the
+  bucket it needs; neither GET depends on adjacency, and no section byte is
+  read before the first GET is sized. A read that is not a `trace_id` lookup
+  never touches the section.
+
+A `trace_id =` lookup probes KEY_IDX after the SKIP_IDX range test and
+before any block is read: an absent key proves the trace absent from every
+block, so the object is dropped with no block read (the SKIP_IDX
+`[min_trace_id, max_trace_id]` test is an interval, and with random ids
+nearly every object passes it); a present key names the blocks that hold
+any trace whose id shares the 8-byte prefix. The reader takes the
+intersection of that block set with the SKIP_IDX candidate set (the blocks
+whose `[min_trace_id, max_trace_id]` admit the id): a block in the KEY_IDX
+set that the range test excludes holds only a colliding trace and is
+skipped, and a block the range test admits that KEY_IDX does not name holds
+no span of either trace and is skipped. Neither disagreement is an error:
+both are the two indexes pruning on different evidence. The intersection is
+read as its contiguous runs. Today's `RspanRangeReader::trace_block_span`
+derives its own candidate set from SKIP_IDX and refuses a non-contiguous
+one, so it cannot take the intersection; ADR-2707's T3 (which touches
+`ravel-rspan` for this) adds
+`RspanRangeReader::block_run_span(&self, trace_id: &[u8; 16], blocks: &[usize])
+-> Result<TraceBlockSpan, SpanSegError>`, which takes one explicit
+contiguous run of block ordinals (adjacent, ascending, in range; anything
+else is `Corrupted`) and returns the same `TraceBlockSpan` that
+`trace_block_span` returns, built inside the crate (the type's fields stay
+private); `trace_block_span` becomes the SKIP_IDX-only convenience that
+calls it on its own run. The reader splits the intersection into maximal
+contiguous runs, calls `block_run_span` per run, issues one ranged GET per
+returned span, and decodes each with `decode_trace(&span, bytes)` as
+today. Under this format's sort order the intersection is always one run:
+the object sorts by `(trace_id, start_ts)`, every trace id that sorts
+between two ids sharing an 8-byte prefix shares that prefix too, so the
+records carrying one `key8` are one contiguous range and the blocks holding
+them one contiguous run, and the SKIP_IDX candidate set is contiguous for
+the same reason. The run splitting is therefore defensive, not required,
+and a prefix collision (two traces sharing 8 leading bytes) costs at most
+one extra block inside the same GET; the per-row `trace_id` equality the
+reader already applies removes it from the result. An empty intersection with a present key is also legal and
+yields no rows. `Corrupted` is reserved for the
+section's own checks (checksums, a block ordinal at or past the SKIP_IDX
+block count, unsorted or duplicate entries). The section
+is the source the catalog fold reads, by ranged GET, to build the per-part
+`.kidx` leaf (docs/catalog-and-mvcc.md, "Per-part key-index leaves"); it is
+never rebuilt from rows.
+
+Like BLOOM and SKIP_IDX, a missing, truncated or checksum-mismatched KEY_IDX
+is a typed `Corrupted` error under v5, never a degrade and never a panic.
+
 ## Checksum coverage
 
 Same per-section/per-block crc32c discipline as RLOG/RSEG. Each section's
@@ -466,6 +559,15 @@ read from bytes outside that crc, and RSPAN adds no separate per-column or
 per-event checksum: the whole-block crc32c is the single covering checksum for
 all of them, exactly as it already was for the v1..v3 columns.
 
+The v5 KEY_IDX section (ADR-2707, proposed) is read by range, so its
+whole-section `Section.crc32c` is stored but not what a probe verifies. Its
+own framing carries the access-path checksums docs/log-segment-format.md's
+coverage map lists: a header crc32c over every header byte, a directory
+crc32c per field, and a per-bucket crc32c over each bucket's stored bytes,
+each verified before the bytes under it are interpreted; the `Section`
+entry's offset, length, `uncompressed_len` and `prefix_len` are under
+`footer_crc32c` as for every other section.
+
 ## Compaction (L0 → L1)
 
 Compaction (ADR-0032's per-signal codec seam, `SpanCodec` in
@@ -484,7 +586,11 @@ re-encodes verbatim with no cross-object identity reconciliation. The merge
 decodes each input's records, groups the union by `trace_id`, re-sorts by
 `(trace_id, start_ts)` (this format's canonical order), and rebuilds
 size-capped parts via `RspanWriter::finish_compacted`, splitting output on
-trace boundaries so one trace's spans never straddle two parts.
+trace boundaries so one trace's spans never straddle two parts. Under v5
+(ADR-2707, proposed) `finish_compacted` emits KEY_IDX through the same
+pipeline as `finish`, so an L1 object carries its own index and the catalog
+fold rebuilds the part's `.kidx` leaf from it when the compaction record
+lands.
 
 Memory: `ravel-rspan` has no ranged section reader (no equivalent of RLOG's
 `RlogRangeReader`), so the merge fetches and decodes each input object

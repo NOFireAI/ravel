@@ -209,7 +209,9 @@ get large objects is a small `--batch-rows` (for example 50,000) and a
 byte budget (see the target-bytes amendment below: the target counts
 uncompressed content). `--batch-rows` stops being a memory setting. The ClickBench
 entry's `load` sizes `--target-bytes` and `--load-memory-bytes` from the
-machine. The default object size is unchanged.
+machine. The default object size is unchanged (retired by the ADR-2707
+amendment below: the default now targets about 250,000 rows per
+shard-object on every signal).
 
 ### Acceptance (pre-registered; measured with the #2592 method)
 
@@ -266,7 +268,8 @@ below.
 
 - **`--batch-rows` stops being the memory knob.**
   - On large machines the default load is unchanged; objects stay at today's
-    size unless `--target-bytes` is raised.
+    size unless `--target-bytes` is raised (retired by the ADR-2707
+    amendment below, which derives the target from the first batch).
   - On small machines the byte budget turns "swap, then a shard-ack timeout"
     into slower progress.
 - **API change.** The `ColumnarLogBatch` change touches `ravel-logseg`'s
@@ -422,7 +425,8 @@ set scales with its per-shard slice. The floor constants were measured at
 
 The rest of decision 6 stands. Shard actors merge batches, the shard
 buffers are inside the byte budget, and the default object size is
-unchanged. When the decoder stays waiting on a full budget, the loader
+unchanged (that last clause is retired by the ADR-2707 amendment below).
+When the decoder stays waiting on a full budget, the loader
 flushes every shard buffer early, so a target the budget cannot hold
 yields smaller objects rather than a stalled load.
 
@@ -587,3 +591,44 @@ once. R5, which differs from R1e only in the larger target, peaked at
 and docs/guides/ingest.md now carry this recipe and its measured outcome
 in place of "pending", and the `--pipeline-depth` help carries the depth
 sweep.
+
+## Amendment (2026-10-10): the default object size changes for every signal (ADR-2707 decision 9)
+
+<!-- amendment-applies: sections="6. Object size is set by bytes, not by batch rows|Consequences" pointer="ADR-2707 amendment" -->
+<!-- amendment-supersedes: phrase="The default object size is unchanged" pointer="ADR-2707 amendment" -->
+
+Decision 6 and the Consequences kept the default object size as it was and
+made large objects a recipe: a small `--batch-rows` with `--target-bytes` at
+the size wanted. ADR-2707's Stage 0 measured what the default costs on
+spans: 200 M spans at `--batch-rows 10000 --target-bytes 1` wrote 80,000
+objects of about 52 KB in 597 s, a cold 1 h trace lookup then took 566 s
+(160,003 resolve GETs, two per commit record above the 25,000-entry cache
+cap), compaction of those objects took 92 min for one shard at default
+settings, and the same data in 1 M-row batches wrote 800 objects in 110 s
+with a 0.68 s lookup. The merging path with an explicit target did not
+rescue it: a 75,000,000 target against a buffered estimate under about 300
+B/span never fired, and every object waited out the 60 s age trigger.
+
+ADR-2707 decision 9 therefore retires "the default object size is
+unchanged" on every signal:
+
+- a shard-object targets about 250,000 rows (`DEFAULT_OBJECT_ROWS`), and
+  `--target-bytes` is derived from the first batch as `DEFAULT_OBJECT_ROWS
+  x est_bytes_per_row`, with the estimate taken from the shard buffer's own
+  size-trigger ruler so the trigger fires at about 250,000 rows;
+- `--pipeline-depth` defaults to `ceil(DEFAULT_OBJECT_ROWS x shards /
+  batch_rows)`, so the size trigger fires as the last in-flight batch lands,
+  bounded above by `--load-memory-bytes / (batch_rows x est_bytes_per_row)`;
+  when the memory bound binds, objects close smaller and the report says so;
+- the default `--max-flush-delay` is 60 s;
+- the flush-trigger mix and the no-effect warning go on every signal's
+  report, with an exact-object-count test per signal.
+
+Overrides keep the old layout: `--target-bytes 1` flushes every batch, and
+an explicit `--batch-rows` sets the batch. The byte budget, the typed
+columnar batch, the one-copy rule and the stall flusher stand as written;
+only the default target, depth and age change. The target-bytes amendment's
+rule that the target counts uncompressed content stands and is what the
+derived target is measured against. The ClickBench entry's recipe (the
+acceptance amendment's R5) is unaffected: an explicit `--target-bytes` wins
+over the derived default.
