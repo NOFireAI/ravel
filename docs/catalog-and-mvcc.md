@@ -1768,7 +1768,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    a resolve holds while it runs: the decoded records of the window stay
    referenced until the include pass finishes, so a resolve over more
    records than the cap holds more than the cache budget for its lifetime
-   (about 69 MB for 80,000 records against the 22.5 MB budget). Two paths
+   (about 69 MB for 80,000 records, three times the budget above). Two paths
    stay outside the once-per-resolve rule: a `min_token` lookup reads its
    record through the cache after the listing and re-fetches it when a
    later miss evicted it, and compaction and rewrite records keep their own

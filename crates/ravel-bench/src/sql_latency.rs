@@ -4488,9 +4488,12 @@ mod tests {
             "cold run's store GETs: l/HEAD + commit record + the data object"
         );
         assert_eq!(
-            acc[0].cache_hits, 1,
-            "cold run's fetcher-cache hits: the carried plan read leaves the \
-             scan nothing to look up"
+            acc[0].cache_hits, 0,
+            "cold run's cache hits: none. The one pooled hit this fixture used \
+             to count was the resolve's include walk re-reading the commit \
+             record the same resolve had just fetched (#2752 reads each \
+             record once); the carried plan read leaves the scan nothing to \
+             look up"
         );
         assert_eq!(acc[0].cache_misses, 3, "cold run's fetcher-cache misses");
         // 846 = the 836 of RLOG v4 plus the v5 BLOOM covered-column list: a
@@ -4514,8 +4517,9 @@ mod tests {
             "warm run's store GETs fall from 3 to 0 (all cache-served)"
         );
         assert_eq!(
-            acc[1].cache_hits, 4,
-            "warm run's cache hits rise from 1 to 4, the cached l/HEAD NotFound included"
+            acc[1].cache_hits, 3,
+            "warm run's cache hits rise from 0 to 3: the commit record (read \
+             once per resolve), the cached l/HEAD NotFound and the data object"
         );
         assert_eq!(
             acc[1].object_store_bytes, 0,
