@@ -141,7 +141,8 @@ impl SpanReadPath {
         }
     }
 
-    /// The label explain output names the path by.
+    /// The label for the read path, exposed for the explain output; wiring
+    /// it into `SpansScanExec`'s explain is #2832.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -565,20 +566,25 @@ impl SpanSegmentFetcher {
     /// block ordinals already known to hold `query.trace_id` (ADR-2707
     /// decision 7, a key-index entry's block set).
     ///
-    /// With a `trace_id`, the object is never read whole. One ranged GET of
-    /// the object's tail ([`DEFAULT_TRACE_PROBE_BYTES`]) yields the footer and,
-    /// when the probe reaches them, SKIP_IDX and BLOOM; a section it does not
-    /// reach is one ranged GET of exactly that section. The block run comes
-    /// from [`RspanRangeReader::trace_block_span`] when `blocks` is `None`, or
-    /// from one [`RspanRangeReader::block_run_span`] per contiguous run of
-    /// `blocks` otherwise, and each run is one ranged GET (skipped when no
-    /// candidate block lies in it, served from the probe when the probe
-    /// already holds it). Only the run's blocks that pass the same skip-index
-    /// and bloom prune the whole-object path applies are decoded, through the
-    /// same per-block decode that accumulates page bytes, so rows and `stats`
-    /// match the whole-object path; the wire bytes and request count are what
-    /// differ. A failed ranged GET is a typed
-    /// [`SpanFetchError::Store`], never a fallback to a whole-object read.
+    /// With a `trace_id`, the object is never read through `GetRange::Full`.
+    /// One ranged GET of the object's tail ([`DEFAULT_TRACE_PROBE_BYTES`];
+    /// an object no larger than that is read in one ranged GET of its full
+    /// length) yields the footer and, when the probe reaches them, SKIP_IDX
+    /// and BLOOM; a section it does not reach is one ranged GET of exactly
+    /// that section. The block run comes from
+    /// [`RspanRangeReader::trace_block_span`] when `blocks` is `None`, or,
+    /// otherwise, from one [`RspanRangeReader::block_run_span`] per
+    /// contiguous run of the intersection of `blocks` with this object's
+    /// skip-index candidates, and each run is one ranged GET (served from the
+    /// probe when the probe already holds it). Only the run's blocks that
+    /// pass the same skip-index and bloom prune the whole-object path applies
+    /// are decoded, through the same per-block decode that accumulates page
+    /// bytes. With `blocks` `None` the decoded set, the rows and `stats` equal
+    /// the whole-object path's; with a block set the decoded set is the
+    /// intersection, so rows and `blocks_after_skip` are those of the set.
+    /// The wire bytes and request count are what differ from the whole-object
+    /// path. A failed ranged GET is a typed [`SpanFetchError::Store`], never a
+    /// fallback to a whole-object read.
     ///
     /// With a read cache, every ranged read is keyed
     /// `(tenant_hash, content_hash, offset, len)`, so a repeated lookup is
@@ -586,8 +592,9 @@ impl SpanSegmentFetcher {
     /// `accounting` as one request plus the wire bytes it returned.
     ///
     /// `blocks` without a `trace_id` is a caller error, reported as
-    /// [`SpanFetchError::Corrupt`] before any GET; a block set that is not a
-    /// valid run in this object is `Corrupt` as well.
+    /// [`SpanFetchError::Corrupt`] before any GET; a block ordinal at or past
+    /// this object's block count is `Corrupt` before any run is read, whether
+    /// or not the object has a candidate block; an empty set reads nothing.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_accounted_in_blocks(
         &self,
@@ -878,6 +885,16 @@ impl SpanSegmentFetcher {
             .map_err(bad)?
         };
 
+        // A caller's block set is validated against this object before any
+        // candidate test, so an ordinal past the block count is `Corrupt`
+        // whether or not the object has a candidate block.
+        if let Some(set) = blocks
+            && let Some(outside) = set.iter().find(|b| **b >= blocks_total)
+        {
+            return Err(bad(SpanSegError::Corrupted(format!(
+                "block {outside} is outside the object's {blocks_total} blocks"
+            ))));
+        }
         let runs: Vec<TraceBlockSpan> = if candidate_idx.is_empty() {
             Vec::new()
         } else {
@@ -887,11 +904,21 @@ impl SpanSegmentFetcher {
                     .map_err(bad)?
                     .into_iter()
                     .collect(),
-                Some(set) => contiguous_runs(set)
-                    .iter()
-                    .map(|run| reader.block_run_span(&trace_id, run))
-                    .collect::<Result<_, _>>()
-                    .map_err(bad)?,
+                // The run is split over the intersection of the caller's set
+                // with this object's candidates, so a non-candidate block
+                // between two candidates never widens a GET.
+                Some(set) => {
+                    let wanted: Vec<u32> = set
+                        .iter()
+                        .copied()
+                        .filter(|b| candidate_idx.binary_search(&(*b as usize)).is_ok())
+                        .collect();
+                    contiguous_runs(&wanted)
+                        .iter()
+                        .map(|run| reader.block_run_span(&trace_id, run))
+                        .collect::<Result<_, _>>()
+                        .map_err(bad)?
+                }
             }
         };
 
@@ -1170,6 +1197,15 @@ impl SpanSegmentFetcher {
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, offset, len);
+        // An exact range names the byte count it must return; a short answer
+        // is refused inside the closure so the cache never admits it (the
+        // logs fetcher's `check_extent_len` placement), and a later lookup of
+        // the same extent goes back to the store instead of replaying the
+        // short bytes as a hit.
+        let want = match range {
+            GetRange::Range(start, end) => Some(end.saturating_sub(start)),
+            _ => None,
+        };
         // One read-through call, accounted from the returned `ReadOutcome`: a
         // single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see `ReadCache::get_or_fetch`).
@@ -1181,14 +1217,21 @@ impl SpanSegmentFetcher {
                 let got = self.store.get(key, range).await?;
                 accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                if let Some(want) = want
+                    && got.data.len() as u64 != want
+                {
+                    return Err(crate::fetcher::CacheFetchError::Corrupt {
+                        key: key.to_string(),
+                        message: format!("short read: got {} bytes of {want}", got.data.len()),
+                    });
+                }
                 Ok(got.data)
             })
             .await
-            // This funnel's closure is one unconditional GET
-            // that verifies nothing itself, so the `EtagChanged`/`Corrupt`
-            // classes below are unreachable here rather than wrong; they are
-            // still mapped so the match is exhaustive against the shared
-            // error type.
+            // The closure verifies the returned length of an exact range and
+            // nothing else, so `Corrupt` is reachable for a short read while
+            // `EtagChanged` is not; both are mapped so the match stays
+            // exhaustive against the shared error type.
             .map_err(|err| from_cache_error(key, err))?;
 
         let mut reservation = reservation;
@@ -1354,7 +1397,8 @@ impl SpanColumnarScan {
         self.stats
     }
 
-    /// Which read this scan's bytes came from, for explain output.
+    /// Which read this scan's bytes came from, exposed for the explain
+    /// output (#2832 wires it).
     pub fn read_path(&self) -> SpanReadPath {
         self.read_path
     }
