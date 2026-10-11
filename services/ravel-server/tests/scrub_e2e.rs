@@ -38,6 +38,7 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// window) and the maintenance loop left disabled, so only the scrubber acts.
 fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

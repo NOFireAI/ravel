@@ -16,8 +16,7 @@ use tonic::{Request, Response, Status};
 use crate::logs_ingest::LogIngestRequestError;
 use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
 use crate::otlp_http::{
-    COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns,
-    write_mode_from_headers,
+    COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns, resolve_write_mode,
 };
 use crate::wire_byte_count::wire_request_bytes;
 
@@ -49,7 +48,7 @@ impl LogsService for GrpcLogsService {
             &request,
             &headers,
         )?;
-        let mode = write_mode_from_headers(&headers);
+        let mode = resolve_write_mode(&headers, self.state.strict_flush_policy);
 
         // Layer 2 (ADR-0051 section 2): byte rate counted by
         // `WireByteCountLayer` as tonic's decoder reads the request body. A

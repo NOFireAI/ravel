@@ -49,12 +49,18 @@ Served in `all` and `gateway` modes.
   `min_commit_token` for read-your-write.
 - Buffered acknowledgement is opt-in per request, with the
   `x-ravel-ingest-mode: buffered` header, on the OTLP routes only.
+- The same header picks a strict write's flush policy on the OTLP routes:
+  `strict-arrival` opens the flush on arrival, `strict-aged` waits for the
+  age threshold or the size trigger. `strict`, an absent header, and any other value use the
+  server's `--strict-flush-policy` (default `aged`). Both policies
+  acknowledge on the same terms.
 - The request body limit is 16 MiB on the wire and 64 MiB after
   decompression, on every ingest route.
 - OTLP HTTP accepts an absent, identity, or single `gzip` (`x-gzip`)
   `Content-Encoding`. A chained or unknown encoding is 415.
 - Remote Write requires Snappy compression. It is strict-acknowledgement
-  only, and ignores a buffered-mode header.
+  only, ignores a buffered-mode header, and always uses the
+  `--strict-flush-policy` flush policy.
 
 | Method | Path | Request | Response | Status codes | Credential | Modes | Feature |
 | --- | --- | --- | --- | --- | --- | --- | --- |

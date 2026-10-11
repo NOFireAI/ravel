@@ -398,6 +398,7 @@ impl LoadReport {
                 counts: FlushMixCounts {
                     size: mix.size,
                     age: mix.age,
+                    arrival: mix.arrival,
                     final_drain: mix.final_drain,
                 },
             })
@@ -406,6 +407,7 @@ impl LoadReport {
         for s in &shards {
             totals.size += s.counts.size;
             totals.age += s.counts.age;
+            totals.arrival += s.counts.arrival;
             totals.final_drain += s.counts.final_drain;
         }
         FlushMixReport { shards, totals }
@@ -445,7 +447,7 @@ pub struct LoadFold {
     pub records_read: usize,
 }
 
-/// Flush counts split by trigger cause: how many flushes each of the three
+/// Flush counts split by trigger cause: how many flushes each of the four
 /// disjoint triggers opened (issue #983). The serializable counterpart of
 /// [`ravel_ingest::FlushTriggerMix`], carried per shard and as load totals. The
 /// `final` drain is serialized under that name (a Rust keyword, so the field is
@@ -456,6 +458,11 @@ pub struct FlushMixCounts {
     pub size: u64,
     /// Flushes opened because a shard buffer aged past `max_flush_delay`.
     pub age: u64,
+    /// Flushes opened by a strict-arrival write ([`ravel_ingest::FlushTrigger::Arrival`]),
+    /// kept apart from `age`. Always `0` on a load: the loader writes
+    /// `WriteMode::Strict` only, so none of its writes carries the arrival
+    /// policy. Carried so the report shape matches the ingest counters.
+    pub arrival: u64,
     /// Flushes opened by a drain: the final drain at load close, and the
     /// loader's budget-stall and straggler flushes, which publish through the
     /// same `FlushNow` path ([`FlushTrigger::Manual`]).
@@ -466,10 +473,10 @@ pub struct FlushMixCounts {
 }
 
 impl FlushMixCounts {
-    /// The flushes-opened count, the sum of the three disjoint causes. On a load
+    /// The flushes-opened count, the sum of the four disjoint causes. On a load
     /// that abandons nothing this equals the objects written.
     pub fn total(&self) -> u64 {
-        self.size + self.age + self.final_drain
+        self.size + self.age + self.arrival + self.final_drain
     }
 }
 

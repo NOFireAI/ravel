@@ -178,6 +178,7 @@ fn disabled_background_fold_config(
     tenant_resolver: Arc<dyn ravel_query::http::TenantResolver>,
 ) -> ServerConfig {
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

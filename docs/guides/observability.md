@@ -176,6 +176,8 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_flushes_by_size_total` | Flushes opened because the tenant buffer reached target_bytes. |
 | `ravel_ingest_flushes_by_age_total` | Flushes opened because the tenant buffer aged past max_flush_delay. |
 | `ravel_ingest_flushes_by_age_floor_total` | Flushes opened because the tenant buffer aged past the sub-floor hold, which a buffer holding fewer object bytes than `--idle-flush-byte-floor` waits for instead of max_flush_delay_idle. Zero unless that flag is set. A rising figure means the floor is holding buffers, which is the point of setting it, and it is also the count of flushes whose rows sat in memory for up to an hour before the flush opened: it is how an operator sizes the buffered-mode loss window they accepted. |
+| `ravel_ingest_flushes_by_arrival_total` | Flushes opened by a strict write under the arrival policy (header `strict-arrival`, or `--strict-flush-policy arrival`), in the write handler when the tenant had no flush in flight on the shard, or on the reap of that flush for the writes that coalesced behind it. |
+| `ravel_ingest_arrival_coalesced_total` | Strict-arrival writes that found a flush in flight on their shard and were folded into the one flush the reap opens, instead of opening their own. |
 | `ravel_ingest_flushes_manual_total` | Flushes opened by an explicit, shutdown, or drop-path drain. |
 | `ravel_ingest_put_retries_total` | Retried PUT attempts on the data-object or commit-record path. |
 | `ravel_ingest_abandoned_retry_exhausted_total` | Flushes abandoned by retry-budget or lifetime exhaustion. |
@@ -224,6 +226,8 @@ These families render for all three signals, so a logs-only or spans-only
 process still renders a real (possibly zero) sample for each:
 
 - `ravel_ingest_flushes_by_age_floor_total`
+- `ravel_ingest_flushes_by_arrival_total`
+- `ravel_ingest_arrival_coalesced_total`
 - `ravel_ingest_in_flight_flushes`
 - `ravel_ingest_flush_permit_wait_seconds_total`
 - `ravel_ingest_queued_flushes`

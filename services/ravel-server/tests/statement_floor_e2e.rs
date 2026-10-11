@@ -326,6 +326,7 @@ fn server_config(
     audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
 ) -> ServerConfig {
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline,
         audit_text: Default::default(),
         query_budgets: Default::default(),

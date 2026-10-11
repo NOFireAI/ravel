@@ -39,6 +39,7 @@ fn server_config(mcp: McpConfig) -> ServerConfig {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: ravel_maintain::AuditTextPolicy::default(),
         query_budgets: QueryBudgets {

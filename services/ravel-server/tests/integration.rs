@@ -21,6 +21,12 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
+#[path = "support/strict_flush.rs"]
+mod strict_flush;
+
+use ravel_server::config::StrictFlushPolicy;
+use strict_flush::{Signal, release_until};
+
 const TOKEN: &str = "testtoken";
 
 fn now_ns() -> i64 {
@@ -77,6 +83,7 @@ async fn start_test_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -261,4 +268,48 @@ async fn missing_credentials_yield_401() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// `strict-arrival` under the default `aged` policy opens the flush from the
+/// write itself: the data PUT is issued while the age threshold is still
+/// ahead, and the ack follows it once the gate lets it through.
+#[tokio::test]
+async fn strict_arrival_header_acks_without_the_age_tick() {
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Metrics).await;
+
+    let client = server.client.clone();
+    let url = format!("{}/v1/metrics", server.base);
+    let export = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .header("x-ravel-ingest-mode", "strict-arrival")
+            .body(export_request("arrival_metric", "demo", 1.0, now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    });
+    server.wait_for_data_put().await;
+    assert!(
+        !export.is_finished(),
+        "the strict ack waits for the held data PUT"
+    );
+    assert_eq!(server.flushes_by_age().await, 0, "no age flush opened");
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_eq!(response.status(), 200, "strict export should succeed");
+    assert!(
+        response
+            .headers()
+            .get("x-ravel-commit-token")
+            .is_some_and(|value| !value.is_empty()),
+        "a strict export acks with a commit token"
+    );
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    server.shutdown().await;
 }

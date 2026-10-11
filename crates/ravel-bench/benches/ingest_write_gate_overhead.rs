@@ -623,6 +623,7 @@ fn gateway_state(
     let normalize_metrics = Arc::new(NormalizeRejectMetrics::new());
     let state = Arc::new(GatewayState {
         tenant_resolver: Arc::new(FixedTenant),
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         ingest: ravel_server::ingest::IngestState {
             router: metrics_router.clone(),
             limits: IngestLimits::default(),
@@ -686,6 +687,7 @@ fn remote_write_state(gate: Option<Arc<WriteGate>>) -> (Arc<RemoteWriteState>, A
     let router = Arc::new(router);
     let state = Arc::new(RemoteWriteState {
         tenant_resolver: Arc::new(FixedTenant),
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         router: router.clone(),
         limits: IngestLimits::default(),
         ack_deadline: Duration::from_secs(30),

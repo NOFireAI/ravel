@@ -873,7 +873,7 @@ macro_rules! strict_arrival_at_cap_test {
             assert_eq!(
                 router.metrics().snapshot().flushes_by_arrival,
                 0,
-                "the reap opens no arrival flush for a buffer whose waiters were answered"
+                "the buffer lost its pending mark when the age tick took it"
             );
             router.flush_all().await;
         }

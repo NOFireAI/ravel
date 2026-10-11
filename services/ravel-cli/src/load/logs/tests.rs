@@ -216,6 +216,7 @@ async fn load_report_carries_the_flush_trigger_mix() {
         FlushMixCounts {
             size: 1,
             age: 0,
+            arrival: 0,
             final_drain: 0,
         },
         "the single row flushes by size, nothing ages or drains"
@@ -225,6 +226,7 @@ async fn load_report_carries_the_flush_trigger_mix() {
         FlushMixCounts {
             size: 1,
             age: 0,
+            arrival: 0,
             final_drain: 0,
         }
     );
@@ -1702,6 +1704,7 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 16,
                 age: 0,
+                arrival: 0,
                 final_drain: 0,
             },
         ),
@@ -1711,6 +1714,7 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 16,
                 age: 0,
+                arrival: 0,
                 final_drain: 0,
             },
         ),
@@ -1720,6 +1724,7 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 8,
                 age: 0,
+                arrival: 0,
                 final_drain: 0,
             },
         ),
@@ -1729,6 +1734,7 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 0,
                 age: 4,
+                arrival: 0,
                 final_drain: 0,
             },
         ),
@@ -2116,6 +2122,7 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         FlushMixCounts {
             size: 1,
             age: 0,
+            arrival: 0,
             final_drain: 0,
         },
         "the single object is a size flush; nothing ages under a delay longer than the advance"
@@ -2136,6 +2143,7 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         FlushMixCounts {
             size: 0,
             age: 1,
+            arrival: 0,
             final_drain: 1,
         },
         "the first object is the aged-out buffer, the second is the tail the end-of-input \
@@ -2282,6 +2290,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         FlushMixCounts {
             size: 1,
             age: 0,
+            arrival: 0,
             final_drain: 1,
         },
         "the tail is published by the manual end-of-input flush, not by the age trigger"

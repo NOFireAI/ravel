@@ -30,6 +30,12 @@ use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 use ravel_types::logstream::AttrValue;
 
+#[path = "support/strict_flush.rs"]
+mod strict_flush;
+
+use ravel_server::config::StrictFlushPolicy;
+use strict_flush::{PolicyServer, Signal, release_until};
+
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
 
@@ -86,6 +92,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -497,4 +504,177 @@ async fn resource_attribute_depth_is_checked_at_admission_not_at_flush() {
     assert_eq!(deep.1, fit_stored);
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Exports one log record to `server` with `mode` as the
+/// `x-ravel-ingest-mode` header (no header for `None`), on its own task so
+/// the test can read the gate while the handler waits for its strict ack.
+fn spawn_export(
+    server: &PolicyServer,
+    mode: Option<&'static str>,
+    body: &'static str,
+) -> tokio::task::JoinHandle<reqwest::Response> {
+    let client = server.client.clone();
+    let url = format!("{}/v1/logs", server.base);
+    tokio::spawn(async move {
+        let mut request = client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf");
+        if let Some(mode) = mode {
+            request = request.header("x-ravel-ingest-mode", mode);
+        }
+        request
+            .body(export_request(body, now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    })
+}
+
+fn assert_strict_ack(response: &reqwest::Response) {
+    assert_eq!(response.status(), 200, "strict export should succeed");
+    assert!(
+        response
+            .headers()
+            .get("x-ravel-commit-token")
+            .is_some_and(|value| !value.is_empty()),
+        "a strict export acks with a commit token"
+    );
+}
+
+/// `strict-arrival` under the default `aged` policy opens the flush from the
+/// write itself: the data PUT is issued while the age threshold is still
+/// ahead, and the ack follows it once the gate lets it through.
+#[tokio::test]
+async fn strict_arrival_header_acks_without_the_age_tick() {
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Logs).await;
+
+    let export = spawn_export(&server, Some("strict-arrival"), "arrival log line");
+    server.wait_for_data_put().await;
+    assert!(
+        !export.is_finished(),
+        "the strict ack waits for the held data PUT"
+    );
+    assert_eq!(server.flushes_by_age().await, 0, "no age flush opened");
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_strict_ack(&response);
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    server.shutdown().await;
+}
+
+/// `strict`, an absent header and an unknown value mean "strict under the
+/// process default": each flushes on arrival under `--strict-flush-policy
+/// arrival`, and none opens a flush before the age threshold under the
+/// default `aged` policy.
+#[tokio::test]
+async fn strict_header_follows_the_process_default() {
+    let server = strict_flush::start(StrictFlushPolicy::Arrival, Signal::Logs).await;
+    for (flushes, mode) in [(1, Some("strict")), (2, None), (3, Some("not-a-mode"))] {
+        let export = spawn_export(&server, mode, "process default log line");
+        server.wait_for_data_put().await;
+        assert_eq!(
+            server.flushes_by_arrival().await,
+            flushes,
+            "header {mode:?} under the arrival policy flushes on arrival"
+        );
+        let response = release_until(&server.gate, export)
+            .await
+            .expect("export task");
+        assert_strict_ack(&response);
+    }
+    assert_eq!(server.flushes_by_age().await, 0);
+    server.shutdown().await;
+
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Logs).await;
+    let strict = spawn_export(&server, Some("strict"), "aged log line");
+    server.assert_no_flush_yet(1).await;
+    let absent = spawn_export(&server, None, "aged log line");
+    server.assert_no_flush_yet(2).await;
+    let unknown = spawn_export(&server, Some("not-a-mode"), "aged log line");
+    server.assert_no_flush_yet(3).await;
+
+    let (strict, absent, unknown) = release_until(&server.gate, async {
+        (
+            strict.await.expect("export task"),
+            absent.await.expect("export task"),
+            unknown.await.expect("export task"),
+        )
+    })
+    .await;
+    assert_strict_ack(&strict);
+    assert_strict_ack(&absent);
+    assert_strict_ack(&unknown);
+    assert_eq!(
+        server.flushes_by_age().await,
+        1,
+        "all three rode one age flush"
+    );
+    assert_eq!(server.flushes_by_arrival().await, 0);
+    server.shutdown().await;
+}
+
+/// `strict-aged` opts one request out of `--strict-flush-policy arrival`: it
+/// opens no flush before the age threshold, then acks from the age flush.
+#[tokio::test]
+async fn strict_aged_header_opts_out_of_an_arrival_process_default() {
+    let server = strict_flush::start(StrictFlushPolicy::Arrival, Signal::Logs).await;
+
+    let export = spawn_export(&server, Some("strict-aged"), "opted out log line");
+    server.assert_no_flush_yet(1).await;
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_strict_ack(&response);
+    assert_eq!(server.flushes_by_age().await, 1);
+    assert_eq!(server.flushes_by_arrival().await, 0);
+
+    server.shutdown().await;
+}
+
+/// The gRPC log handler reads the same mode from request metadata.
+#[tokio::test]
+async fn grpc_strict_arrival_metadata_selects_the_policy() {
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Logs).await;
+    let grpc_addr = server.running.grpc_addr.expect("gateway mode binds gRPC");
+    let mut client = LogsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+
+    let mut request = tonic::Request::new(export_request("grpc arrival log line", now_ns()));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+    request.metadata_mut().insert(
+        "x-ravel-ingest-mode",
+        "strict-arrival".parse().expect("ascii metadata"),
+    );
+    let export = tokio::spawn(async move { client.export(request).await });
+
+    server.wait_for_data_put().await;
+    assert_eq!(server.flushes_by_age().await, 0, "no age flush opened");
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task")
+        .expect("gRPC export succeeds");
+    assert!(
+        response
+            .metadata()
+            .get("x-ravel-commit-token")
+            .is_some_and(|value| !value.is_empty()),
+        "a strict export acks with commit-token metadata"
+    );
+
+    server.shutdown().await;
 }

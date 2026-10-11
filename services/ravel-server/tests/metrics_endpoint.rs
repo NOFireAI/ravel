@@ -115,6 +115,7 @@ async fn start_test_server_with_store_metrics(
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
     };
     match heartbeat {
         Some(heartbeat) => ravel_server::start_with_heartbeat(
@@ -1222,6 +1223,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
             tenants,
             ..LimitsConfig::default()
         },
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
     };
     ravel_server::start(
         config,
@@ -1453,6 +1455,7 @@ async fn start_attribution_server() -> ravel_server::Running {
             tenants,
             ..LimitsConfig::default()
         },
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
     };
     ravel_server::start(
         config,
@@ -1653,4 +1656,88 @@ async fn drain_overrun_and_residue_families_render() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+// --- ADR-2793 decision 3: the arrival trigger's two counters ---
+
+#[path = "support/strict_flush.rs"]
+mod strict_flush;
+
+fn spawn_strict_export(
+    server: &strict_flush::PolicyServer,
+) -> tokio::task::JoinHandle<reqwest::Response> {
+    let client = server.client.clone();
+    let url = format!("{}/v1/metrics", server.base);
+    tokio::spawn(async move {
+        client
+            .post(url)
+            .header("authorization", format!("Bearer {}", strict_flush::TOKEN))
+            .header("content-type", "application/x-protobuf")
+            .body(export_request(1, admission_now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    })
+}
+
+/// Under `--strict-flush-policy arrival`, the first write opens a flush whose
+/// data PUT the gate holds, so the second write finds it in flight and
+/// coalesces; the reap of the first then opens the second's arrival flush.
+/// The exposition carries both counters at those exact values, not zeros.
+#[tokio::test]
+async fn arrival_counters_render_non_zero_values() {
+    use ravel_server::config::StrictFlushPolicy;
+    use strict_flush::{Signal, release_until, sample};
+
+    let server = strict_flush::start(StrictFlushPolicy::Arrival, Signal::Metrics).await;
+
+    let first = spawn_strict_export(&server);
+    server.wait_for_data_put().await;
+    let second = spawn_strict_export(&server);
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while server.counter("ravel_ingest_arrival_coalesced_total").await < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second write coalesces behind the held flush");
+
+    let (first, second) = release_until(&server.gate, async {
+        (
+            first.await.expect("export task"),
+            second.await.expect("export task"),
+        )
+    })
+    .await;
+    assert_eq!(first.status(), 200, "first strict export should succeed");
+    assert_eq!(second.status(), 200, "second strict export should succeed");
+
+    let body = server.scrape().await;
+    for family in [
+        "ravel_ingest_flushes_by_arrival_total",
+        "ravel_ingest_arrival_coalesced_total",
+    ] {
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter")).count(),
+            1,
+            "{family} must be declared exactly once:\n{body}"
+        );
+    }
+    assert_eq!(
+        sample(&body, "ravel_ingest_flushes_by_arrival_total", "metrics"),
+        2,
+        "one arrival flush per write: the first's own, then the reap's"
+    );
+    assert_eq!(
+        sample(&body, "ravel_ingest_arrival_coalesced_total", "metrics"),
+        1,
+        "the second write found the first's flush in flight"
+    );
+    assert_eq!(
+        sample(&body, "ravel_ingest_flushes_by_age_total", "metrics"),
+        0,
+        "neither write waited for the age threshold"
+    );
+
+    server.shutdown().await;
 }

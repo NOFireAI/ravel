@@ -197,10 +197,16 @@ partial-success message with rejected point counts and reasons.
   PUT. The flush delay is a configurable operator budget
   (`--max-flush-delay`), default 2 s in strict mode (ADR-0076 decision 4);
   the p99 visibility target under target load tracks that budget, not a fixed
-  sub-second constant. The permit wait is zero unless the shard already has
-  `max_inflight_flushes` flushes running (ADR-1642), which is where stalled
-  tenants' throttled prefixes show up in a co-resident tenant's visibility
-  once they hold every permit. A tenant at its own per-tenant share defers its
+  sub-second constant. Under the `arrival` strict flush policy
+  (`--strict-flush-policy arrival`, or `x-ravel-ingest-mode: strict-arrival`
+  on one request; `strict-aged` on one request opts back out) the flush delay
+  is zero when the tenant has no flush in
+  flight on the shard, and otherwise the time until that flush is reaped,
+  with the `--max-flush-delay` tick as the fallback; durability is
+  unchanged, since the ack still follows the commit PUT. The permit wait
+  is zero unless the shard already has `max_inflight_flushes` flushes
+  running (ADR-1642), which is where stalled tenants' throttled prefixes
+  show up in a co-resident tenant's visibility once they hold every permit. A tenant at its own per-tenant share defers its
   trigger instead, which adds to its own flush delay rather than to anyone
   else's permit wait.
 - There is no cross-shard ordering guarantee. A query snapshot may include

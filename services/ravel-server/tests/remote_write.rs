@@ -24,6 +24,12 @@ use ravel_remote_write::proto::write_v2::{
 use ravel_server::{FoldTaskConfig, LimitsConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
+#[path = "support/strict_flush.rs"]
+mod strict_flush;
+
+use ravel_server::config::StrictFlushPolicy;
+use strict_flush::{PolicyServer, Signal, release_until};
+
 const TOKEN: &str = "testtoken";
 
 fn now_ms() -> i64 {
@@ -177,6 +183,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
     let mut tenants = HashMap::new();
     tenants.insert(TenantId::new("acme"), tenant_limits);
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -256,6 +263,7 @@ async fn start_test_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -723,4 +731,85 @@ async fn series_cap_breach_is_still_2xx_with_reduced_written_count() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Sends one RW1 sample to `server` with `mode` as the
+/// `x-ravel-ingest-mode` header (no header for `None`), on its own task so
+/// the test can read the gate while the handler waits for its strict ack.
+fn spawn_write(
+    server: &PolicyServer,
+    mode: Option<&'static str>,
+    metric: &'static str,
+) -> tokio::task::JoinHandle<reqwest::Response> {
+    let client = server.client.clone();
+    let url = format!("{}/api/v1/write", server.base);
+    tokio::spawn(async move {
+        let mut request = client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header(
+                "content-type",
+                "application/x-protobuf;proto=prometheus.WriteRequest",
+            );
+        if let Some(mode) = mode {
+            request = request.header("x-ravel-ingest-mode", mode);
+        }
+        request
+            .body(rw1_body(metric, "demo", 1.0, now_ms()))
+            .send()
+            .await
+            .expect("write request completes")
+    })
+}
+
+fn assert_strict_ack(response: &reqwest::Response) {
+    assert_eq!(response.status(), 204, "remote write should succeed");
+    assert!(
+        response
+            .headers()
+            .get("x-ravel-commit-token")
+            .is_some_and(|value| !value.is_empty()),
+        "a remote write acks with a commit token"
+    );
+}
+
+/// Remote Write reads no ingest mode header, so `--strict-flush-policy` alone
+/// decides its flush: `arrival` flushes the write on arrival, the default
+/// `aged` opens no flush before the age threshold, and a `strict-arrival`
+/// header under `aged` changes nothing.
+#[tokio::test]
+async fn strict_flush_policy_arrival_applies_to_remote_write() {
+    let server = strict_flush::start(StrictFlushPolicy::Arrival, Signal::Metrics).await;
+    let write = spawn_write(&server, None, "arrival_rw_metric");
+    server.wait_for_data_put().await;
+    assert!(
+        !write.is_finished(),
+        "the strict ack waits for the held data PUT"
+    );
+    assert_eq!(server.flushes_by_age().await, 0, "no age flush opened");
+    let response = release_until(&server.gate, write)
+        .await
+        .expect("write task");
+    assert_strict_ack(&response);
+    assert_eq!(server.flushes_by_arrival().await, 1);
+    server.shutdown().await;
+
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Metrics).await;
+    let plain = spawn_write(&server, None, "aged_rw_metric");
+    server.assert_no_flush_yet(1).await;
+    let headed = spawn_write(&server, Some("strict-arrival"), "headed_rw_metric");
+    server.assert_no_flush_yet(2).await;
+
+    let (plain, headed) = release_until(&server.gate, async {
+        (
+            plain.await.expect("write task"),
+            headed.await.expect("write task"),
+        )
+    })
+    .await;
+    assert_strict_ack(&plain);
+    assert_strict_ack(&headed);
+    assert_eq!(server.flushes_by_age().await, 1, "both rode one age flush");
+    assert_eq!(server.flushes_by_arrival().await, 0);
+    server.shutdown().await;
 }

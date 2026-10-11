@@ -531,6 +531,7 @@ fn test_config(mode: Mode, tenant: &TenantId, fold_interval: Duration) -> Server
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), tenant.clone());
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

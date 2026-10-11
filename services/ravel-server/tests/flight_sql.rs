@@ -916,6 +916,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

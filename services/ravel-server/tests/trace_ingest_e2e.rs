@@ -31,6 +31,12 @@ use ravel_rspan::{RspanConfig, RspanReader, SpanQuery, SpanRecord, StatusCode};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
+#[path = "support/strict_flush.rs"]
+mod strict_flush;
+
+use ravel_server::config::StrictFlushPolicy;
+use strict_flush::{Signal, release_until};
+
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
 const TRACE_ID: [u8; 16] = [0xa1; 16];
@@ -98,6 +104,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -404,6 +411,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -696,4 +704,48 @@ async fn buffered_mode_header_is_honored() {
     let spans = scan_durable_spans(store.as_ref()).await;
     assert_eq!(spans.len(), 1, "shutdown must flush the buffered span");
     assert_is_the_exported_span(&spans[0], "buffered span", start_ts_ns);
+}
+
+/// `strict-arrival` under the default `aged` policy opens the flush from the
+/// write itself: the data PUT is issued while the age threshold is still
+/// ahead, and the ack follows it once the gate lets it through.
+#[tokio::test]
+async fn strict_arrival_header_acks_without_the_age_tick() {
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Spans).await;
+
+    let client = server.client.clone();
+    let url = format!("{}/v1/traces", server.base);
+    let export = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .header("x-ravel-ingest-mode", "strict-arrival")
+            .body(export_request("arrival span", now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    });
+    server.wait_for_data_put().await;
+    assert!(
+        !export.is_finished(),
+        "the strict ack waits for the held data PUT"
+    );
+    assert_eq!(server.flushes_by_age().await, 0, "no age flush opened");
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_eq!(response.status(), 200, "strict export should succeed");
+    assert!(
+        response
+            .headers()
+            .get("x-ravel-commit-token")
+            .is_some_and(|value| !value.is_empty()),
+        "a strict export acks with a commit token"
+    );
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    server.shutdown().await;
 }

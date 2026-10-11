@@ -220,6 +220,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, metric: &str, samples: 
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

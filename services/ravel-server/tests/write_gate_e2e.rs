@@ -131,6 +131,7 @@ async fn start_ingest_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,

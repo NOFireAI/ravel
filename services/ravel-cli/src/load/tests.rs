@@ -65,6 +65,7 @@ fn flush_mix_report_round_trips_through_json() {
         FlushMixCounts {
             size: 5,
             age: 2,
+            arrival: 0,
             final_drain: 4,
         },
         "totals sum each cause across shards"

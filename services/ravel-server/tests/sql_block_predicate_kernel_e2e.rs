@@ -191,6 +191,7 @@ fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: Default::default(),
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,

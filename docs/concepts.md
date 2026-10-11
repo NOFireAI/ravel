@@ -166,6 +166,16 @@ process death does lose it.
 Buffered mode is offered on OTLP ingest only. Remote Write is strict-only,
 and it ignores a buffered-mode header on a request.
 
+A strict write's flush opens under one of two flush policies, with the
+same acknowledgement either way. `aged` waits for the buffer's age threshold
+or size trigger. `arrival` opens the flush as soon as the write is buffered,
+or as soon as the tenant's in-flight flush on that shard completes: lower
+latency, more object-store PUTs. The `--strict-flush-policy` server flag
+sets the default, `aged`. On OTLP ingest the `x-ravel-ingest-mode` header
+values `strict-arrival` and `strict-aged` override it for one request, and
+`strict`, an absent header, or an unknown value use it. Remote Write always
+uses the flag.
+
 In both modes, admission failures such as limits, authentication, and quota
 reject before anything is buffered. So a rejection is never a silent loss.
 

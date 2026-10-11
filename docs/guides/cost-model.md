@@ -153,10 +153,16 @@ guide covers, in the order that costs the least to use:
    `--min-flush-bytes` on `ravel-server`): the shipped default is
    2s / 40s / 256KiB. This is the lever of last resort. Unlike the first two,
    it costs strict-mode acknowledgement latency directly: a strict export
-   waits for the configured `max_flush_delay` plus two PUT round trips before
-   its ack returns. The three knobs must move together, because raising one
-   alone does little. Startup validates them against a derived ceiling and
-   refuses a value that violates either rule:
+   under the default (aged) policy waits for the configured `max_flush_delay`
+   plus two PUT round trips before its ack returns. A write under the
+   arrival policy (`x-ravel-ingest-mode: strict-arrival`, or
+   `--strict-flush-policy arrival`) skips that wait, so this knob governs
+   only its fallback (a coalesced write the age tick reaches first); it pays
+   for the latency in PUTs instead, up to 20x the aged rate at ten strict
+   requests per second per shard and 32x at saturation. The three knobs
+   must move together, because raising one alone does little. Startup
+   validates them against a derived ceiling and refuses a value that
+   violates either rule:
    - `max_flush_delay` plus the flush lifetime of the ingest pipeline must
      stay under the read-side scan slack budget.
    - The derived strict-visibility budget must stay under a
@@ -172,9 +178,11 @@ guide covers, in the order that costs the least to use:
 
 ## What the cadence costs
 
-If you lengthen `max_flush_delay` by a factor, the fast-tier PUT rate divides
-by about that factor. Every flush is two PUTs, and a buffer that reaches
-neither `min_flush_bytes` nor a strict waiter flushes on age alone.
+If you lengthen `max_flush_delay` by a factor, the fast-tier PUT rate of
+aged strict and buffered writes divides by about that factor; for
+arrival-policy writes it governs only the fallback age tick. Every flush is
+two PUTs, and a buffer that reaches neither `min_flush_bytes` nor a strict
+waiter flushes on age alone.
 
 - Strict-mode acknowledgement latency rises by up to the added delay, because
   a strict export waits for the flush trigger plus two PUT round trips.

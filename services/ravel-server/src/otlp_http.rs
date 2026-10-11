@@ -561,6 +561,11 @@ pub struct GatewayState {
     /// under `otap_decode`, each sized by a bound on its inflated bytes. `None`
     /// runs both inline on the request task.
     pub write_gate: Option<Arc<WriteGate>>,
+    /// The process default strict flush policy (ADR-2793 decision 1),
+    /// resolved from `--strict-flush-policy`. [`resolve_write_mode`] applies
+    /// it to a request whose `x-ravel-ingest-mode` header does not name a
+    /// mode explicitly.
+    pub strict_flush_policy: crate::config::StrictFlushPolicy,
 }
 
 impl crate::ingest_admission::IngestAdmissionState for GatewayState {
@@ -748,15 +753,23 @@ pub(crate) fn now_ns() -> i64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn write_mode_from_headers(headers: &HeaderMap) -> WriteMode {
-    let buffered = headers
+/// Resolves `headers`'s `x-ravel-ingest-mode` value and the process
+/// `--strict-flush-policy` default into a [`WriteMode`] (ADR-2793
+/// decision 1). `buffered` is unconditional; `strict-arrival` and
+/// `strict-aged` override `policy` explicitly for this request; `strict`, an
+/// absent header, and any other value all mean "strict under `policy`".
+pub(crate) fn resolve_write_mode(
+    headers: &HeaderMap,
+    policy: crate::config::StrictFlushPolicy,
+) -> WriteMode {
+    match headers
         .get(INGEST_MODE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        == Some("buffered");
-    if buffered {
-        WriteMode::Buffered
-    } else {
-        WriteMode::Strict
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("buffered") => WriteMode::Buffered,
+        Some("strict-arrival") => WriteMode::StrictArrival,
+        Some("strict-aged") => WriteMode::Strict,
+        _ => policy.write_mode(),
     }
 }
 
@@ -772,7 +785,7 @@ async fn export_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mode = write_mode_from_headers(&headers);
+    let mode = resolve_write_mode(&headers, state.strict_flush_policy);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
     // byte rate and return the OTLP protobuf bytes, decompressing first when
@@ -852,7 +865,7 @@ async fn export_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mode = write_mode_from_headers(&headers);
+    let mode = resolve_write_mode(&headers, state.strict_flush_policy);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
     // byte rate and return the OTLP protobuf bytes, decompressing first when
@@ -936,7 +949,7 @@ async fn export_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mode = write_mode_from_headers(&headers);
+    let mode = resolve_write_mode(&headers, state.strict_flush_policy);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): byte rate
     // applies uniformly to every signal including spans (even though spans get
@@ -1136,6 +1149,7 @@ pub(crate) mod tests {
             ),
             ingest_byte_metrics: Arc::new(IngestByteMetrics::new()),
             write_gate: None,
+            strict_flush_policy: crate::config::StrictFlushPolicy::Aged,
         })
     }
 

@@ -662,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to parse --shutdown-timeout")?,
         drain_settle_interval: ravel_server::DEFAULT_DRAIN_SETTLE_INTERVAL,
         max_ingest_lag,
+        strict_flush_policy: cli.strict_flush_policy,
     };
 
     // The runtime heartbeat (ADR-1702 decision 9) exists in every mode, so

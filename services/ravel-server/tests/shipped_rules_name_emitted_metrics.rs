@@ -965,6 +965,7 @@ async fn start_test_server(
         ravel_server::AlertEvalConfig::default()
     };
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
             audit_mode: ravel_maintain::AuditMode::Required,
             ..Default::default()

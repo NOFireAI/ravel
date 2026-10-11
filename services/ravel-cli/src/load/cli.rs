@@ -1028,18 +1028,20 @@ fn print_flush_mix(report: &LoadReport) {
     }
     let t = &mix.totals;
     println!(
-        "  flush triggers   : size {}, age {}, final {} (total {})",
+        "  flush triggers   : size {}, age {}, arrival {}, final {} (total {})",
         t.size,
         t.age,
+        t.arrival,
         t.final_drain,
         t.total(),
     );
     for s in &mix.shards {
         println!(
-            "    shard {:>3}      : size {}, age {}, final {} (total {})",
+            "    shard {:>3}      : size {}, age {}, arrival {}, final {} (total {})",
             s.shard,
             s.counts.size,
             s.counts.age,
+            s.counts.arrival,
             s.counts.final_drain,
             s.counts.total(),
         );

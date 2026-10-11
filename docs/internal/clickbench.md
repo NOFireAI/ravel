@@ -275,8 +275,10 @@ changing the layout. Two loads of the same file can therefore write different
 object counts and still be correct. The comparison basis that *is* stable is the
 `flush triggers` line, which states how many flushes each cause opened: `size`
 (a buffer reached `--target-bytes`), `age` (a buffer aged past `max_flush_delay`),
-and `final` (the drain at load close), per shard and as load totals. The three
-causes are disjoint and sum to the objects written, so a mix that shifts from
+`arrival` (a strict write under the arrival policy; always 0 on a load, since
+the loader writes strict only), and `final` (the drain at load close), per
+shard and as load totals. The four causes are disjoint and sum to the objects
+written, so a mix that shifts from
 `size` toward `age` between two runs explains an object-count difference that the
 count alone cannot. Compare the mix, not the raw count. The `hits` schema is 104 attribute
 columns (see step 3), far under that budget, so a clean load prints no such

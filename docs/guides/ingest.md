@@ -150,6 +150,25 @@ data survives the crash of any Ravel process, because it survives everything
 the object store survives
 ([docs/consistency-model.md](../consistency-model.md)).
 
+**When a strict write flushes.** Strict mode has two flush policies, and
+they acknowledge on the same terms. Under `aged` the flush opens when the
+buffer reaches its age threshold (`--max-flush-delay`, 2s by default) or its
+size trigger. Under `arrival` the flush opens as soon as your write is
+buffered, or as soon as your tenant's flush already in flight on that shard
+completes. The server flag `--strict-flush-policy aged|arrival` (default
+`aged`) sets the policy for `x-ravel-ingest-mode: strict`, for a request
+with no header, and for an unknown value. Send `strict-arrival` or
+`strict-aged` to choose the policy for one request. Prometheus Remote Write
+reads no header and always uses the flag.
+
+- Latency: `arrival` drops the wait for the age threshold, so when your
+  tenant has no flush in flight on the shard a strict acknowledgement takes
+  about one flush (the shard's flush-permit wait, then the data and commit
+  PUTs) instead of up to `--max-flush-delay` plus that flush.
+- PUT rate: `arrival` issues up to one flush per flush duration per shard
+  and tenant instead of one per `--max-flush-delay`, so a tenant sending ten
+  strict requests per second on one shard can pay up to 20 times the PUTs.
+
 **Buffered.** The call returns as soon as Ravel admits the request and
 enqueues it to its shard actor, before any flush. Latency is lower, but the
 write is not durable, and Ravel issues no commit token.

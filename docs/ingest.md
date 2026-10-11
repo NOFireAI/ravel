@@ -32,11 +32,12 @@ POST /api/v1/write (axum)
   -> negotiate RW1 vs RW2 (Content-Type, then X-Prometheus-Remote-Write-Version; else 415)
   -> snappy-decompress (capped) + protobuf decode (ravel-remote-write) -> ResolvedRequest
   -> normalize_resolved (ravel-remote-write) -> Vec<NormalizedPoint> + rejects
-  -> IngestRouter::write(tenant, points, mode=Strict) -> WriteReceipt
+  -> IngestRouter::write(tenant, points, mode=<strict flush policy>) -> WriteReceipt
 ```
 
-This surface always passes `mode=Strict`: it never reads
-`x-ravel-ingest-mode`, since a Remote Write sender treats any 2xx as
+This surface always writes in strict mode, with the flush policy
+`--strict-flush-policy` selects (`aged` by default, see Modes): it never
+reads `x-ravel-ingest-mode`, since a Remote Write sender treats any 2xx as
 durable and drops its WAL entry on that basis. A commit token still comes
 back in `x-ravel-commit-token`; RW2 responses additionally carry
 `X-Prometheus-Remote-Write-Samples-Written` (and the histogram- and
@@ -1575,8 +1576,42 @@ documented gap with a named follow-up, not an unsafe eviction.
 `mode=strict` (default): ack after step 3 for every flush the request's
 points landed in (a request spanning shards awaits all of them; the receipt
 carries max token per shard).
-`mode=buffered`: ack at enqueue. Config per tenant; header override
-`x-ravel-ingest-mode: buffered` allowed only when tenant config permits.
+`mode=buffered`: ack at enqueue. Selected per request with the header
+`x-ravel-ingest-mode: buffered`, honored for any tenant; Remote Write
+ignores the header and stays strict.
+
+Strict mode has two flush policies (ADR-2793). Both ack on the same
+contract; they differ only in when the flush a strict write waits on opens.
+
+- `aged` (`WriteMode::Strict`): the flush opens on the `max_flush_delay` age
+  tick or the size trigger.
+- `arrival` (`WriteMode::StrictArrival`): each shard the write lands on
+  opens the tenant's flush inside the write handler when the tenant has no
+  flush in flight on that shard. Otherwise it marks the buffer pending,
+  counts `ravel_ingest_arrival_coalesced_total`, and opens the flush when
+  the in-flight one is reaped, so later strict-arrival writes coalesce into
+  it. The age tick stays as the fallback. Flushes it opens count on
+  `ravel_ingest_flushes_by_arrival_total`.
+
+`--strict-flush-policy aged|arrival` (default `aged`) sets the process
+default. On OTLP HTTP and OTLP gRPC the `x-ravel-ingest-mode` header (HTTP
+header or gRPC metadata) selects per request; on OTAP it is read once from
+the stream-open metadata and applies to every batch on that stream:
+
+| header value | mode |
+|---|---|
+| `buffered` | buffered |
+| `strict-arrival` | strict, `arrival` policy |
+| `strict-aged` | strict, `aged` policy |
+| `strict`, absent, or any other value | strict, process default policy |
+
+Prometheus Remote Write reads no header and always uses the process
+default.
+
+The arrival policy issues at most one flush per flush duration per (shard,
+tenant), about 60-70 ms on S3, so at most about 16 flushes per second
+against one per 2 s under `aged`: up to 20x the PUTs for a tenant sending
+ten strict requests per second on one shard, 32x at saturation.
 
 ## Pending strict-ack budget (ADR-2793 decision 4)
 
@@ -1603,6 +1638,7 @@ returned `Submitted`'s `acks()` resolves, when its deadline elapses after
 | per-buffer memory backstop (buffered memory, not object bytes) | `max(target_bytes, min(64 MiB, max ingest buffer bytes / 8))`, so 64 MiB at these defaults |
 | max_flush_delay | 2 s (`--max-flush-delay`) |
 | max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
+| strict flush policy (process default, all strict surfaces) | `aged` (`--strict-flush-policy`, `RAVEL_STRICT_FLUSH_POLICY`; `arrival` opens a strict write's flush on arrival) |
 | min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
 | idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |

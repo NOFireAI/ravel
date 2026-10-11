@@ -35,7 +35,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::ingest::{IngestRequestError, IngestState};
 use crate::otlp_grpc::metadata_to_headers;
-use crate::otlp_http::{GatewayState, now_ns, write_mode_from_headers};
+use crate::otlp_http::{GatewayState, now_ns, resolve_write_mode};
 use crate::wire_byte_count::{WireByteCounter, wire_byte_counter};
 
 pub struct GrpcArrowMetricsService {
@@ -91,7 +91,7 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
             &request,
             &headers,
         )?;
-        let mode = write_mode_from_headers(&headers);
+        let mode = resolve_write_mode(&headers, self.state.strict_flush_policy);
         let wire_bytes = wire_byte_counter(&request)?;
 
         let ctx = StreamCtx {
