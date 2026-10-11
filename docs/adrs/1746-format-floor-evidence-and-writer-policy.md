@@ -362,7 +362,7 @@ record, and Release B neither reads it nor makes it redundant.
 <!-- amendment-applies: sections="Decision|Consequences" pointer="writer policy shipped amendment" -->
 
 Decisions 3 to 5 shipped. The shipped behaviour narrows or names what they
-left open in six places.
+left open in seven places.
 
 - **The tenants known at startup, and what the warning costs (decision 3).**
   Both writer roles check the same static set: the tenants named by
@@ -377,27 +377,48 @@ left open in six places.
   `ravel_format_floor_above_writer{family}` is set by that check only: it
   does not follow a floor raised later or a tenant discovered later. The check
   is `warn_floors_above_writer` in `crates/ravel-ingest/src/format_floor.rs`.
-- **Where ingest checks (decision 4).** At flush open, in `flush_tenant` of
-  each shard actor (`shard.rs`, `log_shard.rs`, `span_shard.rs`), after the
+- **Where ingest checks (decision 4).** Twice. First at admission: each
+  router (`router.rs`, `log_router.rs` for both its submit paths,
+  `span_router.rs`) checks right after it routes the write and before any
+  shard buffers it, so a buffered write, which is acknowledged at enqueue, is
+  refused like any other shed instead of being acknowledged and dropped. The
+  refusal is the typed, retryable `BelowFormatFloor` (HTTP 503), counted once.
+  With the override on, or with no cached view, admission lets the write
+  through and the flush decides. Second, as the backstop for rows buffered
+  before a refresh raised the floor: at flush open, in `flush_tenant` of each
+  shard actor (`shard.rs`, `log_shard.rs`, `span_shard.rs`), after the
   scan-set check and before the flush's `seq` is pinned, the flush is
   counted, or the task that takes the flush permit, runs the encode on the
   ADR-1702 write gate and PUTs is spawned. That task is the only path to the
   data PUT, so the check precedes the PUT on every path, the teardown drain
-  included. The floor is the one `GenerationSwitch` cached with the shard
-  generations, decoded from the same GET (`load_view` in `generation.rs`), so
-  the check adds no store read. A cached view past its refresh horizon still
-  answers, since floors only rise; with no cached view the flush stays
-  unopened, as for an untrusted scan-set view, except on a drain's teardown
-  pass. A floor history that fails validation now fails that record read
-  closed, as a corrupt generation history already did. A refused flush drops
-  its rows and answers its strict waiters with the typed refusal, which is
-  retryable (HTTP 503); it is not counted as a flush, so it is in no
-  `flushes_by_*` or `abandoned_*` counter.
+  included. A flush refused there drops its rows, releases their byte-budget
+  charge and answers its strict waiters with the refusal; a buffered write
+  among those rows was already acknowledged, so its rows are lost, and the
+  refusal counter is the only record. The flush is not counted as a flush, so
+  it is in no `flushes_by_*` or `abandoned_*` counter. Both checks read the
+  floor `GenerationSwitch` cached with the shard generations, decoded from the
+  same GET (`load_view` in `generation.rs`), so neither adds a store read. A
+  cached view past its refresh horizon still answers, since floors only rise;
+  with no cached view the flush stays unopened, as for an untrusted scan-set
+  view, except on a drain's teardown pass. `GenerationSwitch::refresh` and
+  the routers' `refresh_generations`, which install a history without a
+  floor, are test seams that nothing in the shipped server calls.
+- **A corrupt floor history (decision 4).** Because the routers decode the
+  floors from the record they read for routing, a floor history that fails
+  validation, in any family, fails that read closed as a corrupt generation
+  history already did: the router refuses the tenant's writes for that signal
+  with `StaleProvisioningView` (HTTP 503), at once when it holds no cached
+  view and once the cached view's grace window ends otherwise. A maintenance
+  run fails its own floor read with a typed error and writes nothing.
 - **The refusal counter (decision 4).** The decision says a refusal is
   counted without naming the counter. It is
   `ravel_format_floor_refused_total{family}`, beside the two families
   decision 3 and decision 5 name, so all three read on one `family` label.
-  Ingest and maintenance refusals in one process count into it.
+  Ingest and maintenance refusals in one process count into it. A
+  `ravel-cli` refusal counts into its own process's counters, which nothing
+  renders; the operator sees the command fail with the refusal and a nonzero
+  exit. The override counter counts when a flush opens or a run passes its
+  check, so a flush or run that then fails before its PUT still counts.
 - **Where maintenance checks (decision 4).** A maintenance run has no
   `GenerationSwitch`, so it reads the bucket's record fresh: one GET, after
   the run's gates and before its claim, its catalog reads and any PUT
@@ -405,12 +426,13 @@ left open in six places.
   erasure rewrite, `migrate_bucket_format`, the force-2 re-encode and the
   direct `rewrite_and_publish`). A request ledger counts it under its own
   `floor_read` phase. It runs when `CompactorConfig::format_floor` holds a
-  policy: `ravel-server`'s `maintain` role installs one, `migrate_family`
-  uses the refusing default when the caller installed none, and the
-  `ravel-cli` compaction commands install none and do not check. In the
+  policy: `ravel-server`'s `maintain` role installs one, the `ravel-cli`
+  compaction commands install the refusing default, and `migrate_family`
+  uses the refusing default when the caller installed none. In the
   maintenance loop a refused compaction is no compaction and the unit's pass
-  goes on; a refused erasure rewrite leaves its request pending, so the
-  deletion waits for a roll forward or the override.
+  goes on, which holds for this refusal only: any other compaction error
+  still ends the pass. A refused erasure rewrite leaves its request pending,
+  so the deletion waits for a roll forward or the override.
 - **The version compared (decision 4).** The version of the object being
   written: the trailer version each flush stamps, and for maintenance the
   version its parts are written at (`current_part_version`), not

@@ -921,16 +921,18 @@ Labels: `mode`.
 ### Format floors (`ravel_format_floor_*`)
 
 Labels: `mode`, `family`. Every process renders one sample per format family
-for each metric. Ingest flushes, and the compactions and erasure rewrites of
-the maintenance loop, count into these samples. The
+for each metric. Ingest writes and flushes, and the compactions and erasure
+rewrites of the maintenance loop, count into these samples. `ravel-cli`
+compactions, migrations and re-encodes check the floor too, but `ravel-cli`
+renders no `/metrics`. The
 [maintenance guide](operations/maintenance.md#a-writer-below-a-recorded-format-floor)
 says what to do when they move.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_format_floor_above_writer` | Gauge. (tenant, signal) buckets whose recorded floor for the family is above the newest version this build writes, as found once at startup by an ingest or maintenance process. It covers only the tenants named by `--tenant-token`, `--tenant-token-file` and `--maintain-tenant`. A nonzero value means this build refuses that family's writes into those buckets. |
-| `ravel_format_floor_refused_total` | Publishes refused because the object would be written below the bucket's recorded floor for its family. An ingest flush refused this way drops its rows, and answers a strict write with a retryable error. A refused compaction or erasure rewrite builds and publishes nothing. Alert on any increase. |
-| `ravel_format_floor_writes_below_total` | Publishes written below the bucket's recorded floor under `--write-below-format-floor`. Each one contradicts the floor, and `ravel-cli maintain audit-versions` reports it `contradicted`. |
+| `ravel_format_floor_above_writer` | Gauge. (tenant, signal) buckets whose recorded floor for the family is above the newest version this build writes, as found once at startup by an ingest or maintenance process. It covers only the tenants named by `--tenant-token`, `--tenant-token-file` and `--maintain-tenant`. A nonzero value means this build refuses that family's writes into those buckets, unless the process runs with `--write-below-format-floor`, in which case it writes them below the floor. |
+| `ravel_format_floor_refused_total` | Publishes refused because the object would be written below the bucket's recorded floor for its family. An ingest write, strict or buffered, is refused at admission, before it is buffered, with a retryable error (HTTP 503). Rows buffered before a refresh raised the floor are refused when their flush opens: they are dropped, and a strict write waiting on them gets the same error. A refused compaction or erasure rewrite builds and publishes nothing. Alert on any increase. |
+| `ravel_format_floor_writes_below_total` | Ingest flushes opened, and compactions and erasure rewrites started, below the bucket's recorded floor under `--write-below-format-floor`. Counted when the flush opens or the run passes its floor check, so one that then fails before its PUT still counts. Each one that publishes contradicts the floor, and `ravel-cli maintain audit-versions` reports it `contradicted`. |
 
 ### Store reachability
 

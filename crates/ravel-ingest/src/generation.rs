@@ -1930,11 +1930,13 @@ mod tests {
             .expect("provision");
         }
         let clock = Arc::new(SetClock(std::sync::atomic::AtomicI64::new(t0)));
-        let sw = Arc::new(index_switch(1, DEFAULT_REFRESH_INTERVAL_NS).with_refresh_source(
-            store.clone(),
-            Signal::Metrics,
-            clock.clone(),
-        ));
+        let sw = Arc::new(
+            index_switch(1, DEFAULT_REFRESH_INTERVAL_NS).with_refresh_source(
+                store.clone(),
+                Signal::Metrics,
+                clock.clone(),
+            ),
+        );
         let metrics = Arc::new(crate::format_floor::FormatFloorMetrics::default());
         sw.set_floor_policy(FormatFloorPolicy::new(false, Arc::clone(&metrics)));
         sw.refresh(kept, vec![gen0(1)], t0);
