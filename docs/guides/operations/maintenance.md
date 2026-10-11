@@ -289,8 +289,8 @@ records, which only the Maintain policy grants (see
   unsealed one, because every later hour is unsealed too.
 - It streams one line per bucket as each completes. Then it prints a summary:
   the compacted, already-compacted, not-sealed, below-minimum, tombstoned,
-  claim-skipped and claim-cancelled counts, segments written, wall time, the
-  failure count and the concurrency it used.
+  claim-skipped, claim-cancelled and held-out-of-window counts, segments
+  written, wall time, the failure count and the concurrency it used.
 - A bucket whose compaction errors does not abort its siblings. The walk
   completes and prints each failed bucket's own outcome line. Then it exits
   nonzero with an aggregate that names how many failed and how many succeeded.
@@ -776,6 +776,49 @@ its commit record pointing at an object that no longer exists. Retention
 expiry deletes it with the rest of its bucket. Until then, every request it
 holds stays pending, with its `.dreq` and query-time filter in place.
 
+### An input outside this build's reader window
+
+During a rolling upgrade across a format bump, the newer side can write an L0
+object whose format version the older side does not read. When compaction on
+the older side reads that object's catalog, the reader refuses its version.
+Compaction then reads the whole object and compares its blake3 hash with the
+`content_hash` in the object's commit record:
+
+- **The hash matches.** The object is intact data that another build reads.
+  Compaction holds the bucket: it writes nothing to it and publishes no
+  compaction record, and the bucket's outcome is `HeldOutOfWindow`. The scan
+  goes on to later hours, which compact as usual.
+- **The hash does not match.** Every reader checks the version before the
+  footer checksum, so a flipped version byte reads the same as a newer object.
+  Only the content hash tells them apart. A mismatch is corruption, and the
+  scan fails with the reader's own error, as for any other undecodable input.
+
+Any other decode error fails the scan as before. Only a version refusal is
+checked against the hash.
+
+What an operator sees for a held bucket:
+
+- `ravel_maintain_buckets_held_out_of_window_total` moves by one per held
+  bucket per pass, summed over every signal. The counter is per process and
+  resets to 0 on restart. Alert on an increase, not on a level.
+- One `WARN` line per held bucket per pass, `compaction held a bucket`,
+  carrying `object_key` (the first refused object's storage key) and
+  `version`, with the bucket's signal, shard and hour.
+- The unit is not counted as stalled. A held bucket is a completed scan, not a
+  failed one.
+
+A held bucket is retried on every pass. The scan's advisory cursor does not
+move past it, and the memo never records it as finished. It compacts on the
+first pass after a build that reads the object runs here, once the upgrade
+finishes. Rolling back the newer side does not clear the hold: the object
+stays in the bucket, and only a build that reads it can compact it.
+
+`ravel-cli maintain compact-tenant` prints `outcome=HeldOutOfWindow
+version=<n>` for a held bucket, counts it on the summary's
+`held_out_of_window` line, and treats it as a success, not a failure.
+`compact-bucket` prints `outcome: HeldOutOfWindow`. Neither moves a server
+counter.
+
 ## Garbage collection and retention
 
 Ravel deletes data through two independent triggers. The maintenance loop or
@@ -843,6 +886,11 @@ A trailer with a bad magic, signal, reserved field or footer length is
 corruption and is swept as usual. The check reads the trailer only, not the
 footer checksum. Damage confined to the version field therefore reads as an
 unreadable version and holds the bucket.
+
+Compaction holds a live bucket with such an input too, and checks the
+object's content hash to tell an out-of-window object from a corrupt one. See
+[An input outside this build's reader
+window](#an-input-outside-this-builds-reader-window).
 
 ### The alerts shard
 
