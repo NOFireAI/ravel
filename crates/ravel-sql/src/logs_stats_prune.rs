@@ -11,7 +11,7 @@
 //! catalog event-time span before this runs.
 //!
 //! The segment's min/max is the one its `SegmentRef` stamp carries, the same
-//! coverage `LogsScanExec::partition_statistics` answers from (see
+//! coverage `LogsScanExec::statistics_from_inputs` answers from (see
 //! [`crate::logs_scan::segment_declared_coverage`]). A `.cstat` entry alone
 //! never skips a segment: it tallies only the record-level cells, while SQL
 //! returns the merged value (the record cell, or the resource or scope value a

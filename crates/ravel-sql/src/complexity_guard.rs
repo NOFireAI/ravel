@@ -300,7 +300,7 @@ impl fmt::Display for StatementTooComplex {
 impl std::error::Error for StatementTooComplex {}
 
 /// Recursion limit set on the parser [`parse_guarded`] builds, pinned here
-/// rather than inherited from `datafusion-sql`'s own default (50 in 54.1.0),
+/// rather than inherited from `datafusion-sql`'s own default (50 in 55.2.0),
 /// which is a value an upgrade may change without notice.
 ///
 /// This is a second bound, independent of [`check`], and it is not redundant

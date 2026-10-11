@@ -12,12 +12,12 @@
 //! here.
 //!
 //! What path trips the overrun is a DataFusion-version detail the ticket calls
-//! out explicitly. In datafusion 54.1.0 a `NestedLoopJoinExec` reserves its
+//! out explicitly. In datafusion 55.2.0 a `NestedLoopJoinExec` reserves its
 //! dominant allocation -- the buffered build side -- through the *checked*
-//! `try_grow` (datafusion-physical-plan-54.1.0
-//! src/joins/nested_loop_join.rs:831), and so does ravel's own scan, per batch
+//! `try_grow` (datafusion-physical-plan-55.2.0
+//! src/joins/nested_loop_join.rs:956), and so does ravel's own scan, per batch
 //! (crate::scan, scan.rs:406). The bare, infallible `grow` calls in that same
-//! join (nested_loop_join.rs:1592/975/1647) are narrow force-progress and
+//! join (nested_loop_join.rs:1754/1110/1809) are narrow force-progress and
 //! bitmap paths, each guarded so it is never the *gating* allocation before a
 //! `try_grow` has already refused. The upshot is that a join memory overrun
 //! surfaces here as the pool's `try_grow` `ResourcesExhausted`, not as the

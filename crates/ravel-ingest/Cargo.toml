@@ -62,9 +62,9 @@ ravel-promql = { workspace = true }
 # ravel-logseg, none of which depend on ravel-ingest, so this dev-only edge adds
 # no cycle. No feature flag: ravel-sql's SQL surface is unconditional.
 ravel-sql = { path = "../ravel-sql", version = "0.23.0" }
-# Match ravel-sql's datafusion pin exactly (same arrow 58 line) so the test's
+# Match ravel-sql's datafusion pin exactly (same arrow line) so the test's
 # SessionContext/collect interop with ravel-sql's plan types.
-datafusion = { version = "54", default-features = false, features = ["sql"] }
+datafusion = { version = "55.2", default-features = false, features = ["sql"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 proptest = { workspace = true }

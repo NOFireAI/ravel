@@ -217,7 +217,7 @@ fn unsupported_kind(statement: &DFStatement) -> &'static str {
 ///
 /// This does not go through sqlparser's `Display`: DataFusion's own
 /// `CreateExternalTable` `Display` impl renders neither `OR REPLACE` nor
-/// `OPTIONS` at all (datafusion-sql 54.1.0), so reusing it here would silently
+/// `OPTIONS` at all (datafusion-sql 55.2.0), so reusing it here would silently
 /// drop both from the audit trail. Building the text by hand keeps it
 /// re-parseable and keeps every field the statement actually carried.
 fn render_create_external(

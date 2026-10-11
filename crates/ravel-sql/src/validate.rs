@@ -114,7 +114,8 @@ use std::ops::ControlFlow;
 /// `avg`/`mean` are not here: they are admitted through the allowlist, their
 /// built-in accumulator replaced by a custom sequential-fold UDAF (crate::avg,
 /// ADR-0022 decisions 3, 4).
-pub(crate) const EXCLUDED_AGGREGATES: [&str; 39] = [
+pub(crate) const EXCLUDED_AGGREGATES: [&str; 40] = [
+    "any_value",
     "approx_distinct",
     "approx_median",
     "approx_percentile_cont",
@@ -457,6 +458,11 @@ pub enum DdlValidationError {
     #[error(transparent)]
     Location(#[from] GrantsError),
 
+    /// `LOCATION` named a parenthesized list rather than exactly one URL. A
+    /// table is one prefix (D2).
+    #[error("LOCATION admits exactly one URL; the request named {count}")]
+    LocationCount { count: usize },
+
     /// `DROP TABLE` named something other than exactly one table.
     #[error("DROP TABLE admits exactly one table name; the request named {count}")]
     DropMultipleTables { count: usize },
@@ -670,7 +676,7 @@ pub(crate) fn create_external_intent(
         name,
         columns,
         file_type,
-        location,
+        locations,
         table_partition_cols,
         order_exprs,
         if_not_exists,
@@ -721,6 +727,11 @@ pub(crate) fn create_external_intent(
         }
     }
 
+    let [location] = locations.as_slice() else {
+        return Err(DdlValidationError::LocationCount {
+            count: locations.len(),
+        });
+    };
     // Syntax only: whether `location` lies inside a grant is execute_ddl's
     // job (D2), which is the only caller that has a tenant's grants to check
     // it against.
@@ -2317,6 +2328,17 @@ mod tests {
                 defect: LocationDefect::Query,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn location_list_is_rejected() {
+        assert!(matches!(
+            reject_ddl(
+                "CREATE EXTERNAL TABLE orders STORED AS PARQUET \
+                 LOCATION ('s3://bucket/a/', 's3://bucket/b/')"
+            ),
+            DdlValidationError::LocationCount { count: 2 }
         ));
     }
 

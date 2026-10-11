@@ -11,7 +11,7 @@
 //! plans also names the call its logical plan makes in place of the syntax. A
 //! DataFusion upgrade that teaches a registered planner a new syntax under one
 //! of these methods, drops one, or changes a rewrite target flips a row. The
-//! table covers the 13 methods of DataFusion 54.1 and a test pins that count,
+//! table covers the 13 methods of DataFusion 55.2 and a test pins that count,
 //! so an upgrade that grows the trait has to add a row and raise it.
 //!
 //! Every statement goes through `SqlExecutor::execute`, the entry point an
@@ -173,7 +173,7 @@ async fn substring_syntax_and_unquoted_calls_answer_the_substring() {
 }
 
 /// One row per SQL syntax an `ExprPlanner` method can claim in DataFusion
-/// 54.1, with the outcome each has today and, for a row that plans, the call
+/// 55.2, with the outcome each has today and, for a row that plans, the call
 /// its syntax is rewritten to. Each label starts with the method's name.
 const CANARIES: [(&str, &str, Expect); 22] = [
     // plan_binary_op: TraceIdHexLiteralPlanner rewrites this comparison to a
@@ -311,7 +311,7 @@ const CANARIES: [(&str, &str, Expect); 22] = [
     ),
 ];
 
-/// The `ExprPlanner` methods of DataFusion 54.1, each of which [`CANARIES`]
+/// The `ExprPlanner` methods of DataFusion 55.2, each of which [`CANARIES`]
 /// must cover with at least one row.
 const EXPR_PLANNER_METHODS: usize = 13;
 

@@ -576,8 +576,7 @@ pub(crate) fn decode_footer<E>(
 ) -> Result<DecodedFooter, DecodeError<E>> {
     let estimate = check_footer_shape(footer).map_err(DecodeError::Refused)?;
     let reservation = reserve(estimate).map_err(DecodeError::Reserve)?;
-    // The decoder asserts, rather than checks, that an INT96 column's
-    // statistics are 12 bytes long.
+    // A decoder panic on a malformed footer is refused like a decoder error.
     let metadata = match std::panic::catch_unwind(|| ParquetMetaDataReader::decode_metadata(footer))
     {
         Ok(Ok(metadata)) => metadata,
@@ -856,7 +855,7 @@ mod tests {
     ///
     /// The header (the filter's algorithm, hash, compression and bitset
     /// size) is the Thrift-compact encoding of four i32 fields, each 1 to 5
-    /// bytes, so at most 20 bytes total; parquet-58.4.0's own internal test
+    /// bytes, so at most 20 bytes total; parquet-59.3.0's own internal test
     /// `bloom_filter::mod::test_bloom_filter_header_size_assumption` uses
     /// the same bound. The bitset itself is always a whole number of
     /// 32-byte blocks (the SBBF block size), so `bloom_filter_length % 32`
@@ -2273,7 +2272,7 @@ mod tests {
     /// page).
     ///
     /// Retyping an actual dictionary page's own top-level header as a data
-    /// page does not reach this panic in parquet-58.4.0:
+    /// page does not reach this panic in parquet-59.3.0:
     /// `decode_page` has an explicit typed-error path for a mismatch between
     /// a `PageHeader`'s `type` field and the nested header struct it carries,
     /// which a type that no longer matches its own nested header always is.

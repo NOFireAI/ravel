@@ -7,16 +7,17 @@
 //! element is read; an allocation the allocator refuses aborts the process,
 //! which no `catch_unwind` contains.
 //!
-//! [`check_footer_shape`] walks the footer the way parquet 58.4.0's decoder
+//! [`check_footer_shape`] walks the footer the way parquet 59.3.0's decoder
 //! reads it, without building anything. The decoder picks how to read a
 //! field by its id, not by the type in the field header, so the walk does
 //! the same: [`field`] is the decoder's table of the fields it reads, per
 //! struct, and a field whose header type differs from the type the decoder
 //! reads for that id is refused. Every other field is skipped exactly as the
 //! decoder skips it, and a skip the decoder would get wrong (a list of
-//! booleans, whose elements it skips without reading a byte) or refuse (a
-//! set or a map) is refused, and so is a field the decoder reads appearing
-//! twice in one struct. A collection whose declared count could not fit
+//! booleans, whose elements it skips without reading a byte) is refused. A
+//! set, a map or a UUID in a skipped field is refused too, although the
+//! decoder skips them, and so is a field the decoder reads appearing twice
+//! in one struct. A collection whose declared count could not fit
 //! in the bytes after its header, at one byte per element (two per map
 //! entry), is refused.
 //!
@@ -178,8 +179,8 @@ enum Kind {
     List(Elem),
 }
 
-/// The element the decoder reads from a known list, whatever the list
-/// header's own element type says.
+/// The element the decoder reads from a known list. The list header's own
+/// element type must match it, as the decoder also requires.
 #[derive(Clone, Copy, Debug)]
 enum Elem {
     I32,
@@ -233,7 +234,7 @@ enum Field {
     Refuse(&'static str),
 }
 
-/// The decoder's field table: parquet 58.4.0's `parquet_metadata_from_bytes`,
+/// The decoder's field table: parquet 59.3.0's `parquet_metadata_from_bytes`,
 /// `read_row_group`, `read_column_chunk` and `read_column_metadata`
 /// (src/file/metadata/thrift/mod.rs, called with no options), the
 /// `thrift_struct!`/`thrift_union!` definitions they read, and the
@@ -835,7 +836,7 @@ impl Walk<'_> {
                 };
                 let count = self.count_fits(count, 1, "list")?;
                 // The decoder skips a boolean element without reading a
-                // byte, and cannot skip a set or a map, nor a set itself.
+                // byte. The walk does not skip a set or a map.
                 if element == T_BOOL_TRUE || element == T_BOOL_FALSE {
                     return Err(format!(
                         "footer list at byte {at} holds booleans in a field the decoder skips"
@@ -973,7 +974,7 @@ mod tests {
         ))
     }
 
-    /// Footers parquet 58.4.0's writer produces, covering every footer
+    /// Footers parquet 59.3.0's writer produces, covering every footer
     /// struct it writes: many row groups, nested groups, key-value metadata
     /// beside `ARROW:schema`, page statistics with column and offset
     /// indexes, bloom filters, sorting columns, and a schema of logical
@@ -1114,14 +1115,14 @@ mod tests {
         files
     }
 
-    /// The walk mirrors parquet 58.4.0's decoder; any other version needs
+    /// The walk mirrors parquet 59.3.0's decoder; any other version needs
     /// the field table and the decoder's allocations checked again.
     #[test]
     fn the_parquet_version_the_walk_mirrors_is_the_one_resolved() {
         assert_eq!(
             resolved_parquet(include_str!("../../../Cargo.lock")),
-            "58.4.0",
-            "ravel-parquet no longer resolves parquet 58.4.0: re-check footer_shape's field \
+            "59.3.0",
+            "ravel-parquet no longer resolves parquet 59.3.0: re-check footer_shape's field \
              table and decode estimate against the new decoder before changing this test"
         );
     }
@@ -1296,12 +1297,12 @@ mod tests {
         assert_eq!(long - short, 10 * 3 + 2 * 10);
     }
 
-    /// Guards: the `catch_unwind` around the decoder in `decode_footer`.
-    /// parquet 58.4.0 checks that an INT96 column's statistics are at least
-    /// 12 bytes and then asserts they are exactly 12, so a binary column
-    /// retyped as INT96, its statistics 13 and 20 bytes long, panics it.
+    /// parquet 59.3.0 checks that an INT96 column's statistics are exactly
+    /// 12 bytes and returns an error otherwise, so a binary column retyped as
+    /// INT96, its statistics 13 and 20 bytes long, passes the walk and is
+    /// refused by the decoder with a typed error rather than a panic.
     #[test]
-    fn a_footer_that_panics_the_decoder_is_refused() {
+    fn an_int96_statistic_of_the_wrong_length_is_refused_by_the_decoder() {
         let bytes = binary_parquet_bytes(&[&[1; 13], &[2; 20]]);
         let mut shape = footer(&bytes).to_vec();
         // Column c: type BYTE_ARRAY, repetition REQUIRED, name "c".
@@ -1314,7 +1315,7 @@ mod tests {
         assert_eq!(passes(&shape), Ok(()));
         assert_eq!(
             decode_footer(&shape, u64::MAX).expect_err("refused"),
-            "the footer panicked the parquet decoder"
+            "footer: Parquet error: Incorrect Int96 min statistics"
         );
     }
 
@@ -1701,21 +1702,36 @@ mod tests {
     }
 
     /// Guards: the `0x00` case in `list_header`. The decoder reads that
-    /// byte as an empty list, so a footer carrying one decodes.
+    /// byte as an empty list of element type byte: a skipped field carrying
+    /// one decodes, and a known list carrying one fails the decoder's own
+    /// element type check, which the walk leaves to the decoder.
     #[test]
     fn a_zero_byte_list_header_is_an_empty_list() {
-        let footer = [
+        let head = [
             0x15, 0x02, // version 1
             0x19, 0x2c, // schema: two elements
             0x48, 0x06, b's', b'c', b'h', b'e', b'm', b'a', 0x15, 0x02, 0x00, // root, 1 child
             0x15, 0x04, 0x25, 0x00, 0x18, 0x01, b'a', 0x00, // a: required INT64
             0x16, 0x00, // num_rows 0
-            0x19, 0x00, // row_groups: the 0x00 empty list
-            0x00,
         ];
-        let metadata = decode_footer(&footer, 0).expect("decodes");
+        let skipped = [
+            head.as_slice(),
+            &[0x19, 0x0c],     // row_groups: an empty list of structs
+            &[0x09, 20, 0x00], // field 10, skipped: the 0x00 empty list
+            &[0x00],
+        ]
+        .concat();
+        assert_eq!(passes(&skipped), Ok(()));
+        let metadata = decode_footer(&skipped, 0).expect("decodes");
         assert_eq!(metadata.num_row_groups(), 0);
         assert_eq!(metadata.file_metadata().schema_descr().num_columns(), 1);
+
+        let known = [head.as_slice(), &[0x19, 0x00], &[0x00]].concat();
+        assert_eq!(passes(&known), Ok(()));
+        assert_eq!(
+            decode_footer(&known, 0).expect_err("refused"),
+            "footer: Parquet error: Expected list element type of Struct but got Byte"
+        );
     }
 
     /// A struct of `(id, header type, value)` fields, then the stop byte.

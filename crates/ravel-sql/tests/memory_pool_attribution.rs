@@ -22,7 +22,7 @@ use ravel_sql::{
 };
 use ravel_types::accounting::QueryAccounting;
 
-/// The message DataFusion 54 raises from a `RepartitionExec` output channel
+/// The message DataFusion 55 raises from a `RepartitionExec` output channel
 /// whose `try_grow` the pool refused, once the disk manager is disabled.
 const SPILL_MSG: &str = "Memory Exhausted while SpillPool (DiskManager is disabled)";
 
@@ -53,7 +53,7 @@ fn a_spill_refusal_reports_the_pools_used_and_limit_not_the_exchange() {
     // The aggregate hash tables are what filled the pool: reserve their bytes
     // through the pool so `reserved()` reads the real occupancy at the moment
     // the (separate) exchange's spill is refused.
-    let aggregate = MemoryConsumer::new("GroupedHashAggregateStream[0]").register(&pool);
+    let aggregate = MemoryConsumer::new("PartialHashAggregateStream[0]").register(&pool);
     aggregate.try_grow(RESERVED).expect("within the ceiling");
     assert_eq!(
         pool.reserved(),
