@@ -140,6 +140,7 @@ use crate::attrs_per_key::AttrsPerKeyProjection;
 use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
+use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::late_materialization::TopKLateMaterialization;
@@ -769,6 +770,15 @@ pub fn build_session(
     // `TopKLateMaterialization`'s phase-1 TopK. See
     // `crate::logs_scan::ConfirmTopKThreshold`.
     builder = builder.with_physical_optimizer_rule(Arc::new(ConfirmTopKThreshold));
+    // Issue #2720: give an aggregate's output slices buffers of their own
+    // before a `RepartitionExec` or a sort charges each slice the whole
+    // materialized output. Appended after every rule above because each of
+    // them matches the aggregate shape `EnforceDistribution` chose, or walks a
+    // pass-through allowlist that does not include `CompactSlicesExec`
+    // (`BoundedTopKAggregate` reads `SortExec -> CoalescePartitionsExec ->
+    // AggregateExec` directly). Placed last, it decorates the final plan and
+    // nothing has to see through it. See `crate::compact_slices`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(CompactSlices));
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
 

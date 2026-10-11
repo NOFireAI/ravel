@@ -28,6 +28,8 @@ mod audit_provider;
 mod bounded_topk_aggregate;
 #[path = "ceiling_breach.rs"]
 mod ceiling_breach;
+#[path = "compact_slices.rs"]
+mod compact_slices;
 #[path = "deadline.rs"]
 mod deadline;
 #[path = "distinct_on.rs"]
