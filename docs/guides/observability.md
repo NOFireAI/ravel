@@ -2496,7 +2496,7 @@ PromQL fan-out does not move it.
 ### CPU gates and runtime
 
 Labels: `mode` and `gate` (`read`|`write`) on every CPU gate sample, plus
-`site` on the two per-site counters. The runtime gauges and the heartbeat age
+`site` on the per-site families. The runtime gauges and the heartbeat age
 carry `mode` only, and the per-worker busy counter adds `worker`. The
 families render in every mode.
 
@@ -2513,11 +2513,14 @@ A job below the gate's inline floor runs on the calling thread and takes no
 permit. The floor is 256 KiB of uncompressed bytes, or 100,000 samples for a
 PromQL evaluation.
 
-The catalog's snapshot part, postings and column-statistics decodes are the
-only work submitted to the gates so far. They use the read gate's
-`catalog_part`, `catalog_postings` and `catalog_column_stats` sites. The job
-and inline figures of every other site, and all of the write gate's figures,
-stay at 0 until that decode or encode moves onto a gate.
+Every site except one has a production call site. On the read gate those are
+`catalog_part`, `catalog_postings`, `catalog_column_stats`, `metrics_meta`,
+`segment_section`, `segment_sparse_catalog`, `log_block`, `log_postings`,
+`log_section`, `span_block`, `promql_eval`, `compaction`, `fold`, `scrub` and
+`reachability`; on the write gate, all six: `metrics_flush`, `log_flush`,
+`span_flush`, `otap_decode`, `otlp_http_gzip` and `remote_write_snappy`. The
+read gate's `span_section` site has no call site yet, so its figures stay at
+0.
 
 | Metric | Meaning |
 |---|---|
@@ -2529,8 +2532,8 @@ stay at 0 until that decode or encode moves onto a gate.
 | `ravel_cpu_gate_abandoned_total` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
 | `ravel_cpu_gate_jobs_total{site}` | Counter. Jobs a call site ran through a permit. |
 | `ravel_cpu_gate_inline_total{site}` | Counter. Jobs a call site ran inline, below the inline floor. |
-| `ravel_cpu_gate_handoff_seconds_sum{site}`, `ravel_cpu_gate_handoff_seconds_count{site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means the blocking pool, not the permit count, is slow to pick jobs up. |
-| `ravel_cpu_gate_return_seconds_sum{site}`, `ravel_cpu_gate_return_seconds_count{site}` | Summary with no quantiles. Time from a job's last instruction to its caller resuming, and the number of jobs that returned to a waiting caller. A growing mean points at the async runtime being slow to reschedule the caller; a panicked or abandoned job is not counted, and inline jobs add to neither family. |
+| `ravel_cpu_gate_handoff_seconds_sum{site}`, `ravel_cpu_gate_handoff_seconds_count{site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means jobs are slow to start once they hold a permit: either the blocking pool is slow to pick them up, or the host is oversubscribed, with more runnable threads than cores, so the blocking thread waits for a core. |
+| `ravel_cpu_gate_return_seconds_sum{site}`, `ravel_cpu_gate_return_seconds_count{site}` | Summary with no quantiles. Time from a job's last instruction to its caller resuming, and the number of jobs that returned to a waiting caller. The window also covers dropping the job's guard on the blocking thread, which releases the permit and wakes the next waiter, so a growing mean points at that release or at the async runtime being slow to reschedule the caller; a panicked or abandoned job is not counted, and inline jobs add to neither family. |
 | `ravel_runtime_workers` | Gauge. Worker threads of the tokio runtime serving the process. |
 | `ravel_runtime_alive_tasks` | Gauge. Tasks alive on the runtime. |
 | `ravel_runtime_global_queue_depth` | Gauge. Tasks waiting in the runtime's global queue. |

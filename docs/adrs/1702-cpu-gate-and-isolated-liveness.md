@@ -811,13 +811,18 @@ reach, so none waits on another job.
 <!-- amendment-applies: sections="Decision" pointer="handoff and post-return amendment" -->
 
 Decision 11 gives each gate a permit wait and a run time, per gate only. A
-gated job also spends time between the two that neither counts: the trip from
-`spawn_blocking` onto a blocking thread, and the trip from the job's return
-back to the task awaiting it. Two regressions, #2795 (logs block decode on the
-read gate) and #2818 (ingest decode on the write gate), took a day of serial
-experiments partly because that time showed in no counter. An idle-runtime
-microbench put each at about 8 to 11 us at p50; under load it is unknown,
-which is what these counters are for.
+gated job also spends time in two windows that neither counts: the handoff,
+between the end of the permit wait and the start of the run, which is the trip
+from `spawn_blocking` onto a blocking thread; and the post-return, after the
+end of the run, which is the trip from the job's return back to the task
+awaiting it. Two regressions, #2795 (logs block decode on the read gate) and
+#2818 (ingest decode on the write gate), raised the question of how large
+these windows are. The fresh-box microbench posted on #2795 and #2818 on
+2026-10-11 (comment 6111242515 on #2795) put each at about 8 to 11 us at p50
+on an idle runtime, and #2818's microbench put the whole per-job dispatch
+round trip at about 20 us: the ingest cost lies in the work done on the gate
+thread, not in the handoff. These counters let production confirm that under
+load, where the windows have not been measured.
 
 Two summaries with no quantiles, rendered as `_sum` / `_count` pairs like the
 wait and run families, carrying `{mode, gate, site}`, one sample for every
@@ -831,8 +836,10 @@ site in the gate's closed set:
 - `ravel_cpu_gate_return_seconds{gate,site}`: from the clock reading taken on
   the blocking thread right after the job's code returns, which is also the
   end of the run time, to the clock reading the awaiting task takes right
-  after `handle.await` resumes. A caller's work after `run` returns, such as
-  freeing or using the returned value, is not in it.
+  after `handle.await` resumes. It includes dropping the job's guard on the
+  blocking thread, which releases the permit and wakes the next waiter. A
+  caller's work after `run` returns, such as freeing or using the returned
+  value, is not in it.
 
 Both read the gate's injected monotonic clock. What each excludes:
 
