@@ -161,8 +161,10 @@ check_eq "gates -p ravel-affinity: scoped clippy" "1" \
   "$(count "${out}" '==> cargo clippy --locked -p ravel-affinity -p ravel-ingest-router --all-targets -- -D warnings')"
 check_eq "gates -p ravel-affinity: no feature lane" "0" "$(count_matching "${out}" '--features')"
 
-# Workspace mode: every lane, and no cargo call at all.
-run_stubbed workspace bash "${SCRIPTS}/gates.sh" --dry-run
+# Workspace mode: every lane, and no cargo call at all. The hatch is set
+# because this checkout may itself sit under the fleet work root (the
+# orchestrator host does), and the refusal has its own cases above.
+RAVEL_GATES_ALLOW_UNSCOPED=1 run_stubbed workspace bash "${SCRIPTS}/gates.sh" --dry-run
 out="${tmp}/workspace.out"
 check_eq "gates --dry-run: exit 0" "0" "${rc}"
 check_eq "gates --dry-run: workspace clippy" "1" \

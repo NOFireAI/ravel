@@ -563,7 +563,11 @@ if [[ "${FLEET_MERGE_SKIP_GATES:-0}" == "1" ]]; then
 else
   echo "==> Running local pre-flight gates"
   git checkout -q --detach "${clean_ref}"
-  "${script_dir}/gates.sh" "$@"
+  # This gate is the merge-time workspace run by design, on whatever host
+  # lands the result; gates.sh refuses an unscoped run under the fleet work
+  # root unless told it is deliberate (ADR-2867 change 5), and an
+  # orchestrator checkout can live there too.
+  RAVEL_GATES_ALLOW_UNSCOPED=1 "${script_dir}/gates.sh" "$@"
   git checkout -q "${start_checkout}"
 fi
 

@@ -235,7 +235,8 @@ connection, a pushed-but-broken main).
   the fleet work root) an unscoped run is refused with exit 64: the
   executor's gate is the scoped form, and `RAVEL_GATES_ALLOW_UNSCOPED=1` is
   the escape hatch for a deliberate workspace gate, which
-  `verify-dispatch-gates.sh` sets for its own run.
+  `verify-dispatch-gates.sh` and `fleet-result-merge.sh` set for their
+  own runs.
 - `scripts/disk-reap.sh [-y]`: reclaims disk from merged clean worktrees
   and orphaned cargo target dirs (dry run by default; `-y` applies). Run
   it when free space drops below ~20 GB, and after a land worktree's PR
@@ -422,8 +423,10 @@ assignment to zsh's reserved `status`/`path`/
 inside the primary checkout, a bare 40-character hex literal in a Bash
 command, and three destructive git operations: `reset --hard/--soft` onto
 a remote ref, `filter-branch`, and a force-push naming `main`; and, in a
-dispatched fleet clone only (a checkout under the fleet work root), `cargo
-clippy --workspace`, whose replacement is `scripts/gates.sh -p`. The gate
+checkout under the fleet work root only (a dispatched fleet clone, or an
+orchestrator checkout that lives there), `cargo clippy --workspace` or a
+bare `cargo clippy` with no `-p`, whose replacement is `scripts/gates.sh
+-p`. The gate
 patterns match cargo's global flags
 too (`cargo --locked test | tail -1` was allowed until they did). It
 fails open on any internal error, and it exempts a dispatched fleet clone

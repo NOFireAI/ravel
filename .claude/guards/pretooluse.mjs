@@ -84,6 +84,9 @@ const MASKING_ECHO = /&&\s*echo\b/;
 const CLIPPY_HEAD =
   /^cargo(\s+(\+[A-Za-z0-9._-]+|(--color|--config|-C|-Z)\s+[^\s-]\S*|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+clippy(\s|$)/;
 const WORKSPACE_FLAG = /\s--(workspace|all)(\s|$)/;
+// The root manifest is virtual with no `default-members`, so a clippy with
+// no package selection is workspace-wide as well.
+const PACKAGE_SELECT = /\s(-p|--package|--manifest-path)(\s|=)/;
 // The escape hatch for a deliberate unscoped run in a fleet clone (ADR-2867
 // change 5), spelled inline at the front of the command like ALLOW_DESTRUCTIVE
 // and for the same reason: shell state does not survive between tool calls.
@@ -539,9 +542,10 @@ function checkWorkspaceClippy(stmt) {
     const stripped = part.replace(HARMLESS_PREFIX, "").trim();
     if (!CLIPPY_HEAD.test(stripped)) continue;
     const cargoArgs = ` ${stripped}`.split(/\s--(?=\s|$)/)[0];
-    if (!WORKSPACE_FLAG.test(cargoArgs)) continue;
+    if (!WORKSPACE_FLAG.test(cargoArgs) && PACKAGE_SELECT.test(cargoArgs)) continue;
     deny(
-      "`cargo clippy --workspace` is not a fleet executor's gate. Run " +
+      "`cargo clippy --workspace` (or a bare `cargo clippy`, which is " +
+        "workspace-wide here) is not a fleet executor's gate. Run " +
         "`scripts/gates.sh -p <crate> [-p <crate2>]` instead: it runs clippy " +
         "and tests over the named crates and every crate that depends on " +
         "them, plus the `sql` lane when ravel-server is in that closure and " +
@@ -600,9 +604,7 @@ function checkBash(rawCommand, cwd) {
 
     checkDestructiveGit(stmt);
     checkBareSha(stmt, shaAllowed);
-    if (CLIPPY_HEAD.test(stmt.replace(HARMLESS_PREFIX, "").trim()) || /\bcargo\b/.test(stmt)) {
-      if (inFleetClone()) checkWorkspaceClippy(stmt);
-    }
+    if (/\bcargo\b/.test(stmt) && inFleetClone()) checkWorkspaceClippy(stmt);
   }
 }
 

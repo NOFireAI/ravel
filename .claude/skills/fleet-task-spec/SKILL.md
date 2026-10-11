@@ -129,8 +129,13 @@ Gates: format and lint IN PLACE before the commit you will gate -- run
 the gate: it runs clippy, tests and doctests over the named crates and
 every workspace crate that depends on them, plus the `sql` lane when
 ravel-server is in that closure and the `flight-sql` lane when ravel-sql
-or ravel-server is. Do not hand-run `cargo clippy --workspace` in its
-place: in a fleet clone the PreToolUse hook refuses it. A doc-only or
+or ravel-server is. The `-p` list is load-bearing: name EVERY crate
+you edited (every crates/<x>/ and services/<x>/ directory in `git diff
+--name-only` against the dispatch ref), because the closure follows
+reverse dependencies only, and an edited crate you leave out is never
+compiled by this gate, so its break reaches CI one cycle later. Do not
+hand-run `cargo clippy --workspace` in its place: in a fleet clone the
+PreToolUse hook refuses it. A doc-only or
 test-only round runs the same gate: `cargo check -p <crate>` while
 iterating, then scripts/gates.sh -p <crate>. Cap cargo's build
 parallelism through the environment, not a flag, because
@@ -413,8 +418,13 @@ then an E0282 in a sql-gated test each reached CI, two extra 40-minute
 cycles. A workspace clippy is no substitute: it builds ravel-server with
 `sql` only through ravel-cli's dev-dependency, alongside the other
 features the workspace adds (CLAUDE.md, Gates), and never builds
-`flight-sql` at all. The hook refuses `cargo clippy --workspace` in a
-fleet clone so that the template's older wording cannot creep back.
+`flight-sql` at all. What the scoped gate gives up is the whole-workspace
+compile-break detector: a crate the executor edited but did not name is
+not a reverse dependency of the named ones and is never compiled, which
+is why the template makes the `-p` list cover every edited crate. The
+hook refuses `cargo clippy --workspace`, and a bare `cargo clippy` (this
+virtual manifest has no `default-members`, so that is workspace-wide too),
+in a fleet clone so that the template's older wording cannot creep back.
 
 ## Format before you commit, not after
 

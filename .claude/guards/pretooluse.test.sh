@@ -502,6 +502,9 @@ check deny  "global flag and env before clippy, fleet"  \
 check deny  "workspace clippy after cargo fmt &&, fleet" \
   "$(bash_in 'cargo fmt --all && cargo clippy --workspace --all-targets' "$fleet")"
 check deny  "clippy --all spelling, fleet"              "$(bash_in 'cargo clippy --all --all-targets' "$fleet")"
+check deny  "bare clippy with no package selection, fleet" \
+  "$(bash_in 'cargo clippy --all-targets -- -D warnings' "$fleet")"
+check allow "clippy --package, fleet"                   "$(bash_in 'cargo clippy --package ravel-types' "$fleet")"
 check allow "workspace clippy in a clone with no worktrees" "$(bash_in "$ws_clippy" "$cliproot/clone")"
 check deny  "global flag with a value before clippy, fleet" \
   "$(bash_in 'cargo --color never clippy --workspace --all-targets -- -D warnings' "$fleet")"
