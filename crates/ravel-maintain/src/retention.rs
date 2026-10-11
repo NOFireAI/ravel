@@ -549,7 +549,7 @@ pub(crate) async fn maintain_bucket_observed(
                 // A compaction refused below the format floor took no claim
                 // and wrote nothing, and is already logged and counted. It
                 // must not stop the pass: retention of the shard's other
-                // buckets runs as normal (ADR-1746 decision 3).
+                // buckets runs as normal (ADR-1746 decision 4).
                 Err(MaintainError::BelowFormatFloor(_)) => (None, None),
                 Err(err) => return Err(err),
             }
