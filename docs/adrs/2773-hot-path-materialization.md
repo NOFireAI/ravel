@@ -424,11 +424,10 @@ pooled, which is the 0.70 band; q4, the lowest at 25%, may land near
 less the `UTF-8 validation` column it contains is 16.3, 14.0, 19.2, 23.2,
 24.0 and 24.1% (19.6% pooled); D3 removes most of it, and the band of
 0.85 asks for 15%. Set L: the same subtraction gives 20.5, 23.4, 25.1 and
-20.1% (22.7% pooled), so 0.85 again (see the Set L amendment below: that
-subtraction kept only the validation frames under the builder's own
-`from_utf8` and missed the 15 points reached through the lazy cell
-accessor, and the band did not hold). Wall bands allow for the serial
-floor, which does not move.
+20.1% (22.7% pooled), so 0.85 again (see the Set L amendment below: the
+band did not hold, because those remaining points were treated as
+removable when only the builder's per-cell overhead, about 11 of them on
+q23, was). Wall bands allow for the serial floor, which does not move.
 
 ## Rejected alternatives
 
@@ -602,36 +601,53 @@ build` column of the profile table less the `UTF-8 validation` column
 (45.7 less 20.6 on q23, 22.7% pooled) as the part D3 removes. The
 subtraction itself was right: the validation column already held all of
 the validation. The error was in what remained. Of the 25.1 points left
-on q23, D3 could only remove the per-cell overhead of the builder: read
-by leaf in the #2864 profile's control arm (the same tree minus the epic,
-2 repetitions pooled, where the build frame is 37.9% inclusive), that is
-the multi-occurrence winner selection (`winner_at`, 5.1), the per-cell
+on q23, D3 could only remove the per-cell overhead of the builder. On
+this corpus `URL` and `Title` are dictionary pages, so the pre-D3 build
+took the dictionary arm of `build_declared_str_columnar`
+(`crates/ravel-sql/src/logs_scan.rs` at `7e5ffb59a^`): per row,
+`plan.winning_idx(i)` (line 6878), a key push into a second keys vector,
+and `append_value` of the entry's text; the entry's text came from
+`StrDictText::entry` (lines 6305 to 6309), which validated each entry
+once, lazily on its first read, through a `std::cell::OnceCell` and
+`cell_text` (lines 6273 to 6277). Read by leaf in the #2864 profile's
+control arm (the same tree minus the epic, 2 repetitions pooled), the
+overhead is the winner selection (`winner_at`, 5.1), the per-cell
 `append_value` (2.9), the second keys vector (1.8) and the builder's own
-frame (1.5), about 10 points, and 10 to 12 on q21, q22 and q24. The rest
-of the column was the read and copy of each cell's bytes through the
-cursor (`crates/ravel-logseg/src/columnar.rs`, `text_at`, which is also
-where the validation ran, once per cell, `std::str::from_utf8` at line
-312 of the pre-D3 tree), and that is the cost of the column, not an
-overhead. The control arm reproduces the P1 table's groups within 1 to 4
-points; the #2864 run's zstd share (18 to 20 points) is 2 to 3 above the
-table's 15.0 to 18.1 for the same statements, so figures from the two
-runs are compared by group, not to the decimal.
+frame (1.5): 11.3 points on q23, and 10 to 12 on q21, q22 and q24. The
+rest of the column was the validation and the read and copy of each
+entry's bytes, the cost of the column, not an overhead. Those leaves are
+read in a `build_declared_str_columnar` frame of 37.9% inclusive, while
+the P1 table's `Declared Str build` column is a wider group (it also
+matches the cursor and dictionary-decode frames) at 45.7, so the build
+group is an exception to the 1-to-4-point agreement the control arm
+otherwise shows with the P1 table: on the table's basis the overhead
+scales to about 13.6 of the 25.1. The #2864 run's zstd share (18 to 20
+points) is likewise 2 to 3 above the table's 15.0 to 18.1; figures from
+the two runs are compared by group, not to the decimal.
 
 What landed. In the new tree the build frame is 13 to 17%: `winner_at`
 is not reached on these statements (their columns take the single
-matching branch of `build_str_block`), the per-cell append and the second
-keys vector are gone, and the per-row predicate is 0.2 to 0.4% (D2). The
-validation is unchanged at 8 to 20% of each statement but runs once per
-dictionary entry when the block's `DictValues` is built from
-`decode_columns` (`crates/ravel-logseg/src/dict_values.rs`,
-`validate_entry`), with the entry copy moved there with it; the shared
-values array and its cache (D3) add 4 to 5%. Net per statement in that
-run: q21 1.00, q22 1.00, q23 0.97, q24 0.95, a Set L sum of 0.98 for
-that run's own two repetitions; the T5 sweep's 0.993 above is the ratio
-of record. The dominant phase on these statements is the decode of the
-long cells and their once-per-entry validation (zstd 15 to 20 points,
-validation 8 to 20, the copy), which D1 to D3 do not touch and which this
-ADR's Rejected alternatives leave to a format-level validated flag.
+matching branch of `build_str_block`, `crates/ravel-sql/src/logs_scan.rs`
+lines 7324 to 7332), the per-cell append and the second keys vector are
+gone, and the per-row predicate is 0.2 to 0.4% (D2). The validation is
+unchanged at 8 to 20% of each statement and still once per dictionary
+entry; what moved is when it runs: eagerly, for every entry, when the
+block's `DictValues` is built from `decode_columns`
+(`crates/ravel-logseg/src/dict_values.rs`, `validate_entry`), instead of
+lazily on first read during the build, and the entry copy moved there
+with it (`decode_block` grew by 17.9 points on q23, of which 14.6 is the
+moved validation and the rest that copy); the shared values array and
+its cache (D3) add 4 to 5%. Net per statement in that run: q21 1.00,
+q22 1.00, q23 0.97, q24 0.95, a Set L sum of 0.98 for that run's own two
+repetitions; the T5 sweep's 0.993 above is the ratio of record. The leaf
+budget predicts a little more than that on q23: 11.3 removed plus about
+1.5 for D2, less 4.4 for the values array and cache, less about 3.3 for
+the eager copy, is about 0.95; the remaining 2 points sit inside the
+two runs' repetition spread (1.2%) and the basis difference above. The
+dominant phase on these statements is the decode of the long cells and
+their once-per-entry validation (zstd 15 to 20 points, validation 8 to
+20, the copy), which D1 to D3 do not touch and which this ADR's Rejected
+alternatives leave to a format-level validated flag.
 
 What moves Set L. A `LIKE '%literal%'` arm evaluated on the raw page bytes
 before the block's values are validated and built, so that only the
