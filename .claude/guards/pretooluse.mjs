@@ -77,10 +77,12 @@ const MASKING_ECHO = /&&\s*echo\b/;
 // `scripts/gates.sh -p` runs clippy and tests over the changed crates'
 // reverse-dependency closure plus the `sql` and `flight-sql` lanes, and a
 // hand-run workspace clippy compiles neither lane. cargo's global flags may
-// precede the subcommand, as in GATE_HEAD; `--all` is clippy's older spelling
-// of `--workspace`. Only the arguments before a bare `--` are cargo's.
+// precede the subcommand, as in GATE_HEAD, including the four that take a
+// separate value (`--color never`, `--config k=v`, `-C dir`, `-Z flag`);
+// `--all` is clippy's older spelling of `--workspace`. Only the arguments
+// before a bare `--` are cargo's.
 const CLIPPY_HEAD =
-  /^cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+clippy(\s|$)/;
+  /^cargo(\s+(\+[A-Za-z0-9._-]+|(--color|--config|-C|-Z)\s+[^\s-]\S*|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+clippy(\s|$)/;
 const WORKSPACE_FLAG = /\s--(workspace|all)(\s|$)/;
 
 // zsh marks these read-only; assigning to one kills the enclosing loop with
@@ -543,7 +545,11 @@ function checkBash(rawCommand, cwd) {
   if (typeof rawCommand !== "string" || rawCommand === "") return;
   const command = stripHeredocBodies(rawCommand);
   const shaAllowed = shaLiteralAllowed(command);
-  const fleetClone = cwdIsFleetClone(cwd);
+  let fleetClone = null;
+  const inFleetClone = () => {
+    if (fleetClone === null) fleetClone = cwdIsFleetClone(cwd);
+    return fleetClone;
+  };
 
   for (const raw of scanTexts(command).flatMap(splitStatements)) {
     const stmt = raw.trim();
@@ -582,7 +588,9 @@ function checkBash(rawCommand, cwd) {
 
     checkDestructiveGit(stmt);
     checkBareSha(stmt, shaAllowed);
-    if (fleetClone) checkWorkspaceClippy(stmt);
+    if (CLIPPY_HEAD.test(stmt.replace(HARMLESS_PREFIX, "").trim()) || /\bcargo\b/.test(stmt)) {
+      if (inFleetClone()) checkWorkspaceClippy(stmt);
+    }
   }
 }
 
@@ -619,14 +627,19 @@ function isExemptCheckout(repoRoot, gitPath) {
   return isFleetClone(repoRoot, gitPath);
 }
 
-// The checkout `cwd` sits in, judged the way checkFileWrite judges a file: a
-// linked worktree records .git as a file and is never a fleet clone.
+// The checkout `cwd` sits in, for the workspace-clippy rule. Only the path
+// signal counts here: a refusal must never reach a plain clone, and a clone
+// without linked worktrees (which isFleetClone also reads as a fleet clone,
+// where that reading only grants an exemption) is the ordinary shape of a
+// fresh checkout. A linked worktree records .git as a file and is never a
+// fleet clone.
 function cwdIsFleetClone(cwd) {
   if (typeof cwd !== "string" || cwd === "") return false;
   const found = gitDirFor(resolve(cwd));
   if (!found) return false;
   if (!statSync(found.gitPath).isDirectory()) return false;
-  return isFleetClone(found.repoRoot, found.gitPath);
+  const normalized = found.repoRoot.split(sep).join("/");
+  return normalized.includes("/fleet/work/") || normalized.includes("/var/lib/fleet");
 }
 
 function checkFileWrite(filePath) {

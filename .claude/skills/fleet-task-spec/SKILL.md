@@ -250,9 +250,9 @@ origin/main HEAD`, which is the check CI runs (`changelog-assemble.sh
 --check` only validates the fragments that exist and never says one is
 missing). The `sql` and `flight-sql` lanes need no line of their own:
 scripts/gates.sh -p runs them whenever the closure reaches ravel-server
-or ravel-sql, which it does from crates/ravel-query too. Each of these has
-failed a pull request's first CI run after an executor reported every gate
-it was given green.
+or ravel-sql, which it does from crates/ravel-query too. Each check this
+paragraph names has failed a pull request's first CI run after an executor
+reported every gate it was given green.
 
 CLAIMS AUDIT, before the commit you gate, reported afterwards: list every
 sentence you wrote or edited in docs, HELP text, doc comments or an ADR
@@ -403,8 +403,10 @@ affected-tests.sh because the hand-listed pair misses what CI compiles.
 `scripts/gates.sh -p` runs clippy and tests over the named crates and
 their reverse-dependency closure, then the `sql` lane when ravel-server is
 in that closure and the `flight-sql` lane when ravel-sql or ravel-server
-is: the same package and feature selections CI's `lint`, `sql` and
-`flight-sql` jobs build. Both surfaces
+is: the same feature lanes CI's `sql` and `flight-sql` jobs build, over
+the closure rather than the whole workspace CI's `lint` job compiles, and
+with gates.sh's own test profile rather than CI's `ci` profile. Both
+surfaces
 compile only under their features. On #2833 the executor ran `cargo clippy
 -p ravel-server --all-targets` without `sql`, so a `redundant_closure` and
 then an E0282 in a sql-gated test each reached CI, two extra 40-minute

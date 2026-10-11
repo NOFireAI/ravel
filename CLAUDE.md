@@ -311,7 +311,10 @@ connection, a pushed-but-broken main).
   claim; look at what actually landed.
 - `scripts/fleet-result-merge.sh <task-id> <message-file> [-p CRATE ...]`:
   cleans `wip:`/fixup commits out of the reviewed result branch, runs
-  `gates.sh`, and opens a PR against `main` (`main` is protected; the
+  `gates.sh`, runs `scripts/guards/assert-struct-literals-current.sh`
+  against the branch it is about to push (any non-zero exit refuses the
+  PR; `ALLOW_STALE_SHAPE_SITES=1` passes exit 1 only), and opens a PR
+  against `main` (`main` is protected; the
   script never pushes or merges it directly). The PR opens WITHOUT
   auto-merge by default (standing rule, 2026-08-26): a bot review posts as
   a comment, not a required status check, so `--auto` used to merge before
@@ -414,11 +417,14 @@ assignment to zsh's reserved `status`/`path`/
 `argv`/`PWD`, a `ScheduleWakeup` under 900 s, an `Edit`/`Write`
 inside the primary checkout, a bare 40-character hex literal in a Bash
 command, and three destructive git operations: `reset --hard/--soft` onto
-a remote ref, `filter-branch`, and a force-push naming `main`. The gate
+a remote ref, `filter-branch`, and a force-push naming `main`; and, in a
+dispatched fleet clone only (a checkout under the fleet work root), `cargo
+clippy --workspace`, whose replacement is `scripts/gates.sh -p`. The gate
 patterns match cargo's global flags
 too (`cargo --locked test | tail -1` was allowed until they did). It
 fails open on any internal error, and it exempts a dispatched fleet clone
-(which is itself the isolated workspace).
+(which is itself the isolated workspace) from the worktree rule; the
+workspace-clippy rule is the one that applies only there.
 `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the worktree rule;
 `ALLOW_DESTRUCTIVE=1`, written inline at the front of the command (shell
 state does not survive between tool calls), is the one for the git rules.
@@ -670,7 +676,9 @@ than passing for "no pull request open".
   runs it for the pull request head before the merge line: exit 1 withholds
   the line, and `ALLOW_STALE_SHAPE_SITES=1` (for hits verified by hand as
   false positives) prints them with a note that the guard was overridden,
-  then the line; any other non-zero prints a warning and keeps it. Cases in
+  then the line; any other non-zero prints a warning and keeps it.
+  `scripts/fleet-result-merge.sh` runs it after the gates and before its
+  push, and refuses on any non-zero exit, exit 2 included. Cases in
   `scripts/guards/assert-struct-literals-current.test.sh`, run by
   `gates.sh` and CI's doc-scripts job.
 - `scripts/guards/assert-gh-auth.sh [hostname]`: exits non-zero when gh

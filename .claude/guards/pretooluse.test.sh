@@ -479,8 +479,10 @@ fi
 # --- workspace clippy in a fleet clone ----------------------------------
 # A fleet executor's gate is scripts/gates.sh -p, which adds the reverse-
 # dependency closure and the sql/flight-sql lanes that a hand-run workspace
-# clippy never compiles (#2833). The fleet-path checkout keeps a worktrees
-# directory, so its path is the only signal that makes it a fleet clone.
+# clippy never compiles (#2833). The path is the only signal for this rule:
+# a plain clone with no linked worktrees is an ordinary checkout here, not a
+# fleet clone, so the fleet-path fixture keeps a worktrees directory to prove
+# the path alone decides.
 bash_in() {
   node -e 'process.stdout.write(JSON.stringify({tool_name:"Bash",cwd:process.argv[2],tool_input:{command:process.argv[1]}}))' "$1" "$2"
 }
@@ -500,7 +502,13 @@ check deny  "global flag and env before clippy, fleet"  \
 check deny  "workspace clippy after cargo fmt &&, fleet" \
   "$(bash_in 'cargo fmt --all && cargo clippy --workspace --all-targets' "$fleet")"
 check deny  "clippy --all spelling, fleet"              "$(bash_in 'cargo clippy --all --all-targets' "$fleet")"
-check deny  "workspace clippy in a clone with no worktrees" "$(bash_in "$ws_clippy" "$cliproot/clone")"
+check allow "workspace clippy in a clone with no worktrees" "$(bash_in "$ws_clippy" "$cliproot/clone")"
+check deny  "global flag with a value before clippy, fleet" \
+  "$(bash_in 'cargo --color never clippy --workspace --all-targets -- -D warnings' "$fleet")"
+check deny  "--config value before clippy, fleet" \
+  "$(bash_in 'cargo --config build.jobs=2 clippy --all-targets --workspace' "$fleet")"
+check allow "global flag with a value, crate-scoped, fleet" \
+  "$(bash_in 'cargo --color never clippy -p ravel-types --all-targets' "$fleet")"
 check allow "workspace clippy in a linked worktree"     "$(bash_in "$ws_clippy" "$cliproot/linked")"
 check allow "workspace clippy in a primary with worktrees" "$(bash_in "$ws_clippy" "$cliproot/primary")"
 check allow "workspace clippy with no cwd in the payload" "$(bash_payload "$ws_clippy")"

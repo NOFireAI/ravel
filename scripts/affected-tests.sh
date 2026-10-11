@@ -38,6 +38,10 @@ if [ -z "$seeds" ]; then
   exit 2
 fi
 
+command -v jq >/dev/null 2>&1 || {
+  echo "$0: jq is required to compute the reverse-dependency closure" >&2
+  exit 2
+}
 meta=$(cargo metadata --format-version 1 --no-deps) || exit 1
 members=$(printf '%s' "$meta" | jq -r '.packages[].name')
 
