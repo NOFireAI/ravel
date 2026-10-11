@@ -2040,26 +2040,42 @@ mod default_geometry {
     /// footprint and `--batch-rows <batch_rows>` reads one row group per
     /// batch.
     fn fixture(batch_rows: usize, batches: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        row_fixture(batch_rows, batches, |g, r| {
+            (unique_trace((g * batch_rows + r) as u64), "op".to_string())
+        })
+    }
+
+    fn unique_trace(i: u64) -> [u8; 16] {
+        let mut id = [1u8; 16];
+        id[8..].copy_from_slice(&i.to_be_bytes());
+        id
+    }
+
+    /// [`fixture`] with row `r` of row group `g` carrying the trace id and
+    /// span name `span(g, r)`. Span ids stay distinct across the file.
+    fn row_fixture(
+        batch_rows: usize,
+        batches: usize,
+        span: impl Fn(usize, usize) -> ([u8; 16], String),
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let pq = dir.path().join("spans.parquet");
         let group = |g: usize| {
             let ids: Vec<u64> = (0..batch_rows)
                 .map(|r| (g * batch_rows + r) as u64)
                 .collect();
+            let (traces, names): (Vec<[u8; 16]>, Vec<String>) =
+                (0..batch_rows).map(|r| span(g, r)).unzip();
             batch(vec![
                 (
                     "trace_id",
-                    bin_col(
-                        ids.iter()
-                            .map(|i| [[1u8; 8], i.to_be_bytes()].concat())
-                            .collect(),
-                    ),
+                    bin_col(traces.iter().map(|t| t.to_vec()).collect()),
                 ),
                 (
                     "span_id",
                     bin_col(ids.iter().map(|i| (i + 1).to_be_bytes().to_vec()).collect()),
                 ),
-                ("name", str_col(vec!["op"; batch_rows])),
+                ("name", str_col(names.iter().map(String::as_str).collect())),
                 ("start_ns", i64_col(vec![NOW_NS; batch_rows])),
                 ("end_ns", i64_col(vec![NOW_NS; batch_rows])),
                 ("method", str_col(vec!["GET"; batch_rows])),
@@ -2084,6 +2100,16 @@ mod default_geometry {
         pq: &Path,
         request: GeometryRequest,
     ) -> SpansLoadReport {
+        load_sharded(store, pq, request, 1, BATCH_ROWS).await
+    }
+
+    async fn load_sharded(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+    ) -> SpansLoadReport {
         let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
         let mut report = SpansLoadReport::default();
         load_spans_into(
@@ -2092,8 +2118,8 @@ mod default_geometry {
             pq,
             "acme",
             &mapping,
-            1,
-            BATCH_ROWS,
+            shards,
+            batch_rows,
             0,
             request,
             None,
@@ -2114,15 +2140,20 @@ mod default_geometry {
     }
 
     async fn span_objects(store: &dyn ObjectStoreBackend) -> usize {
+        span_objects_matching(store, "/s/l0/").await
+    }
+
+    /// Data objects on one spans shard.
+    async fn shard_span_objects(store: &dyn ObjectStoreBackend, shard: u32) -> usize {
+        span_objects_matching(store, &format!("/s/l0/{shard:04}/")).await
+    }
+
+    async fn span_objects_matching(store: &dyn ObjectStoreBackend, needle: &str) -> usize {
         let mut count = 0;
         let mut page: Option<ravel_object_store::PageToken> = None;
         loop {
             let p = store.list("", page).await.expect("list");
-            count += p
-                .objects
-                .iter()
-                .filter(|o| o.key.contains("/s/l0/"))
-                .count();
+            count += p.objects.iter().filter(|o| o.key.contains(needle)).count();
             match p.next {
                 Some(t) => page = Some(t),
                 None => break,
@@ -2136,8 +2167,9 @@ mod default_geometry {
     /// objects: every 25th batch reaches the derived target (250,000 times
     /// the first batch's estimate per span) and closes an object on size,
     /// and the end-of-input drain publishes the 10,000-span tail. The
-    /// derived depth is ceil(250,000 / 10,000) = 25, so the depth flush runs
-    /// after batches 25 and 50 on buffers the size trigger has just emptied.
+    /// derived depth is ceil(250,000 / 10,000) = 25; the size flushes at
+    /// batches 25 and 50 each restart the depth window, so the depth flush
+    /// never comes due.
     ///
     /// The clock is pinned, so the age trigger cannot fire. Per-batch
     /// flushing writes 51 objects; a target the size trigger never reaches
@@ -2307,5 +2339,150 @@ mod default_geometry {
         assert_eq!(value["target_bytes_no_effect_warning"], warning.as_str());
         let parsed: LoadLayoutReport = serde_json::from_str(json).expect("the report round-trips");
         assert_eq!(parsed, layout);
+    }
+
+    /// Issue #2753: a first batch of spans with 400-byte names over-estimates
+    /// the later batches, whose names are 2 bytes, so the derived target
+    /// (250,000 first-batch spans) is never reached: the largest window, the
+    /// first batch plus 24 small ones, estimates below 25 first batches. The
+    /// depth flush closes each window of 25 batches: `51 / 25` depth flushes
+    /// and one end-of-input flush for the 1-batch remainder.
+    ///
+    /// Prove-the-test: never call `window.submitted` in the spans loader
+    /// (the `if window.submitted(observed)` in `load_spans_into`) and nothing
+    /// answers the write the loop waits on at the 25th submit; the pinned
+    /// clock never fires the age trigger, so the load fails on the Strict ack
+    /// deadline and `load`'s `expect("load succeeds")` panics.
+    #[tokio::test]
+    async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
+        let fat = "x".repeat(400);
+        let (_dir, pq) = row_fixture(BATCH_ROWS, BATCHES, |g, r| {
+            let name = if g == 0 {
+                fat.clone()
+            } else {
+                "op".to_string()
+            };
+            (unique_trace((g * BATCH_ROWS + r) as u64), name)
+        });
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+
+        assert_eq!(report.rows_processed, (BATCH_ROWS * BATCHES) as u64);
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        let depth = geometry.pipeline_depth;
+        assert_eq!(depth, 25);
+        let depth_flushes = (BATCHES / depth) as u64;
+        let manual = u64::from(!BATCHES.is_multiple_of(depth));
+        assert_eq!(
+            span_objects(store.as_ref()).await as u64,
+            depth_flushes + manual
+        );
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 0,
+                age: 0,
+                depth: depth_flushes,
+                manual,
+            },
+            "no size flush is reachable, so the depth flush closes every full window"
+        );
+    }
+
+    /// Issue #2753: a size flush restarts the depth window of its own shard
+    /// only. Four shards, `--pipeline-depth 8`, batches of 40,000 spans:
+    /// batches 1-6 put every span on trace `a` (shard A), batch 7 splits
+    /// 20,000 / 20,000 between `a` and trace `b` (shard B), and batches 8-12
+    /// put every span on `b`. Every span estimates the same, so the derived
+    /// target is 250,000 spans: `a` reaches it at batch 7 with 260,000 spans
+    /// and closes on size, and `b` ends with 220,000. Shard A's window
+    /// restarts at batch 7; shard B has been pending since batch 7, and a
+    /// depth flush would come due at batch 7 + 8 - 1 = 14, after the last
+    /// batch, so the end-of-input flush closes `b`.
+    ///
+    /// Prove-the-test: under the router-wide rule (a size flush clears
+    /// pending shards only when the router-wide size-flush count grew by the
+    /// number of shards the batch reached), batch 7 reached two shards and
+    /// opened one size flush, so nothing is cleared, shard A's batch-1 entry
+    /// comes due at batch 8, and the depth flush closes `b`'s batches 7-8 as
+    /// an object of its own: 3 objects, and the mix assertion fails with
+    /// size 1, depth 1, manual 1.
+    #[tokio::test]
+    async fn a_size_flush_restarts_only_that_shards_window() {
+        const SHARDS: u32 = 4;
+        const ROWS: usize = 40_000;
+        const BATCHES: usize = 12;
+        const DEPTH: usize = 8;
+        let (shard_a, shard_b) = (0u32, 1u32);
+        let trace_on = |shard: u32| {
+            (0u64..)
+                .map(unique_trace)
+                .find(|t| ravel_ingest::shard_for_span(t, SHARDS) == shard)
+                .expect("some trace id routes to every shard")
+        };
+        let (a, b) = (trace_on(shard_a), trace_on(shard_b));
+        let (_dir, pq) = row_fixture(ROWS, BATCHES, |g, r| {
+            let trace = match g {
+                0..=5 => a,
+                6 if r < ROWS / 2 => a,
+                _ => b,
+            };
+            (trace, "op".to_string())
+        });
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_sharded(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: Some(DEPTH),
+                load_memory: host_derived(),
+            },
+            SHARDS,
+            ROWS,
+        )
+        .await;
+
+        assert_eq!(report.rows_processed, (ROWS * BATCHES) as u64);
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        assert_eq!(geometry.pipeline_depth, DEPTH);
+
+        let a_spans = 6 * ROWS + ROWS / 2;
+        let b_spans = ROWS / 2 + (BATCHES - 7) * ROWS;
+        assert!(a_spans >= DEFAULT_OBJECT_ROWS && b_spans < DEFAULT_OBJECT_ROWS);
+        let b_first_pending = 7;
+        assert!(
+            b_first_pending + DEPTH - 1 > BATCHES,
+            "b's window never comes due"
+        );
+
+        let mix = layout.flush_mix.totals;
+        assert_eq!(
+            mix,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                depth: 0,
+                manual: 1,
+            },
+            "a closes on size at batch 7; b's window, started at batch 7, is not due by batch 12"
+        );
+        assert_eq!(shard_span_objects(store.as_ref(), shard_a).await, 1);
+        assert_eq!(shard_span_objects(store.as_ref(), shard_b).await, 1);
+        assert_eq!(report.objects_written() as u64, mix.total());
+        assert_eq!(report.realign_gave_up, 0);
     }
 }

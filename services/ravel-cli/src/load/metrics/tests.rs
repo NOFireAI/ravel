@@ -503,7 +503,7 @@ mod metrics_pipeline_review {
     /// A `host` label value whose series routes to each of `shards` shards,
     /// found through the loader's own point builder so the routing is the
     /// one `IngestRouter::write` applies.
-    fn host_per_shard(mapping: &MetricsMapping, shards: u32) -> Vec<String> {
+    pub(super) fn host_per_shard(mapping: &MetricsMapping, shards: u32) -> Vec<String> {
         let candidates: Vec<String> = (0..256).map(|i| format!("h{i}")).collect();
         let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let b = drain_batch(&refs);
@@ -532,7 +532,7 @@ mod metrics_pipeline_review {
     }
 
     /// Every data-object key under one metrics shard.
-    async fn shard_data_keys(store: &dyn ObjectStoreBackend, shard: u32) -> Vec<String> {
+    pub(super) async fn shard_data_keys(store: &dyn ObjectStoreBackend, shard: u32) -> Vec<String> {
         let needle = format!("/m/l0/{shard:04}/");
         let mut out = Vec::new();
         let mut page: Option<ravel_object_store::PageToken> = None;
@@ -993,13 +993,22 @@ mod default_geometry {
         batches: usize,
         host: impl Fn(usize) -> String,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        row_hosted_fixture(batch_rows, batches, |g, _| host(g))
+    }
+
+    /// [`fixture`] with row `r` of row group `g` on the series `host(g, r)`.
+    fn row_hosted_fixture(
+        batch_rows: usize,
+        batches: usize,
+        host: impl Fn(usize, usize) -> String,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         use parquet::arrow::ArrowWriter;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let pq = dir.path().join("points.parquet");
         let group = |g: usize| {
             let base = NOW_NS - 60_000_000_000 + (g * batch_rows) as i64;
-            let host = host(g);
+            let hosts: Vec<String> = (0..batch_rows).map(|r| host(g, r)).collect();
             batch(vec![
                 (
                     "ts",
@@ -1009,7 +1018,7 @@ mod default_geometry {
                     "value",
                     Arc::new(Float64Array::from(vec![1.0; batch_rows])) as ArrayRef,
                 ),
-                ("host", str_col(vec![host.as_str(); batch_rows])),
+                ("host", str_col(hosts.iter().map(String::as_str).collect())),
             ])
         };
         let first = group(0);
@@ -1030,13 +1039,23 @@ mod default_geometry {
         pq: &Path,
         request: GeometryRequest,
     ) -> MetricsLoadReport {
+        load_sharded(store, pq, request, 1, BATCH_ROWS).await
+    }
+
+    async fn load_sharded(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+    ) -> MetricsLoadReport {
         load_metrics_with(
             store,
             pq,
             "acme",
             &mapping(),
-            1,
-            BATCH_ROWS,
+            shards,
+            batch_rows,
             0,
             request,
             None,
@@ -1300,5 +1319,87 @@ mod default_geometry {
         assert_eq!(value["target_bytes_no_effect_warning"], warning.as_str());
         let parsed: LoadLayoutReport = serde_json::from_str(json).expect("the report round-trips");
         assert_eq!(parsed, layout);
+    }
+
+    /// Issue #2753: a size flush restarts the depth window of its own shard
+    /// only. Four shards, `--pipeline-depth 8`, batches of 40,000 points:
+    /// batches 1-6 put every point on series `a` (shard A), batch 7 splits
+    /// 20,000 / 20,000 between `a` and series `b` (shard B), and batches 8-12
+    /// put every point on `b`. The derived target is 250,000 of the first
+    /// batch's points (one series charge per 40,000 points), so `a` reaches
+    /// it at batch 7 with 260,000 points and closes on size; `b` ends with
+    /// 220,000 points, below the target. Shard A's window restarts at batch
+    /// 7; shard B has been pending since batch 7, and a depth flush would
+    /// come due at batch 7 + 8 - 1 = 14, after the last batch, so the
+    /// end-of-input flush closes `b`.
+    ///
+    /// Prove-the-test: under the router-wide rule (a size flush clears
+    /// pending shards only when the router-wide size-flush count grew by the
+    /// number of shards the batch reached), batch 7 reached two shards and
+    /// opened one size flush, so nothing is cleared, shard A's batch-1 entry
+    /// comes due at batch 8, and the depth flush closes `b`'s batches 7-8 as
+    /// an object of its own: 3 objects, and the mix assertion fails with
+    /// size 1, depth 1, manual 1.
+    #[tokio::test]
+    async fn a_size_flush_restarts_only_that_shards_window() {
+        const SHARDS: u32 = 4;
+        const ROWS: usize = 40_000;
+        const BATCHES: usize = 12;
+        const DEPTH: usize = 8;
+        let hosts = super::metrics_pipeline_review::host_per_shard(&mapping(), SHARDS);
+        let (shard_a, shard_b) = (0u32, 1u32);
+        let (a, b) = (hosts[0].clone(), hosts[1].clone());
+        let (_dir, pq) = row_hosted_fixture(ROWS, BATCHES, |g, r| match g {
+            0..=5 => a.clone(),
+            6 if r < ROWS / 2 => a.clone(),
+            _ => b.clone(),
+        });
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_sharded(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: Some(DEPTH),
+                load_memory: host_derived(),
+            },
+            SHARDS,
+            ROWS,
+        )
+        .await;
+
+        assert_eq!(report.points_written, (ROWS * BATCHES) as u64);
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        assert_eq!(geometry.pipeline_depth, DEPTH);
+
+        // Points per series, and the batch each series is first pending in
+        // (1-based, as the depth window counts submits).
+        let a_points = 6 * ROWS + ROWS / 2;
+        let b_points = ROWS / 2 + (BATCHES - 7) * ROWS;
+        assert!(a_points >= DEFAULT_OBJECT_ROWS && b_points < DEFAULT_OBJECT_ROWS);
+        let b_first_pending = 7;
+        assert!(
+            b_first_pending + DEPTH - 1 > BATCHES,
+            "b's window never comes due"
+        );
+
+        let mix = layout.flush_mix.totals;
+        assert_eq!(
+            mix,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                depth: 0,
+                manual: 1,
+            },
+            "a closes on size at batch 7; b's window, started at batch 7, is not due by batch 12"
+        );
+        let shard_keys = super::metrics_pipeline_review::shard_data_keys;
+        assert_eq!(shard_keys(store.as_ref(), shard_a).await.len(), 1);
+        assert_eq!(shard_keys(store.as_ref(), shard_b).await.len(), 1);
+        assert_eq!(report.objects_written() as u64, mix.total());
+        assert_eq!(report.realign_gave_up, 0);
     }
 }
