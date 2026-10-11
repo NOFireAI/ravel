@@ -8710,7 +8710,7 @@ mod columnar_lookup_tests {
 
     /// ADR-2773 D3: a row group dictionary's Arrow values are built once for
     /// the scan, however many blocks and `BATCH_ROWS` chunks read it, and every
-    /// chunk of a block is a slice over that one values array.
+    /// chunk of every block of the row group reads that one values array.
     ///
     /// Six blocks of `BATCH_ROWS + 1000` rows in row groups of three, so each
     /// block spans two chunks and each dictionary three blocks. The counter
@@ -8718,8 +8718,9 @@ mod columnar_lookup_tests {
     /// and a rebuild per block 6.
     ///
     /// Flipped: `StrValuesCache::values` looking up no cached entry fails the
-    /// counter (6, not 2); together with `build_declared_str_columnar` not
-    /// keeping `resolver.str_block`, the two chunks' values stop sharing.
+    /// cross-block pointer check at the group's second block; together with
+    /// `build_declared_str_columnar` not keeping `resolver.str_block`, the two
+    /// chunks' values stop sharing.
     #[test]
     fn declared_str_dictionary_values_are_built_once_per_dictionary() {
         const POOL: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
@@ -8749,7 +8750,7 @@ mod columnar_lookup_tests {
             .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
             .expect("scan");
         let shared = Arc::new(std::sync::Mutex::new(StrValuesCache::new(Count::new())));
-        let mut dicts: Vec<Arc<DictValues>> = Vec::new();
+        let mut dicts: Vec<(Arc<DictValues>, ArrayRef)> = Vec::new();
         let mut blocks = 0;
         while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
             blocks += 1;
@@ -8762,9 +8763,7 @@ mod columnar_lookup_tests {
             else {
                 panic!("block {blocks}: `k` reads a dictionary page");
             };
-            if !dicts.iter().any(|d| Arc::ptr_eq(d, page.values())) {
-                dicts.push(Arc::clone(page.values()));
-            }
+            let dict = Arc::clone(page.values());
             let mut resolver = DeclaredResolver::with_str_values(&plan, Arc::clone(&shared));
             let mut cache = HashMap::new();
             let mut chunks = Vec::new();
@@ -8791,6 +8790,20 @@ mod columnar_lookup_tests {
                 Arc::ptr_eq(&values[0], &values[1]),
                 "block {blocks}: both chunks share one values array"
             );
+            match dicts.iter().find(|(d, _)| Arc::ptr_eq(d, &dict)) {
+                Some((_, first)) => assert!(
+                    Arc::ptr_eq(first, &values[0]),
+                    "block {blocks}: shares its row group's values array with the \
+                     group's earlier blocks"
+                ),
+                None => {
+                    assert!(
+                        dicts.iter().all(|(_, v)| !Arc::ptr_eq(v, &values[0])),
+                        "block {blocks}: a new dictionary gets its own values array"
+                    );
+                    dicts.push((dict, Arc::clone(&values[0])));
+                }
+            }
             let cells: Vec<Option<String>> = chunks
                 .iter()
                 .flat_map(|c| declared_cells(c, DeclaredType::Str))
@@ -8804,7 +8817,7 @@ mod columnar_lookup_tests {
         assert_eq!(dicts.len(), 2, "two row groups, one dictionary each");
         assert_eq!(
             lock_str_values(&shared).built.value(),
-            dicts.len(),
+            2,
             "values built once per dictionary, not per block or chunk"
         );
     }
@@ -9760,6 +9773,16 @@ mod tests {
                         None => {
                             if chunk_cells[j].is_some() {
                                 seen.insert("a resource or scope value shown through");
+                                let attrs = view.stream_attrs(i).map(|blob| {
+                                    ravel_logseg::record::decode_stream_attrs(blob)
+                                        .expect("stream attrs")
+                                });
+                                if attrs.is_some_and(|a| {
+                                    a.resource.iter().all(|(k, _)| k != KEY)
+                                        && a.scope_attrs.iter().any(|(k, _)| k == KEY)
+                                }) {
+                                    seen.insert("a scope-only fallback value");
+                                }
                             } else {
                                 seen.insert("a NULL row");
                             }
@@ -9792,6 +9815,9 @@ mod tests {
                     .expect("Utf8 dictionary values");
                 let texts: Vec<Option<&str>> = p.values().texts().collect();
                 prop_assert!(v.len() >= texts.len());
+                if v.len() > texts.len() {
+                    seen.insert("a dictionary page plus fallback in one block (extended cache)");
+                }
                 let prefix: Vec<Option<&str>> = (0..texts.len())
                     .map(|k| v.is_valid(k).then(|| v.value(k)))
                     .collect();
@@ -9870,6 +9896,8 @@ mod tests {
             "an object mixing dictionary and plain pages",
             "one key under several types in one row",
             "a resource or scope value shown through",
+            "a scope-only fallback value",
+            "a dictionary page plus fallback in one block (extended cache)",
             "a NULL row",
             "one stream's fallback on several rows",
             "a surviving-row subset",
