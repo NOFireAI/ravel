@@ -10,12 +10,8 @@
 //! buffered-byte ceiling.
 //!
 //! A strict `submit` takes a permit before charging the byte budget and before
-//! touching any shard, so a refused submit holds no byte charge. The permit is
-//! released by [`PendingAckPermit`]'s `Drop`: when `acks()` resolves (ack
-//! success or a shard-level error), when its `ack_deadline` elapses (the
-//! duration is captured at submit and the clock starts at the first poll of
-//! `acks()`), or when the `Submitted` value is dropped. A `Submitted` that is
-//! never polled holds its permit until it is dropped.
+//! touching any shard, so a refused submit holds no byte charge. When the
+//! permit is released is stated once, on [`PendingAckPermit`].
 //!
 //! The gauge and counter are process-wide only when every router is built
 //! from one shared `Arc<PendingAckBudget>`; each router reports the budget it
@@ -93,9 +89,11 @@ impl PendingAckBudget {
 }
 
 /// A held pending-ack permit. Releases on `Drop`, exactly once: when `acks()`
-/// resolves (ack success or a shard-level error), when its deadline elapses
-/// after `acks()` is first polled, or when the `Submitted` value is dropped.
-/// A plain RAII guard gives all three, with no explicit release call on any
+/// resolves (ack success or a shard-level error), when its `ack_deadline`
+/// elapses (the duration is captured at submit and the clock starts at the
+/// first poll of `acks()`), or when the `Submitted` value is dropped. A
+/// `Submitted` that is never polled holds its permit until it is dropped. A
+/// plain RAII guard gives all three, with no explicit release call on any
 /// path.
 #[derive(Debug)]
 pub struct PendingAckPermit {

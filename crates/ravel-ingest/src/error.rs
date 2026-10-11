@@ -86,10 +86,9 @@ pub enum WriteError {
     /// ceiling: `submit` could not take a pending-ack permit, so the write is
     /// refused before the byte budget is charged and before any shard is
     /// touched, with no commit token issued. Retryable, classified the same as
-    /// [`Self::BufferBudgetExceeded`]: a permit frees when an in-flight strict
-    /// write's `acks()` resolves, when its deadline elapses after `acks()` is
-    /// first polled, or when its `Submitted` is dropped unawaited. Gateway
-    /// status mapping is not yet wired to this variant.
+    /// [`Self::BufferBudgetExceeded`]: a permit frees as
+    /// [`crate::PendingAckPermit`] states. Gateway status mapping is not yet
+    /// wired to this variant.
     #[error("pending strict-ack budget reached")]
     PendingAckLimitReached,
     /// A shard this write routes to has a flush that has stayed deferred at the

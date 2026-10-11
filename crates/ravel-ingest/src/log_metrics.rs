@@ -14,7 +14,7 @@
 //!   when a flush is *opened*, before the RLOG build, the data-object PUT, or
 //!   the commit-record PUT. A flush later abandoned is counted in both
 //!   `flushes_by_*` **and** one of the `abandoned_*` counters. Flushes that
-//!   reached a durable commit are the three trigger counters summed, minus
+//!   reached a durable commit are the `flushes_*` trigger counters summed, minus
 //!   `abandoned_retry_exhausted` and `abandoned_input_rejected`; the bare
 //!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's
@@ -56,6 +56,12 @@ pub struct LogIngestMetrics {
     /// `max_flush_lifetime` less one `flush_tick` ([`FlushTrigger::AgeFloor`],
     /// ADR-1737 decision 6). Attempt-time.
     flushes_by_age_floor: AtomicU64,
+    /// Flushes opened by a strict-arrival write ([`FlushTrigger::Arrival`],
+    /// ADR-2793 decision 3). Never folded into `flushes_by_age`. Attempt-time.
+    flushes_by_arrival: AtomicU64,
+    /// Strict-arrival writes that found their tenant with a flush in flight on
+    /// the shard and marked the buffer pending instead of opening a flush.
+    arrival_coalesced: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path. Attempt-time.
     flushes_manual: AtomicU64,
     /// Retried PUT attempts across both the data-object and commit-record
@@ -324,6 +330,8 @@ pub struct LogIngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
     pub flushes_by_age_floor: u64,
+    pub flushes_by_arrival: u64,
+    pub arrival_coalesced: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -456,7 +464,7 @@ pub struct LogIngestMetricsSnapshot {
 }
 
 /// One shard's flush count split by the trigger that opened each flush (issue
-/// #983). The three causes are disjoint and every flush lands in exactly one,
+/// #983). The four causes are disjoint and every flush lands in exactly one,
 /// so [`FlushTriggerMix::total`] equals the shard's flushes-opened count. Read
 /// via [`LogIngestMetrics::flush_trigger_mix_by_shard`].
 ///
@@ -475,15 +483,18 @@ pub struct FlushTriggerMix {
     /// past the sub-floor hold ([`FlushTrigger::AgeFloor`]). The process-wide
     /// counters keep the floor case apart as `flushes_by_age_floor`.
     pub age: u64,
+    /// Flushes opened by a strict-arrival write ([`FlushTrigger::Arrival`]),
+    /// kept apart from `age`.
+    pub arrival: u64,
     /// Flushes opened by the final drain at close: a [`FlushTrigger::Manual`]
     /// shutdown drain, channel-close drain, or explicit flush request.
     pub final_drain: u64,
 }
 
 impl FlushTriggerMix {
-    /// The shard's flushes-opened count, the sum of the three disjoint causes.
+    /// The shard's flushes-opened count, the sum of the four disjoint causes.
     pub fn total(&self) -> u64 {
-        self.size + self.age + self.final_drain
+        self.size + self.age + self.arrival + self.final_drain
     }
 }
 
@@ -568,6 +579,7 @@ impl LogIngestMetrics {
             // exhaustive here, and is never reached from this actor.
             FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
             FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
+            FlushTrigger::Arrival => &self.flushes_by_arrival,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -584,8 +596,13 @@ impl LogIngestMetrics {
             FlushTrigger::Age | FlushTrigger::AgeAdaptive | FlushTrigger::AgeFloor => {
                 entry.age += 1
             }
+            FlushTrigger::Arrival => entry.arrival += 1,
             FlushTrigger::Manual => entry.final_drain += 1,
         }
+    }
+
+    pub(crate) fn record_arrival_coalesced(&self) {
+        self.arrival_coalesced.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Point-in-time per-shard flush trigger mix, sorted by shard index (issue
@@ -898,6 +915,8 @@ impl LogIngestMetrics {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
             flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
+            flushes_by_arrival: self.flushes_by_arrival.load(Ordering::Relaxed),
+            arrival_coalesced: self.arrival_coalesced.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -1041,6 +1060,20 @@ mod tests {
             |m| m.record_flush(0, FlushTrigger::Age),
             LogIngestMetricsSnapshot {
                 flushes_by_age: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush(0, FlushTrigger::Arrival),
+            LogIngestMetricsSnapshot {
+                flushes_by_arrival: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_arrival_coalesced,
+            LogIngestMetricsSnapshot {
+                arrival_coalesced: 1,
                 ..Default::default()
             },
         );
@@ -1254,10 +1287,12 @@ mod tests {
     #[test]
     fn flush_trigger_mix_splits_by_shard_and_cause() {
         let metrics = LogIngestMetrics::default();
-        // Shard 0: two size, one age, one final. Shard 3: one final only.
+        // Shard 0: two size, one age, one arrival, one final. Shard 3: one
+        // final only.
         metrics.record_flush(0, FlushTrigger::Size);
         metrics.record_flush(0, FlushTrigger::Size);
         metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::Arrival);
         metrics.record_flush(0, FlushTrigger::Manual);
         metrics.record_flush(3, FlushTrigger::Manual);
 
@@ -1270,6 +1305,7 @@ mod tests {
                     FlushTriggerMix {
                         size: 2,
                         age: 1,
+                        arrival: 1,
                         final_drain: 1,
                     }
                 ),
@@ -1278,6 +1314,7 @@ mod tests {
                     FlushTriggerMix {
                         size: 0,
                         age: 0,
+                        arrival: 0,
                         final_drain: 1,
                     }
                 ),
@@ -1285,12 +1322,13 @@ mod tests {
             "each cause lands in its own field, keyed by the flushing shard, sorted by shard index"
         );
         // total() is the shard's flushes-opened count.
-        assert_eq!(mix[0].1.total(), 4);
+        assert_eq!(mix[0].1.total(), 5);
         assert_eq!(mix[1].1.total(), 1);
         // The process-wide flat counters equal the mix summed across shards.
         let snap = metrics.snapshot();
         assert_eq!(snap.flushes_by_size, 2);
         assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_arrival, 1);
         assert_eq!(snap.flushes_manual, 2);
     }
 
@@ -1308,6 +1346,7 @@ mod tests {
                 FlushTriggerMix {
                     size: 0,
                     age: 1,
+                    arrival: 0,
                     final_drain: 0
                 }
             )]
@@ -1332,6 +1371,7 @@ mod tests {
                 FlushTriggerMix {
                     size: 0,
                     age: 3,
+                    arrival: 0,
                     final_drain: 0
                 }
             )]

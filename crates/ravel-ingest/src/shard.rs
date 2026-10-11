@@ -87,6 +87,10 @@ pub(crate) enum ShardMsg {
         /// test write that bypasses the budget (production always charges via
         /// [`crate::IngestRouter`]).
         charge: Option<Arc<IngestByteCharge>>,
+        /// Set for a [`crate::WriteMode::StrictArrival`] write that carries an
+        /// ack: the actor opens the tenant's flush on arrival rather than on
+        /// the age tick (ADR-2793 decision 2).
+        arrival: bool,
     },
     /// Rows a retiring shard handed back at flush open instead of writing them
     /// outside the scan set of the hour they would have pinned (ADR-1642
@@ -230,6 +234,12 @@ struct TenantBuf {
     /// undelivered, so later triggers retry it only until the deferral cap
     /// ([`mismatch_retry_spent`]).
     mismatch_held_since_ns: Option<i64>,
+    /// Set when a strict-arrival write merged while this tenant already had a
+    /// flush in flight, so the reap that brings it to zero opens this buffer's
+    /// flush (ADR-2793 decision 2). Cleared whenever the buffer leaves the map
+    /// for a flush ([`ShardActor::take_for_flush`]), so a buffer the flush puts
+    /// back never carries it.
+    arrival_pending: bool,
 }
 
 impl TenantBuf {
@@ -1243,7 +1253,7 @@ impl ShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(ShardMsg::Write { tenant, points, exemplars, ack, charge }) => {
+                        Some(ShardMsg::Write { tenant, points, exemplars, ack, charge, arrival }) => {
                             // Per-shard skew (issue #865): time the serial on-actor
                             // section only. The flush this may open runs in a spawned
                             // task, timed off-actor, and the `max_inflight_flushes`
@@ -1251,7 +1261,7 @@ impl ShardActor {
                             // (issue #1292), so there is no on-actor permit wait left
                             // to exclude: this delta is pure merge-and-pin work.
                             let started_ns = self.clock.now_ns();
-                            self.handle_write(tenant, points, exemplars, ack, charge)
+                            self.handle_write(tenant, points, exemplars, ack, charge, arrival)
                                 .await;
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
@@ -1312,6 +1322,7 @@ impl ShardActor {
                 Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
                     handle_flush_join_result(self.shard, result);
                     self.shares.prune();
+                    self.flush_arrival_pending().await;
                     self.record_queued_flushes();
                 }
             }
@@ -1359,6 +1370,7 @@ impl ShardActor {
         exemplars: Vec<IngestExemplar>,
         mut ack: Option<Ack>,
         charge: Option<Arc<IngestByteCharge>>,
+        arrival: bool,
     ) {
         if points.is_empty() && exemplars.is_empty() && ack.is_none() {
             // Nothing buffered: drop the charge now so its bytes are refunded
@@ -1424,10 +1436,74 @@ impl ShardActor {
                 )
             })
             .unwrap_or(false);
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
-                .await;
+        if should_flush {
+            if let Some(buf) = self.take_for_flush(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                    .await;
+            }
+        } else if arrival {
+            self.open_arrival_flush(tenant).await;
         }
+    }
+
+    /// Removes `tenant`'s buffer to hand it to [`Self::flush_tenant`], clearing
+    /// `arrival_pending`: a buffer `flush_tenant` puts back waits for its next
+    /// trigger like any other, rather than being reopened by the reap as an
+    /// arrival flush.
+    fn take_for_flush(&mut self, tenant: &TenantId) -> Option<TenantBuf> {
+        let mut buf = self.tenants.remove(tenant)?;
+        buf.arrival_pending = false;
+        Some(buf)
+    }
+
+    /// Opens `tenant`'s flush for a strict-arrival write when the tenant has
+    /// none in flight, or marks the buffer for the reap that brings it to zero.
+    /// Opening only at zero in flight keeps the queued-flush cap and the
+    /// tenant share from ever refusing it (ADR-2793 decision 2).
+    async fn open_arrival_flush(&mut self, tenant: TenantId) {
+        if self.shares.in_flight(tenant.hash()) == 0 {
+            if let Some(buf) = self.take_for_flush(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
+                    .await;
+            }
+        } else if let Some(buf) = self.tenants.get_mut(&tenant) {
+            buf.arrival_pending = true;
+            self.metrics.record_arrival_coalesced();
+        }
+    }
+
+    /// Opens the flush of every buffer a strict-arrival write marked pending
+    /// whose tenant now has no flush in flight, in [`Self::flush_aged`]'s
+    /// order. The scan is over buffers the actor already holds, so it costs
+    /// the tenant count per reap and nothing per write.
+    async fn flush_arrival_pending(&mut self) {
+        let mut due: Vec<(i64, i64, TenantId)> = self
+            .tenants
+            .iter()
+            .filter(|(tenant, buf)| {
+                buf.arrival_pending
+                    && !buf.waiters.is_empty()
+                    && self.shares.in_flight(tenant.hash()) == 0
+            })
+            .map(|(tenant, buf)| {
+                (
+                    buf.deferred_since_ns.unwrap_or(i64::MAX),
+                    buf.oldest_arrival_ns.unwrap_or(i64::MAX),
+                    tenant.clone(),
+                )
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        due.sort_unstable_by_key(|(since, oldest, _)| (*since, *oldest));
+        for (_, _, tenant) in due {
+            if let Some(buf) = self.take_for_flush(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
+                    .await;
+            }
+        }
+        self.refresh_oldest_deferral();
     }
 
     /// Merges rows another shard handed back at flush open (ADR-1642 scan-set
@@ -1455,7 +1531,7 @@ impl ShardActor {
                 self.backstop_ceiling.get(),
             )
         });
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+        if should_flush && let Some(buf) = self.take_for_flush(&tenant) {
             self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                 .await;
         }
@@ -1713,7 +1789,7 @@ impl ShardActor {
             .collect();
         due.sort_unstable_by_key(|(since, oldest, ..)| (*since, *oldest));
         for (_, _, tenant, trigger) in due {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                     .await;
             }
@@ -1837,7 +1913,7 @@ impl ShardActor {
                 .map(|(tenant, _)| tenant.clone())
                 .collect();
             for tenant in held {
-                if let Some(buf) = self.tenants.remove(&tenant) {
+                if let Some(buf) = self.take_for_flush(&tenant) {
                     self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                         .await;
                 }
@@ -1901,7 +1977,7 @@ impl ShardActor {
     async fn flush_all_pass(&mut self, trigger: FlushTrigger, lag_check: LagCheck) {
         let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
         for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, lag_check).await;
             }
         }
@@ -4305,6 +4381,7 @@ mod tests {
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(ShardMsg::Write {
+                    arrival: false,
                     tenant: TenantId::new("acme"),
                     points: Self::six_points(),
                     exemplars: Vec::new(),
@@ -4332,6 +4409,7 @@ mod tests {
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(ShardMsg::Write {
+                    arrival: false,
                     tenant,
                     points,
                     exemplars: Vec::new(),

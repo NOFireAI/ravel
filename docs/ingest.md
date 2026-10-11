@@ -20,9 +20,7 @@ strict-mode acks under the `ack_deadline` duration passed to `submit`, its
 clock starting at the first poll of `acks()` (buffered mode's `acks()`
 returns immediately). A strict `submit` takes a pending-ack permit from the
 router's `PendingAckBudget` before it charges the byte budget or touches a
-shard. The permit is released when `acks()` resolves, when its deadline
-elapses after `acks()` is first polled, or when the `Submitted` is dropped;
-a `Submitted` that is never polled holds its permit until it is dropped.
+shard, released as "Pending strict-ack budget" below states.
 
 Remote Write (`POST /api/v1/write`, ADR-0015) is a second gateway handler
 in front of the same router, decode/normalize swapped for the RW-specific
@@ -479,6 +477,28 @@ Loop over `select!`:
   (hash collision) rejects the point with a typed error and increments
   the series_id_collisions counter instead of silently merging
   (ADR-0005 fail-loud rule).
+  A `WriteMode::StrictArrival` write (ADR-2793 decision 2) has the same ack
+  contract as a strict one, and its flush opens on arrival rather than on the
+  age tick. When the size trigger did not fire and the tenant has no flush in
+  flight on this shard, the handler opens the tenant's flush at once,
+  recorded as `FlushTrigger::Arrival`. When the tenant does have one in
+  flight, the write marks the buffer arrival-pending and counts one
+  `arrival_coalesced`; the reap below opens it, so every arrival write that
+  lands behind an in-flight flush shares the next one. An arrival-pending
+  buffer keeps its age threshold, measured from its own oldest row and not
+  from when the in-flight flush started: once that row is older than the
+  threshold while the flush is still in flight, the tick flushes the buffer by
+  age as it would a strict buffer. A buffer leaves the map without its
+  arrival-pending mark whenever a trigger takes it for a flush, so one the
+  flush puts back (deferred at the queued-flush cap, refused on the clock, or
+  kept by the scan-set check) waits for its next trigger like any other
+  rather than being reopened by the reap.
+- flush reaped (a spawned flush task finished): prune the tenant shares, then
+  open the flush of every arrival-pending buffer that still holds a strict
+  waiter and whose tenant now has no flush in flight, in the age tick's
+  order (deferred buffers first, oldest deferral first, then oldest row).
+  The scan covers the buffers the actor already holds, so it costs the
+  tenant count per reap and nothing per write.
 - flush tick (interval default 200 ms): flush if `oldest_ns` older than an
   age threshold, and buffer non-empty. The threshold is `max_flush_delay`
   (default 2 s) when the buffer has a strict-mode waiter or already holds
@@ -774,6 +794,16 @@ deferred object at about 4x `target_bytes` plus one batch.
 flat is this exemption, not a queue that lost its bound. Both are exported:
 `/metrics` renders them as `ravel_ingest_queued_flushes` (gauge) and
 `ravel_ingest_flush_trigger_deferred_total` (counter), by `{mode, signal}`.
+
+An arrival flush (`FlushTrigger::Arrival`, "Shard actor" above) takes the
+same shard permit inside its spawned task as every other flush. It is exempt
+from the queued-flush cap and from the per-tenant share by construction, not
+by a special case: it opens only when its tenant has no flush in flight on
+the shard, and a tenant with nothing in flight is never refused by either.
+So it has no queued-flush-cap or share deferral path, and
+`flush_trigger_deferred` never counts one. A strict-arrival waiter in a
+buffer that was already deferred for another trigger is still answered
+`Abandoned` at the flush deferral cap, as a strict waiter is.
 
 Raising the bound gives healthy tenants a permit to flush on while one prefix
 is throttled, at the cost of more concurrent PUTs and more encode memory in
@@ -1754,7 +1784,8 @@ tenants of the process.
 Counters recorded today:
 
 - `flushes_by_size`, `flushes_by_age`, `flushes_by_age_adaptive`,
-  `flushes_by_age_floor`, `flushes_manual`: flush count by trigger.
+  `flushes_by_age_floor`, `flushes_by_arrival`, `flushes_manual`: flush count
+  by trigger.
   `flushes_by_age_adaptive` is the
   subset of age-triggered flushes where `adaptive_flush_delay` actually
   stretched the threshold past `max_flush_delay`; it is zero unless that knob
@@ -1762,12 +1793,21 @@ Counters recorded today:
   one of the two). `flushes_by_age_floor` is the age-triggered subset that
   waited for the sub-floor hold instead of `max_flush_delay_idle`, disjoint
   from the other two the same way, and zero unless `idle_flush_byte_floor` is
-  set. `flushes_manual` covers explicit `FlushNow`, the `Shutdown`
+  set. `flushes_by_arrival` counts flushes a strict-arrival write opened, in
+  its handler or on the reap after an in-flight flush ("Shard actor" above);
+  it is never folded into `flushes_by_age`, and an arrival-pending buffer the
+  age tick reaches first counts as an age flush. The log pipeline's per-shard
+  trigger mix carries it as its own `arrival` entry. `flushes_manual` covers
+  explicit `FlushNow`, the `Shutdown`
   drain, and the channel-close drop-path drain. These are **attempt-time**:
   incremented when a flush is opened, before the segment build or any PUT, so
   a later-abandoned flush is counted here as well as in an `abandoned_*`
-  counter. Successful flushes = the five trigger counters minus the four
+  counter. Successful flushes = the six trigger counters minus the four
   `abandoned_*` counters.
+- `arrival_coalesced`: strict-arrival writes that merged while their tenant
+  already had a flush in flight on the shard, so they marked the buffer
+  arrival-pending instead of opening a flush. Reported on the metrics, log,
+  and span snapshots alike.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
   budget or `max_flush_lifetime` elapsed while the flush's own store calls were
   in flight (`WriteError::Abandoned`). Object-store durability signal;
