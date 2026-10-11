@@ -160,11 +160,14 @@ In ravel, `benchmarks/clickbench/kit/`:
    phases `run.toml` names: the 43-statement benchmark per arm, the q29
    probe, the concurrent phases, each logging every call's statement,
    outcome, duration and refusal class to `calls.jsonl` (that is change
-   7's kit half). It writes `results.json` in the shape the lane already
-   parses: `ClickBenchParquetReport`
-   (`crates/ravel-bench/src/clickbench_parquet/report.rs`, the serde type
-   with the round-trip test, which the runbook's section 9 `analyse.py`
-   reads), extended by a `bands` block with pass, miss or inconclusive per
+   7's kit half). It writes `results.json` in the shape each lane already
+   parses: the 43-statement lane's report is `SqlLatencyReport` with its
+   `entries` of `EntryReport` (`crates/ravel-bench/src/sql_latency.rs`),
+   which is what the runbook's section 9 `analyse.py` reads from
+   `bench.json` today (statement `id`, `min_ms`, `error`,
+   `per_run_accounting`); the Parquet lane's is `ClickBenchParquetReport`
+   (`crates/ravel-bench/src/clickbench_parquet/report.rs`). Each is
+   extended by a `bands` block with pass, miss or inconclusive per
    pre-registered band read from the band file, and an evidence tarball
    to `s3://<bucket>/runs/<run-id>/out/`, writes `DONE` or `FAILED` beside
    them, and terminates the instance.
@@ -257,7 +260,12 @@ In ravel:
    rule and must not switch this refusal off). The hook sees only the
    command text, so `gates.sh` itself refuses to run unscoped (no `-p`)
    when its checkout is a fleet clone, with the same path test; the hook
-   covers the hand-typed spelling, the script covers its own.
+   covers the hand-typed spelling, the script covers its own. The escape
+   hatch is `RAVEL_GATES_ALLOW_UNSCOPED=1`, in the shape of
+   `ALLOW_DESTRUCTIVE=1`: a genuinely cross-crate task sets it to run the
+   workspace gate CLAUDE.md requires, and `verify-dispatch-gates.sh` sets
+   it for its own unscoped run so a verification host under the fleet root
+   still produces a gates-pass receipt.
 2. `fleet-result-merge.sh` runs `assert-struct-literals-current.sh`
    before `gh pr create`, so a shape break is a local refusal, not a CI
    cycle.
@@ -285,7 +293,9 @@ In ravel:
 1. The fleet-task-spec template's CLAIMS AUDIT gains: every number in a
    spec or an ADR band table names its source as a comment id, a report
    path, or `file:line`, and a profile-derived band cites exclusive leaf
-   shares.
+   shares. The paragraph stays advisory for specs (nothing parses a spec);
+   the check that makes the rule bite is item 2's guard on the ADR tables
+   that specs copy their numbers from.
 2. `scripts/guards/check-adr-band-sources.sh`: in every ADR, a table whose
    header names a band, bar, target or miss must carry a source token in
    each basis cell (an issue comment link, an `s3://` or `bench/` report
@@ -316,7 +326,14 @@ ravel-hardening.
 3. `EXPLAIN ANALYZE` on an operator-only diagnostics path: a
    `ravel-cli sql explain --analyze` that runs the statement in the
    embedded session against the tenant and prints the physical plan with
-   metrics, so no HTTP surface changes (store-00, after #2774).
+   metrics, so no HTTP surface changes (store-00, after #2774). `ravel-sql`
+   is a dev-dependency of `ravel-cli` today, so the subcommand lands behind
+   a new off-by-default `ravel-cli` feature `sql-explain` that makes
+   `ravel-sql` an optional dependency; the default `ravel-cli` build and
+   the workspace gate's feature unification (which rests on the
+   dev-dependency on `ravel-server` with `sql`) are unchanged, and the
+   feature is compiled by CI's `all-features` job and by a
+   `-p ravel-cli --features sql-explain` line added to the `features` lane.
 4. One `perf record` of a hot run per statement in the kit, as an opt-in
    lane (part of change 2).
 
@@ -324,9 +341,10 @@ Acceptance: both gate counter families appear on the scraped `/metrics`
 with their site labels and an artificial delay inside the gate lands in
 the handoff counter only; a stub concurrent phase writes one `calls.jsonl`
 line per call and the band evaluation reads pooled error and QPS from it;
-`ravel-cli sql explain --analyze` over an in-memory tenant prints
-`CompactSlicesExec` metrics and per-operator `elapsed_compute` while the
-HTTP endpoint still refuses `EXPLAIN`. Owners: ravel-hardening (item 1),
+`ravel-cli sql explain --analyze` over an in-memory tenant prints the
+physical plan with per-operator `elapsed_compute` and output rows for a
+grouped aggregate (and the slice-compaction node's own metrics once #2774
+is on main) while the HTTP endpoint still refuses `EXPLAIN`. Owners: ravel-hardening (item 1),
 ravel-perf (items 2 and 4), store-00 (item 3).
 
 ## Rejected alternatives
