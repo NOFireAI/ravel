@@ -126,6 +126,10 @@ run_gate() {
 
 if [[ ${with_gates} -eq 1 ]]; then
   gates_sh="${GATES_SH:-${worktree_dir}/scripts/gates.sh}"
+  # This run is the unscoped workspace gate by design, on whatever host
+  # verifies the branch; gates.sh refuses an unscoped run under the fleet
+  # work root unless told it is deliberate (ADR-2867 change 5).
+  export RAVEL_GATES_ALLOW_UNSCOPED=1
   run_gate "${gates_sh}"
 
   tree_hash="$(git -C "${worktree_dir}" rev-parse 'HEAD^{tree}')"

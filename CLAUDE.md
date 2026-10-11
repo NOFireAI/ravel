@@ -231,7 +231,11 @@ connection, a pushed-but-broken main).
   This is the executor's gate in fleet specs. A scoped run writes no
   gates-pass receipt. `--dry-run` prints the closure and every cargo
   command the same arguments would run, then exits 0 without building;
-  `scripts/gates.test.sh` pins that selection.
+  `scripts/gates.test.sh` pins that selection. In a dispatched fleet clone (a checkout under
+  the fleet work root) an unscoped run is refused with exit 64: the
+  executor's gate is the scoped form, and `RAVEL_GATES_ALLOW_UNSCOPED=1` is
+  the escape hatch for a deliberate workspace gate, which
+  `verify-dispatch-gates.sh` sets for its own run.
 - `scripts/disk-reap.sh [-y]`: reclaims disk from merged clean worktrees
   and orphaned cargo target dirs (dry run by default; `-y` applies). Run
   it when free space drops below ~20 GB, and after a land worktree's PR

@@ -123,6 +123,24 @@ check_eq "gates -p ravel-query: scoped clippy names ravel-server" "1" \
   "$(count_matching "${out}" '^==> cargo clippy --locked (-p [a-z-]+ )*-p ravel-server (-p [a-z-]+ )*--all-targets')"
 check_eq "gates -p ravel-query: builds nothing" "0" "$(builds "${tmp}/query.calls")"
 
+# Unscoped under the fleet work root: refused with exit 64 naming the hatch,
+# and allowed with RAVEL_GATES_ALLOW_UNSCOPED=1. The scripts are copied into
+# a fleet-shaped path, since gates.sh judges its own checkout.
+fleet_root="${tmp}/var/lib/fleet/work/task-1"
+mkdir -p "${fleet_root}/scripts"
+cp "${SCRIPTS}/gates.sh" "${SCRIPTS}/affected-tests.sh" "${fleet_root}/scripts/"
+run_stubbed fleet_unscoped bash "${fleet_root}/scripts/gates.sh" --dry-run
+check_eq "gates unscoped in a fleet clone: exit 64" "64" "${rc}"
+check_eq "gates unscoped in a fleet clone: names the hatch" "1" \
+  "$(count_matching "${tmp}/fleet_unscoped.out" 'RAVEL_GATES_ALLOW_UNSCOPED=1')"
+check_eq "gates unscoped in a fleet clone: builds nothing" "0" "$(builds "${tmp}/fleet_unscoped.calls")"
+RAVEL_GATES_ALLOW_UNSCOPED=1 run_stubbed fleet_hatch bash "${fleet_root}/scripts/gates.sh" --dry-run
+check_eq "gates unscoped in a fleet clone with the hatch: exit 0" "0" "${rc}"
+check_eq "gates unscoped with the hatch: dry run reached" "1" \
+  "$(count_matching "${tmp}/fleet_hatch.out" '^gates.sh: dry run')"
+run_stubbed fleet_scoped bash "${fleet_root}/scripts/gates.sh" -p ravel-query --dry-run
+check_eq "gates -p in a fleet clone: exit 0" "0" "${rc}"
+
 # -p ravel-logseg: ravel-ingest depends on it, so it is in the closure.
 run_stubbed logseg bash "${SCRIPTS}/gates.sh" -p ravel-logseg --dry-run
 out="${tmp}/logseg.out"

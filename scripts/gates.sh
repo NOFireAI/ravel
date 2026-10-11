@@ -17,6 +17,16 @@
 #                                     # anything (scoped mode still reads
 #                                     # `cargo metadata --no-deps` for the
 #                                     # closure)
+#
+# In a dispatched fleet clone (a checkout under the fleet work root:
+# /fleet/work/ or /var/lib/fleet) an unscoped run is refused with exit 64
+# (ADR-2867 change 5): the executor's gate is the scoped form, and the
+# PreToolUse hook covers the hand-typed workspace clippy while this covers
+# the script's own. RAVEL_GATES_ALLOW_UNSCOPED=1 is the escape hatch for a
+# genuinely cross-crate task; verify-dispatch-gates.sh sets it for its own
+# unscoped run so a verification host under that root still produces a
+# gates-pass receipt.
+#
 #   scripts/gates.sh --flag-doc-guard-only [FILE]
 #                                     # run only the ingest-memory flag-doc
 #                                     # overclaim guard, against FILE or the
@@ -57,6 +67,20 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Unscoped in a fleet clone: see the header. Judged on the script's own
+# checkout, not the caller's cwd, since the gate runs on the tree it lives in.
+if [[ ${#crate_args[@]} -eq 0 && ${flag_doc_guard_only} -eq 0 ]]; then
+  gates_repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
+  case "${gates_repo_root}" in
+    */fleet/work/*|*/var/lib/fleet*)
+      if [[ "${RAVEL_GATES_ALLOW_UNSCOPED:-0}" != "1" ]]; then
+        echo "gates.sh: an unscoped run in a dispatched fleet clone (${gates_repo_root}) is not the executor's gate: run scripts/gates.sh -p <crate> [-p <crate2>], or set RAVEL_GATES_ALLOW_UNSCOPED=1 for a deliberate workspace gate" >&2
+        exit 64
+      fi
+      ;;
+  esac
+fi
 
 # Ingest-memory flag-doc overclaim guard (issue #1297). The two ingest memory
 # flags (--max-inflight-ingest-requests, --max-ingest-buffer-bytes) once
