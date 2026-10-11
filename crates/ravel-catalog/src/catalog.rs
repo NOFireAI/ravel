@@ -12844,7 +12844,7 @@ mod tests {
         assert_eq!(budget.reserved(), cached_len);
 
         // Host available memory below the floor: the gate is closed.
-        budget.set_host_memory_gate(0, 1);
+        budget.set_host_memory_gate(false, 0, 1);
         const CEILING: u64 = 4_096;
         let err = catalog
             .reserve_decoded(1, CEILING)
@@ -12875,7 +12875,7 @@ mod tests {
 
         // The same charge with the gate open is an accounted refusal, and
         // that class keeps the pass and the single retry.
-        budget.set_host_memory_gate(1, 1);
+        budget.set_host_memory_gate(true, 1, 1);
         let reservation = catalog
             .reserve_decoded(1, CEILING)
             .expect("one evicted part makes room for a one-byte charge");

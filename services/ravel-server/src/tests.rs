@@ -1162,7 +1162,7 @@ async fn a_promql_fetch_over_the_process_budget_answers_422() {
 
     // Host-memory gate class: an unlimited ledger, gate closed.
     let gated = Arc::new(ravel_memory::MemoryBudget::unlimited());
-    gated.set_host_memory_gate(0, 1);
+    gated.set_host_memory_gate(false, 0, 1);
     let (state, promql, _metrics) = promql_harness(Arc::clone(&store), Arc::clone(&gated), None);
     let requested = match state
         .engine
@@ -1214,7 +1214,7 @@ async fn a_promql_fetch_over_the_process_budget_answers_422() {
     assert_eq!(gated.accounted_refusals(), 0);
 
     // The gate alone refused it: reopened, the same query answers.
-    gated.set_host_memory_gate(1, 1);
+    gated.set_host_memory_gate(true, 1, 1);
     let (status, body) = get_promql_instant(&promql, "big_gauge_422", query_time_s).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "success", "{body}");
@@ -1296,7 +1296,7 @@ async fn a_promql_catalog_decode_refusal_answers_422() {
     // Host-memory gate class: an unlimited ledger, gate closed, no eviction
     // pass.
     let gated = Arc::new(ravel_memory::MemoryBudget::unlimited());
-    gated.set_host_memory_gate(0, 1);
+    gated.set_host_memory_gate(false, 0, 1);
     let catalog = Arc::new(
         Catalog::new(Arc::clone(&store), CatalogConfig::default())
             .expect("catalog")
@@ -1359,7 +1359,7 @@ async fn a_promql_catalog_decode_refusal_answers_422() {
 
     // The gate alone refused it: reopened, the same query answers from the
     // folded part.
-    gated.set_host_memory_gate(1, 1);
+    gated.set_host_memory_gate(true, 1, 1);
     let (status, body) = get_promql_instant(&promql, "folded_gauge_422", query_time_s).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "success", "{body}");
