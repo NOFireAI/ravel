@@ -586,6 +586,11 @@ pub async fn compact_to(
             out,
             "outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)"
         )?,
+        CompactionOutcome::HeldOutOfWindow { version } => writeln!(
+            out,
+            "outcome: HeldOutOfWindow (an input is format version {version}, outside \
+             this build's reader window; held until a build that reads it runs)"
+        )?,
         CompactionOutcome::Compacted { parts, publish } => {
             let verb = if dry_run { "would write" } else { "wrote" };
             writeln!(out, "outcome: Compacted")?;
@@ -676,6 +681,10 @@ pub struct CompactTenantReport {
     /// object gone), so the run stopped and published nothing. Not counted in
     /// `compacted`.
     pub claim_cancelled: usize,
+    /// Buckets held because an input's format version is outside this build's
+    /// reader window and its bytes match its content hash (ADR-2708 D5b). Not
+    /// compacted; a later run compacts them once this build can read them.
+    pub held_out_of_window: usize,
     /// L1 parts written across every compacted bucket (would-be writes under
     /// `--dry-run`).
     pub parts_written: usize,
@@ -1084,12 +1093,13 @@ pub async fn compact_tenant_to(
     writeln!(out, "tombstoned: {}", report.tombstoned)?;
     writeln!(out, "claim_skipped: {}", report.claim_skipped)?;
     writeln!(out, "claim_cancelled: {}", report.claim_cancelled)?;
+    writeln!(out, "held_out_of_window: {}", report.held_out_of_window)?;
     writeln!(out, "parts ({verb}): {}", report.parts_written)?;
     writeln!(out, "wall_time_ms: {}", started.elapsed().as_millis())?;
     // Buckets that reported any non-error outcome (compacted, already,
     // rewrite-present, not-sealed, below-min, tombstoned, claim-skipped,
-    // claim-cancelled). `failed` is the count of buckets whose compaction
-    // returned a typed error.
+    // claim-cancelled, held-out-of-window). `failed` is the count of buckets
+    // whose compaction returned a typed error.
     let succeeded = report.compacted
         + report.already
         + report.rewrite_present
@@ -1097,7 +1107,8 @@ pub async fn compact_tenant_to(
         + report.below_min
         + report.tombstoned
         + report.claim_skipped
-        + report.claim_cancelled;
+        + report.claim_cancelled
+        + report.held_out_of_window;
     writeln!(out, "failed: {failed}")?;
     writeln!(out, "bucket_concurrency: {bucket_concurrency}")?;
     // The counters above are printed first even on the refusal path: an
@@ -1219,6 +1230,13 @@ fn emit_bucket_outcome(
         Ok(CompactionOutcome::RewritePresent) => {
             report.rewrite_present += 1;
             writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
+        }
+        Ok(CompactionOutcome::HeldOutOfWindow { version }) => {
+            report.held_out_of_window += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=HeldOutOfWindow version={version}"
+            )?;
         }
         Ok(CompactionOutcome::BelowMinInputs { count }) => {
             report.below_min += 1;

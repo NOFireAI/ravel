@@ -4148,6 +4148,9 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::retention::held_by_lease_buckets_total`], read at
     /// scrape time. Not signal-scoped: ravel-maintain keeps one total.
     pub retention_held_by_lease_buckets: u64,
+    /// [`ravel_maintain::buckets_held_out_of_window_total`], read at scrape
+    /// time. Not signal-scoped: ravel-maintain keeps one total.
+    pub compaction_held_out_of_window_buckets: u64,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -4185,6 +4188,8 @@ impl MaintenanceSafetySnapshot {
             retention_held_out_of_window_objects:
                 ravel_maintain::retention::held_out_of_window_objects_total(),
             retention_held_by_lease_buckets: ravel_maintain::retention::held_by_lease_buckets_total(
+            ),
+            compaction_held_out_of_window_buckets: ravel_maintain::buckets_held_out_of_window_total(
             ),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
@@ -4322,6 +4327,23 @@ fn render_maintain_safety_family(
         "ravel_maintain_retention_held_by_lease_buckets_total",
         &[Label::Mode(mode)],
         snapshot.retention_held_by_lease_buckets,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_buckets_held_out_of_window_total",
+        "Buckets compaction left uncompacted because an input object's format version is outside \
+         this build's reader window and its bytes match its commit record's content hash, \
+         counted once per bucket per pass, summed over every signal since process start \
+         (ADR-2708 D5b). Later hours still compact and the bucket is retried every pass. A \
+         rising total means an upgrade is unfinished: finish it or roll back.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_buckets_held_out_of_window_total",
+        &[Label::Mode(mode)],
+        snapshot.compaction_held_out_of_window_buckets,
     );
 
     write_header(
@@ -12120,6 +12142,7 @@ mod tests {
             erasure_unwritable_objects: Vec::new(),
             retention_held_out_of_window_objects: 15,
             retention_held_by_lease_buckets: 16,
+            compaction_held_out_of_window_buckets: 31,
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -12222,6 +12245,12 @@ mod tests {
                 "ravel_maintain_retention_held_by_lease_buckets_total{mode=\"maintain\"} 16\n"
             ),
             "missing retention_held_by_lease_buckets sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_buckets_held_out_of_window_total{mode=\"maintain\"} 31\n"
+            ),
+            "missing compaction_held_out_of_window_buckets sample:\n{body}"
         );
         assert!(
             body.contains(
@@ -13563,6 +13592,7 @@ mod tests {
             )],
             retention_held_out_of_window_objects: 1,
             retention_held_by_lease_buckets: 1,
+            compaction_held_out_of_window_buckets: 1,
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
