@@ -18379,9 +18379,8 @@ mod tests {
             ("warn", FormatWindowCheck::Warn),
             ("refuse", FormatWindowCheck::Refuse),
         ] {
-            let cli =
-                Cli::parse_validated_from(["ravel-server", "--format-window-check", value])
-                    .expect("a known value validates");
+            let cli = Cli::parse_validated_from(["ravel-server", "--format-window-check", value])
+                .expect("a known value validates");
             assert_eq!(cli.format_window_check, expected, "{value}");
         }
         let err = Cli::parse_validated_from(["ravel-server", "--format-window-check", "ignore"])

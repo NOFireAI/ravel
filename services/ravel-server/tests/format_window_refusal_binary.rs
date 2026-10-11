@@ -77,9 +77,10 @@ async fn seeded_bucket() -> (String, Arc<fake_s3::FakeS3>) {
     let mut argv = vec!["ravel-server".to_string()];
     argv.extend(s3_args(&endpoint));
     let cli = Cli::try_parse_from(argv).expect("flags parse");
-    let store = ravel_server::store::build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
-        .expect("build the S3 store")
-        .foreground;
+    let store =
+        ravel_server::store::build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("build the S3 store")
+            .foreground;
 
     let record = QualificationRecord {
         suite_version: CONFORMANCE_SUITE_VERSION,
@@ -143,11 +144,7 @@ async fn seeded_bucket() -> (String, Arc<fake_s3::FakeS3>) {
     put(store.as_ref(), &part_key, part).await;
     put(
         store.as_ref(),
-        &format!(
-            "t/{}/catalog/{}/HEAD",
-            tenant.to_hex(),
-            signal.key_prefix()
-        ),
+        &format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix()),
         encode_head(&head).expect("encode head"),
     )
     .await;

@@ -469,7 +469,13 @@ mod tests {
         let store = MemoryStore::new();
         let t = tenant("acme");
         for signal in CHECKED_SIGNALS {
-            seed(&store, &t, signal, &[&[current(signal)], &[current(signal)]]).await;
+            seed(
+                &store,
+                &t,
+                signal,
+                &[&[current(signal)], &[current(signal)]],
+            )
+            .await;
         }
         let report = check(&store, &[t, tenant("never-folded")]).await;
         assert!(report.is_clean(), "{report:?}");
@@ -544,13 +550,59 @@ mod tests {
         assert!(err.to_string().contains("signal spans"), "{err}");
     }
 
+    /// A corrupt HEAD, and a part whose bytes do not match the blake3 its HEAD
+    /// names, are both a check that could not run.
+    #[tokio::test]
+    async fn a_corrupt_catalog_is_not_reported_as_clean() {
+        let store = MemoryStore::new();
+        let t = tenant("acme");
+        store
+            .put(
+                &crate::fold::head_key(&t, Signal::Metrics),
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+        seed(&store, &t, Signal::Logs, &[&[current(Signal::Logs)]]).await;
+        let head = decode_head(
+            &store
+                .get(&crate::fold::head_key(&t, Signal::Logs), GetRange::Full)
+                .await
+                .expect("get head")
+                .data,
+        )
+        .expect("decode head");
+        store
+            .put(
+                &head.parts[0].key,
+                Bytes::from_static(b"replaced part"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite part");
+
+        let report = check(&store, &[t]).await;
+        let signals: Vec<Signal> = report.unchecked.iter().map(|u| u.signal).collect();
+        assert_eq!(signals, vec![Signal::Metrics, Signal::Logs]);
+        assert!(report.unchecked[0].reason.contains("corrupt"), "{report:?}");
+        assert!(report.unchecked[1].reason.contains("blake3"), "{report:?}");
+        assert!(enforce(FormatWindowCheck::Refuse, &report).is_err());
+    }
+
     #[test]
     fn the_window_comes_from_the_reader_constants() {
         for signal in CHECKED_SIGNALS {
             assert!(in_reader_window(signal, current(signal)), "{signal:?}");
-            assert!(!in_reader_window(signal, below_window(signal)), "{signal:?}");
+            assert!(
+                !in_reader_window(signal, below_window(signal)),
+                "{signal:?}"
+            );
             assert!(!in_reader_window(signal, current(signal) + 1), "{signal:?}");
-            assert!(!in_reader_window(signal, u32::from(u16::MAX) + 1), "{signal:?}");
+            assert!(
+                !in_reader_window(signal, u32::from(u16::MAX) + 1),
+                "{signal:?}"
+            );
         }
     }
 }
