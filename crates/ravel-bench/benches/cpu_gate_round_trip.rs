@@ -8,6 +8,9 @@
 //! (handoff in), and from the job's last instruction to the await returning
 //! (handoff out). It also times, alone, the drop of whatever value a job
 //! builds, since a free after `gate.run` returns is seen by no gate counter.
+//! Latency, handoff and page read percentiles come from a log-bucketed
+//! histogram (relative error under 1.6 percent); drop percentiles from exact
+//! samples, at most 16384 per caller.
 //!
 //! A configuration is one group of variants at one caller count. Every
 //! variant of a configuration runs once per run, in an order shuffled per run
@@ -299,6 +302,55 @@ impl Histogram {
     }
 }
 
+/// Drop times kept exactly: a structured value's drop runs to tens of
+/// milliseconds, where a [`Histogram`] bucket is wider than the verdict band.
+/// Memory is bounded by keeping at most [`RESERVOIR_CAP`] samples per caller
+/// (reservoir sampling, Algorithm R, seeded per caller).
+struct Reservoir {
+    kept: Vec<Duration>,
+    total: u64,
+    rng: OrderRng,
+}
+
+const RESERVOIR_CAP: usize = 16 * 1024;
+
+impl Reservoir {
+    fn new(seed: u64) -> Self {
+        Reservoir {
+            kept: Vec::new(),
+            total: 0,
+            rng: OrderRng(seed),
+        }
+    }
+
+    fn record(&mut self, d: Duration) {
+        self.total += 1;
+        if self.kept.len() < RESERVOIR_CAP {
+            self.kept.push(d);
+        } else {
+            let j = (self.rng.next() % self.total) as usize;
+            if j < RESERVOIR_CAP {
+                self.kept[j] = d;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Reservoir) {
+        self.kept.extend_from_slice(&other.kept);
+        self.total += other.total;
+    }
+
+    fn percentile(&self, q: f64) -> Duration {
+        let mut sorted = self.kept.clone();
+        sorted.sort_unstable();
+        if sorted.is_empty() {
+            return Duration::ZERO;
+        }
+        let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+        sorted[rank - 1]
+    }
+}
+
 /// The payload values a job can return.
 enum Value {
     Word(u64),
@@ -463,19 +515,19 @@ struct CallerStats {
     latency: Histogram,
     handoff_in: Histogram,
     handoff_out: Histogram,
-    drop: Histogram,
+    drop: Reservoir,
     page_read: Histogram,
     errors: Vec<String>,
 }
 
 impl CallerStats {
-    fn new() -> Self {
+    fn new(seed: u64) -> Self {
         CallerStats {
             jobs: 0,
             latency: Histogram::new(),
             handoff_in: Histogram::new(),
             handoff_out: Histogram::new(),
-            drop: Histogram::new(),
+            drop: Reservoir::new(seed),
             page_read: Histogram::new(),
             errors: Vec::new(),
         }
@@ -506,6 +558,7 @@ fn consume(value: Value, stats: &mut CallerStats) {
 }
 
 async fn caller(
+    index: usize,
     variant: Variant,
     gate: Arc<ReadGate>,
     spin_iterations: u64,
@@ -513,7 +566,7 @@ async fn caller(
     deadline: Arc<OnceLock<Instant>>,
     run_for: Duration,
 ) -> CallerStats {
-    let mut stats = CallerStats::new();
+    let mut stats = CallerStats::new(ORDER_SEED ^ index as u64);
     let size = JobSize::Bytes(BUFFER_BYTES as u64);
     // Every caller is running before the shared deadline is set.
     start.wait().await;
@@ -569,7 +622,7 @@ struct VariantRun {
     latency: Histogram,
     handoff_in: Histogram,
     handoff_out: Histogram,
-    drop: Histogram,
+    drop: Reservoir,
     page_read: Histogram,
     gate: GateDelta,
     errors: Vec<String>,
@@ -604,8 +657,9 @@ fn one_variant(
     let deadline = Arc::new(OnceLock::new());
     let stats: Vec<CallerStats> = rt.block_on(async {
         let handles: Vec<_> = (0..callers)
-            .map(|_| {
+            .map(|index| {
                 tokio::spawn(caller(
+                    index,
                     variant,
                     Arc::clone(gate),
                     spin_iterations,
@@ -628,7 +682,7 @@ fn one_variant(
         latency: Histogram::new(),
         handoff_in: Histogram::new(),
         handoff_out: Histogram::new(),
-        drop: Histogram::new(),
+        drop: Reservoir::new(0),
         page_read: Histogram::new(),
         gate: GateDelta {
             jobs: 0,
@@ -1144,8 +1198,8 @@ fn configuration(
 /// once at 1 caller for `run_for` and checks it, then checks it again with
 /// the bench's job count one too high (gated variants, and the drop and page
 /// read counts) or one gated job added to the gate's counters (inline and
-/// bare): each wrong case must fail. Also checks the histogram's p50 against
-/// an exact one.
+/// bare): each wrong case must fail. Also checks the histogram's and the
+/// reservoir's p50 against an exact one.
 fn self_check(
     rt: &tokio::runtime::Runtime,
     gate: &Arc<ReadGate>,
@@ -1160,6 +1214,18 @@ fn self_check(
     if (p50 - 50_000.0).abs() > 50_000.0 * 0.016 {
         return Err(format!(
             "self-check histogram: p50 {p50} ns of 1..=100000 ns"
+        ));
+    }
+    let mut r = Reservoir::new(ORDER_SEED);
+    for ns in 1..=100_000u64 {
+        r.record(Duration::from_nanos(ns));
+    }
+    let p50 = r.percentile(0.50).as_nanos() as f64;
+    if r.total != 100_000 || r.kept.len() != RESERVOIR_CAP || (p50 - 50_000.0).abs() > 2_500.0 {
+        return Err(format!(
+            "self-check reservoir: total {} kept {} p50 {p50} ns of 1..=100000 ns",
+            r.total,
+            r.kept.len()
         ));
     }
     for group in Group::all() {
@@ -1277,7 +1343,8 @@ fn main() {
     println!(
         "figures: us, median [min-max] over runs of each run's percentile; jobs summed over \
          runs; X_minus_Y paired run by run, median of the per-run differences; drop times the \
-         free alone; allocations_per_value counts the Strings and Vecs one value holds"
+         free alone, percentiles from exact samples (at most {RESERVOIR_CAP} per caller); \
+         allocations_per_value counts the Strings and Vecs one value holds"
     );
     println!();
 
