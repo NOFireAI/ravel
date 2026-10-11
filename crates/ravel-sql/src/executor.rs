@@ -411,11 +411,15 @@ pub struct SqlStats {
     pub int_values_buffers: u64,
     /// Decoded blocks the successful attempt's logs scans kept whole without
     /// evaluating the pushed exact predicate, every arm proven by the block's
-    /// skip-index bounds (ADR-2773 decision D2), and the rows of the other
-    /// decoded blocks that predicate was evaluated over. Read off the scans'
-    /// `blocks_predicate_dropped` and `rows_predicate_evaluated` counters and
-    /// summed over every logs scan in the plan. Zero for a metrics query.
+    /// skip-index bounds (ADR-2773 decision D2). Read off the scans'
+    /// `blocks_predicate_dropped` counter and summed over every logs scan in
+    /// the plan. Zero for a metrics query.
     pub blocks_predicate_dropped: u64,
+    /// Rows of the successful attempt's decoded logs blocks that the pushed
+    /// exact predicate was evaluated over: every row of each decoded block not
+    /// counted in [`Self::blocks_predicate_dropped`]. Read off the scans'
+    /// `rows_predicate_evaluated` counter and summed over every logs scan in
+    /// the plan. Zero for a metrics query.
     pub rows_predicate_evaluated: u64,
     /// String dictionary values arrays the successful attempt's logs scans
     /// built for declared `Str` columns (ADR-2773 decision D3): one per row
