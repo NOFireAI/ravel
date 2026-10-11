@@ -802,8 +802,10 @@ pub fn sample_once(
         0
     };
     let closed = below_floor && *below_floor_run >= floors.close_after_samples;
-    // The gate is written before the sub-floor count moves, so a scrape
-    // that reads the count at the close threshold reads a closed gate.
+    // The gate is written before the sub-floor count moves, but the count's
+    // Relaxed fetch_add after the Release store orders nothing for a Relaxed
+    // reader: a scrape may see the count at the close threshold with the
+    // gate still open, for up to one interval.
     budget.set_host_memory_gate(!closed, available, floors.min_available);
     if below_floor {
         stats.samples_below_floor.fetch_add(1, Ordering::Relaxed);
@@ -1448,7 +1450,8 @@ mod tests {
     /// since the sample above the floor reset the run.
     ///
     /// FLIP: never reset (drop the `else` arm that writes 0 to
-    /// `below_floor_run`) and the fifth sample closes the gate.
+    /// `below_floor_run`) and the run goes 1, 2, 2, 3, so the fourth sample
+    /// closes the gate.
     #[test]
     fn a_sample_above_the_floor_resets_the_run() {
         let budget = MemoryBudget::new(u64::MAX);
@@ -1987,6 +1990,86 @@ mod tests {
             }
         );
         assert_eq!(stats.snapshot().resident_bytes, 29 * GB);
+    }
+
+    /// Issue #2838: the run and the sub-floor count follow the sample's
+    /// final reading. At a close run of 2, a first sample at 0.6 GB whose
+    /// purge reclaims nothing starts the run at 1; a second whose pre-purge
+    /// reading is 0.6 GB and whose post-purge re-read is at the floor leaves
+    /// the gate open, resets the run to 0 and leaves the count at 1.
+    ///
+    /// FLIP: decide `below_floor` on the pre-purge reading (`let
+    /// below_floor = first_reading < floors.min_available`, with
+    /// `first_reading` taken before the purge) and the second sample
+    /// closes the gate with the run at 2 and the count at 2.
+    #[test]
+    fn a_purge_that_lifts_the_reading_to_the_floor_does_not_count() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        let mut purges = 0;
+        let sample = sample_once(
+            &budget,
+            &stats,
+            floors_closing_after(2),
+            &mut clock.now(),
+            &mut last_purge,
+            &mut below_floor_run,
+            &mut || Some(600_000_000),
+            &mut || Some(29 * GB),
+            &mut || purges += 1,
+        );
+        assert_eq!(
+            sample,
+            Sample::Sampled {
+                available: 600_000_000,
+                resident: Some(29 * GB),
+                purged: true,
+                closed: false,
+            }
+        );
+        assert!(budget.gate_open());
+        assert_eq!(below_floor_run, 1);
+        assert_eq!(stats.snapshot().samples_below_floor, 1);
+
+        clock.advance(Duration::from_secs(10));
+        let mut availables = [600_000_000, FLOOR_32G].into_iter();
+        let sample = sample_once(
+            &budget,
+            &stats,
+            floors_closing_after(2),
+            &mut clock.now(),
+            &mut last_purge,
+            &mut below_floor_run,
+            &mut || availables.next(),
+            &mut || Some(25 * GB),
+            &mut || purges += 1,
+        );
+        assert_eq!(
+            sample,
+            Sample::Sampled {
+                available: FLOOR_32G,
+                resident: Some(25 * GB),
+                purged: true,
+                closed: false,
+            }
+        );
+        assert_eq!(purges, 2);
+        assert!(
+            budget.gate_open(),
+            "the post-purge re-read at the floor decides"
+        );
+        budget.try_reserve(1).expect("an open gate admits");
+        assert_eq!(budget.gate_available(), FLOOR_32G);
+        assert_eq!(below_floor_run, 0, "a re-read at the floor resets the run");
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.samples_below_floor, 1,
+            "a re-read at the floor does not count"
+        );
+        assert_eq!(snapshot.samples, 2);
     }
 
     #[test]
@@ -2629,17 +2712,9 @@ mod tests {
         }
     }
 
-    /// The stamp is one INFO line carrying every resolved field once.
-    #[test]
-    fn the_stamp_logs_every_field_once() {
-        let gate = resolve(
-            flags(),
-            Mode::Query,
-            &performance(Mode::Query, 27 * GB, host()),
-            host(),
-            true,
-        )
-        .expect("resolves");
+    /// The one `memory gate resolved` line [`MemoryGate::emit`] logs for
+    /// `gate`, captured at INFO without ANSI codes.
+    fn stamp_line(gate: &MemoryGate) -> String {
         let log = CapturedLog::default();
         let writer = log.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2656,6 +2731,21 @@ mod tests {
             .filter(|line| line.contains("memory gate resolved"))
             .collect();
         assert_eq!(lines.len(), 1, "{logged}");
+        lines[0].to_string()
+    }
+
+    /// The stamp is one INFO line carrying every resolved field once.
+    #[test]
+    fn the_stamp_logs_every_field_once() {
+        let gate = resolve(
+            flags(),
+            Mode::Query,
+            &performance(Mode::Query, 27 * GB, host()),
+            host(),
+            true,
+        )
+        .expect("resolves");
+        let line = stamp_line(&gate);
         for field in [
             "INFO",
             "enabled=true",
@@ -2670,13 +2760,113 @@ mod tests {
             "available_source=\"meminfo\"",
             "source=\"default\"",
         ] {
-            assert_eq!(
-                lines[0].matches(field).count(),
-                1,
-                "{field} in {}",
-                lines[0]
+            assert_eq!(line.matches(field).count(), 1, "{field} in {line}");
+        }
+    }
+
+    /// Issue #2838: `--memory-gate-close-after-samples 7` reaches the
+    /// resolved gate, the floors the sampler runs with, and the stamp, and a
+    /// run under those floors closes on the seventh sub-floor sample and
+    /// not the sixth.
+    ///
+    /// FLIP: carry `DEFAULT_CLOSE_AFTER_SAMPLES` instead of the flag in any
+    /// one of the three places the value passes through, the
+    /// `close_after_samples` assignment in `resolve`, the one in
+    /// `MemoryGate::floors`, or the field in `MemoryGate::emit`, and the
+    /// assertion on that place fails.
+    #[test]
+    fn a_flagged_close_after_samples_reaches_the_sampler_and_the_stamp() {
+        let cli = parse_cli(&[
+            "--mode",
+            "query",
+            "--memory-budget-bytes",
+            &(27 * GB).to_string(),
+            "--memory-gate-close-after-samples",
+            "7",
+        ])
+        .expect("flags parse");
+        assert_eq!(cli.memory_gate_close_after_samples, 7);
+        let performance = cli
+            .resolve_performance(host())
+            .expect("performance resolves");
+        let flagged = MemoryGateFlags {
+            close_after_samples: cli.memory_gate_close_after_samples,
+            ..flags()
+        };
+        let gate = resolve(flagged, cli.mode, &performance, host(), true).expect("resolves");
+        assert!(gate.enabled);
+        assert_eq!(gate.close_after_samples, 7, "resolve carries the flag");
+        let floors = gate.floors();
+        assert_eq!(floors.close_after_samples, 7, "floors() carries the flag");
+        assert_eq!(
+            floors,
+            Floors {
+                min_available: FLOOR_32G,
+                purge_available: PURGE_FLOOR_32G,
+                purge_min_interval: Duration::from_millis(DEFAULT_PURGE_MIN_INTERVAL_MS),
+                close_after_samples: 7,
+            }
+        );
+        let line = stamp_line(&gate);
+        assert_eq!(
+            line.matches("close_after_samples=7").count(),
+            1,
+            "the stamp carries the flag: {line}"
+        );
+        assert_eq!(
+            line.matches("close_after_samples=").count(),
+            1,
+            "one close_after_samples field: {line}"
+        );
+
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        for sub_floor_sample in 1..7 {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            let sample = run_sample_with(
+                floors,
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                600_000_000,
+                29 * GB,
+            );
+            assert!(
+                matches!(sample, Sample::Sampled { closed: false, .. }),
+                "sub-floor sample {sub_floor_sample} of 7: {sample:?}"
+            );
+            assert!(
+                budget.gate_open(),
+                "sub-floor sample {sub_floor_sample} of 7"
             );
         }
+        assert_eq!(
+            below_floor_run, 6,
+            "the sixth sub-floor sample leaves it open"
+        );
+        clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+        let seventh = run_sample_with(
+            floors,
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            &mut below_floor_run,
+            600_000_000,
+            29 * GB,
+        );
+        assert!(
+            matches!(seventh, Sample::Sampled { closed: true, .. }),
+            "the seventh sub-floor sample closes: {seventh:?}"
+        );
+        assert!(!budget.gate_open());
+        assert_eq!(below_floor_run, 7);
+        assert_eq!(stats.snapshot().samples_below_floor, 7);
     }
 
     /// A fixture reader: the files present and their text, nothing else.
