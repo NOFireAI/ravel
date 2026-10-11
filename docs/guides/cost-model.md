@@ -242,14 +242,16 @@ to measure against, not as a value known to be correct for your deployment.
 
 The engine configuration carries the constant when nothing resolves over it.
 `--logs-fetch-policy byte-minimal` and `latency-first` resolve to it while
-this flag is unset. On the shipped flag set it is not the value in force.
+this flag is unset. On the shipped flag set it is the value in force against a
+loopback `--s3-endpoint`, where `--logs-fetch-policy` defaults to
+`latency-first`, and not against a remote one.
 
 ### The derived value
 
-**The value the shipped flag set resolves to** is derived, not that constant,
-on every deployment, loopback `--s3-endpoint` or not. `--logs-fetch-policy`
-defaults to `cost-based`. `cost-based` computes the rate from the active store
-cost profile and does not fall back to the constant. The profile is
+**The value the shipped flag set resolves to against a remote store** is
+derived, not that constant. There `--logs-fetch-policy` defaults to
+`cost-based`, which computes the rate from the active store cost profile and
+does not fall back to the constant. The profile is
 `--store-cost-profile`, which defaults to the reference `s3-intra-region-2026`
 profile. The derivation takes the larger of a price term and a time term:
 
@@ -372,7 +374,7 @@ value, except where the resolution also hands it a projection break-even:
 
 | Case | The second and third decisions follow |
 |---|---|
-| `cost-based` derives a finite rate from the profile (the shipped flag set) | The projection break-even, which replaces the threshold in both decisions. It is the larger of the routing threshold and three request costs, so the decisions follow the derived rate (18,900,000 bytes at the reference profile). |
+| `cost-based` derives a finite rate from the profile (the shipped flag set on a remote store) | The projection break-even, which replaces the threshold in both decisions. It is the larger of the routing threshold and three request costs, so the decisions follow the derived rate (18,900,000 bytes at the reference profile). |
 | `byte-minimal` or `latency-first`, or this flag set explicitly | The routing threshold. A higher value here without a higher `--logs-block-range-threshold` moves the coalescing gap and leaves the other two where the threshold puts them. |
 | A saturated rate | Whole-object reads. A saturated rate saturates the routing threshold too. |
 
@@ -490,8 +492,10 @@ inside `--logs-block-range-threshold`, which selects which fetcher entry point
 an object takes before this value governs how that fetch behaves. That
 threshold is itself a resolved value, not whatever was passed: a saturated
 request cost overrides it. On the shipped flag set the rate is finite, so the
-threshold keeps its 512 KiB default. Above it, the projection break-even
-decides whether the read is ranged or whole.
+threshold keeps its 512 KiB default. Above it, on a remote store, the
+projection break-even decides whether the read is ranged or whole; on a
+loopback store, where `latency-first` is the default, the routing threshold
+does.
 
 To see which way your queries route, read the `fast_path_whole_object_segments`
 and `fast_path_ranged_segments` plan metrics of the logs scan from an
