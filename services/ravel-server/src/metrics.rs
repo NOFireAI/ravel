@@ -5765,10 +5765,12 @@ fn render_cache_residency_family(
     }
 }
 
-/// The ADR-2633 memory gate families. The two gauges are the budget's own
-/// gate figures, which only the sampler writes, so both read 0 when the gate
-/// is off. The `admission` and `grow` refusal sites render 0: their checks
-/// are ADR-2633 task 3.
+/// The ADR-2633 memory gate families, as amended for issue #2806. The
+/// available reading and the close floor are the budget's own gate figures,
+/// the resident reading and the purge floor the sampler's; only the sampler
+/// writes any of them, so all four read 0 when the gate is off. The
+/// `admission` and `grow` refusal sites render 0: their checks are ADR-2633
+/// task 3.
 fn render_memory_gate_family(
     out: &mut String,
     mode: Mode,
@@ -5777,30 +5779,49 @@ fn render_memory_gate_family(
 ) {
     let nanos_to_seconds = |nanos: u64| nanos as f64 / 1_000_000_000.0;
     let labels = [Label::Mode(mode)];
-    let scalars: [(&str, &str, &str, u64); 4] = [
+    let scalars: [(&str, &str, &str, u64); 6] = [
+        (
+            "ravel_memory_gate_available_bytes",
+            "Host available memory (MemAvailable, or the cgroup memory limit minus its usage) as \
+             the memory gate sampler last read it, after the forced purge when one ran; 0 when \
+             the gate is off or before its first sample.",
+            "gauge",
+            budget.gate_available(),
+        ),
+        (
+            "ravel_memory_gate_available_floor_bytes",
+            "The memory gate's close floor (--memory-gate-min-available-bytes): the gate is closed \
+             while the available reading is below it; 0 when the gate is off or before its first \
+             sample.",
+            "gauge",
+            budget.gate_floor(),
+        ),
+        (
+            "ravel_memory_gate_purge_floor_bytes",
+            "The memory gate's purge floor (--memory-gate-purge-available-bytes): a forced purge \
+             runs while the available reading is below it, spaced by \
+             --memory-gate-purge-min-interval-ms; 0 when the gate is off.",
+            "gauge",
+            stats.purge_floor_bytes,
+        ),
         (
             "ravel_memory_gate_resident_bytes",
             "jemalloc stats.resident as the memory gate sampler last read it, after the forced purge \
-             when one ran; 0 when the gate is off or before its first sample.",
+             when one ran; 0 when the gate is off or before its first reading.",
             "gauge",
-            budget.gate_resident(),
-        ),
-        (
-            "ravel_memory_gate_high_water_bytes",
-            "The memory gate's high-water mark (--memory-gate-high-water-percent of the memory \
-             budget); 0 when the gate is off or before its first sample.",
-            "gauge",
-            budget.gate_high_water(),
+            stats.resident_bytes,
         ),
         (
             "ravel_memory_gate_purges_total",
-            "Forced jemalloc purges the memory gate sampler ran, one per sample at or above the mark.",
+            "Forced jemalloc purges the memory gate sampler ran, at most one per \
+             --memory-gate-purge-min-interval-ms while the available reading is below the purge \
+             floor.",
             "counter",
             stats.purges,
         ),
         (
             "ravel_memory_gate_samples_total",
-            "Memory gate samples that read stats.resident.",
+            "Memory gate samples that read host available memory.",
             "counter",
             stats.samples,
         ),
@@ -5813,8 +5834,9 @@ fn render_memory_gate_family(
     write_header(
         out,
         "ravel_memory_gate_epoch_refresh_seconds_total",
-        "Wall time the memory gate sampler spent refreshing the jemalloc stats epoch and reading \
-         stats.resident, the post-purge re-read included; the forced purge is not counted here.",
+        "Wall time the memory gate sampler spent reading host available memory, refreshing the \
+         jemalloc stats epoch and reading stats.resident, the post-purge re-read included; the \
+         forced purge is not counted here.",
         "counter",
     );
     write_sample_f64(
@@ -5871,7 +5893,8 @@ fn render_memory_gate_family(
     let refusals = [
         (
             "ravel_memory_gate_refusals_total",
-            "Memory reservations refused because the resident memory gate was closed, by check site.",
+            "Memory reservations refused because the memory gate was closed on host available \
+             memory, by check site.",
             gate_sites,
         ),
         (
@@ -8928,8 +8951,8 @@ mod tests {
     }
 
     /// The memory gate families carry the budget's gate figures and refusal
-    /// counters and the sampler's stats, and both gauges read 0 on a budget
-    /// whose gate was never set.
+    /// counters and the sampler's stats, and all four gauges read 0 on a
+    /// budget whose gate was never set.
     #[test]
     fn memory_gate_families_render_the_budget_and_sampler_figures() {
         let samples = |body: &str| -> Vec<String> {
@@ -8949,20 +8972,22 @@ mod tests {
         );
         assert!(off.gate_open());
         let off_samples = samples(&body);
-        assert!(
-            off_samples.contains(&"ravel_memory_gate_resident_bytes{mode=\"query\"} 0".to_string()),
-            "{body}"
-        );
-        assert!(
-            off_samples
-                .contains(&"ravel_memory_gate_high_water_bytes{mode=\"query\"} 0".to_string()),
-            "{body}"
-        );
+        for gauge in [
+            "ravel_memory_gate_available_bytes",
+            "ravel_memory_gate_available_floor_bytes",
+            "ravel_memory_gate_purge_floor_bytes",
+            "ravel_memory_gate_resident_bytes",
+        ] {
+            assert!(
+                off_samples.contains(&format!("{gauge}{{mode=\"query\"}} 0")),
+                "{body}"
+            );
+        }
 
         let budget = ravel_memory::MemoryBudget::new(1_000);
         assert!(budget.try_reserve(600).is_ok());
         assert!(budget.try_reserve(600).is_err());
-        budget.set_resident_gate(900, 800);
+        budget.set_host_memory_gate(700, 800);
         assert!(budget.try_reserve(1).is_err());
         assert!(budget.try_reserve(1).is_err());
         let mut purge_buckets = [0; crate::memory_gate::PURGE_BUCKET_COUNT];
@@ -8974,13 +8999,17 @@ mod tests {
             purges: 3,
             purge_nanos: 2_000_000,
             purge_buckets,
+            resident_bytes: 900,
+            purge_floor_bytes: 1_600,
         };
         let mut body = String::new();
         render_memory_gate_family(&mut body, Mode::Query, &budget, &stats);
 
         for (name, kind) in [
+            ("ravel_memory_gate_available_bytes", "gauge"),
+            ("ravel_memory_gate_available_floor_bytes", "gauge"),
+            ("ravel_memory_gate_purge_floor_bytes", "gauge"),
             ("ravel_memory_gate_resident_bytes", "gauge"),
-            ("ravel_memory_gate_high_water_bytes", "gauge"),
             ("ravel_memory_gate_purges_total", "counter"),
             ("ravel_memory_gate_samples_total", "counter"),
             ("ravel_memory_gate_epoch_refresh_seconds_total", "counter"),
@@ -8995,8 +9024,10 @@ mod tests {
             );
         }
         let expected = [
+            "ravel_memory_gate_available_bytes{mode=\"query\"} 700",
+            "ravel_memory_gate_available_floor_bytes{mode=\"query\"} 800",
+            "ravel_memory_gate_purge_floor_bytes{mode=\"query\"} 1600",
             "ravel_memory_gate_resident_bytes{mode=\"query\"} 900",
-            "ravel_memory_gate_high_water_bytes{mode=\"query\"} 800",
             "ravel_memory_gate_purges_total{mode=\"query\"} 3",
             "ravel_memory_gate_samples_total{mode=\"query\"} 5",
             "ravel_memory_gate_epoch_refresh_seconds_total{mode=\"query\"} 1.5",
