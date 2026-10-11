@@ -1224,10 +1224,12 @@ fn build_sql_state_inner(
         .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?
         .with_memory_budget(process_memory_budget.clone());
     // The spans fetcher (RSPAN) reads the same object store, with the default
-    // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache:
-    // `SpanSegmentFetcher::with_cache` exists, but no cache is wired to it
-    // here. Its `fetch_accounted` path is tenant-checked and accounted (ADR-0045
-    // via #1080), so a `spans` query is isolated and metered like any other.
+    // RspanConfig (ADR-0045 decision 5), and shares the process read cache
+    // below (ADR-2707 decision 10): a trace lookup's ranged reads are keyed
+    // `(tenant_hash, content_hash, offset, len)` like the logs fetcher's, so a
+    // repeated lookup is served without a GET. Its `fetch_accounted` path is
+    // tenant-checked and accounted (ADR-0045 via #1080), so a `spans` query is
+    // isolated and metered like any other.
     // ADR-1195: shares the same process-wide `GetLimiter` as the metrics and
     // logs fetchers above, not a private pool.
     let mut span_fetcher = SpanSegmentFetcher::new(store.clone())
@@ -1243,7 +1245,8 @@ fn build_sql_state_inner(
     }
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
-        logs_fetcher = logs_fetcher.with_cache(cache);
+        logs_fetcher = logs_fetcher.with_cache(cache.clone());
+        span_fetcher = span_fetcher.with_cache(cache);
     }
     // The metrics fetcher (RSEG), the logs fetcher (RLOG), and the spans
     // fetcher (RSPAN) all read the same object store; the executor uses
