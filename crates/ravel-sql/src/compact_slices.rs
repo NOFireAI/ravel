@@ -1,5 +1,5 @@
-//! Give an aggregate's output slices buffers of their own before an exchange
-//! or a sort charges them to the memory pool (issue #2720).
+//! Copy an aggregate's over-charged output slices before an exchange or a
+//! sort charges them to the memory pool (issue #2720).
 //!
 //! # The over-count
 //!
@@ -48,9 +48,10 @@
 //! buffer capacity: a round-robin `RepartitionExec`, a `SortExec` (TopK
 //! included) or a `SortPreservingMergeExec`, looking through the
 //! `ProjectionExec`, `FilterExec` and `CoalescePartitionsExec` nodes that sit
-//! between them, and above nothing else. The exec rewrites each batch so that
-//! its arrays own buffers sized to the batch: the consumer then charges the
-//! slice's own bytes.
+//! between them, and above nothing else. The exec copies each over-charged
+//! batch into new buffers that hold the bytes its rows reference, except for
+//! the columns named below that the copy keeps whole: the consumer then
+//! charges about the slice's own bytes.
 //!
 //! A batch whose charge is already within 2x of the bytes its rows reference
 //! is passed through untouched, so on an aggregate that emits one batch the
@@ -64,6 +65,9 @@
 //! has no per-value size here (anything but a fixed-width primitive,
 //! FixedSizeBinary, Utf8, Binary, their Large forms and the byte views: a
 //! Boolean, List or Map, for example) counts its values in full.
+//! Under-counting is the safe direction for memory: a measurement that
+//! returned 0 would copy every batch with a nonzero charge. Over-counting is
+//! the unsafe one: it passes an over-charged batch through.
 //! `ArrayData::get_slice_memory_size` alone would not do: it adds every
 //! child in full, because `ArrayData::slice` only slices the children of a
 //! Struct, so a sliced List column would read as unsliced. The copy is one
@@ -91,11 +95,17 @@
 //! Boolean, List or Map value type. The copy follows the nesting the measure
 //! does: a List or LargeList column rebuilds its offsets from zero over its
 //! compacted child range, and a Struct column compacts its children, so a
-//! byte-view or Dictionary child is copied the same way at any depth. `concat` through a
-//! Map or FixedSizeList copies exactly the rows of a plain child but keeps a
-//! byte-view or Dictionary child's buffers whole: `MutableArrayData` carries
-//! a view array's data buffers over as they are. Such a column stays
-//! correct and is charged above its rows; the gap is accepted.
+//! byte-view or Dictionary child is copied the same way at any depth.
+//! `concat` through a Map or FixedSizeList copies exactly the rows of a
+//! plain child but keeps a byte-view or Dictionary child's buffers whole:
+//! `MutableArrayData` carries a view array's data buffers over as they are.
+//! Such a column stays correct and is charged above its rows; the gap is
+//! accepted. The same holds for a Dictionary column copied by `concat`:
+//! correct, and charged for its whole values unless
+//! `should_merge_dictionary_values` merged them. The measurement's
+//! `_ => children_in_full` fallback over-counts a ListView, LargeListView,
+//! RunEndEncoded or Union column, so a batch carrying one tends to pass
+//! through uncopied; its values stay correct.
 
 use std::fmt;
 use std::sync::Arc;

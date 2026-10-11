@@ -1407,14 +1407,26 @@ piece (two partitions, or skewed keys), `preserve_order`, and unbounded
 input, which run without a coalescer; that gap is accepted. The exec is a
 one-child pass-through with its input's partitioning, ordering and
 distribution. Its stream measures the bytes each batch's rows reference,
-into nested columns (a List's child range, a Dictionary's keys plus its
-values once, a Struct's sliced children, a byte-view column's referenced
-data), copies each batch whose charge is more than twice that figure into
-arrays that own buffers sized to the batch (`concat` with an empty array
-for a plain column, `gc` for a byte-view column, a cast through the value
-type for a Dictionary column, offsets rebuilt over the compacted child for
-a List column), and passes every other batch through untouched, so a batch
-that already owns its buffers costs one walk over its buffers and no copy.
+into nested columns (a List's child range, a Dictionary's keys slice plus
+each distinct value its keys point at, once, a Struct's sliced children, a
+byte-view column's referenced data), copies each batch whose charge is more
+than twice that figure into new buffers that hold the bytes its rows
+reference (`concat` with an empty array for a plain column, `gc` for a
+byte-view column, a cast to the value type and back for a Dictionary
+column, offsets rebuilt over the compacted child for a List column), and
+passes every other batch through untouched, so a batch that already owns
+its buffers costs one walk over its buffers and no copy. A Dictionary whose
+value type has no per-value size in the measurement (a Boolean, List or
+Map, for example) counts its values in full. `concat` through a Map or
+FixedSizeList copies exactly the rows of a plain child but keeps a
+byte-view or Dictionary child's buffers whole; such a column stays correct
+and is charged above its rows. A Dictionary whose value type arrow's cast cannot pack (Boolean, List, Map
+and others: the cast errors), or whose values hold a null, is copied by
+`concat` instead and keeps its values whole unless
+`should_merge_dictionary_values` merges them, which it never does for a
+Boolean, List or Map value type. The measurement's fallback over-counts a
+ListView, LargeListView, RunEndEncoded or Union column, so a batch carrying
+one tends to pass through uncopied; its values stay correct.
 The cost is one copy of each aggregate output that feeds an exchange or a
 sort; `EXPLAIN` shows the operator and `EXPLAIN ANALYZE` its `copied_bytes`
 (the referenced bytes of the batches it copied), `compacted_batches` and
