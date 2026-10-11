@@ -2634,3 +2634,78 @@ fn compact_bucket_binary_refuses_zero_part_split_flags() {
         assert!(stderr.contains(message), "{flag}: {stderr}");
     }
 }
+
+/// ADR-1746 decision 4: `maintain compact-bucket` checks the bucket's recorded
+/// format floor. With the tenant's RLOG floor one above the newest version
+/// the build writes, the compaction of a sealed two-input bucket is refused
+/// before its claim and every PUT, and the command fails naming the floor.
+/// Without the policy `build_compactor_config` installs, the same run
+/// compacts the bucket.
+#[tokio::test]
+async fn compact_bucket_below_the_format_floor_is_refused_with_no_put() {
+    let mem = MemoryStore::new();
+    for seq in 1..=2u64 {
+        seed_l0(&mem, 0, HOUR_OLD, seq).await;
+    }
+    ravel_catalog::validate_or_adopt(
+        &mem,
+        &tenant_hash(),
+        Signal::Logs,
+        SHARDS,
+        1,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+    let floor = ravel_ingest::FormatFamily::Rlog.writable_version() + 1;
+    ravel_catalog::raise_format_floor(
+        &mem,
+        &tenant_hash(),
+        Signal::Logs,
+        "rlog",
+        floor,
+        ravel_catalog::FloorBasis {
+            observed_entries: 0,
+            observed_newest_created_unix_ns: 0,
+            observed_shards: SHARDS,
+        },
+        "test",
+        2,
+    )
+    .await
+    .expect("raise floor");
+    let store = Arc::new(ravel_object_store::InstrumentedStore::new(mem));
+    let before = store.metrics().snapshot().put.calls;
+
+    let mut out: Vec<u8> = Vec::new();
+    let err = compact_to(
+        &mut out,
+        store.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        0,
+        HOUR_OLD,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        FixedClock::new(now_ns()),
+        &claiming(),
+    )
+    .await
+    .expect_err("the compaction is refused below the floor");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(&format!("recorded rlog format floor is {floor}")),
+        "{message}"
+    );
+    assert_eq!(
+        store.metrics().snapshot().put.calls,
+        before,
+        "neither the claim nor a part nor a record is PUT"
+    );
+}
