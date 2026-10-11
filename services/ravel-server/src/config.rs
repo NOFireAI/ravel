@@ -2093,7 +2093,7 @@ pub struct Cli {
     #[arg(long)]
     pub disable_cache: bool,
 
-    /// Close the memory gate while the host's available memory is below this many bytes (64 MiB or more); default max(512 MiB, 2% of host memory).
+    /// Close the memory gate while the host's available memory is below this many bytes (64 MiB or more); default min(max(512 MiB, 2% of host memory), host memory / 8).
     ///
     /// Every `--memory-gate-interval-ms` the `ravel-memory-gate` sampler
     /// reads `MemAvailable` from `/proc/meminfo` and, under a finite cgroup
@@ -2103,8 +2103,13 @@ pub struct Cli {
     /// closed gate refuses memory reservations until a reading at or above
     /// it (ADR-2633 section 2, as amended for issue #2806). Host memory is
     /// `MemTotal` capped by the cgroup memory limit, the figure the
-    /// performance defaults resolve. Startup refuses a floor at or above
-    /// host memory. The gate is off in `gateway` mode, with a fallback-sized
+    /// performance defaults resolve. The default is `max(512 MiB, 2 %)` on
+    /// a host of 4 GiB or more and an eighth of host memory below that
+    /// (128 MiB on 1 GiB), so a small host starts at the defaults. The
+    /// 64 MiB minimum applies to a flagged value only: a derived floor
+    /// below it (a host under 512 MiB) is accepted. Startup refuses a
+    /// flagged floor at or above host memory; a derived floor is never
+    /// refused. The gate is off in `gateway` mode, with a fallback-sized
     /// budget, in a build whose allocator is not jemalloc, and when
     /// `MemAvailable` or `MemTotal` cannot be read. See
     /// [`crate::memory_gate`].
@@ -2115,13 +2120,18 @@ pub struct Cli {
     )]
     pub memory_gate_min_available_bytes: Option<u64>,
 
-    /// Force a jemalloc purge while the host's available memory is below this many bytes; must be above --memory-gate-min-available-bytes, default twice it.
+    /// Force a jemalloc purge while the host's available memory is below this many bytes; must be above --memory-gate-min-available-bytes, default min(twice it, host memory / 4).
     ///
     /// Below this floor the sampler returns every arena's unused dirty and
     /// muzzy pages to the operating system and re-reads before deciding the
     /// gate, so retained-but-freed memory is given back before the close
     /// floor is reached. Purges are spaced by
-    /// `--memory-gate-purge-min-interval-ms`.
+    /// `--memory-gate-purge-min-interval-ms`. The default, the smaller of
+    /// twice the close floor and a quarter of host memory, is above a
+    /// derived close floor on every host size; a close floor flagged at or
+    /// above a quarter of host memory has no derivable default, and startup
+    /// refuses until this flag is passed. A flagged value must be above the
+    /// close floor and below host memory.
     #[arg(long, value_name = "BYTES")]
     pub memory_gate_purge_available_bytes: Option<u64>,
 
