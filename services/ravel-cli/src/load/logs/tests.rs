@@ -1792,7 +1792,9 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
 /// advances, the age trigger can never fire (the shard actor's flush tick
 /// waits on that clock's own `sleep`, which only returns on an advance),
 /// and at an 8 MiB target no write in this 16-row fixture can reach the
-/// size trigger either. With no trigger reachable, the load cannot finish
+/// size trigger either. The pipeline depth is above the batch count and the
+/// decoder is held after its last batch, so neither the depth flush nor the
+/// end-of-input flush runs (issue #2753). With no trigger reachable, the load cannot finish
 /// and -- the part that would be false under the old semantics -- the
 /// store holds zero data objects while it is suspended. The store is read
 /// with the load future still alive and pinned, so no shutdown flush from
@@ -1830,11 +1832,19 @@ async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(NOW_NS);
 
+    // The decoder parks after queuing the last batch, so the loader never
+    // sees end of input and its end-of-input flush never runs.
     let queued = Arc::new(AtomicUsize::new(0));
     let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
     let on_batch_queued: BuildStartHook = Arc::new(move || {
         if queued.fetch_add(1, Ordering::SeqCst) + 1 == batches {
             let _ = gate_tx.send(());
+            let guard = release_rx
+                .lock()
+                .expect("the release channel is not poisoned");
+            let _ = guard.recv();
         }
     });
 
@@ -1847,7 +1857,8 @@ async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
         rows_per_group,
         0,
         Some(shards as usize),
-        rows_per_group,
+        // Above the batch count, so the depth flush never fires either.
+        batches + 1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
         8 * 1024 * 1024,
@@ -1883,6 +1894,7 @@ async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
         0,
         "no flush has been triggered, so nothing is durable yet: {stored:?}"
     );
+    drop(release_tx);
 }
 
 /// `--target-bytes 0` is rejected rather than silently behaving as `1`
