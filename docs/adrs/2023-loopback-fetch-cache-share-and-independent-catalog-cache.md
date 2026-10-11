@@ -63,7 +63,8 @@ the query remainder to 6.76 GB.
 
 1. **A loopback store is back on whole-object fetching by default.** With
    `--logs-fetch-policy` unset, every deployment resolves `cost-based`, as
-   ADR-1196 decided. This supersedes ADR-2014's decision. An explicit
+   ADR-1196 decided (see the ADR-2677 loopback amendment below: a loopback
+   store now resolves `latency-first`). This supersedes ADR-2014's decision. An explicit
    `--logs-fetch-policy byte-minimal` still gives the ranged plan, where its
    single-query gain is the goal, for example a tuned benchmark entry.
    The rate `cost-based` resolves on the intra-region profile and the
@@ -136,6 +137,9 @@ tried a larger cache, and the stock ClickBench entry passes no flags.
 - A single-host deployment on a loopback store reads whole objects again: its
   single-query cold time returns to the pre-ADR-2014 figure, and its
   concurrent throughput with it. The ranged plan is an explicit opt-in.
+  The ADR-2677 loopback amendment below makes the ranged `latency-first` plan
+  the loopback default again, with the GET permits derived from the memory
+  budget.
 - The larger loopback share cuts hot times, since whole objects held in a
   corpus-sized cache serve every statement that touches them. The competing
   explanation, that the host page cache already holds the corpus for the store
@@ -204,7 +208,8 @@ without giving back the hot-time gain.
 
 <!-- amendment-applies: sections="Decision" pointer="ADR-2414 amendment" -->
 
-Decision 1 keeps `cost-based` as every deployment's default. ADR-2414
+Decision 1 keeps `cost-based` as every deployment's default (every remote
+deployment's since the ADR-2677 loopback amendment below). ADR-2414
 decision A3 changes what that policy resolves to: the store cost profile
 carries a request latency and a per-connection throughput beside its
 prices, the request cost in bytes is the larger of the price-derived rate
@@ -254,4 +259,63 @@ the planned route. What moves is the band between 18,900,000 and 31,500,000
 bytes: an object there that a narrow projection skips more than 18,900,000
 bytes of reads ranged on the fast path, and the planned route probes every
 object there before the coverage crossover decides.
+
+## Amendment (2026-10-11, Refs: #2683): latency-first on a loopback store, with GET permits from the memory budget
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-2677 loopback amendment" -->
+<!-- amendment-supersedes: phrase="every deployment resolves `cost-based`" pointer="ADR-2677 loopback amendment" -->
+<!-- amendment-supersedes: phrase="every deployment's default" pointer="ADR-2677 loopback amendment" -->
+
+This is the ADR-2677 loopback amendment, ADR-2677 decision 7 applied to
+decision 1 for the loopback case only. With `--logs-fetch-policy` unset, a
+`--store s3` deployment against a loopback `--s3-endpoint` (the same
+`Cli::store_is_loopback` predicate decision 3 uses) resolves `latency-first`,
+and startup logs its source as `default-loopback`. Every other deployment
+still resolves `cost-based`, where ADR-1196 measured it, with source
+`default`. An explicit `--logs-fetch-policy` wins on every store, so the
+whole-object plan decision 1 chose stays one flag away on loopback.
+
+Decision 1 left the ranged route because it cut concurrent throughput when
+the GET concurrency was not raised with it. The same change therefore
+sizes `--store-get-concurrency` from memory instead of cores, on every
+store, remote included: the count is 60% of `memory_budget_bytes`
+(`STORE_GET_MEMORY_PERCENT`) divided by 64 MiB (`STORE_GET_PERMIT_BYTES`,
+the fetcher's default run bound `ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES`),
+rounded down and clamped to at least 8 and at most
+`LATENCY_FIRST_MEASURED_CONCURRENCY`, 256. The 60% is calibrated to reach
+256 on the reference host: 256 needs a budget of at least 28.63e9 bytes
+(28,633,115,307), and the test reference host, 30 GiB of `MemTotal` with a
+28 GiB budget, derives 256. A 14 GiB budget (16 GiB host) derives 134 and a
+6 GiB budget (8 GiB host) 57. On the 16-core reference host this moves the
+default from the core-derived 32 to 256 on a remote store as well as a
+loopback one. Startup logs it with source `budget-share` and the budget,
+share, per-permit bytes, and ceiling it used. An explicit
+`--store-get-concurrency` or `--fetch-concurrency` wins; with no known
+budget (the fallback) or in gateway mode the permits keep the core
+derivation, `max(8, 2 x cores)`.
+
+The count bounds concurrent GETs, not bytes. A fetch reserves its object's
+bytes on the process memory budget (#2086) before it acquires a permit, a
+whole-object read reserves the object's full size however it is split into
+GETs, and the reservation outlives the permit through decode. The budget
+refuses a reservation it cannot hold, and the client sees the retryable
+`upstream storage temporarily unavailable` (HTTP 503); that refusal, not the
+permit count, bounds the bytes. The 60% is not a carve either: fetch
+reservations draw on `memory_remainder_bytes`, which SQL shares. On a remote
+store the remainder after the 25% fetcher cache and 5% catalog cache is 70%
+of the budget, 21,045,339,751 bytes on the reference host; on a loopback
+store, after decision 3's 40% carve and the 5% catalog cache, it is 55%,
+16,535,624,091 bytes, less than the 17,179,869,184 bytes that 256 reservations
+of 64 MiB would take.
+
+The SQL ranged fast path's per-partition prefetch share,
+`max(2, store_get_concurrency / sql_partition_count)`, follows the permits:
+on the reference host it moves from 2 (32 / 32) to 8 (256 / 32) on both
+store kinds, so a partition can hold four times as many opens' reservations
+at once. The SQL partition count does not follow the permits and stays at
+its core derivation (ADR-1195), so the `latency-first` startup line still reports
+its concurrency precondition unmet on a stock loopback deployment until
+`--sql-partition-count` is raised. Decision 4's error-ratio bar is the bar
+ADR-2677 decision 8 measures this default against; this amendment records
+the rule, not that measurement.
 
