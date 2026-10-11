@@ -229,10 +229,15 @@ when it creates the per-call capture directory, before the task's first
 Bash call, so exporting it from inside a task changes nothing. Setting it
 on the executor image is the real fix and is tracked on #1526.
 Commit with trailer "Refs: #N".
-When the task edits anything under docs/, changelog.d/ or a `--help`
-string, add `python3 scripts/check_docs.py` and `scripts/changelog-assemble.sh
---check` to the gates; when it touches crates/ravel-server, crates/ravel-sql
-or crates/ravel-query, add the `sql` and `flight-sql` lanes from CLAUDE.md's
+When the task edits any markdown file (README.md and docs/reference/
+included) or a `--help` string, add `python3 scripts/check_docs.py` to the
+gates. When a `feat` or `fix` commit touches crates/ or services/, the
+commit needs a fragment under changelog.d/ (or a `Changelog: none`
+trailer); verify with `scripts/guards/check-changelog-touched.sh
+origin/main HEAD`, which is the check CI runs (`changelog-assemble.sh
+--check` only validates the fragments that exist and never says one is
+missing). When the task touches crates/ravel-server, crates/ravel-sql or
+crates/ravel-query, add the `sql` and `flight-sql` lanes from CLAUDE.md's
 Gates section. Each of these has failed a pull request's first CI run after
 an executor reported every gate it was given green.
 
