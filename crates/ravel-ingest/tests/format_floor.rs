@@ -2,11 +2,14 @@
 //!
 //! A tenant's provisioning record is written and its floor raised with the
 //! catalog's own functions, one above the version each pipeline writes. A
-//! flush into that bucket is refused at flush open on the record the router's
-//! generation switch cached for routing: the strict write is answered with
-//! `BelowFormatFloor`, the refusal is counted, and the store sees no PUT. The
-//! clock is injected and never advanced except where a case says so, so every
-//! flush here is a strict-arrival flush opened inside its write.
+//! write into that bucket, strict or buffered, is refused at admission on the
+//! record the router's generation switch cached for routing, before any shard
+//! buffers it: it is answered with `BelowFormatFloor`, the refusal is counted,
+//! and the store sees no PUT. Rows buffered before a refresh raised the floor
+//! are refused at flush open instead, dropped and counted. The clock is
+//! injected and never advanced except where a case says so, so every flush
+//! here is a strict-arrival flush opened inside its write or one a case drives
+//! with `flush_all`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -117,6 +120,15 @@ fn metrics_router(
     clock: &Arc<TestClock>,
     policy: FormatFloorPolicy,
 ) -> IngestRouter {
+    metrics_router_with(store, clock, policy, unlimited())
+}
+
+fn metrics_router_with(
+    store: &Arc<InstrumentedStore<MemoryStore>>,
+    clock: &Arc<TestClock>,
+    policy: FormatFloorPolicy,
+    budget: Arc<IngestByteBudget>,
+) -> IngestRouter {
     let store: Arc<dyn ObjectStoreBackend> = store.clone();
     IngestRouter::new(
         config(),
@@ -125,8 +137,48 @@ fn metrics_router(
         clock.clone(),
         Arc::new(PendingAckBudget::new(0)),
     )
-    .with_budget(unlimited())
+    .with_budget(budget)
     .with_format_floor_policy(policy)
+}
+
+fn log_router(
+    store: &Arc<InstrumentedStore<MemoryStore>>,
+    clock: &Arc<TestClock>,
+    policy: FormatFloorPolicy,
+    budget: Arc<IngestByteBudget>,
+) -> LogIngestRouter {
+    let store: Arc<dyn ObjectStoreBackend> = store.clone();
+    LogIngestRouter::new(
+        config(),
+        store,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(budget)
+    .with_format_floor_policy(policy)
+}
+
+fn span_router(
+    store: &Arc<InstrumentedStore<MemoryStore>>,
+    clock: &Arc<TestClock>,
+    policy: FormatFloorPolicy,
+    budget: Arc<IngestByteBudget>,
+) -> SpanIngestRouter {
+    let store: Arc<dyn ObjectStoreBackend> = store.clone();
+    SpanIngestRouter::new(
+        config(),
+        store,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(budget)
+    .with_format_floor_policy(policy)
+}
+
+/// A finite budget far above anything a case here buffers, so every charge
+/// is admitted and the gauge reads exactly what is held.
+fn bounded() -> Arc<IngestByteBudget> {
+    IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30))
 }
 
 async fn write_metric(
@@ -134,15 +186,19 @@ async fn write_metric(
     tenant: &TenantId,
     i: usize,
 ) -> Result<ravel_ingest::WriteReceipt, WriteError> {
+    write_metric_in(router, tenant, i, WriteMode::StrictArrival).await
+}
+
+async fn write_metric_in(
+    router: &IngestRouter,
+    tenant: &TenantId,
+    i: usize,
+    mode: WriteMode,
+) -> Result<ravel_ingest::WriteReceipt, WriteError> {
     let host = format!("h{i}");
     let point = make_point(tenant, "cpu_usage", &[("host", &host)], 1_000, 1.0);
     router
-        .write(
-            tenant.clone(),
-            vec![point],
-            WriteMode::StrictArrival,
-            ACK_DEADLINE,
-        )
+        .write(tenant.clone(), vec![point], mode, ACK_DEADLINE)
         .await
 }
 
@@ -189,11 +245,10 @@ fn above(family: FormatFamily) -> BelowFormatFloor {
     }
 }
 
-/// A metrics flush into a bucket whose RSEG floor is one above the writer's
-/// version is refused before any PUT, and the strict write gets the typed
-/// refusal.
+/// A strict metrics write into a bucket whose RSEG floor is one above the
+/// writer's version is refused before any PUT, and gets the typed refusal.
 #[tokio::test]
-async fn a_metrics_flush_below_the_floor_is_refused_with_no_put() {
+async fn a_strict_metrics_write_below_the_floor_is_refused_with_no_put() {
     let acme = tenant("acme");
     let family = FormatFamily::Rseg;
     let store = provisioned(
@@ -216,15 +271,16 @@ async fn a_metrics_flush_below_the_floor_is_refused_with_no_put() {
         "{err:?}"
     );
     assert!(err.is_retryable());
-    assert_eq!(puts(&store), before, "a refused flush PUTs nothing");
+    assert_eq!(puts(&store), before, "a refused write PUTs nothing");
     assert_eq!(metrics.refused(family), 1);
     assert_eq!(metrics.writes_below(family), 0);
     assert_eq!(router.metrics().snapshot().flushes_by_arrival, 0);
 }
 
-/// The log pipeline refuses below its RLOG floor the same way.
+/// The log pipeline refuses below its RLOG floor the same way, with a
+/// retryable error.
 #[tokio::test]
-async fn a_log_flush_below_the_floor_is_refused_with_no_put() {
+async fn a_strict_log_write_below_the_floor_is_refused_with_no_put() {
     let acme = tenant("acme");
     let family = FormatFamily::Rlog;
     let store = provisioned(
@@ -235,15 +291,7 @@ async fn a_log_flush_below_the_floor_is_refused_with_no_put() {
     .await;
     let clock = TestClock::new(BASE_NS);
     let metrics = Arc::new(FormatFloorMetrics::default());
-    let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
-    let router = LogIngestRouter::new(
-        config(),
-        dyn_store,
-        clock.clone(),
-        Arc::new(PendingAckBudget::new(0)),
-    )
-    .with_budget(unlimited())
-    .with_format_floor_policy(refusing(&metrics));
+    let router = log_router(&store, &clock, refusing(&metrics), unlimited());
     let before = puts(&store);
 
     let err = router
@@ -260,13 +308,15 @@ async fn a_log_flush_below_the_floor_is_refused_with_no_put() {
         matches!(err, LogWriteError::BelowFormatFloor(refused) if refused == above(family)),
         "{err:?}"
     );
-    assert_eq!(puts(&store), before, "a refused flush PUTs nothing");
+    assert!(err.is_retryable(), "a floor refusal is retryable");
+    assert_eq!(puts(&store), before, "a refused write PUTs nothing");
     assert_eq!(metrics.refused(family), 1);
 }
 
-/// The span pipeline refuses below its RSPAN floor the same way.
+/// The span pipeline refuses below its RSPAN floor the same way, with a
+/// retryable error.
 #[tokio::test]
-async fn a_span_flush_below_the_floor_is_refused_with_no_put() {
+async fn a_strict_span_write_below_the_floor_is_refused_with_no_put() {
     let acme = tenant("acme");
     let family = FormatFamily::Rspan;
     let store = provisioned(
@@ -277,15 +327,7 @@ async fn a_span_flush_below_the_floor_is_refused_with_no_put() {
     .await;
     let clock = TestClock::new(BASE_NS);
     let metrics = Arc::new(FormatFloorMetrics::default());
-    let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
-    let router = SpanIngestRouter::new(
-        config(),
-        dyn_store,
-        clock.clone(),
-        Arc::new(PendingAckBudget::new(0)),
-    )
-    .with_budget(unlimited())
-    .with_format_floor_policy(refusing(&metrics));
+    let router = span_router(&store, &clock, refusing(&metrics), unlimited());
     let before = puts(&store);
 
     let err = router
@@ -302,7 +344,8 @@ async fn a_span_flush_below_the_floor_is_refused_with_no_put() {
         matches!(err, SpanWriteError::BelowFormatFloor(refused) if refused == above(family)),
         "{err:?}"
     );
-    assert_eq!(puts(&store), before, "a refused flush PUTs nothing");
+    assert!(err.is_retryable(), "a floor refusal is retryable");
+    assert_eq!(puts(&store), before, "a refused write PUTs nothing");
     assert_eq!(metrics.refused(family), 1);
 }
 
@@ -380,7 +423,7 @@ async fn the_refusal_survives_a_refresh_that_raises_the_floor_mid_run() {
         matches!(err, WriteError::BelowFormatFloor(refused) if refused == above(family)),
         "{err:?}"
     );
-    assert_eq!(puts(&store), after_cached, "the refused flush PUTs nothing");
+    assert_eq!(puts(&store), after_cached, "the refused write PUTs nothing");
     assert_eq!(metrics.refused(family), 1);
 }
 
@@ -412,4 +455,287 @@ async fn the_override_writes_below_the_floor_and_counts_it() {
     assert_eq!(puts(&store), before + 2);
     assert_eq!(metrics.writes_below(family), 1);
     assert_eq!(metrics.refused(family), 0);
+}
+
+/// A buffered metrics write into a floored bucket is refused at admission,
+/// before any shard buffers it: it gets the retryable refusal instead of the
+/// 2xx a buffered write gets at enqueue, it is counted once, and nothing is
+/// left buffered, so the byte gauge reads 0 and a later `flush_all` finds no
+/// rows to refuse or PUT.
+#[tokio::test]
+async fn a_buffered_metrics_write_below_the_floor_is_refused_and_nothing_is_buffered() {
+    let acme = tenant("acme");
+    let family = FormatFamily::Rseg;
+    let store = provisioned(
+        &acme,
+        Signal::Metrics,
+        Some((family, family.writable_version() + 1)),
+    )
+    .await;
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let budget = unlimited();
+    let router = metrics_router_with(&store, &clock, refusing(&metrics), budget.clone());
+    let before = puts(&store);
+
+    let err = write_metric_in(&router, &acme, 0, WriteMode::Buffered)
+        .await
+        .expect_err("a buffered write below the floor is refused, not acknowledged");
+
+    assert!(
+        matches!(err, WriteError::BelowFormatFloor(refused) if refused == above(family)),
+        "{err:?}"
+    );
+    assert!(err.is_retryable());
+    assert_eq!(budget.in_flight_bytes(), 0, "nothing is buffered");
+    assert_eq!(metrics.refused(family), 1);
+    router.flush_all().await;
+    assert_eq!(metrics.refused(family), 1, "no buffered rows reach a flush");
+    assert_eq!(puts(&store), before);
+}
+
+/// The log pipeline refuses a buffered write at admission the same way.
+#[tokio::test]
+async fn a_buffered_log_write_below_the_floor_is_refused_and_nothing_is_buffered() {
+    let acme = tenant("acme");
+    let family = FormatFamily::Rlog;
+    let store = provisioned(
+        &acme,
+        Signal::Logs,
+        Some((family, family.writable_version() + 1)),
+    )
+    .await;
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let budget = unlimited();
+    let router = log_router(&store, &clock, refusing(&metrics), budget.clone());
+    let before = puts(&store);
+
+    let err = router
+        .write(
+            acme.clone(),
+            vec![log_record()],
+            WriteMode::Buffered,
+            ACK_DEADLINE,
+        )
+        .await
+        .expect_err("a buffered write below the floor is refused, not acknowledged");
+
+    assert!(
+        matches!(err, LogWriteError::BelowFormatFloor(refused) if refused == above(family)),
+        "{err:?}"
+    );
+    assert_eq!(budget.in_flight_bytes(), 0, "nothing is buffered");
+    assert_eq!(metrics.refused(family), 1);
+    router.flush_all().await;
+    assert_eq!(metrics.refused(family), 1, "no buffered rows reach a flush");
+    assert_eq!(puts(&store), before);
+}
+
+/// The span pipeline refuses a buffered write at admission the same way.
+#[tokio::test]
+async fn a_buffered_span_write_below_the_floor_is_refused_and_nothing_is_buffered() {
+    let acme = tenant("acme");
+    let family = FormatFamily::Rspan;
+    let store = provisioned(
+        &acme,
+        Signal::Spans,
+        Some((family, family.writable_version() + 1)),
+    )
+    .await;
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let budget = unlimited();
+    let router = span_router(&store, &clock, refusing(&metrics), budget.clone());
+    let before = puts(&store);
+
+    let err = router
+        .write(acme.clone(), vec![span()], WriteMode::Buffered, ACK_DEADLINE)
+        .await
+        .expect_err("a buffered write below the floor is refused, not acknowledged");
+
+    assert!(
+        matches!(err, SpanWriteError::BelowFormatFloor(refused) if refused == above(family)),
+        "{err:?}"
+    );
+    assert_eq!(budget.in_flight_bytes(), 0, "nothing is buffered");
+    assert_eq!(metrics.refused(family), 1);
+    router.flush_all().await;
+    assert_eq!(metrics.refused(family), 1, "no buffered rows reach a flush");
+    assert_eq!(puts(&store), before);
+}
+
+/// Rows buffered before a refresh raised the floor are refused when their
+/// flush opens: they are dropped, counted, PUT nothing, and the flush hands
+/// its byte-budget charge back, so a finite budget's gauge returns to its
+/// pre-write value. The write that refreshed the view is itself refused at
+/// admission, so the counter reads two.
+#[tokio::test]
+async fn rows_buffered_before_the_floor_rose_are_dropped_counted_and_release_their_charge() {
+    let acme = tenant("acme");
+    let family = FormatFamily::Rseg;
+    let store = provisioned(&acme, Signal::Metrics, None).await;
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let budget = bounded();
+    let router = metrics_router_with(&store, &clock, refusing(&metrics), budget.clone());
+    let gauge_before = budget.in_flight_bytes();
+
+    write_metric_in(&router, &acme, 0, WriteMode::Buffered)
+        .await
+        .expect("no floor yet: buffered");
+    assert!(budget.in_flight_bytes() > gauge_before, "the rows are held");
+    raise_floor(
+        store.as_ref(),
+        &acme,
+        Signal::Metrics,
+        family,
+        family.writable_version() + 1,
+    )
+    .await;
+    let after_raise = puts(&store);
+
+    clock.advance_ns(PAST_REFRESH_NS);
+    let err = write_metric_in(&router, &acme, 1, WriteMode::Buffered)
+        .await
+        .expect_err("the refreshed view carries the floor");
+    assert!(
+        matches!(err, WriteError::BelowFormatFloor(refused) if refused == above(family)),
+        "{err:?}"
+    );
+    assert_eq!(metrics.refused(family), 1, "the refreshing write");
+
+    router.flush_all().await;
+
+    assert_eq!(metrics.refused(family), 2, "the buffered rows' flush");
+    assert_eq!(puts(&store), after_raise, "the refused flush PUTs nothing");
+    assert_eq!(
+        budget.in_flight_bytes(),
+        gauge_before,
+        "the refused flush released its charge"
+    );
+}
+
+/// The log pipeline's flush-open backstop drops and counts rows buffered
+/// before the floor rose, the same way.
+#[tokio::test]
+async fn log_rows_buffered_before_the_floor_rose_are_dropped_and_counted() {
+    let acme = tenant("acme");
+    let family = FormatFamily::Rlog;
+    let store = provisioned(&acme, Signal::Logs, None).await;
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let budget = bounded();
+    let router = log_router(&store, &clock, refusing(&metrics), budget.clone());
+    let write = |mode| router.write(acme.clone(), vec![log_record()], mode, ACK_DEADLINE);
+
+    write(WriteMode::Buffered).await.expect("no floor yet");
+    assert!(budget.in_flight_bytes() > 0);
+    raise_floor(
+        store.as_ref(),
+        &acme,
+        Signal::Logs,
+        family,
+        family.writable_version() + 1,
+    )
+    .await;
+    let after_raise = puts(&store);
+    clock.advance_ns(PAST_REFRESH_NS);
+    write(WriteMode::Buffered)
+        .await
+        .expect_err("the refreshed view carries the floor");
+
+    router.flush_all().await;
+
+    assert_eq!(metrics.refused(family), 2);
+    assert_eq!(puts(&store), after_raise);
+    assert_eq!(budget.in_flight_bytes(), 0);
+}
+
+/// The span pipeline's flush-open backstop drops and counts rows buffered
+/// before the floor rose, the same way.
+#[tokio::test]
+async fn span_rows_buffered_before_the_floor_rose_are_dropped_and_counted() {
+    let acme = tenant("acme");
+    let family = FormatFamily::Rspan;
+    let store = provisioned(&acme, Signal::Spans, None).await;
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let budget = bounded();
+    let router = span_router(&store, &clock, refusing(&metrics), budget.clone());
+    let write = |mode| router.write(acme.clone(), vec![span()], mode, ACK_DEADLINE);
+
+    write(WriteMode::Buffered).await.expect("no floor yet");
+    assert!(budget.in_flight_bytes() > 0);
+    raise_floor(
+        store.as_ref(),
+        &acme,
+        Signal::Spans,
+        family,
+        family.writable_version() + 1,
+    )
+    .await;
+    let after_raise = puts(&store);
+    clock.advance_ns(PAST_REFRESH_NS);
+    write(WriteMode::Buffered)
+        .await
+        .expect_err("the refreshed view carries the floor");
+
+    router.flush_all().await;
+
+    assert_eq!(metrics.refused(family), 2);
+    assert_eq!(puts(&store), after_raise);
+    assert_eq!(budget.in_flight_bytes(), 0);
+}
+
+/// A flush refused at flush open does not consume a sequence number: the
+/// shard's next successful flush, for a tenant with no floor on the same
+/// shard, carries the `writer_seq` right after the one before the refusal.
+#[tokio::test]
+async fn a_refused_flush_does_not_advance_the_shards_sequence() {
+    let acme = tenant("acme");
+    let bob = tenant("bob");
+    let family = FormatFamily::Rseg;
+    let store = provisioned(&acme, Signal::Metrics, None).await;
+    validate_or_adopt(
+        store.as_ref(),
+        &bob.hash(),
+        Signal::Metrics,
+        1,
+        BASE_NS,
+        AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision bob");
+    let clock = TestClock::new(BASE_NS);
+    let metrics = Arc::new(FormatFloorMetrics::default());
+    let router = metrics_router(&store, &clock, refusing(&metrics));
+
+    let first = write_metric(&router, &bob, 0).await.expect("bob lands");
+    write_metric_in(&router, &acme, 1, WriteMode::Buffered)
+        .await
+        .expect("no floor yet: buffered");
+    raise_floor(
+        store.as_ref(),
+        &acme,
+        Signal::Metrics,
+        family,
+        family.writable_version() + 1,
+    )
+    .await;
+    clock.advance_ns(PAST_REFRESH_NS);
+    write_metric_in(&router, &acme, 2, WriteMode::Buffered)
+        .await
+        .expect_err("the refreshed view carries the floor");
+    router.flush_all().await;
+    assert_eq!(metrics.refused(family), 2, "the flush itself was refused");
+    let second = write_metric(&router, &bob, 3).await.expect("bob lands");
+
+    assert_eq!(first.tokens.len(), 1);
+    assert_eq!(second.tokens.len(), 1);
+    assert_eq!(
+        second.tokens[0].seq,
+        first.tokens[0].seq + 1,
+        "the refused flush pinned no seq"
+    );
 }

@@ -109,11 +109,14 @@ pub enum WriteError {
     /// `RESOURCE_EXHAUSTED`.
     #[error("ingest shard flush deferral cap reached")]
     DeferralCapReached,
-    /// The flush would have published an object below the tenant's recorded
-    /// format floor for its family (ADR-1746 decision 4), so it was refused at
-    /// flush open, before any store call, and its rows were dropped. Retryable:
-    /// the refusal is a property of the writer's build, so a writer that can
-    /// write at the floor does not refuse the retry.
+    /// The write would have published an object below the tenant's recorded
+    /// format floor for its family (ADR-1746 decision 4). A write is refused at
+    /// admission, on the router's cached provisioning view and before any shard
+    /// buffers it, buffered mode included. Rows already buffered when a refresh
+    /// raised the floor are refused at flush open instead, before the flush's
+    /// PUT, and dropped; their strict waiters get this error. Retryable: the
+    /// refusal is a property of the writer's build, so a writer that can write
+    /// at the floor does not refuse the retry.
     #[error(transparent)]
     BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
     /// A multi-shard Strict write in which at least one shard failed *after*

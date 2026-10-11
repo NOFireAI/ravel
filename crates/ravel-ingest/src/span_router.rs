@@ -20,9 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
-use crate::config::IngestConfig;
+use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION};
 use crate::deferral::DeferralCapFlag;
-use crate::format_floor::FormatFloorPolicy;
+use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_view,
@@ -543,6 +543,13 @@ impl SpanIngestRouter {
         // provisioning record when the cache is older than `C` and failing
         // closed if that read cannot complete (ADR-0052 section 3).
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        // ADR-1746 decision 4, as in `IngestRouter`: refused against the RSPAN
+        // floor of the view just routed with, before any shard buffers it.
+        self.switch.admit_floor(
+            tenant.hash(),
+            FormatFamily::Rspan,
+            u32::from(SPAN_SEGMENT_FORMAT_VERSION),
+        )?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<NormalizedSpan>> = HashMap::new();
         for span in spans {
