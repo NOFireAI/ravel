@@ -40,7 +40,9 @@ pub(crate) const TRAILER_LEN: u64 = 8;
 /// the footer is read. parquet 58.4.0's writer puts about 65 bytes per
 /// column chunk in a footer without statistics and 120 to 230 with page
 /// statistics (measured on Int64 columns, whose path the footer repeats per
-/// chunk), so 64 MiB holds about 300,000 column chunks with statistics:
+/// chunk; re-measured on 59.3.0: unchanged, 64 to 66 and 124 to 127 with a
+/// 2- or 3-byte name, 225 to 236 with page statistics at a 104-byte name), so
+/// 64 MiB holds about 300,000 column chunks with statistics:
 /// 1,000 columns in 300 row groups, or 10,000 columns in 30. At a writer's
 /// default row group of a million rows, that is hundreds of millions of
 /// rows in one file before the footer nears the limit.

@@ -647,6 +647,7 @@ impl ExecutionPlan for LogsRowFetchExec {
         vec![&self.input]
     }
 
+    // Visits nothing: this node holds no physical expression it evaluates.
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
