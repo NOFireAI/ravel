@@ -69,8 +69,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::col;
@@ -351,10 +353,11 @@ impl ExecutionPlan for DistributedSliceScanExec {
         let expected = Arc::clone(&self.schema);
         let accounting = self.accounting.clone();
         let max_bytes_scanned = self.max_bytes_scanned;
+        let mut last_values = Vec::new();
         let folded = inner.map(move |item| {
             let batch = item?;
             validate_schema(batch.schema().as_ref(), expected.as_ref())?;
-            let bytes = batch.get_array_memory_size() as u64;
+            let bytes = batch_bytes_scanned(&batch, &mut last_values) as u64;
             accounting.add_s3_bytes(AccountedOp::Get, bytes);
             let scanned = accounting.snapshot().total_s3_bytes();
             if max_bytes_scanned.is_exceeded_by(scanned) {
@@ -374,6 +377,34 @@ impl ExecutionPlan for DistributedSliceScanExec {
             folded,
         )))
     }
+}
+
+/// The bytes one worker batch adds to the scanned figure: its Arrow footprint,
+/// less the values of each dictionary column whose values are the very array
+/// that column carried in the previous batch. A dictionary the worker shares
+/// across batches decodes into one values array until a different one arrives,
+/// so it counts once per arrival, not once per batch. `last` holds each
+/// column's most recent dictionary values.
+fn batch_bytes_scanned(batch: &RecordBatch, last: &mut Vec<Option<ArrayRef>>) -> usize {
+    last.resize(batch.num_columns(), None);
+    batch
+        .columns()
+        .iter()
+        .zip(last.iter_mut())
+        .map(|(column, last)| {
+            let bytes = column.get_array_memory_size();
+            let Some(dict) = column.as_any_dictionary_opt() else {
+                *last = None;
+                return bytes;
+            };
+            let values = dict.values();
+            if last.as_ref().is_some_and(|v| Arc::ptr_eq(v, values)) {
+                return bytes.saturating_sub(values.get_array_memory_size());
+            }
+            *last = Some(Arc::clone(values));
+            bytes
+        })
+        .sum()
 }
 
 /// Verify a worker's slice stream carries this scan's declared public schema
@@ -528,4 +559,54 @@ pub fn distributed_spans_plan(
         accounting,
         max_bytes_scanned,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::Int32Type;
+
+    fn batch(values: &ArrayRef, keys: &[i32], other: &[i32]) -> RecordBatch {
+        let dict = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(keys.to_vec()),
+            Arc::clone(values),
+        )
+        .expect("dictionary");
+        RecordBatch::try_from_iter([
+            ("region", Arc::new(dict) as ArrayRef),
+            ("n", Arc::new(Int32Array::from(other.to_vec())) as ArrayRef),
+        ])
+        .expect("batch")
+    }
+
+    /// A dictionary the worker shares across batches counts once, on the batch
+    /// that brought it; a batch carrying different values counts them again.
+    /// Flipped: charging `get_array_memory_size` per batch (the former fold)
+    /// counts `shared` three times where twice is expected.
+    #[test]
+    fn a_shared_worker_dictionary_counts_once_per_arrival() {
+        let shared: ArrayRef = Arc::new(StringArray::from(vec!["emea", "apac", "amer"]));
+        let other: ArrayRef = Arc::new(StringArray::from(vec!["emea", "apac", "amer"]));
+        let batches = [
+            batch(&shared, &[0, 1, 2, 0], &[1, 2, 3, 4]),
+            batch(&shared, &[2, 2], &[5, 6]),
+            batch(&other, &[1], &[7]),
+            batch(&shared, &[0], &[8]),
+        ];
+        let mut last = Vec::new();
+        let counted: Vec<usize> = batches
+            .iter()
+            .map(|b| batch_bytes_scanned(b, &mut last))
+            .collect();
+        let full: Vec<usize> = batches.iter().map(|b| b.get_array_memory_size()).collect();
+        let values = shared.get_array_memory_size();
+        assert_eq!(values, other.get_array_memory_size());
+        assert_eq!(
+            counted,
+            vec![full[0], full[1] - values, full[2], full[3]],
+            "the second batch reuses the first's values; the third and fourth each bring a different array"
+        );
+    }
 }
