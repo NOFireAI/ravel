@@ -14,6 +14,15 @@
 //! from two places: the fixture itself, and the same statement led by
 //! `observed_ts`, which every record sets equal to `ts` and which the skip
 //! does not read.
+//!
+//! How many blocks a run skips is not fixed here. The plan is a single TopK
+//! over a `CoalescePartitionsExec` over eight scan partitions, so each
+//! partition decodes on its own task and buffers into the coalesce channel
+//! while the TopK has not yet seen a row: a partition can drain its whole
+//! segment before the threshold exists, and the partitions that start later
+//! may then skip theirs whole. This test asserts what holds on every
+//! schedule; `crates/ravel-sql/tests/topk_threshold_skip_order.rs` drives the
+//! threshold in a fixed order and pins the exact skip.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -31,7 +40,7 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::http::StaticBearerTokenResolver;
@@ -75,8 +84,13 @@ fn body_of(rank: usize, m: usize) -> String {
 }
 
 /// Publish object `index` and its `Signal::Logs` commit record, as the log
-/// shard actor does.
-async fn publish_object(store: &dyn ObjectStoreBackend, tenant: &TenantId, index: usize) {
+/// shard actor does, and return each of its blocks' minimum `ts` as the
+/// written skip index records it.
+async fn publish_object(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+) -> Vec<i64> {
     let tenant_hash = tenant.hash();
     let writer_id = Uuid::from_u128(7_000 + index as u128);
     let cfg = RlogConfig {
@@ -116,6 +130,15 @@ async fn publish_object(store: &dyn ObjectStoreBackend, tenant: &TenantId, index
             .expect("push log record");
     }
     let bytes = writer.finish().expect("finish rlog object");
+    let block_mins: Vec<i64> = RlogReader::new(&bytes, &cfg)
+        .expect("read back rlog object")
+        .directories()
+        .skip_index()
+        .l0
+        .iter()
+        .map(|block| block.min_ts)
+        .collect();
+    assert_eq!(block_mins.len(), BLOCKS_PER_OBJECT, "object {index}");
     let min_event_ts_ns = ts_of(r, 0);
     let max_event_ts_ns = ts_of(r, PER_OBJECT - 1);
     let rec = record::build(NewCommitRecord {
@@ -146,6 +169,7 @@ async fn publish_object(store: &dyn ObjectStoreBackend, tenant: &TenantId, index
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish log commit");
+    block_mins
 }
 
 fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> Router {
@@ -233,8 +257,8 @@ fn pruning(value: &Value, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("no stats.pruning.{key} in {value}"))
 }
 
-/// The `k` smallest-`ts` bodies of the fixture, in `ts` order.
-fn expected(k: usize) -> Vec<String> {
+/// The fixture's rows as `(ts, body)`, in `ts` order.
+fn sorted_rows() -> Vec<(i64, String)> {
     let mut all: Vec<(i64, String)> = (0..OBJECTS)
         .flat_map(|o| {
             let r = rank(o);
@@ -242,15 +266,21 @@ fn expected(k: usize) -> Vec<String> {
         })
         .collect();
     all.sort();
-    all.into_iter().take(k).map(|(_, b)| b).collect()
+    all
+}
+
+/// The `k` smallest-`ts` bodies of the fixture, in `ts` order.
+fn expected(k: usize) -> Vec<String> {
+    sorted_rows().into_iter().take(k).map(|(_, b)| b).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_by_ts_limit_skips_and_reports_through_the_endpoint() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
+    let mut block_mins = Vec::with_capacity(OBJECTS);
     for index in 0..OBJECTS {
-        publish_object(store.as_ref(), &tenant, index).await;
+        block_mins.push(publish_object(store.as_ref(), &tenant, index).await);
     }
     let app = build_router(
         store,
@@ -277,6 +307,21 @@ async fn order_by_ts_limit_skips_and_reports_through_the_endpoint() {
         "{oracle}"
     );
 
+    // The TopK's threshold never drops below the oracle's 10th `ts`, so no
+    // block or object whose minimum is at or below it can be skipped. Those
+    // objects are always opened and those blocks always scanned.
+    let tenth_ts = sorted_rows()[9].0;
+    let must_read = block_mins
+        .iter()
+        .flatten()
+        .filter(|&&min| min <= tenth_ts)
+        .count() as u64;
+    let must_open = block_mins
+        .iter()
+        .filter(|mins| mins.iter().any(|&min| min <= tenth_ts))
+        .count() as u64;
+    assert!(must_read > 0 && must_read < TOTAL_BLOCKS as u64);
+
     for sql in [
         "SELECT ts, body FROM logs ORDER BY ts LIMIT 10",
         "SELECT ts, body FROM logs ORDER BY ts, body LIMIT 10",
@@ -287,8 +332,11 @@ async fn order_by_ts_limit_skips_and_reports_through_the_endpoint() {
         let total = pruning(&value, "blocksTotal");
         let blocks_skipped = pruning(&value, "blocksSkippedByThreshold");
         let segments_skipped = pruning(&value, "segmentsSkippedByThreshold");
-        assert!(scanned < total, "{sql}: {scanned}/{total}: {value}");
-        assert!(blocks_skipped > 0, "{sql}: {value}");
+        assert_eq!(
+            pruning(&value, "segments"),
+            OBJECTS as u64,
+            "{sql}: {value}"
+        );
         // Every opened object's blocks are either scanned or skipped, and every
         // object is either opened or skipped whole.
         assert_eq!(scanned + blocks_skipped, total, "{sql}: {value}");
@@ -296,6 +344,25 @@ async fn order_by_ts_limit_skips_and_reports_through_the_endpoint() {
             total + segments_skipped * BLOCKS_PER_OBJECT as u64,
             TOTAL_BLOCKS as u64,
             "{sql}: {value}"
+        );
+        assert!(
+            segments_skipped <= OBJECTS as u64 - must_open,
+            "{sql}: an object holding a row at or below ts {tenth_ts} was skipped: {value}"
+        );
+        if blocks_skipped > 0 {
+            // Inside the opened objects, only blocks whose minimum is above
+            // the oracle's 10th `ts` can have been skipped.
+            assert!(
+                scanned >= must_read && blocks_skipped <= total - must_read,
+                "{sql}: a block with minimum at or below ts {tenth_ts} was skipped \
+                 ({must_read} such blocks): {value}"
+            );
+        }
+        eprintln!(
+            "{sql}: pruning fired: {}; blocks scanned {scanned} of {total} opened, \
+             skipped by threshold {blocks_skipped}; objects skipped whole \
+             {segments_skipped} of {OBJECTS}",
+            blocks_skipped + segments_skipped > 0
         );
     }
 }
