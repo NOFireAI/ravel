@@ -66,9 +66,10 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::flush_share::TenantFlushShares;
+use crate::format_floor::{FormatFamily, warn_flush_refused, warn_flush_written_below};
 use crate::generation::{
-    FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck, mismatch_retry_spent,
-    reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
+    mismatch_retry_spent, reread_and_check, send_hand_back,
 };
 use crate::metrics::FlushTrigger;
 use crate::shard::{InPlaceCause, InPlaceWarnings};
@@ -1908,6 +1909,32 @@ impl SpanShardActor {
                     self.metrics.record_stale_provisioning_flush();
                 }
                 if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
+                    self.tenants.insert(tenant, buf);
+                    return;
+                }
+                buf
+            }
+        };
+        // ADR-1746 decision 4, as in the metrics shard: refused on the cached
+        // record before a `seq` is pinned or the PUT task is spawned.
+        let buf = match self.scope.floor_check(
+            tenant_hash,
+            FormatFamily::Rspan,
+            u32::from(SPAN_SEGMENT_FORMAT_VERSION),
+        ) {
+            FloorCheck::Write => buf,
+            FloorCheck::WriteBelow(below) => {
+                warn_flush_written_below(Signal::Spans, self.shard, tenant_hash, &below);
+                buf
+            }
+            FloorCheck::Refuse(refused) => {
+                warn_flush_refused(Signal::Spans, self.shard, tenant_hash, &refused);
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(SpanWriteError::BelowFormatFloor(refused)));
+                return;
+            }
+            FloorCheck::NoView => {
+                if self.keeps_unconfirmed_flush(lag_check, "no cached format floor") {
                     self.tenants.insert(tenant, buf);
                     return;
                 }

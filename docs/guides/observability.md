@@ -40,8 +40,8 @@ collisions.
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
 `tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
-`carrier`, `gate`, `site`, `worker`, `shard`, and `phase`, twenty-two in
-all. Some keys split more than one family:
+`carrier`, `gate`, `site`, `worker`, `shard`, `family`, and `phase`,
+twenty-three in all. Some keys split more than one family:
 
 | Label | What it splits |
 |---|---|
@@ -58,6 +58,7 @@ all. Some keys split more than one family:
 | `worker` | The tokio runtime's per-worker busy counter, bounded by the runtime's fixed worker count. |
 | `level` | The scrub counters by which part of the commit lineage a target came from (`l0`, `l1` or `rewrite`). |
 | `shard` | The per-shard ingest skew family only, beside `mode` and `signal` and never beside `tenant_hash`. |
+| `family` | The [format-floor families](#format-floors-ravel_format_floor_) only, by format family: `rseg`, `rlog` or `rspan`. |
 
 The allowlist is closed at compile time. A label key is a variant of a closed
 enum, so a raw string can never reach the label position. The closed set
@@ -916,6 +917,20 @@ Labels: `mode`.
 |---|---|
 | `ravel_provisioning_shard_count_mismatch_total` | Provisioning checks that failed hard: an unreadable record, a decodable record whose generation history fails structural validation, or pre-ADR data a lower `shard_count` would hide. Alert on any increase. [Troubleshooting](operations/troubleshooting.md) gives its rule. |
 | `ravel_provisioning_shard_count_drift_total` | Validations where a decodable record with a structurally valid generation history had a recorded `shard_count` that differed from the live `--shards` default (a record that fails structural validation is counted by the mismatch counter above, never here). The drift is tolerated and routing uses the record's own generation history, so this is informational: a nonzero value is expected after lowering the global default, not a fault. |
+
+### Format floors (`ravel_format_floor_*`)
+
+Labels: `mode`, `family`. Every process renders one sample per format family
+for each metric. Ingest flushes, and the compactions and erasure rewrites of
+the maintenance loop, count into these samples. The
+[maintenance guide](operations/maintenance.md#a-writer-below-a-recorded-format-floor)
+says what to do when they move.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_format_floor_above_writer` | Gauge. (tenant, signal) buckets whose recorded floor for the family is above the newest version this build writes, as found once at startup by an ingest or maintenance process. It covers only the tenants named by `--tenant-token`, `--tenant-token-file` and `--maintain-tenant`. A nonzero value means this build refuses that family's writes into those buckets. |
+| `ravel_format_floor_refused_total` | Publishes refused because the object would be written below the bucket's recorded floor for its family. An ingest flush refused this way drops its rows, and answers a strict write with a retryable error. A refused compaction or erasure rewrite builds and publishes nothing. Alert on any increase. |
+| `ravel_format_floor_writes_below_total` | Publishes written below the bucket's recorded floor under `--write-below-format-floor`. Each one contradicts the floor, and `ravel-cli maintain audit-versions` reports it `contradicted`. |
 
 ### Store reachability
 

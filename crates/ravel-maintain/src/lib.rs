@@ -47,6 +47,7 @@ pub mod config;
 pub mod discover;
 pub mod erasure_rewrite;
 pub mod error;
+mod format_floor;
 pub mod gc_config;
 pub mod legal_hold;
 pub mod memo_snapshot;

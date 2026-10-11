@@ -13,6 +13,7 @@ mod config;
 mod deferral;
 mod error;
 mod flush_share;
+mod format_floor;
 mod generation;
 mod idempotency;
 mod indexed_fields;
@@ -53,6 +54,11 @@ pub use config::{
     buffer_memory_backstop_bytes, plausible_ingest_clock,
 };
 pub use error::WriteError;
+pub use format_floor::{
+    BelowFormatFloor, FloorAboveWriter, FloorAdmission, FormatFamily, FormatFloorFamilySnapshot,
+    FormatFloorMetrics, FormatFloorPolicy, global_metrics as format_floor_metrics,
+    warn_floors_above_writer,
+};
 pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, HandBackReason, Routed};
 pub use idempotency::{
     IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, IdempotencyReceipt, LookupOutcome, MARKER_SUFFIX,

@@ -1678,6 +1678,19 @@ pub async fn migrate_family(
     budget: MigrateBudget,
     raised_by: &str,
 ) -> Result<FamilyMigrateReport> {
+    // ADR-1746 decision 4: every bucket this walk rewrites is checked against
+    // the format floor before its claim, with the refusing default when the
+    // caller installed no policy.
+    let with_floor_check;
+    let config = if config.format_floor.is_some() {
+        config
+    } else {
+        with_floor_check = CompactorConfig {
+            format_floor: Some(ravel_ingest::FormatFloorPolicy::default()),
+            ..config.clone()
+        };
+        &with_floor_check
+    };
     let now = clock.now_ns();
     let scan_shards = scan_shard_count(store, &tenant_hash, signal, configured_shards).await?;
 

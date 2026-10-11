@@ -311,6 +311,15 @@ pub enum MaintainError {
          format-floor history): {0}"
     )]
     Provisioning(String),
+    /// The run would have published an object below the bucket's recorded
+    /// format floor for its family, so it refused before building or PUTting
+    /// anything (ADR-1746 decision 4).
+    #[error(transparent)]
+    BelowFormatFloor(#[from] ravel_ingest::BelowFormatFloor),
+    /// The bucket's format floor could not be read before a run that checks
+    /// it, so the run built and published nothing.
+    #[error("format-floor read failed before a publish; nothing written: {0}")]
+    FormatFloorRead(String),
     #[error("audit batch flush failed: {0}")]
     AuditFlush(String),
     #[error(

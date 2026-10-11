@@ -42,6 +42,9 @@ proptest = { workspace = true }
 ravel-logseg = { workspace = true, features = ["test-support"] }
 # Captures the warn line compaction emits for a skipped input.
 tracing-subscriber = { workspace = true }
+# Builds the points an ingest router flushes in the format-floor acceptance
+# test (ADR-1746), whose audit half runs this crate's census.
+ravel-otlp = { workspace = true }
 
 [lints]
 workspace = true

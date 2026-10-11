@@ -969,6 +969,19 @@ pub struct Cli {
     #[arg(long = "maintain-claims", value_enum, default_value_t = MaintainClaimsArg::On)]
     pub maintain_claims: MaintainClaimsArg,
 
+    /// Write objects below a bucket's recorded format floor instead of
+    /// refusing them (ADR-1746 decision 5). Without it an ingest flush, a
+    /// compaction or an erasure rewrite that would publish an object below the
+    /// floor for its family is refused and counted under
+    /// `ravel_format_floor_refused_total`. With it the object is written, a
+    /// warning is logged per publish and counted under
+    /// `ravel_format_floor_writes_below_total`, and the floor no longer holds:
+    /// the next `ravel-cli maintain audit-versions` classifies it
+    /// `contradicted`. The floor itself is never lowered. Meant for keeping a
+    /// rolled-back binary ingesting until a roll forward and a `migrate` run.
+    #[arg(long = "write-below-format-floor")]
+    pub write_below_format_floor: bool,
+
     /// Age past which the maintenance loop deletes alert transition records,
     /// as a humantime duration (e.g. `90d`), ADR-1688 decision 5. Each alert
     /// identity's current-state record is kept whatever its age. A tenant
@@ -6867,6 +6880,10 @@ impl Cli {
             claim_lease_duration,
             claim_min_input_bytes,
             rlog_zstd_level,
+            format_floor: Some(ravel_ingest::FormatFloorPolicy::new(
+                self.write_below_format_floor,
+                ravel_ingest::format_floor_metrics(),
+            )),
             ..ravel_maintain::CompactorConfig::default()
         };
         let memory_target = self.resolve_l1_part_memory_target(
@@ -14539,6 +14556,28 @@ mod tests {
             let text = format!("{err:#}");
             assert!(text.contains("--maintain-compaction-zstd-level"), "{text}");
         }
+    }
+
+    /// `--write-below-format-floor` resolves into the format-floor policy the
+    /// compactor config carries in every mode, which is the one `start` also
+    /// hands the ingest routers: refusing without the flag, writing with it,
+    /// both counting into the process-wide counters `/metrics` renders.
+    #[test]
+    fn write_below_format_floor_resolves_into_the_one_policy() {
+        let refusing = compactor(&[])
+            .expect("default")
+            .format_floor
+            .expect("every mode installs a policy");
+        assert!(!refusing.write_below_floor());
+        assert!(std::sync::Arc::ptr_eq(
+            refusing.metrics(),
+            &ravel_ingest::format_floor_metrics()
+        ));
+        let writing = compactor(&["--write-below-format-floor"])
+            .expect("flag")
+            .format_floor
+            .expect("every mode installs a policy");
+        assert!(writing.write_below_floor());
     }
 
     /// `--maintain-claims` defaults to on and its `.mode()` maps each variant

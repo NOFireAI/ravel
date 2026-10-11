@@ -1540,6 +1540,60 @@ fleet in this order and never the reverse:
    recorded floor is at or above N+1. The floors that `migrate` raised make
    that a checkable fact. Do it in its own later reviewed change.
 
+### A writer below a recorded format floor
+
+A recorded floor says that a bucket holds no live object of its family below
+the floor's version. A writer keeps that true. It refuses to publish an object
+below the floor of the bucket it writes into. The usual cause is a
+rollback: `migrate` raised a floor to N+1, and a build that writes N is
+running again.
+
+What you see:
+
+- At startup, each ingest (`all`, `gateway`) and `maintain` process reads the
+  provisioning record of every tenant named by `--tenant-token`,
+  `--tenant-token-file` and `--maintain-tenant`, for metrics, logs and spans.
+  That is one GET per tenant and signal. It logs one warning per tenant,
+  signal and family whose floor is above the version this build writes, with
+  both numbers, and sets `ravel_format_floor_above_writer{family}` to the
+  count. The process starts either way. Queries, the fold and retention run
+  as normal, and so does the retention version hold. A tenant that is not
+  named by a flag is not checked at startup. Its writes are still checked.
+- On ingest, the check runs when a flush opens. It uses the provisioning
+  record the router already caches for routing, so it adds no store read. A
+  refused flush makes no store call, drops its rows, and answers a strict
+  write with a retryable error naming the family, the floor and the version
+  (HTTP 503). A floor raised while a writer runs takes effect once the writer
+  reads the record again. A write does that before it routes when the
+  router's copy is more than 60 seconds old.
+- In a `maintain` process, a compaction or erasure rewrite reads the bucket's
+  provisioning record before it claims the bucket or writes anything. That is
+  one GET per run. A refused run builds and publishes nothing, and the
+  maintenance loop moves on to the next bucket. An erasure request whose
+  rewrite is refused stays pending, so its deletion waits too.
+  `ravel-cli maintain migrate` checks each bucket the same way and stops at
+  the first refused one. The `ravel-cli` compaction commands do not check the
+  floor.
+- Every refusal logs a warning and counts under
+  `ravel_format_floor_refused_total{family}`.
+
+What to do. Pick one of two ways out:
+
+1. Roll forward to a build that writes at or above the floor. The floor
+   stays true, so nothing else is needed. If the rollback also wrote below
+   the floor, run `migrate` as well (see the second way).
+2. Keep writing on the rolled-back build with `--write-below-format-floor` on
+   its ingest and `maintain` processes. Each publish below the floor then
+   lands, logs a warning and counts under
+   `ravel_format_floor_writes_below_total{family}`. The floor is never
+   lowered, but it is no longer true: `audit-versions` reports it
+   `contradicted` and exits nonzero, so the old reader cannot be retired on
+   it. Once you roll forward, run `migrate` for the family. It rewrites the
+   objects below the target. A floor already at the target is not raised
+   again, so after the rewrite that floor reads `stale` rather than
+   `current`. It reads `current` again only after a later version raise
+   appends a new floor for the family.
+
 ## Legal hold
 
 ```sh

@@ -2348,6 +2348,17 @@ pub async fn start_with_heartbeat(
     // gate.
     let cpu_gates = cpu_gates::CpuGates::new(config.cpu_gate_permits);
 
+    // The one format-floor policy every writer in this process checks with
+    // (ADR-1746 decisions 4 and 5). `--write-below-format-floor` is resolved
+    // into the compactor config, which every mode builds, so ingest takes the
+    // same policy from there.
+    let format_floor_policy = config
+        .maintain
+        .compactor
+        .format_floor
+        .clone()
+        .unwrap_or_default();
+
     let ingest_router = if config.mode.holds_ingest_buffer() {
         let ingest_config = validated_ingest_config(
             IngestConfig {
@@ -2384,7 +2395,8 @@ pub async fn start_with_heartbeat(
                 Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(ingest_buffer_budget.clone())
-            .with_write_gate(cpu_gates.write.clone()),
+            .with_write_gate(cpu_gates.write.clone())
+            .with_format_floor_policy(format_floor_policy.clone()),
         ))
     } else {
         None
@@ -2467,7 +2479,8 @@ pub async fn start_with_heartbeat(
                 Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(ingest_buffer_budget.clone())
-            .with_write_gate(cpu_gates.write.clone()),
+            .with_write_gate(cpu_gates.write.clone())
+            .with_format_floor_policy(format_floor_policy.clone()),
         ))
     } else {
         None
@@ -2501,11 +2514,31 @@ pub async fn start_with_heartbeat(
                 Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(ingest_buffer_budget.clone())
-            .with_write_gate(cpu_gates.write.clone()),
+            .with_write_gate(cpu_gates.write.clone())
+            .with_format_floor_policy(format_floor_policy.clone()),
         ))
     } else {
         None
     };
+
+    // ADR-1746 decision 3: a writer role warns once per recorded format floor
+    // above what this build writes, for the statically-known tenants, and
+    // starts regardless. One provisioning-record GET per (tenant, signal).
+    let format_floor_role = match config.mode {
+        Mode::All | Mode::Gateway => Some("ingest"),
+        Mode::Maintain => Some("maintenance"),
+        Mode::Query => None,
+    };
+    if let Some(role) = format_floor_role {
+        ravel_ingest::warn_floors_above_writer(
+            store.as_ref(),
+            &config.fold_tenants,
+            role,
+            format_floor_policy.write_below_floor(),
+            format_floor_policy.metrics(),
+        )
+        .await;
+    }
 
     // Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
     // bucket. Threaded into every ingest path below so a keyed tenant's first

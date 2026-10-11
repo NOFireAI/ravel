@@ -17,9 +17,10 @@ use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
+use crate::format_floor::FormatFloorPolicy;
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    load_generations,
+    load_view,
 };
 use crate::metrics::{IngestMetrics, IngestMetricsSnapshot};
 use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
@@ -517,6 +518,16 @@ impl IngestRouter {
         self
     }
 
+    /// Sets what a flush below a tenant's recorded RSEG format floor does
+    /// (ADR-1746 decisions 4 and 5). Without it a router refuses such a flush
+    /// and counts into [`crate::format_floor_metrics`]. Reaches every actor, as
+    /// [`Self::with_write_gate`] does.
+    #[must_use]
+    pub fn with_format_floor_policy(self, policy: FormatFloorPolicy) -> Self {
+        self.switch.set_floor_policy(policy);
+        self
+    }
+
     pub fn metrics(&self) -> &IngestMetrics {
         &self.metrics
     }
@@ -559,7 +570,7 @@ impl IngestRouter {
         match self.switch.route_cached(tenant, now_ns) {
             Routed::Fresh(set) => Ok(set),
             Routed::Stale => {
-                match load_generations(
+                match load_view(
                     self.store.as_ref(),
                     self.signal,
                     &tenant,
@@ -567,7 +578,7 @@ impl IngestRouter {
                 )
                 .await
                 {
-                    Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
+                    Ok(view) => Ok(self.switch.refresh_view(tenant, view, now_ns)),
                     Err(_) => match self.switch.try_grace_extend(tenant, now_ns) {
                         Some(set) => {
                             self.metrics.record_grace_extended_stale_flush();
