@@ -8,29 +8,44 @@
 //! batch_size)` pieces (`MaterializedOutput::next_batch`). A slice shares the
 //! whole batch's buffers, and `RecordBatch::get_array_memory_size` reports the
 //! capacity of every buffer an array references, so each slice reports the
-//! size of the entire output. A round-robin `RepartitionExec` passes each
-//! input batch on as it is (its producer-side coalescer finishes a buffered
-//! `batch_size`-row slice through `concat`, which returns the slice) and
-//! reserves exactly that figure for every batch it buffers
-//! (`RepartitionExec::send`); `SortExec`, its TopK, and
-//! `SortPreservingMergeExec` size their input the same way. With `n` slices
-//! in flight at the exchange the pool is charged `n` times the aggregate's
-//! output, and when the charge exceeds the pool `RepartitionExec` asks to
-//! spill, which the session's disabled disk manager refuses: a plan whose
-//! live bytes fit the pool several times over is answered with "the query
-//! memory pool is full and spill is disabled". Upstream:
-//! apache/datafusion#24704.
+//! size of the entire output. A round-robin `RepartitionExec` pushes each
+//! input batch through its producer-side coalescer, whose large-batch bypass
+//! (`BatchCoalescer::push_batch`: a batch of more than `batch_size / 2` rows
+//! arriving on an empty buffer is emitted as it is) passes a `batch_size`-row
+//! slice on unchanged, and then reserves exactly that figure for every batch
+//! it buffers (`RepartitionExec::send`). `SortExec`, its TopK and
+//! `SortPreservingMergeExec` size each input batch with
+//! `get_record_batch_memory_size`, which counts every buffer the batch
+//! references once, in full, and the sort and the merge sum that figure over
+//! the batches they hold. With `n` slices in flight at the exchange the pool
+//! is charged `n` times the aggregate's output, and when the charge exceeds
+//! the pool `RepartitionExec` asks to spill, which the session's disabled disk
+//! manager refuses: a plan whose live bytes fit the pool several times over
+//! is answered with "the query memory pool is full and spill is disabled".
+//! Upstream: apache/datafusion#24704.
 //!
-//! A hash `RepartitionExec` is not a consumer of this kind: it builds each
-//! output batch with `take`, whose buffers hold exactly the rows taken, and
-//! charges those. The rule leaves the aggregate below one alone.
+//! A hash or range `RepartitionExec` is excluded, for a narrower reason than
+//! owning its buffers. `partition_grouped_take` does one `take_arrays` over
+//! the input batch and returns `reordered_batch.slice(start, len)` per
+//! partition, and `take_byte_view` and `take_dict` reuse the source data
+//! buffers, so a Utf8View or Dictionary column under a hash exchange still
+//! references the aggregate's whole buffers, and every partition's piece
+//! references the whole taken batch. What bounds the charge in practice is
+//! the exchange's coalescer: a piece of at most `batch_size / 2` rows is
+//! copied into the coalescer's own buffers (sparse byte-view buffers are
+//! garbage-collected on the way), so the batch `send` charges owns its
+//! bytes. The over-count survives a piece of more than `batch_size / 2` rows,
+//! which two partitions or skewed keys produce, and it survives whole under
+//! `preserve_order` and with unbounded input, which run without a coalescer.
+//! The rule leaves the aggregate below a hash or range exchange alone and
+//! accepts that gap.
 //!
 //! # The rewrite
 //!
 //! [`CompactSlices`] is a physical optimizer rule that places a
 //! [`CompactSlicesExec`] directly above every `AggregateExec`, of any mode,
 //! whose output reaches one of the operators that charge their input by
-//! `get_array_memory_size`: a non-hash `RepartitionExec`, a `SortExec` (TopK
+//! buffer capacity: a round-robin `RepartitionExec`, a `SortExec` (TopK
 //! included) or a `SortPreservingMergeExec`, looking through the
 //! `ProjectionExec`, `FilterExec` and `CoalescePartitionsExec` nodes that sit
 //! between them, and above nothing else. The exec rewrites each batch so that
@@ -38,29 +53,51 @@
 //! slice's own bytes.
 //!
 //! A batch whose charge is already within 2x of the bytes its rows reference
-//! is passed through untouched, so the rule costs nothing on an aggregate
-//! that emits one batch, and nothing on a plan without an aggregate. The copy
-//! is one pass over each sliced batch; it happens once per aggregate output
-//! that feeds an exchange or a sort, and it is reported through the exec's
-//! `copied_bytes`, `compacted_batches` and `passed_through_batches` metrics.
+//! is passed through untouched, so on an aggregate that emits one batch the
+//! rule costs one walk over each batch's buffers and no copy, and on a plan
+//! without an aggregate it costs nothing. The referenced bytes are computed
+//! into nested columns: a List, LargeList or Map column counts the child
+//! range its offsets cover, a FixedSizeList column its child slice, a Struct
+//! column its sliced children, a Dictionary column its keys slice plus its
+//! values once, and a byte-view column its views plus the data bytes those
+//! views point at. `ArrayData::get_slice_memory_size` alone would not do:
+//! it adds every child in full, because `ArrayData::slice` only slices the
+//! children of a Struct, so a sliced List column would read as unsliced. The
+//! copy is one pass over each sliced batch; it happens once per aggregate
+//! output that feeds an exchange or a sort, and it is reported through the
+//! exec's `copied_bytes`, `compacted_batches` and `passed_through_batches`
+//! metrics.
 //!
 //! `arrow::compute::concat_batches` over a single batch does not copy
 //! (`concat` of one array returns a slice of it), and `Array::shrink_to_fit`
 //! only reallocates a buffer it owns alone, which a slice never does. So the
 //! copy is `concat` of the column with an empty array of its type, which
-//! takes the real path and sizes its buffers to the rows it writes, and for a
+//! takes the real path and sizes its buffers to the rows it writes; for a
 //! byte-view column `gc`, which copies only the bytes the slice's views
-//! reference.
+//! reference; and for a Dictionary column a cast to its value type and back,
+//! which re-encodes the slice over the values it references alone
+//! (`concat` drops a Dictionary's unreferenced values only when it holds at
+//! least as many values as the output has rows,
+//! `should_merge_dictionary_values`; below that `MutableArrayData` copies the
+//! values whole). The copy follows the nesting the measure does: a List or
+//! LargeList column rebuilds its offsets from zero over its compacted child
+//! range, and a Struct column compacts its children, so a byte-view or
+//! Dictionary child is copied the same way at any depth. `concat` through a
+//! Map or FixedSizeList copies exactly the rows of a plain child but keeps a
+//! byte-view or Dictionary child's buffers whole: `MutableArrayData` carries
+//! a view array's data buffers over as they are. Such a column stays
+//! correct and is charged above its rows; the gap is accepted.
 
 use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BinaryViewArray, GenericByteViewArray, StringViewArray,
+    Array, ArrayRef, AsArray, GenericByteViewArray, GenericListArray, OffsetSizeTrait, StructArray,
     new_empty_array,
 };
-use datafusion::arrow::compute::concat;
-use datafusion::arrow::datatypes::{ByteViewType, DataType};
+use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+use datafusion::arrow::compute::{can_cast_types, cast, concat};
+use datafusion::arrow::datatypes::{ByteViewType, DataType, FieldRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::Result as DFResult;
 use datafusion::common::config::ConfigOptions;
@@ -123,20 +160,27 @@ impl PhysicalOptimizerRule for CompactSlices {
     }
 }
 
-/// True for an operator that charges each input batch by
-/// `get_array_memory_size`: the consumers the rewrite protects. A hash
-/// repartition rebuilds its batches with `take` and is not one.
+/// True for an operator that charges each input batch by the capacity of the
+/// buffers it references: the consumers the rewrite protects. A hash or range
+/// repartition is left out: its pieces are `take`n and then coalesced, and
+/// the coalescer's copy is what bounds the charge there (the module docs name
+/// the cases where it does not).
 fn charges_by_capacity(node: &Arc<dyn ExecutionPlan>) -> bool {
     if let Some(repartition) = node.downcast_ref::<RepartitionExec>() {
-        return !matches!(repartition.partitioning(), Partitioning::Hash(..));
+        return matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_));
     }
     node.is::<SortExec>() || node.is::<SortPreservingMergeExec>()
 }
 
-/// True for an operator that passes its input batches on, or the arrays of
-/// them it does not compute, without copying: a charge above it is a charge
-/// on the batches below it. (DataFusion 55.2 no longer plans a
-/// `CoalesceBatchesExec`; its consumers coalesce for themselves.)
+/// True for an operator above which a charge is a charge on the batches below
+/// it. A `ProjectionExec` passes the columns it does not compute on as the
+/// same arrays. A `FilterExec` whose predicate keeps every row of a batch
+/// passes it on as a slice of itself (the filter kernel's all-selected path,
+/// then the coalescer's large-batch bypass); when it drops rows the filtered
+/// batch owns its rows, and the exec above it has nothing to compact and
+/// passes those batches through. A `CoalescePartitionsExec` forwards batches
+/// unchanged. (DataFusion 55.2 no longer plans a `CoalesceBatchesExec`; its
+/// consumers coalesce for themselves.)
 fn passes_batches_through(node: &Arc<dyn ExecutionPlan>) -> bool {
     node.is::<ProjectionExec>() || node.is::<FilterExec>() || node.is::<CoalescePartitionsExec>()
 }
@@ -188,8 +232,9 @@ pub struct CompactSlicesExec {
 /// What the exec reports through `EXPLAIN ANALYZE`.
 #[derive(Clone)]
 struct CompactMetrics {
-    /// Bytes written by the copies: the referenced bytes of every batch the
-    /// exec compacted, which is what the consumer above is charged afterwards.
+    /// The referenced-bytes estimate of every batch the exec compacted,
+    /// summed: an estimate of the bytes the copies wrote, and the figure the
+    /// consumer above is charged afterwards to within the copy's own slack.
     copied_bytes: Count,
     /// Batches the exec copied.
     compacted_batches: Count,
@@ -330,14 +375,70 @@ impl ExecutionPlan for CompactSlicesExec {
 fn referenced_bytes(batch: &RecordBatch) -> DFResult<usize> {
     let mut total = 0usize;
     for column in batch.columns() {
-        total = total.saturating_add(column.to_data().get_slice_memory_size()?);
-        if let Some(views) = column.as_any().downcast_ref::<StringViewArray>() {
-            total = total.saturating_add(referenced_view_bytes(views));
-        } else if let Some(views) = column.as_any().downcast_ref::<BinaryViewArray>() {
-            total = total.saturating_add(referenced_view_bytes(views));
-        }
+        total = total.saturating_add(referenced_array_bytes(column.as_ref())?);
     }
     Ok(total)
+}
+
+/// The bytes `array`'s rows reference, into its children.
+/// `ArrayData::get_slice_memory_size` sizes an array's own buffers to its
+/// slice but adds every child in full, because `ArrayData::slice` only slices
+/// the children of a Struct; this keeps the own-buffer figure and replaces
+/// the children's with the part the slice reaches.
+fn referenced_array_bytes(array: &dyn Array) -> DFResult<usize> {
+    let data = array.to_data();
+    let whole = data.get_slice_memory_size()?;
+    let mut children_in_full = 0usize;
+    for child in data.child_data() {
+        children_in_full = children_in_full.saturating_add(child.get_slice_memory_size()?);
+    }
+    let own = whole.saturating_sub(children_in_full);
+    let reached = match array.data_type() {
+        DataType::Utf8View => referenced_view_bytes(array.as_string_view()),
+        DataType::BinaryView => referenced_view_bytes(array.as_binary_view()),
+        DataType::List(_) => referenced_list_bytes(array.as_list::<i32>())?,
+        DataType::LargeList(_) => referenced_list_bytes(array.as_list::<i64>())?,
+        DataType::Map(_, _) => {
+            let map = array.as_map();
+            referenced_offset_range_bytes(map.entries(), map.value_offsets())?
+        }
+        DataType::FixedSizeList(_, _) => {
+            referenced_array_bytes(array.as_fixed_size_list().values().as_ref())?
+        }
+        DataType::Struct(_) => {
+            let mut total = 0usize;
+            for column in array.as_struct().columns() {
+                total = total.saturating_add(referenced_array_bytes(column.as_ref())?);
+            }
+            total
+        }
+        DataType::Dictionary(_, _) => {
+            referenced_array_bytes(array.as_any_dictionary().values().as_ref())?
+        }
+        _ => children_in_full,
+    };
+    Ok(own.saturating_add(reached))
+}
+
+/// The referenced bytes of the child rows a (possibly sliced) list array's
+/// offsets cover.
+fn referenced_list_bytes<O: OffsetSizeTrait>(list: &GenericListArray<O>) -> DFResult<usize> {
+    referenced_offset_range_bytes(list.values().as_ref(), list.value_offsets())
+}
+
+/// The referenced bytes of `values[offsets[0]..offsets[len]]`, the child
+/// range a list or map slice reaches; `offsets` is the slice's own `len + 1`
+/// offsets.
+fn referenced_offset_range_bytes<O: OffsetSizeTrait>(
+    values: &dyn Array,
+    offsets: &[O],
+) -> DFResult<usize> {
+    let (Some(first), Some(last)) = (offsets.first(), offsets.last()) else {
+        return Ok(0);
+    };
+    let start = first.as_usize();
+    let len = last.as_usize().saturating_sub(start);
+    referenced_array_bytes(values.slice(start, len).as_ref())
 }
 
 /// Bytes in `array`'s data buffers that its (possibly sliced) views point at.
@@ -381,11 +482,40 @@ fn compact_batch(batch: RecordBatch, metrics: &CompactMetrics) -> DFResult<Recor
     Ok(compact)
 }
 
-/// A copy of `array` whose buffers hold exactly its rows.
+/// A copy of `array` whose buffers hold exactly its rows, into its children.
+/// A Dictionary column is re-encoded through its value type so the copy holds
+/// only the values the slice references (a Dictionary whose value type arrow
+/// cannot pack, by `can_cast_types`, goes through `concat` and keeps every
+/// value); a List or LargeList column rebuilds its offsets from zero over its
+/// compacted child range; a Struct column compacts its children. Everything
+/// else goes through `concat`, which copies exactly the rows of a plain
+/// column but keeps a byte-view or Dictionary child's buffers whole under a
+/// Map or FixedSizeList.
 fn compact_array(array: &ArrayRef) -> DFResult<ArrayRef> {
     match array.data_type() {
         DataType::Utf8View => Ok(Arc::new(array.as_string_view().gc())),
         DataType::BinaryView => Ok(Arc::new(array.as_binary_view().gc())),
+        dictionary @ DataType::Dictionary(_, value_type)
+            if can_cast_types(value_type, dictionary) =>
+        {
+            let rows = cast(array.as_ref(), value_type)?;
+            Ok(cast(rows.as_ref(), dictionary)?)
+        }
+        DataType::List(field) => compact_list(array.as_list::<i32>(), field),
+        DataType::LargeList(field) => compact_list(array.as_list::<i64>(), field),
+        DataType::Struct(fields) => {
+            let strukt = array.as_struct();
+            let columns = strukt
+                .columns()
+                .iter()
+                .map(compact_array)
+                .collect::<DFResult<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                columns,
+                compact_nulls(strukt.nulls()),
+            )?))
+        }
         other => {
             let empty = new_empty_array(other);
             Ok(concat(&[array.as_ref(), empty.as_ref()])?)
@@ -393,14 +523,46 @@ fn compact_array(array: &ArrayRef) -> DFResult<ArrayRef> {
     }
 }
 
+/// `list` over its compacted child range, with offsets rebuilt from zero.
+fn compact_list<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    field: &FieldRef,
+) -> DFResult<ArrayRef> {
+    let offsets = list.value_offsets();
+    let (Some(first), Some(last)) = (offsets.first(), offsets.last()) else {
+        let empty = new_empty_array(list.data_type());
+        return Ok(concat(&[list, empty.as_ref()])?);
+    };
+    let start = first.as_usize();
+    let len = last.as_usize().saturating_sub(start);
+    let values = compact_array(&list.values().slice(start, len))?;
+    let lengths = offsets
+        .windows(2)
+        .map(|pair| pair[1].as_usize().saturating_sub(pair[0].as_usize()));
+    Ok(Arc::new(GenericListArray::<O>::try_new(
+        Arc::clone(field),
+        OffsetBuffer::<O>::from_lengths(lengths),
+        values,
+        compact_nulls(list.nulls()),
+    )?))
+}
+
+/// A null bitmap of its own for a (possibly sliced) one.
+fn compact_nulls(nulls: Option<&NullBuffer>) -> Option<NullBuffer> {
+    nulls.map(|nulls| nulls.iter().collect())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
-    use datafusion::arrow::array::{Int64Array, StringArray, StringViewArray};
-    use datafusion::arrow::compute::SortOptions;
-    use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+    use datafusion::arrow::array::{
+        DictionaryArray, Int32Array, Int64Array, ListArray, StringArray, StringViewArray,
+    };
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::compute::{SortOptions, concat_batches};
+    use datafusion::arrow::datatypes::{Field, Int32Type, Schema, SchemaRef};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::logical_expr::Operator;
@@ -439,18 +601,98 @@ mod tests {
         .expect("batch")
     }
 
-    /// A `ROWS`-row batch cut into `PIECES` slices, the way an aggregate
-    /// hands out its materialized output.
-    fn sliced_batches() -> Vec<RecordBatch> {
-        let batch = batch_of(ROWS);
-        let piece = ROWS / PIECES;
+    /// `batch` cut into `PIECES` slices, the way an aggregate hands out its
+    /// materialized output.
+    fn pieces_of(batch: &RecordBatch) -> Vec<RecordBatch> {
+        let piece = batch.num_rows() / PIECES;
         (0..PIECES).map(|i| batch.slice(i * piece, piece)).collect()
+    }
+
+    /// Rows of the nested fixture that share one dictionary value.
+    const ROWS_PER_DICT_VALUE: usize = 10;
+
+    fn dictionary_type() -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+    }
+
+    /// A Dictionary column, a `List<Utf8View>` column and a nullable Utf8View
+    /// column: the shapes whose children a slice does not slice.
+    fn nested_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("d", dictionary_type(), false),
+            Field::new_list("l", Field::new_list_field(DataType::Utf8View, true), false),
+            Field::new("n", DataType::Utf8View, true),
+        ]))
+    }
+
+    /// One `rows`-row batch over [`nested_schema`]: `d` repeats each value for
+    /// [`ROWS_PER_DICT_VALUE`] rows, `l` holds two long strings per row, `n`
+    /// is null on every third row and long otherwise.
+    fn nested_batch_of(rows: usize) -> RecordBatch {
+        let keys = Int32Array::from(
+            (0..rows)
+                .map(|i| (i / ROWS_PER_DICT_VALUE) as i32)
+                .collect::<Vec<_>>(),
+        );
+        let values: Vec<String> = (0..rows.div_ceil(ROWS_PER_DICT_VALUE))
+            .map(|v| format!("dict-value-{v:08}-padding"))
+            .collect();
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(StringArray::from(values)))
+                .expect("dictionary");
+        let items: Vec<String> = (0..rows)
+            .flat_map(|i| {
+                [
+                    format!("item-a-{i:08}-padding"),
+                    format!("item-b-{i:08}-padding"),
+                ]
+            })
+            .collect();
+        let list = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(2usize, rows)),
+            Arc::new(StringViewArray::from(items)),
+            None,
+        );
+        let nullable: StringViewArray = (0..rows)
+            .map(|i| (i % 3 != 0).then(|| format!("nullable-{i:08}-padding")))
+            .collect();
+        RecordBatch::try_new(
+            nested_schema(),
+            vec![
+                Arc::new(dictionary) as ArrayRef,
+                Arc::new(list),
+                Arc::new(nullable),
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn list_only_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new_list(
+            "l",
+            Field::new_list_field(DataType::Int64, true),
+            false,
+        )]))
+    }
+
+    /// One `rows`-row batch of a single `List<Int64>` column with two items
+    /// per row, its buffers sized exactly to their contents.
+    fn list_only_batch_of(rows: usize) -> RecordBatch {
+        let list = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Int64, true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(2usize, rows)),
+            Arc::new(Int64Array::from((0..2 * rows as i64).collect::<Vec<_>>())),
+            None,
+        );
+        RecordBatch::try_new(list_only_schema(), vec![Arc::new(list) as ArrayRef]).expect("batch")
     }
 
     /// Run `batches` (one partition) through a `CompactSlicesExec` and return
     /// the exec and what came out.
     async fn run(batches: Vec<RecordBatch>) -> (Arc<CompactSlicesExec>, Vec<RecordBatch>) {
-        let source = MemorySourceConfig::try_new_exec(&[batches], schema(), None).expect("source");
+        let schema = batches.first().expect("a batch").schema();
+        let source = MemorySourceConfig::try_new_exec(&[batches], schema, None).expect("source");
         let exec = Arc::new(CompactSlicesExec::new(source));
         let out = collect(
             Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
@@ -475,7 +717,7 @@ mod tests {
     /// referenced per 100-row piece.
     #[tokio::test]
     async fn a_sliced_batch_comes_out_with_buffers_of_its_own() {
-        let pieces = sliced_batches();
+        let pieces = pieces_of(&batch_of(ROWS));
         let piece_rows = ROWS / PIECES;
         for piece in &pieces {
             let charged = piece.get_array_memory_size();
@@ -506,8 +748,119 @@ mod tests {
         assert_eq!(metric(&exec, "copied_bytes"), referenced_total);
 
         let expected = batch_of(ROWS);
-        let got = datafusion::arrow::compute::concat_batches(&schema(), &out).expect("concat");
+        let got = concat_batches(&schema(), &out).expect("concat");
         assert_eq!(got, expected, "the rows are unchanged");
+    }
+
+    /// Every column of every piece compares equal to the piece that went in,
+    /// a compacted Dictionary piece holds only the values its keys reference
+    /// (10 of the batch's 1,000), and every piece comes out charged within 2x
+    /// of its own rows, the `List<Utf8View>` child included.
+    ///
+    /// FLIP: make the Dictionary arm of `compact_array` return
+    /// `Ok(Arc::clone(array))` and the values assertion fails with 1000
+    /// against 10. FLIP: route a List column through the `concat` arm and the
+    /// charge assertion fails on piece 0 with 522,270 charged against 12,181
+    /// referenced: `MutableArrayData` carries the child's view data buffers
+    /// over whole.
+    #[tokio::test]
+    async fn nested_columns_come_out_with_their_own_buffers_and_the_same_contents() {
+        let whole = nested_batch_of(ROWS);
+        let pieces = pieces_of(&whole);
+        let piece_rows = ROWS / PIECES;
+        let (exec, out) = run(pieces.clone()).await;
+        assert_eq!(out.len(), PIECES);
+        for (i, (before, after)) in pieces.iter().zip(&out).enumerate() {
+            assert_eq!(after.num_rows(), piece_rows);
+            for (column, (b, a)) in before.columns().iter().zip(after.columns()).enumerate() {
+                assert_eq!(a, b, "piece {i}, column {column} compares equal");
+            }
+            let values_before = before.column(0).as_dictionary::<Int32Type>().values().len();
+            let values_after = after.column(0).as_dictionary::<Int32Type>().values().len();
+            assert_eq!(values_before, ROWS / ROWS_PER_DICT_VALUE);
+            assert_eq!(
+                values_after,
+                piece_rows / ROWS_PER_DICT_VALUE,
+                "piece {i} keeps only the dictionary values it references"
+            );
+            let charged = after.get_array_memory_size();
+            let referenced = referenced_bytes(after).expect("sized");
+            assert!(
+                charged <= COMPACT_ABOVE_FACTOR * referenced,
+                "piece {i} is charged within {COMPACT_ABOVE_FACTOR}x of its own rows: \
+                 {charged} charged, {referenced} referenced"
+            );
+        }
+        assert_eq!(metric(&exec, "compacted_batches"), PIECES);
+        assert_eq!(metric(&exec, "passed_through_batches"), 0);
+        let got = concat_batches(&nested_schema(), &out).expect("concat");
+        assert_eq!(got, whole, "the rows are unchanged");
+    }
+
+    /// FLIP: make `compact_batch` always copy (drop the pass-through arm) and
+    /// the pointer equality fails on every column.
+    #[tokio::test]
+    async fn an_unsliced_nested_batch_passes_through_untouched() {
+        let batch = nested_batch_of(8_000);
+        let (exec, out) = run(vec![batch.clone()]).await;
+        assert_eq!(out.len(), 1);
+        for (before, after) in batch.columns().iter().zip(out[0].columns()) {
+            assert!(
+                Arc::ptr_eq(before, after),
+                "an unsliced column is the same array after the exec"
+            );
+        }
+        assert_eq!(out[0], batch);
+        assert_eq!(metric(&exec, "compacted_batches"), 0);
+        assert_eq!(metric(&exec, "passed_through_batches"), 1);
+        assert_eq!(metric(&exec, "copied_bytes"), 0);
+    }
+
+    /// `ArrayData::slice` leaves a List's child whole, so
+    /// `get_slice_memory_size` on a piece counts the child in full and the
+    /// piece's charge sits within 2x of that figure: measured by it, every
+    /// piece would pass through with the 100x charge intact.
+    ///
+    /// FLIP: make `referenced_array_bytes` return `data.get_slice_memory_size()`
+    /// and the second precondition fails on piece 0 with 200,212 charged
+    /// against 160,404 referenced: by that measure the piece is within 2x and
+    /// `compact_batch` would pass it through.
+    #[tokio::test]
+    async fn a_sliced_list_batch_is_classified_as_sliced() {
+        let pieces = pieces_of(&list_only_batch_of(ROWS));
+        for (i, piece) in pieces.iter().enumerate() {
+            let charged = piece.get_array_memory_size();
+            let child_in_full = piece
+                .column(0)
+                .to_data()
+                .get_slice_memory_size()
+                .expect("sized");
+            assert!(
+                charged <= COMPACT_ABOVE_FACTOR * child_in_full,
+                "piece {i}: the whole-child measure would pass it through, {charged} charged \
+                 against {child_in_full} by get_slice_memory_size"
+            );
+            let referenced = referenced_bytes(piece).expect("sized");
+            assert!(
+                charged > COMPACT_ABOVE_FACTOR * referenced,
+                "piece {i}: over-charged by the slice measure, {charged} charged against \
+                 {referenced} referenced"
+            );
+        }
+
+        let (exec, out) = run(pieces.clone()).await;
+        assert_eq!(metric(&exec, "compacted_batches"), PIECES);
+        assert_eq!(metric(&exec, "passed_through_batches"), 0);
+        for (i, (before, after)) in pieces.iter().zip(&out).enumerate() {
+            assert_eq!(after, before, "piece {i} compares equal");
+            let charged = after.get_array_memory_size();
+            let referenced = referenced_bytes(after).expect("sized");
+            assert!(
+                charged <= COMPACT_ABOVE_FACTOR * referenced,
+                "piece {i} is charged within {COMPACT_ABOVE_FACTOR}x of its own rows: \
+                 {charged} charged, {referenced} referenced"
+            );
+        }
     }
 
     /// The batch stays under the source's `batch_size`, so it reaches the
@@ -592,6 +945,26 @@ mod tests {
                 input_schema,
             )
             .expect("final"),
+        )
+    }
+
+    /// `AggregateExec(Single)` over `input`, grouping on `k` and counting
+    /// `v`, in every partition of `input`.
+    fn single(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let input_schema = input.schema();
+        Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(
+                    col("k", &input_schema).expect("k"),
+                    "k".to_string(),
+                )]),
+                count_v(&input_schema),
+                vec![None],
+                input,
+                input_schema,
+            )
+            .expect("single"),
         )
     }
 
@@ -682,7 +1055,6 @@ mod tests {
             "the hand-built plan carries no exec:\n{before}"
         );
         let after = plan_text(&optimize(q29_plan()));
-        eprintln!("{after}");
 
         let execs = lines_starting_with(&after, "CompactSlicesExec");
         assert_eq!(execs.len(), 1, "exactly one exec:\n{after}");
@@ -746,8 +1118,39 @@ mod tests {
         assert!(!after.contains("CompactSlicesExec"));
     }
 
-    /// A hash repartition builds its output batches with `take`, so the
-    /// aggregate below it is left alone.
+    /// The merge edge: an aggregate feeding a `SortPreservingMergeExec` gets
+    /// one exec, directly above it.
+    ///
+    /// FLIP: make `charges_by_capacity` return `false` for a
+    /// `SortPreservingMergeExec` and the exec count is 0.
+    #[test]
+    fn an_aggregate_feeding_a_sort_preserving_merge_gets_one_exec() {
+        let aggregated = single(scan(4));
+        let schema = aggregated.schema();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+            col("count(v)", &schema).expect("count"),
+        )])
+        .expect("one sort key");
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SortPreservingMergeExec::new(ordering, aggregated));
+        let after = plan_text(&optimize(plan));
+        let execs = lines_starting_with(&after, "CompactSlicesExec");
+        assert_eq!(execs.len(), 1, "exactly one exec:\n{after}");
+        assert_eq!(
+            lines_starting_with(&after, "SortPreservingMergeExec"),
+            vec![execs[0] - 1],
+            "the merge is directly above:\n{after}"
+        );
+        assert_eq!(
+            lines_starting_with(&after, "AggregateExec: mode=Single"),
+            vec![execs[0] + 1],
+            "the aggregate is directly below:\n{after}"
+        );
+    }
+
+    /// A hash repartition's pieces are `take`n and then coalesced, and the
+    /// coalescer's copy bounds the charge there (see the module docs for the
+    /// cases it does not cover), so the aggregate below it is left alone.
     ///
     /// FLIP: make `charges_by_capacity` return `true` for every
     /// `RepartitionExec` and the text gains a line.

@@ -14,7 +14,10 @@
 //!
 //! The rule is on in every session `build_session` makes; the "off" side
 //! rebuilds the same session state without `CompactSlices`, which is the
-//! only difference between the two measurements.
+//! only difference between the two measurements. The two sides are measured
+//! at a 1 GiB pool, where neither refuses, and then run at a pool set between
+//! their two peaks, where the rule-off side refuses and the rule-on side
+//! answers.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -23,10 +26,11 @@ use crate::util;
 use std::sync::Arc;
 
 use datafusion::arrow::array::AsArray;
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{cast, concat_batches};
 use datafusion::arrow::datatypes::{DataType, Int64Type};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigNonZeroUsize;
+use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
@@ -94,9 +98,23 @@ fn expected_top_k() -> Vec<(String, i64)> {
         .collect()
 }
 
-fn config() -> SqlConfig {
+/// The pool size at which the two sides are measured: neither refuses there.
+const MEASURE_POOL_BYTES: usize = 1 << 30;
+
+/// The pool for the refuses-versus-answers test, as a multiple of the
+/// aggregate's materialized output: between the measured rule-on peak
+/// (2.22x) and rule-off peak (6.00x).
+const REFUSAL_POOL_FACTOR: u64 = 4;
+
+/// The substring DataFusion puts in the error a spill request raises when the
+/// disk manager is disabled, which is how the exchange reports a pool it
+/// could not grow.
+const SPILL_DISABLED: &str = "DiskManager is disabled";
+
+fn config(max_query_bytes: usize) -> SqlConfig {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(PARTITIONS);
+    config.max_query_bytes = max_query_bytes;
     config
 }
 
@@ -127,11 +145,25 @@ struct Run {
     peak_intermediate_bytes: u64,
 }
 
-/// Run `sql` on a fresh production session over `fixture` (the production
-/// pool, spill disabled, `batch_size` [`BATCH_SIZE`]), with the rule left
-/// in or taken out.
+/// Run `sql` on a fresh production session over `fixture` at the measuring
+/// pool, with the rule left in or taken out; the query must succeed.
 async fn run(fixture: &Fixture, sql: &str, rule_on: bool) -> Run {
-    let config = config();
+    run_with_pool(fixture, sql, rule_on, MEASURE_POOL_BYTES)
+        .await
+        .expect("query runs")
+}
+
+/// Run `sql` on a fresh production session over `fixture` (the production
+/// pool capped at `max_query_bytes`, spill disabled, `batch_size`
+/// [`BATCH_SIZE`]), with the rule left in or taken out. A refused query comes
+/// back as the error the pool raised.
+async fn run_with_pool(
+    fixture: &Fixture,
+    sql: &str,
+    rule_on: bool,
+    max_query_bytes: usize,
+) -> Result<Run, DataFusionError> {
+    let config = config(max_query_bytes);
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let accounting = QueryAccounting::new();
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), accounting.clone());
@@ -166,17 +198,23 @@ async fn run(fixture: &Fixture, sql: &str, rule_on: bool) -> Run {
         .await
         .expect("physical plan");
     let plan = displayable(physical.as_ref()).indent(true).to_string();
-    let batches = collect(physical, ctx.task_ctx()).await.expect("query runs");
+    let batches = collect(physical, ctx.task_ctx()).await?;
     assert_eq!(
         pool.reserved(),
         0,
         "the pool returns to zero after the query"
     );
-    Run {
+    Ok(Run {
         plan,
         batches,
         peak_intermediate_bytes: accounting.snapshot().peak_intermediate_bytes,
-    }
+    })
+}
+
+/// One batch of all of `batches`, for a whole-output comparison.
+fn one_batch(batches: &[RecordBatch]) -> RecordBatch {
+    let schema = batches.first().expect("at least one batch").schema();
+    concat_batches(&schema, batches).expect("one schema")
 }
 
 /// `(k, n)` per row, in output order.
@@ -238,7 +276,7 @@ fn assert_round_robin_over_final_aggregate(plan: &str, rule_on: bool) {
 /// With the rule on, the query's peak intermediate bytes stay under 3x the
 /// aggregate's materialized output; with the rule off every slice in flight
 /// at the repartition is charged the whole output, and the peak is an exact
-/// multiple of it. Both sides return the same rows.
+/// multiple of it. Both sides return the same batches, every column of them.
 ///
 /// Measured: output 2,211,069 bytes in 79 slices; rule on peak 4,912,669
 /// (2.22x), rule off peak 13,266,414 (6.00x: the aggregate's own
@@ -308,6 +346,11 @@ async fn the_peak_with_the_rule_on_is_bounded_by_the_output_and_the_rows_match()
         expected_top_k(),
         "the rows with the rule off"
     );
+    assert_eq!(
+        one_batch(&on.batches),
+        one_batch(&off.batches),
+        "every column, the gc'd `s` and the concatenated `a` included, is the same on both sides"
+    );
 
     assert!(
         on.peak_intermediate_bytes < 3 * output_bytes,
@@ -322,6 +365,44 @@ async fn the_peak_with_the_rule_on_is_bounded_by_the_output_and_the_rows_match()
     );
 }
 
+/// At a pool set between the two measured peaks ([`REFUSAL_POOL_FACTOR`]
+/// times the aggregate's materialized output: 8,844,276 bytes against peaks
+/// of 4,912,669 with the rule on and 13,266,414 off) the rule-off run is
+/// refused with the pool's spill-disabled error and the rule-on run answers
+/// with the expected rows.
+///
+/// FLIP: make `compact_array` return `Ok(Arc::clone(array))` in the module
+/// and the rule-on run is refused too, with the same error.
+#[tokio::test]
+async fn between_the_two_peaks_the_rule_off_run_refuses_and_the_rule_on_run_answers() {
+    let specs = corpus();
+    let fixture = Fixture::memory(&[(&tenant(), &specs)]).await;
+    let all_groups = run(&fixture, ALL_GROUPS, true).await;
+    let output_bytes = all_groups.batches[0].get_array_memory_size() as u64;
+    let pool_bytes = usize::try_from(REFUSAL_POOL_FACTOR * output_bytes).expect("fits");
+
+    let refused = run_with_pool(&fixture, TOP_K, false, pool_bytes)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("the rule-off run must refuse at a {pool_bytes}-byte pool"));
+    assert!(
+        matches!(refused, DataFusionError::ResourcesExhausted(_))
+            && refused.to_string().contains(SPILL_DISABLED),
+        "the rule-off run is refused by the pool, spill disabled: {refused}"
+    );
+
+    let answered = run_with_pool(&fixture, TOP_K, true, pool_bytes)
+        .await
+        .unwrap_or_else(|e| panic!("the rule-on run must answer at a {pool_bytes}-byte pool: {e}"));
+    assert_round_robin_over_final_aggregate(&answered.plan, true);
+    assert_eq!(rows(&answered.batches), expected_top_k());
+    assert!(
+        answered.peak_intermediate_bytes < pool_bytes as u64,
+        "the rule-on peak ({}) fits the pool ({pool_bytes})",
+        answered.peak_intermediate_bytes
+    );
+}
+
 /// The production path: the same statement through `SqlExecutor`, as the
 /// server runs it, plans the exec under the round-robin repartition and
 /// returns the same rows.
@@ -331,7 +412,7 @@ async fn the_executor_plans_the_exec_under_the_round_robin_repartition() {
     let fixture = Fixture::build(
         Arc::new(ravel_object_store::memory::MemoryStore::new()),
         &[(&tenant(), &specs)],
-        config(),
+        config(MEASURE_POOL_BYTES),
         1 << 30,
     )
     .await;
