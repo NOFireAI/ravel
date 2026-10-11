@@ -479,7 +479,7 @@ impl TenantDelegatingPool {
     fn charge(&self, additional: usize) {
         // The trait requires this to be infallible, and both budgets grow
         // unconditionally -- this is not only reachable after a validated
-        // try_grow. datafusion 54.1.0's MemoryReservation::resize() and at
+        // try_grow. datafusion 55.2.0's MemoryReservation::resize() and at
         // least the nested-loop and sort-merge join operators call grow
         // directly with a delta that was never checked against either
         // ceiling (confirmed against the pinned datafusion source; matches
