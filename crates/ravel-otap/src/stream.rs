@@ -16,7 +16,6 @@
 //! arrive once, record batches reference them by stream state).
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -106,10 +105,10 @@ pub enum StreamError {
     },
     #[error("stream was already torn down by a previous corruption")]
     Poisoned,
-    /// The write gate returned no result for a payload's decompression. That
-    /// payload never reached its decoder, but the batch's earlier payloads
-    /// already fed theirs, so the stream's decode state has advanced past
-    /// what a nack tells the client. A resend on this stream would feed those
+    /// The write gate returned no result for a payload's decompression and
+    /// decode. That payload's decoder went into the job and did not come back,
+    /// and the batch's earlier payloads already fed theirs, so the stream's
+    /// decode state has advanced past what a nack tells the client. A resend on this stream would feed those
     /// payloads' schema and dictionary messages to decoders that already took
     /// them, and any the failed payload carried never reach its decoder, so
     /// the stream is poisoned like a corrupted one.
@@ -407,10 +406,11 @@ impl StreamState {
         }
     }
 
-    /// Runs each payload's zstd decompression in [`decode_gated`] on the
-    /// ADR-1702 write gate under the `otap_decode` site, sized by an upper
-    /// bound on its decompressed length so the gate's inline floor applies.
-    /// `None` decompresses inline, as [`decode`] always does.
+    /// Runs each payload's zstd decompression and Arrow IPC decode in
+    /// [`decode_gated`] as one job on the ADR-1702 write gate under the
+    /// `otap_decode` site, sized by an upper bound on its decompressed length
+    /// so the gate's inline floor applies. `None` runs both inline, as
+    /// [`decode`] always does.
     ///
     /// [`decode`]: Self::decode
     /// [`decode_gated`]: Self::decode_gated
@@ -452,7 +452,11 @@ impl StreamState {
                 Ok((payload_type, raw))
             });
             let decoded = match decoded {
-                Ok((payload_type, raw)) => self.decode_raw(payload_type, payload.schema_id, raw),
+                Ok((payload_type, raw)) => {
+                    let (key, job) = self.take_payload(payload_type, payload.schema_id);
+                    let outcome = decode_payload(&self.config, job, raw);
+                    self.settle_payload(key, outcome)
+                }
                 Err(e) => Err(e.into()),
             };
             self.collect_payload(decoded, &mut payloads)?;
@@ -463,12 +467,16 @@ impl StreamState {
         })
     }
 
-    /// [`decode`](Self::decode), with each payload's zstd decompression on the
-    /// write gate set by [`with_write_gate`](Self::with_write_gate). The
-    /// decompression job owns the payload's compressed bytes; nothing else in
-    /// the decode leaves the calling task, so the stateful IPC decoders are
-    /// fed in payload order as before. A gate failure is a [`StreamError::Gate`]
-    /// and poisons the stream.
+    /// [`decode`](Self::decode), with each payload's zstd decompression and
+    /// Arrow IPC decode as one job on the write gate set by
+    /// [`with_write_gate`](Self::with_write_gate). The job owns the payload's
+    /// compressed bytes and its IPC decoder, which [`take_payload`] moves out
+    /// of the stream and [`settle_payload`] puts back; payloads are awaited
+    /// one at a time, so the stateful decoders are still fed in payload order.
+    /// A gate failure is a [`StreamError::Gate`] and poisons the stream.
+    ///
+    /// [`take_payload`]: Self::take_payload
+    /// [`settle_payload`]: Self::settle_payload
     pub async fn decode_gated(
         &mut self,
         batch: BatchArrowRecords,
@@ -479,10 +487,10 @@ impl StreamState {
         let mut payloads = Vec::with_capacity(batch.arrow_payloads.len());
         for payload in batch.arrow_payloads {
             let decoded = match payload_type_of(&payload) {
-                Ok(payload_type) => match self.decompress_on_gate(payload.record).await {
-                    Ok(raw) => self.decode_raw(payload_type, payload.schema_id, raw),
-                    Err(e) => Err(e),
-                },
+                Ok(payload_type) => {
+                    self.decode_on_gate(payload_type, payload.schema_id, payload.record)
+                        .await
+                }
                 Err(e) => Err(e.into()),
             };
             self.collect_payload(decoded, &mut payloads)?;
@@ -493,28 +501,77 @@ impl StreamState {
         })
     }
 
-    async fn decompress_on_gate(
+    async fn decode_on_gate(
         &mut self,
+        payload_type: ArrowPayloadType,
+        schema_id: String,
         record: bytes::Bytes,
-    ) -> Result<MutableBuffer, DecodeError> {
-        let cap = self.config.max_decompressed_payload_bytes;
-        match &self.write_gate {
+    ) -> Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError> {
+        let config = self.config;
+        let cap = config.max_decompressed_payload_bytes;
+        match self.write_gate.clone() {
             Some(gate) => {
                 #[cfg(test)]
                 if let Some(err) = self.fail_next_gate.take() {
                     return Err(StreamError::Gate(err).into());
                 }
                 let size = JobSize::Bytes(zstd_job_bytes(&record, cap));
-                let decompressed = gate
-                    .run(WriteSite::OtapDecode, size, move || {
-                        decompress_capped(&record, cap)
-                    })
+                let (key, job) = self.take_payload(payload_type, schema_id);
+                let outcome = gate
+                    .run(
+                        WriteSite::OtapDecode,
+                        size,
+                        move || match decompress_capped(&record, cap) {
+                            Ok(raw) => decode_payload(&config, job, raw),
+                            Err(e) => PayloadOutcome::untouched(job, e.into()),
+                        },
+                    )
                     .await
                     .map_err(StreamError::Gate)?;
-                Ok(decompressed?)
+                self.settle_payload(key, outcome)
             }
-            None => Ok(decompress_capped(&record, cap)?),
+            None => {
+                let raw = decompress_capped(&record, cap)?;
+                let (key, job) = self.take_payload(payload_type, schema_id);
+                let outcome = decode_payload(&config, job, raw);
+                self.settle_payload(key, outcome)
+            }
         }
+    }
+
+    /// Moves the decode state one payload reads out of the stream: its
+    /// decoder, if the stream has one for the key, and the budgets it checks.
+    fn take_payload(
+        &mut self,
+        payload_type: ArrowPayloadType,
+        schema_id: String,
+    ) -> (DecoderKey, PayloadJob) {
+        let key: DecoderKey = (payload_type, schema_id.clone());
+        let decoder = self.decoders.remove(&key);
+        let job = PayloadJob {
+            payload_type,
+            schema_id,
+            decoder,
+            other_decoders: self.decoders.len(),
+            dictionary_bytes_used: self.dictionary_bytes_used,
+        };
+        (key, job)
+    }
+
+    /// Puts back what [`decode_payload`] advanced: the decoder, the dictionary
+    /// bytes it accepted and the frame counts.
+    fn settle_payload(
+        &mut self,
+        key: DecoderKey,
+        outcome: PayloadOutcome,
+    ) -> Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError> {
+        if let Some(decoder) = outcome.decoder {
+            self.decoders.insert(key, decoder);
+        }
+        self.dictionary_bytes_used += outcome.dictionary_bytes;
+        self.stats.zero_copy_frames += outcome.stats.zero_copy_frames;
+        self.stats.copy_fallback_frames += outcome.stats.copy_fallback_frames;
+        outcome.batches
     }
 
     /// Appends one payload's batches, or poisons the stream on a
@@ -536,111 +593,164 @@ impl StreamState {
             Err(e @ DecodeError::Batch(_)) => Err(e),
         }
     }
+}
 
-    fn decode_raw(
-        &mut self,
-        payload_type: ArrowPayloadType,
-        schema_id: String,
-        raw: MutableBuffer,
-    ) -> Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError> {
-        let scanned = scan_messages(&raw).map_err(BatchError::MalformedIpc)?;
+/// The stream state one payload's decode reads, owned so the decode can run
+/// as a write gate job: [`StreamState::take_payload`] builds it.
+struct PayloadJob {
+    payload_type: ArrowPayloadType,
+    schema_id: String,
+    /// The decoder for this payload's key, `None` when the stream has none.
+    decoder: Option<StreamDecoder>,
+    /// How many decoders the stream holds for other keys.
+    other_decoders: usize,
+    dictionary_bytes_used: u64,
+}
 
-        for message in &scanned {
-            if let Some(rows) = message.row_count
-                && rows > self.config.max_rows_per_batch
-            {
-                return Err(BatchError::RowCountExceeded {
-                    limit: self.config.max_rows_per_batch,
-                    actual: rows,
-                }
-                .into());
-            }
+/// What one payload's decode hands back to [`StreamState::settle_payload`].
+struct PayloadOutcome {
+    /// The decoder to keep under the payload's key; `None` leaves the key
+    /// without one.
+    decoder: Option<StreamDecoder>,
+    /// Dictionary bytes the payload added to the stream's budget.
+    dictionary_bytes: u64,
+    /// Frames this payload decoded, by kind.
+    stats: DecodeStats,
+    batches: Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError>,
+}
+
+impl PayloadOutcome {
+    /// A payload refused before it reached its decoder: the stream state is
+    /// left as it was.
+    fn untouched(job: PayloadJob, err: DecodeError) -> Self {
+        Self {
+            decoder: job.decoder,
+            dictionary_bytes: 0,
+            stats: DecodeStats::default(),
+            batches: Err(err),
         }
-
-        let dictionary_bytes: u64 = scanned
-            .iter()
-            .filter(|m| m.header == MessageHeader::DictionaryBatch)
-            .map(|m| m.body_len)
-            .sum();
-        if self.dictionary_bytes_used.saturating_add(dictionary_bytes)
-            > self.config.max_stream_dictionary_bytes
-        {
-            return Err(BatchError::DictionaryBudgetExceeded {
-                limit: self.config.max_stream_dictionary_bytes,
-            }
-            .into());
-        }
-
-        let key: DecoderKey = (payload_type, schema_id.clone());
-        let is_new = !self.decoders.contains_key(&key);
-        if is_new && self.decoders.len() >= self.config.max_schemas_per_stream {
-            return Err(BatchError::SchemaBudgetExceeded {
-                limit: self.config.max_schemas_per_stream,
-            }
-            .into());
-        }
-
-        self.dictionary_bytes_used += dictionary_bytes;
-
-        let entry = self.decoders.entry(key.clone());
-        let had_schema_before = matches!(&entry, Entry::Occupied(e) if e.get().schema().is_some());
-        let decoder = entry.or_default();
-
-        let mut buffer = ArrowBuffer::from(raw);
-        let frame_range = frame_range_of(&buffer);
-        let mut batches = Vec::new();
-        while !buffer.is_empty() {
-            // A hostile `BatchArrowRecords` can drive arrow's `StreamDecoder`
-            // to panic inside `arrow-buffer` (e.g. "the offset of the new
-            // Buffer cannot exceed the existing length") on some malformed
-            // inputs, rather than returning `Err` (a known footgun class in
-            // the arrow decoders; see tests/fuzz_mutation.rs). Catch the
-            // unwind at this boundary so a single tenant's malformed batch is
-            // converted to a typed error instead of unwinding through the
-            // ingest task. A panicked decoder's internal buffering state is
-            // untrustworthy, so it is dropped exactly as on a returned `Err`.
-            let step = match panic::catch_unwind(AssertUnwindSafe(|| decoder.decode(&mut buffer))) {
-                Ok(step) => step,
-                Err(panic_payload) => {
-                    self.decoders.remove(&key);
-                    let detail = panic_detail(panic_payload.as_ref());
-                    if had_schema_before {
-                        return Err(StreamError::Corrupted {
-                            payload_type,
-                            schema_id,
-                            detail,
-                        }
-                        .into());
-                    }
-                    return Err(BatchError::InternalPanic(detail).into());
-                }
-            };
-            match step {
-                Ok(Some(record_batch)) => {
-                    if batch_is_zero_copy(frame_range, &record_batch) {
-                        self.stats.zero_copy_frames += 1;
-                    } else {
-                        self.stats.copy_fallback_frames += 1;
-                    }
-                    batches.push((payload_type, record_batch));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.decoders.remove(&key);
-                    if had_schema_before {
-                        return Err(StreamError::Corrupted {
-                            payload_type,
-                            schema_id,
-                            detail: e.to_string(),
-                        }
-                        .into());
-                    }
-                    return Err(BatchError::IpcDecode(e.to_string()).into());
-                }
-            }
-        }
-        Ok(batches)
     }
+}
+
+/// Decodes one payload's decompressed IPC bytes against `job`'s decoder. A
+/// payload that fails the row, dictionary or schema caps leaves the decoder
+/// untouched; one its decoder rejects or panics on drops it.
+fn decode_payload(config: &StreamConfig, job: PayloadJob, raw: MutableBuffer) -> PayloadOutcome {
+    let scanned = match scan_messages(&raw) {
+        Ok(scanned) => scanned,
+        Err(e) => return PayloadOutcome::untouched(job, BatchError::MalformedIpc(e).into()),
+    };
+
+    for message in &scanned {
+        if let Some(rows) = message.row_count
+            && rows > config.max_rows_per_batch
+        {
+            let err = BatchError::RowCountExceeded {
+                limit: config.max_rows_per_batch,
+                actual: rows,
+            };
+            return PayloadOutcome::untouched(job, err.into());
+        }
+    }
+
+    let dictionary_bytes: u64 = scanned
+        .iter()
+        .filter(|m| m.header == MessageHeader::DictionaryBatch)
+        .map(|m| m.body_len)
+        .sum();
+    if job.dictionary_bytes_used.saturating_add(dictionary_bytes)
+        > config.max_stream_dictionary_bytes
+    {
+        let err = BatchError::DictionaryBudgetExceeded {
+            limit: config.max_stream_dictionary_bytes,
+        };
+        return PayloadOutcome::untouched(job, err.into());
+    }
+
+    if job.decoder.is_none() && job.other_decoders >= config.max_schemas_per_stream {
+        let err = BatchError::SchemaBudgetExceeded {
+            limit: config.max_schemas_per_stream,
+        };
+        return PayloadOutcome::untouched(job, err.into());
+    }
+
+    let PayloadJob {
+        payload_type,
+        schema_id,
+        decoder,
+        ..
+    } = job;
+    let had_schema_before = decoder.as_ref().is_some_and(|d| d.schema().is_some());
+    let mut decoder = decoder.unwrap_or_default();
+    let mut stats = DecodeStats::default();
+    let outcome =
+        |decoder: Option<StreamDecoder>,
+         stats: DecodeStats,
+         batches: Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError>| {
+            PayloadOutcome {
+                decoder,
+                dictionary_bytes,
+                stats,
+                batches,
+            }
+        };
+
+    let mut buffer = ArrowBuffer::from(raw);
+    let frame_range = frame_range_of(&buffer);
+    let mut batches = Vec::new();
+    while !buffer.is_empty() {
+        // A hostile `BatchArrowRecords` can drive arrow's `StreamDecoder`
+        // to panic inside `arrow-buffer` (e.g. "the offset of the new
+        // Buffer cannot exceed the existing length") on some malformed
+        // inputs, rather than returning `Err` (a known footgun class in
+        // the arrow decoders; see tests/fuzz_mutation.rs). Catch the
+        // unwind at this boundary so a single tenant's malformed batch is
+        // converted to a typed error instead of unwinding through the
+        // ingest task. A panicked decoder's internal buffering state is
+        // untrustworthy, so it is dropped exactly as on a returned `Err`.
+        let step = match panic::catch_unwind(AssertUnwindSafe(|| decoder.decode(&mut buffer))) {
+            Ok(step) => step,
+            Err(panic_payload) => {
+                let detail = panic_detail(panic_payload.as_ref());
+                let err: DecodeError = if had_schema_before {
+                    StreamError::Corrupted {
+                        payload_type,
+                        schema_id,
+                        detail,
+                    }
+                    .into()
+                } else {
+                    BatchError::InternalPanic(detail).into()
+                };
+                return outcome(None, stats, Err(err));
+            }
+        };
+        match step {
+            Ok(Some(record_batch)) => {
+                if batch_is_zero_copy(frame_range, &record_batch) {
+                    stats.zero_copy_frames += 1;
+                } else {
+                    stats.copy_fallback_frames += 1;
+                }
+                batches.push((payload_type, record_batch));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let err: DecodeError = if had_schema_before {
+                    StreamError::Corrupted {
+                        payload_type,
+                        schema_id,
+                        detail: e.to_string(),
+                    }
+                    .into()
+                } else {
+                    BatchError::IpcDecode(e.to_string()).into()
+                };
+                return outcome(None, stats, Err(err));
+            }
+        }
+    }
+    outcome(Some(decoder), stats, Ok(batches))
 }
 
 #[cfg(test)]

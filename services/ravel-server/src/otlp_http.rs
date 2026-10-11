@@ -341,35 +341,71 @@ fn gzip_job_bytes(wire_len: u64, cap: usize) -> u64 {
         .min(cap as u64)
 }
 
-/// The inflated gzip body.
-type GzipInflate = Result<(Vec<Bytes>, Vec<IngestByteCharge>), GzipDecodeError>;
+/// Why a gzip body's decode job returned no request.
+#[derive(Debug)]
+enum GzipJobError {
+    /// The inflate itself failed: shed, over the cap, or not gzip.
+    Inflate(GzipDecodeError),
+    /// The decompressed length was over the tenant's byte rate.
+    Rejected(RequestRejection),
+    /// prost rejected the inflated bytes: HTTP 400, as on the identity path.
+    Protobuf(prost::DecodeError),
+}
 
-/// Runs [`decompress_gzip_capped_charged`] for `body` on `write_gate` under the
-/// `otlp_http_gzip` site, sized by [`gzip_job_bytes`] (ADR-1702), or inline
-/// when no gate is attached. The job takes each chunk's charge as it inflates
-/// and returns the charges with the chunks, so nothing is charged while it
-/// waits for a permit, and a dropped request releases the charges only when
-/// the job returns. `Err` is the gate returning no result.
-async fn inflate_gzip_gated(
+/// The decoded request of a gzip body, with the inflate charges.
+type GzipDecode<M> = Result<(M, Vec<IngestByteCharge>), GzipJobError>;
+
+/// Runs [`decompress_gzip_capped_charged`], the decompressed-length byte-rate
+/// check `admit` makes, and the protobuf decode of `body` as one job on
+/// `write_gate` under the `otlp_http_gzip` site, sized by [`gzip_job_bytes`]
+/// (ADR-1702), or inline when no gate is attached. The decode reads the inflate
+/// chunks on the thread that produced them and frees them as it returns. The
+/// job takes each chunk's charge as it inflates and returns the charges with
+/// the decoded request, so nothing is charged while it waits for a permit, and
+/// a dropped request releases the charges only when the job returns. On any
+/// job error the charges drop inside the job. `Err` is the gate returning no
+/// result.
+async fn decode_gzip_gated<M, A>(
     write_gate: Option<&WriteGate>,
     body: Bytes,
     budget: Arc<IngestByteBudget>,
-) -> Result<GzipInflate, CpuGateError> {
+    admit: A,
+) -> Result<GzipDecode<M>, CpuGateError>
+where
+    M: Message + Default + Send + 'static,
+    A: FnOnce(u64) -> Result<(), RequestRejection> + Send + 'static,
+{
     let size = gzip_job_bytes(body.len() as u64, MAX_DECOMPRESSED_OTLP_BODY_BYTES);
-    let inflate =
-        move || decompress_gzip_capped_charged(&body, MAX_DECOMPRESSED_OTLP_BODY_BYTES, &budget);
+    let decode = move || -> GzipDecode<M> {
+        let (chunks, charges) =
+            decompress_gzip_capped_charged(&body, MAX_DECOMPRESSED_OTLP_BODY_BYTES, &budget)
+                .map_err(GzipJobError::Inflate)?;
+        let decompressed = ChunkedBody::new(chunks);
+        admit(decompressed.remaining() as u64).map_err(GzipJobError::Rejected)?;
+        let request = M::decode(decompressed).map_err(GzipJobError::Protobuf)?;
+        Ok((request, charges))
+    };
     match write_gate {
         Some(gate) => {
-            gate.run(WriteSite::OtlpHttpGzip, JobSize::Bytes(size), inflate)
+            gate.run(WriteSite::OtlpHttpGzip, JobSize::Bytes(size), decode)
                 .await
         }
-        None => Ok(inflate()),
+        None => Ok(decode()),
     }
 }
 
-/// The write gate produced no inflate result: the job panicked, or the runtime
-/// dropped it while shutting down. Nothing was decoded or written, so a retry
-/// is safe; a panic is the server's fault, a cancelled job a transient one.
+/// HTTP 400 for a body prost could not decode, on either coding.
+fn invalid_payload_response(err: prost::DecodeError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("invalid OTLP payload: {err}"),
+    )
+        .into_response()
+}
+
+/// The write gate produced no decode result: the job panicked, or the runtime
+/// dropped it while shutting down. Nothing was written, so a retry is safe; a
+/// panic is the server's fault, a cancelled job a transient one.
 fn gate_failure_response(err: CpuGateError) -> Response {
     let status = match err {
         CpuGateError::Panicked => StatusCode::INTERNAL_SERVER_ERROR,
@@ -389,36 +425,40 @@ fn unsupported_encoding_response() -> Response {
         .into_response()
 }
 
-/// Applies the layer-2 byte-rate charge and returns the OTLP protobuf bytes to
-/// decode, dispatching on `Content-Encoding` (ADR-0084 decisions 1, 3, 4).
+/// Applies the layer-2 byte-rate charge and returns the decoded OTLP request,
+/// dispatching on `Content-Encoding` (ADR-0084 decisions 1, 3, 4).
 ///
-/// - Identity: the current path byte for byte. `check_byte_rate` charges the
-///   wire body length exactly as before, and the returned `Bytes` is the input
-///   with no copy.
+/// - Identity: `check_byte_rate` charges the wire body length, then prost
+///   decodes the body in place with no copy.
 /// - gzip/x-gzip: the compressed length is pre-checked against the tenant's
 ///   available tokens without consuming any (`peek_byte_rate`); if even that
 ///   lower bound is over rate the request is rejected 429 before anything is
-///   inflated. Otherwise the body is decompressed under the 64 MiB cap and the
-///   real charge is made on the decompressed size.
+///   inflated. Otherwise one write gate job decompresses the body under the
+///   64 MiB cap, makes the real charge on the decompressed size, and decodes
+///   it ([`decode_gzip_gated`]).
 /// - anything else: 415.
 ///
-/// The wire (compressed) length is recorded per tenant on the admitted path so
+/// A body prost rejects is a 400 on either coding. The wire (compressed)
+/// length is recorded per tenant once the byte rate admitted the body, so
 /// `/metrics` can report it alongside the charged (decompressed) size.
 ///
-/// On the gzip path the returned [`IngestByteCharge`] guards hold the
-/// process-wide ingest byte budget charge for the retained inflate chunks
-/// (ADR-0069 as amended by issue #1297); the caller keeps them alive through
-/// protobuf decode and drops them once prost has copied the chunks into owned
-/// structs, before the router takes its own buffered charge, so the two never
-/// coexist. The identity path allocates no transient inflate buffer, so it
-/// returns no guards.
-async fn admit_and_decode_body(
+/// On the gzip path the returned [`IngestByteCharge`] guards are the ones the
+/// inflate took for its chunks, summing to the decompressed length (ADR-0069
+/// as amended by issue #1297). The chunks are gone by the time they come
+/// back: prost consumed them inside the job. The guards come back held with
+/// the decoded request, and the caller drops them before the router takes its
+/// own buffered charge, so the two never coexist. The identity path allocates
+/// no transient inflate buffer, so it returns no guards.
+async fn admit_and_decode_body<M>(
     state: &GatewayState,
     headers: &HeaderMap,
     tenant: &TenantId,
     signal: Signal,
     body: Bytes,
-) -> Result<(ChunkedBody, Vec<IngestByteCharge>), Box<Response>> {
+) -> Result<(M, Vec<IngestByteCharge>), Box<Response>>
+where
+    M: Message + Default + Send + 'static,
+{
     match parse_content_encoding(headers) {
         ContentCoding::Unsupported => Err(Box::new(unsupported_encoding_response())),
         ContentCoding::Identity => {
@@ -435,7 +475,10 @@ async fn admit_and_decode_body(
             state
                 .ingest_byte_metrics
                 .record_wire_bytes(tenant, signal, wire_len);
-            Ok((ChunkedBody::single(body), Vec::new()))
+            match M::decode(ChunkedBody::single(body)) {
+                Ok(request) => Ok((request, Vec::new())),
+                Err(err) => Err(Box::new(invalid_payload_response(err))),
+            }
         }
         ContentCoding::Gzip => {
             let wire_len = body.len() as u64;
@@ -458,22 +501,45 @@ async fn admit_and_decode_body(
             // not just by --max-inflight-ingest-requests. A body whose inflate
             // would cross the ceiling is shed mid-inflate (429), before the
             // process grows by the full expansion.
-            let inflated = match inflate_gzip_gated(
+            //
+            // The real byte-rate charge is on the decompressed size (ADR-0084
+            // decision 4), so a compressing tenant and an uncompressing one
+            // sending the same telemetry are charged the same. The job makes it
+            // between the inflate and the decode, and on rejection drops the
+            // inflate charges, refunding the budget exactly.
+            let admission = Arc::clone(&state.admission);
+            let rate_tenant = tenant.clone();
+            let admit = move |decompressed_len: u64| {
+                admission.check_byte_rate(&rate_tenant, signal, decompressed_len, now_ns())
+            };
+            let decoded = match decode_gzip_gated::<M, _>(
                 state.write_gate.as_deref(),
                 body,
                 Arc::clone(&state.budget),
+                admit,
             )
             .await
             {
-                Ok(inflated) => inflated,
+                Ok(decoded) => decoded,
                 Err(err) => return Err(Box::new(gate_failure_response(err))),
             };
-            let (chunks, decode_charge) = match inflated {
+            let decoded = match decoded {
                 Ok(result) => result,
-                Err(GzipDecodeError::Shed) => {
+                Err(GzipJobError::Rejected(rejection)) => {
+                    return Err(Box::new(admission_rejection_response(rejection)));
+                }
+                Err(GzipJobError::Protobuf(err)) => {
+                    // Admitted by the byte rate, so recorded like any admitted
+                    // body before the 400.
+                    state
+                        .ingest_byte_metrics
+                        .record_wire_bytes(tenant, signal, wire_len);
+                    return Err(Box::new(invalid_payload_response(err)));
+                }
+                Err(GzipJobError::Inflate(GzipDecodeError::Shed)) => {
                     return Err(Box::new(ingest_buffer_budget_shed_response()));
                 }
-                Err(GzipDecodeError::TooLarge) => {
+                Err(GzipJobError::Inflate(GzipDecodeError::TooLarge)) => {
                     return Err(Box::new(
                         (
                             StatusCode::PAYLOAD_TOO_LARGE,
@@ -485,7 +551,7 @@ async fn admit_and_decode_body(
                             .into_response(),
                     ));
                 }
-                Err(GzipDecodeError::Invalid(detail)) => {
+                Err(GzipJobError::Inflate(GzipDecodeError::Invalid(detail))) => {
                     return Err(Box::new(
                         (
                             StatusCode::BAD_REQUEST,
@@ -495,23 +561,10 @@ async fn admit_and_decode_body(
                     ));
                 }
             };
-            let decompressed = ChunkedBody::new(chunks);
-            let decompressed_len = decompressed.remaining() as u64;
-            // The real byte-rate charge: the decompressed size (ADR-0084
-            // decision 4), so a compressing tenant and an uncompressing one
-            // sending the same telemetry are charged the same. On rejection the
-            // `decode_charge` guards drop, refunding the budget exactly.
-            if let Err(rejection) =
-                state
-                    .admission
-                    .check_byte_rate(tenant, signal, decompressed_len, now_ns())
-            {
-                return Err(Box::new(admission_rejection_response(rejection)));
-            }
             state
                 .ingest_byte_metrics
                 .record_wire_bytes(tenant, signal, wire_len);
-            Ok((decompressed, decode_charge))
+            Ok(decoded)
         }
     }
 }
@@ -542,9 +595,9 @@ pub struct GatewayState {
     /// by issue #1297). The same `Arc` the ingest routers hold via
     /// `with_budget`. The gzip inflate path (`admit_and_decode_body`) charges
     /// the decompressed bytes into it *while* it inflates, one charge per chunk
-    /// taken before that chunk is retained, and holds the charge through decode;
-    /// it releases the charge once prost has copied the chunks into owned
-    /// structs, before the router takes its own buffered charge, so the inflate
+    /// taken before that chunk is retained, and holds the charge through decode
+    /// and back to the handler with the decoded request; the handler releases
+    /// it before the router takes its own buffered charge, so the inflate
     /// charge and the buffered charge never coexist and transient decode memory
     /// is bounded by `--max-ingest-buffer-bytes` the same way buffered memory
     /// is.
@@ -556,10 +609,11 @@ pub struct GatewayState {
     /// and the layer-2 byte-rate check, so a shed request does none of that
     /// work.
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
-    /// The ADR-1702 write gate. A gzip body's inflate runs on it under the
-    /// `otlp_http_gzip` site, and an OTAP stream's payload decompression
-    /// under `otap_decode`, each sized by a bound on its inflated bytes. `None`
-    /// runs both inline on the request task.
+    /// The ADR-1702 write gate. A gzip body's inflate and protobuf decode run
+    /// on it as one job under the `otlp_http_gzip` site, and an OTAP stream's
+    /// payload decompression and Arrow IPC decode as one job under
+    /// `otap_decode`, each sized by a bound on its inflated bytes. `None` runs
+    /// both inline on the request task.
     pub write_gate: Option<Arc<WriteGate>>,
 }
 
@@ -775,34 +829,28 @@ async fn export_metrics(
     let mode = write_mode_from_headers(&headers);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
-    // byte rate and return the OTLP protobuf bytes, decompressing first when
-    // the client sent gzip. Identity is unchanged from before. On the gzip path
-    // `decode_charge` holds the process-wide budget charge for the retained
-    // inflate chunks (empty on the identity path); it is released once prost has
-    // decoded and freed them, just below (ADR-0069 as amended by issue #1297).
-    let (body, decode_charge) =
-        match admit_and_decode_body(&state, &headers, &tenant, Signal::Metrics, body).await {
-            Ok(decoded) => decoded,
-            Err(response) => return *response,
-        };
-
-    // `decode` consumes the chunked body, so prost's own return frees the
-    // retained inflate chunks: it copies them into owned protobuf structs and
-    // nothing borrows them afterwards.
-    let request = match ExportMetricsServiceRequest::decode(body) {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid OTLP payload: {err}"),
-            )
-                .into_response();
-        }
+    // byte rate and decode the OTLP request, decompressing first when the
+    // client sent gzip. On the gzip path `decode_charge` holds the process-wide
+    // budget charge the inflate took (empty on the identity path); the decode
+    // already consumed and freed the inflate chunks, and the charge now stands
+    // for the decoded request it came back with (ADR-0069 as amended by issue
+    // #1297).
+    let (request, decode_charge) = match admit_and_decode_body::<ExportMetricsServiceRequest>(
+        &state,
+        &headers,
+        &tenant,
+        Signal::Metrics,
+        body,
+    )
+    .await
+    {
+        Ok(decoded) => decoded,
+        Err(response) => return *response,
     };
-    // Release the inflate charge here, with the chunks already freed, before the
-    // router takes its own charge for the normalized batch: the inflate charge
-    // and the router's buffered charge never coexist, so a request whose inflate
-    // and batch each fit the budget is not shed for their sum (issue #1297).
+    // Release the inflate charge here, before the router takes its own charge
+    // for the normalized batch: the inflate charge and the router's buffered
+    // charge never coexist, so a request whose inflate and batch each fit the
+    // budget is not shed for their sum (issue #1297).
     drop(decode_charge);
 
     match crate::ingest::handle_export(&state.ingest, tenant, mode, request, now_ns()).await {
@@ -855,28 +903,23 @@ async fn export_logs(
     let mode = write_mode_from_headers(&headers);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
-    // byte rate and return the OTLP protobuf bytes, decompressing first when
-    // the client sent gzip. Identity is unchanged from before.
-    // `decode_charge`: see `export_metrics`. Released once decode has consumed
-    // and freed the inflate chunks, before the log write below.
-    let (body, decode_charge) =
-        match admit_and_decode_body(&state, &headers, &tenant, Signal::Logs, body).await {
-            Ok(decoded) => decoded,
-            Err(response) => return *response,
-        };
-
-    let request = match ExportLogsServiceRequest::decode(body) {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid OTLP payload: {err}"),
-            )
-                .into_response();
-        }
+    // byte rate and decode the OTLP request, decompressing first when the
+    // client sent gzip.
+    // `decode_charge`: see `export_metrics`. Released before the log write
+    // below.
+    let (request, decode_charge) = match admit_and_decode_body::<ExportLogsServiceRequest>(
+        &state,
+        &headers,
+        &tenant,
+        Signal::Logs,
+        body,
+    )
+    .await
+    {
+        Ok(decoded) => decoded,
+        Err(response) => return *response,
     };
-    // See `export_metrics`: decode consumed the chunks and prost owns the
-    // decoded structs, so release the charge before the router charges the
+    // See `export_metrics`: release the charge before the router charges the
     // normalized batch, so the two never coexist (issue #1297).
     drop(decode_charge);
 
@@ -941,26 +984,21 @@ async fn export_traces(
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): byte rate
     // applies uniformly to every signal including spans (even though spans get
     // no layer-4 admission), charged after decompression on the gzip path.
-    // `decode_charge`: see `export_metrics`. Released once decode has consumed
-    // and freed the inflate chunks, before the span write below.
-    let (body, decode_charge) =
-        match admit_and_decode_body(&state, &headers, &tenant, Signal::Spans, body).await {
-            Ok(decoded) => decoded,
-            Err(response) => return *response,
-        };
-
-    let request = match ExportTraceServiceRequest::decode(body) {
-        Ok(request) => request,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid OTLP payload: {err}"),
-            )
-                .into_response();
-        }
+    // `decode_charge`: see `export_metrics`. Released before the span write
+    // below.
+    let (request, decode_charge) = match admit_and_decode_body::<ExportTraceServiceRequest>(
+        &state,
+        &headers,
+        &tenant,
+        Signal::Spans,
+        body,
+    )
+    .await
+    {
+        Ok(decoded) => decoded,
+        Err(response) => return *response,
     };
-    // See `export_metrics`: decode consumed the chunks and prost owns the
-    // decoded structs, so release the charge before the router charges the
+    // See `export_metrics`: release the charge before the router charges the
     // normalized batch, so the two never coexist (issue #1297).
     drop(decode_charge);
 
@@ -1843,17 +1881,19 @@ pub(crate) mod tests {
     /// ADR-0069 as amended by issue #1297: the gzip inflate path charges the
     /// process-wide ingest byte budget exactly what it retains -- the summed
     /// length of the chunks it holds, which is the ACTUAL decompressed length,
-    /// not the compressed length and not the 64 MiB inflate cap -- and releases
-    /// it at the instant decode consumes and frees those chunks, before the
-    /// router takes its own buffered charge (finding 3), so the two never
-    /// coexist. Proven on `admit_and_decode_body` in isolation plus the modelled
-    /// drop point below.
+    /// not the compressed length and not the 64 MiB inflate cap -- and the
+    /// charge comes back held with the decoded request, so the handler can
+    /// release it before the router takes its own buffered charge (finding 3)
+    /// and the two never coexist. Proven on `admit_and_decode_body` in
+    /// isolation plus the modelled drop point below.
     ///
     /// The charge is asserted against the retained chunk total, not only against
     /// the decompressed length: those are the same figure only because the body
     /// is retained as exactly-sized chunks. A growing `Vec<u8>` would hold spare
     /// capacity (and, mid-reallocation, two allocations) that a length-based
-    /// charge would miss, and this assertion is what would catch that.
+    /// charge would miss, and this assertion is what would catch that. The
+    /// chunks are consumed inside the decode job, so that half is read off
+    /// `decompress_gzip_capped_charged` directly.
     ///
     /// Non-vacuity: change `decompress_gzip_capped_charged`'s per-chunk
     /// `budget.try_charge(read as u64)` to charge the compressed `body.len()`
@@ -1876,7 +1916,25 @@ pub(crate) mod tests {
         );
         assert_eq!(budget.in_flight_bytes(), 0);
 
-        let (body, charges) = admit_and_decode_body(
+        let (chunks, chunk_charges) =
+            decompress_gzip_capped_charged(&compressed, MAX_DECOMPRESSED_OTLP_BODY_BYTES, &budget)
+                .expect("gzip body inflates under a generous budget");
+        let chunk_lens = ChunkedBody::new(chunks).chunk_lens();
+        let chunk_total: u64 = chunk_lens.iter().map(|len| *len as u64).sum();
+        let chunk_charged: u64 = chunk_charges.iter().map(IngestByteCharge::bytes).sum();
+        assert_eq!(
+            chunk_charged, chunk_total,
+            "the summed charge equals the bytes actually retained, chunk for chunk"
+        );
+        assert!(
+            chunk_lens.iter().all(|len| *len <= INFLATE_CHUNK_BYTES),
+            "every retained chunk is bounded by the staging size, so none grew by \
+             reallocation: {chunk_lens:?}"
+        );
+        drop(chunk_charges);
+        assert_eq!(budget.in_flight_bytes(), 0);
+
+        let (request, charges) = admit_and_decode_body::<ExportMetricsServiceRequest>(
             &state,
             &gzip_headers(),
             &TenantId::new(TENANT),
@@ -1886,28 +1944,13 @@ pub(crate) mod tests {
         .await
         .expect("gzip body admitted under a generous budget");
 
-        assert_eq!(
-            body.remaining(),
-            encoded.len(),
-            "the decoded body is the full inflate"
-        );
-        let chunk_lens = body.chunk_lens();
-        let chunk_total: u64 = chunk_lens.iter().map(|len| *len as u64).sum();
         let charged: u64 = charges.iter().map(IngestByteCharge::bytes).sum();
         assert_eq!(
             charged,
             encoded.len() as u64,
             "the summed charge equals the decompressed length exactly"
         );
-        assert_eq!(
-            charged, chunk_total,
-            "the summed charge equals the bytes actually retained, chunk for chunk"
-        );
-        assert!(
-            chunk_lens.iter().all(|len| *len <= INFLATE_CHUNK_BYTES),
-            "every retained chunk is bounded by the staging size, so none grew by \
-             reallocation: {chunk_lens:?}"
-        );
+        assert_eq!(charged, chunk_total, "the same chunks were charged");
         assert_ne!(
             charged,
             compressed.len() as u64,
@@ -1915,32 +1958,28 @@ pub(crate) mod tests {
         );
         assert_eq!(
             budget.in_flight_bytes(),
-            chunk_total,
-            "in-flight bytes settle to the retained chunk total while the charge is held"
+            charged,
+            "in-flight bytes settle to the inflated length while the charge is held"
+        );
+        assert_eq!(
+            request.resource_metrics.len(),
+            1,
+            "the charge comes back with the decoded request"
         );
 
-        // The handler decodes the inflate chunks into owned protobuf structs;
-        // `decode` consumes the chunked body, so the chunks are freed when it
-        // returns and the handler then releases this charge, before the router
-        // takes its own (issue #1297). Model that point: decode, then drop the
-        // charge. The settled figure returns to zero at the instant the charge is
-        // released, with no router charge ever coexisting with the inflate charge.
-        let request = ExportMetricsServiceRequest::decode(body)
-            .expect("the inflate chunks decode into an owned request");
+        // The handler releases the charge here, before the router takes its
+        // own (issue #1297). The settled figure returns to zero at the instant
+        // the charge is released, with no router charge ever coexisting with
+        // the inflate charge.
         drop(charges);
         assert_eq!(
             budget.in_flight_bytes(),
             0,
-            "the inflate charge is released once decode has freed the chunks, before any router charge"
+            "the inflate charge is released before any router charge"
         );
-        // The decoded request owns its bytes, so it outlives the chunks it was
-        // copied from: the release above is sound precisely because nothing
-        // borrows them.
-        assert_eq!(
-            request.resource_metrics.len(),
-            1,
-            "the decoded request outlives the released inflate buffer"
-        );
+        // The decoded request owns its bytes, so it outlives the charge for
+        // the chunks it was decoded from.
+        assert_eq!(request.resource_metrics.len(), 1);
     }
 
     /// ADR-0069 as amended by issue #1297: a gzip inflate whose charge would
@@ -1975,7 +2014,7 @@ pub(crate) mod tests {
             .expect("prior charge fits under ceiling");
         assert_eq!(budget.in_flight_bytes(), PRIOR);
 
-        let response = admit_and_decode_body(
+        let response = admit_and_decode_body::<ExportMetricsServiceRequest>(
             &state,
             &gzip_headers(),
             &TenantId::new(TENANT),
@@ -2018,10 +2057,18 @@ pub(crate) mod tests {
             .map_or((0, 0), |s| (s.jobs, s.inline))
     }
 
-    /// A gzip inflate is sized by deflate's expansion bound on its compressed
+    /// Admits every decompressed length, for the tests that call
+    /// `decode_gzip_gated` without an admission controller.
+    fn admit_all(_decompressed_len: u64) -> Result<(), RequestRejection> {
+        Ok(())
+    }
+
+    /// A gzip decode is sized by deflate's expansion bound on its compressed
     /// length, capped: a body that compresses below the gate's default floor
     /// but can inflate above it runs on the gate, and only a body too small to
-    /// reach the floor at 1032:1 runs inline.
+    /// reach the floor at 1032:1 runs inline. The protobuf decode runs in the
+    /// same job: one job per body, and a body prost rejects comes back from
+    /// that job as the decode error.
     #[tokio::test]
     async fn the_gzip_job_is_sized_by_the_deflate_expansion_bound() {
         assert_eq!(
@@ -2035,29 +2082,48 @@ pub(crate) mod tests {
 
         let gate = gzip_gate(ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
         let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        // Zero bytes are not a protobuf message: field number 0 is invalid.
         let large = Bytes::from(gzip(&vec![0u8; 1024 * 1024]));
         assert!((large.len() as u64) < ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
-        let inflated = inflate_gzip_gated(Some(&gate), large, Arc::clone(&budget))
-            .await
-            .expect("gate result")
-            .expect("inflate");
+        let decoded = decode_gzip_gated::<ExportMetricsServiceRequest, _>(
+            Some(&gate),
+            large,
+            Arc::clone(&budget),
+            admit_all,
+        )
+        .await
+        .expect("gate result");
+        assert!(
+            matches!(decoded, Err(GzipJobError::Protobuf(_))),
+            "the job decoded the inflated bytes: {decoded:?}"
+        );
         assert_eq!(gzip_site(&gate), (1, 0));
-        drop(inflated);
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "a decode error drops the inflate charges inside the job"
+        );
 
-        let tiny = Bytes::from(gzip(b"hi"));
+        let tiny = Bytes::from(gzip(&compressible_request(1).encode_to_vec()));
         assert!(gzip_job_bytes(tiny.len() as u64, MAX_DECOMPRESSED_OTLP_BODY_BYTES) < 256 * 1024);
-        inflate_gzip_gated(Some(&gate), tiny, Arc::clone(&budget))
-            .await
-            .expect("gate result")
-            .expect("inflate");
+        let (request, _charges) = decode_gzip_gated::<ExportMetricsServiceRequest, _>(
+            Some(&gate),
+            tiny,
+            Arc::clone(&budget),
+            admit_all,
+        )
+        .await
+        .expect("gate result")
+        .expect("decode");
+        assert_eq!(request.resource_metrics.len(), 1);
         assert_eq!(gzip_site(&gate), (1, 1));
     }
 
-    /// Decision 6 for the gzip inflate: nothing is charged while the job waits
-    /// for a permit, and the charges the job took come back with the chunks
-    /// and stay held until the caller drops them.
+    /// Decision 6 for the gzip decode: nothing is charged while the job waits
+    /// for a permit, and the charges the job took come back with the decoded
+    /// request and stay held until the caller drops them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_gzip_charges_come_back_with_the_chunks() {
+    async fn the_gzip_charges_come_back_with_the_decoded_request() {
         let gate = gzip_gate(0);
         let (release, parked) = std::sync::mpsc::channel::<()>();
         let blocker_gate = Arc::clone(&gate);
@@ -2074,10 +2140,19 @@ pub(crate) mod tests {
         }
 
         let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
-        let body = Bytes::from(gzip(&vec![5u8; 100_000]));
-        let inflate = tokio::spawn({
+        let encoded = compressible_request(2000).encode_to_vec();
+        let body = Bytes::from(gzip(&encoded));
+        let decode = tokio::spawn({
             let (gate, budget) = (Arc::clone(&gate), Arc::clone(&budget));
-            async move { inflate_gzip_gated(Some(&gate), body, budget).await }
+            async move {
+                decode_gzip_gated::<ExportMetricsServiceRequest, _>(
+                    Some(&gate),
+                    body,
+                    budget,
+                    admit_all,
+                )
+                .await
+            }
         });
         while gate.queued() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -2090,18 +2165,53 @@ pub(crate) mod tests {
 
         release.send(()).expect("release the parked job");
         blocker.await.expect("blocker task");
-        let (chunks, charges) = inflate
+        let (request, charges) = decode
             .await
-            .expect("inflate task")
+            .expect("decode task")
             .expect("gate result")
-            .expect("inflate");
-        assert_eq!(chunks.iter().map(Bytes::len).sum::<usize>(), 100_000);
+            .expect("decode");
+        assert_eq!(request.resource_metrics.len(), 1);
         assert_eq!(
             budget.in_flight_bytes(),
-            100_000,
-            "the charges come back with the chunks, still held"
+            encoded.len() as u64,
+            "the charges come back with the decoded request, still held"
         );
         drop(charges);
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    /// A gzip body that inflates but is not a protobuf message is still the
+    /// client's 400 when its decode runs on the gate, not a gate fault, and
+    /// the job leaves nothing charged.
+    #[tokio::test]
+    async fn a_gated_gzip_body_prost_rejects_is_a_400() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
+        let mut state = Arc::into_inner(state_with_store_and_budget(
+            Arc::new(MemoryStore::new()),
+            AdmissionLimits::default(),
+            budget.clone(),
+        ))
+        .expect("the fixture's only handle");
+        let gate = gzip_gate(0);
+        state.write_gate = Some(Arc::clone(&gate));
+        let state = Arc::new(state);
+
+        let response = export_metrics(
+            State(state.clone()),
+            admitted_tenant(),
+            gzip_headers(),
+            Bytes::from(gzip(&[0u8; 4096])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert!(
+            String::from_utf8_lossy(&body).starts_with("invalid OTLP payload: "),
+            "{body:?}"
+        );
+        assert_eq!(gzip_site(&gate), (1, 0));
         assert_eq!(budget.in_flight_bytes(), 0);
     }
 

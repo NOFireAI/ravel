@@ -1,5 +1,5 @@
-//! ADR-1702 task 9: `StreamState::decode_gated` decompresses every payload on
-//! the write gate and decodes exactly what `decode` decodes inline.
+//! ADR-1702 task 9: `StreamState::decode_gated` decompresses and decodes every
+//! payload on the write gate, and decodes exactly what `decode` decodes inline.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
@@ -27,11 +27,14 @@ fn metric(name: &str, points: &[(i64, f64)]) -> MetricRow {
 
 /// Two batches on one stream, the second decoding against the IPC schema the
 /// first established, through a gated and an ungated `StreamState`. The
-/// decoded batches are equal, and the gate ran one `otap_decode` job per
-/// payload with an inline floor of 0, so every decompression went through it.
+/// decoded batches and the frame counts are equal, and the gate ran one
+/// `otap_decode` job per payload with an inline floor of 0, so every
+/// payload's decompression and decode went through it.
 ///
-/// Fails with `decompress_on_gate` decompressing inline whatever gate is set:
-/// the count reads `(0, 0)`.
+/// Fails with `decode_on_gate` decoding inline whatever gate is set: the
+/// count reads `(0, 0)`. Fails with the job's decoder or frame counts not
+/// put back on the stream: the second batch cannot decode against the first
+/// batch's schema, or the stats differ.
 #[tokio::test]
 async fn decode_gated_decompresses_every_payload_on_the_write_gate() {
     let gate = Arc::new(WriteGate::new(
@@ -62,6 +65,7 @@ async fn decode_gated_decompresses_every_payload_on_the_write_gate() {
         assert_eq!(actual.batch_id, expected.batch_id);
         assert_eq!(actual.payloads, expected.payloads);
     }
+    assert_eq!(gated.decode_stats(), inline.decode_stats());
     let site = gate
         .snapshot()
         .sites

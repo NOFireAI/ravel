@@ -680,10 +680,14 @@ production instance of each:
   RLOG and RSPAN, its blake3 content hash; RSEG's writer computes that hash
   itself. The data object PUT and the commit publish stay on the flush task.
   The three routers take the gate through `with_write_gate`.
-- `otap_decode`: one OTAP payload's zstd decompression, in
-  `StreamState::decode_gated`. The IPC decode after it stays on the stream's
-  task, which feeds the stateful decoders in payload order.
-- `otlp_http_gzip`: one OTLP-HTTP gzip body's inflate.
+- `otap_decode`: one OTAP payload's zstd decompression and Arrow IPC decode,
+  as one job, in `StreamState::decode_gated`. The job takes the payload's
+  stateful decoder out of the stream and returns it with the decoded
+  batches; the stream awaits one payload at a time, so its decoders are still
+  fed in payload order.
+- `otlp_http_gzip`: one OTLP-HTTP gzip body's inflate, decompressed-length
+  byte-rate check and protobuf decode, as one job, so the decode reads the
+  inflated bytes on the thread that produced them.
 - `remote_write_snappy`: one Remote Write body's snappy inflate and protobuf
   decode, as one job, since `ravel-remote-write` does both in one call.
 
@@ -721,8 +725,10 @@ never started:
   and come back with the object. The flush task holds them until its terminal
   outcome, after the commit publish, as before.
 - The gzip job takes each inflated chunk's charge as it produces the chunk,
-  and returns the charges with the chunks. The handler holds them through
-  protobuf decode, as before. Nothing is charged while the job waits.
+  holds the charges through the protobuf decode that consumes the chunks,
+  and returns them with the decoded request. The handler releases them before
+  the router takes its own buffered charge, where it released them before.
+  Nothing is charged while the job waits.
 - The snappy inflate's charge, the declared inflated length, is taken before
   submission and moves into the job, which returns it with the decoded
   request. The handler holds it through normalization, as before.
@@ -741,10 +747,10 @@ A gate result error fails the unit as a server fault, not as bad input:
 - An HTTP request answers 500 for a panicked job and 503 for a cancelled one.
 - An OTAP batch is nacked INTERNAL for a panicked job and UNAVAILABLE for a
   cancelled one, and the stream ends, as it does for a corrupted decoder. The
-  batch's earlier payloads have already fed their decoders and any schema or
-  dictionary messages in the failed payload never reach its decoder, so the
-  stream's decode state no longer matches what the client sent; a resend has
-  to start a fresh stream.
+  batch's earlier payloads have already fed their decoders and the failed
+  payload's decoder went into the job and did not come back, so the stream's
+  decode state no longer matches what the client sent; a resend has to start
+  a fresh stream.
 
 A flush's wait for its encode on the write gate is bounded by the flush's
 lifetime, re-derived when the shard permit is granted, as its store calls are.
@@ -753,8 +759,8 @@ retryable `Abandoned` and counted in
 `ravel_ingest_abandoned_queue_deadline_total`; an encode that had not started
 never runs.
 
-No write-gate job submits another one. A flush encode, a decompression and a
-Remote Write decode are each a synchronous codec call with no gate in reach.
+No write-gate job submits another one. A flush encode and each decode job
+are synchronous codec calls with no gate in reach.
 
 ### Task 10: maintenance on the read gate
 

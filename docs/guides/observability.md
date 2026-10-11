@@ -180,6 +180,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_abandoned_retry_exhausted_total` | Flushes abandoned by retry-budget or lifetime exhaustion. |
 | `ravel_ingest_abandoned_hour_bound_total` | Flushes abandoned at permit grant, before any store call, because the grant came after their pinned ingest hour's end plus `max_flush_lifetime`. The flush is not moved to a later hour, so a buffered flush queued behind a long stall drops its already-acknowledged rows here instead of publishing into an hour the catalog has sealed. Any increase means a shard's permits were held past an hour's bound, normally by a stall on the tenant's own prefix. |
 | `ravel_ingest_abandoned_input_rejected_total` | Flushes abandoned because the input could not build a durable object. |
+| `ravel_ingest_flush_gate_faults_total` | Flushes whose write gate encode panicked or was cancelled. Nothing is stored and the flush's rows are lost; its strict waiters get the retryable 503 (gRPC `UNAVAILABLE`). Counted here and in no `abandoned_*` family. |
 | `ravel_ingest_buffered_bytes_total` | Bytes admitted into shard buffers at enqueue time. |
 | `ravel_ingest_buffered_items_total` | Samples, records, or spans admitted into shard buffers. |
 | `ravel_ingest_acks_ok_total` | Strict-mode waiters acked with a commit token. |
@@ -228,6 +229,7 @@ process still renders a real (possibly zero) sample for each:
 - `ravel_ingest_queued_flushes`
 - `ravel_ingest_flush_trigger_deferred_total`
 - `ravel_ingest_abandoned_hour_bound_total`
+- `ravel_ingest_flush_gate_faults_total`
 - `ravel_ingest_grace_extended_stale_flushes_total`
 - `ravel_ingest_flush_all_residue_tenants_total`
 - The three `ravel_ingest_clock_lag_*` families
