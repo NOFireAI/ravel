@@ -30,10 +30,11 @@ fn batch_failed_reports_durable_tokens_not_empty() {
     );
 }
 
-/// Round-trip (issue #983): the machine-readable flush mix serializes and
-/// deserializes without changing the counts, and the final drain is keyed
-/// `final` in the serialized form (the Rust field is `final_drain`, since
-/// `final` is a keyword). Test 3's serialize/deserialize half.
+/// Round-trip (issues #983, #2753): the machine-readable flush mix serializes
+/// and deserializes without changing the counts. The router's loader-requested
+/// flushes split into `depth` (the loader's depth flushes on that shard,
+/// capped at the router's count) and `manual` (the rest), with `arrival`
+/// kept apart from `age`.
 #[test]
 fn flush_mix_report_round_trips_through_json() {
     let report = LoadReport {
@@ -42,9 +43,9 @@ fn flush_mix_report_round_trips_through_json() {
                 0,
                 FlushTriggerMix {
                     size: 5,
-                    arrival: 0,
+                    arrival: 1,
                     age: 2,
-                    final_drain: 1,
+                    final_drain: 3,
                 },
             ),
             (
@@ -57,25 +58,47 @@ fn flush_mix_report_round_trips_through_json() {
                 },
             ),
         ],
+        depth_flushes_by_shard: vec![(0, 2), (2, 9)],
         ..LoadReport::default()
     };
     let mix = report.flush_mix_report();
+    assert_eq!(
+        mix.shards[0].counts,
+        FlushMixCounts {
+            size: 5,
+            age: 2,
+            arrival: 1,
+            depth: 2,
+            manual: 1,
+        },
+        "shard 0: arrival stays apart from age, two of three requested flushes were depth flushes"
+    );
+    assert_eq!(
+        mix.shards[1].counts.depth, 3,
+        "a depth count above the router's requested flushes is capped at them"
+    );
     assert_eq!(
         mix.totals,
         FlushMixCounts {
             size: 5,
             age: 2,
-            arrival: 0,
-            final_drain: 4,
+            arrival: 1,
+            depth: 5,
+            manual: 1,
         },
         "totals sum each cause across shards"
     );
 
     let json = serde_json::to_string(&mix).expect("serialize");
-    assert!(
-        json.contains("\"final\":"),
-        "the drain is keyed `final` in the serialized form: {json}"
-    );
+    for key in [
+        "\"size\":",
+        "\"age\":",
+        "\"arrival\":",
+        "\"depth\":",
+        "\"manual\":",
+    ] {
+        assert!(json.contains(key), "{key} missing from {json}");
+    }
     let back: FlushMixReport = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(
         back, mix,
@@ -85,7 +108,7 @@ fn flush_mix_report_round_trips_through_json() {
     assert_eq!(back.shards[0].shard, 0);
     assert_eq!(back.shards[0].counts.size, 5);
     assert_eq!(back.shards[1].shard, 2);
-    assert_eq!(back.shards[1].counts.final_drain, 3);
+    assert_eq!(back.shards[1].counts.depth, 3);
 }
 
 /// The loader's two write windows compose as
@@ -98,7 +121,7 @@ fn flush_mix_report_round_trips_through_json() {
 #[test]
 fn default_max_inflight_flushes_matches_pipeline_depth() {
     assert_eq!(
-        DEFAULT_MAX_INFLIGHT_FLUSHES as usize, DEFAULT_PIPELINE_DEPTH,
+        DEFAULT_MAX_INFLIGHT_FLUSHES as usize, MEASURED_PIPELINE_DEPTH,
         "the inner flush window's default must track the outer pipeline depth's"
     );
 }
@@ -123,7 +146,12 @@ fn loader_flush_window_default_diverges_from_the_serving_default() {
         None,
         "the serving path leaves the share at max(1, N-1)"
     );
-    let cfg = build_ingest_config(4, DEFAULT_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    let cfg = build_ingest_config(
+        4,
+        PER_BATCH_TARGET_BYTES,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        None,
+    );
     assert_eq!(
         cfg.max_inflight_flushes_per_tenant,
         Some(DEFAULT_MAX_INFLIGHT_FLUSHES as usize),
@@ -131,9 +159,11 @@ fn loader_flush_window_default_diverges_from_the_serving_default() {
     );
 }
 
-/// `--max-flush-delay` unset (`None`) leaves the router's age trigger at
-/// its `IngestConfig::default()` value, so an omitted flag builds a
-/// byte-for-byte default config (issue #801, deliverable 1). The config
+/// A `None` max flush delay leaves the router's age trigger at its
+/// `IngestConfig::default()` value, so a library caller that passes none
+/// builds a byte-for-byte default config (issue #801, deliverable 1). The
+/// CLI resolves an omitted `--max-flush-delay` to `DEFAULT_MAX_FLUSH_DELAY`
+/// before it gets here (issue #2753). The config
 /// field is the thing that flows to the router, so it is what this asserts.
 ///
 /// Prove-the-test: change `build_ingest_config` to substitute any other
@@ -142,7 +172,12 @@ fn loader_flush_window_default_diverges_from_the_serving_default() {
 /// `left: 1s, right: 2s`.
 #[test]
 fn max_flush_delay_unset_keeps_the_default_age_trigger() {
-    let cfg = build_ingest_config(4, DEFAULT_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    let cfg = build_ingest_config(
+        4,
+        PER_BATCH_TARGET_BYTES,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        None,
+    );
     assert_eq!(
         cfg.max_flush_delay,
         IngestConfig::default().max_flush_delay,
@@ -162,7 +197,7 @@ fn max_flush_delay_unset_keeps_the_default_age_trigger() {
 fn max_flush_delay_set_reaches_the_config_exactly() {
     let cfg = build_ingest_config(
         4,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         Some(Duration::from_secs(600)),
     );
@@ -218,7 +253,7 @@ fn write_ack_deadline_scales_with_the_configured_flush_delay() {
 fn strict_visibility_budget_follows_the_configured_flush_delay() {
     let raised = build_ingest_config(
         4,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         Some(Duration::from_secs(600)),
     );
@@ -233,7 +268,12 @@ fn strict_visibility_budget_follows_the_configured_flush_delay() {
         "the budget must exceed the delay, not equal it: equal collapses the corridor"
     );
 
-    let unset = build_ingest_config(4, DEFAULT_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    let unset = build_ingest_config(
+        4,
+        PER_BATCH_TARGET_BYTES,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        None,
+    );
     assert_eq!(
         unset.strict_visibility_budget_ns,
         IngestConfig::default().strict_visibility_budget_ns,

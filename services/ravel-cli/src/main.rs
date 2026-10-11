@@ -506,10 +506,12 @@ enum Command {
         /// read cursors' decode holds about one batch of rows in total, and
         /// each flush's working set scales with the per-shard slice. The
         /// budget's estimated floor for those was measured at 500,000-row
-        /// batches (issue #2613). At the default `--target-bytes 1` each
-        /// batch also flushes as its own RLOG object per involved shard, so
-        /// there this sets the object size; to choose the object size
-        /// independently, use `--target-bytes`. Must be at least 1; 0 is
+        /// batches (issue #2613). With `--target-bytes` unset it does not set
+        /// the object size, which is `DEFAULT_OBJECT_ROWS` (250,000) rows per
+        /// shard object, but it does set the derived `--pipeline-depth`
+        /// (`ceil(250,000 x --shards / --batch-rows)`). With `--target-bytes
+        /// 1` each batch flushes as its own object per involved shard, so
+        /// there this sets the object size. Must be at least 1; 0 is
         /// rejected. Defaults to `DEFAULT_BATCH_ROWS` (10000).
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
         batch_rows: usize,
@@ -544,59 +546,75 @@ enum Command {
         /// Number of Strict writes allowed in flight at once. Each batch's
         /// write is one S3 PUT round trip per involved shard; at depth `1` the
         /// loader submits one write and waits for its ack before building or
-        /// submitting the next, so that round-trip latency is serial and the
-        /// machine has nothing to run in between. Raising the depth lets up to
-        /// this many writes overlap, hiding the PUT latency behind later
-        /// batches' encode and I/O. Defaults to `DEFAULT_PIPELINE_DEPTH` (4),
-        /// which is where the measured 2.94x on the 100M-row ClickBench corpus
-        /// comes from (ADR-0807); `1` restores the old one-batch-at-a-time
-        /// behavior. The cost is memory: each in-flight write keeps its built
+        /// submitting the next, so that round-trip latency is serial. Raising
+        /// the depth lets up to this many writes overlap. Unset, the depth is
+        /// derived once the first batch is decoded (issue #2753): the rows
+        /// bound `ceil(250,000 x --shards / --batch-rows)`, lowered to the
+        /// memory bound `--load-memory-bytes` divided by the estimated object
+        /// bytes of one batch when that is smaller, never below 1, and capped
+        /// at 1,024. With `--target-bytes` unset the loader also flushes every
+        /// shard once the oldest batch pending on any shard is this many
+        /// submitted batches old (a size flush restarts only its own shard's
+        /// window); an explicit `--target-bytes` turns that depth flush off.
+        /// The durable-token list a failed load reports
+        /// is exactly what landed at any depth. `0` is rejected.
+        ///
+        /// At the defaults (4 shards, 10,000-row batches) the rows bound is
+        /// 100, enough batches in flight for every shard to fill one
+        /// 250,000-row object. The summary, the stderr geometry line printed
+        /// before the first write, and the JSON load report name the depth
+        /// and which bound decided it (`rows`, `memory`, `cap` or `flag`). The
+        /// load report counts the depth flush's flushes under `depth`.
+        /// `4` (`MEASURED_PIPELINE_DEPTH`) is the depth measured at 2.94x on
+        /// the 100M-row ClickBench corpus at one object per batch (ADR-0807),
+        /// and `1` is one batch at a time.
+        ///
+        /// The cost is memory: each in-flight write keeps its built
         /// batch resident until its ack, so the window adds up to this many
         /// built batches to the working set. That is an upper bound, not the
         /// typical cost: the single decode task is usually the bottleneck and
         /// the window seldom fills, and on the 100M-row ClickBench corpus
         /// depth 4 against depth 1 was 11-17% of peak RSS at 500,000- and
         /// 1,000,000-row batches (issue #2613; docs/internal/loader-memory-2613.md
-        /// attributes the peak by allocation site). Those batches are charged
-        /// to `--load-memory-bytes`, so the depth cannot take them past it: the
-        /// decoder waits instead. The reported
+        /// attributes the peak by allocation site). On a logs load those
+        /// batches are charged to `--load-memory-bytes`, so the depth cannot
+        /// take them past it: the decoder waits instead. The reported
         /// durable-token list is unaffected by the depth. It is always exactly
         /// the batches strictly before the failing one, in submission order,
         /// followed by whatever a batch submitted after the failing one had
         /// committed: on a failure the loader resolves every outstanding write
         /// before returning rather than abandoning it, so the report equals what
         /// landed at any depth, and a resume from it does not re-ingest rows
-        /// that already committed. `0` is rejected.
+        /// that already committed.
         ///
-        /// With `--target-bytes` above `1` the depth also bounds object size
-        /// and load time: each Strict write waits for the flush of its own
-        /// batch, so one object merges at most this many batches' slices, and
-        /// a depth below the batches one object needs on a shard leaves the
-        /// writes waiting for `--max-flush-delay` to close it. Set it to at
-        /// least that many batches. On ClickBench at `--batch-rows 100000
-        /// --target-bytes 1650000000 --max-flush-delay 30s` (issue #2627),
-        /// depth 16 loaded in 1,990 s, 24 in 1,139 s and 32 in 858 s, with
+        /// With a flush target above `1` the depth also bounds object size:
+        /// each Strict write waits for the flush of its own batch inside the
+        /// window, so one object merges at most this many batches' slices. An explicit depth
+        /// below the batches one object needs on a shard gives objects of
+        /// about `depth x --batch-rows / --shards` rows. On ClickBench at
+        /// `--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay
+        /// 30s` (issue #2627, before the depth flush existed), depth 16
+        /// loaded in 1,990 s, 24 in 1,139 s and 32 in 858 s, with
         /// `--load-memory-bytes` raised alongside to 5,000,000,000,
         /// 5,500,000,000 and 6,500,000,000 and peak loader RSS 4.34, 5.77
         /// and 6.42 GB.
-        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_PIPELINE_DEPTH)]
-        pipeline_depth: usize,
+        #[arg(long)]
+        pipeline_depth: Option<usize>,
         /// Number of flushes one shard may have in flight at once (issue #807).
-        /// This bounds the shard actor's own flush pipeline, PER SHARD: the
-        /// loader writes one RLOG object per batch per involved shard, and at
-        /// `1` a shard actor must wait for the previous object's PUT and
+        /// This bounds the shard actor's own flush pipeline, PER SHARD: at `1`
+        /// a shard actor must wait for the previous object's PUT and
         /// commit-record publish before it starts the next one, so a second
-        /// batch landing on the same shard queues behind the first even when
-        /// `--pipeline-depth` has already handed both to the router. The
-        /// resulting ceiling on genuinely concurrent flushes is roughly
+        /// flush on the same shard queues behind the first even when
+        /// `--pipeline-depth` has already handed both batches to the router.
+        /// The resulting ceiling on genuinely concurrent flushes is roughly
         /// `--shards` x this value, capped additionally by `--pipeline-depth`
         /// (the loader never keeps more than that many writes outstanding, so a
         /// value above `--pipeline-depth` cannot be reached). Defaults to
-        /// `DEFAULT_MAX_INFLIGHT_FLUSHES`, which tracks `--pipeline-depth`'s own
-        /// default (4) so the inner window never re-serialises what the outer
-        /// one made concurrent. Setting it below `--pipeline-depth` makes each
-        /// shard's excess batches queue on this semaphore, and they still have
-        /// to clear it inside the 60s Strict ack deadline. On this bulk path it
+        /// `DEFAULT_MAX_INFLIGHT_FLUSHES` (4, `MEASURED_PIPELINE_DEPTH`), the
+        /// depth ADR-0807 measured at one object per batch. Setting it below
+        /// the pipeline depth makes each shard's excess flushes queue on this
+        /// semaphore, and they still have to clear it inside the Strict ack
+        /// deadline (`--max-flush-delay` plus one minute). On this bulk path it
         /// costs no extra memory: the resident flush working set is whatever the
         /// outstanding batches carry and `--pipeline-depth` already caps that,
         /// so this knob only decides whether those objects are encoded and PUT
@@ -621,94 +639,97 @@ enum Command {
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_DECODE_QUEUE_BATCHES)]
         decode_queue_batches: usize,
         /// The object-size setting: the estimated UNCOMPRESSED content a
-        /// shard's buffer accumulates before it flushes as one RLOG object
-        /// (issue #801). Stored objects come out much smaller than the
-        /// target: on the ClickBench corpus the estimate counts about 7.4 KB
-        /// per row and a stored object holds about 102 bytes per row, so
-        /// stored objects are about 65 to 75 times below the target
-        /// (375,000,000 gave 5.7 MB objects, 66x; 1,650,000,000 about 22 MB,
-        /// 75x; 1,850,000,000 25.1 MB mean, 74x). That ratio is a
-        /// property of that corpus, not of the format. At the default `1`
-        /// every batch flushes as its own object the moment it is written:
-        /// one object per involved shard per batch, so `--batch-rows` sets
-        /// its size. A larger value lets a shard merge several batches'
-        /// slices into one buffer until the target is reached, but each
-        /// Strict write waits for the flush of its own batch, so a buffer
-        /// merges at most `--pipeline-depth` batches' slices.
+        /// shard's buffer accumulates before it flushes as one object (issue
+        /// #801). Unset, the target is derived once the first batch is
+        /// decoded (issue #2753): `DEFAULT_OBJECT_ROWS` (250,000) times that
+        /// batch's estimated bytes per row, so the size trigger fires at
+        /// about 250,000 rows on every signal, and the depth flush closes a
+        /// shard whose rows came out narrower at the `--pipeline-depth` row
+        /// bound. An explicit value is used as given and turns the depth
+        /// flush off. Stored objects come out much smaller than the target.
+        /// `0` is rejected.
         ///
-        /// Large objects from small batches need all three settings together:
-        /// this target, a `--pipeline-depth` that covers the batches one
-        /// object needs on a shard, and a `--max-flush-delay` long enough for
-        /// one object to fill. Measured on ClickBench (issue #2627),
-        /// `--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay
-        /// 30s --pipeline-depth 32 --load-memory-bytes 6500000000` stored
-        /// objects of 25.1 MB (mean) and loaded in 896 s at a 7.03 GB peak
-        /// loader RSS on a 16-vCPU 128 GB host. A 1,650,000,000 target at the
-        /// 2s default delay closed 798 of its 916 objects on age (10.2 MB
-        /// median).
+        /// On the ClickBench corpus the logs estimate counts about 7.4 KB per
+        /// row and a stored object holds about 102 bytes per row, so stored
+        /// objects are about 65 to 75 times below the target (375,000,000
+        /// gave 5.7 MB objects, 66x; 1,650,000,000 about 22 MB, 75x;
+        /// 1,850,000,000 25.1 MB mean, 74x). That ratio is a property of that
+        /// corpus, not of the format. The summary, the stderr geometry line
+        /// and the JSON load report print the derived target and the bytes
+        /// per row it came from. Rows wider than the first batch's reach the
+        /// target sooner, so only they move the size trigger.
         ///
-        /// The estimate sums body, severity text, stream attributes,
+        /// `--target-bytes 1 --batch-rows N` restores the layout every load
+        /// had before issue #2753, when `1` was the default: every batch
+        /// flushes as its own object the moment it is written, one object per
+        /// involved shard per batch, so `--batch-rows` sets its size. Any
+        /// value above `1` lets a shard merge several batches' slices into one
+        /// buffer until the target is reached, but each Strict write waits
+        /// for the flush of its own batch, so a buffer merges at most
+        /// `--pipeline-depth` batches' slices.
+        ///
+        /// Measured on ClickBench before the derived default existed (issue
+        /// #2627), `--batch-rows 100000 --target-bytes 1850000000
+        /// --max-flush-delay 30s --pipeline-depth 32 --load-memory-bytes
+        /// 6500000000` stored objects of 25.1 MB (mean) and loaded in 896 s at
+        /// a 7.03 GB peak loader RSS on a 16-vCPU 128 GB host. A
+        /// 1,650,000,000 target at the then-default 2s delay closed 798 of
+        /// its 916 objects on age (10.2 MB median).
+        ///
+        /// The logs estimate sums body, severity text, stream attributes,
         /// attribute names and values, and fixed per-row fields over the rows
-        /// the buffer holds. The check runs once per
-        /// write, after a batch's per-shard slice has merged, so a target at
-        /// or below one slice's estimate (`--batch-rows / --shards` rows) is
-        /// exceeded by the first write into an empty buffer and reproduces the
-        /// `1` layout. A load whose `--target-bytes` turned out to lay the
-        /// objects out exactly as `1` would have says so on stderr.
+        /// the buffer holds; metrics and spans use their routers' own
+        /// estimates. The check runs once per write, after a batch's
+        /// per-shard slice has merged, so a target at or below one slice's
+        /// estimate (`--batch-rows / --shards` rows) is exceeded by the first
+        /// write into an empty buffer and reproduces the `1` layout. A load
+        /// whose target turned out to lay the objects out exactly as `1`
+        /// would have says so on stderr and in the load report.
         ///
-        /// Buffered batches stay charged to `--load-memory-bytes` until their
-        /// flush finishes. When two checks 250 ms apart both find the decoder
-        /// waiting for room in that budget and the bytes charged not lower
-        /// than at the first, the loader flushes every shard buffer early
-        /// rather than wait for the
-        /// target or the age trigger, so a target the budget cannot hold
-        /// yields smaller objects, never a stalled load.
+        /// On a logs load buffered batches stay charged to
+        /// `--load-memory-bytes` until their flush finishes. When two checks
+        /// 250 ms apart both find the decoder waiting for room in that budget
+        /// and the bytes charged not lower than at the first, the loader
+        /// flushes every shard buffer early rather than wait for the target
+        /// or the age trigger, so a target the budget cannot hold yields
+        /// smaller objects, never a stalled load.
         ///
         /// The trade is ack timing, not durability. A Strict write's ack is
         /// still sent only after its records' object and commit record are
         /// published, so an ack always means durable. But above `1` the flush
         /// that answers a batch's ack may be triggered by a LATER batch, so
-        /// that ack now waits for one; a buffer that never reaches the target
-        /// waits for the router's wall-clock age trigger instead
-        /// (`--max-flush-delay`, 2s by default), or, at the end of the input,
-        /// for the loader's own force-flush. Set `--pipeline-depth` to at
-        /// least the number of batches that accumulate into one flush, or
-        /// every flush waits out that timer. `0` is rejected.
-        #[arg(long, value_name = "BYTES", default_value_t = ravel_cli::load::DEFAULT_TARGET_BYTES)]
-        target_bytes: usize,
+        /// that ack waits for one: the size trigger, the depth flush (derived
+        /// target only), the wall-clock age trigger
+        /// (`--max-flush-delay`, 60s by default) or, at the end of the input,
+        /// the loader's own force-flush. `0` is rejected.
+        #[arg(long, value_name = "BYTES")]
+        target_bytes: Option<usize>,
         /// How long a shard buffer may age before the router flushes it,
         /// regardless of `--target-bytes` (issue #801). A humantime duration
-        /// (`2s`, `10m`, `1h5m`). Unset leaves the router's default (2s), so an
-        /// omitted flag changes a load's object layout not at all.
+        /// (`2s`, `10m`, `1h5m`). Unset, it is `DEFAULT_MAX_FLUSH_DELAY` (60s)
+        /// on every signal (issue #2753), long enough that the size trigger
+        /// and the depth flush, not the age trigger, close a bulk load's
+        /// objects.
         ///
         /// This is the THIRD binding constraint on object size, beside
         /// `--target-bytes` and one batch's per-shard slice footprint. A shard
         /// flushes on the first of: its buffer reaches `--target-bytes`, its
-        /// oldest buffered point ages past this delay, or the final drain at
-        /// load close. At the 2s default a buffer that fills slower than one
-        /// target's worth every 2s ages out before it ever reaches a large
-        /// `--target-bytes`, so the size trigger never fires and the target is
-        /// unreachable as a lever no matter how large it is set: the v4 load's
-        /// ~11,871-row objects are about 2s of one shard's ingest rate. To make
-        /// `--target-bytes` bind, raise this past the time one target's worth
-        /// takes to accumulate on a shard.
+        /// oldest buffered point ages past this delay, the depth flush (with
+        /// `--target-bytes` unset), or the final drain at load close. A
+        /// buffer that fills slower than one target's worth per delay ages out
+        /// before it ever reaches the target, so the size trigger never fires
+        /// no matter how large the target is: at the router's own 2s delay the
+        /// v4 load's ~11,871-row objects were about 2s of one shard's ingest
+        /// rate.
         ///
-        /// The interaction is a triangle: `--target-bytes` binds only when the
-        /// buffer both SURVIVES long enough (this flag) and FILLS fast enough
-        /// (`--pipeline-depth` at least the number of batches that accumulate
-        /// into one flush, so a later batch is in flight to push the buffer over
-        /// the target before it ages out). Setting any one of the three without
-        /// the other two leaves the object layout at the `--target-bytes 1`
-        /// shape.
-        ///
-        /// The trade is ack latency, not durability, and it lands mid-load
-        /// rather than at the tail. At the end of the input the loader force-
-        /// flushes every shard buffer (the load report's flush mix counts those
-        /// under `final`) before waiting on the last batches' acks, so a tail
-        /// buffer left under `--target-bytes` is published there and never
-        /// waits out this delay. Mid-load, a buffer that misses
-        /// `--target-bytes` because a batch's slices fell unevenly waits up to
-        /// this delay for the age trigger, and every write's ack deadline is
+        /// The trade is ack latency, not durability. At the end of the input
+        /// the loader force-flushes every shard buffer (the load report's
+        /// flush mix counts those under `manual`) before waiting on the last
+        /// batches' acks, so a tail buffer left under `--target-bytes` is
+        /// published there and never waits out this delay. Mid-load, a buffer
+        /// that misses `--target-bytes` waits for the depth flush (derived
+        /// target only), another batch's flush, or up to this delay for the
+        /// age trigger, and every write's ack deadline is
         /// raised to this delay plus one minute so that wait completes instead
         /// of failing the load. An ack still means durable whenever it arrives.
         ///
@@ -759,8 +780,15 @@ enum Command {
         /// names the budget, its source and the floor. The summary prints the
         /// budget, its source, the floor, the peak bytes charged (above the
         /// budget only when one batch alone is larger) and how often the
-        /// decoder waited. A metrics or spans load ignores this flag and warns
-        /// when it is set. `0` is rejected.
+        /// decoder waited.
+        ///
+        /// On every signal the budget also bounds the derived
+        /// `--pipeline-depth` (issue #2753): the depth is at most the budget
+        /// divided by one batch's estimated bytes (`--batch-rows` x the first
+        /// batch's estimated bytes per row), and never below 1. A metrics or
+        /// spans load charges nothing to the budget while it runs; there it
+        /// only bounds that depth, with the floor taken at one read cursor.
+        /// `0` is rejected.
         #[arg(long, value_name = "BYTES")]
         load_memory_bytes: Option<u64>,
         /// Fold the loaded tenant's logs catalog once the load succeeds
@@ -4058,17 +4086,12 @@ mod tests {
         assert!(scope_set("none").is_err());
     }
 
-    /// The shipped write-concurrency defaults, read where an operator meets
-    /// them: `ravel load` with neither window flag given (issue #800). The
-    /// constants in `load.rs` are only the shipped behaviour if the clap
-    /// attributes actually reference them, and a `default_value_t = 1` literal
-    /// on either flag would leave the library constant correct and the binary
-    /// serial.
-    ///
-    /// Non-vacuity (prove-the-test): the pre-change tree had
-    /// `#[arg(long, default_value_t = 1)] pipeline_depth`, and this test's
-    /// `pipeline_depth == DEFAULT_PIPELINE_DEPTH` assertion fails against it
-    /// (1 against 4).
+    /// The shipped write-concurrency and object-size defaults, read where an
+    /// operator meets them: `ravel load` with none of the window or target
+    /// flags given (issues #800, #2753). `--pipeline-depth` and
+    /// `--target-bytes` must reach the loader unset, so it derives both from
+    /// the first batch; a `default_value_t` on either would pin the layout the
+    /// derived default replaced.
     #[test]
     fn load_write_window_flags_default_to_the_documented_constants() {
         let cli = Cli::try_parse_from([
@@ -4085,6 +4108,7 @@ mod tests {
 
         let Command::Load {
             pipeline_depth,
+            target_bytes,
             max_inflight_flushes,
             ..
         } = cli.command
@@ -4093,9 +4117,12 @@ mod tests {
         };
 
         assert_eq!(
-            pipeline_depth,
-            ravel_cli::load::DEFAULT_PIPELINE_DEPTH,
-            "--pipeline-depth must default to DEFAULT_PIPELINE_DEPTH"
+            pipeline_depth, None,
+            "--pipeline-depth must reach the loader unset so it is derived"
+        );
+        assert_eq!(
+            target_bytes, None,
+            "--target-bytes must reach the loader unset so it is derived"
         );
         assert_eq!(
             max_inflight_flushes,
@@ -4104,8 +4131,8 @@ mod tests {
         );
     }
 
-    /// `--max-flush-delay` is absent by default (so the loader keeps the
-    /// router's own age-trigger default) and, when given, parses humantime into
+    /// `--max-flush-delay` is absent by default (so the loader resolves it to
+    /// `DEFAULT_MAX_FLUSH_DELAY` on every signal) and, when given, parses humantime into
     /// the `Option<Duration>` the load handler threads on (issue #801).
     #[test]
     fn max_flush_delay_flag_is_optional_and_parses_humantime() {
@@ -4130,7 +4157,7 @@ mod tests {
         };
         assert_eq!(
             max_flush_delay, None,
-            "an omitted --max-flush-delay leaves the router default in place"
+            "an omitted --max-flush-delay reaches the loader unset"
         );
 
         let Command::Load {

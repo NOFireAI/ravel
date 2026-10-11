@@ -1831,8 +1831,10 @@ routes rows to every configured shard; with narrower fan-out the active shard
 count replaces `shards` and the real ceiling is lower. The third term is the
 queued-flush cap (the ADR-1642 amendment): a shard stops spawning flush tasks
 at that count, so permits above it are unreachable. The loader takes the
-`IngestConfig` default of 8, above both other windows at their defaults of 4,
-so it does not bind there; `ravel-server` raises the effective
+`IngestConfig` default of 8, above `--max-inflight-flushes`'s default of 4,
+so it does not bind there (`--pipeline-depth` is derived from the object
+geometry when unset, so the per-shard window is the one that
+binds at the defaults); `ravel-server` raises the effective
 `--max-queued-flushes` to match a larger `--max-inflight-flushes`, with a
 warning naming both numbers, rather than let the difference read as
 backpressure.

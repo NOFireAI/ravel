@@ -202,7 +202,8 @@ the audit changed nothing.
    it (`config.rs:2065`). Exposing the knob is not changing its default.
 
 3. **Both bulk-loader defaults stay at 1.** (Both are 4 since the #800
-   amendment below; what follows is the reasoning it replaced.)
+   amendment below, and `--pipeline-depth` is derived since the #2753
+   amendment below; what follows is the reasoning they replaced.)
    `--pipeline-depth` and
    `--max-inflight-flushes` both default to 1, preserving today's
    one-batch-at-a-time behavior and today's exact durable-token report.
@@ -373,7 +374,9 @@ not have made it one.
 
 ### Amended decisions
 
-**3 (amended). Both bulk-loader defaults are 4.** `DEFAULT_PIPELINE_DEPTH = 4`
+**3 (amended). Both bulk-loader defaults are 4.** (The `--pipeline-depth` half
+of this decision is superseded by the #2753 amendment below; `4` remains the
+`--max-inflight-flushes` default.) `DEFAULT_PIPELINE_DEPTH = 4`
 and `DEFAULT_MAX_INFLIGHT_FLUSHES = DEFAULT_PIPELINE_DEPTH`, pinned to each other
 by test, because an inner window below the outer one re-serialises each shard's
 PUT round trips and an inner window above it is unreachable. `4` and not higher:
@@ -426,3 +429,33 @@ the old defaults also stands, and now has a second reason to be re-measured: the
 defaults themselves have moved.
 
 Refs: #800
+
+## Amendment (issue #2753): the pipeline depth is derived, so decision 3 covers `--max-inflight-flushes` only
+
+<!-- amendment-applies: sections="Decision" pointer="#2753 amendment" -->
+<!-- amendment-supersedes: phrase="Both bulk-loader defaults are 4" pointer="#2753 amendment" -->
+
+Issue #2753 (epic #2707) removes the fixed `--pipeline-depth` default. With
+the flag unset, `ravel-cli load` derives the depth once the first batch is
+decoded, as `ceil(250,000 x shards / batch_rows)`, lowered to the memory bound
+when that is smaller and capped at 1,024, so that about 250,000 rows reach each
+shard before its buffer is flushed (`services/ravel-cli/src/load/geometry.rs`,
+`resolve_geometry`). The constant amended decision 3 named,
+`DEFAULT_PIPELINE_DEPTH`, is renamed `MEASURED_PIPELINE_DEPTH`: it still
+records the depth of 4 this ADR measured, and `DEFAULT_MAX_INFLIGHT_FLUSHES`
+is still pinned to it by test, so the per-shard flush window keeps the
+measured default. Amended decision 3 therefore now decides one default, not
+two: `--max-inflight-flushes` is 4; `--pipeline-depth` has no fixed default
+and an explicit value still wins. A derived depth at or above 4 puts the outer
+window at or above the inner one, the case the reasoning that kept the two
+windows equal says re-serialises a shard's PUT round trips, but at the derived
+defaults a write no longer flushes on its own: a shard's buffer closes on the
+size trigger at the derived target or on the depth flush, which is one
+`flush_all` per window of `--pipeline-depth` writes. A shard therefore asks for
+one flush per object rather than one per batch, and the inner window is largely
+unconsulted. The pinning amended decision 3 made is preserved for the explicit
+`--pipeline-depth` path, where `--pipeline-depth 4` still meets an inner window
+of 4, and for the size-trigger path: an explicit `--target-bytes` turns the
+depth flush off, and at `--target-bytes 1` every write flushes as its own
+object, the layout decision 3 measured. The ingest guide (`docs/guides/ingest.md`, "Object geometry") states the
+derivation and its three bounds.

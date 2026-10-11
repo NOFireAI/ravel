@@ -88,9 +88,12 @@ ravel-cli --store <your-store-flags> load \
   --fold-after-load
 ```
 
-The two write-concurrency flags are spelled out here only because this is a
-worked example; both already default to `4`, so omitting them loads the same
-way. Set them to `1` to reproduce the pre-issue-#800 serial behaviour.
+`--max-inflight-flushes` already defaults to `4`. `--pipeline-depth` no longer
+does: unset, it is derived (issue #2753; 25 at `--shards 4 --batch-rows 40000`,
+see docs/guides/ingest.md), so the example spells out `4` together with
+`--target-bytes 1` to keep the one-object-per-batch layout this runbook
+measures. Set both write-concurrency flags to `1` to reproduce the
+pre-issue-#800 serial behaviour.
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
 one RLOG object per shard the batch's rows land on. Per-object cost (LIST,
@@ -118,7 +121,8 @@ spread and this flag as one of the levers to raise it.
 a shard: rows spread across all `--shards` instead of every row landing on
 shard 0. That changes the batch-rows arithmetic. A batch's rows now split
 across up to `--shards` shards, and each shard's slice flushes as its own
-object *immediately* (at the default `--target-bytes 1`) — before it
+object *immediately* (at `--target-bytes 1`, which the example sets and
+which was the default before issue #2753) — before it
 can reach the `block_target_records` block target (8192 rows). With the
 default `--batch-rows 10000` and `--shards 4`, a shard's slice averages ~2500
 rows, well under one full block, and object count would inflate well past
@@ -139,7 +143,9 @@ means raising `--batch-rows` to match, regardless of `--read-cursors`.
 does not multiply Arrow batch memory. It is not free, though: a larger target
 means each active shard holds a larger *encoded* buffer until it flushes, so
 total encoded-buffer memory scales with the target times the shard count. What
-stays bounded is the Arrow side, which is what made `--batch-rows` expensive. At the default `1` a shard's slice of a batch flushes as
+stays bounded is the Arrow side, which is what made `--batch-rows` expensive.
+Unset, the target is derived from the first batch as 250,000 rows' worth of
+estimated bytes (issue #2753). At `1`, the default before that, a shard's slice of a batch flushes as
 its own object the moment it is written: one object per involved shard per
 batch, `--batch-rows` sets its size, no buffer lingers. Any larger value is a
 byte target the shard accumulates *encoded* records toward across several
@@ -148,9 +154,9 @@ held resident. That is the difference that matters at 100M rows: raising
 `--batch-rows` for bigger objects costs memory linearly, because each Arrow
 batch is buffered whole (measured on issue #801: 6x the batch rows reached
 27.4GB RSS on a 30GB box in 2.5 minutes), while raising `--target-bytes` costs
-one partially-filled shard buffer per shard. For reference, the default load
-geometry at `--batch-rows 65536` over 100M rows wrote 8424 objects of 1.32MB
-each: 16,850 PUTs during the load and an 8424-GET floor on every query
+one partially-filled shard buffer per shard. For reference, the load geometry
+that was the default before issue #2753 (target `1`, depth `4`) at
+`--batch-rows 65536` over 100M rows wrote 8424 objects of 1.32MB each: 16,850 PUTs during the load and an 8424-GET floor on every query
 afterward. `IngestConfig`'s own default target is 8MiB.
 
 The trade is ack timing, not durability. A Strict write's ack is still sent
@@ -158,12 +164,15 @@ only after that flush's data object and commit record are published, so an ack
 always means the records are durable. But above `1` the flush that answers a
 batch's ack may be triggered by a *later* batch reaching the target, so that
 ack now waits for one; a buffer that never reaches the target is released by
-the ingest router's wall-clock age trigger instead (`max_flush_delay`, 2s),
-which is also what releases the tail of every load. Two consequences for a bulk
-load: set `--pipeline-depth` to at least the number of batches that accumulate
-into one flush, or the loader blocks on an ack no submitted batch can release
-and every flush waits out that 2s timer; and objects bucket by their flush-open
-wall-clock reading, which above `1` is later than the write that filled them.
+the ingest router's wall-clock age trigger instead (`--max-flush-delay`, 60s
+by default since issue #2753), and the loader's own drain releases the tail of
+every load. With the target derived, the loader also flushes every shard each
+`--pipeline-depth` batches; with an explicit target it does not. Two
+consequences for a bulk load with an explicit target: set `--pipeline-depth` to
+at least the number of batches that accumulate into one flush, or the loader
+blocks on an ack no submitted batch can release and every flush waits out the
+age trigger; and objects bucket by their flush-open wall-clock reading, which
+above `1` is later than the write that filled them.
 `0` is rejected.
 
 `--pipeline-depth` and `--max-inflight-flushes` are the two write-concurrency
@@ -189,8 +198,11 @@ took 673.9ms, depth 4 / flushes 1 took 671.9ms, depth 1 / flushes 4 took
 673.3ms, and depth 4 / flushes 4 took 169.3ms. The first three are the same
 number.
 
-Both therefore default to `4`, and the recipe for tuning further is to raise
-them together (and to raise `--shards` toward core count, which is a
+`--max-inflight-flushes` therefore defaults to `4`. `--pipeline-depth` has no
+fixed default since issue #2753: unset, it is derived as the lowest of the rows
+bound, the memory bound and 1,024 (see `docs/guides/ingest.md`), which at the
+default `--batch-rows` is 25 on one shard. The recipe for tuning further is to
+raise them together (and to raise `--shards` toward core count, which is a
 provisioning decision made when the signal is provisioned, not a per-load
 knob).
 
@@ -255,10 +267,11 @@ the loader does not compute or enforce a safe ceiling for you: size
 `--pipeline-depth` against your host's memory the same way you size the
 `--batch-rows` x `--shards` product, measuring on your own allocator rather than
 trusting a single baked-in per-row estimate. `1` reproduces the
-one-write-at-a-time behaviour the loader had before issue #800; the shipped
-default of `4` raises the in-flight batches 4x, which takes that anchor's live
+one-write-at-a-time behaviour the loader had before issue #800; `4`, the
+default until issue #2753 made it derived, raises the in-flight batches 4x, which takes that anchor's live
 working set from 3 to 6 batches, roughly `2x` on the same geometry. That is the
-memory the default spends.
+memory a depth of 4 spends; the derived depth is usually larger and is
+lowered to the memory bound when that is smaller.
 
 The loader prints a completion summary to stdout — `rows_written`
 (`rows processed` before the resume work), `rows_skipped`, `objects written`,
@@ -269,16 +282,19 @@ per-object dynamic-column budget of 1000.
 
 `objects written` is not reproducible across runs of the same command, and is
 not a function of the command line alone (issue #983): input order concentrates
-consecutive rows on one shard, and the 2-second `max_flush_delay` age trigger
-means a slower host ages more buffers out before they reach `--target-bytes`,
+consecutive rows on one shard, and the `--max-flush-delay` age trigger (60s
+by default) means a slower host ages more buffers out before they reach
+`--target-bytes`,
 changing the layout. Two loads of the same file can therefore write different
 object counts and still be correct. The comparison basis that *is* stable is the
 `flush triggers` line, which states how many flushes each cause opened: `size`
-(a buffer reached `--target-bytes`), `age` (a buffer aged past `max_flush_delay`),
-`arrival` (a strict write under the arrival policy; always 0 on a load, since
-the loader writes strict only), and `final` (the drain at load close), per
-shard and as load totals. The four causes are disjoint and sum to the objects
-written, so a mix that shifts from
+(a buffer reached `--target-bytes`), `age` (a buffer aged past
+`--max-flush-delay`), `arrival` (a strict write under the arrival policy;
+always 0 on a load, since the loader writes strict only), `depth` (the
+loader's flush every `--pipeline-depth` batches, derived target only) and
+`manual` (every other loader-requested flush: the drain at load close and a
+logs load's budget-stall flushes), per shard and as load totals. The five
+causes are disjoint and sum to the objects written, so a mix that shifts from
 `size` toward `age` between two runs explains an object-count difference that the
 count alone cannot. Compare the mix, not the raw count. The `hits` schema is 104 attribute
 columns (see step 3), far under that budget, so a clean load prints no such

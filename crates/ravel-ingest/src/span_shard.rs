@@ -166,6 +166,13 @@ pub(crate) fn est_span_object_bytes(span: &NormalizedSpan) -> usize {
         + SPAN_OBJECT_FIXED_BYTES
 }
 
+/// The object-bytes figure a span shard buffer's size trigger adds for
+/// `spans`: [`est_span_object_bytes`] summed. Public so a bulk loader can size
+/// `target_bytes` in rows from one decoded batch.
+pub fn est_spans_object_bytes(spans: &[NormalizedSpan]) -> usize {
+    spans.iter().map(est_span_object_bytes).sum()
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedSpan`] to the
 /// writer's [`SpanRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename. In particular `attrs` is already the
@@ -1953,6 +1960,9 @@ impl SpanShardActor {
             ..
         } = buf;
         self.metrics.record_flush(trigger);
+        if trigger == FlushTrigger::Size {
+            self.metrics.record_shard_size_flush(self.shard);
+        }
         // The deadline pinned here is the flush-open deadline. It bounds how
         // long the flush may sit queued for a permit: the spawned task checks it
         // before acquiring and abandons a flush already past it without taking a

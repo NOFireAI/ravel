@@ -13,10 +13,10 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 ///   first-touch path `services/ravel-server` runs; the router then resolves
 ///   the active generation from that record itself.
 /// - `batch_rows` rows are written per Strict write. At this entry point's
-///   fixed [`DEFAULT_TARGET_BYTES`] flush target that is also one flush, and so
+///   fixed [`PER_BATCH_TARGET_BYTES`] flush target that is also one flush, and so
 ///   one RLOG object per involved shard; [`load_instrumented`] takes the target
 ///   as a parameter and documents what a larger one changes.
-/// - `pipeline_depth` is the outer write window; [`DEFAULT_PIPELINE_DEPTH`] is
+/// - `pipeline_depth` is the outer write window; [`MEASURED_PIPELINE_DEPTH`] is
 ///   what the CLI passes. The per-shard flush window is
 ///   [`DEFAULT_MAX_INFLIGHT_FLUSHES`] and the decode-queue depth
 ///   [`DEFAULT_DECODE_QUEUE_BATCHES`]; [`load_instrumented`] is the seam that
@@ -65,7 +65,7 @@ pub async fn load(
         pipeline_depth,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         now_ns,
         clock,
@@ -105,10 +105,10 @@ pub async fn load_with_fold_after_load(
         batch_rows,
         0,
         read_cursors,
-        pipeline_depth,
+        Some(pipeline_depth),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         now_ns,
         clock,
@@ -151,10 +151,10 @@ pub async fn load_with_memory(
         batch_rows,
         0,
         read_cursors,
-        pipeline_depth,
+        Some(pipeline_depth),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        target_bytes,
+        Some(target_bytes),
         max_flush_delay,
         now_ns,
         clock,
@@ -235,10 +235,10 @@ pub(super) async fn load_instrumented(
         batch_rows,
         skip_rows,
         read_cursors,
-        pipeline_depth,
+        Some(pipeline_depth),
         max_inflight_flushes,
         decode_queue_batches,
-        target_bytes,
+        Some(target_bytes),
         max_flush_delay,
         now_ns,
         clock,
@@ -258,6 +258,9 @@ pub(super) async fn load_instrumented(
 /// memory budget's inputs, resolved once the read-cursor count is known;
 /// `None` derives the budget from this host's memory. `fold_after_load` is
 /// the `--fold-after-load` flag ([`load_with_fold_after_load`]).
+/// `pipeline_depth` and `target_bytes` left `None` are derived from the first
+/// built batch by [`resolve_geometry`], and a derived depth is bounded by the
+/// resolved memory budget.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_instrumented_at(
     store: Arc<dyn ObjectStoreBackend>,
@@ -268,10 +271,10 @@ pub(super) async fn load_instrumented_at(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
@@ -326,10 +329,10 @@ pub(super) async fn load_with_drain_reflush_period(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
@@ -355,7 +358,7 @@ pub(super) async fn load_with_drain_reflush_period(
     // operator-facing lever bounding how many writes are in flight at once, so 0
     // (a pipeline that can hold no write) is a rejected value, not a silent
     // clamp to 1.
-    if pipeline_depth == 0 {
+    if pipeline_depth == Some(0) {
         return Err(LoadError::Setup(
             "--pipeline-depth must be at least 1 (the number of concurrent in-flight writes); 0 \
              was given"
@@ -392,7 +395,7 @@ pub(super) async fn load_with_drain_reflush_period(
     // flush-target lever (issue #801). A target of 0 is not a smaller target
     // than 1, it is the same one (an estimate `>= 0` holds for an empty buffer),
     // so it is rejected rather than silently behaving as 1.
-    if target_bytes == 0 {
+    if target_bytes == Some(0) {
         return Err(LoadError::Setup(
             "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
              given"
@@ -434,64 +437,35 @@ pub(super) async fn load_with_drain_reflush_period(
         ))
     })?;
 
-    // `target_bytes: 1` (the `--target-bytes` default) makes each Strict batch
-    // flush immediately as one RLOG object, inside `handle_write`'s size
-    // trigger, rather than waiting on the age trigger's `max_flush_delay`
-    // clock. That is what a bulk loader wants by default: one object per batch,
-    // `batch_rows` controls its size, and every write's ack is durable with no
-    // lingering buffer. It also keeps flush timing off the wall clock, so the
-    // object buckets by the flush-open reading directly.
+    // At `target_bytes: 1` each Strict batch flushes inside its own
+    // `handle_write` as one RLOG object per shard. A larger target (the derived
+    // one included) keeps the durability meaning of an ack (it is still sent
+    // only after that flush's object and commit record are published), but a
+    // shard's buffer now spans several batches, so a batch's ack waits for the
+    // later batch that pushes the buffer over the target, for the depth flush
+    // below, or for the age trigger (`max_flush_delay`). The target is measured
+    // against the shard's uncompressed object-content estimate and tested once
+    // per write after a whole batch's slice has merged: below one slice's
+    // content it changes nothing (`target_bytes_no_effect_warning`).
     //
-    // A larger target keeps the durability meaning of an ack (it is still sent
-    // from `ack_waiters` only after that flush's object and commit record are
-    // published) but drops the other three: a shard's buffer now spans several
-    // batches, so a batch's ack waits for whichever later batch pushes the
-    // buffer over the target, and mid-load a buffer that never reaches the
-    // target is released by the wall-clock age trigger instead (at the end of
-    // the input the `flush_all` below releases it, since no later batch is
-    // coming). The loader's in-flight window must therefore be wide enough to
-    // hold the batches that accumulate into one flush, or every flush waits out
-    // `max_flush_delay`.
+    // `max_inflight_flushes` is the inner concurrency window (issue #807):
+    // `pipeline_depth` bounds the writes the loader keeps outstanding, this
+    // bounds the flushes each shard actor may run at once, and the two
+    // multiply. It reaches the shard actors' flush semaphores unmodified.
     //
-    // That age trigger (`max_flush_delay`, the `--max-flush-delay` lever) is the
-    // THIRD binding constraint on object layout, beside `target_bytes` and one
-    // batch's per-shard slice footprint. At its 2s default a shard buffer that
-    // fills slower than one target's worth every 2s ages out before it reaches a
-    // large `target_bytes`, so the size trigger never fires and the target is
-    // unreachable as a lever no matter how the other two are set: the v4 load's
-    // ~11,871-row objects are about 2s of one shard's ingest rate. A bulk load
-    // that wants target-sized objects must therefore raise `--max-flush-delay`
-    // past the time one target takes to fill, in addition to widening the
-    // in-flight window. `None` here leaves the age trigger at its default, so an
-    // unset flag changes nothing.
-    //
-    // "Larger" is measured against the shard's uncompressed object-content
-    // estimate, not the encoded object, and tested once per write after a whole
-    // batch's slice has merged: below one slice's content the target is unreachable
-    // as a lever, whatever byte figure it names
-    // (`target_bytes_no_effect_warning`).
-    //
-    // `Arc` so each batch's write can be `tokio::spawn`ed onto its own task and
-    // run genuinely concurrently up to `pipeline_depth` (a constructed-but-
-    // unawaited future does no I/O until polled; spawning is what makes the S3
-    // PUT round trips overlap). `write`/`write_columnar` take `&self`, so this
-    // is the only change the router's own type needs.
-    //
-    // `max_inflight_flushes` is the second, inner concurrency window (issue
-    // #807): `pipeline_depth` bounds the writes the loader keeps outstanding,
-    // this bounds the flushes each shard actor may run at once, and the two
-    // multiply. It reaches the shard actors' flush semaphores unmodified
-    // (`Semaphore::new(config.max_inflight_flushes as usize)` in
-    // crates/ravel-ingest/src/log_shard.rs); nothing downstream clamps it.
-    let router = Arc::new(LogIngestRouter::new(
-        IngestConfig {
-            rlog_zstd_level: zstd_level,
-            ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
-        },
-        Arc::clone(&store),
-        Arc::clone(&clock),
-        Arc::new(PendingAckBudget::new(0)),
-    ));
+    // The router is built once the first non-empty batch is decoded, because a
+    // derived target is read off that batch's estimate.
+    let build_router = |target_bytes: usize| {
+        Arc::new(LogIngestRouter::new(
+            IngestConfig {
+                rlog_zstd_level: zstd_level,
+                ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
+            },
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Arc::new(PendingAckBudget::new(0)),
+        ))
+    };
 
     // Every Strict write below waits this long for its ack, and the wait is
     // whatever the age trigger the same flag configured takes to release the
@@ -567,7 +541,7 @@ pub(super) async fn load_with_drain_reflush_period(
     let mut inflight: std::collections::VecDeque<(
         u64,
         tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
-    )> = std::collections::VecDeque::with_capacity(pipeline_depth);
+    )> = std::collections::VecDeque::new();
 
     // Decode/encode overlap (issue #680). A single blocking decoder task owns
     // the K stride cursors and drives the existing `collect_spans` +
@@ -613,14 +587,70 @@ pub(super) async fn load_with_drain_reflush_period(
     // the held bytes do not drop for a whole period, nothing new can reach
     // those buffers, so only a flush can make room: flush them rather than leave the
     // load parked on the age trigger, or forever on a raised one. At the
-    // default target every write flushes itself and this never runs, so the
-    // default layout is unchanged.
+    // target of 1 every write flushes itself and this never runs. The lock
+    // keeps a stall flush out of the depth flush's count.
+    //
+    // The first non-empty batch is received here, ahead of the loop, so the
+    // geometry and the router exist before the loop needs them; the loop
+    // takes it from `first` instead of the channel. A failure or the end of
+    // the input arriving first resolves the geometry over no rows.
+    let decode_wait_start = Instant::now();
+    let mut first: Option<Prefetched> = None;
+    while let Some(received) = rx.recv().await {
+        if let Prefetched::Batch(built) = &received
+            && built.num_rows() == 0
+        {
+            continue;
+        }
+        first = Some(received);
+        break;
+    }
+    report.decode_wait += decode_wait_start.elapsed();
+    let (first_rows, first_est_bytes) = match &first {
+        Some(Prefetched::Batch(Built::Row(records))) => (
+            records.len(),
+            ravel_ingest::est_log_records_object_bytes(records),
+        ),
+        Some(Prefetched::Batch(Built::Columnar(batch, _))) => (
+            batch.num_rows,
+            ravel_ingest::est_columnar_log_batch_object_bytes(batch),
+        ),
+        _ => (0, 0),
+    };
+    let geometry = resolve_geometry(
+        target_bytes,
+        pipeline_depth,
+        shards,
+        batch_rows,
+        first_rows,
+        first_est_bytes,
+        budget.is_some().then_some(load_memory.budget_bytes),
+    );
+    // Resolved over no rows, the geometry describes nothing the load did, so
+    // it is neither announced nor reported, as on the metrics and spans paths.
+    let geometry_resolved = first_rows > 0;
+    if let (true, Some(on_geometry)) = (geometry_resolved, &memory_options.on_geometry) {
+        on_geometry(&geometry);
+        // Lets a caller driving this future print the line before the first
+        // submit.
+        tokio::task::yield_now().await;
+    }
+    let pipeline_depth = geometry.pipeline_depth;
+    let router = build_router(geometry.target_bytes);
+    let mut window = DepthWindow::new(&geometry);
+    let mut enqueue = EnqueueTracker::new();
+    let flush_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let mut depth_flushes_by_shard: std::collections::BTreeMap<u32, u64> =
+        std::collections::BTreeMap::new();
     let stall_flusher = match &budget {
-        Some(budget) if target_bytes > DEFAULT_TARGET_BYTES => Some(spawn_stall_flusher(
-            Arc::clone(&router),
-            Arc::clone(budget),
-            memory_options.stall_flush_period,
-        )),
+        Some(budget) if geometry.target_bytes > PER_BATCH_TARGET_BYTES => {
+            Some(spawn_stall_flusher(
+                Arc::clone(&router),
+                Arc::clone(budget),
+                memory_options.stall_flush_period,
+                Arc::clone(&flush_lock),
+            ))
+        }
         _ => None,
     };
 
@@ -634,7 +664,10 @@ pub(super) async fn load_with_drain_reflush_period(
         // this receive or a write resolution below, so timing both partitions
         // the loop's own wall clock with no third bucket to hide in.
         let decode_wait_start = Instant::now();
-        let received = rx.recv().await;
+        let received = match first.take() {
+            Some(received) => Some(received),
+            None => rx.recv().await,
+        };
         report.decode_wait += decode_wait_start.elapsed();
         let built = match received {
             Some(Prefetched::Done) => {
@@ -648,6 +681,8 @@ pub(super) async fn load_with_drain_reflush_period(
                 // one, exactly as the former serial loop ordered them.
                 drain_inflight(
                     &mut inflight,
+                    &router,
+                    &mut enqueue,
                     &mut report,
                     &mut shards_seen,
                     &mut data_batches_flushed,
@@ -663,6 +698,8 @@ pub(super) async fn load_with_drain_reflush_period(
             Some(Prefetched::RowRejected { row, reason }) => {
                 drain_inflight(
                     &mut inflight,
+                    &router,
+                    &mut enqueue,
                     &mut report,
                     &mut shards_seen,
                     &mut data_batches_flushed,
@@ -698,10 +735,13 @@ pub(super) async fn load_with_drain_reflush_period(
             Built::Row(records) => {
                 let router = Arc::clone(&router);
                 let tenant = tenant_id.clone();
+                let enqueued = enqueue.guard();
                 tokio::spawn(async move {
-                    router
-                        .write(tenant, records, WriteMode::Strict, ack_deadline)
-                        .await
+                    let submitted = router
+                        .submit(tenant, records, WriteMode::Strict, ack_deadline)
+                        .await;
+                    drop(enqueued);
+                    submitted?.acks().await
                 })
             }
             Built::Columnar(batch, charge) => {
@@ -727,6 +767,8 @@ pub(super) async fn load_with_drain_reflush_period(
                     }
                     drain_inflight(
                         &mut inflight,
+                        &router,
+                        &mut enqueue,
                         &mut report,
                         &mut shards_seen,
                         &mut data_batches_flushed,
@@ -749,11 +791,12 @@ pub(super) async fn load_with_drain_reflush_period(
                 report.columnar_batches_built += 1;
                 let router = Arc::clone(&router);
                 let tenant = tenant_id.clone();
+                let enqueued = enqueue.guard();
                 tokio::spawn(async move {
-                    match charge {
+                    let submitted = match charge {
                         Some(charge) => {
                             router
-                                .write_columnar_charged(
+                                .submit_columnar_charged(
                                     tenant,
                                     *batch,
                                     WriteMode::Strict,
@@ -764,14 +807,52 @@ pub(super) async fn load_with_drain_reflush_period(
                         }
                         None => {
                             router
-                                .write_columnar(tenant, *batch, WriteMode::Strict, ack_deadline)
+                                .submit_columnar(tenant, *batch, WriteMode::Strict, ack_deadline)
                                 .await
                         }
-                    }
+                    };
+                    drop(enqueued);
+                    submitted?.acks().await
                 })
             }
         };
         inflight.push_back((n, handle));
+
+        // The depth flush runs before the window is resolved, so the oldest
+        // write the loop waits on below has always been flushed already.
+        if window.enabled() {
+            enqueue.wait_enqueued().await;
+            let observed = if window.realigning() {
+                settle_shards(clock.as_ref(), || router.metrics().shard_skew_by_shard())
+                    .await
+                    .map(|enqueued| ShardObservation {
+                        enqueued,
+                        size_flushes: router
+                            .metrics()
+                            .flush_trigger_mix_by_shard()
+                            .into_iter()
+                            .map(|(shard, mix)| (shard, mix.size))
+                            .collect(),
+                    })
+            } else {
+                None
+            };
+            if window.submitted(observed) {
+                let _flushing = flush_lock.lock().await;
+                let before = router.metrics().flush_trigger_mix_by_shard();
+                router.flush_all().await;
+                for (shard, mix) in router.metrics().flush_trigger_mix_by_shard() {
+                    let prior = before
+                        .iter()
+                        .find(|(s, _)| *s == shard)
+                        .map_or(0, |(_, m)| m.final_drain);
+                    let delta = mix.final_drain.saturating_sub(prior);
+                    if delta > 0 {
+                        *depth_flushes_by_shard.entry(shard).or_default() += delta;
+                    }
+                }
+            }
+        }
 
         // Bound true concurrency to `pipeline_depth`: once the window is full,
         // resolve the oldest write before starting the next batch's write. This
@@ -807,7 +888,7 @@ pub(super) async fn load_with_drain_reflush_period(
             )
             .await
             {
-                harvest_after_failure(&mut inflight, &mut e).await;
+                harvest_after_failure(&mut inflight, &mut e, &router, &mut enqueue).await;
                 report.write_wait += write_wait_start.elapsed();
                 return Err(e);
             }
@@ -822,6 +903,8 @@ pub(super) async fn load_with_drain_reflush_period(
     if !decoder_done {
         drain_inflight(
             &mut inflight,
+            &router,
+            &mut enqueue,
             &mut report,
             &mut shards_seen,
             &mut data_batches_flushed,
@@ -859,7 +942,9 @@ pub(super) async fn load_with_drain_reflush_period(
     // sweeps such stragglers every few seconds while the drain runs. Sends
     // are FIFO per shard, so re-flushing never splits a dispatched write's
     // records; at most a straggler gets its own object, exactly as
-    // `--target-bytes 1` would have laid it out.
+    // `--target-bytes 1` would have laid it out. Waiting for every submit to
+    // be enqueued first means this flush finds every buffered write.
+    enqueue.wait_enqueued().await;
     router.flush_all().await;
 
     // Drain every write still in the window in the same oldest-first order
@@ -880,6 +965,8 @@ pub(super) async fn load_with_drain_reflush_period(
         });
         let result = drain_inflight(
             &mut inflight,
+            &router,
+            &mut enqueue,
             &mut report,
             &mut shards_seen,
             &mut data_batches_flushed,
@@ -897,6 +984,16 @@ pub(super) async fn load_with_drain_reflush_period(
     // (ADR-0100 decision 1).
     report.metrics = router.metrics().snapshot();
     report.flush_trigger_mix = router.metrics().flush_trigger_mix_by_shard();
+    report.depth_flushes_by_shard = depth_flushes_by_shard.into_iter().collect();
+    report.target_bytes_no_effect_warning = layout_no_effect_warning(
+        geometry.target_bytes,
+        geometry.target_source,
+        &report.tokens,
+        batch_rows,
+        shards,
+    );
+    report.geometry = geometry_resolved.then_some(geometry);
+    report.realign_gave_up = window.realign_gave_up();
     #[cfg(feature = "stage-timing")]
     {
         report.stage_timings = router.stage_timings().snapshot();
@@ -1243,10 +1340,14 @@ impl Drop for AbortOnDrop {
 /// the samples can cancel out, and a refund can come from a flush already
 /// running rather than a buffer, so this can flush when room was on its way.
 /// That costs an early flush and a smaller object, never a hang.
+///
+/// `flush_lock` is held across each flush so the loader's depth flush can
+/// attribute the router's flush counts to itself alone.
 fn spawn_stall_flusher(
     router: Arc<LogIngestRouter>,
     budget: Arc<IngestByteBudget>,
     period: Duration,
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
         let mut stalled_at: Option<u64> = None;
@@ -1258,6 +1359,7 @@ fn spawn_stall_flusher(
             }
             let held = budget.in_flight_bytes();
             if stalled_at.is_some_and(|before| held >= before) {
+                let _flushing = flush_lock.lock().await;
                 router.flush_all().await;
                 stalled_at = None;
             } else {
@@ -1435,21 +1537,28 @@ async fn resolve_write_entry(
 /// error every remaining (later) write is resolved too and whatever it
 /// committed is folded into that error's durable-token list; see
 /// [`harvest_after_failure`] for why the loader waits rather than aborts.
+/// Buffered writes are flushed first so none of them waits out the age trigger.
 async fn drain_inflight(
     inflight: &mut std::collections::VecDeque<(
         u64,
         tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
     )>,
+    router: &LogIngestRouter,
+    enqueue: &mut EnqueueTracker,
     report: &mut LoadReport,
     shards_seen: &mut std::collections::HashSet<u32>,
     data_batches_flushed: &mut u64,
     shards: u32,
 ) -> Result<(), LoadError> {
+    if !inflight.is_empty() {
+        enqueue.wait_enqueued().await;
+        router.flush_all().await;
+    }
     while let Some(entry) = inflight.pop_front() {
         if let Err(mut e) =
             resolve_write_entry(entry, report, shards_seen, data_batches_flushed, shards).await
         {
-            harvest_after_failure(inflight, &mut e).await;
+            harvest_after_failure(inflight, &mut e, router, enqueue).await;
             return Err(e);
         }
     }
@@ -1494,7 +1603,15 @@ async fn harvest_after_failure(
         tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
     )>,
     err: &mut LoadError,
+    router: &LogIngestRouter,
+    enqueue: &mut EnqueueTracker,
 ) {
+    if !inflight.is_empty() {
+        // A still-buffered write would otherwise wait out the age trigger
+        // before its ack, so the failure would report a minute late.
+        enqueue.wait_enqueued().await;
+        router.flush_all().await;
+    }
     let Some(durable) = err.durable_tokens_mut() else {
         // `Setup` carries no token list because it cannot occur once a batch
         // could have flushed; there is nothing outstanding to harvest into.

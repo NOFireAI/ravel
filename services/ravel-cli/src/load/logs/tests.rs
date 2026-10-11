@@ -4,107 +4,12 @@ use arrow::datatypes::Int32Type;
 use super::*;
 use crate::load::test_support::*;
 
-/// A deterministic clock the test advances by hand, whose `sleep` the shard
-/// actor's flush tick waits on (mirrors `ravel-ingest`'s own unit-test
-/// `TestClock`, restated here because that clock is private to that crate's
-/// test module). Advancing it past `max_flush_delay` is what drives an age
-/// flush with no real-time sleep, so the age trigger can be exercised
-/// through the loader deterministically.
-struct TestClock {
-    now_ns: std::sync::atomic::AtomicI64,
-    /// Clock reads and sleep registrations since construction. Every shard
-    /// actor loop iteration, every write the actor handles, and every flush
-    /// task reads this clock, so the counter standing still means no task
-    /// in the router is runnable: the progress signal
-    /// [`yield_until_router_is_quiet`] samples.
-    reads: std::sync::atomic::AtomicU64,
-    wake_tx: tokio::sync::watch::Sender<()>,
-}
-
-impl TestClock {
-    fn new(start_ns: i64) -> std::sync::Arc<Self> {
-        let (wake_tx, _rx) = tokio::sync::watch::channel(());
-        std::sync::Arc::new(TestClock {
-            now_ns: std::sync::atomic::AtomicI64::new(start_ns),
-            reads: std::sync::atomic::AtomicU64::new(0),
-            wake_tx,
-        })
-    }
-
-    fn advance_ns(&self, delta_ns: i64) {
-        self.now_ns
-            .fetch_add(delta_ns, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.wake_tx.send(());
-    }
-
-    fn reads(&self) -> u64 {
-        self.reads.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl Clock for TestClock {
-    fn now_ns(&self) -> i64 {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.now_ns.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn sleep(
-        &self,
-        dur: Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        let deadline = self
-            .now_ns()
-            .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
-        let mut rx = self.wake_tx.subscribe();
-        Box::pin(async move {
-            loop {
-                if self.now_ns() >= deadline {
-                    return;
-                }
-                if rx.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-    }
-}
-
-/// Consecutive scheduler rounds [`yield_until_router_is_quiet`] needs to see
-/// the clock unread before it calls the router quiet. A routed write reaches
-/// its shard buffer within a handful of rounds, so this is generous rather
-/// than tuned; it costs nothing, because a round is one `yield_now` and no
-/// wall-clock wait.
-const QUIET_ROUNDS: usize = 64;
-
 /// Nanoseconds [`load_with_released_tail`] advances the injected clock by to
 /// release a load's tail. Above the router's 2s default `max_flush_delay`,
 /// so a buffer no size trigger can reach ages out; far below the 60s Strict
 /// ack deadline ([`WRITE_ACK_DEADLINE_FLOOR`]), so no in-flight write's
 /// deadline can fire on the same advance.
 const TAIL_RELEASE_ADVANCE_NS: i64 = 5 * 1_000_000_000;
-
-/// Yields to the runtime until the router has stopped making progress, so
-/// the caller can advance the clock knowing every dispatched write is
-/// already in its shard buffer.
-///
-/// Quiescence is read off `clock.reads()`: with the clock frozen no timer
-/// can fire, so once nothing reads it for [`QUIET_ROUNDS`] consecutive
-/// rounds, no task in the router is runnable. Nothing here waits on wall
-/// time.
-async fn yield_until_router_is_quiet(clock: &TestClock) {
-    let mut last = clock.reads();
-    let mut still = 0usize;
-    while still < QUIET_ROUNDS {
-        tokio::task::yield_now().await;
-        let reads = clock.reads();
-        if reads == last {
-            still += 1;
-        } else {
-            last = reads;
-            still = 0;
-        }
-    }
-}
 
 /// Run one load whose object count is a function of `target_bytes` and the
 /// input geometry alone, with no wall-clock input at all.
@@ -217,7 +122,8 @@ async fn load_report_carries_the_flush_trigger_mix() {
             size: 1,
             age: 0,
             arrival: 0,
-            final_drain: 0,
+            depth: 0,
+            manual: 0,
         },
         "the single row flushes by size, nothing ages or drains"
     );
@@ -227,7 +133,8 @@ async fn load_report_carries_the_flush_trigger_mix() {
             size: 1,
             age: 0,
             arrival: 0,
-            final_drain: 0,
+            depth: 0,
+            manual: 0,
         }
     );
     assert_eq!(
@@ -389,7 +296,7 @@ async fn decode_queue_batches_zero_is_rejected() {
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         0,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -438,7 +345,7 @@ async fn max_inflight_flushes_zero_is_rejected() {
         1,
         0,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -829,7 +736,7 @@ async fn load_writes_the_same_objects_across_decode_queue_depths() {
                 2,
                 DEFAULT_MAX_INFLIGHT_FLUSHES,
                 depth,
-                DEFAULT_TARGET_BYTES,
+                PER_BATCH_TARGET_BYTES,
                 None,
                 NOW_NS,
                 Arc::new(FixedClock(NOW_NS)),
@@ -1015,7 +922,7 @@ async fn decoder_runs_ahead_bounded_by_the_queue_depth() {
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         QUEUE_DEPTH,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -1296,7 +1203,7 @@ async fn next_batch_decode_overlaps_current_batch_write() {
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -1520,7 +1427,7 @@ async fn stride_reading_spreads_a_sorted_batch_across_all_shards() {
 /// every group and therefore touching all 4 shards -- 16 (batch, shard)
 /// writes over 16 rows.
 ///
-/// At the default `--target-bytes 1` each of those 16 writes flushes inside
+/// At `--target-bytes 1` each of those 16 writes flushes inside
 /// its own `handle_write`: 16 objects. At 8 MiB none of them can, because a
 /// shard's whole share of the file is 4 one-row writes, so each shard
 /// flushes exactly once (released by [`load_with_released_tail`], which
@@ -1563,7 +1470,7 @@ async fn a_larger_target_bytes_writes_strictly_fewer_objects_for_the_same_rows()
         }
     };
 
-    let (small, stored_small, records_small) = run(DEFAULT_TARGET_BYTES).await;
+    let (small, stored_small, records_small) = run(PER_BATCH_TARGET_BYTES).await;
     let (large, stored_large, records_large) = run(8 * 1024 * 1024).await;
 
     assert_eq!(small.rows_processed, n_rows);
@@ -1664,7 +1571,7 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
         }
     };
 
-    let (default, objects_default, records_default) = run(DEFAULT_TARGET_BYTES).await;
+    let (default, objects_default, records_default) = run(PER_BATCH_TARGET_BYTES).await;
     let (below, objects_below, records_below) = run(4096).await;
     let (mid, objects_mid, _) = run(24_576).await;
     let (whole, objects_whole, records_whole) = run(1024 * 1024).await;
@@ -1699,13 +1606,14 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
     // size 4 / final 8 on the mid regime, before it showed up as 12 objects.
     for (target, report, expected) in [
         (
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             &default,
             FlushMixCounts {
                 size: 16,
                 age: 0,
                 arrival: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
         (
@@ -1715,7 +1623,8 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
                 size: 16,
                 age: 0,
                 arrival: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
         (
@@ -1725,7 +1634,8 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
                 size: 8,
                 age: 0,
                 arrival: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
         (
@@ -1735,7 +1645,8 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
                 size: 0,
                 age: 4,
                 arrival: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
     ] {
@@ -1780,6 +1691,846 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
     );
 }
 
+/// Rows per batch in the issue #2753 default-geometry tests.
+const GEOMETRY_BATCH_ROWS: usize = 10_000;
+
+/// Batches in the issue #2753 default-geometry tests: 510,000 rows, which is
+/// not a multiple of [`DEFAULT_OBJECT_ROWS`].
+const GEOMETRY_BATCHES: usize = 51;
+
+/// A host total large enough that the derived memory bound never decides the
+/// depth in the default-geometry tests.
+const GEOMETRY_HOST_BYTES: u64 = 64 << 30;
+
+/// `batches` row groups of `batch_rows` identical rows on one stream, so
+/// every batch has the same estimated footprint and `--batch-rows
+/// <batch_rows>` reads one row group per batch.
+fn uniform_rows_fixture(
+    batch_rows: usize,
+    batches: usize,
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    bodied_rows_fixture(batch_rows, batches, UNIFORM_BODY, UNIFORM_BODY)
+}
+
+/// The body every row of [`uniform_rows_fixture`] carries.
+const UNIFORM_BODY: &str = "request served";
+
+/// [`uniform_rows_fixture`] with the first row group's body `first_body` and
+/// every later group's `later_body`, so the first batch's estimate per row
+/// can be made to under- or over-state the rest.
+fn bodied_rows_fixture(
+    batch_rows: usize,
+    batches: usize,
+    first_body: &str,
+    later_body: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("uniform.parquet");
+    let group = |body: &str| {
+        batch(vec![
+            ("ts", i64_col(vec![NOW_NS; batch_rows])),
+            ("svc", str_col(vec!["api"; batch_rows])),
+            ("msg", str_col(vec![body; batch_rows])),
+        ])
+    };
+    let first = group(first_body);
+    let later = group(later_body);
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+    for g in 0..batches {
+        writer
+            .write(if g == 0 { &first } else { &later })
+            .expect("write row group");
+        writer.flush().expect("flush row group");
+    }
+    writer.close().expect("close writer");
+
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"msg\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+    (dir, pq, m)
+}
+
+/// A logs load with every geometry flag unset, as the CLI runs it: no
+/// `--target-bytes`, no `--pipeline-depth`, the 60 s `--max-flush-delay`,
+/// and a host-derived memory budget. The clock never advances, so the age
+/// trigger cannot fire and the layout is decided by the target alone.
+async fn load_with_default_geometry(
+    store: Arc<dyn ObjectStoreBackend>,
+    pq: &Path,
+    m: &Mapping,
+    batch_rows: usize,
+    pipeline_depth: Option<usize>,
+    target_bytes: Option<usize>,
+    load_memory: LoadMemoryRequest,
+) -> LoadReport {
+    load_with_default_geometry_on(
+        store,
+        pq,
+        m,
+        1,
+        batch_rows,
+        pipeline_depth,
+        target_bytes,
+        load_memory,
+    )
+    .await
+}
+
+/// [`load_with_default_geometry`] on `shards` shards, read through one
+/// sequential cursor so the first batch is the file's first row group.
+#[allow(clippy::too_many_arguments)]
+async fn load_with_default_geometry_on(
+    store: Arc<dyn ObjectStoreBackend>,
+    pq: &Path,
+    m: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    pipeline_depth: Option<usize>,
+    target_bytes: Option<usize>,
+    load_memory: LoadMemoryRequest,
+) -> LoadReport {
+    let clock = TestClock::new(NOW_NS);
+    load_instrumented_at(
+        store,
+        pq,
+        "acme",
+        m,
+        shards,
+        batch_rows,
+        0,
+        Some(1),
+        pipeline_depth,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        target_bytes,
+        Some(DEFAULT_MAX_FLUSH_DELAY),
+        NOW_NS,
+        clock as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::default(),
+        Some(LoadMemoryOptions::new(load_memory)),
+        false,
+    )
+    .await
+    .expect("load succeeds")
+}
+
+/// Issue #2753: with `--target-bytes` and `--pipeline-depth` unset, a logs
+/// load merges batches into objects of [`DEFAULT_OBJECT_ROWS`] rows. 51
+/// batches of 10,000 rows on one shard are 510,000 rows, so the shard writes
+/// exactly ceil(510,000 / 250,000) = 3 objects: two of 250,000 rows that the
+/// size trigger closes (every 25th batch reaches the derived target, which
+/// is 250,000 times the first batch's estimate per row), and a 10,000-row
+/// tail the end-of-input drain publishes.
+///
+/// The derived depth is ceil(250,000 x 1 / 10,000) = 25. The size flushes
+/// at batches 25 and 50 each restart the depth window, so the depth flush
+/// never comes due and counts nothing.
+///
+/// Per-batch flushing (a target of 1) writes 51 objects. A target compared
+/// against a figure the buffer never reaches (stored bytes instead of the
+/// estimate) leaves the size trigger silent and every object to the depth
+/// flush or the drain, so the size count is 0.
+#[tokio::test]
+async fn default_load_merges_batches_into_target_sized_objects() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, GEOMETRY_BATCHES);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    let rows = (GEOMETRY_BATCH_ROWS * GEOMETRY_BATCHES) as u64;
+    assert_eq!(report.rows_processed, rows);
+    let expected_objects = (GEOMETRY_BATCH_ROWS * GEOMETRY_BATCHES).div_ceil(DEFAULT_OBJECT_ROWS);
+    assert_eq!(expected_objects, 3);
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len(),
+        expected_objects,
+        "510,000 rows on one shard make ceil(510,000 / 250,000) objects"
+    );
+    assert_eq!(report.objects_written(), expected_objects);
+
+    let layout = report.layout_report();
+    let geometry = layout
+        .geometry
+        .expect("a load that decoded rows resolves its geometry");
+    assert_eq!(geometry.target_source, TargetSource::Derived);
+    // `est_bytes_per_row` is the first batch's estimate per row rounded up;
+    // the target is 250,000 rows of the unrounded figure.
+    let target_rows = DEFAULT_OBJECT_ROWS as u64;
+    assert!(
+        (geometry.target_bytes as u64) <= target_rows * geometry.est_bytes_per_row
+            && (geometry.target_bytes as u64) > target_rows * (geometry.est_bytes_per_row - 1),
+        "the derived target is 250,000 rows of the first batch's estimate: {geometry:?}"
+    );
+    assert_eq!(geometry.rows_depth, 25);
+    assert_eq!(geometry.pipeline_depth, 25);
+    assert_eq!(geometry.depth_bound, DepthBound::Rows);
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: 2,
+            age: 0,
+            arrival: 0,
+            depth: 0,
+            manual: 1,
+        },
+        "two full objects close on size, the tail on the end-of-input drain"
+    );
+    assert_eq!(layout.flush_mix.totals.dominant(), Some("size"));
+    assert_eq!(layout.target_bytes_no_effect_warning, None);
+}
+
+/// Issue #2753: `--target-bytes 1 --batch-rows 10000` restores the layout
+/// every load had before the target was derived: one object per batch per
+/// shard, each closed by the size trigger.
+#[tokio::test]
+async fn target_bytes_one_writes_one_object_per_batch_per_shard() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let batches = 3;
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, batches);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        Some(PER_BATCH_TARGET_BYTES),
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), batches);
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.target_source, TargetSource::Flag);
+    assert_eq!(geometry.target_bytes, PER_BATCH_TARGET_BYTES);
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: batches as u64,
+            age: 0,
+            arrival: 0,
+            depth: 0,
+            manual: 0,
+        }
+    );
+}
+
+/// Issue #2753: a `--load-memory-bytes` budget too small for the rows bound's
+/// 25 batches decides the depth, and the report says so. The budget holds
+/// three batches at the first batch's estimate (read off an unbudgeted run of
+/// the same file), so the depth is 3.
+#[tokio::test]
+async fn a_small_memory_budget_decides_the_derived_depth() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, 4);
+    let probe_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let probe = load_with_default_geometry(
+        probe_store,
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    let est_bytes_per_row = probe
+        .layout_report()
+        .geometry
+        .expect("geometry resolved")
+        .est_bytes_per_row;
+    let batch_bytes = GEOMETRY_BATCH_ROWS as u64 * est_bytes_per_row;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Flag(3 * batch_bytes),
+    )
+    .await;
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.rows_depth, 25);
+    assert_eq!(geometry.memory_depth, Some(3));
+    assert_eq!(geometry.pipeline_depth, 3);
+    assert_eq!(geometry.depth_bound, DepthBound::Memory);
+    let summary = render_layout_summary(&layout);
+    assert!(
+        summary.contains(
+            "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+        ),
+        "{summary}"
+    );
+}
+
+/// Nanoseconds the issue #2753 explicit-target test advances the injected
+/// clock by to age a parked buffer out: past the 60 s `--max-flush-delay`
+/// default. The Strict ack deadline runs on wall time, which this never
+/// moves.
+const AGE_OUT_ADVANCE_NS: i64 = 61 * 1_000_000_000;
+
+/// The geometry a default load of `pq` resolves, read off one run of it.
+async fn probe_default_geometry(pq: &Path, m: &Mapping, batch_rows: usize) -> LoadGeometry {
+    use ravel_object_store::memory::MemoryStore;
+
+    load_with_default_geometry(
+        Arc::new(MemoryStore::new()),
+        pq,
+        m,
+        batch_rows,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await
+    .layout_report()
+    .geometry
+    .expect("a load that decoded rows resolves its geometry")
+}
+
+/// Issue #2753: an explicit `--target-bytes` turns the depth flush off
+/// (`LoadGeometry::depth_flush_enabled`), so the load keeps the layout it
+/// had before the depth flush existed, closed by the size and age triggers
+/// alone, whatever `--pipeline-depth` says.
+///
+/// The target is the one the default geometry derives for this file (25
+/// batches' worth), passed as a flag, and the depth is 5, below the 25
+/// batches one object holds. No size flush comes within 5 batches, so at
+/// every 5th submit the loop waits on a write whose buffer nothing has
+/// flushed, and the driver ages that buffer out. It does so only once the
+/// loop is parked: the decode queue holds one batch, so the decoder has
+/// queued batch `5k + 1` only after the loader took batch `5k`, and the
+/// loader takes no further batch until the oldest write is answered. 51
+/// batches make 10 objects of 5 batches closed on age and a 1-batch tail
+/// the end-of-input flush publishes: 11 objects, depth 0.
+///
+/// Prove-the-test: make `depth_flush_enabled` ignore `target_source` and the
+/// same objects close on depth instead, failing the mix assertion.
+#[tokio::test]
+async fn an_explicit_target_turns_the_depth_flush_off() {
+    use ravel_object_store::memory::MemoryStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const DEPTH: usize = 5;
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, GEOMETRY_BATCHES);
+    let derived = probe_default_geometry(&pq, &m, GEOMETRY_BATCH_ROWS).await;
+    assert_eq!(derived.target_source, TargetSource::Derived);
+    assert_eq!(derived.rows_depth, 25);
+    assert!(DEPTH < derived.rows_depth);
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(NOW_NS);
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let on_batch_queued: BuildStartHook = Arc::new(move || {
+        let _ = queued_tx.send(queued.fetch_add(1, Ordering::SeqCst) + 1);
+    });
+    let load_fut = load_instrumented_at(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &m,
+        1,
+        GEOMETRY_BATCH_ROWS,
+        0,
+        Some(1),
+        Some(DEPTH),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        1,
+        Some(derived.target_bytes),
+        Some(DEFAULT_MAX_FLUSH_DELAY),
+        NOW_NS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        None,
+        Some(on_batch_queued),
+        RlogZstdLevel::default(),
+        Some(LoadMemoryOptions::new(LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        })),
+        false,
+    );
+
+    let parks = GEOMETRY_BATCHES / DEPTH;
+    let driver = async {
+        let mut seen = 0;
+        for k in 1..=parks {
+            let wanted = (k * DEPTH + 1).min(GEOMETRY_BATCHES);
+            while seen < wanted {
+                seen = queued_rx
+                    .recv()
+                    .await
+                    .expect("the decoder queues every batch");
+            }
+            yield_until_router_is_quiet(&clock).await;
+            clock.advance_ns(AGE_OUT_ADVANCE_NS);
+            yield_until_router_is_quiet(&clock).await;
+        }
+        std::future::pending::<()>().await
+    };
+    let report = tokio::select! {
+        report = load_fut => report.expect("load succeeds"),
+        () = driver => unreachable!("the driver parks after its last advance"),
+    };
+
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.target_source, TargetSource::Flag);
+    assert_eq!(geometry.pipeline_depth, DEPTH);
+    let expected = parks + usize::from(!GEOMETRY_BATCHES.is_multiple_of(DEPTH));
+    assert_eq!(expected, 11);
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), expected);
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: 0,
+            age: parks as u64,
+            arrival: 0,
+            depth: 0,
+            manual: 1,
+        },
+        "every 5-batch buffer closes on age, the tail on the end-of-input flush"
+    );
+    assert!(!geometry.depth_flush_enabled());
+}
+
+/// The batch numbers (1-based) at which a lone shard's buffer reaches
+/// `target`, when the first batch estimates at `first` bytes and every
+/// later one at `later`, with a size flush emptying the buffer.
+fn size_closes(first: u64, later: u64, target: u64, batches: usize) -> Vec<usize> {
+    let mut closes = Vec::new();
+    let mut buffered = 0;
+    for b in 1..=batches {
+        buffered += if b == 1 { first } else { later };
+        if buffered >= target {
+            closes.push(b);
+            buffered = 0;
+        }
+    }
+    closes
+}
+
+/// Issue #2753: a size flush restarts the depth window. The window reads
+/// each shard's size-flush count off the router
+/// (`flush_trigger_mix_by_shard`, field `size`) after every submit, and a
+/// count that moved clears that shard's pending batches.
+///
+/// Every batch after the first is 5% wider per row (a longer body), so the
+/// buffer reaches the derived target (25 first batches' worth) after 24
+/// batches: the size trigger closes batches 1-24 and 25-48, and the
+/// end-of-input flush publishes 49-51. At the derived depth of 25 the window
+/// restarted at batches 25 and 49 never comes due: 3 objects, depth 0.
+///
+/// Prove-the-test: drop the `oldest_pending.remove(&shard)` in the per-shard
+/// arm of `DepthWindow::realign_to`, which restores the window that only a
+/// depth flush restarts. It comes due at batches 25 and 50, each time on a
+/// buffer the size trigger has just emptied, and the load writes 5 objects
+/// with depth 2.
+#[tokio::test]
+async fn a_size_flush_restarts_the_depth_window() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_probe_dir, probe_pq, probe_m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, 1);
+    let probe = probe_default_geometry(&probe_pq, &probe_m, GEOMETRY_BATCH_ROWS).await;
+    let first_per_row = probe.est_bytes_per_row;
+    let wider = first_per_row.div_ceil(20);
+    let later_per_row = first_per_row + wider;
+    assert!(
+        later_per_row * 100 >= first_per_row * 105,
+        "later rows are at least 5% wider: {first_per_row} -> {later_per_row}"
+    );
+    let later_body = format!("{UNIFORM_BODY}{}", "x".repeat(wider as usize));
+
+    let (_dir, pq, m) = bodied_rows_fixture(
+        GEOMETRY_BATCH_ROWS,
+        GEOMETRY_BATCHES,
+        UNIFORM_BODY,
+        &later_body,
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.est_bytes_per_row, first_per_row);
+    assert_eq!(geometry.target_bytes, probe.target_bytes);
+    assert_eq!(geometry.pipeline_depth, 25);
+    let batch_rows = GEOMETRY_BATCH_ROWS as u64;
+    assert_eq!(
+        size_closes(
+            batch_rows * first_per_row,
+            batch_rows * later_per_row,
+            geometry.target_bytes as u64,
+            GEOMETRY_BATCHES,
+        ),
+        vec![24, 48]
+    );
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), 3);
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: 2,
+            age: 0,
+            arrival: 0,
+            depth: 0,
+            manual: 1,
+        },
+        "each size flush restarts the window, so the depth flush never comes due"
+    );
+}
+
+/// Issue #2753: a first batch that over-estimates the rest (a much longer
+/// body) derives a target no 25 later batches reach, so the size trigger
+/// never fires and the depth flush closes every object. At depth 25, 51
+/// batches make `51 / 25` depth flushes and one end-of-input flush for the
+/// 1-batch remainder.
+///
+/// Prove-the-test: never call `window.submitted` in the logs loader and no
+/// flush answers the oldest write the loop waits on at the 25th submit; the
+/// frozen clock never fires the age trigger, so the load fails on the
+/// Strict ack deadline and `load_with_default_geometry`'s `expect("load
+/// succeeds")` panics.
+#[tokio::test]
+async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let wide_body = format!("{UNIFORM_BODY}{}", "x".repeat(200));
+    let (_dir, pq, m) = bodied_rows_fixture(
+        GEOMETRY_BATCH_ROWS,
+        GEOMETRY_BATCHES,
+        &wide_body,
+        UNIFORM_BODY,
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.target_source, TargetSource::Derived);
+    let depth = geometry.pipeline_depth;
+    assert_eq!(depth, 25);
+    let depth_flushes = (GEOMETRY_BATCHES / depth) as u64;
+    let manual = u64::from(!GEOMETRY_BATCHES.is_multiple_of(depth));
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len() as u64,
+        depth_flushes + manual
+    );
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: 0,
+            age: 0,
+            arrival: 0,
+            depth: depth_flushes,
+            manual,
+        },
+        "no size flush is reachable, so the depth flush closes every full window"
+    );
+}
+
+/// `shards` row groups' worth of rows per batch: `batches` row groups of
+/// `batch_rows` rows each, every row group spread evenly over one host per
+/// shard, the first row group's body `first_body` and every later one's
+/// `later_body`.
+fn spread_rows_fixture(
+    shards: u32,
+    batch_rows: usize,
+    batches: usize,
+    first_body: &str,
+    later_body: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    use parquet::arrow::ArrowWriter;
+
+    let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+    let host_col: Vec<&str> = (0..batch_rows)
+        .map(|r| hosts[r % hosts.len()].as_str())
+        .collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("spread.parquet");
+    let group = |body: &str| {
+        batch(vec![
+            ("ts", i64_col(vec![NOW_NS; batch_rows])),
+            ("svc", str_col(vec!["api"; batch_rows])),
+            ("host", str_col(host_col.clone())),
+            ("msg", str_col(vec![body; batch_rows])),
+        ])
+    };
+    let first = group(first_body);
+    let later = group(later_body);
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+    for g in 0..batches {
+        writer
+            .write(if g == 0 { &first } else { &later })
+            .expect("write row group");
+        writer.flush().expect("flush row group");
+    }
+    writer.close().expect("close writer");
+
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"msg\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+    (dir, pq, m)
+}
+
+/// Issue #2753: on 4 shards the derived depth is ceil(250,000 x 4 /
+/// `--batch-rows`), one target's worth of rows per shard, and the summary
+/// shows it. Every batch reaches all 4 shards, and the first over-estimates
+/// the rest, so no shard reaches the target: after 20 batches the depth
+/// flush closes one object per shard, and the end-of-input flush closes the
+/// 21st batch's 4 slices.
+///
+/// Prove-the-test: never call `window.submitted` in the logs loader and the
+/// load fails on the Strict ack deadline instead (`expect("load succeeds")`
+/// in `load_with_default_geometry_on`), as in
+/// `an_over_estimating_first_batch_is_closed_by_the_depth_flush`.
+#[tokio::test]
+async fn four_shards_at_the_default_geometry_close_on_depth() {
+    use ravel_object_store::memory::MemoryStore;
+
+    const SHARDS: u32 = 4;
+    const BATCH_ROWS: usize = 50_000;
+    let depth = (DEFAULT_OBJECT_ROWS * SHARDS as usize).div_ceil(BATCH_ROWS);
+    assert_eq!(depth, 20);
+    let batches = depth + 1;
+    let wide_body = format!("{UNIFORM_BODY}{}", "x".repeat(200));
+    let (_dir, pq, m) = spread_rows_fixture(SHARDS, BATCH_ROWS, batches, &wide_body, UNIFORM_BODY);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry_on(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        SHARDS,
+        BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    assert_eq!(report.rows_processed, (BATCH_ROWS * batches) as u64);
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.rows_depth, depth);
+    assert_eq!(geometry.pipeline_depth, depth);
+    assert_eq!(geometry.depth_bound, DepthBound::Rows);
+    let summary = render_layout_summary(&layout);
+    assert!(
+        summary.contains("pipeline depth   : 20 (rows bound decided it: rows bound 20, memory"),
+        "{summary}"
+    );
+    let shards = u64::from(SHARDS);
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len() as u64,
+        2 * shards
+    );
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: 0,
+            age: 0,
+            arrival: 0,
+            depth: shards,
+            manual: shards,
+        },
+        "one depth-closed object and one tail object per shard"
+    );
+    for s in &layout.flush_mix.shards {
+        assert_eq!(
+            s.counts,
+            FlushMixCounts {
+                size: 0,
+                age: 0,
+                arrival: 0,
+                depth: 1,
+                manual: 1,
+            },
+            "shard {}",
+            s.shard
+        );
+    }
+}
+
+/// Issue #2753: `--batch-rows 1` on 4 shards has a rows bound of 1,000,000
+/// batches; the derived depth is capped at 1,024 and the summary names the
+/// cap.
+#[tokio::test]
+async fn a_derived_depth_above_the_cap_is_capped() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(1, 4);
+    let report = load_with_default_geometry_on(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        4,
+        1,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.rows_depth, 1_000_000);
+    assert_eq!(geometry.pipeline_depth, MAX_DERIVED_PIPELINE_DEPTH);
+    assert_eq!(MAX_DERIVED_PIPELINE_DEPTH, 1_024);
+    assert_eq!(geometry.depth_bound, DepthBound::Cap);
+    let summary = render_layout_summary(&layout);
+    assert!(
+        summary.contains(
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000, memory bound "
+        ),
+        "{summary}"
+    );
+}
+
+/// Issue #2753: a memory bound between the cap and the rows bound still
+/// leaves the cap deciding, and the summary names all three. `--batch-rows 1`
+/// on 4 shards has a rows bound of 1,000,000; a `--load-memory` of 2,000
+/// batches puts the memory bound at 2,000, above the 1,024 cap.
+#[tokio::test]
+async fn a_memory_bound_above_the_cap_leaves_the_cap_deciding() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(1, 4);
+    let probe = load_with_default_geometry_on(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        4,
+        1,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    let per_row = probe.geometry.expect("geometry resolved").est_bytes_per_row;
+    let report = load_with_default_geometry_on(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        4,
+        1,
+        None,
+        None,
+        LoadMemoryRequest::Flag(2_000 * per_row),
+    )
+    .await;
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.rows_depth, 1_000_000);
+    assert_eq!(geometry.memory_depth, Some(2_000));
+    assert_eq!(geometry.pipeline_depth, MAX_DERIVED_PIPELINE_DEPTH);
+    assert_eq!(geometry.depth_bound, DepthBound::Cap);
+    let summary = render_layout_summary(&layout);
+    assert!(
+        summary.contains(
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000, memory bound \
+             2000)"
+        ),
+        "{summary}"
+    );
+}
+
+/// Issue #2753: a logs input with no rows resolves no geometry, so the
+/// report carries none and the summary prints no geometry lines, as on the
+/// metrics and spans paths.
+#[tokio::test]
+async fn an_empty_input_reports_no_geometry() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(0, 2);
+    let report = load_with_default_geometry(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        2,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    assert_eq!(report.rows_processed, 0);
+    assert!(
+        report.tokens.is_empty(),
+        "nothing was written: {:?}",
+        report.tokens
+    );
+    assert_eq!(report.geometry, None);
+    let layout = report.layout_report();
+    assert_eq!(layout.geometry, None);
+    let summary = render_layout_summary(&layout);
+    assert!(!summary.contains("flush target"), "{summary}");
+    assert!(!summary.contains("pipeline depth"), "{summary}");
+}
+
 /// The ack semantics a larger `--target-bytes` changes (issue #801,
 /// deliverable 3). A Strict write's ack is answered from `ack_waiters` in
 /// `crates/ravel-ingest/src/log_shard.rs`, which only runs once that
@@ -1792,7 +2543,11 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
 /// advances, the age trigger can never fire (the shard actor's flush tick
 /// waits on that clock's own `sleep`, which only returns on an advance),
 /// and at an 8 MiB target no write in this 16-row fixture can reach the
-/// size trigger either. With no trigger reachable, the load cannot finish
+/// size trigger either. The target is explicit, so the depth flush is off
+/// (issue #2753), and the pipeline depth is the batch count: after
+/// submitting the last batch the loader waits on the first batch's ack
+/// before it reads the decoder's end of input, so the end-of-input flush
+/// never runs either. With no trigger reachable, the load cannot finish
 /// and -- the part that would be false under the old semantics -- the
 /// store holds zero data objects while it is suspended. The store is read
 /// with the load future still alive and pinned, so no shutdown flush from
@@ -1808,13 +2563,15 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
 /// buffer). A yield count would bound neither, since yields on this task
 /// do not wait on the blocking decode thread.
 ///
-/// Prove-the-test: pass `1` as `target_bytes` to the
-/// `build_ingest_config` call in `load_instrumented` (that function has
-/// other callers, so change the call, not the function) and every write
+/// Prove-the-test: pass `Some(1)` as the target to the
+/// `load_instrumented_at` call in `load_instrumented` and every write
 /// triggers its own flush, so the
 /// acks are answered, the load runs to completion while the driver is
 /// still waiting for the router to go quiet, and the `biased` select hits
-/// the `panic!` arm ("the load must not complete...").
+/// the `panic!` arm ("the load must not complete..."). Making
+/// `LoadGeometry::depth_flush_enabled` ignore `target_source` trips the same
+/// arm: the 4th submit brings the depth window due and its flush answers
+/// every ack.
 #[tokio::test]
 async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
     use ravel_object_store::memory::MemoryStore;
@@ -1847,7 +2604,7 @@ async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
         rows_per_group,
         0,
         Some(shards as usize),
-        rows_per_group,
+        batches,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
         8 * 1024 * 1024,
@@ -2123,7 +2880,8 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
             size: 1,
             age: 0,
             arrival: 0,
-            final_drain: 0,
+            depth: 0,
+            manual: 0,
         },
         "the single object is a size flush; nothing ages under a delay longer than the advance"
     );
@@ -2144,7 +2902,8 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
             size: 0,
             age: 1,
             arrival: 0,
-            final_drain: 1,
+            depth: 0,
+            manual: 1,
         },
         "the first object is the aged-out buffer, the second is the tail the end-of-input \
              flush published"
@@ -2236,10 +2995,10 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         1,
         0,
         Some(1),
-        5, // pipeline depth above the batch count: no mid-loop ack wait
+        Some(5), // pipeline depth above the batch count: no mid-loop ack wait or depth flush
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         1,
-        TARGET,
+        Some(TARGET),
         Some(Duration::from_secs(60)),
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
@@ -2291,7 +3050,8 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
             size: 1,
             age: 0,
             arrival: 0,
-            final_drain: 1,
+            depth: 0,
+            manual: 1,
         },
         "the tail is published by the manual end-of-input flush, not by the age trigger"
     );
@@ -2426,10 +3186,10 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         batch_rows,
         0,
         Some(1),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -2460,10 +3220,10 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         batch_rows,
         0,
         Some(4),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -2508,10 +3268,10 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         batch_rows,
         0,
         Some(1),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -2901,7 +3661,7 @@ async fn max_inflight_flushes_bounds_concurrent_flushes_per_shard() {
             PIPELINE_DEPTH,
             flushes,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -2960,7 +3720,7 @@ async fn max_inflight_flushes_bounds_concurrent_flushes_per_shard() {
 ///
 /// Non-vacuity (prove-the-test): the shipped-defaults arm's peak of 4 fails
 /// against the pre-change defaults. Confirmed by setting
-/// `DEFAULT_PIPELINE_DEPTH` back to 1: that arm reads `left: 1, right: 4`
+/// `MEASURED_PIPELINE_DEPTH` back to 1: that arm reads `left: 1, right: 4`
 /// and its wall goes to 665.99ms, indistinguishable from the fully serial
 /// arm's 673.05ms in the same run. The `4`/`1` and `1`/`4` arms are what make
 /// the claim "both windows, not either" falsifiable: a change that only
@@ -3036,7 +3796,7 @@ async fn both_write_windows_are_needed_to_overlap_put_round_trips() {
             depth,
             flushes,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -3136,21 +3896,22 @@ async fn both_write_windows_are_needed_to_overlap_put_round_trips() {
     // of the code. The end-to-end wall figure that justifies the default
     // lives in ADR-0807, measured on a real corpus.
 
-    // The shipped defaults, run through the same fixture: what an operator
-    // gets with neither flag given must be the overlapped arm, not the
-    // serial one. This is the assertion the default change is accountable
-    // to; against the pre-change defaults of 1 and 1 it reads a peak of 1.
-    let a_default = arm(DEFAULT_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
+    // The measured depth (`MEASURED_PIPELINE_DEPTH`, what
+    // `--pipeline-depth 4` restores now that the depth is derived) with the
+    // default `--max-inflight-flushes`, run through the same fixture: it
+    // must be the overlapped arm, not the serial one. Against flush and
+    // depth windows of 1 and 1 it reads a peak of 1.
+    let a_default = arm(MEASURED_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
     let (wall_default, peak_default) = (a_default.wall, a_default.peak);
     println!(
-        "  shipped defaults:    wall {wall_default:?} peak {peak_default} \
+        "  measured depth:      wall {wall_default:?} peak {peak_default} \
              (submit loop: write_wait {:?}, decode_wait {:?})",
         a_default.write_wait, a_default.decode_wait
     );
     assert_eq!(
         peak_default, 4,
-        "the shipped defaults must overlap four object PUTs; a peak of 1 means \
-             the loader ships serial"
+        "the measured depth with the default flush window must overlap four \
+             object PUTs; a peak of 1 means the loader runs serial"
     );
 }
 
@@ -3320,6 +4081,94 @@ async fn partial_window_failure_reports_every_batch_that_committed() {
     );
 }
 
+/// Issue #2753: a failed write reports at once even while a later write is
+/// still buffered. Two shards, `--target-bytes 5000 --pipeline-depth 2`, two
+/// 2-row batches: batch 1's rows carry 5,000-byte bodies on a stream routed
+/// to shard 0, so it reaches the target and flushes on size into a PUT that
+/// fails; batch 2's rows have 1-byte bodies on shard 1, below the target.
+/// The second submit fills the window, the loop resolves batch 1's failure,
+/// and the pinned clock never fires the age trigger, so only the harvest's
+/// own flush (`harvest_after_failure`) can publish batch 2: the load returns
+/// the flush failure with batch 2's one token durable.
+///
+/// Prove-the-test: delete the `router.flush_all().await` in
+/// `harvest_after_failure` and batch 2 waits until its Strict ack deadline
+/// expires on wall time; the harvest keeps only that write's recovered
+/// tokens, none, and the `durable.len()` assertion fails with 0.
+#[tokio::test]
+async fn a_failed_write_flushes_the_buffered_writes_before_it_reports() {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    let shards = 2;
+    let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+    let fat = "x".repeat(5_000);
+    let (_dir, pq) = write_parquet(&batch(vec![
+        ("ts", i64_col(vec![NOW_NS; 4])),
+        ("svc", str_col(vec!["api"; 4])),
+        (
+            "host",
+            str_col(vec![
+                hosts[0].as_str(),
+                hosts[0].as_str(),
+                hosts[1].as_str(),
+                hosts[1].as_str(),
+            ]),
+        ),
+        ("msg", str_col(vec![fat.as_str(), fat.as_str(), "y", "y"])),
+    ]));
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"msg\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+        )
+        .with_key_contains("/l0/0000/")
+        .with_occurrence(Occurrence::Always),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+    let err = load_instrumented(
+        fault.clone() as Arc<dyn ObjectStoreBackend>,
+        &pq,
+        "acme",
+        &m,
+        shards,
+        2,
+        0,
+        None,
+        2,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        5_000,
+        Some(DEFAULT_MAX_FLUSH_DELAY),
+        NOW_NS,
+        Arc::new(FixedClock(NOW_NS)),
+        LoadPath::Columnar,
+        None,
+        None,
+    )
+    .await
+    .expect_err("batch 1's permanent PUT failure fails the load");
+
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 1);
+    let LoadError::Flush { durable, .. } = &err else {
+        panic!("expected LoadError::Flush, got {err:?}");
+    };
+    assert_eq!(durable.len(), 1, "batch 2 acked: {durable:?}");
+    assert_eq!(durable[0].shard, 1);
+    let landed = list_data_objects(fault.as_ref()).await;
+    assert_eq!(landed.len(), 1, "{landed:?}");
+    assert!(landed[0].0.contains("/l0/0001/"), "{landed:?}");
+}
+
 /// `--skip-rows` (issue #1713): a positional resume with no idempotency
 /// marker. These tests exercise `load_instrumented` directly (rather than
 /// the public [`load`] wrapper, which hardcodes `skip_rows: 0` to avoid
@@ -3418,7 +4267,7 @@ mod load_skip_rows {
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -3631,10 +4480,10 @@ mod load_skip_rows {
             2,
             99,
             Some(1),
-            1,
+            Some(1),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -3713,10 +4562,10 @@ mod load_skip_rows {
             2,
             2,
             Some(1),
-            1,
+            Some(1),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -3766,7 +4615,8 @@ mod load_skip_rows {
 
         // The same failure under the default geometry: the figures are the
         // same numbers and are NOT an offset.
-        let multi = resume_hint(&load_err, Some(4), 4).expect("a non-setup error has figures");
+        let multi =
+            resume_hint(&load_err, Some(4), Some(4)).expect("a non-setup error has figures");
         assert!(
             multi.contains("next --skip-rows : 4 (rows_skipped + rows_written)")
                 && multi.contains("NOT a contiguous prefix of the file")

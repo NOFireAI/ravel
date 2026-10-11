@@ -503,7 +503,7 @@ mod metrics_pipeline_review {
     /// A `host` label value whose series routes to each of `shards` shards,
     /// found through the loader's own point builder so the routing is the
     /// one `IngestRouter::write` applies.
-    fn host_per_shard(mapping: &MetricsMapping, shards: u32) -> Vec<String> {
+    pub(super) fn host_per_shard(mapping: &MetricsMapping, shards: u32) -> Vec<String> {
         let candidates: Vec<String> = (0..256).map(|i| format!("h{i}")).collect();
         let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let b = drain_batch(&refs);
@@ -532,7 +532,7 @@ mod metrics_pipeline_review {
     }
 
     /// Every data-object key under one metrics shard.
-    async fn shard_data_keys(store: &dyn ObjectStoreBackend, shard: u32) -> Vec<String> {
+    pub(super) async fn shard_data_keys(store: &dyn ObjectStoreBackend, shard: u32) -> Vec<String> {
         let needle = format!("/m/l0/{shard:04}/");
         let mut out = Vec::new();
         let mut page: Option<ravel_object_store::PageToken> = None;
@@ -796,10 +796,10 @@ mod metrics_pipeline_review {
             1,
             0,
             read_cursors,
-            pipeline_depth,
+            Some(pipeline_depth),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             decode_queue_batches,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -852,7 +852,7 @@ mod metrics_pipeline_review {
             "a metrics failure never names --read-cursors: {emitted}"
         );
 
-        let hint = sequential_resume_hint(&load_err, 2).expect("a row rejection has figures");
+        let hint = sequential_resume_hint(&load_err, Some(2)).expect("a row rejection has figures");
         assert_eq!(
             hint,
             format!(
@@ -952,6 +952,878 @@ mod metrics_pipeline_review {
                 "the \"latency\" data point at ts {NOW_NS} has 5 explicit bounds, more than \
                      the limit of 4"
             ),
+        );
+    }
+}
+
+/// Issue #2753: the derived object geometry on the metrics path.
+mod default_geometry {
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    const MAPPING: &str = "[metrics]\nname = \"geometry_probe\"\nvalue_column = \"value\"\n\
+                           ts_column = \"ts\"\nts_unit = \"nanos\"\nkind = \"gauge\"\n\n\
+                           [[metrics.label]]\nname = \"host\"\ncolumn = \"host\"\n";
+
+    const BATCH_ROWS: usize = 10_000;
+    const BATCHES: usize = 51;
+    const HOST_BYTES: u64 = 64 << 30;
+
+    fn mapping() -> MetricsMapping {
+        match parse_mapping_document(MAPPING, SignalArg::Metrics).expect("valid mapping") {
+            MappingSection::Metrics(m) => m,
+            _ => panic!("a [metrics] section parses as metrics"),
+        }
+    }
+
+    /// `batches` row groups of `batch_rows` points. Each row group is one
+    /// series of its own (a fixed-width `host` value), with a distinct
+    /// timestamp per point: the points estimate charges a series' bytes once
+    /// per buffer, at its first sighting there, so a distinct series per batch
+    /// keeps every batch's estimate equal and a buffer's estimate the sum of
+    /// its batches'.
+    fn fixture(batch_rows: usize, batches: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        hosted_fixture(batch_rows, batches, |g| format!("b{g:03}"))
+    }
+
+    /// [`fixture`] with row group `g` on the series `host(g)`.
+    fn hosted_fixture(
+        batch_rows: usize,
+        batches: usize,
+        host: impl Fn(usize) -> String,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        row_hosted_fixture(batch_rows, batches, |g, _| host(g))
+    }
+
+    /// [`fixture`] with row `r` of row group `g` on the series `host(g, r)`.
+    fn row_hosted_fixture(
+        batch_rows: usize,
+        batches: usize,
+        host: impl Fn(usize, usize) -> String,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("points.parquet");
+        let group = |g: usize| {
+            let base = NOW_NS - 60_000_000_000 + (g * batch_rows) as i64;
+            let hosts: Vec<String> = (0..batch_rows).map(|r| host(g, r)).collect();
+            batch(vec![
+                (
+                    "ts",
+                    i64_col((0..batch_rows).map(|r| base + r as i64).collect()),
+                ),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(vec![1.0; batch_rows])) as ArrayRef,
+                ),
+                ("host", str_col(hosts.iter().map(String::as_str).collect())),
+            ])
+        };
+        let first = group(0);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for g in 1..batches {
+            writer.write(&group(g)).expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+        (dir, pq)
+    }
+
+    async fn load(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+    ) -> MetricsLoadReport {
+        load_sharded(store, pq, request, 1, BATCH_ROWS).await
+    }
+
+    async fn load_sharded(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+    ) -> MetricsLoadReport {
+        try_load_sharded(store, pq, request, shards, batch_rows)
+            .await
+            .expect("load succeeds")
+    }
+
+    async fn try_load_sharded(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+    ) -> Result<MetricsLoadReport, LoadError> {
+        try_load_clocked(
+            store,
+            pq,
+            request,
+            shards,
+            batch_rows,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+    }
+
+    async fn try_load_clocked(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Result<MetricsLoadReport, LoadError> {
+        load_metrics_with(
+            store,
+            pq,
+            "acme",
+            &mapping(),
+            shards,
+            batch_rows,
+            0,
+            request,
+            None,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(DEFAULT_MAX_FLUSH_DELAY),
+            NOW_NS,
+            clock,
+        )
+        .await
+    }
+
+    fn host_derived() -> LoadMemoryRequest {
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(HOST_BYTES),
+        }
+    }
+
+    /// Data objects on shard 0.
+    async fn stored_objects(store: &dyn ObjectStoreBackend) -> usize {
+        let mut stored = 0;
+        let mut page: Option<ravel_object_store::PageToken> = None;
+        loop {
+            let p = store.list("", page).await.expect("list");
+            stored += p
+                .objects
+                .iter()
+                .filter(|o| o.key.contains("/m/l0/0000/"))
+                .count();
+            match p.next {
+                Some(t) => page = Some(t),
+                None => break,
+            }
+        }
+        stored
+    }
+
+    /// Issue #2753: one series across every batch makes the first batch
+    /// over-estimate the rest, since a buffer charges a series' bytes only at
+    /// its first sighting there. 25 batches then estimate below the derived
+    /// target (25 first batches' worth), the size trigger never fires, and
+    /// the depth flush closes each window of 25: `51 / 25` depth flushes and
+    /// one end-of-input flush for the 1-batch remainder.
+    ///
+    /// Prove-the-test: never call `window.submitted` in the metrics loader
+    /// and nothing answers the write the loop waits on at the 25th submit;
+    /// the pinned clock never fires the age trigger, so the load fails on the
+    /// Strict ack deadline and `load`'s `expect("load succeeds")` panics.
+    #[tokio::test]
+    async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
+        let (_dir, pq) = hosted_fixture(BATCH_ROWS, BATCHES, |_| "b000".to_string());
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+
+        assert_eq!(report.points_written, (BATCH_ROWS * BATCHES) as u64);
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        let depth = geometry.pipeline_depth;
+        assert_eq!(depth, 25);
+        let depth_flushes = (BATCHES / depth) as u64;
+        let manual = u64::from(!BATCHES.is_multiple_of(depth));
+        assert_eq!(
+            stored_objects(store.as_ref()).await as u64,
+            depth_flushes + manual
+        );
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 0,
+                age: 0,
+                arrival: 0,
+                depth: depth_flushes,
+                manual,
+            },
+            "no size flush is reachable, so the depth flush closes every full window"
+        );
+    }
+
+    /// With `--target-bytes` and `--pipeline-depth` unset, 51 batches of
+    /// 10,000 points on one shard make exactly ceil(510,000 / 250,000) = 3
+    /// objects: every 25th batch reaches the derived target (250,000 times
+    /// the first batch's estimate per row) and closes an object on size, and
+    /// the end-of-input drain publishes the 10,000-point tail. The derived
+    /// depth is ceil(250,000 / 10,000) = 25; the size flushes at batches 25
+    /// and 50 each restart the depth window, so the depth flush never comes
+    /// due.
+    ///
+    /// The clock is pinned, so the age trigger cannot fire. Per-batch
+    /// flushing writes 51 objects; a target the size trigger never reaches
+    /// leaves every object to the depth flush or the drain (size 0).
+    #[tokio::test]
+    async fn default_load_merges_batches_into_target_sized_objects() {
+        let (_dir, pq) = fixture(BATCH_ROWS, BATCHES);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+
+        assert_eq!(report.points_written, (BATCH_ROWS * BATCHES) as u64);
+        let expected_objects = (BATCH_ROWS * BATCHES).div_ceil(DEFAULT_OBJECT_ROWS);
+        assert_eq!(expected_objects, 3);
+        assert_eq!(
+            stored_objects(store.as_ref()).await,
+            expected_objects,
+            "510,000 points on one shard make ceil(510,000 / 250,000) objects"
+        );
+        assert_eq!(report.objects_written(), expected_objects);
+
+        let layout = report.layout_report();
+        let geometry = layout
+            .geometry
+            .expect("a load that decoded rows resolves its geometry");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        // `est_bytes_per_row` is the first batch's estimate per row rounded
+        // up; the target is 250,000 rows of the unrounded figure.
+        let rows = DEFAULT_OBJECT_ROWS as u64;
+        assert!(
+            (geometry.target_bytes as u64) <= rows * geometry.est_bytes_per_row
+                && (geometry.target_bytes as u64) > rows * (geometry.est_bytes_per_row - 1),
+            "the derived target is 250,000 rows of the first batch's estimate: {geometry:?}"
+        );
+        assert_eq!(geometry.rows_depth, 25);
+        assert_eq!(geometry.pipeline_depth, 25);
+        assert_eq!(geometry.depth_bound, DepthBound::Rows);
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 2,
+                age: 0,
+                arrival: 0,
+                depth: 0,
+                manual: 1,
+            },
+            "two full objects close on size, the tail on the end-of-input drain"
+        );
+        assert_eq!(layout.flush_mix.totals.dominant(), Some("size"));
+        assert_eq!(layout.target_bytes_no_effect_warning, None);
+    }
+
+    const HISTOGRAM_MAPPING: &str = "[metrics]\nname = \"geometry_histogram\"\nvalue_column \
+                                     = \"bucket_count\"\nts_column = \"ts\"\nts_unit = \
+                                     \"nanos\"\n\n[[metrics.label]]\nname = \"host\"\ncolumn = \
+                                     \"host\"\n\n[metrics.histogram]\nle_column = \
+                                     \"le\"\nsum_column = \"sum\"\ncount_column = \"count\"\n";
+
+    /// The finite bounds of every fixture data point: one source row each.
+    const BOUNDS: [f64; 2] = [0.1, 1.0];
+
+    /// One data point of `BOUNDS.len()` finite bounds and a null sum explodes
+    /// into one bucket per bound, the `+Inf` bucket and `_count`.
+    const POINTS_PER_DATA_POINT: usize = BOUNDS.len() + 2;
+
+    fn histogram_mapping() -> MetricsMapping {
+        match parse_mapping_document(HISTOGRAM_MAPPING, SignalArg::Metrics).expect("valid mapping")
+        {
+            MappingSection::Metrics(m) => m,
+            _ => panic!("a [metrics] section parses as metrics"),
+        }
+    }
+
+    /// Row group `g` of the histogram fixture: `batch_rows / BOUNDS.len()`
+    /// data points on the series of host `b{g:03}`, one source row per bound,
+    /// each data point at its own `ts`.
+    fn histogram_group(g: usize, batch_rows: usize) -> RecordBatch {
+        let per_group = batch_rows / BOUNDS.len();
+        let base = NOW_NS - 60_000_000_000 + (g * per_group) as i64;
+        let host = format!("b{g:03}");
+        batch(vec![
+            (
+                "ts",
+                i64_col(
+                    (0..batch_rows)
+                        .map(|r| base + (r / BOUNDS.len()) as i64)
+                        .collect(),
+                ),
+            ),
+            (
+                "le",
+                Arc::new(Float64Array::from(
+                    (0..batch_rows)
+                        .map(|r| BOUNDS[r % BOUNDS.len()])
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                "bucket_count",
+                Arc::new(Float64Array::from(vec![1.0; batch_rows])) as ArrayRef,
+            ),
+            (
+                "sum",
+                Arc::new(Float64Array::from(vec![None::<f64>; batch_rows])) as ArrayRef,
+            ),
+            ("count", i64_col(vec![BOUNDS.len() as i64; batch_rows])),
+            ("host", str_col(vec![host.as_str(); batch_rows])),
+        ])
+    }
+
+    fn histogram_fixture(
+        batch_rows: usize,
+        batches: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("histograms.parquet");
+        let first = histogram_group(0, batch_rows);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for g in 1..batches {
+            writer
+                .write(&histogram_group(g, batch_rows))
+                .expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+        (dir, pq)
+    }
+
+    /// Each shard-0 data object's sample count, read from its RSEG footer.
+    async fn object_points(store: &dyn ObjectStoreBackend) -> Vec<u64> {
+        let mut out = Vec::new();
+        for key in super::metrics_pipeline_review::shard_data_keys(store, 0).await {
+            let got = store
+                .get(&key, ravel_object_store::GetRange::Full)
+                .await
+                .expect("get object");
+            let location = ravel_segment::open_from_full(got.data.as_ref(), Default::default())
+                .expect("open rseg footer");
+            out.push(location.footer.sample_count);
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Issue #2753: the derived target counts points, the object's own rows,
+    /// not source rows. A classic-histogram data point of 2 finite bounds and
+    /// a null sum is 2 source rows and 4 points, so a batch of 10,000 rows
+    /// carries 20,000 points. 27 batches make 540,000 points on one shard:
+    /// size flushes after 13 batches (259,996 points: the first batch leaves
+    /// its last data point open for the second) and 26 (260,000), and the
+    /// end-of-input drain publishes the last 20,004 (the last batch's 20,000
+    /// and the data point the end of input closes).
+    ///
+    /// Prove-the-test: resolve the geometry on the first batch's source rows
+    /// (9,998) instead of its points (19,996) and the target doubles to
+    /// 250,000 x 2 points' worth, so the first object holds about 500,000
+    /// points and the target assertion fails first.
+    #[tokio::test]
+    async fn a_histogram_load_sizes_objects_in_points_not_source_rows() {
+        const BATCHES: usize = 27;
+        let (_dir, pq) = histogram_fixture(BATCH_ROWS, BATCHES);
+        let mapping = histogram_mapping();
+
+        // The loader's first write, built independently: every data point of
+        // row group 0 but the last, which stays open until row group 1.
+        let first = histogram_group(0, BATCH_ROWS);
+        let cols = MetricsColumnIndex::resolve(&first, &mapping).expect("columns resolve");
+        let tenant = TenantId::new("acme");
+        let mut grouper = HistogramGrouper::new(tenant.clone());
+        let (first_points, first_rows) = build_batch_points(
+            &first,
+            &cols,
+            0,
+            &tenant,
+            &mapping,
+            &IngestLimits::default(),
+            NOW_NS,
+            false,
+            Some(&mut grouper),
+        )
+        .expect("every row is admitted");
+        let data_points = BATCH_ROWS / BOUNDS.len();
+        assert_eq!(first_rows as usize, BATCH_ROWS - BOUNDS.len());
+        assert_eq!(
+            first_points.len(),
+            (data_points - 1) * POINTS_PER_DATA_POINT,
+            "the first write carries n + 2 points per n source rows"
+        );
+        let first_points: Vec<ravel_ingest::IngestPoint> = first_points
+            .into_iter()
+            .map(ravel_ingest::IngestPoint::from)
+            .collect();
+        let est = ravel_ingest::est_points_object_bytes(&first_points);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_metrics_with(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping,
+            1,
+            BATCH_ROWS,
+            0,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+            None,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(DEFAULT_MAX_FLUSH_DELAY),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("load succeeds");
+
+        let total_points = BATCHES * data_points * POINTS_PER_DATA_POINT;
+        assert_eq!(report.rows_processed, (BATCHES * BATCH_ROWS) as u64);
+        assert_eq!(report.points_written, total_points as u64);
+
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        assert_eq!(
+            geometry.target_bytes,
+            DEFAULT_OBJECT_ROWS * est / first_points.len(),
+            "the derived target is 250,000 points at the first write's estimate per point"
+        );
+        assert_eq!(
+            geometry.est_bytes_per_row,
+            est.div_ceil(first_points.len()) as u64
+        );
+
+        let objects = object_points(store.as_ref()).await;
+        assert_eq!(objects.iter().sum::<u64>(), total_points as u64);
+        assert_eq!(
+            objects.len(),
+            total_points.div_ceil(DEFAULT_OBJECT_ROWS),
+            "540,000 points on one shard make ceil(540,000 / 250,000) objects: {objects:?}"
+        );
+        let batch_points = (data_points * POINTS_PER_DATA_POINT) as u64;
+        let (tail, full) = objects.split_first().expect("objects were written");
+        assert_eq!(
+            *tail,
+            batch_points + POINTS_PER_DATA_POINT as u64,
+            "the last batch and the data point closed at end of input are the drained tail"
+        );
+        for &points in full {
+            assert!(
+                points >= DEFAULT_OBJECT_ROWS as u64
+                    && points < DEFAULT_OBJECT_ROWS as u64 + batch_points,
+                "a size-closed object holds 250,000 points plus less than one batch: \
+                 {objects:?}"
+            );
+        }
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 2,
+                age: 0,
+                arrival: 0,
+                depth: 0,
+                manual: 1,
+            }
+        );
+    }
+
+    /// `--target-bytes 1 --batch-rows 10000` writes one object per batch on
+    /// the one shard, each closed by the size trigger.
+    #[tokio::test]
+    async fn target_bytes_one_writes_one_object_per_batch_per_shard() {
+        let batches = 3;
+        let (_dir, pq) = fixture(BATCH_ROWS, batches);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: Some(PER_BATCH_TARGET_BYTES),
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        assert_eq!(report.objects_written(), batches);
+        assert_eq!(
+            report.layout_report().flush_mix.totals,
+            FlushMixCounts {
+                size: batches as u64,
+                age: 0,
+                arrival: 0,
+                depth: 0,
+                manual: 0,
+            }
+        );
+    }
+
+    /// A budget of three batches at the first batch's estimate decides the
+    /// derived depth over the rows bound's 25, and the summary says so.
+    #[tokio::test]
+    async fn a_small_memory_budget_decides_the_derived_depth() {
+        let (_dir, pq) = fixture(BATCH_ROWS, 2);
+        let probe = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        let est_bytes_per_row = probe.geometry.expect("geometry resolved").est_bytes_per_row;
+        let report = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: LoadMemoryRequest::Flag(3 * BATCH_ROWS as u64 * est_bytes_per_row),
+            },
+        )
+        .await;
+        let geometry = report.geometry.expect("geometry resolved");
+        assert_eq!(geometry.memory_depth, Some(3));
+        assert_eq!(geometry.pipeline_depth, 3);
+        assert_eq!(geometry.depth_bound, DepthBound::Memory);
+        let summary = render_layout_summary(&report.layout_report());
+        assert!(
+            summary.contains(
+                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+            ),
+            "{summary}"
+        );
+    }
+
+    /// The metrics summary carries the trigger mix and the no-effect warning,
+    /// both as text and in the JSON line, which parses back to the report.
+    /// `--target-bytes 2` is below one batch's content, so all three writes
+    /// flush on size as their own object and the warning applies.
+    #[tokio::test]
+    async fn the_summary_and_json_carry_the_trigger_mix_and_the_warning() {
+        let (_dir, pq) = fixture(BATCH_ROWS, 3);
+        let report = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: Some(2),
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        let layout = report.layout_report();
+        let warning = layout
+            .target_bytes_no_effect_warning
+            .clone()
+            .expect("a target below one batch changes nothing and says so");
+        assert!(warning.contains("--target-bytes 2"), "{warning}");
+
+        let summary = render_layout_summary(&layout);
+        assert!(
+            summary.contains(
+                "  flush triggers   : size 3, age 0, arrival 0, depth 0, manual 0 (total 3)"
+            ),
+            "{summary}"
+        );
+        assert!(summary.contains(&warning), "{summary}");
+        let json = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(LOAD_REPORT_JSON_PREFIX))
+            .expect("the summary ends with the JSON report");
+        let value: serde_json::Value = serde_json::from_str(json).expect("the line is JSON");
+        assert_eq!(value["signal"], "metrics");
+        assert_eq!(value["flush_mix"]["totals"]["size"], 3);
+        assert_eq!(value["flush_mix"]["totals"]["manual"], 0);
+        assert_eq!(value["target_bytes_no_effect_warning"], warning.as_str());
+        let parsed: LoadLayoutReport = serde_json::from_str(json).expect("the report round-trips");
+        assert_eq!(parsed, layout);
+    }
+
+    /// Issue #2753: a size flush restarts the depth window of its own shard
+    /// only. Four shards, `--pipeline-depth 8`, batches of 40,000 points:
+    /// batches 1-6 put every point on series `a` (shard A), batch 7 splits
+    /// 20,000 / 20,000 between `a` and series `b` (shard B), and batches 8-12
+    /// put every point on `b`. The derived target is 250,000 of the first
+    /// batch's points (one series charge per 40,000 points), so `a` reaches
+    /// it at batch 7 with 260,000 points and closes on size; `b` ends with
+    /// 220,000 points, below the target. Shard A's window restarts at batch
+    /// 7; shard B has been pending since batch 7, and a depth flush would
+    /// come due at batch 7 + 8 - 1 = 14, after the last batch, so the
+    /// end-of-input flush closes `b`.
+    ///
+    /// Prove-the-test: under the router-wide rule (a size flush clears
+    /// pending shards only when the router-wide size-flush count grew by the
+    /// number of shards the batch reached), batch 7 reached two shards and
+    /// opened one size flush, so nothing is cleared, shard A's batch-1 entry
+    /// comes due at batch 8, and the depth flush closes `b`'s batches 7-8 as
+    /// an object of its own: 3 objects, and the mix assertion fails with
+    /// size 1, depth 1, manual 1.
+    #[tokio::test]
+    async fn a_size_flush_restarts_only_that_shards_window() {
+        const SHARDS: u32 = 4;
+        const ROWS: usize = 40_000;
+        const BATCHES: usize = 12;
+        const DEPTH: usize = 8;
+        let hosts = super::metrics_pipeline_review::host_per_shard(&mapping(), SHARDS);
+        let (shard_a, shard_b) = (0u32, 1u32);
+        let (a, b) = (hosts[0].clone(), hosts[1].clone());
+        let (_dir, pq) = row_hosted_fixture(ROWS, BATCHES, |g, r| match g {
+            0..=5 => a.clone(),
+            6 if r < ROWS / 2 => a.clone(),
+            _ => b.clone(),
+        });
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_sharded(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: Some(DEPTH),
+                load_memory: host_derived(),
+            },
+            SHARDS,
+            ROWS,
+        )
+        .await;
+
+        assert_eq!(report.points_written, (ROWS * BATCHES) as u64);
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        assert_eq!(geometry.pipeline_depth, DEPTH);
+
+        // Points per series, and the batch each series is first pending in
+        // (1-based, as the depth window counts submits).
+        let a_points = 6 * ROWS + ROWS / 2;
+        let b_points = ROWS / 2 + (BATCHES - 7) * ROWS;
+        assert!(a_points >= DEFAULT_OBJECT_ROWS && b_points < DEFAULT_OBJECT_ROWS);
+        let b_first_pending = 7;
+        assert!(
+            b_first_pending + DEPTH - 1 > BATCHES,
+            "b's window never comes due"
+        );
+
+        let mix = layout.flush_mix.totals;
+        assert_eq!(
+            mix,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                arrival: 0,
+                depth: 0,
+                manual: 1,
+            },
+            "a closes on size at batch 7; b's window, started at batch 7, is not due by batch 12"
+        );
+        let shard_keys = super::metrics_pipeline_review::shard_data_keys;
+        assert_eq!(shard_keys(store.as_ref(), shard_a).await.len(), 1);
+        assert_eq!(shard_keys(store.as_ref(), shard_b).await.len(), 1);
+        assert_eq!(report.objects_written() as u64, mix.total());
+        assert_eq!(report.realign_gave_up, 0);
+    }
+
+    /// Issue #2753: a shard that never handles its writes makes the load give
+    /// up realigning once, on the injected clock, and say so in the report,
+    /// the summary line and the JSON line. The skew override holds every
+    /// shard one write short of its enqueued count, so the first submit's
+    /// settle waits until the test advances the clock by the settle timeout;
+    /// no wall-clock time passes. Once given up, the later submits never
+    /// settle again (the override is read exactly once more, by the round
+    /// that sees the deadline), and the load still writes every point.
+    #[tokio::test]
+    async fn a_shard_that_never_merges_gives_up_realigning_on_the_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::load::geometry::{SETTLE_TIMEOUT, SKEW_OVERRIDE};
+
+        const BATCHES: usize = 3;
+        let (_dir, pq) = fixture(BATCH_ROWS, BATCHES);
+        let reads = Arc::new(AtomicU64::new(0));
+        let override_reads = Arc::clone(&reads);
+        let stall: crate::load::geometry::SkewOverride = Arc::new(move |stats| {
+            override_reads.fetch_add(1, Ordering::SeqCst);
+            stats
+                .into_iter()
+                .map(|(shard, mut s)| {
+                    s.messages_enqueued = s.messages_processed + 1;
+                    (shard, s)
+                })
+                .collect()
+        });
+        let clock = TestClock::new(NOW_NS);
+        let run = SKEW_OVERRIDE.scope(
+            stall,
+            try_load_clocked(
+                Arc::new(MemoryStore::new()),
+                &pq,
+                GeometryRequest {
+                    target_bytes: None,
+                    pipeline_depth: None,
+                    load_memory: host_derived(),
+                },
+                1,
+                BATCH_ROWS,
+                clock.clone(),
+            ),
+        );
+        tokio::pin!(run);
+        // The settle loop yields 64 rounds before it sleeps on the clock, so
+        // more reads than that mean its deadline is set and it is parked.
+        while reads.load(Ordering::SeqCst) < 64 {
+            tokio::select! {
+                biased;
+                _ = &mut run => panic!("the load finished while a shard held its writes"),
+                () = yield_until_router_is_quiet(&clock) => {}
+            }
+        }
+        let parked = reads.load(Ordering::SeqCst);
+        clock.advance_ns(i64::try_from(SETTLE_TIMEOUT.as_nanos()).expect("fits"));
+        let report = loop {
+            tokio::select! {
+                biased;
+                done = &mut run => break done.expect("load succeeds"),
+                () = yield_until_router_is_quiet(&clock) => assert!(
+                    reads.load(Ordering::SeqCst) <= parked + 1,
+                    "a later submit settled again after the window gave up"
+                ),
+            }
+        };
+        assert_eq!(reads.load(Ordering::SeqCst), parked + 1);
+
+        assert_eq!(report.realign_gave_up, 1);
+        assert_eq!(report.points_written, (BATCHES * BATCH_ROWS) as u64);
+        let layout = report.layout_report();
+        let summary = render_layout_summary(&layout);
+        assert!(
+            summary.contains(
+                "  depth realign    : gave up 1 time(s): the shards had not handled a batch \
+                 within 30 s, so later depth flushes counted batches without size flushes and \
+                 may have closed objects early"
+            ),
+            "{summary}"
+        );
+        let json = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(LOAD_REPORT_JSON_PREFIX))
+            .expect("the summary ends with the JSON report");
+        let value: serde_json::Value = serde_json::from_str(json).expect("the line is JSON");
+        assert_eq!(value["realign_gave_up"], 1);
+        let parsed: LoadLayoutReport = serde_json::from_str(json).expect("parses back");
+        assert_eq!(parsed.realign_gave_up, 1);
+
+        let settled = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        assert_eq!(settled.realign_gave_up, 0);
+        let summary = render_layout_summary(&settled.layout_report());
+        assert!(
+            summary.contains("  depth realign    : per shard on size flushes\n"),
+            "{summary}"
+        );
+        let json = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(LOAD_REPORT_JSON_PREFIX))
+            .expect("the summary ends with the JSON report");
+        let value: serde_json::Value = serde_json::from_str(json).expect("the line is JSON");
+        assert_eq!(value["realign_gave_up"], 0);
+    }
+
+    /// Issue #2753: a decode refusal at the default geometry reports at once.
+    /// Three 2-point batches on one shard, the third opening with a point a
+    /// day in the future, which the decoder rejects. The derived target is
+    /// far above the two buffered batches and the pinned clock never fires
+    /// the age trigger, so only the refusal path's own flush
+    /// (`drain_sequential_before_refusal`) can answer their acks: the load
+    /// returns the row rejection with both earlier batches durable as one
+    /// object.
+    ///
+    /// Prove-the-test: delete the `flush_buffered(router, enqueue).await` in
+    /// `drain_sequential_before_refusal` and nothing answers the buffered
+    /// acks until the Strict ack deadline expires on wall time; the drain
+    /// then fails, the rejection carries that failure's empty durable list,
+    /// and the `durable.len()` assertion fails with 0.
+    #[tokio::test]
+    async fn a_refused_batch_flushes_the_buffered_writes_before_it_reports() {
+        let host = "b000";
+        let mut ts: Vec<i64> = (0..6).map(|r| NOW_NS - 60_000_000_000 + r).collect();
+        ts[4] = NOW_NS + 86_400_000_000_000;
+        let (_dir, pq) = write_parquet(&batch(vec![
+            ("ts", i64_col(ts)),
+            (
+                "value",
+                Arc::new(Float64Array::from(vec![1.0; 6])) as ArrayRef,
+            ),
+            ("host", str_col(vec![host; 6])),
+        ]));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let err = try_load_sharded(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+            1,
+            2,
+        )
+        .await
+        .expect_err("row 4 is a day in the future");
+
+        let LoadError::RowRejected { row, durable, .. } = &err else {
+            panic!("expected the row rejection, got {err:?}");
+        };
+        assert_eq!(*row, 4);
+        assert_eq!(durable.len(), 2, "both earlier batches acked: {durable:?}");
+        assert_eq!(
+            stored_objects(store.as_ref()).await,
+            1,
+            "the refusal flush published the two buffered batches as one object"
         );
     }
 }
