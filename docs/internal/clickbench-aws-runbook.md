@@ -532,7 +532,17 @@ to `/root/kit/arm.env` once and every server start sources it, so a restart
 runs the flags the first start ran. Its `benchmark` phase runs each statement
 cold (server restarted, page cache dropped) and then twice hot, and every
 call goes through `run_query`, which records it in
-`out/benchmark/calls.jsonl`. The box
+`out/benchmark/calls.jsonl`. Every request body carries an explicit `start`
+and `end` spanning `run.toml`'s `window_hours` (default 200000, the window
+`sql_latency_bench --window-hours 200000` uses), because the SQL endpoint
+otherwise reads only the last hour. Each answer's row count is checked against
+the statement's `expected_rows` in `hits.corpus.json`, or, where that is null,
+against the cold try's count; a mismatch is recorded as a `wrong_answer` error
+and counts in the pooled error rate. `results.json` has the shape of
+`sql_latency_bench`'s report: an `entries` array of `id`, `min_ms` (fastest of
+the three tries), `cold_ms` and `per_run_accounting` (null over HTTP), a
+`failed` array of `id`, `run` and `error`, and the provenance and band
+verdicts as further top-level keys. The box
 then writes `results.json`, `evidence.tgz` and `progress.log`, uploads them
 with `DONE` (or `FAILED`, naming the step) to its `out/<arm>/` prefix, and
 terminates itself.
@@ -1005,9 +1015,11 @@ a miss writes `DONE` with `bands=miss`. `benchmarks/clickbench/kit/fetch.sh
 single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
 each arm's absolute bands and then arm B's relative bands against arm A, and
 exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
-3 on timeout and 4 when S3 is unreachable. The script above reads
-`sql_latency_bench`'s `bench.json`, not the kit's `results.json`; the kit
-does not feed it.
+3 on timeout and 4 when S3 is unreachable. The script above reads an arm's
+`results.json` unchanged, and its sums match the kit's. Its cost-class bands
+need `per_run_accounting`, which the HTTP endpoint does not return, so on a
+kit report it lists each statement as `no per_run_accounting; cold cost not
+emitted` and exits 3; the kit's own bands are the verdict for a kit run.
 
 ## 10. Profiling a statement
 

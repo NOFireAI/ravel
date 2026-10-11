@@ -10,32 +10,38 @@ Subcommands (each exits 0 on success, 2 on a refusal, 64 on bad usage):
   get FILE KEY                 print one run.toml value; an array prints one
                                item per line; a dotted key reads a table
   check-run FILE               refuse a run.toml missing a required key or
-                               holding a malformed SHA, lane or phase
-  check-bands FILE             refuse a band file holding a placeholder value,
-                               naming every key that holds one
-  request-bodies CORPUS DIR    write DIR/NN.json ({"query": sql}) and
-                               DIR/index.tsv (NN, statement id) per statement
+                               holding a malformed SHA, lane, phase, band
+                               section or digest
+  check-bands LANE FILE [SECTION...]
+                               refuse a band file that does not match the
+                               lane's schema (a missing, unknown or removed
+                               key, named) or that holds a placeholder value
+                               in a section it will be judged by (default:
+                               every section)
+  request-bodies CORPUS DIR START END
+                               write DIR/NN.json ({"query", "start", "end"})
+                               and DIR/index.tsv (NN, statement id, expected
+                               row count or -) per statement
   phases OUT PHASE...          print per-phase call and error counts from
                                OUT/<phase>/calls.jsonl as JSON
   assemble ARGS...             write results.json from the box's phase output
   validate FILE                refuse a results.json missing a field the
-                               ClickBenchParquetReport shape or the kit's
-                               provenance and bands blocks require
+                               shape below requires
   absolute LABEL FILE          print a results.json's absolute band table,
                                exit 1 on a miss
-  relative BANDS A.json B.json evaluate the relative bands, print the table,
-                               exit 1 on a miss
+  relative BANDS A.json B.json evaluate the lane's relative bands, print the
+                               table, exit 1 on a miss
 
-Band files are the lane's pre-registration TOML (parse_prereg in
-crates/ravel-bench/src/clickbench_parquet/report.rs reads the same file and
-refuses any key it does not know), so the kit's own bands are written as
-comment lines that TOML ignores:
-
-  #@ relative.<band> = <number>
-  #@ absolute.<metric>_max = <number>    (or _min)
-
-Every plain TOML key of the parquet lane's file is an absolute band as well;
-`absolute_bands` below names how each is judged.
+results.json carries SqlLatencyReport's statement shape
+(crates/ravel-bench/src/sql_latency.rs), so the runbook's analyse.py
+(docs/internal/clickbench-aws-runbook.md section 9) reads it unchanged:
+`entries` holds one EntryReport per answered statement (id, min_ms, median_ms,
+max_ms, cold_ms, rows_returned, per_run_accounting) and `failed` one
+FailedEntry per statement that did not answer (id, run, error). Both carry the
+kit's `answer` check and entries carry `"error": null`. per_run_accounting is
+null: an HTTP answer carries no executor accounting, as on the Flight lane.
+The kit's own blocks sit beside them: provenance, totals, error_pooled,
+concurrency, phases and bands.
 """
 
 import json
@@ -46,47 +52,68 @@ import sys
 
 PLACEHOLDER_PREFIX = "FILL-IN"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 # Phases box/run.sh implements. T5 adds its phases here and in run.sh.
 KNOWN_PHASES = ("benchmark",)
 
+# Band file sections a run.toml can select. `absolute` covers the [absolute]
+# table and every [absolute.*] table under it.
+BAND_SECTIONS = ("relative", "absolute")
+
+STATEMENT_KEYS = tuple("q%02d" % n for n in range(1, 44))
+
+# Each lane the kit runs, by table: the keys its band file must hold and the
+# only ones it may hold. The parquet lane's bands/parquet.toml belongs to
+# clickbench_parquet_bench, which runs no kit phase yet.
+LANE_BANDS = {
+    "rlog": {
+        "relative": (
+            "error_pooled_max_delta", "qps_min_ratio", "hot_statement_max_ratio",
+            "hot_statement_floor_s", "hot_sum_max_ratio", "cold_sum_max_ratio",
+        ),
+        "absolute": ("hot_sum_s_max", "cold_sum_s_max", "error_pooled_max"),
+        "absolute.hot_s_max": STATEMENT_KEYS,
+    },
+}
+# Keys a band file may no longer carry, refused by name (parse_prereg in
+# crates/ravel-bench/src/clickbench_parquet/report.rs refuses the same).
+REMOVED_BAND_KEYS = ("concurrency_error_ratio_ceiling",)
+
 RUN_REQUIRED = (
     "sha_a", "sha_b", "lanes", "phases", "instance_type", "region", "bucket",
     "prefix", "instance_profile", "repo_url", "tenant", "shards", "corpus",
-    "dataset_url", "rustfs_url", "rustfs_sha256", "memory_budget_bytes",
-    "audit_mode",
+    "dataset_url", "dataset_sha256", "rustfs_url", "rustfs_sha256",
+    "memory_budget_bytes", "audit_mode",
 )
+DEFAULT_WINDOW_HOURS = 200000
 
-# ClickBenchParquetReport's fields (report.rs, `pub struct
-# ClickBenchParquetReport`), its Provenance's and StatementFigures', none of
-# which is optional to serde.
+ENTRY_FIELDS = (
+    "id", "min_ms", "median_ms", "max_ms", "cold_ms", "rows_returned",
+    "per_run_accounting", "error", "answer",
+)
+FAILED_FIELDS = ("id", "run", "error", "answer")
+ANSWER_FIELDS = ("answered", "rows", "expected_rows", "match")
 REPORT_FIELDS = (
-    "provenance", "statements", "totals", "registered_failures_answered",
-    "concurrency", "concurrency_error",
+    "provenance", "entries", "skipped", "failed", "totals", "error_pooled",
+    "concurrency", "phases", "bands",
 )
 PROVENANCE_FIELDS = (
-    "git_sha", "binary", "arm", "location", "server", "server_log",
-    "server_settings", "sql_max_query_bytes", "sql_tenant_max_bytes",
-    "reference_dir", "reference_version", "ddl_files",
-)
-STATEMENT_FIELDS = (
-    "number", "cold_s", "hot_s", "verdict", "float_mismatches",
-    "missing_rows", "extra_rows", "compare_error", "error",
+    "git_sha", "binary", "arm", "tenant", "server", "server_logs",
+    "server_settings", "band_sections",
 )
 TOTALS_FIELDS = ("cold_sum_s", "hot_sum_s", "answered", "failed")
-# The kit's own provenance stamps.
+# The provenance stamps run.sh writes, one file each.
 KIT_STAMPS = (
     "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
     "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold",
-    "object_counts",
+    "object_counts", "query_window",
 )
 STAMPED_SETTINGS = (
     "cache_max_bytes", "catalog_cache_max_bytes", "fetch_concurrency",
     "sql_max_query_bytes", "sql_tenant_max_bytes",
 )
-
-
 class Refusal(Exception):
     pass
 
@@ -149,26 +176,15 @@ def _value(text, where):
 
 def parse_toml(path):
     """The flat subset run.toml and the band files use: [table] headers,
-    `key = value` with strings, numbers, booleans and one-line arrays. Kit
-    band lines (`#@ ...`) are returned separately."""
-    data, kit_lines, table = {}, {}, None
+    `key = value` with strings, numbers, booleans and one-line arrays. A
+    dotted table name ([a.b]) is kept as one flat key "a.b"."""
+    data, table = {}, None
     try:
         lines = open(path).read().splitlines()
     except OSError as e:
         raise Refusal("cannot read %s: %s" % (path, e))
     for n, raw in enumerate(lines, 1):
         where = "%s:%d" % (path, n)
-        stripped = raw.strip()
-        if stripped.startswith("#@"):
-            body = stripped[2:].strip()
-            if "=" not in body:
-                raise Refusal("%s: a #@ line must read `#@ key = value`" % where)
-            key, val = body.split("=", 1)
-            key = key.strip()
-            if key in kit_lines:
-                raise Refusal("%s: %s is set twice" % (where, key))
-            kit_lines[key] = _value(val, where)
-            continue
         line = _strip_comment(raw)
         if not line:
             continue
@@ -186,7 +202,7 @@ def parse_toml(path):
         if key in target:
             raise Refusal("%s: %s is set twice" % (where, key))
         target[key] = _value(val, where)
-    return data, kit_lines
+    return data
 
 
 def lookup(data, key):
@@ -200,8 +216,19 @@ def lookup(data, key):
 
 # --- run.toml --------------------------------------------------------------
 
+def band_sections(data):
+    sections = data.get("band_sections", list(BAND_SECTIONS))
+    if not isinstance(sections, list) or not sections:
+        raise Refusal("band_sections must be a non-empty array")
+    for s in sections:
+        if s not in BAND_SECTIONS:
+            raise Refusal("band_sections holds %r; known sections: %s"
+                          % (s, ", ".join(BAND_SECTIONS)))
+    return sections
+
+
 def check_run(path):
-    data, _ = parse_toml(path)
+    data = parse_toml(path)
     missing = [k for k in RUN_REQUIRED if lookup(data, k) in (None, "")]
     if missing:
         raise Refusal("run.toml %s: missing required key(s): %s" % (path, ", ".join(missing)))
@@ -209,6 +236,9 @@ def check_run(path):
         if not SHA_RE.match(str(data[key])):
             raise Refusal("run.toml %s: %s must be a full 40-character commit, got %r"
                           % (path, key, data[key]))
+    if not SHA256_RE.match(str(data["dataset_sha256"])):
+        raise Refusal("run.toml %s: dataset_sha256 must be 64 lowercase hex digits, got %r"
+                      % (path, data["dataset_sha256"]))
     for key in ("lanes", "phases"):
         if not isinstance(data[key], list) or not data[key]:
             raise Refusal("run.toml %s: %s must be a non-empty array" % (path, key))
@@ -219,13 +249,24 @@ def check_run(path):
         if phase not in KNOWN_PHASES:
             raise Refusal("run.toml %s: phase %r is not one box/run.sh implements (%s)"
                           % (path, phase, ", ".join(KNOWN_PHASES)))
+    for lane in data["lanes"]:
+        if lane not in LANE_BANDS:
+            raise Refusal("run.toml %s: lane %r is not one the kit runs (%s)"
+                          % (path, lane, ", ".join(sorted(LANE_BANDS))))
     bands = data.get("bands")
     for lane in data["lanes"]:
         if not isinstance(bands, dict) or not isinstance(bands.get(lane), str):
             raise Refusal("run.toml %s: lane %r has no band file under [bands]" % (path, lane))
+    try:
+        band_sections(data)
+    except Refusal as e:
+        raise Refusal("run.toml %s: %s" % (path, e))
     for key in ("shards", "memory_budget_bytes"):
         if not isinstance(data[key], int) or isinstance(data[key], bool) or data[key] <= 0:
             raise Refusal("run.toml %s: %s must be a whole number above 0" % (path, key))
+    hours = data.get("window_hours", DEFAULT_WINDOW_HOURS)
+    if not isinstance(hours, int) or isinstance(hours, bool) or hours <= 0:
+        raise Refusal("run.toml %s: window_hours must be a whole number above 0" % path)
     if data["audit_mode"] not in ("off", "required"):
         raise Refusal("run.toml %s: audit_mode must be off or required" % path)
     if data.get("audit_text", "redacted") not in ("redacted", "plaintext"):
@@ -238,104 +279,79 @@ def check_run(path):
 
 # --- band files ------------------------------------------------------------
 
-def check_bands(path):
-    data, kit = parse_toml(path)
-    found = []
-
-    def walk(prefix, node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                walk(prefix + [k], v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(prefix, v)
-        elif isinstance(node, str) and node.startswith(PLACEHOLDER_PREFIX):
-            found.append(".".join(prefix))
-
-    walk([], data)
-    walk([], kit)
-    if found:
-        raise Refusal("band file %s: placeholder value in %s; fill it in before launching"
-                      % (path, ", ".join(sorted(set(found)))))
-    return data, kit
-
-
 def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
-def absolute_bands(bands_path, report):
-    """Pass, miss or inconclusive for every absolute band in the lane's file,
-    judged against one arm's report."""
-    data, kit = check_bands(bands_path)
-    totals = report["totals"]
-    hot, cold = totals["hot_sum_s"], totals["cold_sum_s"]
-    failed = set(totals["failed"])
-    out = []
+def _placeholder(v):
+    return isinstance(v, str) and v.startswith(PLACEHOLDER_PREFIX)
 
-    def add(band, value, bound, verdict, note=""):
-        out.append({"band": band, "kind": "absolute", "value": value,
-                    "bound": bound, "verdict": verdict, "note": note})
 
-    stamped = report["provenance"].get("sql_max_query_bytes")
-    if "memory_cap_bytes" in data:
-        cap = data["memory_cap_bytes"]
-        add("sql_max_query_bytes == memory_cap_bytes", stamped, cap,
-            "pass" if stamped == cap else "miss")
-    if "arm_b_hot_s" in data:
-        bound = 1.25 * data["arm_b_hot_s"]
-        add("hot_sum_s <= 1.25 x arm_b_hot_s", hot, bound, "pass" if hot <= bound else "miss")
-    if "arm_b_cold_s" in data:
-        bound = 1.25 * data["arm_b_cold_s"]
-        add("cold_sum_s <= 1.25 x arm_b_cold_s", cold, bound, "pass" if cold <= bound else "miss")
-    if "rlog_hot_ceiling_s" in data:
-        bound = data["rlog_hot_ceiling_s"]
-        add("hot_sum_s < rlog_hot_ceiling_s", hot, bound, "pass" if hot < bound else "miss")
-    if "failures" in data:
-        allowed = set()
-        for label in data["failures"]:
-            allowed.add(int(str(label).lstrip("q")))
-        extra = sorted(failed - allowed)
-        add("failed statements within failures",
-            ["q%d" % n for n in sorted(failed)],
-            sorted(data["failures"]),
-            "miss" if extra else "pass",
-            ("outside failures: %s" % ", ".join("q%d" % n for n in extra)) if extra else "")
-    if "concurrency_qps_floor" in data:
-        conc = report.get("concurrency")
-        qps = conc.get("qps") if isinstance(conc, dict) else None
-        if _num(qps):
-            add("concurrency qps >= concurrency_qps_floor", qps, data["concurrency_qps_floor"],
-                "pass" if qps >= data["concurrency_qps_floor"] else "miss")
-        else:
-            add("concurrency qps >= concurrency_qps_floor", None, data["concurrency_qps_floor"],
-                "inconclusive", "no concurrency phase ran")
+def _section_of(table):
+    return table.split(".", 1)[0]
 
-    metrics = run_metrics(report)
-    for key, bound in sorted(kit.items()):
-        if not key.startswith("absolute."):
+
+def check_bands(lane, path, sections=None):
+    """The lane's band file, checked the way parse_prereg checks a
+    pre-registration: removed keys, then unknown keys, then missing ones, each
+    named. A placeholder is refused only in a section the run selected; any
+    other value must be a number."""
+    if lane not in LANE_BANDS:
+        raise Refusal("band file %s: lane %r is not one the kit runs (%s)"
+                      % (path, lane, ", ".join(sorted(LANE_BANDS))))
+    schema = LANE_BANDS[lane]
+    sections = list(BAND_SECTIONS) if sections is None else sections
+    data = parse_toml(path)
+    removed, unknown = [], []
+    for table, node in sorted(data.items()):
+        if not isinstance(node, dict):
+            (removed if table in REMOVED_BAND_KEYS else unknown).append(table)
             continue
-        name = key[len("absolute."):]
-        m = re.match(r"^(.+)_(max|min)$", name)
-        if not m or not _num(bound):
-            raise Refusal("band file %s: %s must be absolute.<metric>_max|_min = <number>"
-                          % (bands_path, key))
-        metric, side = m.group(1), m.group(2)
-        if metric not in METRICS:
-            raise Refusal("band file %s: %s names unknown metric %r (known: %s)"
-                          % (bands_path, key, metric, ", ".join(METRICS)))
-        value = metrics.get(metric)
-        label = "%s %s %s" % (metric, "<=" if side == "max" else ">=", bound)
-        if not _num(value):
-            add(label, None, bound, "inconclusive", "metric not measured")
-        elif side == "max":
-            add(label, value, bound, "pass" if value <= bound else "miss")
-        else:
-            add(label, value, bound, "pass" if value >= bound else "miss")
-    return out
+        for key in sorted(node):
+            name = "%s.%s" % (table, key)
+            if key in REMOVED_BAND_KEYS:
+                removed.append(name)
+            elif table not in schema or key not in schema[table]:
+                unknown.append(name)
+    if removed:
+        raise Refusal("band file %s: removed key(s) %s; delete them"
+                      % (path, ", ".join(removed)))
+    if unknown:
+        raise Refusal("band file %s: unknown key(s) %s for lane %s"
+                      % (path, ", ".join(unknown), lane))
+    missing = ["%s.%s" % (t, k) for t in sorted(schema) for k in schema[t]
+               if k not in data.get(t, {})]
+    if missing:
+        raise Refusal("band file %s: missing required key(s) %s" % (path, ", ".join(missing)))
+    placeholders, malformed = [], []
+    for table in sorted(schema):
+        for key in schema[table]:
+            v, name = data[table][key], "%s.%s" % (table, key)
+            if _placeholder(v):
+                if _section_of(table) in sections:
+                    placeholders.append(name)
+            elif not _num(v) or v < 0:
+                malformed.append(name)
+    if malformed:
+        raise Refusal("band file %s: %s must be a number of at least 0"
+                      % (path, ", ".join(malformed)))
+    if placeholders:
+        raise Refusal("band file %s: placeholder value in %s; fill it in on the reference "
+                      "machine before selecting that section in band_sections"
+                      % (path, ", ".join(placeholders)))
+    return data
 
 
-METRICS = ("hot_sum_s", "cold_sum_s", "error_pooled", "qps")
+def lane_of(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _row(kind, band, value, bound, verdict, note="", statement=None):
+    row = {"band": band, "kind": kind, "value": value, "bound": bound,
+           "verdict": verdict, "note": note}
+    if statement is not None:
+        row["statement"] = statement
+    return row
 
 
 def run_metrics(report):
@@ -352,64 +368,88 @@ def run_metrics(report):
     }
 
 
-RELATIVE_BANDS = (
-    "error_pooled_max_delta", "qps_min_ratio", "hot_statement_max_ratio",
-    "hot_statement_floor_s", "hot_sum_max_ratio", "cold_sum_max_ratio",
-)
-
-
-def relative_bands(bands_path, a, b):
-    """Arm B judged against arm A, per the `#@ relative.*` lines."""
-    _, kit = check_bands(bands_path)
-    rel = {}
-    for key, value in kit.items():
-        if not key.startswith("relative."):
+def absolute_bands(lane, path, sections, report):
+    """One arm judged against the lane's absolute section, when selected."""
+    if "absolute" not in sections:
+        return []
+    data = check_bands(lane, path, sections)
+    ab, per = data["absolute"], data["absolute.hot_s_max"]
+    m = run_metrics(report)
+    out = []
+    for metric in ("hot_sum_s", "cold_sum_s", "error_pooled"):
+        bound, value = ab[metric + "_max"], m[metric]
+        label = "%s <= %s_max" % (metric, metric)
+        if not _num(value):
+            out.append(_row("absolute", label, None, bound, "miss", "not measured"))
+        else:
+            out.append(_row("absolute", label, value, bound, "pass" if value <= bound else "miss"))
+    answered = {e["id"]: e for e in report["entries"]}
+    for sid in sorted(set(answered) | set(f["id"] for f in report["failed"])):
+        q = sid.split("_", 1)[0]
+        if q not in per:
+            raise Refusal("band file %s: no absolute.hot_s_max key for statement %s" % (path, sid))
+        label = "%s hot_s <= hot_s_max.%s" % (q, q)
+        if sid not in answered:
+            out.append(_row("absolute", label, None, per[q], "miss", "not answered", sid))
             continue
-        name = key[len("relative."):]
-        if name not in RELATIVE_BANDS or not _num(value):
-            raise Refusal("band file %s: %s is not a known relative band with a number (%s)"
-                          % (bands_path, key, ", ".join(RELATIVE_BANDS)))
-        rel[name] = value
+        hot = answered[sid]["min_ms"] / 1000.0
+        out.append(_row("absolute", label, hot, per[q], "pass" if hot <= per[q] else "miss",
+                        "", sid))
+    return out
+
+
+def relative_bands(path, a, b):
+    """Arm B judged against arm A, over the statements both arms answered. A
+    statement A answered and B did not is a miss of its own."""
+    sections = a["provenance"]["band_sections"]
+    if "relative" not in sections:
+        return []
+    rel = check_bands(lane_of(path), path, sections)["relative"]
     out = []
 
-    def add(band, value, bound, verdict, note=""):
-        out.append({"band": band, "kind": "relative", "value": value,
-                    "bound": bound, "verdict": verdict, "note": note})
+    def add(*args, **kw):
+        out.append(_row("relative", *args, **kw))
 
     ma, mb = run_metrics(a), run_metrics(b)
-    if "error_pooled_max_delta" in rel:
-        d = rel["error_pooled_max_delta"]
-        if _num(ma["error_pooled"]) and _num(mb["error_pooled"]):
-            bound = ma["error_pooled"] + d
-            add("error_pooled <= A + %g" % d, mb["error_pooled"], bound,
-                "pass" if mb["error_pooled"] <= bound else "miss")
-        else:
-            add("error_pooled <= A + %g" % d, None, None, "inconclusive", "no calls recorded")
-    if "qps_min_ratio" in rel:
-        r = rel["qps_min_ratio"]
-        if _num(ma["qps"]) and _num(mb["qps"]):
-            bound = r * ma["qps"]
-            add("qps >= %g x A" % r, mb["qps"], bound, "pass" if mb["qps"] >= bound else "miss")
-        else:
-            add("qps >= %g x A" % r, None, None, "inconclusive", "no concurrency phase ran")
-    for metric, key in (("hot_sum_s", "hot_sum_max_ratio"), ("cold_sum_s", "cold_sum_max_ratio")):
-        if key in rel:
-            bound = rel[key] * ma[metric]
-            add("%s <= %g x A" % (metric, rel[key]), mb[metric], bound,
-                "pass" if mb[metric] <= bound else "miss")
-    if "hot_statement_max_ratio" in rel:
-        r = rel["hot_statement_max_ratio"]
-        floor = rel.get("hot_statement_floor_s", 0.0)
-        a_hot = {s["number"]: s["hot_s"] for s in a["statements"]}
-        for s in sorted(b["statements"], key=lambda s: s["number"]):
-            label = "q%02d hot_s <= max(%g x A, %g s)" % (s["number"], r, floor)
-            ah = a_hot.get(s["number"])
-            if not _num(ah) or not _num(s["hot_s"]):
-                add(label, s["hot_s"], None, "inconclusive",
-                    "failed on %s" % ("A" if not _num(ah) else "B"))
-                continue
-            bound = max(r * ah, floor)
-            add(label, s["hot_s"], bound, "pass" if s["hot_s"] <= bound else "miss")
+    d = rel["error_pooled_max_delta"]
+    if _num(ma["error_pooled"]) and _num(mb["error_pooled"]):
+        bound = ma["error_pooled"] + d
+        add("error_pooled <= A + %g" % d, mb["error_pooled"], bound,
+            "pass" if mb["error_pooled"] <= bound else "miss")
+    else:
+        add("error_pooled <= A + %g" % d, None, None, "inconclusive", "no calls recorded")
+    r = rel["qps_min_ratio"]
+    if _num(ma["qps"]) and _num(mb["qps"]):
+        bound = r * ma["qps"]
+        add("qps >= %g x A" % r, mb["qps"], bound, "pass" if mb["qps"] >= bound else "miss")
+    else:
+        add("qps >= %g x A" % r, None, None, "inconclusive", "no concurrency phase ran")
+
+    ea = {e["id"]: e for e in a["entries"]}
+    eb = {e["id"]: e for e in b["entries"]}
+    both = sorted(set(ea) & set(eb))
+    for sid in sorted(set(ea) - set(eb)):
+        add("%s answered by B" % sid.split("_", 1)[0], None, None, "miss",
+            "answered by A, not by B", statement=sid)
+    for metric, field, key in (("hot_sum_s", "min_ms", "hot_sum_max_ratio"),
+                               ("cold_sum_s", "cold_ms", "cold_sum_max_ratio")):
+        sa = sum(ea[s][field] for s in both) / 1000.0
+        sb = sum(eb[s][field] for s in both) / 1000.0
+        bound = rel[key] * sa
+        add("%s <= %g x A (%d both answered)" % (metric, rel[key], len(both)), sb, bound,
+            "pass" if sb <= bound else "miss")
+    r = rel["hot_statement_max_ratio"]
+    floor = rel["hot_statement_floor_s"]
+    for sid in sorted(set(ea) | set(eb)):
+        label = "%s hot_s <= max(%g x A, %g s)" % (sid.split("_", 1)[0], r, floor)
+        if sid not in both:
+            if sid in eb:
+                add(label, eb[sid]["min_ms"] / 1000.0, None, "inconclusive", "failed on A",
+                    statement=sid)
+            continue
+        ah, bh = ea[sid]["min_ms"] / 1000.0, eb[sid]["min_ms"] / 1000.0
+        bound = max(r * ah, floor)
+        add(label, bh, bound, "pass" if bh <= bound else "miss", statement=sid)
     return out
 
 
@@ -428,56 +468,121 @@ def print_table(rows, arm=""):
 
 # --- request bodies --------------------------------------------------------
 
-def request_bodies(corpus, out_dir):
+def request_bodies(corpus, out_dir, start, end):
+    """One body per statement with an explicit window: the server's default
+    is the last hour, which would hide every commit the load made earlier."""
+    try:
+        start, end = int(start), int(end)
+    except ValueError:
+        raise Refusal("request-bodies: START and END must be whole Unix seconds")
+    if start >= end:
+        raise Refusal("request-bodies: START %d is not before END %d" % (start, end))
     doc = json.load(open(corpus))
     entries = doc["entries"]
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "index.tsv"), "w") as idx:
         for n, e in enumerate(entries, 1):
             with open(os.path.join(out_dir, "%02d.json" % n), "w") as f:
-                json.dump({"query": e["sql"]}, f)
-            idx.write("%02d\t%s\n" % (n, e["id"]))
+                json.dump({"query": e["sql"], "start": start, "end": end}, f)
+            expected = e.get("expected_rows")
+            idx.write("%02d\t%s\t%s\n" % (n, e["id"], "-" if expected is None else int(expected)))
     print(len(entries))
 
 
 # --- results.json ----------------------------------------------------------
 
 def parse_settings(log_text):
-    """The five `performance default resolved` stamps, in the shape
-    report.rs's ServerSetting serialises to."""
+    """Every `performance default resolved` value per stamped setting."""
     ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-    settings = [{"setting": s, "values": [], "unreadable_lines": []} for s in STAMPED_SETTINGS]
+    settings = dict((s, []) for s in STAMPED_SETTINGS)
+    unreadable = []
     for raw in log_text.splitlines():
         line = ansi.sub("", raw)
         if " performance default resolved " not in line:
             continue
         m = re.search(r' setting="?([A-Za-z0-9_]+)"?', line)
-        if not m:
+        if not m or m.group(1) not in settings:
             continue
-        for entry in settings:
-            if entry["setting"] == m.group(1):
-                v = re.search(r" value=([0-9]+)(?: |$)", line)
-                if v:
-                    entry["values"].append(int(v.group(1)))
-                else:
-                    entry["unreadable_lines"].append(line.strip())
-    return settings
+        v = re.search(r" value=([0-9]+)(?: |$)", line)
+        if v:
+            settings[m.group(1)].append(int(v.group(1)))
+        else:
+            unreadable.append(line.strip())
+    return settings, unreadable
+
+
+def server_settings(logs):
+    """The settings every benchmark server start resolved. Each restart must
+    resolve the same values, and the two memory caps exactly once, or the
+    statements did not all run under one configuration."""
+    first, first_log = None, None
+    for log in logs:
+        settings, unreadable = parse_settings(open(log, errors="replace").read())
+        if unreadable:
+            raise Refusal("server log %s: unreadable setting line %r" % (log, unreadable[0]))
+        for name in ("sql_max_query_bytes", "sql_tenant_max_bytes"):
+            if len(settings[name]) != 1:
+                raise Refusal("server log %s carries %s %d times, not once"
+                              % (log, name, len(settings[name])))
+        if first is None:
+            first, first_log = settings, log
+            continue
+        for name in STAMPED_SETTINGS:
+            if settings[name] != first[name]:
+                raise Refusal("server log %s resolved %s %r, %s resolved %r"
+                              % (log, name, settings[name], first_log, first[name]))
+    if first is None:
+        raise Refusal("assemble: no server log")
+    return dict((k, v[0] if len(v) == 1 else v) for k, v in first.items())
+
+
+def _median(xs):
+    s = sorted(xs)
+    return s[(len(s) - 1) // 2]
+
+
+def statement_report(sid, expected, calls):
+    """EntryReport for an answered statement, FailedEntry otherwise."""
+    calls = sorted(calls, key=lambda c: int(c["try"]))
+    rows = [c.get("rows") for c in calls if isinstance(c.get("rows"), int)]
+    answer = {"answered": False, "rows": rows[0] if rows else None,
+              "expected_rows": expected, "match": None}
+    if expected is not None:
+        answer["match"] = bool(rows) and all(r == expected for r in rows)
+    bad = [c for c in calls if c.get("outcome") != "ok"]
+    if len(calls) != 3 or bad:
+        first = bad[0] if bad else None
+        if first:
+            error = "%s HTTP %s %s: %s" % (first.get("outcome"), first.get("http_status"),
+                                          first.get("refusal_class"), first.get("error"))
+            run = int(first["try"]) - 1
+        else:
+            error, run = "%d of 3 tries recorded" % len(calls), len(calls)
+        return None, {"id": sid, "run": run, "error": error, "answer": answer}
+    answer["answered"] = True
+    ms = [float(c["duration_s"]) * 1000.0 for c in calls]
+    return {"id": sid, "min_ms": min(ms), "median_ms": _median(ms), "max_ms": max(ms),
+            "cold_ms": ms[0], "rows_returned": answer["rows"], "per_run_accounting": None,
+            "error": None, "answer": answer, "tries_ms": ms}, None
 
 
 def assemble(args):
     """assemble KEY=VALUE...: build results.json from the files run.sh wrote.
     Required keys: out, calls (the benchmark phase's calls.jsonl), index,
-    server_log, bands (lane:path[,lane:path]), provenance (a directory of
-    stamp files, one per provenance key), arm, sha, binary, tenant, phases_json."""
+    server_logs (comma-separated, every benchmark server start), bands
+    (lane:path[,lane:path]), sections (comma-separated band sections),
+    provenance (a directory of stamp files, one per provenance key), arm, sha,
+    binary, tenant, phases_json."""
     kv = dict(a.split("=", 1) for a in args)
-    for key in ("out", "calls", "index", "server_log", "bands", "provenance",
+    for key in ("out", "calls", "index", "server_logs", "bands", "sections", "provenance",
                 "arm", "sha", "binary", "tenant", "phases_json"):
         if key not in kv:
             raise Refusal("assemble: missing %s=" % key)
-    ids = {}
+    sections = band_sections({"band_sections": kv["sections"].split(",")})
+    index = []
     for line in open(kv["index"]):
-        n, sid = line.rstrip("\n").split("\t")
-        ids[int(n)] = sid
+        n, sid, expected = line.rstrip("\n").split("\t")
+        index.append((int(n), sid, None if expected == "-" else int(expected)))
     tries = {}
     for n, line in enumerate(open(kv["calls"]), 1):
         try:
@@ -485,33 +590,15 @@ def assemble(args):
             tries.setdefault(int(call["number"]), []).append(call)
         except (ValueError, KeyError, TypeError) as e:
             raise Refusal("assemble: %s:%d is not a call record: %s" % (kv["calls"], n, e))
-    statements = []
-    for n in sorted(ids):
-        rows = tries.get(n, [])
-        base = {"number": n, "id": ids[n], "cold_s": None, "hot_s": None, "verdict": None,
-                "float_mismatches": [], "missing_rows": 0, "extra_rows": 0,
-                "compare_error": "not compared: the kit runs no reference comparison",
-                "error": None, "tries_s": []}
-        bad = [r for r in rows if r.get("outcome") != "ok"]
-        if len(rows) != 3 or bad:
-            first = bad[0] if bad else None
-            base["error"] = ("%s HTTP %s %s: %s" % (first.get("outcome"), first.get("http_status"),
-                                                    first.get("refusal_class"), first.get("error"))
-                             if first else "%d of 3 tries recorded" % len(rows))
-            base["compare_error"] = None
-        else:
-            t = [float(r["duration_s"]) for r in sorted(rows, key=lambda r: int(r["try"]))]
-            base["tries_s"] = t
-            base["cold_s"] = t[0]
-            base["hot_s"] = min(t[1], t[2])
-        statements.append(base)
-    failed = [s["number"] for s in statements if s["error"] is not None]
-    answered = [s for s in statements if s["error"] is None]
+    entries, failed = [], []
+    for n, sid, expected in index:
+        entry, fail = statement_report(sid, expected, tries.get(n, []))
+        (entries if entry else failed).append(entry or fail)
     totals = {
-        "cold_sum_s": sum(s["cold_s"] for s in answered),
-        "hot_sum_s": sum(s["hot_s"] for s in answered),
-        "answered": len(answered),
-        "failed": failed,
+        "cold_sum_s": sum(e["cold_ms"] for e in entries) / 1000.0,
+        "hot_sum_s": sum(e["min_ms"] for e in entries) / 1000.0,
+        "answered": len(entries),
+        "failed": [f["id"] for f in failed],
     }
     lanes = []
     for item in kv["bands"].split(","):
@@ -519,31 +606,16 @@ def assemble(args):
         if not lane or not path:
             raise Refusal("assemble: bands= takes lane:path[,lane:path], got %r" % item)
         lanes.append((lane, path))
-    allowed = set()
-    for _, path in lanes:
-        data, _ = check_bands(path)
-        allowed |= set(int(str(x).lstrip("q")) for x in data.get("failures", []))
-    settings = parse_settings(open(kv["server_log"], errors="replace").read())
-
-    def single(name):
-        for s in settings:
-            if s["setting"] == name and len(s["values"]) == 1 and not s["unreadable_lines"]:
-                return s["values"][0]
-        raise Refusal("server log %s does not carry %s exactly once" % (kv["server_log"], name))
-
+    logs = kv["server_logs"].split(",")
     provenance = {
         "git_sha": kv["sha"],
         "binary": kv["binary"],
         "arm": kv["arm"].lower(),
-        "location": "tenant %s" % kv["tenant"],
+        "tenant": kv["tenant"],
         "server": kv.get("server", "http://127.0.0.1:4318"),
-        "server_log": kv["server_log"],
-        "server_settings": settings,
-        "sql_max_query_bytes": single("sql_max_query_bytes"),
-        "sql_tenant_max_bytes": single("sql_tenant_max_bytes"),
-        "reference_dir": "",
-        "reference_version": "none: the kit compares no answers",
-        "ddl_files": None,
+        "server_logs": [os.path.basename(p) for p in logs],
+        "server_settings": server_settings(logs),
+        "band_sections": sections,
     }
     # One file per stamp: a file that parses as JSON is that value, any
     # other file is its text with the trailing newline dropped.
@@ -553,18 +625,23 @@ def assemble(args):
             provenance[name] = json.loads(text)
         except ValueError:
             provenance[name] = text.rstrip("\n")
+    phases = json.load(open(kv["phases_json"]))
+    calls = sum(p.get("calls", 0) for p in phases.values())
+    errors = sum(p.get("errors", 0) for p in phases.values())
     report = {
         "provenance": provenance,
-        "statements": statements,
+        "entries": entries,
+        "skipped": [],
+        "failed": failed,
         "totals": totals,
-        "registered_failures_answered": [s["number"] for s in answered if s["number"] in allowed],
+        "error_pooled": {"calls": calls, "errors": errors,
+                         "ratio": (errors / calls) if calls else None},
         "concurrency": None,
-        "concurrency_error": None,
-        "phases": json.load(open(kv["phases_json"])),
+        "phases": phases,
     }
     report["bands"] = []
     for lane, path in lanes:
-        for row in absolute_bands(path, report):
+        for row in absolute_bands(lane, path, sections, report):
             row["lane"] = lane
             report["bands"].append(row)
     tmp = kv["out"] + ".tmp"
@@ -603,7 +680,7 @@ def validate(path):
         raise Refusal("%s: not readable JSON: %s" % (path, e))
     if not isinstance(r, dict):
         raise Refusal("%s: not a JSON object" % path)
-    missing = [k for k in REPORT_FIELDS + ("bands", "phases") if k not in r]
+    missing = [k for k in REPORT_FIELDS if k not in r]
     if missing:
         raise Refusal("%s: missing %s" % (path, ", ".join(missing)))
     p = r["provenance"]
@@ -617,15 +694,34 @@ def validate(path):
     for k in ("start", "end"):
         if k not in (p["burst_balance"] or {}):
             raise Refusal("%s: provenance burst_balance has no %s" % (path, k))
-    if not isinstance(r["statements"], list) or not r["statements"]:
+    for k in ("start", "end", "window_hours"):
+        if not _num((p["query_window"] or {}).get(k)):
+            raise Refusal("%s: provenance query_window has no %s" % (path, k))
+    seen = set()
+    for kind, fields in (("entries", ENTRY_FIELDS), ("failed", FAILED_FIELDS)):
+        for e in r[kind]:
+            miss = [k for k in fields if k not in e]
+            if miss:
+                raise Refusal("%s: %s row %r missing %s" % (path, kind, e.get("id"), ", ".join(miss)))
+            miss = [k for k in ANSWER_FIELDS if k not in (e["answer"] or {})]
+            if miss:
+                raise Refusal("%s: %s row %r answer missing %s"
+                              % (path, kind, e["id"], ", ".join(miss)))
+            if e["id"] in seen:
+                raise Refusal("%s: statement %s appears twice" % (path, e["id"]))
+            seen.add(e["id"])
+    if not seen:
         raise Refusal("%s: no statements" % path)
-    for s in r["statements"]:
-        miss = [k for k in STATEMENT_FIELDS if k not in s]
-        if miss:
-            raise Refusal("%s: statement %r missing %s" % (path, s.get("number"), ", ".join(miss)))
+    for e in r["entries"]:
+        for k in ("min_ms", "median_ms", "max_ms", "cold_ms"):
+            if not _num(e[k]):
+                raise Refusal("%s: entry %s has %s %r" % (path, e["id"], k, e[k]))
     miss = [k for k in TOTALS_FIELDS if k not in r["totals"]]
     if miss:
         raise Refusal("%s: totals missing %s" % (path, ", ".join(miss)))
+    for k in ("cold_sum_s", "hot_sum_s"):
+        if not _num(r["totals"][k]):
+            raise Refusal("%s: totals.%s is %r, not a number" % (path, k, r["totals"][k]))
     for b in r["bands"]:
         if b.get("verdict") not in ("pass", "miss", "inconclusive"):
             raise Refusal("%s: band %r has verdict %r" % (path, b.get("band"), b.get("verdict")))
@@ -639,18 +735,17 @@ def main(argv):
     cmd, args = argv[1], argv[2:]
     try:
         if cmd == "get" and len(args) == 2:
-            data, _ = parse_toml(args[0])
-            v = lookup(data, args[1])
+            v = lookup(parse_toml(args[0]), args[1])
             if v is None:
                 raise Refusal("%s: no key %s" % (args[0], args[1]))
             for item in (v if isinstance(v, list) else [v]):
                 print(item if not isinstance(item, bool) else str(item).lower())
         elif cmd == "check-run" and len(args) == 1:
             check_run(args[0])
-        elif cmd == "check-bands" and len(args) == 1:
-            check_bands(args[0])
-        elif cmd == "request-bodies" and len(args) == 2:
-            request_bodies(args[0], args[1])
+        elif cmd == "check-bands" and len(args) >= 2:
+            check_bands(args[0], args[1], args[2:] or None)
+        elif cmd == "request-bodies" and len(args) == 4:
+            request_bodies(*args)
         elif cmd == "phases" and len(args) >= 2:
             phases_summary(args[0], args[1:])
         elif cmd == "assemble":

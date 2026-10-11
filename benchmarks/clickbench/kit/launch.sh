@@ -3,7 +3,8 @@
 # box/run.sh against its own commit (ADR-2867 change 2).
 #
 # This is the only credentialed step. It reads run.toml, refuses a band file
-# that still holds a placeholder value (naming the key), checks with
+# that does not match its lane's schema or that holds a placeholder value in a
+# section run.toml's band_sections selects (naming the key), checks with
 # `aws iam simulate-principal-policy` that the instance profile's role may
 # s3:GetObject the run's in/ prefix and s3:PutObject its out/ prefix (refusing
 # with the role's name otherwise), tars the kit with a SHA256SUMS sidecar,
@@ -101,6 +102,7 @@ INSTANCE_TYPE="$(toml instance_type)"
 PROFILE="$(toml instance_profile)"
 CORPUS="$(toml corpus)"
 LANES="$(toml lanes | tr '\n' ' ')"
+BAND_SECTIONS="$(toml_opt band_sections | tr '\n' ' ')"
 AMI="$(toml_opt ami)"
 SUBNET="$(toml_opt subnet)"
 SECURITY_GROUP="$(toml_opt security_group)"
@@ -124,7 +126,8 @@ CORPUS_PATH="$(resolve "$CORPUS")"
 for lane in $LANES; do
   band="$(resolve "$(toml "bands.$lane")")"
   [ -f "$band" ] || die64 "lane $lane: band file not found: $band"
-  kit_py check-bands "$band" || die64 "lane $lane: band file refused"
+  # shellcheck disable=SC2086 # BAND_SECTIONS is a space-separated list of names
+  kit_py check-bands "$lane" "$band" $BAND_SECTIONS || die64 "lane $lane: band file refused"
 done
 
 if command -v sha256sum >/dev/null; then

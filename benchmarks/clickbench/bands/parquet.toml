@@ -41,17 +41,6 @@ rlog_hot_ceiling_s = 101.7
 # `concurrency_error_ratio_ceiling` key.
 concurrency_qps_floor = 0.400
 
-# Kit bands (benchmarks/clickbench/kit, ADR-2867 change 2). parse_prereg
-# refuses any key it does not know, so these sit on `#@` comment lines it
-# ignores; the kit's lib/kit.py reads them. Every plain key above is an
-# absolute band the kit also judges each arm by.
-#
-# Relative bands: fetch.sh judges arm B against arm A. The per-statement hot
-# band is max(ratio x A's hot time, floor), so a sub-floor statement's noise
-# is not a miss.
-#@ relative.error_pooled_max_delta = 0.02
-#@ relative.qps_min_ratio = 0.95
-#@ relative.hot_statement_max_ratio = 1.15
-#@ relative.hot_statement_floor_s = 0.2
-#@ relative.hot_sum_max_ratio = 1.05
-#@ relative.cold_sum_max_ratio = 1.05
+# The ClickBench kit (benchmarks/clickbench/kit, ADR-2867 change 2) does not
+# run this lane yet and does not read this file. Its RLOG lane's relative and
+# absolute bands are in rlog.toml beside it.

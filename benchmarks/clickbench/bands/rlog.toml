@@ -1,0 +1,84 @@
+# Bands for the ClickBench kit's RLOG lane (benchmarks/clickbench/kit,
+# ADR-2867 change 2): the 43 statements of hits.corpus.json over HTTP against
+# a ravel-server on the box, cold then hot.
+#
+# The kit's lib/kit.py reads this file and refuses a missing key, a key it does
+# not know and a removed key, each named. run.toml's band_sections selects which
+# sections a run is judged by; a placeholder value is refused only in a selected
+# section.
+#
+# Hot is a statement's fastest of its three tries (min_ms) and cold its first
+# try (cold_ms), the figures the runbook's analyse.py sums.
+
+# Arm B judged against arm A by fetch.sh. Both arms must be comparable first:
+# the same dataset digest, mapping digest, CPU model and RustFS version.
+[relative]
+# Pooled error ratio (failed or wrong-answer calls over all calls) at most
+# arm A's plus this.
+error_pooled_max_delta = 0.02
+# Queries per second at least this times arm A's. Inconclusive until a
+# concurrency phase exists.
+qps_min_ratio = 0.95
+# Each statement's hot time at most max(ratio x A's, floor), so noise on a
+# sub-floor statement is not a miss.
+hot_statement_max_ratio = 1.15
+hot_statement_floor_s = 0.2
+# Hot and cold sums over the statements both arms answered, each at most this
+# times arm A's. A statement arm A answered and arm B did not is a miss of its
+# own, named.
+hot_sum_max_ratio = 1.05
+cold_sum_max_ratio = 1.05
+
+# One arm judged on its own by the box itself. Fill these in on the reference
+# machine, then select "absolute" in run.toml's band_sections.
+[absolute]
+hot_sum_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
+cold_sum_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
+error_pooled_max = "FILL-IN-ON-REFERENCE-MACHINE"
+
+# Each statement's hot time in seconds, keyed by its id's qNN prefix. A
+# statement that did not answer misses its band.
+[absolute.hot_s_max]
+q01 = "FILL-IN-ON-REFERENCE-MACHINE"
+q02 = "FILL-IN-ON-REFERENCE-MACHINE"
+q03 = "FILL-IN-ON-REFERENCE-MACHINE"
+q04 = "FILL-IN-ON-REFERENCE-MACHINE"
+q05 = "FILL-IN-ON-REFERENCE-MACHINE"
+q06 = "FILL-IN-ON-REFERENCE-MACHINE"
+q07 = "FILL-IN-ON-REFERENCE-MACHINE"
+q08 = "FILL-IN-ON-REFERENCE-MACHINE"
+q09 = "FILL-IN-ON-REFERENCE-MACHINE"
+q10 = "FILL-IN-ON-REFERENCE-MACHINE"
+q11 = "FILL-IN-ON-REFERENCE-MACHINE"
+q12 = "FILL-IN-ON-REFERENCE-MACHINE"
+q13 = "FILL-IN-ON-REFERENCE-MACHINE"
+q14 = "FILL-IN-ON-REFERENCE-MACHINE"
+q15 = "FILL-IN-ON-REFERENCE-MACHINE"
+q16 = "FILL-IN-ON-REFERENCE-MACHINE"
+q17 = "FILL-IN-ON-REFERENCE-MACHINE"
+q18 = "FILL-IN-ON-REFERENCE-MACHINE"
+q19 = "FILL-IN-ON-REFERENCE-MACHINE"
+q20 = "FILL-IN-ON-REFERENCE-MACHINE"
+q21 = "FILL-IN-ON-REFERENCE-MACHINE"
+q22 = "FILL-IN-ON-REFERENCE-MACHINE"
+q23 = "FILL-IN-ON-REFERENCE-MACHINE"
+q24 = "FILL-IN-ON-REFERENCE-MACHINE"
+q25 = "FILL-IN-ON-REFERENCE-MACHINE"
+q26 = "FILL-IN-ON-REFERENCE-MACHINE"
+q27 = "FILL-IN-ON-REFERENCE-MACHINE"
+q28 = "FILL-IN-ON-REFERENCE-MACHINE"
+q29 = "FILL-IN-ON-REFERENCE-MACHINE"
+q30 = "FILL-IN-ON-REFERENCE-MACHINE"
+q31 = "FILL-IN-ON-REFERENCE-MACHINE"
+q32 = "FILL-IN-ON-REFERENCE-MACHINE"
+q33 = "FILL-IN-ON-REFERENCE-MACHINE"
+q34 = "FILL-IN-ON-REFERENCE-MACHINE"
+q35 = "FILL-IN-ON-REFERENCE-MACHINE"
+q36 = "FILL-IN-ON-REFERENCE-MACHINE"
+q37 = "FILL-IN-ON-REFERENCE-MACHINE"
+q38 = "FILL-IN-ON-REFERENCE-MACHINE"
+q39 = "FILL-IN-ON-REFERENCE-MACHINE"
+q40 = "FILL-IN-ON-REFERENCE-MACHINE"
+q41 = "FILL-IN-ON-REFERENCE-MACHINE"
+q42 = "FILL-IN-ON-REFERENCE-MACHINE"
+q43 = "FILL-IN-ON-REFERENCE-MACHINE"
