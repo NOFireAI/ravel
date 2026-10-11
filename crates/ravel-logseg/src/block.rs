@@ -9,11 +9,12 @@
 //! placing and checksum-verifying them belongs to the writer's `BlocksBuilder`
 //! and to `crate::reader::decode_v4_block`.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
+use crate::dict_values::{DictValues, Validity};
 use crate::encoding::{
     DecodedStrings, Enc, count_present, decode_bitmap, decode_f64, decode_fixed, decode_i64_into,
     decode_strings_columnar, encode_bitmap, encode_f64, encode_fixed,
@@ -778,27 +779,162 @@ pub fn write_block_columnar(
 
 /// A decoded string column, kept in whichever shape its page carried
 /// (ADR-0099 decision 4). A dictionary page keeps its distinct set and per-row
-/// ids instead of materializing one owned `Vec<u8>` per row; a plain page keeps
+/// keys instead of materializing one owned `Vec<u8>` per row; a plain page keeps
 /// the per-row values. Both are addressed by block row position and carry
 /// presence separately: an absent row reads `None` either way.
 pub(crate) enum StrColumn {
     /// Per-row values, `None` for an absent row. What a plain page decodes to.
     Plain(Vec<Option<Vec<u8>>>),
-    /// The distinct values plus one id per block row: `Some(id)` indexes `dict`,
-    /// `None` marks an absent row (the presence bitmap, kept out of the id
-    /// vector rather than folded in as a sentinel). Every `Some(id)` is
-    /// `< dict.len()`, validated at decode.
-    Dict {
-        dict: Vec<Vec<u8>>,
-        ids: Vec<Option<u32>>,
-    },
+    /// A shared dictionary plus one key per block row.
+    Dict(DictColumn),
 }
 
-/// The borrowed dictionary form of a string column: the distinct values and
-/// one id per block row (`None` for an absent row). Returned by
-/// [`DecodedBlock::str_dict`] for the columnar view to build an Arrow
-/// dictionary array from.
-type StrDictRef<'a> = (&'a [Vec<u8>], &'a [Option<u32>]);
+/// The dictionary form of a string column (ADR-2773 decision D3): the
+/// dictionary itself, shared rather than copied (a row group dictionary is the
+/// one its `DictCache` entry holds), one `Int32` key per block row, and the
+/// rows' presence. Every present row's key indexes `values`, validated at
+/// decode; an absent row's key is 0 and is never read.
+pub(crate) struct DictColumn {
+    values: Arc<DictValues>,
+    keys: Vec<i32>,
+    present: Validity,
+    /// Whether `values` is a row group dictionary. Its legacy view narrows it
+    /// to the entries the block uses, the dictionary a tag 7 page over the
+    /// block's values would have.
+    narrow: bool,
+    /// The pre-D3 view ([`StrDictColumn::dict`](crate::StrDictColumn::dict)
+    /// and its ids), built on first use. The scan's own readers use the keys.
+    legacy: OnceCell<LegacyDict>,
+    /// The bytes [`heap_bytes`](Self::heap_bytes) charges for `values`: a
+    /// row group dictionary's referenced share
+    /// ([`DictValues::share_heap_bytes`]), a block's own dictionary in full.
+    values_charge: usize,
+}
+
+/// A dictionary column as owned entries plus one id per block row.
+pub(crate) struct LegacyDict {
+    pub(crate) dict: Vec<Vec<u8>>,
+    pub(crate) ids: Vec<Option<u32>>,
+}
+
+impl DictColumn {
+    /// The column over `values` with `ids` one per present row in row order,
+    /// each already checked `< values.len()`.
+    fn new(
+        values: Arc<DictValues>,
+        present: &[bool],
+        ids: Vec<u32>,
+        narrow: bool,
+    ) -> Result<Self, LogSegError> {
+        let mut keys = Vec::with_capacity(present.len());
+        let mut bits = Validity::unset(present.len());
+        let mut used = Validity::unset(if narrow { values.len() } else { 0 });
+        let mut it = ids.into_iter();
+        for (row, &p) in present.iter().enumerate() {
+            if p {
+                let id = it.next().ok_or_else(|| {
+                    LogSegError::Corrupted("presence/value count mismatch".into())
+                })?;
+                let key = i32::try_from(id)
+                    .ok()
+                    .filter(|&k| (k as usize) < values.len())
+                    .ok_or_else(|| {
+                        LogSegError::Corrupted(format!(
+                            "dictionary id {id} out of range for {} entries",
+                            values.len()
+                        ))
+                    })?;
+                keys.push(key);
+                bits.set(row);
+                used.set(key as usize);
+            } else {
+                keys.push(0);
+            }
+        }
+        if it.next().is_some() {
+            return Err(LogSegError::Corrupted(
+                "value page longer than presence".into(),
+            ));
+        }
+        let values_charge = if narrow {
+            values.share_heap_bytes(&used)
+        } else {
+            values.heap_bytes()
+        };
+        Ok(DictColumn {
+            values,
+            keys,
+            present: bits,
+            narrow,
+            legacy: OnceCell::new(),
+            values_charge,
+        })
+    }
+
+    /// The shared dictionary.
+    pub(crate) fn values(&self) -> &Arc<DictValues> {
+        &self.values
+    }
+
+    /// The key at block row `row`, or `None` when the row is absent (or out of
+    /// range).
+    pub(crate) fn key(&self, row: usize) -> Option<i32> {
+        if self.present.get(row) {
+            self.keys.get(row).copied()
+        } else {
+            None
+        }
+    }
+
+    /// The number of block rows.
+    pub(crate) fn rows(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn cell(&self, row: usize) -> Option<&[u8]> {
+        self.values.entry(self.key(row)? as usize)
+    }
+
+    /// The pre-D3 view: owned entries (narrowed to the block's for a row group
+    /// dictionary, as `block_dict` used to clone them) and per-row ids.
+    pub(crate) fn legacy(&self) -> &LegacyDict {
+        self.legacy.get_or_init(|| {
+            let n = self.values.len();
+            let mut used = vec![!self.narrow; n];
+            for r in 0..self.rows() {
+                if let Some(k) = self.key(r) {
+                    used[k as usize] = true;
+                }
+            }
+            let mut remap: Vec<Option<u32>> = vec![None; n];
+            let mut dict = Vec::new();
+            for (k, slot) in remap.iter_mut().enumerate() {
+                if used[k] {
+                    *slot = Some(dict.len() as u32);
+                    dict.push(self.values.entry(k).unwrap_or_default().to_vec());
+                }
+            }
+            let ids = (0..self.rows())
+                .map(|r| self.key(r).and_then(|k| remap[k as usize]))
+                .collect();
+            LegacyDict { dict, ids }
+        })
+    }
+
+    /// The block's keys and presence, plus its charge for the dictionary. A row
+    /// group dictionary is held once, by its `DictCache` entry, and shared by
+    /// every block of the group, so each block is charged only the share it
+    /// references: what a dictionary narrowed to the block's entries would
+    /// hold, the figure the pre-D3 per-block copy cost. A block never pays for
+    /// entries only its neighbours use, and a group's blocks charged together
+    /// pay for an entry once per block that reads it. A per-block dictionary
+    /// page's dictionary belongs to the block alone and is charged in full.
+    fn heap_bytes(&self) -> usize {
+        self.keys.capacity() * std::mem::size_of::<i32>()
+            + self.present.heap_bytes()
+            + self.values_charge
+    }
+}
 
 impl StrColumn {
     /// The bytes at block row `row`, or `None` when the row is absent (or out of
@@ -807,10 +943,7 @@ impl StrColumn {
     fn cell(&self, row: usize) -> Option<&[u8]> {
         match self {
             StrColumn::Plain(v) => v.get(row)?.as_deref(),
-            StrColumn::Dict { dict, ids } => {
-                let id = (*ids.get(row)?)? as usize;
-                dict.get(id).map(Vec::as_slice)
-            }
+            StrColumn::Dict(d) => d.cell(row),
         }
     }
 }
@@ -1189,13 +1322,7 @@ impl DecodedBlock {
                         total += cell.capacity();
                     }
                 }
-                StrColumn::Dict { dict, ids } => {
-                    total += ids.capacity() * std::mem::size_of::<Option<u32>>();
-                    total += dict.capacity() * std::mem::size_of::<Vec<u8>>();
-                    for entry in dict {
-                        total += entry.capacity();
-                    }
-                }
+                StrColumn::Dict(d) => total += d.heap_bytes(),
             }
         }
         for v in self.fixed_cols.values() {
@@ -1261,14 +1388,14 @@ impl DecodedBlock {
             .map(|v| BytesColRef::Fixed(v.as_slice()))
     }
 
-    /// The dictionary form of string column `column_id`: its distinct values and
-    /// one id per block row (`None` for an absent row). `None` when the column is
-    /// absent, projected away, or stored in plain form -- a plain page is read
-    /// through [`Self::str_at`], never forced into a dictionary here.
-    pub(crate) fn str_dict(&self, column_id: u32) -> Option<StrDictRef<'_>> {
+    /// The dictionary form of string column `column_id`: its shared dictionary
+    /// and one key per block row. `None` when the column is absent, projected
+    /// away, or stored in plain form -- a plain page is read through
+    /// [`Self::str_at`], never forced into a dictionary here.
+    pub(crate) fn str_dict(&self, column_id: u32) -> Option<&DictColumn> {
         self.bump_lookup();
         match self.str_cols.get(column_id)? {
-            StrColumn::Dict { dict, ids } => Some((dict, ids)),
+            StrColumn::Dict(d) => Some(d),
             StrColumn::Plain(_) => None,
         }
     }
@@ -1381,7 +1508,7 @@ pub fn read_block_pages(
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
-    read_block_pages_with_dicts(record_count, descs, page_bytes, &[], plans, counters)
+    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &[], plans, counters)
 }
 
 /// [`read_block_pages`] for a block whose row group carries string
@@ -1394,6 +1521,24 @@ pub fn read_block_pages_with_dicts(
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &[Vec<u8>])],
+    plans: &[ColumnPlan],
+    counters: PageCounters,
+) -> Result<DecodedBlock, LogSegError> {
+    let shared: Vec<(u32, Arc<DictValues>)> = dicts
+        .iter()
+        .map(|(cid, d)| Ok((*cid, Arc::new(DictValues::from_entries(d)?))))
+        .collect::<Result<_, LogSegError>>()?;
+    let shared: Vec<(u32, &Arc<DictValues>)> = shared.iter().map(|(c, d)| (*c, d)).collect();
+    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &shared, plans, counters)
+}
+
+/// [`read_block_pages_with_dicts`] over dictionaries already built, which the
+/// block shares rather than copies (ADR-2773 decision D3).
+pub(crate) fn read_block_pages_with_shared_dicts(
+    record_count: usize,
+    descs: &[PageDesc],
+    page_bytes: &[Option<Vec<u8>>],
+    dicts: &[(u32, &Arc<DictValues>)],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1467,26 +1612,6 @@ fn referenced_i64(
     Ok(col.clone())
 }
 
-/// Narrows a row group dictionary to the entries one block's `ids` reference,
-/// renumbering the ids to match. The group dictionary is ascending, so the
-/// narrowed one is too: the block decodes to exactly the dictionary and ids a
-/// tag 7 page over the same values would have given it.
-fn block_dict(group: &[Vec<u8>], ids: Vec<u32>) -> (Vec<Vec<u8>>, Vec<u32>) {
-    let mut remap = vec![u32::MAX; group.len()];
-    for &id in &ids {
-        remap[id as usize] = 0;
-    }
-    let mut dict = Vec::new();
-    for (i, slot) in remap.iter_mut().enumerate() {
-        if *slot == 0 {
-            *slot = dict.len() as u32;
-            dict.push(group[i].clone());
-        }
-    }
-    let ids = ids.into_iter().map(|id| remap[id as usize]).collect();
-    (dict, ids)
-}
-
 /// Turns a block's page descriptors and their decompressed bytes into a
 /// [`DecodedBlock`].
 ///
@@ -1496,7 +1621,7 @@ fn decode_columns(
     record_count: usize,
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
-    dicts: &[(u32, &[Vec<u8>])],
+    dicts: &[(u32, &Arc<DictValues>)],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1599,10 +1724,11 @@ fn decode_columns(
             }
             ColKind::Str => {
                 let present = present_rows(presence, record_count)?;
-                // Presence is applied by scattering against the block's presence
-                // bitmap; the page's ids are per present row, so an absent row
-                // gets a `None` slot rather than a sentinel id (ADR-0099
-                // decision 4). A dict page keeps its distinct set intact.
+                // Presence is applied against the block's presence bitmap; the
+                // page's ids are per present row, so an absent row is an unset
+                // presence bit rather than a sentinel id (ADR-0099 decision 4).
+                // A row group dictionary is shared with its cache entry, not
+                // copied (ADR-2773 decision D3).
                 let col = if enc == Enc::DictIds {
                     let dict = dicts
                         .iter()
@@ -1613,19 +1739,15 @@ fn decode_columns(
                                 "column {column_id} has a dictionary id page but no dictionary page"
                             ))
                         })?;
-                    let (dict, ids) =
-                        block_dict(dict, decode_dict_ids(encoded, present_count, dict.len())?);
-                    StrColumn::Dict {
-                        dict,
-                        ids: scatter(&present, ids)?,
-                    }
+                    let ids = decode_dict_ids(encoded, present_count, dict.len())?;
+                    StrColumn::Dict(DictColumn::new(Arc::clone(dict), &present, ids, true)?)
                 } else {
                     match decode_strings_columnar(enc, encoded, present_count)? {
                         DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
-                        DecodedStrings::Dict { dict, ids } => StrColumn::Dict {
-                            dict,
-                            ids: scatter(&present, ids)?,
-                        },
+                        DecodedStrings::Dict { dict, ids } => {
+                            let values = Arc::new(DictValues::from_entries(&dict)?);
+                            StrColumn::Dict(DictColumn::new(values, &present, ids, false)?)
+                        }
                     }
                 };
                 out.str_cols.insert(column_id, col);
@@ -2292,7 +2414,7 @@ mod tests {
     }
 
     /// `decoded_heap_bytes` charges a dictionary-form string column its true
-    /// footprint -- the distinct set once plus a narrow id per row -- not one
+    /// footprint -- the distinct set once plus a narrow key per row -- not one
     /// owned `Vec<u8>` per row (ADR-0099 decision 4, deliverable 4). Pinned
     /// against a column of known distinct count so a regression to the fused
     /// figure (which would over-report by the deduplication factor) fails here.
@@ -2321,16 +2443,22 @@ mod tests {
         let dec = decode_out(&out, &plans, Some(&keep)).expect("read");
 
         // The column dictionary-encoded (4 distinct of 100) and is kept intact.
-        let (dict, ids) = dec.str_dict(10).expect("column 10 is a dictionary page");
-        assert_eq!(dict.len(), DISTINCT);
-        assert_eq!(ids.len(), N);
+        let col = dec.str_dict(10).expect("column 10 is a dictionary page");
+        assert_eq!(col.values().len(), DISTINCT);
+        assert_eq!(col.rows(), N);
 
-        let opt_u32 = std::mem::size_of::<Option<u32>>();
-        let vec_spine = std::mem::size_of::<Vec<u8>>();
+        let word = std::mem::size_of::<u64>();
+        let key = std::mem::size_of::<i32>();
         let opt_vec = std::mem::size_of::<Option<Vec<u8>>>();
 
-        // New (dict) footprint: one id per row + the distinct set once.
-        let dict_figure = N * opt_u32 + DISTINCT * vec_spine + DISTINCT * LEN;
+        // Dict footprint (ADR-2773 decision D3): one `i32` key and one presence
+        // bit per row, plus the dictionary once as one byte region, `i32`
+        // offsets and one validity bit per entry.
+        let dict_figure = N * key
+            + N.div_ceil(64) * word
+            + DISTINCT * LEN
+            + (DISTINCT + 1) * key
+            + DISTINCT.div_ceil(64) * word;
         // Plus the slot vector `str_cols` allocates to hold that one column.
         // It is sized by the largest column id present, so decoding column 10
         // alone still forces 11 slots; charging it is what stops a sparse block
@@ -2347,11 +2475,109 @@ mod tests {
         );
 
         // Old (fused) footprint the code must no longer report: one owned buffer
-        // per row. On this 64-bit host dict_figure=916, fused_figure=2900.
+        // per row. On this 64-bit host dict_figure=464, fused_figure=2900.
         let fused_figure = N * opt_vec + N * LEN;
         assert!(
             dict_figure < fused_figure,
             "the dictionary form must be smaller: dict={dict_figure}, fused={fused_figure}"
+        );
+    }
+
+    /// A row group dictionary shared by two blocks charges each block the
+    /// share it references, not the whole dictionary (ADR-2773 D3). Block 0
+    /// reads entries 0..=3, block 1 entries 0, 1, 4 and 5 with one absent row;
+    /// each charge is pinned exactly and sits under main's charge for the
+    /// narrowed per-block copy (the legacy view is that copy).
+    ///
+    /// Flipped: charging `values.heap_bytes()` in `DictColumn::heap_bytes`
+    /// reports 116 per block where 92 is expected.
+    #[test]
+    fn a_shared_group_dictionary_charges_each_block_its_referenced_share() {
+        let entries: Vec<Vec<u8>> = [
+            "aaaa", "bbbb", "c0c0c0c0", "d0d0d0d0", "c1c1c1c1", "d1d1d1d1",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        let values = Arc::new(DictValues::from_entries(&entries).expect("dict"));
+        let b0 = DictColumn::new(
+            Arc::clone(&values),
+            &[true; 8],
+            vec![0, 1, 2, 3, 0, 1, 2, 3],
+            true,
+        )
+        .expect("block 0");
+        let mut present = [true; 8];
+        present[3] = false;
+        let b1 = DictColumn::new(
+            Arc::clone(&values),
+            &present,
+            vec![0, 1, 4, 5, 0, 1, 4],
+            true,
+        )
+        .expect("block 1");
+        assert!(Arc::ptr_eq(b0.values(), b1.values()));
+
+        // Keys 8 x 4 and one presence word, plus the share: four entries of
+        // 4 + 4 + 8 + 8 bytes with an offset each, the leading offset, and one
+        // validity word.
+        let share = (4 + 4 + 8 + 8) + 4 * 4 + 4 + 8;
+        assert_eq!(share, 52);
+        // The whole dictionary: 40 region bytes, 7 offsets, one validity word.
+        assert_eq!(values.heap_bytes(), 40 + 7 * 4 + 8);
+        for (block, col) in [(0, &b0), (1, &b1)] {
+            assert_eq!(col.heap_bytes(), 8 * 4 + 8 + share, "block {block}");
+            assert_eq!(col.heap_bytes(), 92, "block {block}");
+            let legacy = col.legacy();
+            assert_eq!(legacy.dict.len(), 4, "block {block} narrows to 4 entries");
+            let main_charge = legacy.ids.capacity() * std::mem::size_of::<Option<u32>>()
+                + legacy.dict.capacity() * std::mem::size_of::<Vec<u8>>()
+                + legacy.dict.iter().map(Vec::capacity).sum::<usize>();
+            assert_eq!(main_charge, 8 * 8 + 4 * 24 + 24, "block {block}");
+            assert!(col.heap_bytes() <= main_charge, "block {block}");
+        }
+
+        // A block's own (tag 7) dictionary is charged in full.
+        let own = DictColumn::new(Arc::clone(&values), &[true; 2], vec![0, 0], false).expect("own");
+        assert_eq!(own.heap_bytes(), 2 * 4 + 8 + values.heap_bytes());
+    }
+
+    /// A dictionary page holding a non-UTF-8 entry validates each entry once,
+    /// at decode, however many times its rows are read as text through the
+    /// column. Flipped: re-checking the entry in `DictValues::text` (a
+    /// `validate_entry` call in its mixed arm) counts 3 + 2 x 8 (the UTF-8
+    /// rows, two passes) = 19 where 3 is expected.
+    #[test]
+    fn a_mixed_dictionary_page_validates_each_entry_once_per_block() {
+        let plans = vec![ColumnPlan {
+            column_id: 10,
+            ty: FieldType::Str,
+        }];
+        let vals: [&[u8]; 3] = [b"a", b"bc", &[b'b', 0xff]];
+        let rows: Vec<ResolvedRow> = (0..12)
+            .map(|i| {
+                let mut r = row(0, i as i64);
+                r.columns.push((10, ColumnValue::Str(vals[i % 3].to_vec())));
+                r
+            })
+            .collect();
+        let out = write_block(&rows, &plans, 3).expect("write");
+        let keep: ColumnIdSet = ColumnIdSet::from_iter([10]);
+        let before = crate::dict_values::ENTRY_VALIDATIONS.with(|n| n.get());
+        let dec = decode_out(&out, &plans, Some(&keep)).expect("read");
+        let col = dec.str_dict(10).expect("column 10 is a dictionary page");
+        assert!(!col.values().all_valid());
+        for _ in 0..2 {
+            let texts: Vec<Option<&str>> = (0..col.rows())
+                .map(|r| col.values().text(col.key(r)? as usize))
+                .collect();
+            let want: Vec<Option<&str>> =
+                (0..12).map(|i| ["a", "bc"].get(i % 3).copied()).collect();
+            assert_eq!(texts, want);
+        }
+        assert_eq!(
+            crate::dict_values::ENTRY_VALIDATIONS.with(|n| n.get()) - before,
+            3
         );
     }
 

@@ -299,6 +299,10 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
                 "intValuesBuffers".to_string(),
                 serde_json::Value::from(outcome.stats.int_values_buffers),
             );
+            accounting.insert(
+                "strDictValuesBuilt".to_string(),
+                serde_json::Value::from(outcome.stats.str_dict_values_built),
+            );
         }
     }
     encode(&headers, &outcome, tenant_hash, stats)

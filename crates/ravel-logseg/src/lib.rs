@@ -16,6 +16,7 @@ pub mod block;
 pub mod columnar;
 pub mod columnar_batch;
 pub mod columns;
+pub mod dict_values;
 pub mod error;
 pub mod field_dir;
 pub mod footer;
@@ -53,6 +54,7 @@ pub use columnar_batch::{
     VarBytes,
 };
 pub use columns::ColumnSelection;
+pub use dict_values::{DictValues, Validity};
 pub use error::LogSegError;
 pub use footer::{
     SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, SuffixOutcome, open_from_suffix,

@@ -69,8 +69,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Array, ArrayData, AsArray};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::col;
@@ -345,16 +347,19 @@ impl ExecutionPlan for DistributedSliceScanExec {
 
         // Validate every worker batch against this exec's declared schema, then
         // fold its bytes into the coordinator's accounting and enforce the
-        // per-tenant budget, exactly as the metrics lane does. A version-skewed
+        // per-tenant budget. The metrics lane folds each batch's whole Arrow
+        // footprint; this fold leaves out dictionary values that arrived in an
+        // earlier batch (`batch_bytes_scanned`). A version-skewed
         // or buggy worker that streams a different layout must fail typed here,
         // not feed mismatched columns into the merge's key resolution downstream.
         let expected = Arc::clone(&self.schema);
         let accounting = self.accounting.clone();
         let max_bytes_scanned = self.max_bytes_scanned;
+        let mut last_values = Vec::new();
         let folded = inner.map(move |item| {
             let batch = item?;
             validate_schema(batch.schema().as_ref(), expected.as_ref())?;
-            let bytes = batch.get_array_memory_size() as u64;
+            let bytes = batch_bytes_scanned(&batch, &mut last_values) as u64;
             accounting.add_s3_bytes(AccountedOp::Get, bytes);
             let scanned = accounting.snapshot().total_s3_bytes();
             if max_bytes_scanned.is_exceeded_by(scanned) {
@@ -374,6 +379,37 @@ impl ExecutionPlan for DistributedSliceScanExec {
             folded,
         )))
     }
+}
+
+/// The bytes one worker batch adds to the scanned figure: its Arrow footprint,
+/// less the values of each dictionary column whose values sit in the same
+/// buffers that column carried in the previous batch. The IPC reader wraps
+/// the dictionary it last decoded in a new values array for every record
+/// batch, so the comparison is on buffer identity (`ArrayData::ptr_eq`), not
+/// on the `Arc`: a dictionary the worker sends once counts once per arrival,
+/// not once per batch. Equal values in distinct buffers count again. `last`
+/// holds each column's most recent dictionary values.
+fn batch_bytes_scanned(batch: &RecordBatch, last: &mut Vec<Option<ArrayData>>) -> usize {
+    last.resize(batch.num_columns(), None);
+    batch
+        .columns()
+        .iter()
+        .zip(last.iter_mut())
+        .map(|(column, last)| {
+            let bytes = column.get_array_memory_size();
+            let Some(dict) = column.as_any_dictionary_opt() else {
+                *last = None;
+                return bytes;
+            };
+            let values = dict.values();
+            let data = values.to_data();
+            if last.as_ref().is_some_and(|v| v.ptr_eq(&data)) {
+                return bytes.saturating_sub(values.get_array_memory_size());
+            }
+            *last = Some(data);
+            bytes
+        })
+        .sum()
 }
 
 /// Verify a worker's slice stream carries this scan's declared public schema
@@ -528,4 +564,134 @@ pub fn distributed_spans_plan(
         accounting,
         max_bytes_scanned,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, DictionaryArray, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::Int32Type;
+
+    fn batch(values: &ArrayRef, keys: &[i32], other: &[i32]) -> RecordBatch {
+        let dict = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(keys.to_vec()),
+            Arc::clone(values),
+        )
+        .expect("dictionary");
+        RecordBatch::try_from_iter([
+            ("region", Arc::new(dict) as ArrayRef),
+            ("n", Arc::new(Int32Array::from(other.to_vec())) as ArrayRef),
+        ])
+        .expect("batch")
+    }
+
+    /// A dictionary the worker shares across batches counts once, on the batch
+    /// that brought it; a batch carrying different values counts them again.
+    /// Flipped: charging `get_array_memory_size` per batch (the former fold)
+    /// counts `shared` three times where twice is expected.
+    #[test]
+    fn a_shared_worker_dictionary_counts_once_per_arrival() {
+        let shared: ArrayRef = Arc::new(StringArray::from(vec!["emea", "apac", "amer"]));
+        let other: ArrayRef = Arc::new(StringArray::from(vec!["emea", "apac", "amer"]));
+        let batches = [
+            batch(&shared, &[0, 1, 2, 0], &[1, 2, 3, 4]),
+            batch(&shared, &[2, 2], &[5, 6]),
+            batch(&other, &[1], &[7]),
+            batch(&shared, &[0], &[8]),
+        ];
+        let mut last = Vec::new();
+        let counted: Vec<usize> = batches
+            .iter()
+            .map(|b| batch_bytes_scanned(b, &mut last))
+            .collect();
+        let full: Vec<usize> = batches.iter().map(|b| b.get_array_memory_size()).collect();
+        let values = shared.get_array_memory_size();
+        assert_eq!(values, other.get_array_memory_size());
+        assert_eq!(
+            counted,
+            vec![full[0], full[1] - values, full[2], full[3]],
+            "the second batch reuses the first's values; the third and fourth each bring a different array"
+        );
+    }
+
+    /// The same sequence through the wire the coordinator reads: the worker's
+    /// encoder with `DictionaryHandling::Resend` and arrow-flight's decoder.
+    /// Three batches of one row group share one values array, so the worker
+    /// sends the dictionary once and the decoded batches each carry a new values
+    /// `Arc` over the same buffers; the group's values count once. The fourth
+    /// batch brings another group's values, and the fifth returns to the first
+    /// group's array, which the encoder sends again (A-B-A), so both count.
+    /// Flipped: an `Arc::ptr_eq` comparison counts the values on all five.
+    #[tokio::test]
+    async fn a_dictionary_sent_once_over_flight_counts_once() {
+        use arrow_flight::decode::FlightRecordBatchStream;
+        use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
+        use futures::TryStreamExt;
+
+        let group: ArrayRef = Arc::new(StringArray::from(
+            (0..64)
+                .map(|i| format!("region-{i:03}"))
+                .collect::<Vec<_>>(),
+        ));
+        let next: ArrayRef = Arc::new(StringArray::from(
+            (0..64).map(|i| format!("zone-{i:03}")).collect::<Vec<_>>(),
+        ));
+        let sent = vec![
+            batch(&group, &[0, 1, 2, 3], &[1, 2, 3, 4]),
+            batch(&group, &[63, 62], &[5, 6]),
+            batch(&group, &[7], &[7]),
+            batch(&next, &[1, 2], &[8, 9]),
+            batch(&group, &[0], &[10]),
+        ];
+        let schema = sent[0].schema();
+        let encoded: Vec<_> = FlightDataEncoderBuilder::new()
+            .with_dictionary_handling(DictionaryHandling::Resend)
+            .with_schema(schema)
+            .build(futures::stream::iter(sent.into_iter().map(Ok)))
+            .try_collect()
+            .await
+            .expect("encode");
+        let decoded: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            futures::stream::iter(encoded.into_iter().map(Ok)),
+        )
+        .try_collect()
+        .await
+        .expect("decode");
+        assert_eq!(decoded.len(), 5, "one decoded batch per sent batch");
+
+        let values: Vec<ArrayRef> = decoded
+            .iter()
+            .map(|b| Arc::clone(b.column(0).as_any_dictionary().values()))
+            .collect();
+        assert!(
+            !Arc::ptr_eq(&values[0], &values[1]),
+            "the decoder wraps the stored dictionary in a new values array per batch"
+        );
+        assert!(
+            values[0].to_data().ptr_eq(&values[1].to_data()),
+            "a dictionary sent once decodes into the same buffers for every batch"
+        );
+
+        let mut last = Vec::new();
+        let counted: Vec<usize> = decoded
+            .iter()
+            .map(|b| batch_bytes_scanned(b, &mut last))
+            .collect();
+        let full: Vec<usize> = decoded.iter().map(|b| b.get_array_memory_size()).collect();
+        let values_bytes: Vec<usize> = values.iter().map(|v| v.get_array_memory_size()).collect();
+        assert!(values_bytes.iter().all(|&v| v > 0));
+        assert_eq!(
+            counted,
+            vec![
+                full[0],
+                full[1] - values_bytes[1],
+                full[2] - values_bytes[2],
+                full[3],
+                full[4],
+            ],
+            "the group's values count on the batch that brought them; the next group's \
+             values and the resent first group each count again"
+        );
+    }
 }

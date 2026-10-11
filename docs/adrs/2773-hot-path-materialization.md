@@ -296,13 +296,12 @@ The exact content predicate the SQL scan pushes into `scan_blocks`
   the block's key column is the ids page mapped to `Int32` with a validity
   bitmap, and `build_declared_str_columnar` builds the chunk's
   `DictionaryArray` from a slice of those keys and the shared values array.
-  A non-UTF-8 entry keeps today's rule on this arm, which is that the row
-  reads NULL and no resource or scope fallback is consulted (the values
-  builder appends NULL for the entry and the row keeps the page id as its
-  key, `logs_scan.rs:6817-6844`); marking the entry invalid once in the
-  shared array's validity preserves exactly that. The fall-through to the
-  resource or scope value belongs to the plain-page arm only
-  (`logs_scan.rs:6884-6885`), and D3 keeps it there. Validation moves
+  A non-UTF-8 entry keeps today's rule on this arm, which this section
+  first stated as "the row reads NULL and no resource or scope fallback is
+  consulted"; that statement was wrong, see the non-UTF-8 correction
+  below: on both arms a non-UTF-8 record cell reads as absent and falls
+  through to the resource or scope value, and marking the entry invalid
+  once in the shared array's validity preserves exactly that. Validation moves
   from the entries a block's rows reference (today's `OnceCell` per
   entry, `logs_scan.rs:6286-6301`) to every entry of the row-group
   dictionary, once; on dictionary pages that pass is 0.3 to 0.4% of the
@@ -381,7 +380,9 @@ or both, so the waves are serial and each wave is one task:
    because it evaluates over D1's buffer; after D3 because the `Str`
    predicates evaluate over D3's keys.
 4. D4 (`ravel-sql` `logs_scan.rs` row path, `ravel-query` erasure read
-   site); its P2 gate held (Context, Row path), so it ships.
+   site); its P2 gate held (Context, Row path), so it ships, sequenced
+   under epic #2815 by the D4 epic amendment below rather than as this
+   epic's wave 4.
 5. Measurement: the review sweep procedure on a fresh box with the build
    that lands the last task, checked against the bands below.
 
@@ -512,3 +513,40 @@ flowchart LR
     K --> DA1
   end
 ```
+
+## Correction (2026-10-11): a non-UTF-8 dictionary entry falls through to the fallback
+
+<!-- amendment-applies: sections="D3. A declared `Str` column's dictionary is built once per dictionary" pointer="the non-UTF-8 correction below" -->
+<!-- amendment-supersedes: phrase="the row reads NULL and no resource or scope fallback is consulted" pointer="the non-UTF-8 correction below" -->
+
+D3 as accepted said that on the dictionary arm a row whose entry is not
+UTF-8 "reads NULL and no resource or scope fallback is consulted", and
+that the fall-through to the resource or scope value belonged to the
+plain-page arm only. That was a misreading of the dictionary arm. On main
+before #2787 the values builder appends a NULL slot for a non-UTF-8 entry
+to keep the Arrow dictionary ids aligned with the page's ids, and the row
+then reads as absent and falls through to the resource or scope value,
+exactly as the plain-page arm and the row path (`String::from_utf8().ok()`)
+do. `crates/ravel-sql/tests/logs_columnar.rs`,
+`dict_page_with_non_utf8_entry_and_resource_fallback_append`, has pinned
+that since ADR-2121 D3 with a non-UTF-8 entry that sorts mid-dictionary.
+The wave 2 implementation (#2787) keeps that behaviour: an entry marked
+invalid in the shared values array's validity makes its rows absent, and
+absent rows take the fallback. Nothing about the shared values array,
+the key slicing or the once-per-stream fallback append changes; only the
+stated rule does. Found by the #2787 executor's claims audit and verified
+against the test before this correction was written.
+
+## Amendment (2026-10-11): D4 ships under epic #2815
+
+<!-- amendment-applies: sections="Sequencing" pointer="the D4 epic amendment below" -->
+
+D4 (the row path builds attribute columns from the decoded block) moves
+from this epic's wave 4 to its own epic, #2815, with #2789 as its task
+and the P2 profile as its Stage 0. The decision and its gate are
+unchanged; only where it is sequenced changes. Epic #2773 closes on D1,
+D2 and D3 plus the band measurement (T5, #2790), because D4 has no effect
+on the ClickBench statements the bands are over: every ClickBench column
+is declared and no block carries an `attrs_raw` page, so the row path is
+never taken there. The owner took this decision on 2026-10-11 to close
+#2773 on the decisions that move its measured figures.

@@ -14,10 +14,11 @@ use std::sync::Arc;
 use ravel_types::logstream::AttrValue;
 
 use crate::block::{
-    ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages_with_dicts,
+    ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages_with_shared_dicts,
 };
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
+use crate::dict_values::DictValues;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
 use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open_source};
@@ -1473,7 +1474,7 @@ pub(crate) fn located_block_pages(
 #[derive(Debug, Default)]
 pub(crate) struct DictCache {
     group: Option<u32>,
-    entries: Vec<(DictKey, Vec<Vec<u8>>)>,
+    entries: Vec<(DictKey, Arc<DictValues>)>,
 }
 
 /// A dictionary page's `(offset, column_id)`.
@@ -1490,11 +1491,8 @@ impl DictCache {
         }
     }
 
-    fn get(&self, key: DictKey) -> Option<&[Vec<u8>]> {
-        self.entries
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, d)| d.as_slice())
+    fn get(&self, key: DictKey) -> Option<&Arc<DictValues>> {
+        self.entries.iter().find(|(k, _)| *k == key).map(|(_, d)| d)
     }
 }
 
@@ -1566,7 +1564,9 @@ fn decode_v4_block_with<'s>(
         let decoded = decode_dict_page(&produced)?;
         #[cfg(test)]
         DICT_PAGE_DECODES.with(|n| n.set(n.get() + 1));
-        dicts.entries.push((key, decoded));
+        dicts
+            .entries
+            .push((key, Arc::new(DictValues::from_entries(&decoded)?)));
     }
     let mut block_crc = 0u32;
     let mut all_read = true;
@@ -1586,7 +1586,7 @@ fn decode_v4_block_with<'s>(
     if all_read && block_crc != block_crc32c {
         return Err(LogSegError::Corrupted("block crc mismatch".into()));
     }
-    let dicts: Vec<(u32, &[Vec<u8>])> = dict_pages
+    let dicts: Vec<(u32, &Arc<DictValues>)> = dict_pages
         .iter()
         .filter(|p| wanted(p.desc.column_id))
         .map(|p| {
@@ -1601,7 +1601,7 @@ fn decode_v4_block_with<'s>(
                 })
         })
         .collect::<Result<_, _>>()?;
-    read_block_pages_with_dicts(record_count, &descs, &page_bytes, &dicts, plans, counters)
+    read_block_pages_with_shared_dicts(record_count, &descs, &page_bytes, &dicts, plans, counters)
 }
 
 /// Checks one kept page's stored bytes against its PAGE_DIR crc, then
