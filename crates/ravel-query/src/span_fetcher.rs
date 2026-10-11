@@ -165,15 +165,18 @@ pub enum SpanFetchError {
     TenantMismatch { key: String },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
     /// reservation for the bytes this GET would materialize. Carries only the
-    /// three accounting figures, never a key or tenant value. Mirrors
-    /// [`crate::FetchError::FetchMemoryExhausted`].
+    /// budget's figures and the class of the refusal (`cause`), never a key
+    /// or tenant value. Mirrors [`crate::FetchError::FetchMemoryExhausted`],
+    /// `Display` included.
     #[error(
-        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+        "fetch {}",
+        crate::fetcher::memory_exhausted(.requested, .reserved, .limit, .cause)
     )]
     FetchMemoryExhausted {
         requested: u64,
         reserved: u64,
         limit: u64,
+        cause: ravel_memory::ExhaustionCause,
     },
 }
 
@@ -265,6 +268,7 @@ impl SpanSegmentFetcher {
                 requested: e.requested,
                 reserved: e.reserved,
                 limit: e.limit,
+                cause: e.cause,
             })
     }
 

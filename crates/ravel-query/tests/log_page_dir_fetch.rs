@@ -2691,6 +2691,7 @@ async fn version_4_ranged_read_refuses_a_placement_before_issuing_its_get() {
             requested,
             reserved,
             limit,
+            ..
         } => {
             assert_eq!(requested, 84, "the refused placement is the front span");
             assert_eq!(

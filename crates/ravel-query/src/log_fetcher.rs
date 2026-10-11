@@ -663,17 +663,20 @@ pub enum LogFetchError {
     EtagChanged { key: String },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
     /// reservation for the bytes this GET would materialize. Carries only the
-    /// three accounting figures, never an object key or tenant value: the
-    /// refusal is a resource condition, not corruption, and must not leak which
-    /// object or tenant provoked it. Mirrors
-    /// [`crate::FetchError::FetchMemoryExhausted`].
+    /// budget's figures and the class of the refusal (`cause`), never an
+    /// object key or tenant value: the refusal is a resource condition, not
+    /// corruption, and must not leak which object or tenant provoked it.
+    /// Mirrors [`crate::FetchError::FetchMemoryExhausted`], `Display`
+    /// included.
     #[error(
-        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+        "fetch {}",
+        crate::fetcher::memory_exhausted(.requested, .reserved, .limit, .cause)
     )]
     FetchMemoryExhausted {
         requested: u64,
         reserved: u64,
         limit: u64,
+        cause: ravel_memory::ExhaustionCause,
     },
     /// A [`CarriedWholeObject`] produced by one `plan_segment` read was supplied
     /// to a read of a different object, or of the same object under a different
@@ -1192,6 +1195,7 @@ impl LogSegmentFetcher {
                 requested: e.requested,
                 reserved: e.reserved,
                 limit: e.limit,
+                cause: e.cause,
             })
     }
 
@@ -4534,6 +4538,7 @@ impl BlockRangeFetcher {
                 requested: e.requested,
                 reserved: e.reserved,
                 limit: e.limit,
+                cause: e.cause,
             })
     }
 
@@ -8974,6 +8979,7 @@ mod whole_object_get_limiter_tests {
                 requested,
                 reserved,
                 limit: reported_limit,
+                cause: ravel_memory::ExhaustionCause::Accounted,
             } => {
                 assert_eq!(requested, size, "the refusal names the object's byte size");
                 assert_eq!(reserved, 0, "nothing else was reserved on this budget");

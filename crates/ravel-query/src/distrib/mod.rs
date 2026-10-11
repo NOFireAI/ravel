@@ -996,11 +996,12 @@ pub(crate) fn typed_budget_refusal(
     if let Some(err) = bytes_scanned_exceeded(folded_bytes, max_bytes_scanned) {
         return Some(err);
     }
-    if let Some((requested, reserved, limit)) = parse_fetch_memory_exhausted(status_message) {
+    if let Some(refusal) = parse_fetch_memory_exhausted(status_message) {
         return Some(QueryError::Fetch(FetchError::FetchMemoryExhausted {
-            requested,
-            reserved,
-            limit,
+            requested: refusal.requested,
+            reserved: refusal.reserved,
+            limit: refusal.limit,
+            cause: refusal.cause,
         }));
     }
     parse_worker_cap_refusal(status_message)
@@ -1036,29 +1037,51 @@ fn parse_worker_cap_refusal(msg: &str) -> Option<QueryError> {
     }
 }
 
-/// Reconstructs the `(requested, reserved, limit)` figures from the `Display`
-/// text of [`FetchError::FetchMemoryExhausted`]. Today's proto `Status`
-/// carries only a message string, so a worker's memory refusal survives the
-/// wire as its rendered text and this is the exact inverse of that `Display`
-/// -- a stopgap that holds only as long as `FetchError`, `LogFetchError`,
-/// and `SpanFetchError` keep textually identical `FetchMemoryExhausted`
-/// messages, which is why `fetch_memory_exhausted_message_round_trips`
-/// pins all three, not just this one. An additive `Status` field (the
-/// `fragment_capability = 14` precedent in `proto/ravel/queryfrag.proto`)
-/// is the durable fix; that proto change is out of scope here. Until then,
-/// changing any of the three `#[error(..)]` formats without updating this
-/// parser makes that test fail rather than silently degrading the
-/// coordinator to a generic error.
-fn parse_fetch_memory_exhausted(msg: &str) -> Option<(u64, u64, u64)> {
-    let rest = msg.strip_prefix("fetch memory exhausted: requested ")?;
-    let (requested, rest) = rest.split_once(" bytes, ")?;
-    let (reserved, rest) = rest.split_once(" of ")?;
-    let limit = rest.strip_suffix(" byte budget already reserved")?;
-    Some((
-        requested.parse().ok()?,
-        reserved.parse().ok()?,
-        limit.parse().ok()?,
-    ))
+/// Reconstructs the budget refusal, class included, from the `Display` text
+/// of [`FetchError::FetchMemoryExhausted`]: a `fetch ` prefix over
+/// [`ravel_memory::MemoryExhausted`]'s own message, in either of its two
+/// forms (the accounted class names `requested`, `reserved` and `limit`; the
+/// host-memory class names the available reading, the floor and `requested`,
+/// so `reserved` and `limit` read 0 after the round trip, which the HTTP
+/// message never shows for that class). Today's proto `Status` carries only
+/// a message string, so a worker's memory refusal survives the wire as its
+/// rendered text and this is the exact inverse of that `Display` -- a
+/// stopgap that holds only as long as `FetchError`, `LogFetchError`, and
+/// `SpanFetchError` render `FetchMemoryExhausted` through the one
+/// `fetcher::memory_exhausted` helper, which is why
+/// `fetch_memory_exhausted_message_round_trips` pins all three, not just
+/// this one. An additive `Status` field (the `fragment_capability = 14`
+/// precedent in `proto/ravel/queryfrag.proto`) is the durable fix; that
+/// proto change is out of scope here. Until then, changing the budget's
+/// `Display` or the `fetch` prefix without updating this parser makes that
+/// test fail rather than silently degrading the coordinator to a generic
+/// error.
+fn parse_fetch_memory_exhausted(msg: &str) -> Option<ravel_memory::MemoryExhausted> {
+    let rest = msg.strip_prefix("fetch memory exhausted: ")?;
+    if let Some(rest) = rest.strip_prefix("requested ") {
+        let (requested, rest) = rest.split_once(" bytes, ")?;
+        let (reserved, rest) = rest.split_once(" of ")?;
+        let limit = rest.strip_suffix(" byte limit already reserved")?;
+        return Some(ravel_memory::MemoryExhausted {
+            requested: requested.parse().ok()?,
+            reserved: reserved.parse().ok()?,
+            limit: limit.parse().ok()?,
+            cause: ravel_memory::ExhaustionCause::Accounted,
+        });
+    }
+    let rest = rest.strip_prefix("host available memory ")?;
+    let (available, rest) = rest.split_once(" bytes is below the ")?;
+    let (floor, rest) = rest.split_once(" byte floor (requested ")?;
+    let requested = rest.strip_suffix(')')?;
+    Some(ravel_memory::MemoryExhausted {
+        requested: requested.parse().ok()?,
+        reserved: 0,
+        limit: 0,
+        cause: ravel_memory::ExhaustionCause::HostMemory {
+            available: available.parse().ok()?,
+            floor: floor.parse().ok()?,
+        },
+    })
 }
 
 /// The stated cross-segment total order for RLOG records (no dedup: see below),

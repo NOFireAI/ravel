@@ -2608,10 +2608,12 @@ impl QueryEngine {
                 requested,
                 reserved,
                 limit,
+                cause,
             }) => QueryError::Fetch(FetchError::FetchMemoryExhausted {
                 requested,
                 reserved,
                 limit,
+                cause,
             }),
             // A carry paired with the wrong segment breaks the caller's
             // contract rather than the object: it surfaces as hard corruption

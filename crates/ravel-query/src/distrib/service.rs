@@ -1891,7 +1891,11 @@ fn map_fetch_error(err: FetchError) -> (pb::status::Code, String) {
         // quarantine and then perform the refused allocation on the very node the
         // budget exists to protect. `BudgetExceeded` is `Attempt::Keep` (terminal,
         // no re-dispatch, no local fallback), so the refusal sheds load instead of
-        // amplifying it. The message carries only byte counts.
+        // amplifying it. The message is the budget's own text, class included
+        // (the ledger's limit, or the host-memory gate), carrying only byte
+        // figures; the coordinator parses the class back out of it so its
+        // HTTP answer is the same 422 the local path gives (ADR-2633
+        // decision 3).
         FetchError::FetchMemoryExhausted { .. } => {
             (pb::status::Code::BudgetExceeded, err.to_string())
         }
