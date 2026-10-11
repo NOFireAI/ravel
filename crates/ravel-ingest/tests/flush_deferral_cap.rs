@@ -790,6 +790,108 @@ dead_shard_at_cap_test!(
     false
 );
 
+/// A strict-arrival write that lands in a buffer already deferred at the
+/// queued-flush cap coalesces there, and at the deferral cap it is answered
+/// `Abandoned` with the same message as the strict waiter beside it: the
+/// arrival path adds no exemption from the cap.
+macro_rules! strict_arrival_at_cap_test {
+    ($name:ident, $new_router:ident, $err:ident, $spawn:ident, $buffered:ident) => {
+        #[tokio::test]
+        async fn $name() {
+            let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+            let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+            let clock = TestClock::new(BASE_NS);
+            let config = one_slot_config();
+            let cap_ns = config.flush_deferral_cap_ns();
+            let router = Arc::new($new_router(config, store, clock.clone()));
+            let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+            let buffered = || router.metrics().snapshot().$buffered;
+            let deferred_triggers = || -> u64 {
+                router
+                    .metrics()
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum()
+            };
+            let acme = tenant("acme");
+
+            let parked = $spawn(&router, &acme, 0, WriteMode::Strict);
+            until(|| buffered() >= 1).await;
+            clock.advance_ns(TICK_ADVANCE_NS);
+            gate.wait_until_held(1).await;
+
+            let deferred = $spawn(&router, &acme, 1, WriteMode::Strict);
+            until(|| buffered() >= 2).await;
+            clock.advance_ns(TICK_ADVANCE_NS);
+            until(|| deferred_triggers() >= 1).await;
+
+            let arrival = $spawn(&router, &acme, 2, WriteMode::StrictArrival);
+            until(|| buffered() >= 3).await;
+            let snapshot = router.metrics().snapshot();
+            assert_eq!(snapshot.arrival_coalesced, 1);
+            assert_eq!(snapshot.flushes_by_arrival, 0);
+            assert!(
+                !arrival.is_finished(),
+                "below the cap the write still waits"
+            );
+
+            clock.advance_ns(cap_ns);
+            until(|| deferred_triggers() >= 2).await;
+            let stripped = deferred.await.expect("deferred write task");
+            let arrival = arrival.await.expect("arrival write task");
+            let (Err($err::Abandoned(strict_msg)), Err($err::Abandoned(arrival_msg))) =
+                (&stripped, &arrival)
+            else {
+                panic!(
+                    "both waiters are answered outcome-unknown at the cap, got \
+                     {stripped:?} and {arrival:?}"
+                );
+            };
+            assert!(arrival_msg.contains("deferral cap"), "{arrival_msg}");
+            assert_eq!(arrival_msg, strict_msg);
+
+            for id in gate.held() {
+                assert!(gate.release(id));
+            }
+            parked
+                .await
+                .expect("parked write task")
+                .expect("parked write acks once the gate is released");
+            assert_eq!(
+                router.metrics().snapshot().flushes_by_arrival,
+                0,
+                "the reap opens no arrival flush for a buffer whose waiters were answered"
+            );
+            router.flush_all().await;
+        }
+    };
+}
+
+strict_arrival_at_cap_test!(
+    strict_arrival_waiter_past_the_deferral_cap_is_abandoned,
+    new_metrics_router,
+    WriteError,
+    spawn_metric_write,
+    buffered_points_total
+);
+
+strict_arrival_at_cap_test!(
+    log_strict_arrival_waiter_past_the_deferral_cap_is_abandoned,
+    new_log_router,
+    LogWriteError,
+    spawn_log_write,
+    buffered_records_total
+);
+
+strict_arrival_at_cap_test!(
+    span_strict_arrival_waiter_past_the_deferral_cap_is_abandoned,
+    new_span_router,
+    SpanWriteError,
+    spawn_span_write,
+    buffered_spans_total
+);
+
 fn new_metrics_router(
     config: IngestConfig,
     store: Arc<dyn ObjectStoreBackend>,

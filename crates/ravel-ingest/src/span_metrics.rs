@@ -47,6 +47,12 @@ pub struct SpanIngestMetrics {
     /// `max_flush_lifetime` less one `flush_tick` ([`FlushTrigger::AgeFloor`],
     /// ADR-1737 decision 6). Attempt-time.
     flushes_by_age_floor: AtomicU64,
+    /// Flushes opened by a strict-arrival write ([`FlushTrigger::Arrival`],
+    /// ADR-2793 decision 3). Never folded into `flushes_by_age`. Attempt-time.
+    flushes_by_arrival: AtomicU64,
+    /// Strict-arrival writes that found their tenant with a flush in flight on
+    /// the shard and marked the buffer pending instead of opening a flush.
+    arrival_coalesced: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path: an explicit flush
     /// request, the shutdown drain, and the channel-close drop-path drain.
     flushes_manual: AtomicU64,
@@ -232,6 +238,8 @@ pub struct SpanIngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
     pub flushes_by_age_floor: u64,
+    pub flushes_by_arrival: u64,
+    pub arrival_coalesced: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -439,9 +447,14 @@ impl SpanIngestMetrics {
             // exhaustive here, and is never reached from this actor.
             FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
             FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
+            FlushTrigger::Arrival => &self.flushes_by_arrival,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_arrival_coalesced(&self) {
+        self.arrival_coalesced.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Attribute one completed flush's PUTs to `tenant` (success-time,
@@ -676,6 +689,8 @@ impl SpanIngestMetrics {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
             flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
+            flushes_by_arrival: self.flushes_by_arrival.load(Ordering::Relaxed),
+            arrival_coalesced: self.arrival_coalesced.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -772,6 +787,20 @@ mod tests {
             |m| m.record_flush(FlushTrigger::Age),
             SpanIngestMetricsSnapshot {
                 flushes_by_age: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush(FlushTrigger::Arrival),
+            SpanIngestMetricsSnapshot {
+                flushes_by_arrival: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_arrival_coalesced,
+            SpanIngestMetricsSnapshot {
+                arrival_coalesced: 1,
                 ..Default::default()
             },
         );

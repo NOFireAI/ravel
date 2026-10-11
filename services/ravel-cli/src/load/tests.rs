@@ -42,6 +42,7 @@ fn flush_mix_report_round_trips_through_json() {
                 0,
                 FlushTriggerMix {
                     size: 5,
+                    arrival: 0,
                     age: 2,
                     final_drain: 1,
                 },
@@ -50,6 +51,7 @@ fn flush_mix_report_round_trips_through_json() {
                 2,
                 FlushTriggerMix {
                     size: 0,
+                    arrival: 0,
                     age: 0,
                     final_drain: 3,
                 },

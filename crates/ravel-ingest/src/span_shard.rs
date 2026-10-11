@@ -89,6 +89,10 @@ pub(crate) enum SpanShardMsg {
         /// bypasses the budget; production charges via
         /// [`crate::SpanIngestRouter`].
         charge: Option<Arc<IngestByteCharge>>,
+        /// Set for a [`crate::WriteMode::StrictArrival`] write that carries an
+        /// ack: the actor opens the tenant's flush on arrival rather than on
+        /// the age tick (ADR-2793 decision 2).
+        arrival: bool,
     },
     /// Spans a retiring shard handed back at flush open instead of writing
     /// them outside the scan set of the hour they would have pinned (ADR-1642
@@ -207,6 +211,8 @@ struct SpanTenantBuf {
     hand_back_blocked: bool,
     /// See [`crate::shard`]'s `TenantBuf::mismatch_held_since_ns`.
     mismatch_held_since_ns: Option<i64>,
+    /// See [`crate::shard`]'s `TenantBuf::arrival_pending`.
+    arrival_pending: bool,
 }
 
 impl SpanTenantBuf {
@@ -781,12 +787,12 @@ impl SpanShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(SpanShardMsg::Write { tenant, spans, ack, charge }) => {
+                        Some(SpanShardMsg::Write { tenant, spans, ack, charge, arrival }) => {
                             // Per-shard skew (issue #865, ADR-1692): time the
                             // serial on-actor section only, matching
                             // `crate::shard`'s own on-actor span.
                             let started_ns = self.clock.now_ns();
-                            self.handle_write(tenant, spans, ack, charge).await;
+                            self.handle_write(tenant, spans, ack, charge, arrival).await;
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
@@ -840,6 +846,7 @@ impl SpanShardActor {
                 Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
                     handle_flush_join_result(self.shard, result);
                     self.shares.prune();
+                    self.flush_arrival_pending().await;
                     self.record_queued_flushes();
                 }
             }
@@ -873,6 +880,7 @@ impl SpanShardActor {
         spans: Vec<NormalizedSpan>,
         mut ack: Option<SpanAck>,
         charge: Option<Arc<IngestByteCharge>>,
+        arrival: bool,
     ) {
         if spans.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
@@ -908,9 +916,13 @@ impl SpanShardActor {
                 )
             })
             .unwrap_or(false);
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
-                .await;
+        if should_flush {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                    .await;
+            }
+        } else if arrival {
+            self.open_arrival_flush(tenant).await;
         }
     }
 
@@ -1144,6 +1156,53 @@ impl SpanShardActor {
         for (_, _, tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
+                    .await;
+            }
+        }
+        self.refresh_oldest_deferral();
+    }
+
+    /// The span counterpart of `crate::shard::ShardActor::open_arrival_flush`.
+    async fn open_arrival_flush(&mut self, tenant: TenantId) {
+        if self.shares.in_flight(tenant.hash()) == 0 {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
+                    .await;
+            }
+        } else if let Some(buf) = self.tenants.get_mut(&tenant) {
+            buf.arrival_pending = true;
+            self.metrics.record_arrival_coalesced();
+        }
+    }
+
+    /// Opens the flush of every buffer a strict-arrival write marked pending
+    /// whose tenant now has no flush in flight, in [`Self::flush_aged`]'s
+    /// order. The scan is over buffers the actor already holds, so it costs
+    /// the tenant count per reap and nothing per write.
+    async fn flush_arrival_pending(&mut self) {
+        let mut due: Vec<(i64, i64, TenantId)> = self
+            .tenants
+            .iter()
+            .filter(|(tenant, buf)| {
+                buf.arrival_pending
+                    && !buf.waiters.is_empty()
+                    && self.shares.in_flight(tenant.hash()) == 0
+            })
+            .map(|(tenant, buf)| {
+                (
+                    buf.deferred_since_ns.unwrap_or(i64::MAX),
+                    buf.oldest_arrival_ns.unwrap_or(i64::MAX),
+                    tenant.clone(),
+                )
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        due.sort_unstable_by_key(|(since, oldest, _)| (*since, *oldest));
+        for (_, _, tenant) in due {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
                     .await;
             }
         }
@@ -2136,6 +2195,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans,
             ack: Some(ack_tx),
@@ -2184,6 +2244,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![span],
             ack: Some(ack_tx),
@@ -2207,6 +2268,7 @@ mod tests {
         // the clock past max_flush_delay from the joined arm.
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
@@ -2239,6 +2301,7 @@ mod tests {
         let tenant = TenantId::new("acme");
         // Buffered (no ack): the span only reaches the store via the drain.
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: None,
@@ -2279,6 +2342,7 @@ mod tests {
             let tenant = TenantId::new(name);
             let (ack_tx, ack_rx) = oneshot::channel();
             h.tx.send(SpanShardMsg::Write {
+                arrival: false,
                 tenant: tenant.clone(),
                 spans: vec![norm_span(i as u8 + 1, 1, 1_000, "op")],
                 ack: Some(ack_tx),
@@ -2326,6 +2390,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
@@ -2365,6 +2430,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
@@ -2429,6 +2495,7 @@ mod tests {
 
         let (ack_tx, mut ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
@@ -2497,6 +2564,7 @@ mod tests {
         let gate = fault.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
 
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: None,
@@ -2560,6 +2628,7 @@ mod tests {
         let h = Harness::spawn(flush_on_first());
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
@@ -2594,6 +2663,7 @@ mod tests {
         let h = Harness::spawn_with_store(exhaustion_config(2), Arc::clone(&store));
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
@@ -2650,6 +2720,7 @@ mod tests {
         let task = tokio::spawn(actor.run());
 
         tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: None,
@@ -2694,6 +2765,7 @@ mod tests {
 
         let (ack_a_tx, mut ack_a_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "a")],
             ack: Some(ack_a_tx),
@@ -2705,6 +2777,7 @@ mod tests {
 
         let (ack_b_tx, ack_b_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(2, 1, 2_000, "b")],
             ack: Some(ack_b_tx),
@@ -2778,6 +2851,7 @@ mod tests {
 
         let (ack_a_tx, ack_a_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "a")],
             ack: Some(ack_a_tx),
@@ -2789,6 +2863,7 @@ mod tests {
 
         let (ack_b_tx, ack_b_rx) = oneshot::channel();
         h.tx.send(SpanShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             spans: vec![norm_span(2, 1, 2_000, "b")],
             ack: Some(ack_b_tx),
@@ -3084,6 +3159,7 @@ mod tests {
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(SpanShardMsg::Write {
+                    arrival: false,
                     tenant: TenantId::new(tenant),
                     spans: Self::six_spans(),
                     ack,

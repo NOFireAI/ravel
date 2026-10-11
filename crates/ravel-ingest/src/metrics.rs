@@ -86,6 +86,11 @@ pub enum FlushTrigger {
     /// sub-floor hold, `max_flush_lifetime` less one `flush_tick`, the hold
     /// tier of ADR-1737. Raised by all three shard actors.
     AgeFloor,
+    /// A strict-arrival write opened the flush inside its own write handler,
+    /// or its buffer was left pending behind an in-flight flush of the same
+    /// (shard, tenant) and the reap of that flush opened it (ADR-2793
+    /// decision 2). Raised by all three shard actors.
+    Arrival,
     Manual,
 }
 
@@ -113,6 +118,15 @@ pub struct IngestMetrics {
     /// `max_flush_lifetime` less one `flush_tick` (ADR-1737 decision 6). Zero
     /// while the floor is 0. Attempt-time, same as `flushes_by_size`.
     flushes_by_age_floor: AtomicU64,
+    /// Flushes opened by a strict-arrival write ([`FlushTrigger::Arrival`],
+    /// ADR-2793 decision 3), in its handler or on the reap its pending buffer
+    /// waited for. Never folded into `flushes_by_age`. Attempt-time, same as
+    /// `flushes_by_size`.
+    flushes_by_arrival: AtomicU64,
+    /// Strict-arrival writes that found their tenant with a flush in flight on
+    /// the shard, so marked the buffer pending instead of opening a second
+    /// flush (ADR-2793 decision 3). One per such write.
+    arrival_coalesced: AtomicU64,
     /// Flushes opened by any `FlushTrigger::Manual` path: an explicit
     /// `FlushNow`, the `Shutdown` drain, or the channel-close drop-path drain.
     /// Attempt-time.
@@ -753,6 +767,8 @@ pub struct IngestMetricsSnapshot {
     pub flushes_by_age: u64,
     pub flushes_by_age_adaptive: u64,
     pub flushes_by_age_floor: u64,
+    pub flushes_by_arrival: u64,
+    pub arrival_coalesced: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -914,9 +930,14 @@ impl IngestMetrics {
             FlushTrigger::Age => &self.flushes_by_age,
             FlushTrigger::AgeAdaptive => &self.flushes_by_age_adaptive,
             FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
+            FlushTrigger::Arrival => &self.flushes_by_arrival,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_arrival_coalesced(&self) {
+        self.arrival_coalesced.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
@@ -1269,6 +1290,8 @@ impl IngestMetrics {
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
             flushes_by_age_adaptive: self.flushes_by_age_adaptive.load(Ordering::Relaxed),
             flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
+            flushes_by_arrival: self.flushes_by_arrival.load(Ordering::Relaxed),
+            arrival_coalesced: self.arrival_coalesced.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -1417,6 +1440,21 @@ mod tests {
         assert_eq!(snap.flushes_by_age, 1);
         assert_eq!(snap.flushes_by_age_adaptive, 1);
         assert_eq!(snap.flushes_by_age_floor, 3);
+    }
+
+    #[test]
+    fn arrival_trigger_counts_apart_from_size_and_age() {
+        let metrics = IngestMetrics::default();
+        metrics.record_flush(FlushTrigger::Arrival);
+        metrics.record_flush(FlushTrigger::Arrival);
+        metrics.record_flush(FlushTrigger::Age);
+        metrics.record_arrival_coalesced();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_arrival, 2);
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_size, 0);
+        assert_eq!(snap.arrival_coalesced, 1);
     }
 
     #[test]
