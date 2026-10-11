@@ -2729,10 +2729,8 @@ impl LogShardActor {
             }
             FloorCheck::Refuse(refused) => {
                 warn_flush_refused(Signal::Logs, self.shard, tenant_hash, &refused);
-                self.ctx.ack_waiters(
-                    buf.waiters,
-                    Err(LogWriteError::BelowFormatFloor(refused)),
-                );
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(LogWriteError::BelowFormatFloor(refused)));
                 return;
             }
             FloorCheck::NoView => {

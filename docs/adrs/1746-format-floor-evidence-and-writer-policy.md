@@ -140,6 +140,8 @@ change, and this ADR follows the same rule.
    with a fresh basis (same-version re-raise amendment below: not at the
    version it already holds). The override exists for the operator who must
    keep ingesting on a rolled-back binary and accepts a later migration.
+   (Decisions 3 to 5 shipped; the writer policy shipped amendment below
+   records where each check sits and the counter the refusal uses.)
 
 6. **Version and rollout.** `PROVISIONING_FORMAT_VERSION` goes from 2 to 3
    (`provisioning.rs:55`) in two releases, exactly as R1 and R2 did:
@@ -256,6 +258,8 @@ flowchart TD
   4. Docs: `docs/adrs/0066` pointer, the maintenance guide, ADR-0531's
      rollback stance paragraph, the flags reference.
 
+  Tasks 3 and 4 are done; see the writer policy shipped amendment below.
+
 ## Amendment (2026-09-27, #1746): Contradicted does not need a basis
 
 <!-- amendment-applies: sections="Decision" pointer="Contradicted-before-basis amendment" -->
@@ -352,3 +356,65 @@ with the servers, or hold reshards and migrations until the rollout ends.
 `StorageLayoutWrite` (ADR-2135, #2146) is unrelated to this flip: it governs
 `TenantConfigRecord`'s `format_version`, a separate field on a separate
 record, and Release B neither reads it nor makes it redundant.
+
+## Amendment (2026-10-11, #2675): the writer policy shipped amendment, where each check sits
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="writer policy shipped amendment" -->
+
+Decisions 3 to 5 shipped. The shipped behaviour narrows or names what they
+left open in six places.
+
+- **The tenants known at startup, and what the warning costs (decision 3).**
+  Both writer roles check the same static set: the tenants named by
+  `--tenant-token`, `--tenant-token-file` and `--maintain-tenant`. The ingest
+  role is the `all` and `gateway` modes, and the maintenance role is the
+  `maintain` mode; a `query` process checks nothing. The startup check does
+  not reuse a record read for shard generations, because the startup
+  provisioning validation does not keep the record. It issues its own GET of
+  `t/<hash>/<sig>/prov` per tenant and signal (metrics, logs and spans), at
+  most 16 at once, once during startup. A record it cannot read is
+  logged and left out of the gauge, and the process starts.
+  `ravel_format_floor_above_writer{family}` is set by that check only: it
+  does not follow a floor raised later or a tenant discovered later. The check
+  is `warn_floors_above_writer` in `crates/ravel-ingest/src/format_floor.rs`.
+- **Where ingest checks (decision 4).** At flush open, in `flush_tenant` of
+  each shard actor (`shard.rs`, `log_shard.rs`, `span_shard.rs`), after the
+  scan-set check and before the flush's `seq` is pinned, the flush is
+  counted, or the task that takes the flush permit, runs the encode on the
+  ADR-1702 write gate and PUTs is spawned. That task is the only path to the
+  data PUT, so the check precedes the PUT on every path, the teardown drain
+  included. The floor is the one `GenerationSwitch` cached with the shard
+  generations, decoded from the same GET (`load_view` in `generation.rs`), so
+  the check adds no store read. A cached view past its refresh horizon still
+  answers, since floors only rise; with no cached view the flush stays
+  unopened, as for an untrusted scan-set view, except on a drain's teardown
+  pass. A floor history that fails validation now fails that record read
+  closed, as a corrupt generation history already did. A refused flush drops
+  its rows and answers its strict waiters with the typed refusal, which is
+  retryable (HTTP 503); it is not counted as a flush, so it is in no
+  `flushes_by_*` or `abandoned_*` counter.
+- **The refusal counter (decision 4).** The decision says a refusal is
+  counted without naming the counter. It is
+  `ravel_format_floor_refused_total{family}`, beside the two families
+  decision 3 and decision 5 name, so all three read on one `family` label.
+  Ingest and maintenance refusals in one process count into it.
+- **Where maintenance checks (decision 4).** A maintenance run has no
+  `GenerationSwitch`, so it reads the bucket's record fresh: one GET, after
+  the run's gates and before its claim, its catalog reads and any PUT
+  (`crates/ravel-maintain/src/format_floor.rs`, called from compaction, the
+  erasure rewrite, `migrate_bucket_format`, the force-2 re-encode and the
+  direct `rewrite_and_publish`). A request ledger counts it under its own
+  `floor_read` phase. It runs when `CompactorConfig::format_floor` holds a
+  policy: `ravel-server`'s `maintain` role installs one, `migrate_family`
+  uses the refusing default when the caller installed none, and the
+  `ravel-cli` compaction commands install none and do not check. In the
+  maintenance loop a refused compaction is no compaction and the unit's pass
+  goes on; a refused erasure rewrite leaves its request pending, so the
+  deletion waits for a roll forward or the override.
+- **The version compared (decision 4).** The version of the object being
+  written: the trailer version each flush stamps, and for maintenance the
+  version its parts are written at (`current_part_version`), not
+  `SUPPORTED_VERSIONS.newest()`. They are equal in every writer today.
+- **The override (decision 5).** `--write-below-format-floor` resolves into
+  the compactor config every mode builds, and the ingest routers take the
+  same policy from there, so one flag covers both roles in a process.

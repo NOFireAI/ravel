@@ -328,7 +328,11 @@ async fn a_floor_at_the_writers_version_admits_the_flush() {
         .expect("a floor at the version admits");
 
     assert_eq!(receipt.tokens.len(), 1);
-    assert_eq!(puts(&store), before + 2, "one data object, one commit record");
+    assert_eq!(
+        puts(&store),
+        before + 2,
+        "one data object, one commit record"
+    );
     assert_eq!(metrics.refused(family), 0);
 }
 

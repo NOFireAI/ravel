@@ -4957,6 +4957,7 @@ dependencies = [
  "ravel-ingest",
  "ravel-logseg",
  "ravel-object-store",
+ "ravel-otlp",
  "ravel-proto",
  "ravel-rspan",
  "ravel-segment",

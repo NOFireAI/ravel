@@ -39,7 +39,8 @@ pub enum FormatFamily {
 
 impl FormatFamily {
     /// Every family, in a fixed order.
-    pub const ALL: [FormatFamily; 3] = [FormatFamily::Rseg, FormatFamily::Rlog, FormatFamily::Rspan];
+    pub const ALL: [FormatFamily; 3] =
+        [FormatFamily::Rseg, FormatFamily::Rlog, FormatFamily::Rspan];
 
     /// The family string a floor is recorded under.
     pub fn as_str(self) -> &'static str {
@@ -443,7 +444,12 @@ mod tests {
         .expect("provision");
     }
 
-    async fn raise(store: &dyn ObjectStoreBackend, tenant: TenantHash, family: FormatFamily, v: u32) {
+    async fn raise(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+        family: FormatFamily,
+        v: u32,
+    ) {
         let signal = match family {
             FormatFamily::Rseg => Signal::Metrics,
             FormatFamily::Rlog => Signal::Logs,

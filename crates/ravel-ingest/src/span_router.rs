@@ -22,13 +22,13 @@ use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
+use crate::format_floor::FormatFloorPolicy;
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_view,
 };
 use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::router::WriteMode;
-use crate::format_floor::FormatFloorPolicy;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 use crate::span_shard::{SpanShardActor, SpanShardMsg, est_span_bytes};

@@ -24,12 +24,12 @@ use crate::budget::{
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
+use crate::format_floor::FormatFloorPolicy;
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_view,
 };
 use crate::indexed_fields::IndexedFieldsOverlay;
-use crate::format_floor::FormatFloorPolicy;
 use crate::log_error::LogWriteError;
 use crate::log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 use crate::log_shard::{LogShardActor, LogShardMsg, est_columnar_bytes, est_record_bytes};

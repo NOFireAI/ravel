@@ -24,8 +24,8 @@ use ravel_ingest::{
 use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FixedClock, MaintainError, MaintainMemo, MigrateBudget,
     NoLeases, PendingErasureRequest, RequestLedger, RetentionConfig, RetentionOutcome,
-    census_family, compact_bucket, erasure_rewrite_bucket, maintain_bucket,
-    migrate_bucket_format, migrate_family,
+    census_family, compact_bucket, erasure_rewrite_bucket, maintain_bucket, migrate_bucket_format,
+    migrate_family,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend};
@@ -225,7 +225,11 @@ async fn flush_into_a_bucket_whose_floor_exceeds_the_writer_is_refused_and_count
         matches!(err, WriteError::BelowFormatFloor(r) if r == refused()),
         "{err:?}"
     );
-    assert_eq!(metrics.refused(FormatFamily::Rseg), 1, "the refusal is counted");
+    assert_eq!(
+        metrics.refused(FormatFamily::Rseg),
+        1,
+        "the refusal is counted"
+    );
     assert_eq!(puts(&store), before, "nothing is PUT");
     refusing.shutdown().await;
     assert_eq!(puts(&store), before, "nothing is PUT at shutdown either");
@@ -247,7 +251,11 @@ async fn flush_into_a_bucket_whose_floor_exceeds_the_writer_is_refused_and_count
     assert_eq!(receipt.tokens.len(), 1);
     assert_eq!(metrics.writes_below(FormatFamily::Rseg), 1);
     assert_eq!(metrics.refused(FormatFamily::Rseg), 1);
-    assert_eq!(puts(&store), before + 2, "one data object, one commit record");
+    assert_eq!(
+        puts(&store),
+        before + 2,
+        "one data object, one commit record"
+    );
     overriding.shutdown().await;
     assert_eq!(
         audit_rseg_floor(store.as_ref(), &acme).await,
