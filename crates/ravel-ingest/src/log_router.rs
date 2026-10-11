@@ -76,11 +76,9 @@ pub struct LogWriteReceipt {
 /// `submit_columnar*` siblings. [`Self::acks`] is the other half of what
 /// [`LogIngestRouter::write`] used to do in one step.
 ///
-/// Holds the strict-mode pending-ack permit this submit took, and releases
-/// it when [`Self::acks`] resolves (either way), when its ack deadline
-/// elapses after [`Self::acks`] is first polled, or when `self` is dropped.
-/// A `LogSubmitted` that is never polled holds its permit until it is
-/// dropped.
+/// Holds the strict-mode pending-ack permit this submit took, released as
+/// [`crate::PendingAckPermit`] states.
+#[must_use = "a submitted strict write is only acknowledged once acks() resolves"]
 pub struct LogSubmitted<'a> {
     router: &'a LogIngestRouter,
     state: LogSubmittedState,
@@ -185,8 +183,8 @@ pub struct LogIngestRouter {
     /// Ceiling on outstanding strict acks (ADR-2793 decision 4). Process-wide
     /// when the caller hands the same `Arc` to the metrics and span routers;
     /// otherwise it bounds this router alone. A strict [`Self::submit`] takes
-    /// a permit here before the byte budget is charged; the [`LogSubmitted`]
-    /// it returns releases it.
+    /// a permit here before the byte budget is charged, released as
+    /// [`crate::PendingAckPermit`] states.
     pending_ack_budget: Arc<PendingAckBudget>,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
@@ -493,7 +491,7 @@ impl LogIngestRouter {
         // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
         // before the byte budget below, so a refused submit holds no charge.
         let permit = match mode {
-            WriteMode::Strict => Some(
+            WriteMode::Strict | WriteMode::StrictArrival => Some(
                 self.pending_ack_budget
                     .try_acquire()
                     .ok_or(LogWriteError::PendingAckLimitReached)?,
@@ -552,20 +550,21 @@ impl LogIngestRouter {
         let mut ack_rxs = Vec::with_capacity(shard_ids.len());
         for shard in shard_ids {
             let records = by_shard.remove(&shard).unwrap_or_default();
-            let ack = match mode {
-                WriteMode::Strict => {
+            let (ack, arrival) = match mode {
+                WriteMode::Strict | WriteMode::StrictArrival => {
                     let (tx, rx) = oneshot::channel();
                     ack_shards.push(shard);
                     ack_rxs.push(rx);
-                    Some(tx)
+                    (Some(tx), mode == WriteMode::StrictArrival)
                 }
-                WriteMode::Buffered => None,
+                WriteMode::Buffered => (None, false),
             };
             let msg = LogShardMsg::Write {
                 tenant: tenant.clone(),
                 records,
                 ack,
                 charge: Some(Arc::clone(&charge)),
+                arrival,
             };
             if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver
@@ -826,7 +825,7 @@ impl LogIngestRouter {
         // A caller that already holds its own charge (`held`) still takes a
         // pending-ack permit here: the two budgets are independent.
         let permit = match mode {
-            WriteMode::Strict => Some(
+            WriteMode::Strict | WriteMode::StrictArrival => Some(
                 self.pending_ack_budget
                     .try_acquire()
                     .ok_or(LogWriteError::PendingAckLimitReached)?,
@@ -870,20 +869,21 @@ impl LogIngestRouter {
         let mut ack_shards = Vec::with_capacity(by_shard.len());
         let mut ack_rxs = Vec::with_capacity(by_shard.len());
         for (shard, shard_batch) in by_shard {
-            let ack = match mode {
-                WriteMode::Strict => {
+            let (ack, arrival) = match mode {
+                WriteMode::Strict | WriteMode::StrictArrival => {
                     let (tx, rx) = oneshot::channel();
                     ack_shards.push(shard);
                     ack_rxs.push(rx);
-                    Some(tx)
+                    (Some(tx), mode == WriteMode::StrictArrival)
                 }
-                WriteMode::Buffered => None,
+                WriteMode::Buffered => (None, false),
             };
             let msg = LogShardMsg::WriteColumnar {
                 tenant: tenant.clone(),
                 batch: Box::new(shard_batch),
                 ack,
                 charge: Some(Arc::clone(&charge)),
+                arrival,
             };
             if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone; count the death once and surface the
@@ -2571,7 +2571,7 @@ mod tests {
         };
         let store_ref: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router_ref = router(&store_ref);
-        router_ref
+        let _ = router_ref
             .submit_columnar_partitioned(
                 tenant.clone(),
                 batch.clone(),
@@ -2772,7 +2772,7 @@ mod tests {
         let store_ref: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router_ref = router(&store_ref);
         for batch in &writes {
-            router_ref
+            let _ = router_ref
                 .submit_columnar_partitioned(
                     tenant.clone(),
                     batch.clone(),

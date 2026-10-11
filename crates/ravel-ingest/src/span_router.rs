@@ -81,11 +81,9 @@ pub struct SpanWriteReceipt {
 /// [`Self::acks`] is the other half of what [`SpanIngestRouter::write`] used
 /// to do in one step.
 ///
-/// Holds the strict-mode pending-ack permit this submit took, and releases
-/// it when [`Self::acks`] resolves (either way), when its ack deadline
-/// elapses after [`Self::acks`] is first polled, or when `self` is dropped.
-/// A `SpanSubmitted` that is never polled holds its permit until it is
-/// dropped.
+/// Holds the strict-mode pending-ack permit this submit took, released as
+/// [`crate::PendingAckPermit`] states.
+#[must_use = "a submitted strict write is only acknowledged once acks() resolves"]
 pub struct SpanSubmitted<'a> {
     router: &'a SpanIngestRouter,
     state: SpanSubmittedState,
@@ -243,8 +241,8 @@ pub struct SpanIngestRouter {
     /// Ceiling on outstanding strict acks (ADR-2793 decision 4). Process-wide
     /// when the caller hands the same `Arc` to the metrics and log routers;
     /// otherwise it bounds this router alone. A strict [`Self::submit`] takes
-    /// a permit here before the byte budget is charged; the [`SpanSubmitted`]
-    /// it returns releases it.
+    /// a permit here before the byte budget is charged, released as
+    /// [`crate::PendingAckPermit`] states.
     pending_ack_budget: Arc<PendingAckBudget>,
 }
 
@@ -469,7 +467,7 @@ impl SpanIngestRouter {
         // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
         // before the byte budget below, so a refused submit holds no charge.
         let permit = match mode {
-            WriteMode::Strict => Some(
+            WriteMode::Strict | WriteMode::StrictArrival => Some(
                 self.pending_ack_budget
                     .try_acquire()
                     .ok_or(SpanWriteError::PendingAckLimitReached)?,
@@ -545,20 +543,21 @@ impl SpanIngestRouter {
         let mut ack_rxs = Vec::with_capacity(shard_ids.len());
         for shard in shard_ids {
             let spans = by_shard.remove(&shard).unwrap_or_default();
-            let ack = match mode {
-                WriteMode::Strict => {
+            let (ack, arrival) = match mode {
+                WriteMode::Strict | WriteMode::StrictArrival => {
                     let (tx, rx) = oneshot::channel();
                     ack_shards.push(shard);
                     ack_rxs.push(rx);
-                    Some(tx)
+                    (Some(tx), mode == WriteMode::StrictArrival)
                 }
-                WriteMode::Buffered => None,
+                WriteMode::Buffered => (None, false),
             };
             let msg = SpanShardMsg::Write {
                 tenant: tenant.clone(),
                 spans,
                 ack,
                 charge: Some(Arc::clone(&charge)),
+                arrival,
             };
             if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver

@@ -97,6 +97,10 @@ pub(crate) enum LogShardMsg {
         /// write that bypasses the budget; production charges via
         /// [`crate::LogIngestRouter`].
         charge: Option<Arc<IngestByteCharge>>,
+        /// Set for a [`crate::WriteMode::StrictArrival`] write that carries an
+        /// ack: the actor opens the tenant's flush on arrival rather than on
+        /// the age tick (ADR-2793 decision 2).
+        arrival: bool,
     },
     /// The columnar counterpart of [`LogShardMsg::Write`] (ADR-0109 decision
     /// 5): one already-partitioned [`ColumnarLogBatch`] for this shard,
@@ -114,6 +118,8 @@ pub(crate) enum LogShardMsg {
         /// This request's ADR-0069 byte-budget charge, held until flush exactly
         /// as [`LogShardMsg::Write`]'s `charge` is.
         charge: Option<Arc<IngestByteCharge>>,
+        /// As [`LogShardMsg::Write`]'s `arrival`.
+        arrival: bool,
     },
     /// Records a retiring shard handed back at flush open instead of writing
     /// them outside the scan set of the hour they would have pinned (ADR-1642
@@ -466,6 +472,8 @@ struct LogTenantBuf {
     hand_back_blocked: bool,
     /// See [`crate::shard`]'s `TenantBuf::mismatch_held_since_ns`.
     mismatch_held_since_ns: Option<i64>,
+    /// See [`crate::shard`]'s `TenantBuf::arrival_pending`.
+    arrival_pending: bool,
 }
 
 impl LogTenantBuf {
@@ -1353,7 +1361,7 @@ impl LogShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(LogShardMsg::Write { tenant, records, ack, charge }) => {
+                        Some(LogShardMsg::Write { tenant, records, ack, charge, arrival }) => {
                             // Per-shard skew (issue #865), identical bracketing
                             // to `crate::shard::ShardActor::run`: time the
                             // serial on-actor section only. The flush this may
@@ -1363,14 +1371,14 @@ impl LogShardActor {
                             // is no on-actor permit wait left to exclude: this
                             // delta is pure merge-and-pin work.
                             let started_ns = self.clock.now_ns();
-                            self.handle_write(tenant, records, ack, charge).await;
+                            self.handle_write(tenant, records, ack, charge, arrival).await;
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
-                        Some(LogShardMsg::WriteColumnar { tenant, batch, ack, charge }) => {
+                        Some(LogShardMsg::WriteColumnar { tenant, batch, ack, charge, arrival }) => {
                             let started_ns = self.clock.now_ns();
-                            self.handle_write_columnar(tenant, *batch, ack, charge)
+                            self.handle_write_columnar(tenant, *batch, ack, charge, arrival)
                                 .await;
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
@@ -1425,6 +1433,7 @@ impl LogShardActor {
                 Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
                     handle_flush_join_result(self.shard, result);
                     self.shares.prune();
+                    self.flush_arrival_pending().await;
                     self.record_queued_flushes();
                 }
             }
@@ -1462,6 +1471,7 @@ impl LogShardActor {
         records: Vec<NormalizedLogRecord>,
         mut ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
+        arrival: bool,
     ) {
         if records.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
@@ -1519,9 +1529,13 @@ impl LogShardActor {
                 )
             })
             .unwrap_or(false);
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
-                .await;
+        if should_flush {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                    .await;
+            }
+        } else if arrival {
+            self.open_arrival_flush(tenant).await;
         }
     }
 
@@ -1799,6 +1813,7 @@ impl LogShardActor {
         batch: ColumnarLogBatch,
         mut ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
+        arrival: bool,
     ) {
         if batch.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
@@ -1851,9 +1866,13 @@ impl LogShardActor {
                 )
             })
             .unwrap_or(false);
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
-                .await;
+        if should_flush {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                    .await;
+            }
+        } else if arrival {
+            self.open_arrival_flush(tenant).await;
         }
     }
 
@@ -1903,6 +1922,53 @@ impl LogShardActor {
         for (_, _, tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
+                    .await;
+            }
+        }
+        self.refresh_oldest_deferral();
+    }
+
+    /// The log counterpart of `crate::shard::ShardActor::open_arrival_flush`.
+    async fn open_arrival_flush(&mut self, tenant: TenantId) {
+        if self.shares.in_flight(tenant.hash()) == 0 {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
+                    .await;
+            }
+        } else if let Some(buf) = self.tenants.get_mut(&tenant) {
+            buf.arrival_pending = true;
+            self.metrics.record_arrival_coalesced();
+        }
+    }
+
+    /// Opens the flush of every buffer a strict-arrival write marked pending
+    /// whose tenant now has no flush in flight, in [`Self::flush_aged`]'s
+    /// order. The scan is over buffers the actor already holds, so it costs
+    /// the tenant count per reap and nothing per write.
+    async fn flush_arrival_pending(&mut self) {
+        let mut due: Vec<(i64, i64, TenantId)> = self
+            .tenants
+            .iter()
+            .filter(|(tenant, buf)| {
+                buf.arrival_pending
+                    && !buf.waiters.is_empty()
+                    && self.shares.in_flight(tenant.hash()) == 0
+            })
+            .map(|(tenant, buf)| {
+                (
+                    buf.deferred_since_ns.unwrap_or(i64::MAX),
+                    buf.oldest_arrival_ns.unwrap_or(i64::MAX),
+                    tenant.clone(),
+                )
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        due.sort_unstable_by_key(|(since, oldest, _)| (*since, *oldest));
+        for (_, _, tenant) in due {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
                     .await;
             }
         }
@@ -2913,6 +2979,7 @@ mod tests {
         async fn buffer_one(&self, tenant: &TenantId, body: &str) {
             self.tx
                 .send(LogShardMsg::Write {
+                    arrival: false,
                     tenant: tenant.clone(),
                     records: vec![norm_record(
                         &[("service.name", "api")],
@@ -2996,6 +3063,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records,
             ack: Some(ack_tx),
@@ -3035,6 +3103,7 @@ mod tests {
         // the clock past max_flush_delay from the joined arm.
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records,
             ack: Some(ack_tx),
@@ -3067,6 +3136,7 @@ mod tests {
         let tenant = TenantId::new("acme");
         // Buffered (no ack): the record only reaches the store via the drain.
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: None,
@@ -3114,6 +3184,7 @@ mod tests {
         for i in 0..N {
             let (ack_tx, ack_rx) = oneshot::channel();
             h.tx.send(LogShardMsg::Write {
+                arrival: false,
                 tenant: tenant.clone(),
                 records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
                 ack: Some(ack_tx),
@@ -3132,6 +3203,7 @@ mod tests {
             mix,
             FlushTriggerMix {
                 size: N,
+                arrival: 0,
                 age: 0,
                 final_drain: 0,
             },
@@ -3170,6 +3242,7 @@ mod tests {
             mix,
             FlushTriggerMix {
                 size: 0,
+                arrival: 0,
                 age: M,
                 final_drain: 0,
             },
@@ -3208,6 +3281,7 @@ mod tests {
             mix,
             FlushTriggerMix {
                 size: 0,
+                arrival: 0,
                 age: 0,
                 final_drain: K,
             },
@@ -3257,6 +3331,7 @@ mod tests {
             mix,
             FlushTriggerMix {
                 size: 0,
+                arrival: 0,
                 age: 2,
                 final_drain: 1,
             }
@@ -3279,6 +3354,7 @@ mod tests {
             let tenant = TenantId::new(name);
             let (ack_tx, ack_rx) = oneshot::channel();
             h.tx.send(LogShardMsg::Write {
+                arrival: false,
                 tenant: tenant.clone(),
                 records: vec![norm_record(&[("service.name", name)], "scope", 1_000, "x")],
                 ack: Some(ack_tx),
@@ -3313,6 +3389,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![good, collider],
             ack: Some(ack_tx),
@@ -3352,6 +3429,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![first, second],
             ack: Some(ack_tx),
@@ -3402,6 +3480,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
@@ -3441,6 +3520,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
@@ -3505,6 +3585,7 @@ mod tests {
 
         let (ack_tx, mut ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
@@ -3576,6 +3657,7 @@ mod tests {
 
         // target_bytes == 1, so this write triggers a size flush at once.
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: None,
@@ -3643,6 +3725,7 @@ mod tests {
         let h = Harness::spawn(flush_on_first());
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
@@ -3679,6 +3762,7 @@ mod tests {
         let h = Harness::spawn_with_store(exhaustion_config(2), Arc::clone(&store));
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
@@ -3744,6 +3828,7 @@ mod tests {
         let task = tokio::spawn(actor.run());
 
         tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: None,
@@ -3795,6 +3880,7 @@ mod tests {
         // Write A -> flush seq0. Its data PUT lands; its commit PUT is held.
         let (ack_a_tx, mut ack_a_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "a")],
             ack: Some(ack_a_tx),
@@ -3808,6 +3894,7 @@ mod tests {
         // is still parked: seq1 lands before seq0.
         let (ack_b_tx, ack_b_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![norm_record(&[("service.name", "api")], "scope", 2_000, "b")],
             ack: Some(ack_b_tx),
@@ -3912,6 +3999,7 @@ mod tests {
         // section indexing exactly the one overridden field.
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![
                 norm_record_with_status("200"),
@@ -3960,6 +4048,7 @@ mod tests {
         // and the POSTINGS counters do not move.
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::Write {
+            arrival: false,
             tenant: tenant.clone(),
             records: vec![norm_record_with_status("200")],
             ack: Some(ack_tx),
@@ -4190,6 +4279,7 @@ mod tests {
             let row = norm_record(&[("service.name", "api")], "scope", 1_000, "row");
             let (a1, _r1) = oneshot::channel();
             h.tx.send(LogShardMsg::Write {
+                arrival: false,
                 tenant: tenant.clone(),
                 records: vec![row],
                 ack: Some(a1),
@@ -4206,6 +4296,7 @@ mod tests {
             ))]);
             let (a2, r2) = oneshot::channel();
             h.tx.send(LogShardMsg::WriteColumnar {
+                arrival: false,
                 tenant: tenant.clone(),
                 batch: Box::new(batch),
                 ack: Some(a2),
@@ -4236,6 +4327,7 @@ mod tests {
             ))]);
             let (a1, _r1) = oneshot::channel();
             h.tx.send(LogShardMsg::WriteColumnar {
+                arrival: false,
                 tenant: tenant.clone(),
                 batch: Box::new(batch),
                 ack: Some(a1),
@@ -4247,6 +4339,7 @@ mod tests {
             let row = norm_record(&[("service.name", "api")], "scope", 2_000, "row");
             let (a2, r2) = oneshot::channel();
             h.tx.send(LogShardMsg::Write {
+                arrival: false,
                 tenant: tenant.clone(),
                 records: vec![row],
                 ack: Some(a2),
@@ -4292,6 +4385,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::WriteColumnar {
+            arrival: false,
             tenant: tenant.clone(),
             batch: Box::new(batch),
             ack: Some(ack_tx),
@@ -4335,6 +4429,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         h.tx.send(LogShardMsg::WriteColumnar {
+            arrival: false,
             tenant,
             batch: Box::new(batch),
             ack: Some(ack_tx),
@@ -4599,6 +4694,7 @@ mod tests {
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(LogShardMsg::Write {
+                    arrival: false,
                     tenant: TenantId::new(tenant),
                     records: Self::six_records(),
                     ack,
@@ -5492,6 +5588,7 @@ mod tests {
         for write in &writes {
             rig.tx
                 .send(LogShardMsg::WriteColumnar {
+                    arrival: false,
                     tenant: TenantId::new("acme"),
                     batch: Box::new(shard_of(
                         partition_columnar(write.clone(), 4).expect("a valid batch partitions"),

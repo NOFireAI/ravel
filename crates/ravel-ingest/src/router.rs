@@ -33,6 +33,12 @@ pub enum WriteMode {
     /// Ack only after every involved shard's flush has both its data object
     /// and commit record durably stored.
     Strict,
+    /// The same acknowledgement contract as [`WriteMode::Strict`], with the
+    /// flush opened on arrival instead of on the age tick (ADR-2793 decision
+    /// 2): each involved shard flushes the tenant's buffer inside the write
+    /// handler when the tenant has no flush in flight there, and otherwise
+    /// flushes it when the in-flight one is reaped.
+    StrictArrival,
     /// Ack at enqueue; never durable on its own (docs/consistency-model.md).
     Buffered,
 }
@@ -49,10 +55,9 @@ pub struct WriteReceipt {
 /// `submit_*` siblings. [`Self::acks`] is the other half of what
 /// [`IngestRouter::write`] used to do in one step.
 ///
-/// Holds the strict-mode pending-ack permit this submit took, and releases
-/// it when [`Self::acks`] resolves (either way), when its ack deadline
-/// elapses after [`Self::acks`] is first polled, or when `self` is dropped.
-/// A `Submitted` that is never polled holds its permit until it is dropped.
+/// Holds the strict-mode pending-ack permit this submit took, released as
+/// [`crate::PendingAckPermit`] states.
+#[must_use = "a submitted strict write is only acknowledged once acks() resolves"]
 pub struct Submitted<'a> {
     router: &'a IngestRouter,
     state: SubmittedState,
@@ -300,9 +305,7 @@ pub struct IngestRouter {
     /// ceiling bounds the sum of outstanding strict acks across every signal;
     /// otherwise it bounds this router alone. A strict
     /// [`IngestRouter::submit`] takes a permit from this before the byte
-    /// budget is charged; the permit releases when [`Submitted::acks`]
-    /// resolves, its deadline elapses after `acks()` is first polled, or the
-    /// `Submitted` is dropped.
+    /// budget is charged, released as [`crate::PendingAckPermit`] states.
     pending_ack_budget: Arc<PendingAckBudget>,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
@@ -721,7 +724,7 @@ impl IngestRouter {
         // charged and before any shard is touched, so a submit this refuses
         // holds no charge and sends nothing.
         let permit = match mode {
-            WriteMode::Strict => Some(
+            WriteMode::Strict | WriteMode::StrictArrival => Some(
                 self.pending_ack_budget
                     .try_acquire()
                     .ok_or(WriteError::PendingAckLimitReached)?,
@@ -838,14 +841,14 @@ impl IngestRouter {
             // Minting an ack for that shard would leave a waiter its flush
             // path has no token to answer with, and a dropped oneshot reads as
             // a dead shard.
-            let ack = match mode {
-                WriteMode::Strict if !points.is_empty() => {
+            let (ack, arrival) = match mode {
+                WriteMode::Strict | WriteMode::StrictArrival if !points.is_empty() => {
                     let (tx, rx) = oneshot::channel();
                     ack_shards.push((shard, incarnation));
                     ack_rxs.push(rx);
-                    Some(tx)
+                    (Some(tx), mode == WriteMode::StrictArrival)
                 }
-                WriteMode::Strict | WriteMode::Buffered => None,
+                WriteMode::Strict | WriteMode::StrictArrival | WriteMode::Buffered => (None, false),
             };
             let msg = ShardMsg::Write {
                 tenant: tenant.clone(),
@@ -853,6 +856,7 @@ impl IngestRouter {
                 exemplars: exemplars_by_shard.remove(&shard).unwrap_or_default(),
                 ack,
                 charge: Some(Arc::clone(&charge)),
+                arrival,
             };
             if shard_tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver
