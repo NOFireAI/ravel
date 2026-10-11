@@ -546,7 +546,9 @@ async fn drain_with_accounting(
 ///    leaves and must reach its spill threshold;
 /// 4. the error is `SpillBudgetExhausted`, which this crate raises only for the
 ///    quota refusal of DataFusion's spill-file writer, so the aggregate reached
-///    its spill threshold and wrote;
+///    its spill threshold and began a spill file; a second run read through
+///    the pinned stream asserts the same thing without the variant, from the
+///    aggregate's own spill-file count;
 /// 5. the quota in those figures is [`TINY_SCRATCH_BYTES`], so the refusal came
 ///    from this query's configured scratch ceiling and not from some other
 ///    limit, and the written figure is below it: DataFusion 55 refuses a write
@@ -671,6 +673,52 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
     assert!(
         written < quota,
         "the gauge never holds a write the quota refused; got {written} of {quota}"
+    );
+
+    // 4, without the variant: the same query fails again, and the plan's spill
+    // counters show the aggregate opened a spill file before the refusal.
+    // DataFusion counts a spill file when it opens one, before the refused
+    // batch write, so the count moves though the gauge above reads 0.
+    let snapshot = fixture.snapshot(&tenant).await;
+    let mut stream = fixture
+        .executor
+        .plan_pinned(
+            tenant.hash(),
+            snapshot,
+            SPILLING_SQL,
+            &QueryAccounting::new(),
+            &[],
+        )
+        .await
+        .expect("the spilling query plans")
+        .execute()
+        .await
+        .expect("the spilling query starts");
+    let mut failed = false;
+    while let Some(next) = stream.next().await {
+        if next.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(
+        failed,
+        "the tiny scratch quota must trip on the pinned stream too"
+    );
+    let (spilled, by_operator) = stream.spill_counts();
+    // The stream holds the query's scratch until it drops.
+    drop(stream);
+    eprintln!("spill counts at the refusal: {spilled:?} by operator {by_operator:?}");
+    assert!(
+        spilled.files >= 1,
+        "the aggregate must have opened a spill file before the refusal; got \
+         {spilled:?}"
+    );
+    assert!(
+        by_operator
+            .iter()
+            .any(|op| op.operator.contains("Aggregate") && op.files >= 1),
+        "the spill file must be the aggregate's; got {by_operator:?}"
     );
 
     // Requirement 7: a typed error cleans up its scratch too.
