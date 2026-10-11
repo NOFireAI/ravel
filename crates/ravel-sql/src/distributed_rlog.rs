@@ -93,6 +93,7 @@ use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
 use crate::distributed::{WorkerSlice, WorkerSliceClient};
 use crate::error::SqlError;
+use crate::flight_ticket::SlicePushdown;
 
 /// The `logs` table's total-order key: the orderable fixed public columns in a
 /// fixed sequence (ADR-0033 schema order). `attrs` is excluded (Arrow maps are
@@ -226,6 +227,10 @@ pub struct DistributedSliceScanExec {
     max_bytes_scanned: ByteLimit,
     /// The signal's public output schema, validated against every worker batch.
     schema: SchemaRef,
+    /// The coordinator's extracted scan pushdown, handed to every worker with
+    /// its slice ticket (issue #2755). `None` asks each worker for every block
+    /// of its slice.
+    pushdown: Option<SlicePushdown>,
     properties: Arc<PlanProperties>,
 }
 
@@ -261,8 +266,15 @@ impl DistributedSliceScanExec {
             accounting,
             max_bytes_scanned,
             schema,
+            pushdown: None,
             properties,
         })
+    }
+
+    /// Hand `pushdown` to every worker with its slice ticket.
+    pub fn with_pushdown(mut self, pushdown: Option<SlicePushdown>) -> Self {
+        self.pushdown = pushdown;
+        self
     }
 
     /// Declare the signal's total-order ordering per partition. Declaring it is
@@ -300,9 +312,14 @@ impl DisplayAs for DistributedSliceScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "DistributedSliceScanExec: endpoints={}, limit={:?}",
+            "DistributedSliceScanExec: endpoints={}, limit={:?}, pushdown={}",
             self.endpoints.len(),
-            self.limit
+            self.limit,
+            match &self.pushdown {
+                Some(p) if p.as_spans().is_some() => "spans",
+                Some(_) => "logs",
+                None => "none",
+            }
         )
     }
 }
@@ -351,9 +368,13 @@ impl ExecutionPlan for DistributedSliceScanExec {
         // no coordinator-local fallback today, so every client here is remote
         // and ignores it, and passing the real context keeps that a property of
         // the client rather than of the call site.
-        let inner =
-            self.client
-                .fetch_slice(&endpoint.location, &endpoint.ticket, self.limit, &context)?;
+        let inner = self.client.fetch_slice_with_pushdown(
+            &endpoint.location,
+            &endpoint.ticket,
+            self.pushdown.as_ref(),
+            self.limit,
+            &context,
+        )?;
 
         // Validate every worker batch against this exec's declared schema, then
         // fold its bytes into the coordinator's accounting and enforce the
@@ -462,6 +483,11 @@ fn validate_schema(actual: &Schema, expected: &Schema) -> DFResult<()> {
 /// Signal-neutral: pass any table's public schema and total-order key. The three
 /// RLOG wrappers below are the only signal-aware callers today; T6b calls it
 /// with the spans schema and key.
+///
+/// `pushdown` is the coordinator's extracted scan pushdown, handed to every
+/// worker with its slice ticket ([`SlicePushdown`]). It narrows which blocks a
+/// worker decodes and nothing else: the caller's filters stay above this plan.
+#[allow(clippy::too_many_arguments)]
 pub fn distributed_slice_plan(
     endpoints: Vec<WorkerSlice>,
     client: Arc<dyn WorkerSliceClient>,
@@ -470,16 +496,20 @@ pub fn distributed_slice_plan(
     limit: Option<usize>,
     accounting: QueryAccounting,
     max_bytes_scanned: ByteLimit,
+    pushdown: Option<SlicePushdown>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
-    let scan: Arc<dyn ExecutionPlan> = Arc::new(DistributedSliceScanExec::new(
-        endpoints,
-        client,
-        Arc::clone(&schema),
-        ordering_cols,
-        limit,
-        accounting,
-        max_bytes_scanned,
-    )?);
+    let scan: Arc<dyn ExecutionPlan> = Arc::new(
+        DistributedSliceScanExec::new(
+            endpoints,
+            client,
+            Arc::clone(&schema),
+            ordering_cols,
+            limit,
+            accounting,
+            max_bytes_scanned,
+        )?
+        .with_pushdown(pushdown),
+    );
     let ordering = lex_ordering(&schema, ordering_cols)?;
     let merge: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(ordering, scan));
     match limit {
@@ -499,6 +529,7 @@ pub fn distributed_logs_plan(
     limit: Option<usize>,
     accounting: QueryAccounting,
     max_bytes_scanned: ByteLimit,
+    pushdown: Option<SlicePushdown>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     distributed_slice_plan(
         endpoints,
@@ -508,6 +539,7 @@ pub fn distributed_logs_plan(
         limit,
         accounting,
         max_bytes_scanned,
+        pushdown,
     )
 }
 
@@ -529,6 +561,7 @@ pub fn distributed_alerts_plan(
         limit,
         accounting,
         max_bytes_scanned,
+        None,
     )
 }
 
@@ -550,6 +583,7 @@ pub fn distributed_audit_plan(
         limit,
         accounting,
         max_bytes_scanned,
+        None,
     )
 }
 
@@ -564,6 +598,7 @@ pub fn distributed_spans_plan(
     limit: Option<usize>,
     accounting: QueryAccounting,
     max_bytes_scanned: ByteLimit,
+    pushdown: Option<SlicePushdown>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     distributed_slice_plan(
         endpoints,
@@ -573,6 +608,7 @@ pub fn distributed_spans_plan(
         limit,
         accounting,
         max_bytes_scanned,
+        pushdown,
     )
 }
 

@@ -114,6 +114,9 @@ const METRIC_PAGES_DECODED: &str = "pages_decoded";
 /// Metric name for the column pages the decode walked past because the
 /// projection excluded them: the page-level proof projection reached decode.
 const METRIC_PAGES_SKIPPED: &str = "pages_skipped";
+/// Metric name for the RSPAN blocks the decode decompressed, on either path:
+/// what the trace id, time window and skip-index pruning left to read.
+const METRIC_BLOCKS_DECODED: &str = "blocks_decoded";
 
 /// The query-shape half of the columnar fast-path eligibility rule (ADR-0110
 /// decision 3), decided once at plan time by the provider and re-derived by the
@@ -380,7 +383,11 @@ impl DisplayAs for SpansScanExec {
             "SpansScanExec: partitions={}, trace_id={}",
             self.partitions.len(),
             self.query.trace_id.is_some(),
-        )
+        )?;
+        if self.query.ts_min != i64::MIN || self.query.ts_max != i64::MAX {
+            write!(f, ", ts=[{}, {}]", self.query.ts_min, self.query.ts_max)?;
+        }
+        Ok(())
     }
 }
 
@@ -429,6 +436,7 @@ impl ExecutionPlan for SpansScanExec {
         let reservation = MemoryConsumer::new(format!("SpansScanExec[{partition}]"))
             .register(context.memory_pool());
 
+        let metrics = SpanScanMetrics::new(&self.metrics, partition);
         let fut = Box::pin(prepare_partition(
             fetcher,
             tenant_hash,
@@ -442,11 +450,12 @@ impl ExecutionPlan for SpansScanExec {
             self.columnar_eligible,
             self.projection.clone(),
             self.accounting.clone(),
+            metrics.blocks_decoded.clone(),
         ));
         Ok(Box::pin(SpanScanStream {
             schema,
             reservation,
-            metrics: SpanScanMetrics::new(&self.metrics, partition),
+            metrics,
             state: SpanScanState::Fetching(fut),
         }))
     }
@@ -467,6 +476,10 @@ struct SpanScanMetrics {
     /// page of every block it scans, which is a measurement of that path, not an
     /// unwritten counter: `pages_decoded` is nonzero beside it.
     pages_skipped: Count,
+    /// RSPAN blocks this partition decoded. A block an abandoned columnar
+    /// attempt decoded and the row path then decoded again counts twice,
+    /// because it was decompressed twice.
+    blocks_decoded: Count,
     /// Output batches this partition built through the columnar fast path,
     /// straight from a [`ravel_rspan::ColumnarBlockView`] with no `SpanRecord`
     /// and no `SpanRow`. The two paths' output is identical by construction, so
@@ -484,6 +497,7 @@ impl SpanScanMetrics {
         SpanScanMetrics {
             pages_decoded: MetricBuilder::new(metrics).counter(METRIC_PAGES_DECODED, partition),
             pages_skipped: MetricBuilder::new(metrics).counter(METRIC_PAGES_SKIPPED, partition),
+            blocks_decoded: MetricBuilder::new(metrics).counter(METRIC_BLOCKS_DECODED, partition),
             columnar_batches: MetricBuilder::new(metrics)
                 .counter(METRIC_COLUMNAR_BATCHES, partition),
             rowpath_batches: MetricBuilder::new(metrics).counter(METRIC_ROWPATH_BATCHES, partition),
@@ -579,6 +593,7 @@ async fn prepare_partition(
     attempt_columnar: bool,
     projection: Option<Arc<Vec<usize>>>,
     accounting: PhaseAccounting,
+    blocks_decoded: Count,
 ) -> DFResult<Prepared> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
@@ -617,6 +632,7 @@ async fn prepare_partition(
             &predicates,
             &proj,
             &accounting,
+            &blocks_decoded,
         )
         .await?
         {
@@ -657,6 +673,7 @@ async fn prepare_partition(
         // block it scanned and skips none (#669).
         pages_decoded += output.pages_decoded;
         pages_skipped += output.pages_skipped;
+        blocks_decoded.add(output.stats.blocks_scanned as usize);
         out.extend(output.records);
     }
     // Selective-erasure exclusion (ADR-0064 decision 2): applied
@@ -697,6 +714,7 @@ async fn prepare_columnar(
     predicates: &[BloomPredicate<'_>],
     projection: &Arc<Vec<usize>>,
     accounting: &PhaseAccounting,
+    blocks_decoded: &Count,
 ) -> DFResult<ColumnarAttempt> {
     let union = union_projected_columns(projection);
     let mut blocks: Vec<HeldBlock> = Vec::new();
@@ -729,6 +747,7 @@ async fn prepare_columnar(
             // goes on to abandon the attempt.
             pages_decoded += cb.block.pages_decoded();
             pages_skipped += cb.block.pages_skipped();
+            blocks_decoded.add(1);
             // Last eligibility clause (ADR-0110 decision 3): a block carrying an
             // `attrs_raw` overflow page fails closed to the row path, answered
             // from page descriptors without decoding the page.
