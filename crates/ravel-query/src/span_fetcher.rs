@@ -2880,6 +2880,467 @@ mod tests {
             other => panic!("expected the decode error, got {other:?}"),
         }
     }
+
+    /// Records the `(key, range)` of every GET and forwards it to a
+    /// `MemoryStore`.
+    struct GetLog {
+        inner: MemoryStore,
+        gets: std::sync::Mutex<Vec<(String, GetRange)>>,
+    }
+
+    impl GetLog {
+        fn new(inner: MemoryStore) -> Self {
+            GetLog {
+                inner,
+                gets: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The ranges GET'd on `key`, in issue order, clearing the log for
+        /// that key.
+        fn take(&self, key: &str) -> Vec<GetRange> {
+            let mut gets = self.gets.lock().expect("get log");
+            let (mine, rest): (Vec<_>, Vec<_>) = gets.drain(..).partition(|(k, _)| k == key);
+            *gets = rest;
+            mine.into_iter().map(|(_, range)| range).collect()
+        }
+
+        fn total(&self) -> usize {
+            self.gets.lock().expect("get log").len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for GetLog {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.gets
+                .lock()
+                .expect("get log")
+                .push((key.to_string(), range));
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Two RSPAN objects over two-record blocks. Object A holds traces 1..=5,
+    /// trace 3 with four spans and the rest with two, so its six blocks are
+    /// `[t1] [t2] [t3] [t3] [t4] [t5]` and trace 3 spans the adjacent blocks 2
+    /// and 3. Object B holds traces 6..=10 and never trace 3.
+    struct TraceFixture {
+        memory: Option<MemoryStore>,
+        a: SegmentRef,
+        b: SegmentRef,
+        /// The tail probe length the fetcher is built with: the longer of the
+        /// two objects' footer-plus-sections tails, so the probe holds every
+        /// section and the ranged path's first GET is exactly the probe.
+        probe: u64,
+        /// Object A's absolute `[start, end)` of each block, from its footer.
+        blocks_a: Vec<(u64, u64)>,
+    }
+
+    impl TraceFixture {
+        /// Trace 3's run in object A: block 2's start to block 3's end.
+        fn run(&self) -> GetRange {
+            GetRange::Range(self.blocks_a[2].0, self.blocks_a[3].1)
+        }
+        fn block(&self, b: usize) -> GetRange {
+            GetRange::Range(self.blocks_a[b].0, self.blocks_a[b].1)
+        }
+        fn probe_of(&self, seg: &SegmentRef) -> GetRange {
+            GetRange::Range(seg.object_size - self.probe, seg.object_size)
+        }
+    }
+
+    /// The BLOCKS section's end and every block's absolute range, read from
+    /// the whole object through `RspanReader`, independently of the ranged
+    /// path under test.
+    fn layout(bytes: &[u8]) -> (u64, Vec<(u64, u64)>, Vec<usize>) {
+        let footer = open(bytes).expect("footer");
+        let blocks = *footer.section(kind::BLOCKS).expect("BLOCKS section");
+        let reader = RspanReader::new(bytes, &RspanConfig::default()).expect("reader");
+        let skip = reader.skip_index();
+        let ranges = skip
+            .blocks
+            .iter()
+            .map(|e| {
+                let (s, e) = abs_block_range(blocks.offset, blocks.len, e).expect("block range");
+                (s as u64, e as u64)
+            })
+            .collect();
+        let trace3 = skip.candidate_blocks(Some(&trace(3)), i64::MIN, i64::MAX, None, None);
+        (blocks.offset + blocks.len, ranges, trace3)
+    }
+
+    async fn trace_fixture() -> TraceFixture {
+        let memory = MemoryStore::new();
+        let mut a_records = Vec::new();
+        for (t, n) in [(1u8, 2u8), (2, 2), (3, 4), (4, 2), (5, 2)] {
+            for s in 0..n {
+                let at = 100 + i64::from(s);
+                a_records.push(bare_span(trace(t), [t * 16 + s; 8], at, at + 50));
+            }
+        }
+        let mut b_records = Vec::new();
+        for t in 6u8..=10 {
+            for s in 0..2u8 {
+                let at = 100 + i64::from(s);
+                b_records.push(bare_span(trace(t), [t * 16 + s; 8], at, at + 50));
+            }
+        }
+        let a = write_object(&memory, 1, &a_records).await;
+        let b = write_object(&memory, 2, &b_records).await;
+        let whole = |seg: &SegmentRef| {
+            let memory = &memory;
+            let key = seg.data_object_key.clone();
+            async move {
+                memory
+                    .get(&key, GetRange::Full)
+                    .await
+                    .expect("whole object")
+                    .data
+            }
+        };
+        let (a_end, blocks_a, a_trace3) = layout(&whole(&a).await);
+        let (b_end, _, b_trace3) = layout(&whole(&b).await);
+        assert_eq!(blocks_a.len(), 6, "fixture geometry: six blocks in A");
+        assert_eq!(
+            a_trace3,
+            vec![2, 3],
+            "fixture geometry: trace 3 is blocks 2..=3"
+        );
+        assert!(
+            b_trace3.is_empty(),
+            "fixture geometry: B cannot hold trace 3"
+        );
+        let probe = (a.object_size - a_end).max(b.object_size - b_end);
+        assert!(
+            blocks_a[3].1 <= a.object_size - probe,
+            "fixture geometry: trace 3's run lies outside the probe"
+        );
+        TraceFixture {
+            memory: Some(memory),
+            a,
+            b,
+            probe,
+            blocks_a,
+        }
+    }
+
+    /// ADR-2707 decision 7: a trace lookup reads the tail probe of each object
+    /// and exactly one ranged GET of the trace's block run where the trace
+    /// lives, and no block bytes where it does not.
+    ///
+    /// FLIP: reading the run through `GetRange::Full`, or issuing one GET per
+    /// candidate block instead of one per run, fails the object-A range list;
+    /// the pre-change fetcher's single `GetRange::Full` per object fails both.
+    #[tokio::test]
+    async fn trace_lookup_reads_only_the_trace_block_span() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let acct = QueryAccounting::new();
+
+        let a_out = fetcher
+            .fetch_accounted(&fx.a, TENANT, &query, None, None, &[], &acct)
+            .await
+            .expect("fetch A")
+            .expect("A is ts-relevant");
+        let b_out = fetcher
+            .fetch_accounted(&fx.b, TENANT, &query, None, None, &[], &acct)
+            .await
+            .expect("fetch B")
+            .expect("B is ts-relevant");
+
+        assert_eq!(
+            log.take(&fx.a.data_object_key),
+            vec![fx.probe_of(&fx.a), fx.run()],
+            "A: the tail probe, then one GET of exactly blocks 2..=3"
+        );
+        assert_eq!(
+            log.take(&fx.b.data_object_key),
+            vec![fx.probe_of(&fx.b)],
+            "B: the tail probe and zero block GETs"
+        );
+        assert_eq!(log.total(), 0, "no other GET was issued");
+
+        let run_len = fx.blocks_a[3].1 - fx.blocks_a[2].0;
+        let snap = acct.snapshot();
+        assert_eq!(snap.total_s3_requests(), 3);
+        assert_eq!(snap.s3_requests(AccountedOp::Get), 3);
+        assert_eq!(
+            snap.s3_bytes(AccountedOp::Get),
+            2 * fx.probe + run_len,
+            "wire bytes are the two probes plus the run, as transferred"
+        );
+
+        assert_eq!(a_out.records.len(), 4, "every trace-3 span");
+        assert!(a_out.records.iter().all(|r| r.record.trace_id == trace(3)));
+        assert!(b_out.records.is_empty());
+        assert_eq!(a_out.stats.blocks_total, 6);
+        assert_eq!(a_out.stats.blocks_after_skip, 2);
+        assert_eq!(a_out.stats.blocks_scanned, 2);
+        assert_eq!(b_out.stats.blocks_total, 5);
+        assert_eq!(b_out.stats.blocks_after_skip, 0);
+    }
+
+    /// The columnar exit takes the same ranged read and names it; a query with
+    /// no `trace_id` still reads the whole object and names that.
+    #[tokio::test]
+    async fn columnar_trace_lookup_takes_the_ranged_path_and_names_it() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let acct = QueryAccounting::new();
+
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        assert_eq!(SpanReadPath::for_query(&query).as_str(), "ranged-trace");
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                &fx.a,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &acct,
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("A is ts-relevant");
+        assert_eq!(scan.read_path(), SpanReadPath::RangedTrace);
+        let mut rows = 0;
+        while let Some(block) = scan.next_block().expect("next block") {
+            rows += block.rows.len();
+        }
+        assert_eq!(rows, 4);
+        assert_eq!(
+            log.take(&fx.a.data_object_key),
+            vec![fx.probe_of(&fx.a), fx.run()]
+        );
+
+        let window = all_query();
+        assert_eq!(SpanReadPath::for_query(&window).as_str(), "whole-object");
+        let scan = fetcher
+            .fetch_accounted_columnar(
+                &fx.a,
+                TENANT,
+                &window,
+                None,
+                None,
+                &[],
+                &FIXED_PROJECTION,
+                &acct,
+            )
+            .await
+            .expect("columnar fetch")
+            .expect("A is ts-relevant");
+        assert_eq!(scan.read_path(), SpanReadPath::WholeObject);
+        assert_eq!(log.take(&fx.a.data_object_key), vec![GetRange::Full]);
+    }
+
+    /// A caller-supplied block set is read as one ranged GET per contiguous
+    /// run that holds a candidate block, and a set that is not a valid run in
+    /// the object, or a set with no trace, is refused.
+    #[tokio::test]
+    async fn a_known_block_set_reads_one_range_per_contiguous_run() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let key = fx.a.data_object_key.clone();
+        let fetch = |blocks: &'static [u32]| {
+            let fetcher = fetcher.clone();
+            let seg = fx.a.clone();
+            async move {
+                fetcher
+                    .fetch_accounted_in_blocks(
+                        &seg,
+                        TENANT,
+                        &query,
+                        None,
+                        None,
+                        &[],
+                        Some(blocks),
+                        &QueryAccounting::new(),
+                    )
+                    .await
+            }
+        };
+
+        let out = fetch(&[3, 2, 3]).await.expect("fetch").expect("relevant");
+        assert_eq!(out.records.len(), 4);
+        assert_eq!(log.take(&key), vec![fx.probe_of(&fx.a), fx.run()]);
+
+        let out = fetch(&[2]).await.expect("fetch").expect("relevant");
+        assert_eq!(out.records.len(), 2, "block 2 holds two of trace 3's spans");
+        assert_eq!(log.take(&key), vec![fx.probe_of(&fx.a), fx.block(2)]);
+
+        // Block 1 holds only trace 2, so its run is skipped without a GET.
+        let out = fetch(&[1, 3]).await.expect("fetch").expect("relevant");
+        assert_eq!(out.records.len(), 2);
+        assert_eq!(log.take(&key), vec![fx.probe_of(&fx.a), fx.block(3)]);
+
+        let err = fetch(&[5, 6]).await.expect_err("block 6 does not exist");
+        assert!(matches!(err, SpanFetchError::Corrupt { .. }), "{err:?}");
+        assert_eq!(log.take(&key), vec![fx.probe_of(&fx.a)]);
+
+        let err = fetcher
+            .fetch_accounted_in_blocks(
+                &fx.a,
+                TENANT,
+                &all_query(),
+                None,
+                None,
+                &[],
+                Some(&[2]),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("a block set without a trace_id");
+        assert!(matches!(err, SpanFetchError::Corrupt { .. }), "{err:?}");
+        assert_eq!(log.total(), 0, "refused before any GET");
+    }
+
+    /// A repeated trace lookup through the read cache issues no GET: the probe
+    /// and the run are cache entries keyed by their absolute extents.
+    #[tokio::test]
+    async fn a_warm_trace_lookup_is_served_from_the_cache() {
+        use ravel_cache::{Cache, CacheLimits};
+
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
+            Arc::new(Cache::new(CacheLimits::new(1 << 20, 100, 1 << 20)));
+        let fetcher = SpanSegmentFetcher::new(log.clone())
+            .with_trace_probe_bytes(fx.probe)
+            .with_cache(cache);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+
+        let lookup = |acct: QueryAccounting| {
+            let fetcher = fetcher.clone();
+            let (a, b) = (fx.a.clone(), fx.b.clone());
+            async move {
+                let mut rows = 0;
+                for seg in [&a, &b] {
+                    let out = fetcher
+                        .fetch_accounted(seg, TENANT, &query, None, None, &[], &acct)
+                        .await
+                        .expect("fetch")
+                        .expect("relevant");
+                    rows += out.records.len();
+                }
+                (rows, acct.snapshot())
+            }
+        };
+
+        let (cold_rows, cold) = lookup(QueryAccounting::new()).await;
+        assert_eq!(cold_rows, 4);
+        assert_eq!(cold.total_s3_requests(), 3);
+        assert_eq!(cold.cache_misses, 3);
+        assert_eq!(log.total(), 3);
+        log.take(&fx.a.data_object_key);
+        log.take(&fx.b.data_object_key);
+
+        let (warm_rows, warm) = lookup(QueryAccounting::new()).await;
+        assert_eq!(warm_rows, 4);
+        assert_eq!(log.total(), 0, "the warm lookup issues no GET");
+        assert_eq!(warm.total_s3_requests(), 0);
+        assert_eq!(warm.cache_hits, 3, "probe A, run A, probe B");
+        assert_eq!(warm.cache_misses, 0);
+        let run_len = fx.blocks_a[3].1 - fx.blocks_a[2].0;
+        assert_eq!(warm.cache_bytes, 2 * fx.probe + run_len);
+    }
+
+    /// A ranged GET that fails surfaces as a typed store error, and the
+    /// fetcher does not retry the read as a whole-object GET.
+    #[tokio::test]
+    async fn a_failed_ranged_trace_get_is_a_store_error_with_no_whole_object_fallback() {
+        use ravel_object_store::fault::ScriptedFault;
+        use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule};
+
+        let mut fx = trace_fixture().await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("injected".into()))
+                .with_key_contains(fx.a.data_object_key.clone())
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let fault = Arc::new(FaultStore::new(
+            GetLog::new(fx.memory.take().expect("memory")),
+            plan,
+        ));
+        let fetcher = SpanSegmentFetcher::new(fault.clone()).with_trace_probe_bytes(fx.probe);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+
+        let err = fetcher
+            .fetch_accounted(
+                &fx.a,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("the run GET fails");
+        assert!(
+            matches!(
+                err,
+                SpanFetchError::Store {
+                    source: StoreError::Transient(_),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            fault.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected fault fired on the run GET"
+        );
+        let reached = fault.inner().take(&fx.a.data_object_key);
+        assert!(!reached.contains(&GetRange::Full), "{reached:?}");
+        assert_eq!(
+            reached,
+            vec![fx.probe_of(&fx.a)],
+            "only the probe reached the store: no retry, no whole-object read"
+        );
+    }
 }
 
 #[cfg(test)]
