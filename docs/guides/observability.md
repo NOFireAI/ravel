@@ -1549,10 +1549,35 @@ dimension.
 |---|---|
 | `ravel_maintain_workers_live` | Gauge. In-process maintenance workers this supervisor currently sees as live. |
 | `ravel_maintain_units_owned` | Gauge. Owned (tenant, signal, shard) units this process is currently maintaining. |
-| `ravel_maintain_compactions_in_flight` | Gauge. Bucket merges this process has started and not yet finished. A merge starts once the bucket has passed its gates and, for a run that takes a claim, its claim is held, before the first input catalog or block read, and ends when it publishes its compaction record, fails, is abandoned, or its task is dropped. The start also logs `compaction merge started` with `bucket=` set to the bucket's commit prefix, the prefix of the key its `compaction record published` line names, and the end logs `compaction merge ended` with the same `bucket=` and an `outcome=`: `published`, `converged`, `abandoned`, `skipped` (the pre-publish re-list or the writable-input count turned it away), `held` (an input outside the reader window), `failed`, `cancelled` (its claim was cancelled), `dry-run`, or `dropped` (its task was dropped or panicked). A bucket refused by its format floor, below the minimum input count, or skipped for another holder's claim never starts one. A bucket held for an input outside the reader window does: that input's read is what finds it, and the merge then ends. Erasure rewrites are not counted. Several units merge concurrently and merges run back to back, so a value at or above 1 for a long time is normal while there is a backlog; a merge that is not finishing shows as its `compaction merge started` line with no `compaction merge ended` line for that bucket after it. |
+| `ravel_maintain_compactions_in_flight` | Gauge. Bucket merges this process has started and not yet finished. Merges run concurrently and back to back, so a sustained value at or above 1 is normal during a backlog; a stuck merge shows in the log, as described below the table. |
 | `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. A pair's shard 0 unit also fails a tick when this process's sweep of another shard of the pair fails, since the owner of shard 0 sweeps every shard of the pair. Alert on a sustained nonzero value, not on any single scrape. |
 | `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
 | `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
+
+A merge counted by `ravel_maintain_compactions_in_flight` starts once the
+bucket has passed its gates and, for a run that takes a claim, its claim is
+held, before the first input catalog or block read. It ends when it publishes
+its compaction record, fails, is abandoned, or its task is dropped. A bucket
+refused by its format floor, below the minimum input count, or skipped for
+another holder's claim never starts one. A bucket held for an input outside
+the reader window does, because that input's read is what finds it, and the
+merge then ends. Erasure rewrites are not counted.
+
+The start logs `compaction merge started` with `bucket=` set to the bucket's
+commit prefix, the prefix of the key its `compaction record published` line
+names. The end logs `compaction merge ended` with the same `bucket=` and an
+`outcome=`:
+
+- `published`, `converged`, `abandoned` or `failed`;
+- `skipped`: the pre-publish re-list or the writable-input count turned it
+  away;
+- `held`: an input outside the reader window;
+- `cancelled`: its claim was cancelled;
+- `dry-run`;
+- `dropped`: its task was dropped or panicked.
+
+A merge that is not finishing shows as a `compaction merge started` line with
+no `compaction merge ended` line for that bucket after it.
 
 ### Maintenance loop liveness
 

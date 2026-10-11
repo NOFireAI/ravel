@@ -32,17 +32,20 @@
 # gauge never reads >= 1 within the window the kill still happens, with a
 # warning, and CHAOS_KILL_ON_GAUGE is 0.
 #
-# CONSERVATION: after the kill, A's log names the bucket it was merging: its
-# latest "compaction merge started" line with no "compaction merge ended"
-# line for the same bucket. The oracle waits up to
-# chaos_conservation_wait_seconds from the kill (the takeover bound, one more
-# tick, and CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS; 1080 s at the
-# defaults), ending the wait early on a survivor publish line for that
-# bucket, then lists `<bucket>l1.` in the store: a compaction record there
-# passes, whichever worker wrote it. With the gauge seen and the bucket known,
-# no record by then is a FAIL; without either, or with a LIST that fails, the
-# run could not measure conservation. It also logs the merge durations it can
-# pair from both workers' logs and whether the survivor started the bucket.
+# CONSERVATION: after the kill, A's log names every bucket it was merging:
+# each "compaction merge started" line with no "compaction merge ended" line
+# for the same bucket. A runs several units at once, so more than one can be
+# open. The oracle waits up to chaos_conservation_wait_seconds from the kill
+# (the takeover bound, one more tick, and
+# CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS; 1080 s at the defaults), ending
+# the wait early once the survivor has logged a publish for every open
+# bucket, then lists `<bucket>l1.` in the store for each: a compaction record
+# there counts, whichever worker wrote it. With the gauge seen and the
+# buckets known, any open bucket with no record by then is a FAIL. Without
+# the gauge or an open bucket, or with a LIST that fails while every listed
+# bucket has a record, the run could not measure conservation. It also logs
+# the merge durations it can pair from both workers' logs and, per open
+# bucket, whether the survivor started and published it.
 #
 # SEAL WAIT: an ingest hour is compactable once the compactor's seal margin
 # has passed the end of the hour (CompactorConfig::seal_margin_ns, 3900 s at
@@ -63,9 +66,12 @@
 # parseable `seal_margin_secs=`, or when conservation could not be measured
 # and no other assertion failed. Could-not-measure means the survivor's
 # conservation-abort counter did not rise and either the kill did not fire on
-# the gauge, worker A's log at the kill names no interrupted bucket, or the
-# store LIST of that bucket's compaction records failed
-# (oracle_conservation_or_unmeasured in lib.sh); 64 on a usage error.
+# the gauge, worker A's log at the kill names no interrupted bucket, or a
+# store LIST of an interrupted bucket's compaction records failed while every
+# bucket it could list had a record (oracle_conservation_or_unmeasured in
+# lib.sh). It also exits 3 before the kill when fewer than
+# CHAOS_MAINTAIN_MIN_EXPORTS exports of the load were accepted; 64 on a usage
+# error.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
 # RustFS, spawning workers, or issuing a real kill. That is the only proof

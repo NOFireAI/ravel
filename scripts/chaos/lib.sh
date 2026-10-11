@@ -1494,7 +1494,11 @@ chaos_line_count() {
 # Seconds past the takeover window the conservation oracle allows for the
 # survivor's own merge of the interrupted bucket. Not measured: no merge at
 # the scenario 2 fan-in has been timed (see the fixture note above); the
-# oracle's `merge durations:` line is where a run reports one. 300 s is
+# oracle's `merge durations:` line is where a run reports one. That figure
+# runs from the merge-start line, which comes after the merge has read all of
+# its inputs' commit records (load_inputs_with_ledger in compact.rs), so it
+# leaves out that load, which a survivor redoing the bucket also pays; read
+# it as a lower bound. 300 s is
 # one more maintenance tick; the chaos job's worst case with it is in the
 # comment above `timeout-minutes` in .github/workflows/k8s-nightly.yml.
 CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS="${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS:-300}"
