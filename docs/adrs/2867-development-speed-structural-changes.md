@@ -157,9 +157,12 @@ In ravel, `benchmarks/clickbench/kit/`:
    phases `run.toml` names: the 43-statement benchmark per arm, the q29
    probe, the concurrent phases, each logging every call's statement,
    outcome, duration and refusal class to `calls.jsonl` (that is change
-   7's kit half). It writes `results.json` (the ADR-0927 report schema,
-   plus a `bands` block with pass, miss or inconclusive per
-   pre-registered band read from the band file) and an evidence tarball
+   7's kit half). It writes `results.json` in the shape the lane already
+   parses: `ClickBenchParquetReport`
+   (`crates/ravel-bench/src/clickbench_parquet/report.rs`, the serde type
+   with the round-trip test, which the runbook's section 9 `analyse.py`
+   reads), extended by a `bands` block with pass, miss or inconclusive per
+   pre-registered band read from the band file, and an evidence tarball
    to `s3://<bucket>/runs/<run-id>/out/`, writes `DONE` or `FAILED` beside
    them, and terminates the instance.
 3. `fetch.sh` (laptop): waits on the `DONE` marker, downloads
@@ -236,8 +239,11 @@ In ravel:
    documented promise), and `affected-tests.sh` runs the `sql`-gated
    tests when `ravel-server` is in the closure. Doc-only and test-only
    rounds run `cargo check -p` plus the crate's tests. The PreToolUse hook
-   refuses `cargo clippy --workspace` when the checkout is a fleet clone
-   (the path test `isExemptCheckout` already has).
+   refuses `cargo clippy --workspace` when the checkout is a fleet clone,
+   keyed on the fleet-clone path test alone (the `/fleet/work/` and
+   `/var/lib/fleet` test inside `isExemptCheckout`, not the whole
+   function: its `RAVEL_GUARD_ALLOW_PRIMARY` escape belongs to the worktree
+   rule and must not switch this refusal off).
 2. `fleet-result-merge.sh` runs `assert-struct-literals-current.sh`
    before `gh pr create`, so a shape break is a local refusal, not a CI
    cycle.
