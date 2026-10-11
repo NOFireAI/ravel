@@ -1236,7 +1236,10 @@ pub(super) async fn load_spans_into(
             if window.submitted(observed) {
                 let before = router.metrics_snapshot().flushes_manual;
                 router.flush_all().await;
-                depth_flushes += router.metrics_snapshot().flushes_manual - before;
+                depth_flushes += router
+                    .metrics_snapshot()
+                    .flushes_manual
+                    .saturating_sub(before);
             }
         }
 

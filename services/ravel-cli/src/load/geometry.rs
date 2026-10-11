@@ -154,8 +154,8 @@ impl LoadGeometry {
 }
 
 /// Resolve the target and depth for a load once its first non-empty batch is
-/// decoded: `first_rows` source rows whose records the router estimates at
-/// `first_est_bytes`. An explicit value is kept as given; a missing one is
+/// decoded: `first_rows` rows of the object (log records, spans or metric
+/// points) that the router estimates at `first_est_bytes`. An explicit value is kept as given; a missing one is
 /// derived as the [`DEFAULT_OBJECT_ROWS`] geometry describes.
 pub fn resolve_geometry(
     target_bytes: Option<usize>,

@@ -1242,6 +1242,227 @@ mod default_geometry {
         assert_eq!(layout.target_bytes_no_effect_warning, None);
     }
 
+    const HISTOGRAM_MAPPING: &str = "[metrics]\nname = \"geometry_histogram\"\nvalue_column \
+                                     = \"bucket_count\"\nts_column = \"ts\"\nts_unit = \
+                                     \"nanos\"\n\n[[metrics.label]]\nname = \"host\"\ncolumn = \
+                                     \"host\"\n\n[metrics.histogram]\nle_column = \
+                                     \"le\"\nsum_column = \"sum\"\ncount_column = \"count\"\n";
+
+    /// The finite bounds of every fixture data point: one source row each.
+    const BOUNDS: [f64; 2] = [0.1, 1.0];
+
+    /// One data point of `BOUNDS.len()` finite bounds and a null sum explodes
+    /// into one bucket per bound, the `+Inf` bucket and `_count`.
+    const POINTS_PER_DATA_POINT: usize = BOUNDS.len() + 2;
+
+    fn histogram_mapping() -> MetricsMapping {
+        match parse_mapping_document(HISTOGRAM_MAPPING, SignalArg::Metrics).expect("valid mapping")
+        {
+            MappingSection::Metrics(m) => m,
+            _ => panic!("a [metrics] section parses as metrics"),
+        }
+    }
+
+    /// Row group `g` of the histogram fixture: `batch_rows / BOUNDS.len()`
+    /// data points on the series of host `b{g:03}`, one source row per bound,
+    /// each data point at its own `ts`.
+    fn histogram_group(g: usize, batch_rows: usize) -> RecordBatch {
+        let per_group = batch_rows / BOUNDS.len();
+        let base = NOW_NS - 60_000_000_000 + (g * per_group) as i64;
+        let host = format!("b{g:03}");
+        batch(vec![
+            (
+                "ts",
+                i64_col(
+                    (0..batch_rows)
+                        .map(|r| base + (r / BOUNDS.len()) as i64)
+                        .collect(),
+                ),
+            ),
+            (
+                "le",
+                Arc::new(Float64Array::from(
+                    (0..batch_rows)
+                        .map(|r| BOUNDS[r % BOUNDS.len()])
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                "bucket_count",
+                Arc::new(Float64Array::from(vec![1.0; batch_rows])) as ArrayRef,
+            ),
+            (
+                "sum",
+                Arc::new(Float64Array::from(vec![None::<f64>; batch_rows])) as ArrayRef,
+            ),
+            ("count", i64_col(vec![BOUNDS.len() as i64; batch_rows])),
+            ("host", str_col(vec![host.as_str(); batch_rows])),
+        ])
+    }
+
+    fn histogram_fixture(
+        batch_rows: usize,
+        batches: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("histograms.parquet");
+        let first = histogram_group(0, batch_rows);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for g in 1..batches {
+            writer
+                .write(&histogram_group(g, batch_rows))
+                .expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+        (dir, pq)
+    }
+
+    /// Each shard-0 data object's sample count, read from its RSEG footer.
+    async fn object_points(store: &dyn ObjectStoreBackend) -> Vec<u64> {
+        let mut out = Vec::new();
+        for key in super::metrics_pipeline_review::shard_data_keys(store, 0).await {
+            let got = store
+                .get(&key, ravel_object_store::GetRange::Full)
+                .await
+                .expect("get object");
+            let location = ravel_segment::open_from_full(got.data.as_ref(), Default::default())
+                .expect("open rseg footer");
+            out.push(location.footer.sample_count);
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Issue #2753: the derived target counts points, the object's own rows,
+    /// not source rows. A classic-histogram data point of 2 finite bounds and
+    /// a null sum is 2 source rows and 4 points, so a batch of 10,000 rows
+    /// carries 20,000 points. 27 batches make 540,000 points on one shard:
+    /// size flushes after 13 batches (259,996 points: the first batch leaves
+    /// its last data point open for the second) and 26 (260,000), and the
+    /// end-of-input drain publishes the last 20,004 (the last batch's 20,000
+    /// and the data point the end of input closes).
+    ///
+    /// Prove-the-test: resolve the geometry on the first batch's source rows
+    /// (9,998) instead of its points (19,996) and the target doubles to
+    /// 250,000 x 2 points' worth, so the first object holds about 500,000
+    /// points and the target assertion fails first.
+    #[tokio::test]
+    async fn a_histogram_load_sizes_objects_in_points_not_source_rows() {
+        const BATCHES: usize = 27;
+        let (_dir, pq) = histogram_fixture(BATCH_ROWS, BATCHES);
+        let mapping = histogram_mapping();
+
+        // The loader's first write, built independently: every data point of
+        // row group 0 but the last, which stays open until row group 1.
+        let first = histogram_group(0, BATCH_ROWS);
+        let cols = MetricsColumnIndex::resolve(&first, &mapping).expect("columns resolve");
+        let tenant = TenantId::new("acme");
+        let mut grouper = HistogramGrouper::new(tenant.clone());
+        let (first_points, first_rows) = build_batch_points(
+            &first,
+            &cols,
+            0,
+            &tenant,
+            &mapping,
+            &IngestLimits::default(),
+            NOW_NS,
+            false,
+            Some(&mut grouper),
+        )
+        .expect("every row is admitted");
+        let data_points = BATCH_ROWS / BOUNDS.len();
+        assert_eq!(first_rows as usize, BATCH_ROWS - BOUNDS.len());
+        assert_eq!(
+            first_points.len(),
+            (data_points - 1) * POINTS_PER_DATA_POINT,
+            "the first write carries n + 2 points per n source rows"
+        );
+        let first_points: Vec<ravel_ingest::IngestPoint> = first_points
+            .into_iter()
+            .map(ravel_ingest::IngestPoint::from)
+            .collect();
+        let est = ravel_ingest::est_points_object_bytes(&first_points);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_metrics_with(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping,
+            1,
+            BATCH_ROWS,
+            0,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+            None,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(DEFAULT_MAX_FLUSH_DELAY),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("load succeeds");
+
+        let total_points = BATCHES * data_points * POINTS_PER_DATA_POINT;
+        assert_eq!(report.rows_processed, (BATCHES * BATCH_ROWS) as u64);
+        assert_eq!(report.points_written, total_points as u64);
+
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        assert_eq!(
+            geometry.target_bytes,
+            DEFAULT_OBJECT_ROWS * est / first_points.len(),
+            "the derived target is 250,000 points at the first write's estimate per point"
+        );
+        assert_eq!(
+            geometry.est_bytes_per_row,
+            est.div_ceil(first_points.len()) as u64
+        );
+
+        let objects = object_points(store.as_ref()).await;
+        assert_eq!(objects.iter().sum::<u64>(), total_points as u64);
+        assert_eq!(
+            objects.len(),
+            total_points.div_ceil(DEFAULT_OBJECT_ROWS),
+            "540,000 points on one shard make ceil(540,000 / 250,000) objects: {objects:?}"
+        );
+        let batch_points = (data_points * POINTS_PER_DATA_POINT) as u64;
+        let (tail, full) = objects.split_first().expect("objects were written");
+        assert_eq!(
+            *tail,
+            batch_points + POINTS_PER_DATA_POINT as u64,
+            "the last batch and the data point closed at end of input are the drained tail"
+        );
+        for &points in full {
+            assert!(
+                points >= DEFAULT_OBJECT_ROWS as u64
+                    && points < DEFAULT_OBJECT_ROWS as u64 + batch_points,
+                "a size-closed object holds 250,000 points plus less than one batch: \
+                 {objects:?}"
+            );
+        }
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 2,
+                age: 0,
+                arrival: 0,
+                depth: 0,
+                manual: 1,
+            }
+        );
+    }
+
     /// `--target-bytes 1 --batch-rows 10000` writes one object per batch on
     /// the one shard, each closed by the size trigger.
     #[tokio::test]

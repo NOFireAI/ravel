@@ -1102,7 +1102,9 @@ pub async fn load_metrics(
 /// [`load_metrics`] with the target and depth left to [`resolve_geometry`]
 /// where `request` leaves them `None`. The router is built once the first
 /// batch with points is decoded, since a derived target is read off that
-/// batch's estimate; its source rows are the rows a derived target counts.
+/// batch's estimate. A derived target counts that batch's points, not its
+/// source rows: a point is one row of the object, and a classic-histogram row
+/// explodes into more than one point.
 /// `on_geometry` is called with the resolved geometry before the first
 /// write is submitted.
 #[allow(clippy::too_many_arguments)]
@@ -1302,7 +1304,7 @@ pub(super) async fn load_metrics_with(
                 request.pipeline_depth,
                 shards,
                 batch_rows,
-                usize::try_from(rows).unwrap_or(usize::MAX),
+                usize::try_from(batch_points).unwrap_or(usize::MAX),
                 ravel_ingest::est_points_object_bytes(&points),
                 memory_budget,
             );
@@ -1357,7 +1359,10 @@ pub(super) async fn load_metrics_with(
             if window.submitted(observed) {
                 let before = router.metrics_snapshot().flushes_manual;
                 router.flush_all().await;
-                depth_flushes += router.metrics_snapshot().flushes_manual - before;
+                depth_flushes += router
+                    .metrics_snapshot()
+                    .flushes_manual
+                    .saturating_sub(before);
             }
         }
 

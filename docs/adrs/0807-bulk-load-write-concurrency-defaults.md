@@ -446,8 +446,16 @@ records the depth of 4 this ADR measured, and `DEFAULT_MAX_INFLIGHT_FLUSHES`
 is still pinned to it by test, so the per-shard flush window keeps the
 measured default. Amended decision 3 therefore now decides one default, not
 two: `--max-inflight-flushes` is 4; `--pipeline-depth` has no fixed default
-and an explicit value still wins. The reasoning that kept the two windows
-equal (an inner window below the outer one re-serialises a shard's PUTs, one
-above it is unreachable) holds at any derived depth at or above 4, and the
-ingest guide (`docs/guides/ingest.md`, "Object geometry") states the
+and an explicit value still wins. A derived depth at or above 4 puts the outer
+window at or above the inner one, the case the reasoning that kept the two
+windows equal says re-serialises a shard's PUT round trips, but at the derived
+defaults a write no longer flushes on its own: a shard's buffer closes on the
+size trigger at the derived target or on the depth flush, which is one
+`flush_all` per window of `--pipeline-depth` writes. A shard therefore asks for
+one flush per object rather than one per batch, and the inner window is largely
+unconsulted. The pinning amended decision 3 made is preserved for the explicit
+`--pipeline-depth` path, where `--pipeline-depth 4` still meets an inner window
+of 4, and for the size-trigger path: an explicit `--target-bytes` turns the
+depth flush off, and at `--target-bytes 1` every write flushes as its own
+object, the layout decision 3 measured. The ingest guide (`docs/guides/ingest.md`, "Object geometry") states the
 derivation and its three bounds.
