@@ -6511,19 +6511,17 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     // unbounded, a cardinality hazard as a label, so this counts drops,
     // never names them; see `crate::normalize_reject_metrics` and the crate
     // docs on `Rejection::ResourceAttributesDropped` for the full reasoning.
-    // Metrics-only: OTLP HTTP and OTLP gRPC build resource labels this way;
-    // OTAP builds none at all (`services/ravel-server/src/otap_grpc.rs`),
-    // and logs/traces never call the recorder, so a logs or spans row would
-    // always render 0. Skip them rather than render a figure that can never
+    // Metrics-only: OTLP HTTP, OTLP gRPC and OTAP build resource labels this
+    // way, and logs/traces never call the recorder, so a logs or spans row
+    // would always render 0. Skip them rather than render a figure that can never
     // be anything else.
     write_header(
         out,
         "ravel_ingest_resource_attrs_dropped_total",
         "Metric resource attributes outside the configured allowlist, dropped rather than turned \
          into labels, by tenant, for the metrics signal only. Not a rejection: counted before the \
-         series cap and the write, so not a count of stored points. Covers OTLP HTTP and OTLP \
-         gRPC ingest; OTAP is not covered, since it builds no resource labels at all. The \
-         allowlist is not configurable today. This counter only makes an existing silent drop \
+         series cap and the write, so not a count of stored points. Covers OTLP HTTP, OTLP \
+         gRPC and OTAP ingest. The allowlist is not configurable today. This counter only makes an existing silent drop \
          visible, including the case where two resources differing only in a dropped attribute \
          collapse into one series.",
         "counter",
@@ -15234,8 +15232,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
     /// here has no admission usage row at all, so this also pins that a
     /// normalize-only (tenant, signal) still renders a full row.
     ///
-    /// `ravel_ingest_resource_attrs_dropped_total` is metrics-only (OTAP and
-    /// logs/traces never call the recorder), so its row is pinned on a
+    /// `ravel_ingest_resource_attrs_dropped_total` is metrics-only (logs/traces
+    /// never call the recorder), so its row is pinned on a
     /// `Signal::Metrics` entry, a state the renderer can actually produce,
     /// rather than on the `Signal::Logs` row above: a nonzero count on a
     /// signal the counter never renders would pass vacuously.

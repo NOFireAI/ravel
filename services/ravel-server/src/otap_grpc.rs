@@ -24,8 +24,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use ravel_ingest::{IngestPoint, WriteMode, plausible_ingest_clock};
-use ravel_otap::normalize::normalize_decoded_with_metadata;
+use ravel_ingest::{IngestByteShed, IngestPoint, WriteError, WriteMode, plausible_ingest_clock};
+use ravel_otap::normalize::{
+    normalize_decoded_with_metadata_projected, project_resolved_label_bytes,
+};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamError, StreamState};
@@ -377,9 +379,24 @@ async fn write_batch(
     // drop-count rejection went into a `rejected` vector this function does not
     // read either. So points, series, and the ack are byte-for-byte what they
     // were; the metadata tuple is the only addition.
+    // The same resolved-label-byte bound and budget charge as the OTLP path
+    // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`.
+    let projected = project_resolved_label_bytes(decoded, &ingest.limits);
+    let label_charge = crate::ingest::charge_projected_labels(
+        &ingest.budget,
+        projected.get(),
+        ingest.limits.max_resolved_label_bytes_per_request,
+    )
+    .map_err(|IngestByteShed| IngestRequestError::Write(WriteError::BufferBudgetExceeded))?;
     let mut cap = ExemplarCap::new(ingest.limits.exemplar_cap_window_ns);
-    let (result, metadata) =
-        normalize_decoded_with_metadata(tenant, decoded, &ingest.limits, ingest_ts_ns, &mut cap);
+    let (result, metadata) = normalize_decoded_with_metadata_projected(
+        tenant,
+        decoded,
+        &ingest.limits,
+        ingest_ts_ns,
+        &mut cap,
+        projected,
+    );
     let normalized = result.output;
     // Layer 3's rejections, counted exactly as the OTLP path counts them
     // (ADR-0051 section 3). OTAP has no partial-success field to carry them,
@@ -390,16 +407,13 @@ async fn write_batch(
         ravel_types::Signal::Metrics,
         NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
     );
-    // No resource_attrs_dropped recording here: OTAP's normalizer builds no
-    // job/instance/allowlist labels from resource attributes at all (unlike
-    // the OTLP path), so every resource attribute is dropped by design, not
-    // exception, and `normalized.rejected` never carries a
-    // `ResourceAttributesDropped` entry to count. Calling the OTLP-path
-    // recorder here would only ever record 0, which reads as "nothing was
-    // dropped" on a transport that drops everything. See
-    // `ravel_ingest_resource_attrs_dropped_total`'s HELP text and
-    // docs/guides/observability.md: the counter covers OTLP HTTP and OTLP
-    // gRPC only.
+    // OTAP builds resource labels with the OTLP builder (ADR-2708 D4), so its
+    // non-allowlisted resource attributes count the same way.
+    ingest.normalize_metrics.record_resource_attrs_dropped(
+        tenant,
+        ravel_types::Signal::Metrics,
+        ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
+    );
     // Synchronous, no I/O, off the acknowledgement path: see the twin call in
     // `crate::ingest::handle_export`.
     if let Some(sink) = &ingest.metadata_sink {
@@ -433,6 +447,7 @@ async fn write_batch(
     // layer 4), never silently discarded.
     let dropped_points = points_before - points.len();
 
+    drop(label_charge);
     let receipt = ingest
         .router
         .write_values(tenant.clone(), points, mode, ingest.ack_deadline)

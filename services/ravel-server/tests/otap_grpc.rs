@@ -13,17 +13,23 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueKind;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
+use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
 use ravel_object_store::fault::{FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
-use ravel_otap::encode::{DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder};
+use ravel_otap::encode::{
+    AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
+    ResourceAssignment,
+};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_client::ArrowMetricsServiceClient;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_server::ingest_concurrency::IngestConcurrencyLimit;
@@ -300,8 +306,8 @@ fn otap_gauge_batch(
 }
 
 /// The OTLP equivalent: one gauge, one point, no resource (so no synthesized
-/// `job`/`instance`), matching the OTAP encoder's known scope (it emits no
-/// RESOURCE_ATTRS). The two paths must therefore produce byte-identical
+/// `job`/`instance`), matching [`otap_gauge_batch`], which assigns no
+/// resource. The two paths must therefore produce byte-identical
 /// series identity and value.
 fn otlp_gauge_request(metric_name: &str, ts_ns: i64) -> ExportMetricsServiceRequest {
     ExportMetricsServiceRequest {
@@ -569,6 +575,178 @@ async fn otap_and_otlp_produce_identical_stored_series() {
         strip_name(otap_series["metric"].clone()),
         strip_name(otlp_series["metric"].clone()),
         "OTAP and OTLP series carry different labels"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Resource attributes of [`otap_resource_gauge_batch`] and
+/// [`otlp_resource_gauge_request`]: the job/instance sources, one allowlisted
+/// key, and one key outside the allowlist that both paths must drop and count.
+const RESOURCE_ATTRS: [(&str, &str); 5] = [
+    ("service.namespace", "shop"),
+    ("service.name", "checkout"),
+    ("service.instance.id", "pod-1"),
+    ("host.name", "h1"),
+    ("telemetry.sdk.name", "opentelemetry"),
+];
+
+/// One gauge point carrying a `route` point attribute, under one resource
+/// carrying [`RESOURCE_ATTRS`] in the RESOURCE_ATTRS table.
+fn otap_resource_gauge_batch(metric_name: &str, ts_ns: i64) -> BatchArrowRecords {
+    let metrics = vec![MetricRow {
+        name: metric_name.to_string(),
+        kind: MetricKind::Gauge,
+        data_points: vec![DataPointRow {
+            time_unix_nano: ts_ns,
+            value: VALUE,
+            flags: 0,
+            exemplars: vec![],
+            attrs: vec![AttrRow {
+                key: "route".to_string(),
+                value: AttrValue::Str("/a".to_string()),
+            }],
+        }],
+    }];
+    let resources = vec![
+        RESOURCE_ATTRS
+            .iter()
+            .map(|(k, v)| AttrRow {
+                key: (*k).to_string(),
+                value: AttrValue::Str((*v).to_string()),
+            })
+            .collect::<Vec<_>>(),
+    ];
+    let assignment = ResourceAssignment {
+        resources: &resources,
+        metrics: &[Some(0)],
+        ..ResourceAssignment::default()
+    };
+    let mut encoder = MetricsStreamEncoder::new("otap-grpc-test").expect("new encoder");
+    encoder
+        .encode_batch_resources(0, &metrics, &[""], &[], &[], &[], &[], &assignment)
+        .expect("encode batch")
+}
+
+/// The OTLP equivalent of [`otap_resource_gauge_batch`].
+fn otlp_resource_gauge_request(metric_name: &str, ts_ns: i64) -> ExportMetricsServiceRequest {
+    let kv = |k: &str, v: &str| KeyValue {
+        key: k.to_string(),
+        value: Some(AnyValue {
+            value: Some(AnyValueKind::StringValue(v.to_string())),
+        }),
+        ..Default::default()
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: RESOURCE_ATTRS.iter().map(|(k, v)| kv(k, v)).collect(),
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    data: Some(MetricData::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: ts_ns as u64,
+                            value: Some(NumberValue::AsDouble(VALUE)),
+                            attributes: vec![kv("route", "/a")],
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// The value of the single metrics-signal
+/// `ravel_ingest_resource_attrs_dropped_total` sample on `/metrics`. Fails
+/// unless exactly one such sample is rendered.
+async fn resource_attrs_dropped(http_base: &str) -> u64 {
+    let body = reqwest::Client::new()
+        .get(format!("{http_base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    let samples: Vec<&str> = body
+        .lines()
+        .filter(|l| l.starts_with("ravel_ingest_resource_attrs_dropped_total{"))
+        .filter(|l| l.contains("signal=\"metrics\""))
+        .collect();
+    assert_eq!(samples.len(), 1, "one metrics sample expected: {samples:?}");
+    samples[0]
+        .rsplit(' ')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("sample value parses as u64")
+}
+
+/// A point under an OTAP resource is stored with the labels the OTLP path
+/// gives the same point under the same resource: `job` from
+/// service.namespace/service.name, `instance` from service.instance.id, the
+/// allowlisted `host_name`, and its own point attribute (ADR-2708 D4). The
+/// attribute outside the allowlist is dropped on both paths and moves
+/// `ravel_ingest_resource_attrs_dropped_total` by one per request on each.
+#[tokio::test]
+async fn otap_resource_labels_match_otlp_stored_series() {
+    let running = start_test_server().await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+    let http_base = format!("http://{}", running.http_addr);
+    let ts = now_ns();
+
+    let otap_status = send_one_batch(grpc_addr, otap_resource_gauge_batch("res_otap", ts)).await;
+    assert_eq!(
+        otap_status.status_code,
+        StatusCode::Ok as i32,
+        "OTAP batch should ack OK: {}",
+        otap_status.status_message
+    );
+    assert_eq!(resource_attrs_dropped(&http_base).await, 1);
+
+    let otlp_response = reqwest::Client::new()
+        .post(format!("{http_base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .body(otlp_resource_gauge_request("res_otlp", ts).encode_to_vec())
+        .send()
+        .await
+        .expect("OTLP export succeeds");
+    assert_eq!(otlp_response.status(), 200);
+    let otlp_token = otlp_response
+        .headers()
+        .get("x-ravel-commit-token")
+        .expect("OTLP commit token header")
+        .to_str()
+        .expect("token header is ascii")
+        .to_string();
+    assert_eq!(resource_attrs_dropped(&http_base).await, 2);
+
+    let otap_series =
+        query_one_series(running.http_addr, "res_otap", &otap_status.status_message).await;
+    let otlp_series = query_one_series(running.http_addr, "res_otlp", &otlp_token).await;
+    let strip_name = |mut m: serde_json::Value| {
+        let obj = m.as_object_mut().expect("metric is an object");
+        obj.remove("__name__");
+        m
+    };
+    let expected = serde_json::json!({
+        "job": "shop/checkout",
+        "instance": "pod-1",
+        "host_name": "h1",
+        "route": "/a",
+    });
+    assert_eq!(strip_name(otlp_series["metric"].clone()), expected);
+    assert_eq!(
+        strip_name(otap_series["metric"].clone()),
+        expected,
+        "OTAP series must carry the OTLP resource labels"
     );
 
     running.shutdown().await.expect("graceful shutdown");
