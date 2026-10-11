@@ -70,9 +70,10 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::flush_share::TenantFlushShares;
+use crate::format_floor::{FormatFamily, warn_flush_refused, warn_flush_written_below};
 use crate::generation::{
-    FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck, mismatch_retry_spent,
-    reread_and_check, send_hand_back,
+    FloorCheck, FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck,
+    mismatch_retry_spent, reread_and_check, send_hand_back,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -2708,6 +2709,34 @@ impl LogShardActor {
                     self.metrics.record_stale_provisioning_flush();
                 }
                 if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
+                    self.tenants.insert(tenant, buf);
+                    return;
+                }
+                buf
+            }
+        };
+        // ADR-1746 decision 4, as in the metrics shard: refused on the cached
+        // record before a `seq` is pinned or the PUT task is spawned.
+        let buf = match self.scope.floor_check(
+            tenant_hash,
+            FormatFamily::Rlog,
+            u32::from(LOG_SEGMENT_FORMAT_VERSION),
+        ) {
+            FloorCheck::Write => buf,
+            FloorCheck::WriteBelow(below) => {
+                warn_flush_written_below(Signal::Logs, self.shard, tenant_hash, &below);
+                buf
+            }
+            FloorCheck::Refuse(refused) => {
+                warn_flush_refused(Signal::Logs, self.shard, tenant_hash, &refused);
+                self.ctx.ack_waiters(
+                    buf.waiters,
+                    Err(LogWriteError::BelowFormatFloor(refused)),
+                );
+                return;
+            }
+            FloorCheck::NoView => {
+                if self.keeps_unconfirmed_flush(lag_check, "no cached format floor") {
                     self.tenants.insert(tenant, buf);
                     return;
                 }

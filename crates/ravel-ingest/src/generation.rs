@@ -56,14 +56,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use prost::Message;
 use ravel_catalog::{
-    DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, provisioning_key,
-    read_generations_checked, scan_count, stable_generation_for_hour,
+    DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, current_floor,
+    provisioning_key, read_floors_checked, read_generations_checked, scan_count,
+    stable_generation_for_hour,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::sys::v1 as sysproto;
@@ -71,6 +71,7 @@ use ravel_types::{Signal, TenantHash};
 use tokio::sync::{mpsc, watch};
 
 use crate::clock::Clock;
+use crate::format_floor::{BelowFormatFloor, FloorAdmission, FormatFamily, FormatFloorPolicy};
 
 /// Default router refresh interval `C` (ADR-0052 section 3, an open question
 /// the ADR left to the implementing task). 60 seconds: frequent enough that a
@@ -121,11 +122,40 @@ fn min_lead_hours(refresh_interval_ns: i64) -> u32 {
 /// is hit repeatedly without a re-read: it is not idle, but its
 /// `refreshed_at_ns` does not move. Eviction keys off last touch so such a
 /// tenant is never evicted mid-use.
+///
+/// `format_floor` is the record's floor for this router's format family, the
+/// floor a flush checks before it publishes (ADR-1746 decision 4). Floors are
+/// only ever raised, so a refresh keeps the higher of the cached and the read
+/// value, and a refresh that carries no floor reading keeps the cached one.
 #[derive(Debug, Clone)]
 struct TenantView {
     generations: Vec<ShardGeneration>,
+    format_floor: Option<u32>,
     refreshed_at_ns: i64,
     last_touched_ns: i64,
+}
+
+/// What one read of a tenant's provisioning record gives the switch: the
+/// generation history routing uses and the format floor for the router's
+/// family (`None`: no floor recorded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisioningView {
+    pub(crate) generations: Vec<ShardGeneration>,
+    pub(crate) format_floor: Option<u32>,
+}
+
+/// The format-floor check a flush makes at flush open (ADR-1746 decision 4),
+/// on the record the switch cached for routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloorCheck {
+    /// No floor, or the object is at or above it.
+    Write,
+    /// Below the floor, written under `--write-below-format-floor`; counted.
+    WriteBelow(BelowFormatFloor),
+    /// Below the floor and refused; counted.
+    Refuse(BelowFormatFloor),
+    /// The switch holds no view of the tenant's record to read a floor from.
+    NoView,
 }
 
 /// The outcome of consulting the cache for a tenant's write ([`GenerationSwitch::route_cached`]).
@@ -266,6 +296,10 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     /// Re-read the tenant's provisioning record, joining a read already in
     /// flight. Resolves `true` once a read succeeded and its view is installed.
     fn reread(&self, tenant: TenantHash) -> Reread;
+    /// The format-floor check of a flush about to publish a `family` object at
+    /// version `writing` for `tenant`, against the floor of the cached view
+    /// (ADR-1746 decision 4). Counts a refusal or an overridden write.
+    fn floor_check(&self, tenant: TenantHash, family: FormatFamily, writing: u32) -> FloorCheck;
 }
 
 /// A hand-back send that did not deliver, with the message it returns.
@@ -418,6 +452,13 @@ where
             None => Box::pin(std::future::ready(false)),
         }
     }
+
+    fn floor_check(&self, tenant: TenantHash, family: FormatFamily, writing: u32) -> FloorCheck {
+        match self.switch.upgrade() {
+            Some(switch) => switch.floor_check(tenant, family, writing),
+            None => FloorCheck::NoView,
+        }
+    }
 }
 
 /// A [`FlushScope`] that finds every flush inside the scan set, for unit tests
@@ -441,6 +482,10 @@ impl<M> FlushScope<M> for AlwaysInScope {
 
     fn reread(&self, _tenant: TenantHash) -> Reread {
         Box::pin(std::future::ready(true))
+    }
+
+    fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
+        FloorCheck::Write
     }
 }
 
@@ -628,6 +673,10 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
     fn reread(&self, _tenant: TenantHash) -> Reread {
         Box::pin(std::future::ready(false))
     }
+
+    fn floor_check(&self, _tenant: TenantHash, _family: FormatFamily, _writing: u32) -> FloorCheck {
+        FloorCheck::Write
+    }
 }
 
 /// Where the switch re-reads a tenant's provisioning record when a flush finds
@@ -681,6 +730,9 @@ pub struct GenerationSwitch<H> {
     /// record. `None` only for a switch built without one (unit tests), whose
     /// untrusted views stay untrusted until the router refreshes them.
     refresh_source: Option<RefreshSource>,
+    /// What a flush below a tenant's format floor does (ADR-1746 decisions 4
+    /// and 5). Set once at startup by the router's `with_format_floor_policy`.
+    floor_policy: RwLock<FormatFloorPolicy>,
 }
 
 impl<H> GenerationSwitch<H> {
@@ -704,6 +756,43 @@ impl<H> GenerationSwitch<H> {
             factory: Box::new(factory),
             refresh_interval_ns,
             refresh_source: None,
+            floor_policy: RwLock::new(FormatFloorPolicy::default()),
+        }
+    }
+
+    /// Replace the format-floor policy every flush of this router's shards
+    /// checks with, existing actors included.
+    pub(crate) fn set_floor_policy(&self, policy: FormatFloorPolicy) {
+        *self
+            .floor_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    }
+
+    /// The format-floor check of a flush (ADR-1746 decision 4): the floor of
+    /// `tenant`'s cached view, whatever its age, against `writing`. A view
+    /// past its refresh horizon still answers: floors are only raised, so its
+    /// floor is at most the record's. [`FloorCheck::NoView`] when no view is
+    /// cached; the caller does not open the flush on it outside a teardown.
+    pub(crate) fn floor_check(
+        &self,
+        tenant: TenantHash,
+        family: FormatFamily,
+        writing: u32,
+    ) -> FloorCheck {
+        let floor = match self.lock().views.get(&tenant) {
+            Some(view) => view.format_floor,
+            None => return FloorCheck::NoView,
+        };
+        let policy = self
+            .floor_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match policy.admit(family, floor, writing) {
+            Ok(FloorAdmission::AtOrAboveFloor) => FloorCheck::Write,
+            Ok(FloorAdmission::BelowFloorOverridden(below)) => FloorCheck::WriteBelow(below),
+            Err(refused) => FloorCheck::Refuse(refused),
         }
     }
 
@@ -834,13 +923,42 @@ impl<H> GenerationSwitch<H> {
     /// background refresher. An empty history is ignored (the caller passes the
     /// normalized, never-empty history [`ravel_catalog::read_generations`]
     /// returns) and falls back to the default view.
+    ///
+    /// A history carries no format floor, so the tenant's cached floor is kept
+    /// ([`Self::refresh_view`] installs one read with the record).
     pub fn refresh(
         &self,
         tenant: TenantHash,
         generations: Vec<ShardGeneration>,
         now_ns: i64,
     ) -> Arc<Vec<H>> {
+        self.refresh_view(
+            tenant,
+            ProvisioningView {
+                generations,
+                format_floor: None,
+            },
+            now_ns,
+        )
+    }
+
+    /// [`Self::refresh`] with the format floor read from the same record. The
+    /// cached floor becomes the higher of the cached and the read one.
+    pub(crate) fn refresh_view(
+        &self,
+        tenant: TenantHash,
+        view: ProvisioningView,
+        now_ns: i64,
+    ) -> Arc<Vec<H>> {
+        let ProvisioningView {
+            generations,
+            format_floor,
+        } = view;
         let mut inner = self.lock();
+        let format_floor = inner
+            .views
+            .get(&tenant)
+            .map_or(format_floor, |cached| cached.format_floor.max(format_floor));
         let generations = if generations.is_empty() {
             vec![ShardGeneration {
                 generation: 0,
@@ -857,6 +975,7 @@ impl<H> GenerationSwitch<H> {
             tenant,
             TenantView {
                 generations,
+                format_floor,
                 refreshed_at_ns: now_ns,
                 last_touched_ns: now_ns,
             },
@@ -1072,13 +1191,13 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
         let switch = Arc::downgrade(self);
         tokio::spawn(async move {
             let issued_ns = clock.now_ns();
-            let loaded = load_generations(store.as_ref(), signal, &tenant, default_count).await;
+            let loaded = load_view(store.as_ref(), signal, &tenant, default_count).await;
             let installed = loaded.is_ok();
             if let Some(switch) = switch.upgrade() {
                 let mut inner = switch.lock();
                 inner.refreshing.remove(&tenant);
-                if let Ok(generations) = loaded {
-                    install_if_newer(&mut inner.views, tenant, generations, issued_ns);
+                if let Ok(view) = loaded {
+                    install_if_newer(&mut inner.views, tenant, view, issued_ns);
                 }
             }
             done_tx.send_replace(Some(installed));
@@ -1090,19 +1209,29 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
 /// Install a re-read view unless the cache already holds one refreshed at or
 /// after `refreshed_at_ns`: a router write may have refreshed the tenant while
 /// the background read was in flight.
+///
+/// The view's format floor is merged in either way: floors are only raised,
+/// so the higher floor is the current one whichever read saw it.
 fn install_if_newer(
     views: &mut HashMap<TenantHash, TenantView>,
     tenant: TenantHash,
-    generations: Vec<ShardGeneration>,
+    read: ProvisioningView,
     refreshed_at_ns: i64,
 ) {
+    let ProvisioningView {
+        generations,
+        format_floor,
+    } = read;
     if generations.is_empty() {
         return;
     }
     match views.get_mut(&tenant) {
-        Some(view) if view.refreshed_at_ns >= refreshed_at_ns => {}
+        Some(view) if view.refreshed_at_ns >= refreshed_at_ns => {
+            view.format_floor = view.format_floor.max(format_floor);
+        }
         Some(view) => {
             view.generations = generations;
+            view.format_floor = view.format_floor.max(format_floor);
             view.refreshed_at_ns = refreshed_at_ns;
         }
         None => {
@@ -1110,6 +1239,7 @@ fn install_if_newer(
                 tenant,
                 TenantView {
                     generations,
+                    format_floor,
                     refreshed_at_ns,
                     last_touched_ns: refreshed_at_ns,
                 },
@@ -1129,25 +1259,58 @@ fn install_if_newer(
 /// [`read_generations`] directly, because this path reads the record straight
 /// off the store rather than through [`ravel_catalog::validate_or_adopt`],
 /// which is where that guard normally lives.
+#[cfg(test)]
 pub(crate) async fn load_generations(
     store: &dyn ObjectStoreBackend,
     signal: Signal,
     tenant: &TenantHash,
     default_count: u32,
 ) -> Result<Vec<ShardGeneration>, GenerationLoadError> {
+    load_view(store, signal, tenant, default_count)
+        .await
+        .map(|view| view.generations)
+}
+
+/// [`load_generations`], also returning the record's format floor for
+/// `signal`'s format family from the same GET (ADR-1746 decision 4). A floor
+/// history that fails [`read_floors_checked`] fails the read closed like a
+/// corrupt generation history: a flush cannot honour a floor it cannot read.
+/// An absent record has no floor.
+pub(crate) async fn load_view(
+    store: &dyn ObjectStoreBackend,
+    signal: Signal,
+    tenant: &TenantHash,
+    default_count: u32,
+) -> Result<ProvisioningView, GenerationLoadError> {
     let key = provisioning_key(tenant, signal);
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
             let record = sysproto::ProvisioningRecord::decode(outcome.data.as_ref())
                 .map_err(|_| GenerationLoadError)?;
-            read_generations_checked(&record, &key, tenant, signal).map_err(|_| GenerationLoadError)
+            let generations = read_generations_checked(&record, &key, tenant, signal)
+                .map_err(|_| GenerationLoadError)?;
+            let format_floor = match FormatFamily::for_signal(signal) {
+                Some(family) => {
+                    let floors = read_floors_checked(&record, &key, tenant, signal)
+                        .map_err(|_| GenerationLoadError)?;
+                    current_floor(&floors, family.as_str())
+                }
+                None => None,
+            };
+            Ok(ProvisioningView {
+                generations,
+                format_floor,
+            })
         }
-        Err(StoreError::NotFound) => Ok(vec![ShardGeneration {
-            generation: 0,
-            shard_count: default_count,
-            activation_hour: 0,
-            appended_unix_ns: 0,
-        }]),
+        Err(StoreError::NotFound) => Ok(ProvisioningView {
+            generations: vec![ShardGeneration {
+                generation: 0,
+                shard_count: default_count,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floor: None,
+        }),
         Err(_) => Err(GenerationLoadError),
     }
 }

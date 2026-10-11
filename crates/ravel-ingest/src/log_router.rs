@@ -26,9 +26,10 @@ use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    load_generations,
+    load_view,
 };
 use crate::indexed_fields::IndexedFieldsOverlay;
+use crate::format_floor::FormatFloorPolicy;
 use crate::log_error::LogWriteError;
 use crate::log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 use crate::log_shard::{LogShardActor, LogShardMsg, est_columnar_bytes, est_record_bytes};
@@ -365,6 +366,15 @@ impl LogIngestRouter {
         self
     }
 
+    /// Sets what a flush below a tenant's recorded RLOG format floor does
+    /// (ADR-1746 decisions 4 and 5); the log counterpart of
+    /// [`crate::IngestRouter::with_format_floor_policy`].
+    #[must_use]
+    pub fn with_format_floor_policy(self, policy: FormatFloorPolicy) -> Self {
+        self.switch.set_floor_policy(policy);
+        self
+    }
+
     pub fn metrics(&self) -> &LogIngestMetrics {
         &self.metrics
     }
@@ -415,7 +425,7 @@ impl LogIngestRouter {
         match self.switch.route_cached(tenant, now_ns) {
             Routed::Fresh(set) => Ok(set),
             Routed::Stale => {
-                match load_generations(
+                match load_view(
                     self.store.as_ref(),
                     ravel_types::Signal::Logs,
                     &tenant,
@@ -423,7 +433,7 @@ impl LogIngestRouter {
                 )
                 .await
                 {
-                    Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
+                    Ok(view) => Ok(self.switch.refresh_view(tenant, view, now_ns)),
                     Err(_) => match self.switch.try_grace_extend(tenant, now_ns) {
                         Some(set) => {
                             self.metrics.record_grace_extended_stale_flush();

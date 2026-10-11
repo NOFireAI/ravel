@@ -104,6 +104,12 @@ pub enum LogWriteError {
     /// HTTP 429 with `Retry-After` / gRPC `RESOURCE_EXHAUSTED`.
     #[error("ingest shard flush deferral cap reached")]
     DeferralCapReached,
+    /// The log flush would have published an object below the tenant's
+    /// recorded format floor for its family (ADR-1746 decision 4); the
+    /// counterpart of [`crate::WriteError::BelowFormatFloor`]. Refused at flush
+    /// open, before any store call, with its records dropped. Retryable.
+    #[error(transparent)]
+    BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`LogIngestRouter::write`](crate::LogIngestRouter::write) call
@@ -144,7 +150,8 @@ impl LogWriteError {
             | LogWriteError::StaleProvisioningView
             | LogWriteError::BufferBudgetExceeded
             | LogWriteError::PendingAckLimitReached
-            | LogWriteError::DeferralCapReached => true,
+            | LogWriteError::DeferralCapReached
+            | LogWriteError::BelowFormatFloor(_) => true,
             LogWriteError::SegmentBuild(_)
             | LogWriteError::StreamIdCollision(_)
             | LogWriteError::MixedBufferRepresentation(_) => false,
