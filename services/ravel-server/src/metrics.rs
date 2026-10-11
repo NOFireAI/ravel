@@ -11,11 +11,11 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-one label keys, twenty-two in a `sql` build:
+//! renders exactly twenty-two label keys, twenty-three in a `sql` build:
 //! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
 //! `level`, `reason`, `shard`, `cache`, `tier`, `kind`, `outcome`,
-//! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`, and
-//! `worker`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`,
+//! `worker`, and `family`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -32,10 +32,11 @@
 //! into their `Pinned` and `Resolve` classes, `carrier` added by
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
-//! decision 11 for the CPU gate and tokio runtime families, and `phase` added
+//! decision 11 for the CPU gate and tokio runtime families, `family` added by
+//! ADR-1746 for the format-floor families, and `phase` added
 //! by issue #2374 for the SQL DDL store-cost families). The keys come from
-//! twenty-nine `Label` variants, thirty-two in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and thirty-three in a `flight-sql` build,
+//! thirty-four `Label` variants, thirty-seven in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and thirty-eight in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
@@ -419,6 +420,10 @@ pub enum Label {
     /// `admission`, `reserve` or `grow`. Shares the `site` key with
     /// [`Label::ReadGateSite`].
     MemoryRefusalSite(MemoryRefusalSite),
+    /// Which format family a `ravel_format_floor_*` sample counts (ADR-1746):
+    /// `rseg`, `rlog` or `rspan`. A closed enum owned by `ravel_ingest`, which
+    /// also owns the spelling the provisioning record's floors use.
+    FormatFamily(ravel_ingest::FormatFamily),
 }
 
 /// The closed `site` set of `ravel_memory_gate_refusals_total` and
@@ -626,6 +631,7 @@ impl Label {
             Label::WriteGateSite(_) => "site",
             Label::RuntimeWorker(_) => "worker",
             Label::MemoryRefusalSite(_) => "site",
+            Label::FormatFamily(_) => "family",
         }
     }
 
@@ -672,6 +678,7 @@ impl Label {
             Label::WriteGateSite(site) => ravel_cpu_gate::GateSite::name(*site).to_string(),
             Label::RuntimeWorker(index) => index.to_string(),
             Label::MemoryRefusalSite(site) => site.name().to_string(),
+            Label::FormatFamily(family) => family.as_str().to_string(),
         }
     }
 
@@ -3633,6 +3640,61 @@ fn render_provisioning_family(
         &[Label::Mode(mode)],
         shard_count_drifts,
     );
+}
+
+/// The ADR-1746 writer-policy family, one sample per format family under
+/// `{mode, family}`: the startup gauge of buckets whose recorded floor is
+/// above what this build writes, publishes refused below a floor, and
+/// publishes written below one under `--write-below-format-floor`. Read from
+/// the process-wide [`ravel_ingest::format_floor_metrics`], which every
+/// writer role in the process counts into; zero in a mode that writes nothing.
+fn render_format_floor_family(
+    out: &mut String,
+    mode: Mode,
+    families: &[ravel_ingest::FormatFloorFamilySnapshot],
+) {
+    write_header(
+        out,
+        "ravel_format_floor_above_writer",
+        "(tenant, signal) buckets the startup check found with a recorded format floor above the newest version this build writes, by format family (ADR-1746 decision 3). Set once at startup for the statically-known tenants.",
+        "gauge",
+    );
+    for f in families {
+        write_sample(
+            out,
+            "ravel_format_floor_above_writer",
+            &[Label::Mode(mode), Label::FormatFamily(f.family)],
+            f.above_writer,
+        );
+    }
+    write_header(
+        out,
+        "ravel_format_floor_refused_total",
+        "Publishes refused because the object's format version is below the bucket's recorded floor for its family: ingest flushes and maintenance compactions, erasure rewrites and migrations (ADR-1746 decision 4).",
+        "counter",
+    );
+    for f in families {
+        write_sample(
+            out,
+            "ravel_format_floor_refused_total",
+            &[Label::Mode(mode), Label::FormatFamily(f.family)],
+            f.refused,
+        );
+    }
+    write_header(
+        out,
+        "ravel_format_floor_writes_below_total",
+        "Publishes written below the bucket's recorded format floor under --write-below-format-floor, each one contradicting the floor (ADR-1746 decision 5).",
+        "counter",
+    );
+    for f in families {
+        write_sample(
+            out,
+            "ravel_format_floor_writes_below_total",
+            &[Label::Mode(mode), Label::FormatFamily(f.family)],
+            f.writes_below,
+        );
+    }
 }
 
 /// Store-reachability probe family (ADR-0050 section 7, EC7; issue #1728):
@@ -7783,6 +7845,11 @@ pub fn render(
         crate::provisioning::shard_count_mismatch_count(),
         ravel_catalog::shard_count_drift_count(),
     );
+    render_format_floor_family(
+        &mut out,
+        mode,
+        &ravel_ingest::format_floor_metrics().snapshot(),
+    );
     render_store_probe_family(
         &mut out,
         mode,
@@ -8768,7 +8835,8 @@ mod tests {
         // ADR-0873 decision 2 to split the declared-statistics drop tally
         // across its four carriers; `gate`, `site` and `worker` are the
         // nineteenth to twenty-first, added by ADR-1702 decision 11 for the
-        // CPU gate and tokio runtime families. The list is the variants every
+        // CPU gate and tokio runtime families; `family` is the twenty-second,
+        // added by ADR-1746 for the format-floor families. The list is the variants every
         // build has: the `sql`-only `DdlKind`, `DdlOutcome` and `DdlPhase`
         // (issue #2374, which add the `phase` key and reuse `kind` and
         // `outcome`) and the `flight-sql`-only `SliceRejectReason` are not in
@@ -8811,6 +8879,7 @@ mod tests {
             Label::WriteGateSite(ravel_cpu_gate::WriteSite::MetricsFlush),
             Label::RuntimeWorker(0),
             Label::MemoryRefusalSite(MemoryRefusalSite::Reserve),
+            Label::FormatFamily(ravel_ingest::FormatFamily::Rseg),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -8860,6 +8929,7 @@ mod tests {
                 Label::WriteGateSite(_) => "site",
                 Label::RuntimeWorker(_) => "worker",
                 Label::MemoryRefusalSite(_) => "site",
+                Label::FormatFamily(_) => "family",
             })
             .collect();
         assert_eq!(
@@ -8924,6 +8994,9 @@ mod tests {
                 "worker",
                 // MemoryRefusalSite (ADR-2633 section 4) reuses the `site` key.
                 "site",
+                // FormatFamily (ADR-1746) is the twenty-second key, for the
+                // format-floor families.
+                "family",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -8931,19 +9004,19 @@ mod tests {
              label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
-             ADR-1702 decision 11's `gate`/`site`/`worker`, and issue #1686's `level` reuse by \
-             `ScrubLevel`"
+             ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, and issue \
+             #1686's `level` reuse by `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            33,
-            "exactly 33 label variants every build has, 21 distinct keys (sql adds DdlKind, \
+            34,
+            "exactly 34 label variants every build has, 22 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            21,
-            "exactly 21 distinct keys"
+            22,
+            "exactly 22 distinct keys"
         );
     }
 
