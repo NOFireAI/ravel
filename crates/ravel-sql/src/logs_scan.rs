@@ -5192,6 +5192,14 @@ impl LogScanStream {
 
     /// Shrink [`Self::str_values_charge`] to `live` when the cache's live
     /// entries have fallen below it.
+    ///
+    /// The batch handed out last keeps only its own keys charged, in
+    /// [`Self::emitted`], until the next emit. Its values can lose their charge
+    /// before that: a base values array here once the reader has moved past
+    /// its row group, a plain page's values in [`Self::release_block`]. The gap
+    /// is at most one values array per dictionary column of that one batch,
+    /// and it closes at the next emit, which releases the batch's charge in
+    /// any case.
     fn release_dead_str_values(&mut self, live: usize) {
         if live < self.str_values_charge {
             self.reservation.shrink(self.str_values_charge - live);
@@ -5215,12 +5223,15 @@ impl LogScanStream {
         }
     }
 
-    /// Drop the drained block's records or batches and release their charge.
+    /// Drop the drained block's records or batches and release their charge,
+    /// with the charge of every cached values array no batch reads any more.
     /// The columnar cursor's decoded block stays charged in
     /// [`Self::resident`] until the next decode replaces it.
     fn release_block(&mut self) {
         self.reservation.shrink(std::mem::take(&mut self.held));
         self.pending = Pending::None;
+        let live = lock_str_values(&self.str_values).live_bytes();
+        self.release_dead_str_values(live);
     }
 
     /// The scan the state holds reported exhaustion: publish its final
@@ -6394,7 +6405,13 @@ impl<'a> StrCursor<'a> {
 /// row group dictionary becomes one `StringArray` however many of its blocks
 /// and chunks read it, and every chunk's `DictionaryArray` shares that array.
 /// An entry is dropped once the cache holds the last reference to its
-/// dictionary: the reader has moved past its row group.
+/// dictionary: the reader has moved past its row group. An extended array
+/// (the base with fallback values appended) is dropped then too, or as soon
+/// as the cache holds its last reference: no batch reads it any more.
+///
+/// So at each [`Self::live_bytes`] call the cache holds, per dictionary still
+/// being read, its base values plus one extended array per distinct sorted
+/// fallback value list that a live batch or a block being built still reads.
 struct StrValuesCache {
     entries: Vec<SharedStrValues>,
     /// [`BlockMetrics::str_dict_values_built`].
@@ -6404,8 +6421,9 @@ struct StrValuesCache {
 struct SharedStrValues {
     dict: Arc<DictValues>,
     values: ArrayRef,
-    /// The values with one block's resource/scope fallback values appended
-    /// past them, keyed by those values in order.
+    /// The values with a block's resource/scope fallback values appended past
+    /// them, keyed by those values sorted and deduplicated
+    /// ([`canonical_fallbacks`]).
     extended: Vec<(Vec<String>, ArrayRef)>,
 }
 
@@ -6449,6 +6467,9 @@ impl StrValuesCache {
 
     fn retain_live(&mut self) {
         self.entries.retain(|e| Arc::strong_count(&e.dict) > 1);
+        for entry in &mut self.entries {
+            entry.extended.retain(|(_, v)| Arc::strong_count(v) > 1);
+        }
     }
 
     /// The Arrow bytes of every array the live entries hold, after dropping
@@ -7099,8 +7120,9 @@ fn chunk_keys(keys: &Int32Array, start: usize, end: usize) -> Int32Array {
 ///   row order, each validated once, so their keys are the identity.
 ///
 /// A row the record does not set reads the resource/scope fallback, whose
-/// value is appended past the record's values once per distinct stream in the
-/// block.
+/// value is appended past the record's values: on a plain page once per
+/// distinct stream in the block, on a dictionary page once per distinct value,
+/// sorted ([`canonical_fallbacks`]).
 fn build_str_block(
     view: &ColumnarBlockView<'_>,
     resolver: &mut DeclaredResolver<'_, '_, '_>,
@@ -7136,11 +7158,23 @@ fn build_str_block(
                 };
                 let key = match record {
                     Some(key) => key,
-                    None => fallbacks.slot(view, resolver, cache, i)?.map(|s| base + s),
+                    // A placeholder below zero until the fallback values are
+                    // all known: fallback slot `s` is key `-1 - s`.
+                    None => fallbacks.slot(view, resolver, cache, i)?.map(|s| -1 - s),
                 };
                 push_key(&mut keys, &mut nulls, key);
             }
-            lock_str_values(&resolver.str_values).values(shared, fallbacks.values)
+            let (extra, slots) = canonical_fallbacks(fallbacks.values)?;
+            for k in keys.iter_mut().filter(|k| **k < 0) {
+                let slot = usize::try_from(-1 - *k)
+                    .ok()
+                    .and_then(|s| slots.get(s).copied())
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("declared Str fallback slot out of range".into())
+                    })?;
+                *k = base + slot;
+            }
+            lock_str_values(&resolver.str_values).values(shared, extra)
         }
         None => {
             let mut texts: Vec<&str> = Vec::with_capacity(n);
@@ -7195,6 +7229,21 @@ fn push_key(keys: &mut Vec<i32>, nulls: &mut NullBufferBuilder, key: Option<i32>
 fn str_key(at: usize) -> DFResult<i32> {
     i32::try_from(at)
         .map_err(|_| DataFusionError::Internal("declared Str values exceed i32 keys".into()))
+}
+
+/// `values` sorted and deduplicated, and each input slot's index in that
+/// list. Blocks of one dictionary that show the same fallback values, from
+/// whichever streams in whichever order, then key one [`StrValuesCache`]
+/// extended array.
+fn canonical_fallbacks(values: Vec<String>) -> DFResult<(Vec<String>, Vec<i32>)> {
+    let mut sorted = values.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let slots = values
+        .iter()
+        .map(|v| str_key(sorted.partition_point(|s| s < v)))
+        .collect::<DFResult<_>>()?;
+    Ok((sorted, slots))
 }
 
 /// The resource/scope `Str` fallback values one block's declared `Str` column
@@ -8821,6 +8870,196 @@ mod columnar_lookup_tests {
             2,
             "values built once per dictionary, not per block or chunk"
         );
+    }
+
+    /// The resource `k` of each fallback stream of [`fallback_order_records`]:
+    /// blocks 0 to 2 show `ra` and `rb` in the orders ab, ba, ab, block 3 shows
+    /// `rc` then `ra`.
+    const FALLBACK_K: [&str; 8] = ["ra", "rb", "rb", "ra", "ra", "rb", "rc", "ra"];
+    const FALLBACK_BLOCK_ROWS: usize = 64;
+
+    /// One row group of four 64-row blocks, two streams per block (the writer
+    /// orders rows by stream). Every fourth row of a stream sets no `k` and
+    /// reads its stream's resource `k`; the rest read the group dictionary.
+    fn fallback_order_records() -> Vec<LogRecord> {
+        let per_stream = FALLBACK_BLOCK_ROWS / 2;
+        (0..FALLBACK_K.len())
+            .flat_map(|s| {
+                (0..per_stream).map(move |j| {
+                    let stream = u8::try_from(s + 1).expect("stream");
+                    let ts = i64::try_from(s * 1000 + j).expect("ts");
+                    let resource = [("k", AttrValue::Str(FALLBACK_K[s].into()))];
+                    let own = AttrValue::Str(format!("v{:02}", j % 12));
+                    if j % 4 == 3 {
+                        rec(stream, ts, &resource, &[])
+                    } else {
+                        rec(stream, ts, &resource, &[("k", own)])
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Per block of [`fallback_order_records`], the cache's live extended
+    /// array count and live bytes (what `hold_batches` charges) while the
+    /// block's chunks are alive and, when `retain` is false, after they drop
+    /// (what `release_block` charges). Also returns the base values bytes,
+    /// each block's extended values bytes, and the values-built count.
+    #[allow(clippy::type_complexity)]
+    fn fallback_order_charges(
+        retain: bool,
+    ) -> (
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+        usize,
+        Vec<usize>,
+        usize,
+    ) {
+        let cfg = RlogConfig {
+            block_target_records: FALLBACK_BLOCK_ROWS,
+            max_dynamic_columns: 8,
+            group_target_blocks: 4,
+            ..RlogConfig::default()
+        };
+        let records = fallback_order_records();
+        let dc = DeclaredColumn::new("k", DeclaredType::Str);
+        let mut obj = Vec::new();
+        let reader = write_and_scan(&records, &cfg, &mut obj);
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let shared = Arc::new(std::sync::Mutex::new(StrValuesCache::new(Count::new())));
+        let live = |cache: &SharedStrValuesCache| {
+            let mut cache = lock_str_values(cache);
+            let bytes = cache.live_bytes();
+            let extended = cache.entries.iter().map(|e| e.extended.len()).sum();
+            (extended, bytes)
+        };
+        let mut group: Option<Arc<DictValues>> = None;
+        let (mut held, mut released, mut extended_bytes) = (Vec::new(), Vec::new(), Vec::new());
+        let mut retained: Vec<ArrayRef> = Vec::new();
+        let mut row = 0;
+        while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
+            let block = held.len();
+            let rows = view.surviving_count();
+            assert_eq!(rows, FALLBACK_BLOCK_ROWS, "block {block}: rows");
+            let plan = DeclaredPlan::build(&view, &dc);
+            let Some(DeclaredCursor::Str(StrCursor {
+                dict: Some(page), ..
+            })) = plan.matching_cursor()
+            else {
+                panic!("block {block}: `k` reads a dictionary page");
+            };
+            match &group {
+                Some(d) => assert!(
+                    Arc::ptr_eq(d, page.values()),
+                    "block {block}: one row group dictionary"
+                ),
+                None => group = Some(Arc::clone(page.values())),
+            }
+            let mut resolver = DeclaredResolver::with_str_values(&plan, Arc::clone(&shared));
+            let mut cache = HashMap::new();
+            let chunks: Vec<ArrayRef> = [(0, rows / 2), (rows / 2, rows)]
+                .into_iter()
+                .map(|(start, end)| {
+                    build_declared_columnar_array(&view, &mut resolver, start, end, &mut cache)
+                        .expect("declared Str chunk")
+                })
+                .collect();
+            // The block job ends here: its resolver, which keeps the block's
+            // values for its chunks, drops before `hold_batches` charges them.
+            drop(resolver);
+            for chunk in &chunks {
+                for cell in declared_cells(chunk, DeclaredType::Str) {
+                    let r = &records[row];
+                    let want = match r.attrs.first() {
+                        Some((_, AttrValue::Str(s))) => s.clone(),
+                        _ => FALLBACK_K[row / (FALLBACK_BLOCK_ROWS / 2)].to_string(),
+                    };
+                    assert_eq!(cell.as_deref(), Some(want.as_str()), "row {row}");
+                    row += 1;
+                }
+            }
+            let values = Arc::clone(
+                datafusion::arrow::array::AsArray::as_any_dictionary(&chunks[0]).values(),
+            );
+            assert_eq!(
+                values.len(),
+                page.values().len() + 2,
+                "block {block}: the group dictionary plus two distinct fallback values"
+            );
+            extended_bytes.push(values.get_array_memory_size());
+            drop(values);
+            held.push(live(&shared));
+            if retain {
+                retained.extend(chunks);
+            } else {
+                drop(chunks);
+                released.push(live(&shared));
+            }
+        }
+        assert_eq!(held.len(), 4, "four blocks");
+        let base = {
+            let cache = lock_str_values(&shared);
+            assert_eq!(cache.entries.len(), 1, "one dictionary");
+            cache.entries[0].values.get_array_memory_size()
+        };
+        let built = lock_str_values(&shared).built.value();
+        (held, released, base, extended_bytes, built)
+    }
+
+    /// ADR-2773 D3's live bound for extended values: a dictionary's cache
+    /// holds its base values plus one extended array per distinct sorted
+    /// fallback value list that a live batch still reads.
+    ///
+    /// Blocks 0 to 2 show the same fallback values in the orders ab, ba, ab and
+    /// block 3 a different pair. With every block's chunks retained (a
+    /// consumer that buffers them), blocks 0 to 2 share one extended array and
+    /// block 3 adds the second: 1, 1, 1, 2 live. With each block's chunks
+    /// dropped before the next block, one is live while a block is held and
+    /// none once it drops, and the charge falls back to the base values.
+    ///
+    /// Flipped: keying the extended arrays by first-appearance order holds 1,
+    /// 2, 2, 3 in both runs; without dropping unreferenced extended arrays the
+    /// dropped run releases nothing until the row group ends.
+    #[test]
+    fn extended_str_values_live_while_a_batch_reads_them() {
+        let (held, released, base, ext, built) = fallback_order_charges(true);
+        assert!(released.is_empty());
+        assert_eq!(ext[0], ext[1], "the two value pairs are the same width");
+        assert_eq!(ext[0], ext[3], "the two value pairs are the same width");
+        assert_eq!(
+            held,
+            vec![
+                (1, base + ext[0]),
+                (1, base + ext[0]),
+                (1, base + ext[0]),
+                (2, base + ext[0] + ext[3]),
+            ],
+            "retained: (live extended arrays, live bytes) per block"
+        );
+        assert_eq!(built, 3, "the base and one extended array per value set");
+        for (block, (live, bytes)) in held.iter().enumerate() {
+            let distinct = if block < 3 { 1 } else { 2 };
+            assert!(
+                *live <= distinct && *bytes <= base + distinct * ext[0],
+                "block {block}: within one base plus one extended array per \
+                 distinct value set still read"
+            );
+        }
+
+        let (held, released, base, ext, built) = fallback_order_charges(false);
+        assert_eq!(
+            held,
+            ext.iter().map(|e| (1, base + e)).collect::<Vec<_>>(),
+            "dropped: (live extended arrays, live bytes) while each block is held"
+        );
+        assert_eq!(
+            released,
+            vec![(0, base); 4],
+            "dropped: (live extended arrays, live bytes) once each block drops"
+        );
+        assert_eq!(built, 5, "the base, and the extended array again per block");
     }
 }
 
