@@ -2,8 +2,11 @@
 //! reads a trace by range and is fronted by the process read cache (issue
 //! #2754): a `trace_id` lookup over `POST /api/v1/sql` issues only ranged GETs
 //! against the RSPAN object, never a whole-object read, and the identical
-//! second lookup issues no data GET at all, its scan phase reporting cache
-//! hits for exactly the bytes the first lookup fetched.
+//! second lookup issues no data GET at all. `stats.phases` splits both by the
+//! phase that issued each read: the plan phase carries the tail probe and any
+//! footer or section read past the BLOCKS section, the scan phase carries the
+//! block-run GETs, and the second lookup's cache hits and served bytes split
+//! the same way.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -65,6 +68,14 @@ impl RecordingStore {
         let (mine, rest): (Vec<_>, Vec<_>) = gets.drain(..).partition(|(k, _)| k == key);
         *gets = rest;
         mine.into_iter().map(|(_, range)| range).collect()
+    }
+
+    /// How many GETs were issued since the last call, on any key, draining them.
+    fn take_all(&self) -> u64 {
+        let mut gets = self.gets.lock().expect("get log");
+        let n = gets.len() as u64;
+        gets.clear();
+        n
     }
 }
 
@@ -138,8 +149,12 @@ fn span(trace: u8, n: u8) -> ravel_rspan::SpanRecord {
 }
 
 /// Publishes one RSPAN object of [`TRACES`] traces, one trace per block, and
-/// returns its data key and size.
-async fn publish_span_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> (String, u64) {
+/// returns its data key, its size, and where its block data ends (the offset
+/// of its first section).
+async fn publish_span_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+) -> (String, u64, u64) {
     let tenant_hash = tenant.hash();
     let writer_id = Uuid::from_u128(2_754);
     let identity = ravel_rspan::ObjectIdentity {
@@ -167,6 +182,11 @@ async fn publish_span_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId)
     let bytes = writer.finish().expect("finish rspan object");
     let size = bytes.len() as u64;
     let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+    let blocks = *ravel_rspan::open(&bytes)
+        .expect("decode footer")
+        .section(ravel_rspan::footer::kind::BLOCKS)
+        .expect("the object carries a BLOCKS section");
+    let data_end = blocks.offset + blocks.len;
 
     let rec = record::build(NewCommitRecord {
         tenant_hash,
@@ -197,7 +217,7 @@ async fn publish_span_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId)
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish span commit");
-    (data_key, size)
+    (data_key, size, data_end)
 }
 
 async fn post_sql(app: &Router, query: &str) -> (StatusCode, Value) {
@@ -232,16 +252,16 @@ async fn post_sql(app: &Router, query: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
-/// The `stats.phases` entry for the scan phase, as `u64` fields.
-fn scan_phase(value: &Value, field: &str) -> u64 {
+/// Field `field` of the `stats.phases` entry for phase `name`, as a `u64`.
+fn phase(value: &Value, name: &str, field: &str) -> u64 {
     value["stats"]["phases"]
         .as_array()
         .expect("phases")
         .iter()
-        .find(|phase| phase["phase"] == "scan")
-        .unwrap_or_else(|| panic!("no scan phase in {value}"))[field]
+        .find(|phase| phase["phase"] == name)
+        .unwrap_or_else(|| panic!("no {name} phase in {value}"))[field]
         .as_u64()
-        .unwrap_or_else(|| panic!("scan.{field} is a u64 in {value}"))
+        .unwrap_or_else(|| panic!("{name}.{field} is a u64 in {value}"))
 }
 
 #[tokio::test]
@@ -252,7 +272,7 @@ async fn spans_warm_trace_lookup_is_cache_served() {
     });
     let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
     let tenant = TenantId::new("acme");
-    let (data_key, size) = publish_span_segment(store.as_ref(), &tenant).await;
+    let (data_key, size, data_end) = publish_span_segment(store.as_ref(), &tenant).await;
     let probe = ravel_query::span_fetcher::DEFAULT_TRACE_PROBE_BYTES;
     assert!(
         size > 2 * probe,
@@ -310,11 +330,11 @@ async fn spans_warm_trace_lookup_is_cache_served() {
     assert_eq!(status, StatusCode::OK, "cold lookup failed: {cold}");
     assert_eq!(cold["data"]["rows"], want_rows, "{cold}");
     let cold_gets = recorder.take(&data_key);
+    let cold_catalog_gets = recorder.take_all();
     assert!(
         cold_gets.len() >= 2,
         "the tail probe and the trace's block run: {cold_gets:?}"
     );
-    let mut cold_bytes = 0;
     for range in &cold_gets {
         let GetRange::Range(start, end) = *range else {
             panic!("a trace lookup reads by range only, got {range:?} in {cold_gets:?}");
@@ -323,36 +343,89 @@ async fn spans_warm_trace_lookup_is_cache_served() {
             end - start < size,
             "no GET covers the whole object: {range:?} of {size}"
         );
-        cold_bytes += end - start;
     }
     assert!(
         cold_gets.contains(&GetRange::Range(size - probe, size)),
         "the first GET is the 64 KiB tail probe: {cold_gets:?}"
     );
+    // A block-run GET lies inside the BLOCKS section; the probe, a footer
+    // chase, and a SKIP_IDX or BLOOM read all reach past it.
+    let len = |range: &GetRange| match *range {
+        GetRange::Range(start, end) => end - start,
+        _ => unreachable!("checked above"),
+    };
+    let (run_gets, plan_gets): (Vec<_>, Vec<_>) = cold_gets
+        .iter()
+        .partition(|r| matches!(**r, GetRange::Range(_, end) if end <= data_end));
     assert!(
-        cold_gets
-            .iter()
-            .any(|r| matches!(*r, GetRange::Range(_, end) if end <= size - probe)),
+        !run_gets.is_empty(),
         "the trace's block run is read ahead of the probe: {cold_gets:?}"
     );
-    assert!(cold_bytes < size, "{cold_bytes} of {size} bytes read");
-    let cold_requests = cold_gets.len() as u64;
-    assert_eq!(scan_phase(&cold, "s3GetRequests"), cold_requests, "{cold}");
-    assert_eq!(scan_phase(&cold, "s3GetWireBytes"), cold_bytes, "{cold}");
-    assert_eq!(scan_phase(&cold, "cacheMisses"), cold_requests, "{cold}");
-    assert_eq!(scan_phase(&cold, "cacheHits"), 0, "{cold}");
+    let plan_requests = plan_gets.len() as u64;
+    let plan_bytes: u64 = plan_gets.iter().map(|r| len(r)).sum();
+    let run_requests = run_gets.len() as u64;
+    let run_bytes: u64 = run_gets.iter().map(|r| len(r)).sum();
+    assert!(
+        plan_bytes + run_bytes < size,
+        "{} of {size} bytes read",
+        plan_bytes + run_bytes
+    );
+
+    assert_eq!(
+        phase(&cold, "plan", "s3GetRequests"),
+        plan_requests,
+        "{cold}"
+    );
+    assert_eq!(phase(&cold, "plan", "s3GetWireBytes"), plan_bytes, "{cold}");
+    assert_eq!(phase(&cold, "plan", "cacheMisses"), plan_requests, "{cold}");
+    assert_eq!(phase(&cold, "plan", "cacheHits"), 0, "{cold}");
+    assert_eq!(
+        phase(&cold, "scan", "s3GetRequests"),
+        run_requests,
+        "{cold}"
+    );
+    assert_eq!(phase(&cold, "scan", "s3GetWireBytes"), run_bytes, "{cold}");
+    assert_eq!(phase(&cold, "scan", "cacheMisses"), run_requests, "{cold}");
+    assert_eq!(phase(&cold, "scan", "cacheHits"), 0, "{cold}");
+    assert_eq!(phase(&cold, "probe", "s3GetRequests"), 0, "{cold}");
+    // Resolve reads the catalog, never the data object: its GETs are exactly
+    // the ones issued on keys other than the data key.
+    assert_eq!(
+        phase(&cold, "resolve", "s3GetRequests"),
+        cold_catalog_gets,
+        "{cold}"
+    );
 
     let (status, warm) = post_sql(&app, &sql).await;
     assert_eq!(status, StatusCode::OK, "warm lookup failed: {warm}");
     assert_eq!(warm["data"]["rows"], want_rows, "{warm}");
     let warm_gets = recorder.take(&data_key);
+    let warm_catalog_gets = recorder.take_all();
     assert!(
         warm_gets.is_empty(),
         "the warm lookup is served from the read cache: {warm_gets:?}"
     );
-    assert_eq!(scan_phase(&warm, "s3GetRequests"), 0, "{warm}");
-    assert_eq!(scan_phase(&warm, "s3GetWireBytes"), 0, "{warm}");
-    assert_eq!(scan_phase(&warm, "cacheHits"), cold_requests, "{warm}");
-    assert_eq!(scan_phase(&warm, "cacheMisses"), 0, "{warm}");
-    assert_eq!(scan_phase(&warm, "cacheServedBytes"), cold_bytes, "{warm}");
+    for name in ["plan", "scan", "probe"] {
+        assert_eq!(phase(&warm, name, "s3GetRequests"), 0, "{name}: {warm}");
+        assert_eq!(phase(&warm, name, "s3GetWireBytes"), 0, "{name}: {warm}");
+        assert_eq!(phase(&warm, name, "cacheMisses"), 0, "{name}: {warm}");
+    }
+    assert_eq!(phase(&warm, "plan", "cacheHits"), plan_requests, "{warm}");
+    assert_eq!(
+        phase(&warm, "plan", "cacheServedBytes"),
+        plan_bytes,
+        "{warm}"
+    );
+    assert_eq!(phase(&warm, "scan", "cacheHits"), run_requests, "{warm}");
+    assert_eq!(
+        phase(&warm, "scan", "cacheServedBytes"),
+        run_bytes,
+        "{warm}"
+    );
+    assert_eq!(phase(&warm, "probe", "cacheHits"), 0, "{warm}");
+    assert_eq!(
+        phase(&warm, "resolve", "s3GetRequests"),
+        warm_catalog_gets,
+        "{warm}"
+    );
 }

@@ -33,6 +33,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 #[cfg(feature = "flight-sql")]
 use ravel_query::ByteLimit;
+use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -55,11 +56,11 @@ pub struct SpansTableProvider {
     tenant_hash: TenantHash,
     fetcher: SpanSegmentFetcher,
     schema: SchemaRef,
-    /// This query's accounting handle (ADR-0044), cloned into every
+    /// This query's accounting handles (ADR-0044), cloned into every
     /// `SpansScanExec` the provider builds so every store fetch the scan
-    /// issues on this query's behalf is recorded against it. Mirrors
-    /// [`crate::logs_provider::LogsTableProvider`].
-    accounting: QueryAccounting,
+    /// issues on this query's behalf is recorded against the phase that
+    /// issued it. Mirrors [`crate::logs_provider::LogsTableProvider`].
+    accounting: PhaseAccounting,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `SpansScanExec` the provider builds.
@@ -89,11 +90,19 @@ impl SpansTableProvider {
             tenant_hash,
             fetcher,
             schema: spans_schema(),
-            accounting,
+            accounting: PhaseAccounting::pooled_over(&accounting),
             erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
         }
+    }
+
+    /// Record every scan's reads on `phases`, split by the phase that issued
+    /// each, instead of on the one handle [`new`](Self::new) took.
+    #[must_use]
+    pub fn with_phase_accounting(mut self, phases: PhaseAccounting) -> Self {
+        self.accounting = phases;
+        self
     }
 
     /// Install a coordinator-side distributed scan context (ADR-0071; #327, T6b).
@@ -209,8 +218,9 @@ impl SpansTableProvider {
             pushdown.status_mask,
             Arc::clone(&self.erasure),
             projection,
-            self.accounting.clone(),
-        )?;
+            QueryAccounting::new(),
+        )?
+        .with_phase_accounting(self.accounting.clone());
         Ok(Arc::new(scan))
     }
 
@@ -281,7 +291,7 @@ impl TableProvider for SpansTableProvider {
                 Arc::clone(&dist.client),
                 Arc::clone(&self.schema),
                 _limit,
-                self.accounting.clone(),
+                self.accounting.scan().clone(),
                 ByteLimit::Unlimited,
             )?;
             return self.apply_projection(plan, projection);
