@@ -1996,13 +1996,14 @@ async fn big_for(lake: &Lake, tenant: &TenantHash) -> Bytes {
     bytes
 }
 
-/// The memory error a signal fetcher's refused reservation is, built for the
-/// comparison of class, status and client message.
-fn signal_memory_error() -> SqlError {
+/// The memory error a signal fetcher's refused reservation is, with the same
+/// figures, built for the comparison of class, status and client message.
+fn signal_memory_error(requested: u64, reserved: u64, limit: u64) -> SqlError {
     SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted {
-        requested: 1,
-        reserved: 0,
-        limit: 0,
+        requested,
+        reserved,
+        limit,
+        cause: ravel_memory::ExhaustionCause::Accounted,
     })
 }
 
@@ -2042,17 +2043,21 @@ async fn a_parquet_read_past_the_memory_budget_is_refused() {
         .execute(&acme, sum_id)
         .await
         .expect_err("a chunk over the budget");
-    match &err {
+    let signal = match &err {
         SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted {
-            requested, limit, ..
+            requested,
+            reserved,
+            limit,
+            cause: ravel_memory::ExhaustionCause::Accounted,
         }) => {
             assert_eq!(*requested, chunk);
             assert_eq!(*limit, chunk - 1);
+            signal_memory_error(*requested, *reserved, *limit)
         }
-        other => panic!("expected FetchMemoryExhausted, got {other:?}"),
-    }
-    assert_eq!(err.class(), signal_memory_error().class());
-    assert_eq!(err.client_message(), signal_memory_error().client_message());
+        other => panic!("expected an accounted FetchMemoryExhausted, got {other:?}"),
+    };
+    assert_eq!(err.class(), signal.class());
+    assert_eq!(err.client_message(), signal.client_message());
     assert_eq!(
         Lake::gets(&refused.lake) - before,
         1,

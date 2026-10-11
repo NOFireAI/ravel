@@ -403,10 +403,12 @@ impl From<ParquetQueryError> for SqlError {
                 requested,
                 reserved,
                 limit,
+                cause,
             }) => SqlError::Fetch(FetchError::FetchMemoryExhausted {
                 requested,
                 reserved,
                 limit,
+                cause,
             }),
             Some(&ParquetReadError::RequestBudgetExceeded { requests, max }) => {
                 SqlError::RequestBudgetExceeded {
@@ -494,6 +496,19 @@ impl SqlError {
             // ahead of the generic `Catalog(_)` arm so it does not collapse
             // into the transient-unavailable redaction.
             SqlError::Catalog(CatalogError::WindowTooWide { .. }) => ErrorClass::Unsupported,
+            // A memory-budget refusal on the fetch path or on a catalog or
+            // column-statistics decode is a budget refusal of a well-formed
+            // request, the same class as the SQL memory pool's own
+            // `ResourcesExhausted` (422), not a storage fault (503): ADR-2633
+            // decision 3, superseding ADR-1170's 503 for these. Handled ahead
+            // of the generic arms below for the same reason `WindowTooWide` is.
+            SqlError::Fetch(FetchError::FetchMemoryExhausted { .. })
+            | SqlError::LogFetch(LogFetchError::FetchMemoryExhausted { .. })
+            | SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted { .. })
+            | SqlError::Catalog(CatalogError::MemoryExhausted(_))
+            | SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(_)) => {
+                ErrorClass::Unsupported
+            }
             SqlError::Catalog(_)
             | SqlError::ColumnStats(_)
             | SqlError::Fetch(_)
@@ -544,6 +559,20 @@ impl SqlError {
             // tells the caller to narrow the window. Same
             // treatment as the budget errors below.
             SqlError::Catalog(catalog @ CatalogError::WindowTooWide { .. }) => catalog.to_string(),
+            // Safe to echo: a memory-budget refusal carries only the budget's
+            // figures and its class (the ledger's limit, or the host-memory
+            // gate), never an object key or tenant identity, and the class is
+            // what the caller needs to see (ADR-2633 decision 3). The same
+            // treatment as the budget errors below, on every path a refusal
+            // reaches this surface by: a catalog or column-statistics decode
+            // charge, and a metrics, log or span fetch reservation.
+            SqlError::Catalog(CatalogError::MemoryExhausted(_))
+            | SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(_))
+            | SqlError::Fetch(FetchError::FetchMemoryExhausted { .. })
+            | SqlError::LogFetch(LogFetchError::FetchMemoryExhausted { .. })
+            | SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted { .. }) => {
+                self.to_string()
+            }
             SqlError::Catalog(catalog) => redact_catalog(catalog).to_string(),
             // A tenant-hash mismatch would otherwise embed both hashes and
             // an object key in its `Display`; corrupt HEAD/part errors embed
@@ -557,14 +586,9 @@ impl SqlError {
             // Any other store read that failed (issue #1976: most often
             // AccessDenied on a missing read grant) is not corruption; it
             // redacts to the same transient message a segment store fault does.
-            // A memory-budget refusal is not corruption either: it carries
-            // only the budget's three figures, and retrying under less
-            // pressure can succeed, so it redacts to the same transient
-            // message `CatalogError::MemoryExhausted` takes through
-            // `redact_catalog`.
-            SqlError::ColumnStats(
-                LoadColumnStatsError::Store { .. } | LoadColumnStatsError::MemoryExhausted(_),
-            ) => MSG_UNAVAILABLE.to_string(),
+            SqlError::ColumnStats(LoadColumnStatsError::Store { .. }) => {
+                MSG_UNAVAILABLE.to_string()
+            }
             // A HEAD the loader cannot decode takes the class the catalog's own
             // HEAD read gives the same `SnapshotFormatError`, so a newer-version
             // HEAD is retryable on both paths.
@@ -582,13 +606,12 @@ impl SqlError {
                     source: StoreError::Corrupted(_),
                     ..
                 } => MSG_CORRUPT.to_string(),
-                // A memory-budget refusal carries only byte counts (no object
-                // key or tenant identity); redacted to the transient message
-                // like a storage fault, since retrying under less pressure can
-                // succeed.
-                FetchError::Store { .. }
-                | FetchError::EtagChanged { .. }
-                | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                FetchError::Store { .. } | FetchError::EtagChanged { .. } => {
+                    MSG_UNAVAILABLE.to_string()
+                }
+                // Never reached: the budget arm above echoes it. Matched
+                // only for exhaustiveness.
+                FetchError::FetchMemoryExhausted { .. } => self.to_string(),
             },
             SqlError::LogFetch(fetch) => match fetch {
                 // A carry paired with the wrong segment is an integrity
@@ -601,9 +624,11 @@ impl SqlError {
                     source: StoreError::Corrupted(_),
                     ..
                 } => MSG_CORRUPT.to_string(),
-                LogFetchError::Store { .. }
-                | LogFetchError::EtagChanged { .. }
-                | LogFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                LogFetchError::Store { .. } | LogFetchError::EtagChanged { .. } => {
+                    MSG_UNAVAILABLE.to_string()
+                }
+                // Never reached: the budget arm above echoes it.
+                LogFetchError::FetchMemoryExhausted { .. } => self.to_string(),
             },
             SqlError::SpanFetch(fetch) => match fetch {
                 // A cross-tenant object is an integrity violation of the fetched
@@ -615,8 +640,9 @@ impl SqlError {
                     source: StoreError::Corrupted(_),
                     ..
                 } => MSG_CORRUPT.to_string(),
-                SpanFetchError::Store { .. }
-                | SpanFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+                // Never reached: the budget arm above echoes it.
+                SpanFetchError::FetchMemoryExhausted { .. } => self.to_string(),
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::Parquet(parquet) => parquet.client_message(),
@@ -719,9 +745,9 @@ impl SqlError {
 ///   `UnsatisfiableToken` keeps its own stable message.
 ///
 /// Every variant is named (no wildcard) so a new `CatalogError` fails to
-/// compile here until it is classified. `WindowTooWide` never reaches this
-/// function -- [`SqlError::client_message`] echoes it verbatim before calling
-/// in -- but is matched for exhaustiveness.
+/// compile here until it is classified. `WindowTooWide` and `MemoryExhausted`
+/// never reach this function -- [`SqlError::client_message`] echoes them
+/// verbatim before calling in -- but are matched for exhaustiveness.
 fn redact_catalog(err: &CatalogError) -> &'static str {
     match err {
         CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
@@ -772,13 +798,16 @@ fn redact_catalog(err: &CatalogError) -> &'static str {
         // stored with them. 500.
         CatalogError::Store(StoreError::Corrupted(_)) => MSG_CORRUPT,
 
-        // Transient storage faults, fold progress/liveness failures, and
-        // resource backpressure: a retry (here or elsewhere) can succeed, so
-        // they keep the retryable message.
+        // Never reached: `client_message` echoes a memory refusal before
+        // calling in (ADR-2633 decision 3). Matched only for exhaustiveness.
+        CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
+
+        // Transient storage faults and fold progress/liveness failures: a
+        // retry (here or elsewhere) can succeed, so they keep the retryable
+        // message.
         CatalogError::InvalidConfig(_)
         | CatalogError::Store(_)
-        | CatalogError::FoldCasRetriesExhausted { .. }
-        | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
+        | CatalogError::FoldCasRetriesExhausted { .. } => MSG_UNAVAILABLE,
     }
 }
 
@@ -872,33 +901,97 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
-    /// A column-stats memory-budget refusal (ADR-1702 decision 6) is a
-    /// resource refusal, not corrupt data: the client must get the same
-    /// transient message `CatalogError::MemoryExhausted` produces on the
-    /// catalog path, so a process under memory pressure never tells a caller
-    /// its stored statistics failed integrity validation.
+    /// ADR-2633 decision 3: every memory-budget refusal this surface answers
+    /// (a column-statistics or catalog decode charge, ADR-1702 decision 6; a
+    /// metrics, log or span fetch reservation, ADR-1170 decision 2) is a
+    /// budget refusal of a well-formed request, the 422 class the SQL memory
+    /// pool's own refusal takes, with a message that is the budget's own
+    /// text, class included. Before this they redacted to `MSG_UNAVAILABLE`
+    /// and answered 503. Both classes are pinned on every path, and the
+    /// message is checked for leaked detail like any other.
     ///
-    /// FLIP: drop `LoadColumnStatsError::MemoryExhausted(_)` from the
-    /// `MSG_UNAVAILABLE` arm and the first assertion fails with
-    /// `left: "stored data failed integrity validation"`,
-    /// `right: "upstream storage temporarily unavailable"`.
+    /// FLIP: drop the memory-refusal arm from `SqlError::class` and the
+    /// class assertion fails with `left: Unavailable`, `right: Unsupported`;
+    /// drop it from `client_message` and the message assertion fails with
+    /// `left: "upstream storage temporarily unavailable"`.
     #[test]
-    fn column_stats_memory_refusal_redacts_to_unavailable_not_corrupt() {
-        let exhausted = ravel_memory::MemoryExhausted {
+    fn memory_budget_refusals_answer_the_budget_class_on_every_path() {
+        use ravel_memory::{ExhaustionCause, MemoryExhausted};
+
+        let accounted = MemoryExhausted {
             requested: 4096,
             reserved: 1024,
             limit: 2048,
-            cause: ravel_memory::ExhaustionCause::Accounted,
+            cause: ExhaustionCause::Accounted,
         };
-        let err = SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(exhausted));
-        assert_eq!(err.client_message(), MSG_UNAVAILABLE);
-        assert_eq!(
-            SqlError::Catalog(CatalogError::MemoryExhausted(exhausted)).client_message(),
-            err.client_message(),
-            "the two decode refusals answer a client the same way"
-        );
-        assert_redacted(&err.client_message());
-        assert_eq!(err.class(), ErrorClass::Unavailable);
+        let host_memory = MemoryExhausted {
+            requested: 4096,
+            reserved: 1024,
+            limit: 2048,
+            cause: ExhaustionCause::HostMemory {
+                available: 100,
+                floor: 200,
+            },
+        };
+        let accounted_text =
+            "memory exhausted: requested 4096 bytes, 1024 of 2048 byte limit already reserved";
+        let host_memory_text = "memory exhausted: host available memory 100 bytes is below the 200 byte floor \
+             (requested 4096)";
+
+        for (refusal, text) in [(accounted, accounted_text), (host_memory, host_memory_text)] {
+            let MemoryExhausted {
+                requested,
+                reserved,
+                limit,
+                cause,
+            } = refusal;
+            let cases = [
+                (
+                    SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(refusal)),
+                    format!("column statistics load failed: column-stats decode refused: {text}"),
+                ),
+                (
+                    SqlError::Catalog(CatalogError::MemoryExhausted(refusal)),
+                    format!("snapshot resolution failed: catalog decode refused: {text}"),
+                ),
+                (
+                    SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                        requested,
+                        reserved,
+                        limit,
+                        cause,
+                    }),
+                    format!("segment fetch failed: fetch {text}"),
+                ),
+                (
+                    SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
+                        requested,
+                        reserved,
+                        limit,
+                        cause,
+                    }),
+                    format!("log segment fetch failed: fetch {text}"),
+                ),
+                (
+                    SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted {
+                        requested,
+                        reserved,
+                        limit,
+                        cause,
+                    }),
+                    format!("span segment fetch failed: fetch {text}"),
+                ),
+            ];
+            for (err, expected) in &cases {
+                assert_eq!(
+                    err.class(),
+                    ErrorClass::Unsupported,
+                    "a {cause:?} refusal takes the budget class: {err}"
+                );
+                assert_eq!(&err.client_message(), expected, "{err}");
+                assert_redacted(&err.client_message());
+            }
+        }
     }
 
     #[test]
@@ -1575,14 +1668,6 @@ mod tests {
                 key: key(),
                 source: StoreError::AccessDenied(RAW_STORE_TEXT.into()),
             }),
-            SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(
-                ravel_memory::MemoryExhausted {
-                    requested: 4096,
-                    reserved: 1024,
-                    limit: 2048,
-                    cause: ravel_memory::ExhaustionCause::Accounted,
-                },
-            )),
             SqlError::RunInvariant(ravel_query::QueryError::PrioritySampleCountMismatch {
                 priorities: 2,
                 samples: 3,

@@ -619,8 +619,10 @@ impl ParquetQueryError {
                     // Unreachable in practice: `From<ParquetQueryError> for
                     // SqlError` (ravel-sql/src/error.rs) converts this to
                     // `SqlError::Fetch` before a boxed `SqlError::Parquet`
-                    // ever reaches this `class()` call.
-                    ParquetReadError::MemoryExhausted { .. } => ErrorClass::Unavailable,
+                    // ever reaches this `class()` call. The class it would
+                    // take is the one that conversion gives it (ADR-2633
+                    // decision 3).
+                    ParquetReadError::MemoryExhausted { .. } => ErrorClass::Unsupported,
                     // Unreachable in practice: the same `From` impl converts
                     // these to `SqlError::RequestBudgetExceeded` /
                     // `SqlError::TooManyBytesScanned` first.
@@ -699,8 +701,9 @@ impl ParquetQueryError {
                     ParquetReadError::Store { .. } | ParquetReadError::LeaderLost { .. } => {
                         MSG_UNAVAILABLE.to_string()
                     }
-                    // Unreachable in practice: same note as above.
-                    ParquetReadError::MemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
+                    // Unreachable in practice: same note as above. Budget
+                    // figures and the class only, no key, so it is echoed.
+                    ParquetReadError::MemoryExhausted { .. } => read.to_string(),
                 }
             }
             ParquetQueryError::Table(

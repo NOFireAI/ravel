@@ -9855,6 +9855,7 @@ mod carried_directory_reservation_tests {
             requested,
             reserved,
             limit,
+            ..
         })) = typed
         else {
             panic!("expected the typed fetch memory error, got: {err:?}");
