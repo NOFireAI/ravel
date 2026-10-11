@@ -514,7 +514,12 @@ private); `trace_block_span` becomes the SKIP_IDX-only convenience that
 calls it on its own run. The reader splits the intersection into maximal
 contiguous runs, calls `block_run_span` per run, issues one ranged GET per
 returned span, and decodes each with `decode_trace(&span, bytes)` as
-today. Under this format's sort order the intersection is always one run:
+today. The spans fetcher (`ravel_query::SpanSegmentFetcher`) already reads
+a trace through `block_run_span`: a `trace_id` lookup reads the object's
+tail, then one ranged GET per contiguous candidate run, never the whole
+object, and the process read cache fronts those reads, keyed
+`(tenant_hash, content_hash, offset, len)`, so a repeated lookup issues no
+GET. Under this format's sort order the intersection is always one run:
 the object sorts by `(trace_id, start_ts)`, every trace id that sorts
 between two ids sharing an 8-byte prefix shares that prefix too, so the
 records carrying one `key8` are one contiguous range and the blocks holding
