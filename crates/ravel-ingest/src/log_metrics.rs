@@ -18,9 +18,6 @@
 //!   `abandoned_retry_exhausted`, `abandoned_input_rejected`,
 //!   `abandoned_queue_deadline`, `abandoned_hour_bound`, and
 //!   `flush_gate_faults`; the bare trigger sum overcounts.
-//!   `abandoned_retry_exhausted`, `abandoned_input_rejected`,
-//!   `abandoned_queue_deadline`, `abandoned_hour_bound`, and
-//!   `flush_gate_faults`; the bare trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's
 //!   strict waiters are acked, i.e. at the flush's terminal outcome. They
 //!   count strict-mode waiters only: a buffered-mode flush, or an age/size

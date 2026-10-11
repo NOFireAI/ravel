@@ -28,8 +28,6 @@
 //!   and `flushes_manual`) summed, minus `abandoned_retry_exhausted`,
 //!   `abandoned_input_rejected`, `abandoned_queue_deadline`,
 //!   `abandoned_hour_bound`, and `flush_gate_faults`; the bare
-//!   `abandoned_input_rejected`, `abandoned_queue_deadline`,
-//!   `abandoned_hour_bound`, and `flush_gate_faults`; the bare
 //!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
 //!   waiters are acked, i.e. at the flush's terminal outcome. They count
