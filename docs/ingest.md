@@ -1767,13 +1767,16 @@ Counters recorded today:
   incremented when a flush is opened, before the segment build or any PUT, so
   a later-abandoned flush is counted here as well as in an `abandoned_*`
   counter. Successful flushes = the five trigger counters minus the four
-  `abandoned_*` counters, minus any flush whose encode the ADR-1702 write
-  gate returned no result for: the job panicked, or the runtime cancelled it
-  while shutting down. Such a flush is a server fault rather than bad input,
-  so it counts in no `abandoned_*` counter; it is logged at ERROR and its
-  strict waiters get the retryable `ShardUnavailable` (503), the answer an
-  encode panic gave when it took the shard actor down. The actor now
-  survives, so `shard_deaths` does not move either.
+  `abandoned_*` counters, minus `flush_gate_faults`.
+- `flush_gate_faults`: flush whose encode the ADR-1702 write gate returned no
+  result for: the job panicked, or the runtime cancelled it while shutting
+  down. Nothing is stored and the buffered rows are dropped. Such a flush is
+  a server fault rather than bad input, so it counts here and in no
+  `abandoned_*` counter; it is logged at ERROR and its strict waiters get the
+  retryable `ShardUnavailable` (503), the answer an encode panic gave when it
+  took the shard actor down. The actor survives, so `shard_deaths` does not
+  move either. Exported as `ravel_ingest_flush_gate_faults_total` by
+  `{mode, signal}`; any increase is a server defect to investigate.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
   budget or `max_flush_lifetime` elapsed while the flush's own store calls were
   in flight (`WriteError::Abandoned`). Object-store durability signal;
@@ -1786,7 +1789,13 @@ Counters recorded today:
   scheduled after its flush-open deadline already passed, never for a mere
   queue wait. It also counts a flush whose re-derived lifetime elapses before
   its encode on the ADR-1702 write gate returns, which a gate queue longer
-  than `max_flush_lifetime` produces; that flush makes no store call.
+  than `max_flush_lifetime` produces; that flush makes no store call. The
+  flush deadline is what bounds a flush's wait on the write gate. The three
+  request-path sites on the same gate (the OTLP-HTTP gzip inflate, the
+  remote-write snappy decode, and the OTAP decode) have no such deadline:
+  their wait is bounded only by the ingest concurrency limiter
+  (`--max-inflight-ingest-requests`) and, for remote-write, also by the
+  ingest byte budget.
 - `abandoned_hour_bound`: flush abandoned at permit grant, before any store
   call, because the grant came past `end(pinned hour) + max_flush_lifetime`
   (ADR-2708 D3). It is not re-pinned. A buffered flush queued behind a stall

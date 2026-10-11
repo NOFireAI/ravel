@@ -78,6 +78,13 @@ pub struct SpanIngestMetrics {
     /// build failed ([`crate::SpanWriteError::SegmentBuild`]). A client
     /// signal: identical input will fail again.
     abandoned_input_rejected: AtomicU64,
+    /// Flushes whose ADR-1702 write gate encode returned no result, because
+    /// the job panicked or the runtime cancelled it
+    /// ([`crate::SpanWriteError::ShardUnavailable`]). Nothing was stored and
+    /// the buffered spans are dropped. A server fault, kept out of the
+    /// `abandoned_*` family; the shard keeps running, so `shard_deaths` does
+    /// not move either.
+    flush_gate_faults: AtomicU64,
     /// Cumulative bytes admitted into shard buffers at enqueue time.
     buffered_bytes_total: AtomicU64,
     /// Cumulative span count admitted into shard buffers at enqueue time.
@@ -245,6 +252,9 @@ pub struct SpanIngestMetricsSnapshot {
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
+    /// Flushes whose write gate encode returned no result (the job panicked
+    /// or was cancelled). Not an `abandoned_*` cause.
+    pub flush_gate_faults: u64,
     pub buffered_bytes_total: u64,
     pub buffered_spans_total: u64,
     pub acks_ok: u64,
@@ -496,6 +506,13 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A flush whose write gate encode returned no result
+    /// ([`crate::SpanWriteError::ShardUnavailable`]): a server fault,
+    /// retryable.
+    pub(crate) fn record_flush_gate_fault(&self) {
+        self.flush_gate_faults.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_buffered(&self, bytes: u64, spans: u64) {
         self.buffered_bytes_total
             .fetch_add(bytes, Ordering::Relaxed);
@@ -684,6 +701,7 @@ impl SpanIngestMetrics {
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
+            flush_gate_faults: self.flush_gate_faults.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_spans_total: self.buffered_spans_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
@@ -816,6 +834,13 @@ mod tests {
             SpanIngestMetrics::record_abandoned_input_rejected,
             SpanIngestMetricsSnapshot {
                 abandoned_input_rejected: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_flush_gate_fault,
+            SpanIngestMetricsSnapshot {
+                flush_gate_faults: 1,
                 ..Default::default()
             },
         );

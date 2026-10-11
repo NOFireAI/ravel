@@ -1918,9 +1918,9 @@ mod tests {
 
     /// A gated encode that panics, or that the gate cancels, fails its flush
     /// with the retryable `ShardUnavailable` an encode panic gave before the
-    /// gate, not the client-fault `SegmentBuild`. Nothing is stored, no
-    /// abandoned_* counter moves, the shard stays alive, and the next write
-    /// commits.
+    /// gate, not the client-fault `SegmentBuild`. Nothing is stored,
+    /// `flush_gate_faults` moves by exactly one and no abandoned_* counter
+    /// moves, the shard stays alive, and the next write commits.
     #[tokio::test]
     async fn gate_failed_log_encode_fails_the_strict_write_retryably() {
         for injected in [
@@ -1962,9 +1962,14 @@ mod tests {
                     snapshot.abandoned_input_rejected,
                     snapshot.abandoned_retry_exhausted,
                     snapshot.abandoned_queue_deadline,
+                    snapshot.abandoned_hour_bound,
                 ),
-                (0, 0, 0),
+                (0, 0, 0, 0),
                 "{injected:?}: a gate failure is not an abandoned flush"
+            );
+            assert_eq!(
+                snapshot.flush_gate_faults, 1,
+                "{injected:?}: a gate failure counts once on flush_gate_faults"
             );
             assert_eq!(snapshot.shard_deaths, 0);
             router
@@ -1976,6 +1981,7 @@ mod tests {
                 )
                 .await
                 .expect("the shard survives and the next write commits");
+            assert_eq!(router.metrics.snapshot().flush_gate_faults, 1);
         }
     }
 

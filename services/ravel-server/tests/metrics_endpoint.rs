@@ -326,6 +326,41 @@ async fn metrics_render_abandoned_hour_bound_family_per_signal() {
     }
 }
 
+/// ADR-1702: a flush whose write gate encode returns no result drops its rows
+/// without dying or abandoning, and `ravel_ingest_flush_gate_faults_total` is
+/// the only signal it leaves. One declaration and one zero sample per ingest
+/// signal wherever an ingest router exists, none elsewhere.
+#[tokio::test]
+async fn metrics_render_flush_gate_faults_family_per_signal() {
+    let family = "ravel_ingest_flush_gate_faults_total";
+    for (mode, mode_label, expect_ingest) in [
+        (Mode::All, "all", true),
+        (Mode::Gateway, "gateway", true),
+        (Mode::Query, "query", false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let body = scrape(&running).await;
+        let expected = usize::from(expect_ingest);
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter")).count(),
+            expected,
+            "mode {mode:?} must declare {family} exactly {expected} time(s):\n{body}"
+        );
+        for signal in ["metrics", "logs", "spans"] {
+            assert_eq!(
+                body.matches(&format!(
+                    "{family}{{mode=\"{mode_label}\",signal=\"{signal}\"}} 0\n"
+                ))
+                .count(),
+                expected,
+                "mode {mode:?} must render {family} for signal {signal} at 0 exactly \
+                 {expected} time(s):\n{body}"
+            );
+        }
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
 /// Issue #2600: the hand-back count split by reason and the in-place mismatch
 /// writes reach a real scrape, each series at exactly `0` on an idle process,
 /// wherever an ingest router exists, and nowhere else. The reason split

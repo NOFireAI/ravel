@@ -15,8 +15,9 @@
 //!   the commit-record PUT. A flush later abandoned is counted in both
 //!   `flushes_by_*` **and** one of the `abandoned_*` counters. Flushes that
 //!   reached a durable commit are the three trigger counters summed, minus
-//!   `abandoned_retry_exhausted` and `abandoned_input_rejected`; the bare
-//!   trigger sum overcounts.
+//!   `abandoned_retry_exhausted`, `abandoned_input_rejected`,
+//!   `abandoned_queue_deadline`, `abandoned_hour_bound`, and
+//!   `flush_gate_faults`; the bare trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's
 //!   strict waiters are acked, i.e. at the flush's terminal outcome. They
 //!   count strict-mode waiters only: a buffered-mode flush, or an age/size
@@ -87,6 +88,13 @@ pub struct LogIngestMetrics {
     /// signal: identical input will fail again, so the write is not
     /// retryable.
     abandoned_input_rejected: AtomicU64,
+    /// Flushes whose ADR-1702 write gate encode returned no result, because
+    /// the job panicked or the runtime cancelled it
+    /// ([`crate::LogWriteError::ShardUnavailable`]). Nothing was stored and
+    /// the buffered records are dropped. A server fault, kept out of the
+    /// `abandoned_*` family; the shard keeps running, so `shard_deaths` does
+    /// not move either.
+    flush_gate_faults: AtomicU64,
     /// Cumulative bytes admitted into shard buffers at enqueue time.
     buffered_bytes_total: AtomicU64,
     /// Cumulative log record count admitted into shard buffers at enqueue
@@ -337,6 +345,9 @@ pub struct LogIngestMetricsSnapshot {
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
+    /// Flushes whose write gate encode returned no result (the job panicked
+    /// or was cancelled). Not an `abandoned_*` cause.
+    pub flush_gate_faults: u64,
     pub buffered_bytes_total: u64,
     pub buffered_records_total: u64,
     pub acks_ok: u64,
@@ -654,6 +665,13 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A flush whose write gate encode returned no result
+    /// ([`crate::LogWriteError::ShardUnavailable`]): a server fault,
+    /// retryable.
+    pub(crate) fn record_flush_gate_fault(&self) {
+        self.flush_gate_faults.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_buffered(&self, bytes: u64, records: u64) {
         self.buffered_bytes_total
             .fetch_add(bytes, Ordering::Relaxed);
@@ -906,6 +924,7 @@ impl LogIngestMetrics {
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
+            flush_gate_faults: self.flush_gate_faults.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_records_total: self.buffered_records_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
@@ -1085,6 +1104,13 @@ mod tests {
             LogIngestMetrics::record_abandoned_input_rejected,
             LogIngestMetricsSnapshot {
                 abandoned_input_rejected: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_flush_gate_fault,
+            LogIngestMetricsSnapshot {
+                flush_gate_faults: 1,
                 ..Default::default()
             },
         );
