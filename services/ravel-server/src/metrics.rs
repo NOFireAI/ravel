@@ -5841,12 +5841,12 @@ fn render_cache_residency_family(
     }
 }
 
-/// The ADR-2633 memory gate families, as amended for issue #2806. The
-/// available reading and the close floor are the budget's own gate figures,
-/// the resident reading and the purge floor the sampler's; only the sampler
-/// writes any of them, so all four read 0 when the gate is off. The
-/// `admission` and `grow` refusal sites render 0: their checks are ADR-2633
-/// task 3.
+/// The ADR-2633 memory gate families, as amended for issues #2806 and
+/// #2838. The available reading and the close floor are the budget's own
+/// gate figures, the resident reading and the purge floor the sampler's;
+/// only the sampler writes any of them, so all four read 0 when the gate is
+/// off. The `admission` and `grow` refusal sites render 0: their checks are
+/// ADR-2633 task 3.
 fn render_memory_gate_family(
     out: &mut String,
     mode: Mode,
@@ -5855,21 +5855,23 @@ fn render_memory_gate_family(
 ) {
     let nanos_to_seconds = |nanos: u64| nanos as f64 / 1_000_000_000.0;
     let labels = [Label::Mode(mode)];
-    let scalars: [(&str, &str, &str, u64); 6] = [
+    let scalars: [(&str, &str, &str, u64); 7] = [
         (
             "ravel_memory_gate_available_bytes",
             "Host available memory as the memory gate sampler last read it, after the forced \
              purge when one ran: MemAvailable, or under a finite cgroup memory limit the smaller \
-             of MemAvailable and the limit minus its usage plus its inactive file cache; 0 when \
-             the gate is off or before its first sample.",
+             of MemAvailable and the limit minus its usage plus its inactive file cache; written \
+             on every sample, so it shows a dip below the close floor while the gate is still \
+             open; 0 when the gate is off or before its first sample.",
             "gauge",
             budget.gate_available(),
         ),
         (
             "ravel_memory_gate_available_floor_bytes",
-            "The memory gate's close floor (--memory-gate-min-available-bytes): the gate is closed \
-             while the available reading is below it; 0 when the gate is off or before its first \
-             sample.",
+            "The memory gate's close floor (--memory-gate-min-available-bytes): the gate closes \
+             once --memory-gate-close-after-samples consecutive available readings are below it \
+             and reopens on the first reading at or above it; 0 when the gate is off or before \
+             its first sample.",
             "gauge",
             budget.gate_floor(),
         ),
@@ -5901,6 +5903,15 @@ fn render_memory_gate_family(
             "Memory gate samples that read host available memory.",
             "counter",
             stats.samples,
+        ),
+        (
+            "ravel_memory_gate_samples_below_floor_total",
+            "Memory gate samples whose available reading was below the close floor, whether or \
+             not the sample closed the gate: the gate closes only after \
+             --memory-gate-close-after-samples consecutive ones, so this moving while \
+             ravel_memory_gate_refusals_total does not is a dip too short to close it.",
+            "counter",
+            stats.samples_below_floor,
         ),
     ];
     for (name, help, kind, value) in scalars {
@@ -9075,7 +9086,7 @@ mod tests {
         let budget = ravel_memory::MemoryBudget::new(1_000);
         assert!(budget.try_reserve(600).is_ok());
         assert!(budget.try_reserve(600).is_err());
-        budget.set_host_memory_gate(700, 800);
+        budget.set_host_memory_gate(false, 700, 800);
         assert!(budget.try_reserve(1).is_err());
         assert!(budget.try_reserve(1).is_err());
         let mut purge_buckets = [0; crate::memory_gate::PURGE_BUCKET_COUNT];
@@ -9083,6 +9094,7 @@ mod tests {
         purge_buckets[3] = 2;
         let stats = crate::memory_gate::MemoryGateStatsSnapshot {
             samples: 5,
+            samples_below_floor: 4,
             epoch_refresh_nanos: 1_500_000_000,
             purges: 3,
             purge_nanos: 2_000_000,
@@ -9124,6 +9136,11 @@ mod tests {
                 "ravel_memory_gate_samples_total",
                 "counter",
                 "samples that read host available memory",
+            ),
+            (
+                "ravel_memory_gate_samples_below_floor_total",
+                "counter",
+                "whether or not the sample closed the gate",
             ),
             (
                 "ravel_memory_gate_epoch_refresh_seconds_total",
@@ -9179,6 +9196,7 @@ mod tests {
             "ravel_memory_gate_resident_bytes{mode=\"query\"} 900",
             "ravel_memory_gate_purges_total{mode=\"query\"} 3",
             "ravel_memory_gate_samples_total{mode=\"query\"} 5",
+            "ravel_memory_gate_samples_below_floor_total{mode=\"query\"} 4",
             "ravel_memory_gate_epoch_refresh_seconds_total{mode=\"query\"} 1.5",
             "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.0001\"} 1",
             "ravel_memory_gate_purge_seconds_bucket{mode=\"query\",le=\"0.00025\"} 1",

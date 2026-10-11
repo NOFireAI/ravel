@@ -38,14 +38,20 @@ pub struct MemoryBudget {
     refusals: RefusalCounts,
 }
 
-/// The memory gate's state (ADR-2633 section 1, as amended for issue #2806):
-/// whether it is open, the last host available-memory reading, and the
-/// floor it was compared against.
+/// The memory gate's state (ADR-2633 section 1, as amended for issues #2806
+/// and #2838): whether it is open, the last host available-memory reading,
+/// and the floor it was compared against.
 ///
 /// Written only by [`MemoryBudget::set_host_memory_gate`], whose caller is
 /// the server's memory-gate sampler thread (ADR-2633 task 2, issue #2730). A
 /// process with the gate off never starts the sampler, so its budget stays
 /// open and `try_reserve` behaves as it did before the gate.
+///
+/// The caller decides `open`: the sampler closes the gate only after a run
+/// of consecutive readings below the floor, so a reading below the floor
+/// can sit beside an open flag while that run is short. A closed flag
+/// always sits beside a reading below the floor, which is what the refusal
+/// path's re-check rests on.
 ///
 /// The reading and the floor are two independent relaxed stores, so a
 /// reader can see the reading of one setter call beside the floor of the
@@ -96,22 +102,26 @@ impl MemoryBudget {
         }
     }
 
-    /// Records a host available-memory reading against the floor and sets
-    /// the gate from them: closed when `available < floor`, open otherwise.
-    /// This is the gate's only writer; the server's sampler thread calls it
-    /// once per sample with the final reading of that sample (ADR-2633
-    /// section 2, as amended for issue #2806), and a test can call it to
-    /// hold the gate closed.
+    /// Records a host available-memory reading, the floor it was compared
+    /// against, and whether the gate is open. This is the gate's only
+    /// writer; the server's sampler thread calls it once per sample with
+    /// the final reading of that sample and its decision (ADR-2633 section
+    /// 2, as amended for issues #2806 and #2838: closed once enough
+    /// consecutive readings were below the floor, open again on the first
+    /// reading at or above it), and a test can call it to hold the gate
+    /// closed.
     ///
-    /// The gate is disabled by never calling this. A floor of 0 opens the
-    /// gate for every reading.
-    pub fn set_host_memory_gate(&self, available: u64, floor: u64) {
+    /// A closed gate must come with `available < floor`: the refusal path
+    /// re-reads the two figures and admits when they show the gate open,
+    /// so a caller that closes on a reading at or above the floor gets no
+    /// refusals. The gate is disabled by never calling this.
+    pub fn set_host_memory_gate(&self, open: bool, available: u64, floor: u64) {
         self.gate.available.store(available, Ordering::Relaxed);
         self.gate.floor.store(floor, Ordering::Relaxed);
         // Release pairs with the acquire fence on the refusal path, so a
         // refusal reads each figure from this call or a later one; see the
         // `ResidentGate` doc for why the pair stays consistent.
-        self.gate.open.store(available >= floor, Ordering::Release);
+        self.gate.open.store(open, Ordering::Release);
     }
 
     /// Whether the memory gate is open. A relaxed load: the check sites
@@ -775,7 +785,7 @@ mod tests {
         budget.try_reserve(10).expect("the gate starts open");
         assert!(budget.gate_open());
 
-        budget.set_host_memory_gate(300, 500);
+        budget.set_host_memory_gate(false, 300, 500);
         assert!(!budget.gate_open());
         assert_eq!(budget.gate_available(), 300);
         assert_eq!(budget.gate_floor(), 500);
@@ -803,28 +813,41 @@ mod tests {
         assert_eq!(budget.reserved(), 10);
     }
 
-    /// The floor is open: a reading equal to it keeps the gate open, and
-    /// one byte below it closes.
+    /// The setter stores the caller's decision, not one of its own: a
+    /// reading below the floor written open (the sampler's short sub-floor
+    /// run, issue #2838) admits, and the same reading written closed
+    /// refuses.
     ///
-    /// FLIP: close on `available <= floor` in `set_host_memory_gate` and the
-    /// first `gate_open()` assertion fails.
+    /// FLIP: derive the flag in `set_host_memory_gate` (`open.store(available
+    /// >= floor)`) and the first `gate_open()` assertion fails.
     #[test]
-    fn a_reading_at_the_floor_opens_and_one_below_closes() {
+    fn the_setter_stores_the_callers_decision() {
         let budget = Arc::new(MemoryBudget::new(100));
-        budget.set_host_memory_gate(500, 500);
-        assert!(budget.gate_open(), "at the floor opens");
+        budget.set_host_memory_gate(true, 499, 500);
+        assert!(
+            budget.gate_open(),
+            "a sub-floor reading written open stays open"
+        );
+        assert_eq!(budget.gate_available(), 499);
+        assert_eq!(budget.gate_floor(), 500);
         let guard = budget.reserve(1).expect("an open gate admits");
         assert_eq!(budget.reserved(), 1);
         drop(guard);
 
-        budget.set_host_memory_gate(499, 500);
-        assert!(!budget.gate_open(), "below the floor closes");
+        budget.set_host_memory_gate(false, 499, 500);
+        assert!(
+            !budget.gate_open(),
+            "the same reading written closed closes"
+        );
         budget
             .reserve(1)
             .expect_err("reserve goes through the closed gate");
 
-        budget.set_host_memory_gate(1_000, 500);
-        assert!(budget.gate_open(), "above the floor reopens");
+        budget.set_host_memory_gate(true, 1_000, 500);
+        assert!(
+            budget.gate_open(),
+            "a reading above the floor written open reopens"
+        );
         budget.try_reserve(100).expect("the whole limit fits again");
     }
 
@@ -841,7 +864,7 @@ mod tests {
             (0, 0)
         );
 
-        budget.set_host_memory_gate(4, 5);
+        budget.set_host_memory_gate(false, 4, 5);
         budget.try_reserve(1).expect_err("closed");
         assert_eq!(budget.gate_refusals(), 1);
         assert_eq!(budget.accounted_refusals(), 0);
@@ -852,7 +875,7 @@ mod tests {
             "an admitted call counts nothing"
         );
 
-        budget.set_host_memory_gate(10, 5);
+        budget.set_host_memory_gate(true, 10, 5);
         let err = budget.try_reserve(101).expect_err("101 of 100");
         assert_eq!(
             err,
@@ -883,7 +906,7 @@ mod tests {
     #[test]
     fn a_closed_flag_with_a_reading_at_the_floor_admits_and_counts_nothing() {
         let budget = MemoryBudget::new(100);
-        budget.set_host_memory_gate(500, 500);
+        budget.set_host_memory_gate(true, 500, 500);
         budget.gate.open.store(false, Ordering::Relaxed);
         budget
             .try_reserve(1)
@@ -898,7 +921,7 @@ mod tests {
     #[test]
     fn reserve_unchecked_ignores_a_closed_gate() {
         let budget = MemoryBudget::new(100);
-        budget.set_host_memory_gate(4, 5);
+        budget.set_host_memory_gate(false, 4, 5);
         assert_eq!(budget.reserve_unchecked(30), 30);
         assert_eq!(budget.reserved(), 30);
         assert_eq!(

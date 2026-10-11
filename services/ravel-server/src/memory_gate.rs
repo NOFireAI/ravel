@@ -1,12 +1,16 @@
 //! The memory gate's server side (ADR-2633 task 2, issue #2730, amended for
-//! issue #2806): startup resolution and its stamp, the `ravel-memory-gate`
-//! sampler thread, and the figures `/metrics` renders for it.
+//! issues #2806 and #2838): startup resolution and its stamp, the
+//! `ravel-memory-gate` sampler thread, and the figures `/metrics` renders
+//! for it.
 //!
 //! The gate closes on the host's available memory, never on the process's
 //! own resident size or on the budget: a warm server whose read caches are
 //! full sits far above any mark on its own memory while the host still has
 //! memory to spare, and the one quantity that separates a server the kernel
-//! kills from one it does not is host available memory.
+//! kills from one it does not is host available memory. It closes only
+//! after `--memory-gate-close-after-samples` consecutive readings below the
+//! close floor, so a dip shorter than that does not refuse work, and it
+//! reopens on the first reading at or above the floor.
 //!
 //! The gate state itself lives in [`ravel_memory::MemoryBudget`]; this module
 //! is its only writer. When the gate is off the sampler is never started, so
@@ -46,6 +50,15 @@ pub const MIN_PURGE_MIN_INTERVAL_MS: u64 = 100;
 pub const MAX_PURGE_MIN_INTERVAL_MS: u64 = 600_000;
 /// Default `--memory-gate-interval-ms`.
 pub const DEFAULT_INTERVAL_MS: u64 = 100;
+/// Default `--memory-gate-close-after-samples`: at the default interval a
+/// dip must last at least 300 ms to close the gate, where a dip shorter
+/// than the acceptance run's own 2 s host sampler period used to close it
+/// for a whole phase (issue #2838).
+pub const DEFAULT_CLOSE_AFTER_SAMPLES: u32 = 3;
+/// The accepted range of `--memory-gate-close-after-samples`; 1 closes on
+/// the first reading below the floor.
+pub const MIN_CLOSE_AFTER_SAMPLES: u32 = 1;
+pub const MAX_CLOSE_AFTER_SAMPLES: u32 = 100;
 /// Default `--memory-gate-wait-ms`.
 pub const DEFAULT_WAIT_MS: u64 = 2000;
 
@@ -75,6 +88,7 @@ pub struct MemoryGateFlags {
     pub purge_available_bytes: Option<u64>,
     pub purge_min_interval_ms: u64,
     pub interval_ms: u64,
+    pub close_after_samples: u32,
     pub wait_ms: u64,
     pub disabled: bool,
 }
@@ -113,17 +127,21 @@ impl HostMemorySource {
     }
 }
 
-/// The sampler's two floors and the purge spacing, the part of a resolved
-/// gate each sample decides on.
+/// The sampler's two floors, the purge spacing and the close run length,
+/// the part of a resolved gate each sample decides on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Floors {
-    /// The gate is closed while the final available reading of a sample is
-    /// below this.
+    /// A sample whose final available reading is below this is below the
+    /// floor; the gate closes once `close_after_samples` consecutive
+    /// samples are, and reopens on the first sample at or above it.
     pub min_available: u64,
     /// A forced purge runs when the available reading is below this and the
     /// previous purge started at least `purge_min_interval` ago.
     pub purge_available: u64,
     pub purge_min_interval: Duration,
+    /// `--memory-gate-close-after-samples`: how many consecutive samples
+    /// below `min_available` close the gate.
+    pub close_after_samples: u32,
 }
 
 /// The resolved memory gate, stamped once at startup by [`MemoryGate::emit`].
@@ -139,6 +157,8 @@ pub struct MemoryGate {
     pub purge_available_bytes: u64,
     pub purge_min_interval_ms: u64,
     pub interval_ms: u64,
+    /// Consecutive samples below the close floor that close the gate.
+    pub close_after_samples: u32,
     pub wait_ms: u64,
     /// The resolved `memory_budget_bytes`, stamped beside the floors so a
     /// reader can see what the gate no longer derives from.
@@ -162,6 +182,7 @@ impl MemoryGate {
             purge_available_bytes = self.purge_available_bytes,
             purge_min_interval_ms = self.purge_min_interval_ms,
             interval_ms = self.interval_ms,
+            close_after_samples = self.close_after_samples,
             wait_ms = self.wait_ms,
             memory_budget_bytes = self.memory_budget_bytes,
             available_source = self.available_source.as_str(),
@@ -179,6 +200,7 @@ impl MemoryGate {
             min_available: self.min_available_bytes,
             purge_available: self.purge_available_bytes,
             purge_min_interval: Duration::from_millis(self.purge_min_interval_ms),
+            close_after_samples: self.close_after_samples,
         }
     }
 }
@@ -328,6 +350,7 @@ pub fn resolve(
         purge_available_bytes: 0,
         purge_min_interval_ms: flags.purge_min_interval_ms,
         interval_ms: flags.interval_ms,
+        close_after_samples: flags.close_after_samples,
         wait_ms: flags.wait_ms,
         memory_budget_bytes: performance.memory_budget_bytes,
         available_source: if host.cgroup_memory_limit_bytes.is_some() {
@@ -406,6 +429,7 @@ impl Cli {
             purge_available_bytes: self.memory_gate_purge_available_bytes,
             purge_min_interval_ms: self.memory_gate_purge_min_interval_ms,
             interval_ms: self.memory_gate_interval_ms,
+            close_after_samples: self.memory_gate_close_after_samples,
             wait_ms: self.memory_gate_wait_ms,
             disabled: self.disable_memory_gate,
         };
@@ -588,6 +612,7 @@ pub const PURGE_BUCKET_COUNT: usize = PURGE_BUCKET_BOUNDS_MICROS.len() + 1;
 #[derive(Debug)]
 pub struct MemoryGateStats {
     samples: AtomicU64,
+    samples_below_floor: AtomicU64,
     epoch_refresh_nanos: AtomicU64,
     purges: AtomicU64,
     purge_nanos: AtomicU64,
@@ -602,6 +627,9 @@ pub struct MemoryGateStats {
 pub struct MemoryGateStatsSnapshot {
     /// Samples that got an available-memory reading.
     pub samples: u64,
+    /// Samples whose final available reading was below the close floor,
+    /// whether or not the sample closed the gate.
+    pub samples_below_floor: u64,
     /// Wall time spent in epoch refresh plus the available and
     /// `stats.resident` reads, the re-read after a purge included.
     pub epoch_refresh_nanos: u64,
@@ -621,6 +649,7 @@ impl MemoryGateStats {
     pub const fn new() -> Self {
         Self {
             samples: AtomicU64::new(0),
+            samples_below_floor: AtomicU64::new(0),
             epoch_refresh_nanos: AtomicU64::new(0),
             purges: AtomicU64::new(0),
             purge_nanos: AtomicU64::new(0),
@@ -656,6 +685,7 @@ impl MemoryGateStats {
         }
         MemoryGateStatsSnapshot {
             samples: self.samples.load(Ordering::Relaxed),
+            samples_below_floor: self.samples_below_floor.load(Ordering::Relaxed),
             epoch_refresh_nanos: self.epoch_refresh_nanos.load(Ordering::Relaxed),
             purges: self.purges.load(Ordering::Relaxed),
             purge_nanos: self.purge_nanos.load(Ordering::Relaxed),
@@ -684,25 +714,36 @@ pub static STATS: MemoryGateStats = MemoryGateStats::new();
 pub enum Sample {
     /// The gate was set from `available`, the sample's final reading (the
     /// post-purge re-read when a purge ran). `resident` is the matching
-    /// `stats.resident` reading, `None` when it could not be read.
+    /// `stats.resident` reading, `None` when it could not be read. `closed`
+    /// is the gate state this sample wrote: a reading below the floor
+    /// leaves it open until the run of consecutive such readings reaches
+    /// `close_after_samples`.
     Sampled {
         available: u64,
         resident: Option<u64>,
         purged: bool,
         closed: bool,
     },
-    /// No available-memory reading; the gate keeps its previous state and
-    /// nothing is written.
+    /// No available-memory reading; the gate keeps its previous state,
+    /// the run of sub-floor samples keeps its count, and nothing is
+    /// written.
     Unread,
 }
 
-/// One sampler pass (ADR-2633 sections 1 and 2, as amended for issue #2806):
-/// read the host's available memory and `stats.resident`; below the purge
-/// floor, purge once if the previous purge started at least the minimum
-/// interval ago, and re-read both; then set the gate from the final
-/// available reading, closed below the close floor. A sample below the
-/// close floor whose purge is rate-limited closes on the reading it has.
-/// When a re-read fails the figure from before the purge stands.
+/// One sampler pass (ADR-2633 sections 1 and 2, as amended for issues
+/// #2806 and #2838): read the host's available memory and
+/// `stats.resident`; below the purge floor, purge once if the previous
+/// purge started at least the minimum interval ago, and re-read both; then
+/// set the gate from the final available reading. A reading below the
+/// close floor extends `below_floor_run`, the count of consecutive such
+/// readings, and the gate is closed once that count reaches
+/// `floors.close_after_samples`; a reading at or above the floor resets
+/// the count to 0 and opens the gate at once. The setter is written on
+/// every readable sample, so the budget's available gauge shows a reading
+/// below the floor while the gate is still open. A sample below the close
+/// floor whose purge is rate-limited decides on the reading it has. When a
+/// re-read fails the figure from before the purge stands. An unread sample
+/// returns before the run is touched.
 ///
 /// `now` is the injected clock: every instant this pass needs, the purge
 /// spacing included, comes from it and never from `Instant::now()`.
@@ -713,6 +754,7 @@ pub fn sample_once(
     floors: Floors,
     now: &mut impl FnMut() -> Instant,
     last_purge: &mut Option<Instant>,
+    below_floor_run: &mut u32,
     read_available: &mut impl FnMut() -> Option<u64>,
     read_resident: &mut impl FnMut() -> Option<u64>,
     purge: &mut impl FnMut(),
@@ -752,12 +794,24 @@ pub fn sample_once(
     if let Some(resident) = resident {
         stats.resident_bytes.store(resident, Ordering::Relaxed);
     }
-    budget.set_host_memory_gate(available, floors.min_available);
+    let below_floor = available < floors.min_available;
+    *below_floor_run = if below_floor {
+        below_floor_run.saturating_add(1)
+    } else {
+        0
+    };
+    let closed = below_floor && *below_floor_run >= floors.close_after_samples;
+    // The gate is written before the sub-floor count moves, so a scrape
+    // that reads the count at the close threshold reads a closed gate.
+    budget.set_host_memory_gate(!closed, available, floors.min_available);
+    if below_floor {
+        stats.samples_below_floor.fetch_add(1, Ordering::Relaxed);
+    }
     Sample::Sampled {
         available,
         resident,
         purged,
-        closed: available < floors.min_available,
+        closed,
     }
 }
 
@@ -802,6 +856,7 @@ fn run_sampler(
 ) {
     let mut now = Instant::now;
     let mut last_purge = None;
+    let mut below_floor_run = 0;
     let mut files = ProcFiles;
     let mut warned_source = false;
     let mut read_available = move || {
@@ -838,6 +893,7 @@ fn run_sampler(
             floors,
             &mut now,
             &mut last_purge,
+            &mut below_floor_run,
             &mut read_available,
             &mut read_resident,
             &mut purge,
@@ -896,17 +952,27 @@ mod tests {
             purge_available_bytes: None,
             purge_min_interval_ms: DEFAULT_PURGE_MIN_INTERVAL_MS,
             interval_ms: DEFAULT_INTERVAL_MS,
+            close_after_samples: DEFAULT_CLOSE_AFTER_SAMPLES,
             wait_ms: DEFAULT_WAIT_MS,
             disabled: false,
         }
     }
 
-    /// The default floors on the 32 GiB host.
+    /// The default floors on the 32 GiB host, closing after the default 3
+    /// consecutive sub-floor samples.
     fn floors() -> Floors {
+        floors_closing_after(DEFAULT_CLOSE_AFTER_SAMPLES)
+    }
+
+    /// The default floors on the 32 GiB host, closing after
+    /// `close_after_samples` consecutive sub-floor samples; 1 is the
+    /// single-sample close.
+    fn floors_closing_after(close_after_samples: u32) -> Floors {
         Floors {
             min_available: FLOOR_32G,
             purge_available: PURGE_FLOOR_32G,
             purge_min_interval: Duration::from_millis(DEFAULT_PURGE_MIN_INTERVAL_MS),
+            close_after_samples,
         }
     }
 
@@ -1012,21 +1078,48 @@ mod tests {
         }
     }
 
-    /// One sample with fixed readings and a purge that reclaims nothing.
+    /// One sample at the default floors with fixed readings and a purge
+    /// that reclaims nothing.
     fn run_sample(
         budget: &MemoryBudget,
         stats: &MemoryGateStats,
         clock: &TestClock,
         last_purge: &mut Option<Instant>,
+        below_floor_run: &mut u32,
+        available: u64,
+        resident: u64,
+    ) -> Sample {
+        run_sample_with(
+            floors(),
+            budget,
+            stats,
+            clock,
+            last_purge,
+            below_floor_run,
+            available,
+            resident,
+        )
+    }
+
+    /// [`run_sample`] at `floors`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_sample_with(
+        floors: Floors,
+        budget: &MemoryBudget,
+        stats: &MemoryGateStats,
+        clock: &TestClock,
+        last_purge: &mut Option<Instant>,
+        below_floor_run: &mut u32,
         available: u64,
         resident: u64,
     ) -> Sample {
         sample_once(
             budget,
             stats,
-            floors(),
+            floors,
             &mut clock.now(),
             last_purge,
+            below_floor_run,
             &mut || Some(available),
             &mut || Some(resident),
             &mut || {},
@@ -1046,7 +1139,16 @@ mod tests {
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
-        let sample = run_sample(&budget, &stats, &clock, &mut last_purge, GB, 29 * GB);
+        let mut below_floor_run = 0;
+        let sample = run_sample(
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            &mut below_floor_run,
+            GB,
+            29 * GB,
+        );
         assert_eq!(
             sample,
             Sample::Sampled {
@@ -1063,20 +1165,22 @@ mod tests {
         assert_eq!(stats.snapshot().resident_bytes, 29 * GB);
     }
 
-    /// Available memory falling 1.0, 0.8, 0.6 GB across three samples, with
-    /// a purge that reclaims nothing: the gate closes at 0.6 GB, below the
-    /// 687 MB floor, and the refusal carries the host-memory cause. The
-    /// second and third samples are below the purge floor but their purge
-    /// is rate-limited, so they decide on the reading they have.
+    /// Available memory falling 1.0, 0.8, 0.6 GB and staying at 0.6 GB,
+    /// with a purge that reclaims nothing: at the default 3 the gate closes
+    /// on the third consecutive sample at 0.6 GB, below the 687 MB floor,
+    /// and the refusal carries the host-memory cause. The samples after the
+    /// first are below the purge floor but their purge is rate-limited, so
+    /// they decide on the reading they have.
     ///
-    /// FLIP: never close (write `available.max(floors.min_available)` to
-    /// the budget) and the third sample leaves the gate open.
+    /// FLIP: never close (write `true` to the budget) and the fifth sample
+    /// leaves the gate open.
     #[test]
     fn the_gate_closes_before_the_kill() {
         let budget = MemoryBudget::new(u64::MAX);
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
+        let mut below_floor_run = 0;
         let mut purges = 0;
         let mut run = |available: u64| {
             clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
@@ -1086,6 +1190,7 @@ mod tests {
                 floors(),
                 &mut clock.now(),
                 &mut last_purge,
+                &mut below_floor_run,
                 &mut || Some(available),
                 &mut || Some(29 * GB),
                 &mut || purges += 1,
@@ -1114,9 +1219,23 @@ mod tests {
         );
         assert!(budget.gate_open());
 
-        let third = run(600_000_000);
+        for sub_floor_sample in 1..DEFAULT_CLOSE_AFTER_SAMPLES {
+            let open = run(600_000_000);
+            assert_eq!(
+                open,
+                Sample::Sampled {
+                    available: 600_000_000,
+                    resident: Some(29 * GB),
+                    purged: false,
+                    closed: false,
+                },
+                "sub-floor sample {sub_floor_sample} of {DEFAULT_CLOSE_AFTER_SAMPLES}"
+            );
+            assert!(budget.gate_open());
+        }
+        let closing = run(600_000_000);
         assert_eq!(
-            third,
+            closing,
             Sample::Sampled {
                 available: 600_000_000,
                 resident: Some(29 * GB),
@@ -1152,20 +1271,432 @@ mod tests {
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
-        run_sample(
+        let mut below_floor_run = 0;
+        run_sample_with(
+            floors_closing_after(1),
             &budget,
             &stats,
             &clock,
             &mut last_purge,
+            &mut below_floor_run,
             600_000_000,
             29 * GB,
         );
         assert!(!budget.gate_open());
         clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
-        let sample = run_sample(&budget, &stats, &clock, &mut last_purge, GB, 29 * GB);
+        let sample = run_sample_with(
+            floors_closing_after(1),
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            &mut below_floor_run,
+            GB,
+            29 * GB,
+        );
         assert!(matches!(sample, Sample::Sampled { closed: false, .. }));
         assert!(budget.gate_open());
         budget.try_reserve(1).expect("a reopened gate admits");
+    }
+
+    /// Issue #2838: two samples below the floor and one at or above it, at
+    /// the default 3, never close the gate; the setter is written on each,
+    /// so the budget's available gauge shows the dip while the gate stays
+    /// open.
+    ///
+    /// FLIP: close on the first sub-floor sample (`closed = below_floor`,
+    /// the single-sample close before this fix) and the first sub-floor
+    /// sample reports closed.
+    #[test]
+    fn two_sub_floor_samples_then_one_above_keep_the_gate_open() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        for available in [530_000_000, 600_000_000, FLOOR_32G] {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            let sample = run_sample(
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                available,
+                29 * GB,
+            );
+            assert!(
+                matches!(sample, Sample::Sampled { closed: false, .. }),
+                "{available}: {sample:?}"
+            );
+            assert!(budget.gate_open(), "{available}");
+            assert_eq!(budget.gate_available(), available);
+            assert_eq!(budget.gate_floor(), FLOOR_32G);
+            budget.try_reserve(1).expect("an open gate admits");
+        }
+        assert_eq!(below_floor_run, 0, "the sample at the floor reset the run");
+        assert_eq!(stats.snapshot().samples_below_floor, 2);
+    }
+
+    /// Issue #2838: the third consecutive sample below the floor closes the
+    /// gate at the default 3, and the refusal carries that sample's
+    /// reading.
+    ///
+    /// FLIP: close on the first sub-floor sample (`closed = below_floor`)
+    /// and the first sample reports closed; require one more
+    /// (`below_floor_run > close_after_samples`) and the third leaves the
+    /// gate open.
+    #[test]
+    fn three_consecutive_sub_floor_samples_close_it() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        let mut sample = |available: u64| {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            run_sample(
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                available,
+                29 * GB,
+            )
+        };
+        assert!(matches!(
+            sample(600_000_000),
+            Sample::Sampled { closed: false, .. }
+        ));
+        assert!(matches!(
+            sample(550_000_000),
+            Sample::Sampled { closed: false, .. }
+        ));
+        assert!(budget.gate_open());
+        assert!(matches!(
+            sample(530_000_000),
+            Sample::Sampled {
+                available: 530_000_000,
+                closed: true,
+                ..
+            }
+        ));
+        assert!(!budget.gate_open());
+        assert_eq!(below_floor_run, 3);
+        let refused = budget
+            .try_reserve(1)
+            .expect_err("a closed gate refuses one byte");
+        assert_eq!(
+            refused.cause,
+            ravel_memory::ExhaustionCause::HostMemory {
+                available: 530_000_000,
+                floor: FLOOR_32G,
+            }
+        );
+        assert_eq!(stats.snapshot().samples_below_floor, 3);
+    }
+
+    /// Issue #2838: the close is debounced, the reopen is not. One sample
+    /// at the floor after a closed gate reopens it at once, and the next
+    /// close needs a fresh run of 3.
+    ///
+    /// FLIP: debounce both ways (reopen only once a run of
+    /// `close_after_samples` samples at or above the floor) and the sample
+    /// at the floor leaves the gate closed.
+    #[test]
+    fn one_sample_at_the_floor_reopens_a_closed_gate_at_once() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        let mut sample = |available: u64| {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            run_sample(
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                available,
+                29 * GB,
+            )
+        };
+        for _ in 0..DEFAULT_CLOSE_AFTER_SAMPLES {
+            sample(600_000_000);
+        }
+        assert!(!budget.gate_open());
+
+        let reopened = sample(FLOOR_32G);
+        assert!(matches!(reopened, Sample::Sampled { closed: false, .. }));
+        assert!(budget.gate_open(), "one sample at the floor reopens");
+        assert_eq!(budget.gate_available(), FLOOR_32G);
+        budget.try_reserve(1).expect("a reopened gate admits");
+
+        // The next close needs a fresh run.
+        assert!(matches!(
+            sample(600_000_000),
+            Sample::Sampled { closed: false, .. }
+        ));
+        assert!(budget.gate_open());
+        assert_eq!(below_floor_run, 1);
+    }
+
+    /// Issue #2838: below, below, above, below, below leaves the gate open,
+    /// since the sample above the floor reset the run.
+    ///
+    /// FLIP: never reset (drop the `else` arm that writes 0 to
+    /// `below_floor_run`) and the fifth sample closes the gate.
+    #[test]
+    fn a_sample_above_the_floor_resets_the_run() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        for available in [600_000_000, 600_000_000, GB, 600_000_000, 600_000_000] {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            let sample = run_sample(
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                available,
+                29 * GB,
+            );
+            assert!(
+                matches!(sample, Sample::Sampled { closed: false, .. }),
+                "{available}: {sample:?}"
+            );
+            assert!(budget.gate_open(), "{available}");
+        }
+        assert_eq!(below_floor_run, 2);
+        assert_eq!(stats.snapshot().samples_below_floor, 4);
+    }
+
+    /// Issue #2838: below, unread, below, below closes at the third
+    /// sub-floor reading, since an unread sample neither counts nor resets.
+    ///
+    /// FLIP: reset on the unread path (`*below_floor_run = 0` before
+    /// returning `Unread`) and the fourth sample leaves the gate open;
+    /// count the unread sample (`saturating_add(1)` there) and the third
+    /// closes it.
+    #[test]
+    fn an_unread_sample_neither_counts_nor_resets() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        let mut sample = |available: Option<u64>, below_floor_run: &mut u32| {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            sample_once(
+                &budget,
+                &stats,
+                floors(),
+                &mut clock.now(),
+                &mut last_purge,
+                below_floor_run,
+                &mut || available,
+                &mut || Some(29 * GB),
+                &mut || {},
+            )
+        };
+        assert!(matches!(
+            sample(Some(600_000_000), &mut below_floor_run),
+            Sample::Sampled { closed: false, .. }
+        ));
+        assert_eq!(sample(None, &mut below_floor_run), Sample::Unread);
+        assert!(budget.gate_open());
+        assert_eq!(
+            below_floor_run, 1,
+            "an unread sample neither counts nor resets"
+        );
+        assert!(matches!(
+            sample(Some(600_000_000), &mut below_floor_run),
+            Sample::Sampled { closed: false, .. }
+        ));
+        assert!(budget.gate_open());
+        assert!(matches!(
+            sample(Some(600_000_000), &mut below_floor_run),
+            Sample::Sampled { closed: true, .. }
+        ));
+        assert!(!budget.gate_open());
+        assert_eq!(below_floor_run, 3);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.samples, 3);
+        assert_eq!(snapshot.samples_below_floor, 3);
+    }
+
+    /// Issue #2838: `--memory-gate-close-after-samples 1` is the behaviour
+    /// before this fix exactly: the 1.0, 0.8, 0.6 GB sequence closes on the
+    /// first sample below the floor.
+    ///
+    /// FLIP: require one more sample than the flag says
+    /// (`below_floor_run > close_after_samples`) and the sample at 0.6 GB
+    /// leaves the gate open.
+    #[test]
+    fn close_after_samples_one_is_the_old_behaviour() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        let mut sample = |available: u64| {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            run_sample_with(
+                floors_closing_after(1),
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                available,
+                29 * GB,
+            )
+        };
+        assert!(matches!(
+            sample(GB),
+            Sample::Sampled {
+                purged: true,
+                closed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            sample(800_000_000),
+            Sample::Sampled {
+                purged: false,
+                closed: false,
+                ..
+            }
+        ));
+        assert!(budget.gate_open());
+        assert_eq!(
+            sample(600_000_000),
+            Sample::Sampled {
+                available: 600_000_000,
+                resident: Some(29 * GB),
+                purged: false,
+                closed: true,
+            }
+        );
+        assert!(!budget.gate_open());
+        assert_eq!(below_floor_run, 1);
+        let refused = budget
+            .try_reserve(1)
+            .expect_err("a closed gate refuses one byte");
+        assert_eq!(
+            refused.cause,
+            ravel_memory::ExhaustionCause::HostMemory {
+                available: 600_000_000,
+                floor: FLOOR_32G,
+            }
+        );
+    }
+
+    /// Issue #2838: while the run is short the setter is still written,
+    /// with the gate open and the sub-floor reading, so
+    /// `ravel_memory_gate_available_bytes` shows the dip; the floor gauge
+    /// is written beside it.
+    ///
+    /// FLIP: skip the setter while the run is short (`if !below_floor ||
+    /// closed`) and the gauge still reads the 1.0 GB of the first sample;
+    /// write the reading clamped to the floor
+    /// (`available.max(floors.min_available)`) and it reads the floor.
+    #[test]
+    fn the_gauge_shows_the_dip_while_the_gate_stays_open() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        run_sample(
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            &mut below_floor_run,
+            GB,
+            29 * GB,
+        );
+        assert_eq!(budget.gate_available(), GB);
+
+        clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+        let sample = run_sample(
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            &mut below_floor_run,
+            530_000_000,
+            29 * GB,
+        );
+        assert!(matches!(sample, Sample::Sampled { closed: false, .. }));
+        assert!(budget.gate_open());
+        assert_eq!(
+            budget.gate_available(),
+            530_000_000,
+            "the gauge shows the dip"
+        );
+        assert_eq!(budget.gate_floor(), FLOOR_32G);
+        budget.try_reserve(1).expect("an open gate admits");
+    }
+
+    /// Issue #2838: every sample below the floor counts on
+    /// `samples_below_floor`, before and after the gate closes, and a
+    /// sample at or above the floor does not.
+    ///
+    /// FLIP: count only the closing samples (`if closed`) and the count
+    /// reads 3 after 5; count every sample and it reads 6.
+    #[test]
+    fn every_sub_floor_sample_counts_closed_or_open() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let mut below_floor_run = 0;
+        let mut sample = |available: u64| {
+            clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+            run_sample(
+                &budget,
+                &stats,
+                &clock,
+                &mut last_purge,
+                &mut below_floor_run,
+                available,
+                29 * GB,
+            )
+        };
+        sample(GB);
+        assert_eq!(stats.snapshot().samples_below_floor, 0);
+        for (sub_floor_samples, available) in [530_000_000, 530_000_000].into_iter().enumerate() {
+            sample(available);
+            assert!(budget.gate_open());
+            assert_eq!(
+                stats.snapshot().samples_below_floor,
+                sub_floor_samples as u64 + 1,
+                "an open gate's sub-floor sample counts"
+            );
+        }
+        for (sub_floor_samples, available) in [530_000_000, 530_000_000, 530_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            sample(available);
+            assert!(!budget.gate_open());
+            assert_eq!(
+                stats.snapshot().samples_below_floor,
+                sub_floor_samples as u64 + 3,
+                "a closed gate's sub-floor sample counts"
+            );
+        }
+        sample(FLOOR_32G);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.samples_below_floor, 5);
+        assert_eq!(snapshot.samples, 7);
     }
 
     /// Available 1.2 GB is below the 1.37 GB purge floor and above the
@@ -1179,11 +1710,13 @@ mod tests {
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
+        let mut below_floor_run = 0;
         let sample = run_sample(
             &budget,
             &stats,
             &clock,
             &mut last_purge,
+            &mut below_floor_run,
             1_200_000_000,
             20 * GB,
         );
@@ -1207,6 +1740,7 @@ mod tests {
             &stats,
             &clock,
             &mut last_purge,
+            &mut below_floor_run,
             PURGE_FLOOR_32G,
             20 * GB,
         );
@@ -1236,6 +1770,7 @@ mod tests {
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
+        let mut below_floor_run = 0;
         let mut purges = 0;
         let mut purged_at = Vec::new();
         for index in 0..51 {
@@ -1248,6 +1783,7 @@ mod tests {
                 floors(),
                 &mut clock.now(),
                 &mut last_purge,
+                &mut below_floor_run,
                 &mut || Some(1_200_000_000),
                 &mut || Some(20 * GB),
                 &mut || purges += 1,
@@ -1274,18 +1810,28 @@ mod tests {
     }
 
     /// A reading exactly at the close floor leaves the gate open: the gate
-    /// closes below the floor, not at it.
+    /// closes below the floor, not at it. At a close run of 1, so the
+    /// boundary alone decides.
     ///
-    /// FLIP: `closed: available <= floors.min_available` and this sample
-    /// reports closed; `open.store(available > floor)` in the budget's
-    /// setter and the gate is closed.
+    /// FLIP: `below_floor = available <= floors.min_available` and this
+    /// sample reports closed.
     #[test]
     fn a_reading_at_the_close_floor_stays_open() {
         let budget = MemoryBudget::new(u64::MAX);
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
-        let sample = run_sample(&budget, &stats, &clock, &mut last_purge, FLOOR_32G, 20 * GB);
+        let mut below_floor_run = 0;
+        let sample = run_sample_with(
+            floors_closing_after(1),
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            &mut below_floor_run,
+            FLOOR_32G,
+            20 * GB,
+        );
         assert_eq!(
             sample,
             Sample::Sampled {
@@ -1301,16 +1847,19 @@ mod tests {
 
         // One byte below closes.
         clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
-        let sample = run_sample(
+        let sample = run_sample_with(
+            floors_closing_after(1),
             &budget,
             &stats,
             &clock,
             &mut last_purge,
+            &mut below_floor_run,
             FLOOR_32G - 1,
             20 * GB,
         );
         assert!(matches!(sample, Sample::Sampled { closed: true, .. }));
         assert!(!budget.gate_open());
+        assert_eq!(stats.snapshot().samples_below_floor, 1);
     }
 
     /// An unreadable available memory leaves the gate in its last state and
@@ -1325,36 +1874,47 @@ mod tests {
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
+        let mut below_floor_run = 0;
         let mut purges = 0;
-        let mut unread = |budget: &MemoryBudget, last_purge: &mut Option<Instant>| {
-            sample_once(
-                budget,
-                &stats,
-                floors(),
-                &mut clock.now(),
-                last_purge,
-                &mut || None,
-                &mut || Some(20 * GB),
-                &mut || purges += 1,
-            )
-        };
-        assert_eq!(unread(&budget, &mut last_purge), Sample::Unread);
+        let mut unread =
+            |budget: &MemoryBudget, last_purge: &mut Option<Instant>, below_floor_run: &mut u32| {
+                sample_once(
+                    budget,
+                    &stats,
+                    floors_closing_after(1),
+                    &mut clock.now(),
+                    last_purge,
+                    below_floor_run,
+                    &mut || None,
+                    &mut || Some(20 * GB),
+                    &mut || purges += 1,
+                )
+            };
+        assert_eq!(
+            unread(&budget, &mut last_purge, &mut below_floor_run),
+            Sample::Unread
+        );
         assert!(budget.gate_open());
         assert_eq!(budget.gate_available(), 0);
         assert_eq!(budget.gate_floor(), 0, "the setter was not called");
 
-        run_sample(
+        run_sample_with(
+            floors_closing_after(1),
             &budget,
             &stats,
             &clock,
             &mut last_purge,
+            &mut below_floor_run,
             600_000_000,
             20 * GB,
         );
         assert!(!budget.gate_open());
         let purged_at = last_purge.expect("the readable sample purged");
         clock.advance(Duration::from_secs(10));
-        assert_eq!(unread(&budget, &mut last_purge), Sample::Unread);
+        assert_eq!(
+            unread(&budget, &mut last_purge, &mut below_floor_run),
+            Sample::Unread
+        );
         assert!(!budget.gate_open(), "a closed gate stays closed");
         assert_eq!(budget.gate_available(), 600_000_000);
         assert_eq!(
@@ -1376,6 +1936,7 @@ mod tests {
         let stats = MemoryGateStats::new();
         let clock = TestClock::new();
         let mut last_purge = None;
+        let mut below_floor_run = 0;
         let mut availables = [GB, 2 * GB].into_iter();
         let mut residents = [29 * GB, 25 * GB].into_iter();
         let sample = sample_once(
@@ -1384,6 +1945,7 @@ mod tests {
             floors(),
             &mut clock.now(),
             &mut last_purge,
+            &mut below_floor_run,
             &mut || availables.next(),
             &mut || residents.next(),
             &mut || {},
@@ -1406,9 +1968,10 @@ mod tests {
         let sample = sample_once(
             &budget,
             &stats,
-            floors(),
+            floors_closing_after(1),
             &mut clock.now(),
             &mut last_purge,
+            &mut below_floor_run,
             &mut || availables.next().filter(|reading| *reading > 0),
             &mut || residents.next(),
             &mut || {},
@@ -1928,13 +2491,33 @@ mod tests {
         assert_eq!(gate.min_available_bytes, 512 * MIB);
     }
 
-    /// clap refuses a close floor under 64 MiB and a purge spacing outside
-    /// 100 to 600000 ms, and accepts each bound.
+    /// clap refuses a close floor under 64 MiB, a purge spacing outside
+    /// 100 to 600000 ms and a close run outside 1 to 100 samples, and
+    /// accepts each bound.
     ///
-    /// FLIP: widen either range in `Cli` (`range(0..)`, `range(1..)`) and
-    /// the refused value parses.
+    /// FLIP: widen any range in `Cli` (`range(0..)`, `range(1..)`,
+    /// `range(0..=101)`) and the refused value parses.
     #[test]
     fn the_flag_ranges_are_enforced_at_parse() {
+        for refused in ["0", "101"] {
+            let error = parse_cli(&["--memory-gate-close-after-samples", refused])
+                .expect_err("outside 1 to 100");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+        for (accepted, expected) in [("1", 1), ("100", 100)] {
+            let cli = parse_cli(&["--memory-gate-close-after-samples", accepted])
+                .expect("inside 1 to 100");
+            assert_eq!(cli.memory_gate_close_after_samples, expected);
+        }
+        assert_eq!(
+            parse_cli(&[])
+                .expect("defaults parse")
+                .memory_gate_close_after_samples,
+            DEFAULT_CLOSE_AFTER_SAMPLES
+        );
+        assert_eq!(DEFAULT_CLOSE_AFTER_SAMPLES, 3);
+        assert_eq!((MIN_CLOSE_AFTER_SAMPLES, MAX_CLOSE_AFTER_SAMPLES), (1, 100));
+
         let refused = parse_cli(&["--memory-gate-min-available-bytes", "67108863"])
             .expect_err("one byte under 64 MiB");
         assert_eq!(refused.kind(), clap::error::ErrorKind::ValueValidation);
@@ -2080,6 +2663,7 @@ mod tests {
             &format!("purge_available_bytes={PURGE_FLOOR_32G}"),
             "purge_min_interval_ms=5000",
             "interval_ms=100",
+            "close_after_samples=3",
             "wait_ms=2000",
             &format!("memory_budget_bytes={}", 27 * GB),
             "available_source=\"meminfo\"",

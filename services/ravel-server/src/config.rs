@@ -2155,15 +2155,16 @@ pub struct Cli {
     #[arg(long)]
     pub disable_cache: bool,
 
-    /// Close the memory gate while the host's available memory is below this many bytes (64 MiB or more); default min(max(512 MiB, 2% of host memory), host memory / 8).
+    /// Close the memory gate once the host's available memory has been below this many bytes for --memory-gate-close-after-samples consecutive samples (64 MiB or more); default min(max(512 MiB, 2% of host memory), host memory / 8).
     ///
     /// Every `--memory-gate-interval-ms` the `ravel-memory-gate` sampler
     /// reads `MemAvailable` from `/proc/meminfo` and, under a finite cgroup
     /// memory limit, the cgroup's own headroom (`memory.max` minus
     /// `memory.current` plus `memory.stat`'s `inactive_file`), takes the
-    /// smaller, and closes the gate when the reading is below this floor; a
-    /// closed gate refuses memory reservations until a reading at or above
-    /// it (ADR-2633 section 2, as amended for issue #2806). Host memory is
+    /// smaller, and closes the gate once `--memory-gate-close-after-samples`
+    /// consecutive readings are below this floor; a closed gate refuses
+    /// memory reservations until a reading at or above it (ADR-2633
+    /// section 2, as amended for issues #2806 and #2838). Host memory is
     /// `MemTotal` capped by the cgroup memory limit, the figure the
     /// performance defaults resolve. The default is `max(512 MiB, 2 %)` on
     /// a host of 4 GiB or more and an eighth of host memory below that
@@ -2222,6 +2223,27 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(10..=1000)
     )]
     pub memory_gate_interval_ms: u64,
+
+    /// Close the memory gate only after this many consecutive samples below --memory-gate-min-available-bytes (1 to 100).
+    ///
+    /// A sample at or above the close floor resets the run and reopens a
+    /// closed gate at once, so reopening never waits. With 1 the gate
+    /// closes on the first sample below the floor. At the default 3 and the
+    /// default 100 ms interval a dip must last at least 300 ms to close the
+    /// gate; a shorter one is still counted on
+    /// `ravel_memory_gate_samples_below_floor_total` and shown on
+    /// `ravel_memory_gate_available_bytes`. The purge decision is not
+    /// affected (ADR-2633, as amended for issue #2838).
+    #[arg(
+        long,
+        value_name = "SAMPLES",
+        default_value_t = crate::memory_gate::DEFAULT_CLOSE_AFTER_SAMPLES,
+        value_parser = clap::value_parser!(u32).range(
+            i64::from(crate::memory_gate::MIN_CLOSE_AFTER_SAMPLES)
+                ..=i64::from(crate::memory_gate::MAX_CLOSE_AFTER_SAMPLES)
+        )
+    )]
+    pub memory_gate_close_after_samples: u32,
 
     /// Query admission wait on a closed memory gate, in milliseconds (0 means no wait); resolved and stamped at startup, not yet read by admission.
     ///
