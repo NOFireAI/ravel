@@ -52,21 +52,42 @@ impl Validity {
     }
 }
 
-/// The entries' bytes, concatenated. Held as a `String` when every entry is
-/// UTF-8, so [`DictValues::text`] slices it with no second validation.
+/// The entries' bytes, concatenated. Held as one `String` when every entry is
+/// UTF-8; otherwise the raw bytes beside a `String` of the UTF-8 entries alone,
+/// with its own offsets. Either way [`DictValues::text`] is a slice and a
+/// boundary check, never a second validation.
 #[derive(Debug)]
 enum Region {
     Text(String),
-    Raw(Vec<u8>),
+    Mixed {
+        raw: Vec<u8>,
+        /// The UTF-8 entries concatenated in dictionary order; a non-UTF-8
+        /// entry contributes nothing.
+        text: String,
+        /// `len + 1` offsets into `text`; a non-UTF-8 entry's span is empty.
+        text_offsets: Vec<i32>,
+    },
 }
 
 impl Region {
     fn bytes(&self) -> &[u8] {
         match self {
             Region::Text(s) => s.as_bytes(),
-            Region::Raw(b) => b,
+            Region::Mixed { raw, .. } => raw,
         }
     }
+}
+
+/// Fails when a dictionary of `entries` entries and `total` bytes cannot be
+/// addressed by `i32` offsets, the range Arrow string offsets and the
+/// dictionary's own keys use.
+fn check_offset_range(entries: usize, total: usize) -> Result<(), LogSegError> {
+    if i32::try_from(total).is_err() || i32::try_from(entries).is_err() {
+        return Err(LogSegError::Corrupted(format!(
+            "dictionary of {entries} entries and {total} bytes exceeds the i32 offset range"
+        )));
+    }
+    Ok(())
 }
 
 /// A decoded string dictionary: one contiguous byte region, `len + 1` `i32`
@@ -81,43 +102,53 @@ pub struct DictValues {
 
 impl DictValues {
     /// Builds the dictionary from its entries in dictionary order, checking
-    /// each entry's UTF-8 once. Fails when the entries' total length does not
-    /// fit an `i32` offset.
+    /// each entry's UTF-8 once. A dictionary whose entries total more than
+    /// `i32::MAX` bytes (or number more than `i32::MAX`) is refused as
+    /// [`LogSegError::Corrupted`].
     pub(crate) fn from_entries(entries: &[Vec<u8>]) -> Result<Self, LogSegError> {
         let total: usize = entries.iter().map(Vec::len).sum();
-        if i32::try_from(total).is_err() || i32::try_from(entries.len()).is_err() {
-            return Err(LogSegError::Corrupted(format!(
-                "dictionary of {} entries and {total} bytes exceeds the i32 offset range",
-                entries.len()
-            )));
-        }
-        let mut offsets = Vec::with_capacity(entries.len() + 1);
-        offsets.push(0i32);
+        check_offset_range(entries.len(), total)?;
+        let texts: Vec<Option<&str>> = entries
+            .iter()
+            .map(|e| validate_entry(e))
+            .collect();
         let mut valid = Validity::unset(entries.len());
-        let mut region = Region::Text(String::with_capacity(total));
-        for (k, entry) in entries.iter().enumerate() {
-            let text = std::str::from_utf8(entry).ok();
-            if text.is_some() {
+        for (k, t) in texts.iter().enumerate() {
+            if t.is_some() {
                 valid.set(k);
             }
-            region = match (region, text) {
-                (Region::Text(mut s), Some(t)) => {
-                    s.push_str(t);
-                    Region::Text(s)
-                }
-                (Region::Text(s), None) => {
-                    let mut b = s.into_bytes();
-                    b.extend_from_slice(entry);
-                    Region::Raw(b)
-                }
-                (Region::Raw(mut b), _) => {
-                    b.extend_from_slice(entry);
-                    Region::Raw(b)
-                }
-            };
-            // `total` fits an i32, so every running length does too.
-            offsets.push(region.bytes().len() as i32);
         }
+        // `total` fits an i32, so every running length below does too.
+        let mut offsets = Vec::with_capacity(entries.len() + 1);
+        offsets.push(0i32);
+        let mut at = 0usize;
+        for entry in entries {
+            at += entry.len();
+            offsets.push(at as i32);
+        }
+        let region = if texts.iter().all(Option::is_some) {
+            let mut s = String::with_capacity(total);
+            s.extend(texts.iter().flatten().copied());
+            Region::Text(s)
+        } else {
+            let mut raw = Vec::with_capacity(total);
+            for entry in entries {
+                raw.extend_from_slice(entry);
+            }
+            let text_total: usize = texts.iter().flatten().map(|t| t.len()).sum();
+            let mut text = String::with_capacity(text_total);
+            let mut text_offsets = Vec::with_capacity(entries.len() + 1);
+            text_offsets.push(0i32);
+            for t in &texts {
+                text.push_str(t.unwrap_or(""));
+                text_offsets.push(text.len() as i32);
+            }
+            Region::Mixed {
+                raw,
+                text,
+                text_offsets,
+            }
+        };
         Ok(DictValues {
             region,
             offsets,
@@ -142,7 +173,7 @@ impl DictValues {
 
     /// Entry `k`'s bytes, or `None` when `k` is out of range.
     pub fn entry(&self, k: usize) -> Option<&[u8]> {
-        let (a, b) = self.span(k)?;
+        let (a, b) = span(&self.offsets, k)?;
         self.region.bytes().get(a..b)
     }
 
@@ -151,17 +182,24 @@ impl DictValues {
         self.valid.get(k)
     }
 
-    /// Entry `k` as text, or `None` when it is not UTF-8 or out of range. A
-    /// dictionary whose entries are all UTF-8 slices its region; one holding a
-    /// non-UTF-8 entry checks the requested entry again.
+    /// Entry `k` as text, or `None` when it is not UTF-8 or out of range. O(1)
+    /// for every dictionary: the UTF-8 was checked once, in
+    /// [`from_entries`](Self::from_entries).
     pub fn text(&self, k: usize) -> Option<&str> {
         if !self.valid.get(k) {
             return None;
         }
-        let (a, b) = self.span(k)?;
         match &self.region {
-            Region::Text(s) => s.get(a..b),
-            Region::Raw(r) => std::str::from_utf8(r.get(a..b)?).ok(),
+            Region::Text(s) => {
+                let (a, b) = span(&self.offsets, k)?;
+                s.get(a..b)
+            }
+            Region::Mixed {
+                text, text_offsets, ..
+            } => {
+                let (a, b) = span(text_offsets, k)?;
+                text.get(a..b)
+            }
         }
     }
 
@@ -170,20 +208,75 @@ impl DictValues {
         (0..self.len()).map(|k| self.text(k))
     }
 
-    fn span(&self, k: usize) -> Option<(usize, usize)> {
-        let a = usize::try_from(*self.offsets.get(k)?).ok()?;
-        let b = usize::try_from(*self.offsets.get(k + 1)?).ok()?;
-        Some((a, b))
-    }
-
     /// Bytes this dictionary holds on the heap.
     pub(crate) fn heap_bytes(&self) -> usize {
         let region = match &self.region {
             Region::Text(s) => s.capacity(),
-            Region::Raw(b) => b.capacity(),
+            Region::Mixed {
+                raw,
+                text,
+                text_offsets,
+            } => raw.capacity() + text.capacity() + text_offsets.capacity() * 4,
         };
         region + self.offsets.capacity() * std::mem::size_of::<i32>() + self.valid.heap_bytes()
     }
+
+    /// Bytes this dictionary narrowed to the entries set in `used` would hold:
+    /// those entries' [`entry_heap_bytes`](Self::entry_heap_bytes), the leading
+    /// offset of each offset array, and one validity bit per used entry. What a
+    /// block referencing only those entries is charged for a shared dictionary.
+    pub(crate) fn share_heap_bytes(&self, used: &Validity) -> usize {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for k in (0..self.len()).filter(|&k| used.get(k)) {
+            count += 1;
+            bytes += self.entry_heap_bytes(k);
+        }
+        let leading = match self.region {
+            Region::Text(_) => 1,
+            Region::Mixed { .. } => 2,
+        };
+        bytes
+            + leading * std::mem::size_of::<i32>()
+            + count.div_ceil(64) * std::mem::size_of::<u64>()
+    }
+
+    /// Bytes entry `k` holds in this dictionary: its bytes (twice for a UTF-8
+    /// entry of a dictionary holding a non-UTF-8 one, which keeps a text copy)
+    /// and its offsets. Zero out of range.
+    pub(crate) fn entry_heap_bytes(&self, k: usize) -> usize {
+        let Some((a, b)) = span(&self.offsets, k) else {
+            return 0;
+        };
+        let offsets = std::mem::size_of::<i32>();
+        match &self.region {
+            Region::Text(_) => (b - a) + offsets,
+            Region::Mixed { text_offsets, .. } => {
+                let text = span(text_offsets, k).map_or(0, |(c, d)| d - c);
+                (b - a) + offsets + text + offsets
+            }
+        }
+    }
+}
+
+fn span(offsets: &[i32], k: usize) -> Option<(usize, usize)> {
+    let a = usize::try_from(*offsets.get(k)?).ok()?;
+    let b = usize::try_from(*offsets.get(k + 1)?).ok()?;
+    Some((a, b))
+}
+
+/// An entry's text when it is UTF-8. The one place a dictionary entry is
+/// validated.
+fn validate_entry(entry: &[u8]) -> Option<&str> {
+    #[cfg(test)]
+    ENTRY_VALIDATIONS.with(|n| n.set(n.get() + 1));
+    std::str::from_utf8(entry).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`validate_entry`] calls on this thread, for the validated-once tests.
+    pub(crate) static ENTRY_VALIDATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -215,6 +308,45 @@ mod tests {
         assert_eq!(d.entry(1), Some(&[b'b', 0xff][..]));
         assert!(!d.is_valid(1));
         assert!(d.is_valid(2));
+    }
+
+    #[test]
+    fn a_mixed_dictionary_validates_each_entry_once_however_often_it_is_read() {
+        let entries = vec![
+            Vec::new(),
+            vec![0xff],
+            "é".as_bytes().to_vec(),
+            vec![b'x', 0xc3],
+            b"tail".to_vec(),
+        ];
+        let before = ENTRY_VALIDATIONS.with(|n| n.get());
+        let d = DictValues::from_entries(&entries).expect("dict");
+        for _ in 0..3 {
+            assert_eq!(
+                d.texts().collect::<Vec<_>>(),
+                [Some(""), None, Some("é"), None, Some("tail")]
+            );
+        }
+        assert_eq!(ENTRY_VALIDATIONS.with(|n| n.get()) - before, 5);
+        for (k, e) in entries.iter().enumerate() {
+            assert_eq!(d.entry(k), Some(e.as_slice()));
+        }
+        assert_eq!(d.text(5), None);
+    }
+
+    #[test]
+    fn the_offset_range_check_refuses_past_i32_with_a_typed_error() {
+        let max = i32::MAX as usize;
+        assert!(check_offset_range(3, max).is_ok());
+        assert!(check_offset_range(max, 0).is_ok());
+        for (entries, total) in [(3, max + 1), (max + 1, 0)] {
+            match check_offset_range(entries, total) {
+                Err(LogSegError::Corrupted(m)) => {
+                    assert!(m.contains("exceeds the i32 offset range"), "{m}")
+                }
+                other => panic!("expected Corrupted, got {other:?}"),
+            }
+        }
     }
 
     #[test]

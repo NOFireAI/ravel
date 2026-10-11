@@ -805,6 +805,10 @@ pub(crate) struct DictColumn {
     /// The pre-D3 view ([`StrDictColumn::dict`](crate::StrDictColumn::dict)
     /// and its ids), built on first use. The scan's own readers use the keys.
     legacy: OnceCell<LegacyDict>,
+    /// The bytes [`heap_bytes`](Self::heap_bytes) charges for `values`: a
+    /// row group dictionary's referenced share
+    /// ([`DictValues::share_heap_bytes`]), a block's own dictionary in full.
+    values_charge: usize,
 }
 
 /// A dictionary column as owned entries plus one id per block row.
@@ -824,6 +828,7 @@ impl DictColumn {
     ) -> Result<Self, LogSegError> {
         let mut keys = Vec::with_capacity(present.len());
         let mut bits = Validity::unset(present.len());
+        let mut used = Validity::unset(if narrow { values.len() } else { 0 });
         let mut it = ids.into_iter();
         for (row, &p) in present.iter().enumerate() {
             if p {
@@ -841,6 +846,7 @@ impl DictColumn {
                     })?;
                 keys.push(key);
                 bits.set(row);
+                used.set(key as usize);
             } else {
                 keys.push(0);
             }
@@ -850,12 +856,18 @@ impl DictColumn {
                 "value page longer than presence".into(),
             ));
         }
+        let values_charge = if narrow {
+            values.share_heap_bytes(&used)
+        } else {
+            values.heap_bytes()
+        };
         Ok(DictColumn {
             values,
             keys,
             present: bits,
             narrow,
             legacy: OnceCell::new(),
+            values_charge,
         })
     }
 
@@ -909,10 +921,18 @@ impl DictColumn {
         })
     }
 
+    /// The block's keys and presence, plus its charge for the dictionary. A row
+    /// group dictionary is held once, by its `DictCache` entry, and shared by
+    /// every block of the group, so each block is charged only the share it
+    /// references: what a dictionary narrowed to the block's entries would
+    /// hold, the figure the pre-D3 per-block copy cost. A block never pays for
+    /// entries only its neighbours use, and a group's blocks charged together
+    /// pay for an entry once per block that reads it. A per-block dictionary
+    /// page's dictionary belongs to the block alone and is charged in full.
     fn heap_bytes(&self) -> usize {
         self.keys.capacity() * std::mem::size_of::<i32>()
             + self.present.heap_bytes()
-            + self.values.heap_bytes()
+            + self.values_charge
     }
 }
 
@@ -2460,6 +2480,105 @@ mod tests {
         assert!(
             dict_figure < fused_figure,
             "the dictionary form must be smaller: dict={dict_figure}, fused={fused_figure}"
+        );
+    }
+
+    /// A row group dictionary shared by two blocks charges each block the
+    /// share it references, not the whole dictionary (ADR-2773 D3). Block 0
+    /// reads entries 0..=3, block 1 entries 0, 1, 4 and 5 with one absent row;
+    /// each charge is pinned exactly and sits under main's charge for the
+    /// narrowed per-block copy (the legacy view is that copy).
+    ///
+    /// Flipped: charging `values.heap_bytes()` in `DictColumn::heap_bytes`
+    /// reports 116 per block where 92 is expected.
+    #[test]
+    fn a_shared_group_dictionary_charges_each_block_its_referenced_share() {
+        let entries: Vec<Vec<u8>> = [
+            "aaaa", "bbbb", "c0c0c0c0", "d0d0d0d0", "c1c1c1c1", "d1d1d1d1",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        let values = Arc::new(DictValues::from_entries(&entries).expect("dict"));
+        let b0 = DictColumn::new(
+            Arc::clone(&values),
+            &[true; 8],
+            vec![0, 1, 2, 3, 0, 1, 2, 3],
+            true,
+        )
+        .expect("block 0");
+        let mut present = [true; 8];
+        present[3] = false;
+        let b1 = DictColumn::new(
+            Arc::clone(&values),
+            &present,
+            vec![0, 1, 4, 5, 0, 1, 4],
+            true,
+        )
+        .expect("block 1");
+        assert!(Arc::ptr_eq(b0.values(), b1.values()));
+
+        // Keys 8 x 4 and one presence word, plus the share: four entries of
+        // 4 + 4 + 8 + 8 bytes with an offset each, the leading offset, and one
+        // validity word.
+        let share = (4 + 4 + 8 + 8) + 4 * 4 + 4 + 8;
+        assert_eq!(share, 52);
+        // The whole dictionary: 40 region bytes, 7 offsets, one validity word.
+        assert_eq!(values.heap_bytes(), 40 + 7 * 4 + 8);
+        for (block, col) in [(0, &b0), (1, &b1)] {
+            assert_eq!(col.heap_bytes(), 8 * 4 + 8 + share, "block {block}");
+            assert_eq!(col.heap_bytes(), 92, "block {block}");
+            let legacy = col.legacy();
+            assert_eq!(legacy.dict.len(), 4, "block {block} narrows to 4 entries");
+            let main_charge = legacy.ids.capacity() * std::mem::size_of::<Option<u32>>()
+                + legacy.dict.capacity() * std::mem::size_of::<Vec<u8>>()
+                + legacy.dict.iter().map(Vec::capacity).sum::<usize>();
+            assert_eq!(main_charge, 8 * 8 + 4 * 24 + 24, "block {block}");
+            assert!(col.heap_bytes() <= main_charge, "block {block}");
+        }
+
+        // A block's own (tag 7) dictionary is charged in full.
+        let own = DictColumn::new(Arc::clone(&values), &[true; 2], vec![0, 0], false)
+            .expect("own");
+        assert_eq!(own.heap_bytes(), 2 * 4 + 8 + values.heap_bytes());
+    }
+
+    /// A dictionary page holding a non-UTF-8 entry validates each entry once,
+    /// at decode, however many times its rows are read as text through the
+    /// column. Flipped: re-checking the entry in `DictValues::text` (a
+    /// `validate_entry` call in its mixed arm) counts 3 + 2 x 8 (the UTF-8
+    /// rows, two passes) = 19 where 3 is expected.
+    #[test]
+    fn a_mixed_dictionary_page_validates_each_entry_once_per_block() {
+        let plans = vec![ColumnPlan {
+            column_id: 10,
+            ty: FieldType::Str,
+        }];
+        let vals: [&[u8]; 3] = [b"a", b"bc", &[b'b', 0xff]];
+        let rows: Vec<ResolvedRow> = (0..12)
+            .map(|i| {
+                let mut r = row(0, i as i64);
+                r.columns.push((10, ColumnValue::Str(vals[i % 3].to_vec())));
+                r
+            })
+            .collect();
+        let out = write_block(&rows, &plans, 3).expect("write");
+        let keep: ColumnIdSet = ColumnIdSet::from_iter([10]);
+        let before = crate::dict_values::ENTRY_VALIDATIONS.with(|n| n.get());
+        let dec = decode_out(&out, &plans, Some(&keep)).expect("read");
+        let col = dec.str_dict(10).expect("column 10 is a dictionary page");
+        assert!(!col.values().all_valid());
+        for _ in 0..2 {
+            let texts: Vec<Option<&str>> = (0..col.rows())
+                .map(|r| col.values().text(col.key(r)? as usize))
+                .collect();
+            let want: Vec<Option<&str>> =
+                (0..12).map(|i| ["a", "bc"].get(i % 3).copied()).collect();
+            assert_eq!(texts, want);
+        }
+        assert_eq!(
+            crate::dict_values::ENTRY_VALIDATIONS.with(|n| n.get()) - before,
+            3
         );
     }
 
