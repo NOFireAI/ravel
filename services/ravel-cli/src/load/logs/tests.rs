@@ -1780,6 +1780,256 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
     );
 }
 
+/// Rows per batch in the issue #2753 default-geometry tests.
+const GEOMETRY_BATCH_ROWS: usize = 10_000;
+
+/// Batches in the issue #2753 default-geometry tests: 510,000 rows, which is
+/// not a multiple of [`DEFAULT_OBJECT_ROWS`].
+const GEOMETRY_BATCHES: usize = 51;
+
+/// A host total large enough that the derived memory bound never decides the
+/// depth in the default-geometry tests.
+const GEOMETRY_HOST_BYTES: u64 = 64 << 30;
+
+/// `batches` row groups of `batch_rows` identical rows on one stream, so
+/// every batch has the same estimated footprint and `--batch-rows
+/// <batch_rows>` reads one row group per batch.
+fn uniform_rows_fixture(
+    batch_rows: usize,
+    batches: usize,
+) -> (tempfile::TempDir, std::path::PathBuf, Mapping) {
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("uniform.parquet");
+    let group = batch(vec![
+        ("ts", i64_col(vec![NOW_NS; batch_rows])),
+        ("svc", str_col(vec!["api"; batch_rows])),
+        ("msg", str_col(vec!["request served"; batch_rows])),
+    ]);
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, group.schema(), None).expect("arrow writer");
+    for _ in 0..batches {
+        writer.write(&group).expect("write row group");
+        writer.flush().expect("flush row group");
+    }
+    writer.close().expect("close writer");
+
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"msg\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+    (dir, pq, m)
+}
+
+/// A logs load with every geometry flag unset, as the CLI runs it: no
+/// `--target-bytes`, no `--pipeline-depth`, the 60 s `--max-flush-delay`,
+/// and a host-derived memory budget. The clock never advances, so the age
+/// trigger cannot fire and the layout is decided by the target alone.
+async fn load_with_default_geometry(
+    store: Arc<dyn ObjectStoreBackend>,
+    pq: &Path,
+    m: &Mapping,
+    batch_rows: usize,
+    pipeline_depth: Option<usize>,
+    target_bytes: Option<usize>,
+    load_memory: LoadMemoryRequest,
+) -> LoadReport {
+    let clock = TestClock::new(NOW_NS);
+    load_instrumented_at(
+        store,
+        pq,
+        "acme",
+        m,
+        1,
+        batch_rows,
+        0,
+        None,
+        pipeline_depth,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        target_bytes,
+        Some(DEFAULT_MAX_FLUSH_DELAY),
+        NOW_NS,
+        clock as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::default(),
+        Some(LoadMemoryOptions::new(load_memory)),
+        false,
+    )
+    .await
+    .expect("load succeeds")
+}
+
+/// Issue #2753: with `--target-bytes` and `--pipeline-depth` unset, a logs
+/// load merges batches into objects of [`DEFAULT_OBJECT_ROWS`] rows. 51
+/// batches of 10,000 rows on one shard are 510,000 rows, so the shard writes
+/// exactly ceil(510,000 / 250,000) = 3 objects: two of 250,000 rows that the
+/// size trigger closes (every 25th batch reaches the derived target, which
+/// is 250,000 times the first batch's estimate per row), and a 10,000-row
+/// tail the end-of-input drain publishes.
+///
+/// The derived depth is ceil(250,000 x 1 / 10,000) = 25, so the depth flush
+/// fires after batches 25 and 50, each time on a buffer the size trigger
+/// has just emptied, and counts nothing.
+///
+/// Per-batch flushing (a target of 1) writes 51 objects. A target compared
+/// against a figure the buffer never reaches (stored bytes instead of the
+/// estimate) leaves the size trigger silent and every object to the depth
+/// flush or the drain, so the size count is 0.
+#[tokio::test]
+async fn default_load_merges_batches_into_target_sized_objects() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, GEOMETRY_BATCHES);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    let rows = (GEOMETRY_BATCH_ROWS * GEOMETRY_BATCHES) as u64;
+    assert_eq!(report.rows_processed, rows);
+    let expected_objects = (GEOMETRY_BATCH_ROWS * GEOMETRY_BATCHES).div_ceil(DEFAULT_OBJECT_ROWS);
+    assert_eq!(expected_objects, 3);
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len(),
+        expected_objects,
+        "510,000 rows on one shard make ceil(510,000 / 250,000) objects"
+    );
+    assert_eq!(report.objects_written(), expected_objects);
+
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("a load that decoded rows resolves its geometry");
+    assert_eq!(geometry.target_source, TargetSource::Derived);
+    // `est_bytes_per_row` is the first batch's estimate per row rounded up;
+    // the target is 250,000 rows of the unrounded figure.
+    let target_rows = DEFAULT_OBJECT_ROWS as u64;
+    assert!(
+        (geometry.target_bytes as u64) <= target_rows * geometry.est_bytes_per_row
+            && (geometry.target_bytes as u64) > target_rows * (geometry.est_bytes_per_row - 1),
+        "the derived target is 250,000 rows of the first batch's estimate: {geometry:?}"
+    );
+    assert_eq!(geometry.rows_depth, 25);
+    assert_eq!(geometry.pipeline_depth, 25);
+    assert_eq!(geometry.depth_bound, DepthBound::Rows);
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: 2,
+            age: 0,
+            depth: 0,
+            manual: 1,
+        },
+        "two full objects close on size, the tail on the end-of-input drain"
+    );
+    assert_eq!(layout.flush_mix.totals.dominant(), Some("size"));
+    assert_eq!(layout.target_bytes_no_effect_warning, None);
+}
+
+/// Issue #2753: `--target-bytes 1 --batch-rows 10000` restores the layout
+/// every load had before the target was derived: one object per batch per
+/// shard, each closed by the size trigger.
+#[tokio::test]
+async fn target_bytes_one_writes_one_object_per_batch_per_shard() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let batches = 3;
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, batches);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        Some(PER_BATCH_TARGET_BYTES),
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), batches);
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.target_source, TargetSource::Flag);
+    assert_eq!(geometry.target_bytes, PER_BATCH_TARGET_BYTES);
+    assert_eq!(
+        layout.flush_mix.totals,
+        FlushMixCounts {
+            size: batches as u64,
+            age: 0,
+            depth: 0,
+            manual: 0,
+        }
+    );
+}
+
+/// Issue #2753: a `--load-memory-bytes` budget too small for the rows bound's
+/// 25 batches decides the depth, and the report says so. The budget holds
+/// three batches at the first batch's estimate (read off an unbudgeted run of
+/// the same file), so the depth is 3.
+#[tokio::test]
+async fn a_small_memory_budget_decides_the_derived_depth() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, 4);
+    let probe_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let probe = load_with_default_geometry(
+        probe_store,
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    let est_bytes_per_row = probe
+        .layout_report()
+        .geometry
+        .expect("geometry resolved")
+        .est_bytes_per_row;
+    let batch_bytes = GEOMETRY_BATCH_ROWS as u64 * est_bytes_per_row;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load_with_default_geometry(
+        Arc::clone(&store),
+        &pq,
+        &m,
+        GEOMETRY_BATCH_ROWS,
+        None,
+        None,
+        LoadMemoryRequest::Flag(3 * batch_bytes),
+    )
+    .await;
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.rows_depth, 25);
+    assert_eq!(geometry.memory_depth, Some(3));
+    assert_eq!(geometry.pipeline_depth, 3);
+    assert_eq!(geometry.depth_bound, DepthBound::Memory);
+    let summary = render_layout_summary(&layout);
+    assert!(
+        summary.contains("pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"),
+        "{summary}"
+    );
+}
+
 /// The ack semantics a larger `--target-bytes` changes (issue #801,
 /// deliverable 3). A Strict write's ack is answered from `ack_waiters` in
 /// `crates/ravel-ingest/src/log_shard.rs`, which only runs once that
