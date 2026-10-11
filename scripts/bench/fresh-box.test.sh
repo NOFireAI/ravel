@@ -92,8 +92,10 @@ ARGS=(
   --repo-url https://example.invalid/ravel.git --commit "$COMMIT" --out "$TMP/out.json"
   --sample-size 10 --warmup 1 --measure 3 --max-series 2000
 )
+# --max-minutes is not in this list: it is the one input with a default (600),
+# pinned by its own case below.
 FLAGS=(--instance-type --ami --subnet --security-group --region --access --key-name
-  --identity-file --ssh-user --volume-gb --max-minutes --repo-url --commit --out --sample-size
+  --identity-file --ssh-user --volume-gb --repo-url --commit --out --sample-size
   --warmup --measure --max-series)
 
 # fresh_box <case> [args...]: runs the script with stubs, fast retry knobs and
@@ -164,6 +166,27 @@ for flag in "${FLAGS[@]}"; do
     pass "missing $flag"
   fi
 done
+
+# --- --max-minutes omitted: the box self-terminates at the 600-minute default ---
+# Catches: the default dropped (exit 64 "missing required input"), or a
+# different figure than the ten hours every measurement box carries.
+pruned=(); skip=""
+for a in "${ARGS[@]}"; do
+  if [ -n "$skip" ]; then skip=""; continue; fi
+  if [ "$a" = "--max-minutes" ]; then skip=1; continue; fi
+  pruned+=("$a")
+done
+fresh_box default-max-minutes --dry-run "${pruned[@]}"
+if [ "$code" -ne 0 ]; then
+  fail default-max-minutes "exit $code, want 0: $out"
+elif ! plain="$(printf '%s\n' "$out" | tr -d '\\')" \
+  || ! printf '%s\n' "$plain" | grep -q -- "--user-data .*#!/bin/sh.*shutdown -h +600"; then
+  fail default-max-minutes "run-instances carries no shutdown -h +600 user-data"; printf '%s\n' "$out" | sed 's/^/    /'
+elif ! printf '%s\n' "$out" | grep -qF -- "self-terminates 600 minutes after boot"; then
+  fail default-max-minutes "the run id line does not say 600 minutes"
+else
+  pass default-max-minutes
+fi
 
 # --- --access ssm needs an instance profile and tunnels ssh through SSM ---
 SSM_ARGS=("${ARGS[@]/#ssh/ssm}")

@@ -24,7 +24,9 @@
 # Written for bash 3.2 (macOS /bin/bash): no associative arrays, no mapfile,
 # no ${var,,}, no date -d. FRESH_BOX_TEST_BASH runs the cases under it.
 #
-# Every input is required and has no default; run with --help for the list.
+# Every input is required and has no default, except --max-minutes, which
+# defaults to 600 (the standing ten-hour self-terminate for a measurement
+# box); run with --help for the list.
 #
 # Exit codes:
 #   0   baseline copied back and every instance confirmed shutting-down or
@@ -49,7 +51,8 @@ usage: scripts/bench/fresh-box.sh [--dry-run] --instance-type T --ami AMI
 
 Launches one EC2 instance, records a tier B baseline on it with
 scripts/bench-tier-b.sh record, copies it to --out, and terminates the
-instance from an EXIT trap. Every input is required; none has a default.
+instance from an EXIT trap. Every input is required and has no default,
+except --max-minutes, which defaults to 600.
 Each flag can also be given as the environment variable in brackets.
 
   --instance-type   EC2 instance type                    [FRESH_BOX_INSTANCE_TYPE]
@@ -74,7 +77,9 @@ Each flag can also be given as the environment variable in brackets.
                     needs tens of GB)                     [FRESH_BOX_VOLUME_GB]
   --max-minutes     minutes after boot at which the instance shuts itself
                     down and terminates, whatever the launcher is doing;
-                    must cover the build and the bench run [FRESH_BOX_MAX_MINUTES]
+                    must cover the build and the bench run; default 600,
+                    the ten-hour self-terminate every measurement box
+                    carries                                 [FRESH_BOX_MAX_MINUTES]
   --repo-url        git URL to clone                      [FRESH_BOX_REPO_URL]
   --commit          full 40-character commit to build     [FRESH_BOX_COMMIT]
   --out             local path the baseline is copied to  [FRESH_BOX_OUT]
@@ -154,6 +159,7 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 
+[ -n "$V_max_minutes" ] || V_max_minutes=600
 for spec in "${INPUTS[@]}"; do
   IFS='|' read -r name flag var <<<"$spec"
   [ -n "$(value "$name")" ] || die64 "missing required input $flag ($var)"

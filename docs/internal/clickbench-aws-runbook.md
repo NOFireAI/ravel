@@ -180,9 +180,21 @@ aws ec2 run-instances \
   --iam-instance-profile Name=ravel-clickbench-box \
   --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=300,VolumeType=gp3}' \
   --key-name <your-key-pair> \
+  --instance-initiated-shutdown-behavior terminate \
+  --user-data '#!/bin/sh
+shutdown -h +600' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ravel-clickbench}]' \
   --query 'Instances[0].InstanceId' --output text
 ```
+
+Every measurement box self-terminates ten hours after boot: the user-data
+arms `shutdown -h +600` and the shutdown behaviour is `terminate`, so a box
+whose driver session died is gone by the next morning instead of billing
+until someone notices. Ten hours covers the longest run in this runbook
+(bootstrap, load, fold and a full concurrent pass) with margin; a run
+pre-registered to need more raises the figure in its own launch, and says
+so on its issue. `scripts/bench/fresh-box.sh` carries the same figure as
+the default of `--max-minutes`.
 
 An IMDSv2 token is required to read instance metadata from on the box:
 
