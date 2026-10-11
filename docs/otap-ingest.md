@@ -124,6 +124,44 @@ Not decoded:
 - `EXP_HISTOGRAM_DATA_POINTS` is unaffected by any of the above: the
   normalizer already rejects that table outright as unsupported.
 
+## Resource labels
+
+A point's resource comes from the root table's nullable `resource` struct:
+its `id` child (DELTA by default, accumulated over the non-null rows) names
+the `RESOURCE_ATTRS` rows whose `parent_id` matches, within the same batch.
+Those rows go through the builder the OTLP path uses
+(`ravel_otlp::build_resource_labels_from`, ADR-2708 D4), so the same
+resource gives the same labels on both transports: `job` from
+`service.name`, prefixed `<service.namespace>/` when that is set;
+`instance` from `service.instance.id`; each key on the resource attribute
+allowlist under its sanitized name, first occurrence winning. The same
+limits apply: more attributes than `max_resource_attributes`, or a
+map/slice/bytes value, rejects every point under that resource, and keys
+outside the allowlist are dropped and counted on
+`ravel_ingest_resource_attrs_dropped_total`. A null `resource` row or one
+with no matching attribute rows has no resource labels, and attribute rows
+whose `parent_id` names no resource are ignored.
+
+The attribute tables (`RESOURCE_ATTRS` and the data-point and exemplar
+`*Attrs` tables) are read whether their columns are plain or
+dictionary-encoded: `key` and `str` as `Utf8` or `Dictionary(UInt8|UInt16,
+Utf8)`, `int` as `Int64` or `Dictionary(UInt16, Int64)`, and `parent_id` as
+`UInt16`, `UInt32` or `Dictionary(UInt8|UInt16, UInt32)`. The `type`
+discriminants are otap-spec.md section 5.5.1's: 0=Empty, 1=Str, 2=Int,
+3=Double, 4=Bool, 5=Map, 6=Slice, 7=Bytes, matching pdata's `ValueType`.
+
+Before building any label, the normalizer projects the batch's resolved
+label bytes and rejects the whole batch over
+`max_resolved_label_bytes_per_request`, the bound the OTLP path applies
+(ADR-2708 D2); the gateway charges that projection to the ingest byte
+budget for the length of normalization. A summary point with more than
+`max_summary_quantiles` quantiles is rejected on its own, as on OTLP.
+
+Points sent before resource labels were built keep their stored series:
+a point under no resource still has the same identity, and a point whose
+resource carries labelled attributes now lands in a new series that
+carries them.
+
 ## Exemplars
 
 `NUMBER_DP_EXEMPLARS` and `HISTOGRAM_DP_EXEMPLARS` rows are carried, not

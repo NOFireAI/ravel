@@ -228,12 +228,14 @@ normalization copies labels per unit: each histogram bucket and summary
 quantile gets its own copy of the point's labels, each log record a copy of
 its resource and scope attributes, and each span a copy of its resource
 attributes. Before normalization allocates, every OTLP metrics, logs and
-traces request is projected to the label bytes it would build, and a request
+traces request, and every OTAP metrics batch, is projected to the label bytes
+it would build, and a request
 over `max_resolved_label_bytes_per_request` (256 MiB, in the same three limits
 structs, not configurable) is rejected whole: HTTP 200 (gRPC OK) with every
 data point, log record or span in the partial-success rejected count, and the
-`resolved_label_bytes` reason on `ravel_admission_rejected_total`. Typical
-collector batches project well under a tenth of the bound.
+`resolved_label_bytes` reason on `ravel_admission_rejected_total`. OTAP has
+no partial-success field, so an OTAP batch over the bound shows up on that
+counter only. Typical collector batches project well under a tenth of the bound.
 
 A request inside the bound has its projection charged to the process-wide
 ingest buffer byte budget (`--max-ingest-buffer-bytes`) until its points reach
