@@ -15,8 +15,20 @@
 #   a field's visibility changed -> 1 (catches: visibility stripped)
 #   literal on main before the fork, untouched since -> 0
 #     (catches: searching every file on base rather than post-fork ones)
-#   the branch touches the file holding the literal -> 0
-#     (catches: branch-touched files not excluded)
+#   both sides add a file, main's version holds the literal -> 1
+#     (catches: a file the branch touches skipped outright)
+#   the branch edits src/other.rs line 1 and makes Cfg.a an Option, main
+#     appends a `Cfg { a: 1 }` literal there (a clean rebase) -> 1, naming the
+#     file at its line on main, and the count line names one file searched in
+#     full and one overlap file (catches: overlap files skipped; hunk line
+#     numbers not advanced or read from the old side; overlap files counted
+#     as searched in full)
+#   main's added lines in an overlap file hold only a declaration while a
+#     pre-fork `Cfg { a: 1 }` sits on an untouched line -> 0 (catches: an
+#     overlap file searched in full; declarations not skipped there)
+#   the branch widens `fn gate(limit: u64)` and edits src/site.rs, main
+#     appends `gate(5)` there -> 1, or `gate(5, 6)` -> 0 (catches: overlap
+#     files skipped for calls; the argument-count rule not applied there)
 #   fields only reordered -> 0 (catches: comparing field order, not the set)
 #   the #2842 shape, a pub fn gains a parameter, six two-argument calls landed
 #     after the fork -> 1 (catches: parameter counts not compared; a method
@@ -252,10 +264,12 @@ put "${r}" src/other.rs 'fn other() {}'
 commit_on "${r}" main 'feat: unrelated post-fork change'
 run "${r}" feature origin/main
 check_eq       "pre-fork literal: exits 0" "0" "${rc}"
-check_contains "pre-fork literal: says it checked one struct and one file" \
-  "guard: checked 1 struct(s) and 0 function(s) changed on feature against 1 .rs file(s) changed on origin/main since the merge base" "${out}"
+check_contains "pre-fork literal: says it checked one struct and one file, searched in full" \
+  "guard: checked 1 struct(s) and 0 function(s) changed on feature against 1 .rs file(s) changed on origin/main since the merge base $(git -C "${r}" rev-parse --short feature~1) (1 searched in full, 0 also touched by the branch and searched on the lines origin/main added): no stale site" "${out}"
 
-# --- the branch itself touches the file holding the post-fork literal ---
+# --- both sides add the file; main's version holds the literal ---
+# Diffed from the merge base, every line of main's file is an added line.
+# Catches: a file the branch touches skipped outright.
 r="$(new_repo)"
 put "${r}" src/config.rs 'pub struct ServerConfig {
     pub listen: String,
@@ -266,7 +280,144 @@ commit_on "${r}" feature 'feat: optional audit pipeline'
 put "${r}" src/server/boot.rs 'fn boot() { let c = ServerConfig { listen: x, audit_pipeline: p }; }'
 commit_on "${r}" main 'feat: boot'
 run "${r}" feature origin/main
-check_eq "branch touches the literal's file: exits 0" "0" "${rc}"
+check_eq       "both sides add the literal's file: exits 1" "1" "${rc}"
+check_contains "both sides add the literal's file: names it" \
+  "src/server/boot.rs: struct ServerConfig literal (line 1;" "${out}"
+
+# overlap_repo <repo>: main gains a `Cfg` struct, src/other.rs holding
+# <other.rs> and src/site.rs holding filler, and `feature` forks there.
+overlap_repo() {
+  put "$1" src/cfg.rs 'pub struct Cfg {
+    pub a: u64,
+}
+pub fn gate(limit: u64) {}'
+  put "$1" src/other.rs "$2"
+  put "$1" src/site.rs 'fn site() {}
+fn s2() {}
+fn s3() {}
+fn s4() {}
+fn s5() {}'
+  commit_on "$1" main 'pre-fork cfg'
+  git -C "$1" branch -f feature main
+}
+
+# --- the branch and main both touch src/other.rs; main appends a literal ---
+# The branch edits line 1 and makes Cfg.a an Option; main changes line 3 and
+# appends two lines, the second a literal of the old shape, so the rebase is
+# clean and only the merge queue's build sees E0308. The literal is line 7 on
+# main, the second added line of a hunk that starts at line 6 on main and at
+# line 5 on the merge base.
+# Catches: overlapping files skipped; a hunk parser that does not advance the
+# line number, or reads the old side's start; the count line lumping the
+# overlap file in with the full-search ones.
+r="$(new_repo)"
+overlap_repo "${r}" 'fn other() {}
+fn o2() {}
+fn o3() {}
+fn o4() {}
+fn o5() {}'
+put "${r}" src/cfg.rs 'pub struct Cfg {
+    pub a: Option<u64>,
+}
+pub fn gate(limit: u64) {}'
+put "${r}" src/other.rs 'fn other() { work() }
+fn o2() {}
+fn o3() {}
+fn o4() {}
+fn o5() {}'
+commit_on "${r}" feature 'feat: make Cfg.a optional'
+put "${r}" src/other.rs 'fn other() {}
+fn o2() {}
+fn o3() { more() }
+fn o4() {}
+fn o5() {}
+fn helper() {}
+fn site() { let c = Cfg { a: 1 }; }'
+put "${r}" src/unrelated.rs 'fn unrelated() {}'
+commit_on "${r}" main 'feat: build a Cfg'
+landed="$(git -C "${r}" rev-parse --short main)"
+run "${r}" feature origin/main
+overlap_out="${out}"
+check_eq       "overlap file, literal appended on main: exits 1" "1" "${rc}"
+check_contains "overlap file, literal appended on main: names the file and its line on main" \
+  "src/other.rs: struct Cfg literal (line 7; changed on origin/main by ${landed} feat: build a Cfg)" "${out}"
+check_contains "overlap file, literal appended on main: the count line names the overlap file" \
+  "against 2 .rs file(s) changed on origin/main since the merge base $(git -C "${r}" rev-parse --short feature~1) (1 searched in full, 1 also touched by the branch and searched on the lines origin/main added)" "${out}"
+check_eq       "overlap file, literal appended on main: the fixture rebases cleanly" "0" \
+  "$(git -C "${r}" merge-tree --write-tree main feature >/dev/null 2>&1 && echo 0 || echo 1)"
+
+# --- main's added lines in an overlap file hold no site; an older one does ---
+# The pre-fork literal on line 2 reads stale on main because only the branch
+# updated it. Main adds a declaration block, which is not a site either.
+# Catches: an overlapping file searched in full rather than on its added
+# lines; declarations not skipped on added lines.
+r="$(new_repo)"
+overlap_repo "${r}" 'fn other() {}
+fn pre() { let c = Cfg { a: 1 }; }
+fn o3() {}
+fn o4() {}
+fn o5() {}'
+put "${r}" src/cfg.rs 'pub struct Cfg {
+    pub a: Option<u64>,
+}
+pub fn gate(limit: u64) {}'
+put "${r}" src/other.rs 'fn other() {}
+fn pre() { let c = Cfg { a: Some(1) }; }
+fn o3() {}
+fn o4() {}
+fn o5() {}'
+commit_on "${r}" feature 'feat: make Cfg.a optional'
+put "${r}" src/other.rs 'fn other() {}
+fn pre() { let c = Cfg { a: 1 }; }
+fn o3() {}
+fn o4() {}
+fn o5() {}
+impl Cfg {
+    fn more(&self) {}
+}'
+commit_on "${r}" main 'feat: Cfg impl'
+run "${r}" feature origin/main
+check_eq       "overlap file, no site on main's added lines: exits 0" "0" "${rc}"
+check_contains "overlap file, no site on main's added lines: the struct and file were checked" \
+  "checked 1 struct(s) and 0 function(s) changed on feature against 1 .rs file(s)" "${out}"
+
+# --- an overlap file and a function: the argument-count rule on added lines ---
+# The branch gives gate a second parameter and edits line 1 of src/site.rs;
+# main appends a call to src/site.rs. A one-argument call is the old shape, a
+# two-argument call the new one.
+# Catches: overlapping files skipped for calls; added-line hits reported
+# without the argument-count rule.
+for call in 'gate(5)' 'gate(5, 6)'; do
+  r="$(new_repo)"
+  overlap_repo "${r}" 'fn other() {}'
+  put "${r}" src/cfg.rs 'pub struct Cfg {
+    pub a: u64,
+}
+pub fn gate(limit: u64, floor: u64) {}'
+  put "${r}" src/site.rs 'fn site() { work() }
+fn s2() {}
+fn s3() {}
+fn s4() {}
+fn s5() {}'
+  commit_on "${r}" feature 'feat: give gate a floor'
+  put "${r}" src/site.rs "fn site() {}
+fn s2() {}
+fn s3() {}
+fn s4() {}
+fn s5() {}
+fn call() { ${call}; }"
+  commit_on "${r}" main 'feat: call gate'
+  run "${r}" feature origin/main
+  if [[ "${call}" == 'gate(5)' ]]; then
+    check_eq       "overlap file, ${call} appended on main: exits 1" "1" "${rc}"
+    check_contains "overlap file, ${call} appended on main: names the call" \
+      "src/site.rs: call gate( (line 6;" "${out}"
+  else
+    check_eq       "overlap file, ${call} appended on main: exits 0" "0" "${rc}"
+    check_contains "overlap file, ${call} appended on main: the function was checked" \
+      "checked 0 struct(s) and 1 function(s)" "${out}"
+  fi
+done
 
 # --- fields only reordered ---
 r="$(new_repo)"

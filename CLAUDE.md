@@ -625,17 +625,22 @@ than passing for "no pull request open".
   field set (a field added, removed, or its type or visibility changed; a
   reorder is not a change) or to a function's parameter count, `self`
   receiver or parameter types (not names) breaks a `Name {` or
-  `Enum::Variant {` literal or a `name(` call in a `.rs` file that landed on
-  `[base]` (default `origin/main`, fetched with an explicit destination
-  refspec) after the branch forked and that the branch does not touch. A
+  `Enum::Variant {` literal or a `name(` call that landed on `[base]`
+  (default `origin/main`, fetched with an explicit destination refspec)
+  after the branch forked. A post-fork `.rs` file the branch does not touch
+  is searched in full; one the branch also touches is searched only on the
+  lines `[base]` added to it after the fork, since the branch already
+  updated that file's older sites, and a literal `[base]` appended beside
+  the branch's own edit rebases cleanly and breaks only in the queue. A
   call counts only when its argument count fits an old signature (one the
   branch removed, or any when it only added one; the receiver is not
   counted for a `.name(` call), so
   `Vec::new()` does not trip a changed `fn new(limit: u64)`; a call it
   cannot count on one line (it wraps, or takes a closure) is reported marked
   "(uncounted)". Exit 1 names each file, line and landing commit and says to
-  rebase and update the site; 0 prints one line saying how many structs,
-  functions and post-fork files it checked; 2 is could-not-answer (a git
+  rebase and update the site; 0 prints one line saying how many structs and
+  functions it checked against how many post-fork files, split into those
+  searched in full and those searched on their added lines; 2 is could-not-answer (a git
   failure, an unknown ref), never 0; 64 is usage. Both halves of this break
   are green on their own base and it surfaces only when the merge queue
   rebases, at the cost of a CI cycle and a review round. Two instances on

@@ -30,11 +30,18 @@
 # between files is not a change.
 #
 # Where a site is looked for: `.rs` files added or modified on <base> after
-# the merge base that the branch itself does not touch, searched on <base> for
-# `Name {` (struct; `Variant {` for a variant, which also finds
-# `Enum::Variant {`) or `name(` (function; `.name(` and `::name(` included),
-# each with a word boundary before the name. Declarations are skipped: `struct
-# Name {`, `impl Name {`, `for Name {`, `-> Name {` and `fn name(`.
+# the merge base, searched on <base> for `Name {` (struct; `Variant {` for a
+# variant, which also finds `Enum::Variant {`) or `name(` (function; `.name(`
+# and `::name(` included), each with a word boundary before the name. A file
+# the branch does not touch is searched in full. A file the branch touches too
+# is searched only on the lines <base> added to it after the merge base (the
+# `+` lines of `git diff -U0 <merge-base> <base> -- <file>`), and a hit there
+# is reported with its line number on <base>: the branch brought that file's
+# older sites to its new shape, so they read as stale on <base> without being
+# stale, while a line <base> added beside them was written against the old
+# shape and rebases cleanly when the two edits do not touch. Declarations are
+# skipped in both kinds of file: `struct Name {`, `impl Name {`, `for Name {`,
+# `-> Name {` and `fn name(`.
 #
 # A call is reported only when its argument count is one a call written
 # against an old shape of the function carries: every parameter for a
@@ -57,7 +64,8 @@
 # used as it resolves locally.
 #
 # Exit codes: 0 no shape change, or no post-fork site (one line says what was
-# checked); 1 a post-fork site uses a changed shape (each is printed with the
+# checked, with how many post-fork files were searched in full and how many on
+# their added lines); 1 a post-fork site uses a changed shape (each is printed with the
 # base commit that brought it in, and the fix); 2 the question could not be
 # answered (git failed, an unknown ref); 64 usage.
 set -u
@@ -298,8 +306,9 @@ BEGIN { mode = "idle"; q = "'"; in_enum = 0 }
 }
 AWK
 
-# Every file the branch touches, any type: a site in one of these is the
-# branch's own business, and its own CI compiled it.
+# Every file the branch touches, any type. Its shapes are read from the `.rs`
+# ones here; below, a post-fork file in this list is searched only on the lines
+# <base> added to it.
 git diff --name-only --no-renames "$merge_base" "$branch_tip" >"$work/branch-files" ||
   fail "git diff --name-only $mb_short..$branch_arg failed"
 : >"$work/old-items"
@@ -360,12 +369,38 @@ n_fns=$(awk '/^F/ { n++ } END { print n + 0 }' "$work/changed") || fail "countin
 
 git log --name-only --no-renames --format= "$merge_base..$base_tip" -- '*.rs' >"$work/postfork-raw" ||
   fail "git log $mb_short..$base_arg failed"
-# Post-fork .rs files minus the ones the branch touches.
-awk 'NR == FNR { touched[$0] = 1; next } $0 != "" && !($0 in touched) && !seen[$0]++' \
-  "$work/branch-files" "$work/postfork-raw" >"$work/postfork" || fail "filtering post-fork files failed"
-n_files=$(awk 'END { print NR }' "$work/postfork") || fail "counting post-fork files failed"
+# Post-fork .rs files split in two: the ones the branch does not touch, searched
+# in full, and the ones it touches too, searched on <base>'s added lines only.
+: >"$work/overlap"
+awk -v tf="$work/branch-files" -v ovf="$work/overlap" '
+  FILENAME == tf { touched[$0] = 1; next }
+  $0 == "" || seen[$0]++ { next }
+  $0 in touched { print >ovf; next }
+  { print }
+' "$work/branch-files" "$work/postfork-raw" >"$work/postfork" || fail "splitting post-fork files failed"
+n_full=$(awk 'END { print NR }' "$work/postfork") || fail "counting post-fork files failed"
+n_overlap=$(awk 'END { print NR }' "$work/overlap") || fail "counting overlapping files failed"
+n_files=$((n_full + n_overlap))
 
-checked="checked ${n_structs} struct(s) and ${n_fns} function(s) changed on ${branch_arg} against ${n_files} .rs file(s) changed on ${base_arg} since the merge base ${mb_short}"
+# path<TAB>line for every line <base> added to an overlapping file after the
+# merge base, numbered as on <base>, from a `git diff -U0` of that one file.
+cat >"$work/added.awk" <<'AWK'
+/^@@ / {
+  split($0, h, " ")
+  split(substr(h[3], 2), c, ",")
+  ln = c[1] + 0; inh = 1
+  next
+}
+inh && substr($0, 1, 1) == "+" { print path "\t" ln; ln++ }
+AWK
+: >"$work/added"
+while IFS= read -r f; do
+  git diff -U0 --no-color --no-ext-diff --no-renames "$merge_base" "$base_tip" -- ":(literal)$f" >"$work/fdiff" ||
+    fail "git diff $mb_short..$base_arg -- $f failed"
+  awk -v path="$f" -f "$work/added.awk" "$work/fdiff" >>"$work/added" || fail "reading added lines of $f failed"
+done <"$work/overlap"
+
+checked="checked ${n_structs} struct(s) and ${n_fns} function(s) changed on ${branch_arg} against ${n_files} .rs file(s) changed on ${base_arg} since the merge base ${mb_short} (${n_full} searched in full, ${n_overlap} also touched by the branch and searched on the lines ${base_arg} added)"
 
 if [ "$n_structs" = 0 ] && [ "$n_fns" = 0 ] || [ "$n_files" = 0 ]; then
   echo "guard: ${checked}: no stale site"
@@ -437,15 +472,17 @@ function call_verdict(text, nm, pc, mc,   t, s, at, pre, after, argc, q) {
   }
   return ""
 }
-# One hit per file, kind and name, at its first line:
+# A grep hit counts only in a file searched in full or on a line <base> added
+# to an overlapping file. One hit per file, kind and name, at its first line:
 # path<TAB>line<TAB>kind<TAB>name<TAB>note, the note "uncounted" or empty.
   FILENAME == changedf { kinds[++nk] = $1; names[nk] = $2; pcs[nk] = $3; mcs[nk] = $4; next }
   FILENAME == postf { post[$0] = 1; next }
+  FILENAME == addedf { added[$0] = 1; next }
   {
     rec = substr($0, length(tip) + 2)
     p = index(rec, ":"); file = substr(rec, 1, p - 1); rec = substr(rec, p + 1)
     p = index(rec, ":"); ln = substr(rec, 1, p - 1); text = substr(rec, p + 1)
-    if (!(file in post)) next
+    if (!(file in post) && !((file "\t" ln) in added)) next
     for (i = 1; i <= nk; i++) {
       nm = names[i]
       note = ""
@@ -464,8 +501,9 @@ function call_verdict(text, nm, pc, mc,   t, s, at, pre, after, argc, q) {
     }
   }
 AWK
-awk -F '\t' -v tip="$base_tip" -v changedf="$work/changed" -v postf="$work/postfork" -f "$work/classify.awk" \
-  "$work/changed" "$work/postfork" "$work/grep" >"$work/hits" || fail "classifying grep hits failed"
+awk -F '\t' -v tip="$base_tip" -v changedf="$work/changed" -v postf="$work/postfork" -v addedf="$work/added" \
+  -f "$work/classify.awk" "$work/changed" "$work/postfork" "$work/added" "$work/grep" >"$work/hits" ||
+  fail "classifying grep hits failed"
 
 if [ ! -s "$work/hits" ]; then
   echo "guard: ${checked}: no stale site"

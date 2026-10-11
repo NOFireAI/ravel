@@ -57,9 +57,15 @@ merge_base_guard() {
 # cwd pinned the same way and for the same reason as the merge-base guard. Exit
 # 1 means a struct literal or call site that landed on the base after the fork
 # still uses a shape this pull request changes, which a queue rebase turns into
-# a red CI cycle (issue #2811). Any other non-zero, 127 included, is "could not
-# check", which is not "clean". ALLOW_STALE_SHAPE_SITES=1 lets an exit 1 through
-# to the merge line, with the hits still printed beside a note saying so.
+# a red CI cycle (issue #2811). Any other non-zero, 127 included, means the guard
+# could not check; this fails open: it prints a warning that this is not the
+# same as no stale site, and still prints the merge line. The merge queue's
+# rebase and CI still catch the break, so a missed check costs one CI cycle.
+# The merge-base guard above fails closed on the same outcome instead, because
+# nothing downstream catches what only it detects: a landing that silently
+# reverts a concurrent change rebases and builds clean.
+# ALLOW_STALE_SHAPE_SITES=1 lets an exit 1 through to the merge line, with the
+# hits still printed beside a note saying so.
 # PR_REVIEW_STATUS_STRUCT_GUARD replaces the guard so this script's own tests
 # can run it offline.
 struct_rc=0
