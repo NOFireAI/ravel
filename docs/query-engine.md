@@ -2343,7 +2343,9 @@ assembly, byte accounting, schema validation) is signal-neutral and shared
 across all four tables; the only per-signal surface is each table's ordering-key
 column list. The slice-ticket plumbing (`WorkerSlice`, `WorkerSliceClient`,
 `plan_distributed_slices`) is reused unchanged from the metrics SQL lane, since
-a slice ticket pins a snapshot subset and carries no signal discriminator.
+a slice ticket pins a snapshot subset and carries no signal discriminator. The
+one signal-specific thing a logs or spans slice ticket can carry is the
+coordinator's pushdown, described next.
 
 Reachability: the distributed scan is installed on a table provider through each
 provider's `with_distributed_scan` (`LogsTableProvider` and the
@@ -2358,6 +2360,50 @@ that flag the service runs every statement whole-set on the coordinator.
 
 The whole seam sits behind the `flight-sql` cargo feature. The published image
 builds that feature; a source build reaches this code only by asking for it.
+
+#### Pushdown on the slice ticket (logs and spans)
+
+A worker fragment scans under the coordinator's pushdown, so it decodes only
+the blocks the predicate admits instead of its whole slice (issue #2755). The
+coordinator extracts the pushdown from the statement's filters exactly as the
+single-node scan does (`extract_spans`, `extract_logs`), and
+`DistributedSliceScanExec` hands it to `WorkerSliceClient::fetch_slice_with_pushdown`
+with every slice. `FlightWorkerSliceClient` writes it into the slice ticket as
+an optional block after the statement and before the MAC, so a client cannot
+alter it without the slice key (`crates/ravel-sql/src/flight_ticket.rs`,
+`SlicePushdown`). What the block carries:
+
+| Table | Carried | Not carried |
+|---|---|---|
+| `spans` | `ts_lo`, `ts_hi`, `trace_id` | `duration_ns` window, `status_code` mask, `service_name`, `name` |
+| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range | the content channel (`has_word`) |
+
+The worker builds its fragment with `worker_fragment_with_pushdown`. A spans
+`trace_id` takes the ranged trace read, so the worker's tail probe, footer and
+SKIP_IDX/BLOOM sections are recorded on the probe phase and only the block runs
+holding the trace on the scan phase. A logs prune predicate drives the same
+segment-stats and block pruning the single-node scan runs. A ticket without the
+block decodes to the no-pushdown query, and a worker that ignores the block (the
+default `fetch_slice_with_pushdown` does) still answers correctly: with a
+distributed scan installed the providers report every filter as `Inexact`, so
+DataFusion re-applies them above the merge and the pushdown only narrows what a
+worker decodes. The fields that are not carried only widen a worker's read for
+the same reason.
+
+The block is additive under ticket version 8. A decoder built before it rejects
+a ticket carrying the block as `TrailingBytes`, so in a mixed-version
+deployment a new coordinator's logs and spans slices fail on an old worker
+until the worker is upgraded. The Flight SQL service's slice `DoGet` serves
+only the metrics samples scan today (`crates/ravel-sql/src/flight/slice.rs`);
+a logs or spans worker fragment runs through the provider's
+`worker_fragment_with_pushdown` wherever a `WorkerSliceClient` implementation
+executes it.
+
+The worker scan reports what it received: `SpansScanExec` prints
+`trace_id=true` and `ts=[lo, hi]` when they are set, `LogsScanExec` prints its
+`prune=N` arm count, and the coordinator's `DistributedSliceScanExec` prints
+`pushdown=spans|logs|none`. The decoded block count is `blocks_decoded` on
+`SpansScanExec` and `blocks_scanned` on `LogsScanExec`.
 
 #### The metrics SQL lane's failure sequence
 
@@ -4560,8 +4606,12 @@ an `attrs_raw` overflow page; and the row path, which rebuilds each
 reconstructed from the nested event columns the fast path exists to skip;
 `links` joins them for a different reason, since it is never promoted into
 nested columns at all, but decoded from the plain `attrs["_links_raw"]` value
-that only the row path's merged `attrs` map carries. Four partition metrics
+that only the row path's merged `attrs` map carries. Five partition metrics
 show what happened, and `EXPLAIN ANALYZE` prints them:
+
+- `blocks_decoded`: RSPAN blocks the partition decoded, on either path. A
+  `trace_id` lookup decodes only the blocks holding the trace; a scan without
+  one decodes every block the skip index admits for its other bounds.
 
 - `columnar_batches` / `rowpath_batches`: batches emitted by each path. The two
   paths' output is identical by construction, so these are the only external

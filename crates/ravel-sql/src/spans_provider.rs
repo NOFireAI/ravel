@@ -44,6 +44,8 @@ use crate::distributed::{WorkerSlice, WorkerSliceClient};
 use crate::distributed_rlog::{
     DistributedRlogContext, SPAN_ORDER_COLS, distributed_spans_plan, sort_slice_fragment,
 };
+#[cfg(feature = "flight-sql")]
+use crate::flight_ticket::SlicePushdown;
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
 use crate::spans_scan::SpansScanExec;
@@ -140,7 +142,26 @@ impl SpansTableProvider {
     /// preserving merge over the leaf's weaker order).
     #[cfg(feature = "flight-sql")]
     pub fn worker_fragment(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let scan = self.build_scan(target_partitions, &SpansPushdown::default(), None)?;
+        self.worker_fragment_with_pushdown(target_partitions, None)
+    }
+
+    /// [`Self::worker_fragment`], scanning under the coordinator's pushdown the
+    /// slice ticket carried (issue #2755): its time bounds window the read, and
+    /// a `trace_id` takes the ranged trace read, so the worker decodes only the
+    /// blocks the predicate admits. `None`, or a logs pushdown, is the
+    /// no-pushdown read. The coordinator re-applies every filter above the
+    /// merge, so the pushdown only narrows what is decoded.
+    #[cfg(feature = "flight-sql")]
+    pub fn worker_fragment_with_pushdown(
+        &self,
+        target_partitions: usize,
+        pushdown: Option<&SlicePushdown>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let pushdown = pushdown
+            .and_then(SlicePushdown::as_spans)
+            .cloned()
+            .unwrap_or_default();
+        let scan = self.build_scan(target_partitions, &pushdown, None)?;
         sort_slice_fragment(scan, &self.schema, SPAN_ORDER_COLS)
     }
 
@@ -283,7 +304,9 @@ impl TableProvider for SpansTableProvider {
         // spans provider). See the `logs` provider for the full rationale: the
         // scan's `_limit` is a fetch-stop hint across partitions with the exact
         // limit re-applied above the merge, and filters are re-applied above the
-        // returned plan by DataFusion (the provider reports `Inexact`).
+        // returned plan by DataFusion (the provider reports `Inexact`). The
+        // extracted trace id and time bounds ride to each worker with its slice
+        // ticket, so a worker reads only the blocks they admit (#2755).
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
             let plan = distributed_spans_plan(
@@ -293,6 +316,7 @@ impl TableProvider for SpansTableProvider {
                 _limit,
                 self.accounting.scan().clone(),
                 ByteLimit::Unlimited,
+                Some(SlicePushdown::spans(&extract_spans(filters))),
             )?;
             return self.apply_projection(plan, projection);
         }

@@ -53,6 +53,8 @@ use crate::distributed::{WorkerSlice, WorkerSliceClient};
 use crate::distributed_rlog::{
     DistributedRlogContext, LOGS_ORDER_COLS, distributed_logs_plan, sort_slice_fragment,
 };
+#[cfg(feature = "flight-sql")]
+use crate::flight_ticket::SlicePushdown;
 use crate::logs_pushdown::{LogsPushdown, extract_logs, filter_is_exact};
 use crate::logs_scan::LogsScanExec;
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
@@ -157,7 +159,27 @@ impl LogsTableProvider {
     /// is returned.
     #[cfg(feature = "flight-sql")]
     pub fn worker_fragment(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let scan = self.build_scan(target_partitions, &LogsPushdown::default(), None)?;
+        self.worker_fragment_with_pushdown(target_partitions, None)
+    }
+
+    /// [`Self::worker_fragment`], scanning under the coordinator's pushdown the
+    /// slice ticket carried (issue #2755): its time bounds window the read and
+    /// its prune comparisons (attribute equalities and declared column
+    /// comparisons) drive segment stats pruning and block pruning, so the
+    /// worker decodes only the blocks they admit. `None`, or a spans pushdown,
+    /// is the no-pushdown read. The coordinator re-applies every filter above
+    /// the merge, so the pushdown only narrows what is decoded.
+    #[cfg(feature = "flight-sql")]
+    pub fn worker_fragment_with_pushdown(
+        &self,
+        target_partitions: usize,
+        pushdown: Option<&SlicePushdown>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let pushdown = pushdown
+            .and_then(SlicePushdown::as_logs)
+            .cloned()
+            .unwrap_or_default();
+        let scan = self.build_scan(target_partitions, &pushdown, None)?;
         sort_slice_fragment(scan, &self.schema, LOGS_ORDER_COLS)
     }
 
@@ -364,10 +386,10 @@ impl TableProvider for LogsTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // The distributed coordinator path fans out to workers without pushing
-        // any filter (see `scan` below), so every filter it plans MUST come back
-        // as a residual above the fan-out. Reporting `Exact` there would delete
-        // a predicate nothing re-applies.
+        // The distributed coordinator path hands workers only a prune hint
+        // they may ignore (see `scan` below), so every filter it plans MUST
+        // come back as a residual above the fan-out. Reporting `Exact` there
+        // would delete a predicate nothing re-applies.
         #[cfg(feature = "flight-sql")]
         if self.distributed.is_some() {
             return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
@@ -397,14 +419,17 @@ impl TableProvider for LogsTableProvider {
         // re-applied above the merge (over-fetch is safe, under-fetch is not).
         // Filters are re-applied above the returned plan by DataFusion (with a
         // coordinator installed, `supports_filters_pushdown` reports `Inexact`
-        // for every filter for exactly this reason), so not pushing them to
-        // workers only widens each worker's read, never changes a row. The
-        // `logs` provider carries no
+        // for every filter for exactly this reason). The extracted time bounds
+        // and prune comparisons ride to each worker with its slice ticket
+        // (#2755) and only narrow which blocks it decodes; the content channel
+        // is not carried, which widens a worker's read and never changes a
+        // row. The `logs` provider carries no
         // per-query byte budget (admission is decided at resolve time), so the
         // fan-out folds bytes into the query accounting under an `Unlimited`
         // ceiling, matching the local path.
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
+            let pushdown = extract_logs(filters, self.declared.as_ref());
             let plan = distributed_logs_plan(
                 dist.endpoints.clone(),
                 Arc::clone(&dist.client),
@@ -412,6 +437,7 @@ impl TableProvider for LogsTableProvider {
                 _limit,
                 self.phase_accounting.scan().clone(),
                 ByteLimit::Unlimited,
+                Some(SlicePushdown::logs(&pushdown)),
             )?;
             return self.apply_projection(plan, projection);
         }

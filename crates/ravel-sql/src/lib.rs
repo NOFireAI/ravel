@@ -163,8 +163,8 @@ pub use flight::{
 };
 #[cfg(feature = "pin-codec")]
 pub use flight_ticket::{
-    FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, SqlTicketKeys, TICKET_KEY_LEN,
-    TicketKey, TicketSurface, derive_surface_key, derive_ticket_key,
+    FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, SlicePushdown, SqlTicketKeys,
+    TICKET_KEY_LEN, TicketKey, TicketSurface, derive_surface_key, derive_ticket_key,
 };
 pub use group_keys::{DICTIONARY_GROUP_KEYS_RULE, DictionaryGroupKeysAsViews};
 pub use late_materialization::{
