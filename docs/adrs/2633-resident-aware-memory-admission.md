@@ -983,7 +983,7 @@ concurrent phases on each): criteria (b), (c) and (d) passed, and criterion
 (0.070 / 0.074 / 0.379) against the 0.10 bar; the 27 GB-budget box pooled
 0.092. In stock phase 3 the gate's own available gauge dipped to 0.53 GB,
 below the 0.66 GB floor, while the 2 s host samples of `MemAvailable` never
-went under 1.22 GB: the dips lasted well under 2 s. While the gate was
+went under 1.22 GB: the dips were shorter than the host sampler's 2 s period (the comment calls them brief; their length was not measured). While the gate was
 closed, the phase's server log holds 47 fetch refusals with 0 bytes already
 reserved (the gate's signature) and 132 "upstream storage temporarily
 unavailable" errors. v0.23.0, with no gate, dipped to 0.83 GB available at
@@ -1002,15 +1002,18 @@ below the healthy operating point and the gate was closing on transients.
    state alone. With the value 1 the behaviour is the one the host-memory
    amendment's decision 1 describes, exactly. The purge decision is
    unchanged; it has its own spacing.
-2. **Why 3 at 100 ms.** At the default interval a dip must last at least
-   300 ms to close the gate. The dips measured above were shorter than the
-   host sampler's own 2 s period and closed the gate for a whole phase,
-   while v0.23.0 ran at 0.83 GB available with an error ratio of about
-   0.07. Three samples is the shortest run that outlasts a dip of one or
-   two readings, and at section 1's measured 0.4 GB/s burst slope it lets
-   about 120 MB of growth go unseen before the close, small against the
+2. **Why 3 at 100 ms.** Three consecutive samples at the default interval
+   span about 200 ms: a dip shorter than that never closes the gate, and
+   one of 300 ms or more always does (a dip between the two closes it only
+   when it covers three sample instants). The dips measured above were
+   shorter than the host sampler's own 2 s period and were the gate's only
+   refusals in that phase (47 fetch refusals with 0 bytes reserved), while
+   v0.23.0 ran at 0.83 GB available with an error ratio of about 0.07.
+   Three samples is the shortest run that outlasts a dip of one or two
+   readings, and at section 1's measured 0.4 GB/s burst slope it lets 80
+   to 120 MB of growth go unseen before the close, small against the
    687 MB floor on the 32 GiB host. The count is a flag, so a host whose
-   dips are longer can raise it, up to 100 (10 s at the default interval).
+   dips are longer can raise it, up to 100 (9.9 s at the default interval).
 3. **The setter is written on every readable sample**, with the gate's
    decision and the sample's reading, so `ravel_memory_gate_available_bytes`
    shows a reading below the floor while the gate is still open. For that,

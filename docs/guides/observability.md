@@ -2533,7 +2533,7 @@ The gate is full when `ravel_cpu_gate_running` equals
 
 ### Memory gate (`ravel_memory_gate_*`)
 
-Labels: `mode` only. The `ravel-memory-gate` sampler reads the host's
+Labels: `mode` on the gauges and counters below; `ravel_memory_gate_refusals_total` also carries `site` (its row is in the label table above) and the purge histogram carries `le`. The `ravel-memory-gate` sampler reads the host's
 available memory every `--memory-gate-interval-ms` and closes the memory gate
 once `--memory-gate-close-after-samples` consecutive readings are below
 `ravel_memory_gate_available_floor_bytes`; one reading at or above the floor
@@ -2543,7 +2543,7 @@ open.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_memory_gate_samples_below_floor_total` | Counter. Samples whose available reading was below the close floor, whether or not the sample closed the gate. Rising while `ravel_memory_gate_refusals_total` stays flat means dips too short to close the gate; raise `--memory-gate-close-after-samples` only if the refusals that do come are from dips you would rather ride out. |
+| `ravel_memory_gate_samples_below_floor_total` | Counter. Samples whose available reading was below the close floor, whether or not the sample closed the gate. Rising while the gate stays open (`ravel_memory_gate_available_floor_bytes` above `ravel_memory_gate_available_bytes` only briefly, no `ravel_memory_gate_refusals_total` movement) means dips too short to close the gate; raise `--memory-gate-close-after-samples` only if the refusals that do come are from dips you would rather ride out. |
 
 ## Reading estimate against actual
 
