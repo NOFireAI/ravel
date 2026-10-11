@@ -67,6 +67,11 @@ pub struct ScanStats {
     /// their column. Zero for an all-columns scan; the observable proof that
     /// column projection reached the page level (ADR-0087 decision 3).
     pub pages_skipped: u64,
+    /// Block-length integer value buffers this scan's decodes built: one per
+    /// integer column decoded from its own value page, per block. A
+    /// column-reference column shares its target's buffer and adds nothing.
+    /// Grows as blocks are decoded, like [`Self::pages_decoded`].
+    pub int_values_buffers: u64,
     /// Stored bytes of pages present in the blocks this scan decoded,
     /// regardless of the [`ColumnSelection`]. A decode-time column-filtering
     /// measurement, distinct from any wire-byte count. Grows as blocks are
@@ -332,6 +337,65 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         let dirs = Self::decode_directories(source, cfg)?;
         let mut reader = Self::from_decoded(source, &dirs);
         reader.open_decompressed_bytes = dirs.open_decompressed_bytes;
+        Ok(reader)
+    }
+
+    /// [`RlogReader::from_source`] for a caller that already decoded SKIP_IDX,
+    /// PAGE_DIR and possibly FIELD_DIR from this object (ADR-2773 decision 5):
+    /// only the sections not passed in are decoded from `source`, and the
+    /// passed PAGE_DIR gets the same cross-checks against the block framing
+    /// and FIELD_DIR a fresh decode would. The reader's scans seed
+    /// [`ScanStats::decompressed_bytes`] with the sections decoded here only;
+    /// the caller charged its own decodes.
+    pub fn from_source_reusing(
+        source: &'a S,
+        cfg: &RlogConfig,
+        skip: Arc<SkipIndex>,
+        page_dir: Arc<PageDir>,
+        field_dir: Option<Arc<FieldDir>>,
+    ) -> Result<Self, LogSegError> {
+        let footer = open_source(source)?;
+        let mut open_decompressed_bytes = 0u64;
+        let stream_desc = *section(&footer, kind::STREAM_DIR)?;
+        let stream_raw = read_section_from(source, &stream_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
+        let mut decoded_bytes = stream_raw.len() as u64;
+        let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
+        let field_desc = *section(&footer, kind::FIELD_DIR)?;
+        let field_dir = match field_dir {
+            Some(field_dir) => {
+                decoded_bytes = decoded_bytes.saturating_add(field_desc.uncomp_len);
+                field_dir
+            }
+            None => {
+                let field_raw = read_section_from(source, &field_desc, cfg)?;
+                open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
+                decoded_bytes += field_raw.len() as u64;
+                Arc::new(FieldDir::decode(&field_raw, MAX_FIELDS)?)
+            }
+        };
+        let skip_desc = *section(&footer, kind::SKIP_IDX)?;
+        let page_desc = *footer
+            .section(kind::PAGE_DIR)
+            .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
+        decoded_bytes = decoded_bytes
+            .saturating_add(skip_desc.uncomp_len)
+            .saturating_add(page_desc.uncomp_len);
+        let blocks = *section(&footer, kind::BLOCKS)?;
+        page_dir.validate_framing(blocks.len, skip.l0.len(), &field_dir)?;
+        let dirs = SegmentDirectories {
+            stream_dir: Arc::new(stream_dir),
+            field_dir,
+            skip,
+            blocks_offset: blocks.offset,
+            page_dir,
+            bloom: *section(&footer, kind::BLOOM)?,
+            postings: footer.section(kind::POSTINGS).copied(),
+            open_decompressed_bytes,
+            decoded_bytes,
+        };
+        let mut reader = Self::from_decoded(source, &dirs);
+        reader.open_decompressed_bytes = open_decompressed_bytes;
         Ok(reader)
     }
 
@@ -1218,23 +1282,19 @@ impl BlockScan {
         // Resolve stream_ref and ts once for the whole block, not once per
         // surviving row (#875): the per-row body then only indexes the resolved
         // slices, and the error text stays identical to the per-cell `i64_at`.
-        let stream_refs = decoded.i64_col(COL_STREAM_REF);
-        let ts = decoded.i64_col(COL_TS);
+        let stream_refs = decoded.i64_column(COL_STREAM_REF);
+        let ts = decoded.i64_column(COL_TS);
         let entries = self.stream_dir.entries();
         for &row in &self.surviving {
-            let raw = stream_refs
-                .and_then(|c| c.get(row).copied())
-                .flatten()
-                .ok_or_else(|| {
-                    LogSegError::Corrupted(format!("missing i64 col {COL_STREAM_REF}"))
-                })?;
+            let raw = stream_refs.and_then(|c| c.get(row)).ok_or_else(|| {
+                LogSegError::Corrupted(format!("missing i64 col {COL_STREAM_REF}"))
+            })?;
             let sref = u32::try_from(raw)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
             if entries.get(sref as usize).is_none() {
                 return Err(LogSegError::Corrupted("stream_ref out of range".into()));
             }
-            ts.and_then(|c| c.get(row).copied())
-                .flatten()
+            ts.and_then(|c| c.get(row))
                 .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {COL_TS}")))?;
         }
         Ok(Some(ColumnarBlockView::new(
@@ -1293,6 +1353,7 @@ impl BlockScan {
         )?;
         self.stats.blocks_scanned += 1;
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
+        self.stats.int_values_buffers += decoded.int_values_buffers() as u64;
         self.stats.pages_skipped += decoded.pages_skipped() as u64;
         self.stats.page_bytes_fetched = self
             .stats
@@ -1804,7 +1865,7 @@ fn i64_projected(
     row: usize,
     strict: bool,
 ) -> Result<i64, LogSegError> {
-    match block.i64_col(col) {
+    match block.i64_column(col) {
         Some(_) => i64_at(block, col, row),
         None if strict => i64_at(block, col, row),
         None => Ok(0),
@@ -1973,9 +2034,8 @@ fn flatten<'p>(pred: &'p Predicate, out: &mut Vec<&'p Predicate>) {
 
 pub(crate) fn i64_at(block: &DecodedBlock, col: u32, row: usize) -> Result<i64, LogSegError> {
     block
-        .i64_col(col)
-        .and_then(|c| c.get(row).copied())
-        .flatten()
+        .i64_column(col)
+        .and_then(|c| c.get(row))
         .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {col}")))
 }
 
@@ -2002,9 +2062,8 @@ fn get_attr_value(block: &DecodedBlock, cid: u32, ty: FieldType, row: usize) -> 
             .map(AttrValue::Str),
         FieldType::Bytes => str_at(block, cid, row).map(AttrValue::Bytes),
         FieldType::I64 => block
-            .i64_col(cid)
-            .and_then(|c| c.get(row).copied())
-            .flatten()
+            .i64_column(cid)
+            .and_then(|c| c.get(row))
             .map(AttrValue::I64),
         FieldType::F64 => block
             .f64_col(cid)
@@ -5569,6 +5628,64 @@ mod tests {
             pages,
             "and a second decoded reader adds none"
         );
+    }
+
+    /// ADR-2773 decision 5: a reader given the SKIP_IDX, PAGE_DIR and
+    /// FIELD_DIR its caller already decoded seeds its scans with the sections
+    /// it decoded itself and no others, and scans the same rows as a reader
+    /// that decoded everything.
+    #[test]
+    fn a_reader_reusing_fetched_directories_charges_only_its_own_decodes() {
+        let (_, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let all = Predicate::TsRange {
+            min_ns: i64::MIN,
+            max_ns: i64::MAX,
+        };
+        let scanned = |reader: &RlogReader<'_>| {
+            let mut scan = reader
+                .scan_blocks(&all, &[], &ColumnSelection::all())
+                .expect("scan");
+            let ts = drain_ts(&mut scan, &object);
+            (ts, scan.stats().decompressed_bytes)
+        };
+        let footer = open_source(&object[..]).expect("footer");
+        let decompressed = |id| {
+            let desc = *section(&footer, id).expect("section");
+            let raw = read_section_from(&object[..], &desc, &cfg).expect("read");
+            section_decompressed_len(&desc, &raw)
+        };
+        let stream = decompressed(kind::STREAM_DIR);
+        let field = decompressed(kind::FIELD_DIR);
+
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        assert!(
+            dirs.open_decompressed_bytes() > stream + field,
+            "SKIP_IDX or PAGE_DIR is zstd, so reusing them changes the figure"
+        );
+        let own = RlogReader::new(&object, &cfg).expect("open");
+        let (own_ts, own_total) = scanned(&own);
+        let pages = own_total - dirs.open_decompressed_bytes();
+
+        let reusing = |field_dir: Option<Arc<FieldDir>>| {
+            RlogReader::from_source_reusing(
+                &object[..],
+                &cfg,
+                Arc::clone(&dirs.skip),
+                Arc::clone(&dirs.page_dir),
+                field_dir,
+            )
+            .expect("open reusing")
+        };
+        let all_passed = reusing(Some(Arc::clone(&dirs.field_dir)));
+        assert_eq!(all_passed.directories().open_decompressed_bytes(), stream);
+        assert_eq!(scanned(&all_passed), (own_ts.clone(), pages + stream));
+        let field_decoded = reusing(None);
+        assert_eq!(
+            field_decoded.directories().open_decompressed_bytes(),
+            stream + field
+        );
+        assert_eq!(scanned(&field_decoded), (own_ts, pages + stream + field));
     }
 
     /// `scan_blocks_raw_subset` names whole-object block indices, and the drain

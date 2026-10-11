@@ -50,7 +50,7 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 /// under a `ts`-only scan, whose column selection is
 /// `ColumnSelection::fixed_only()`. [`first_block_decoded_bytes`] derives it
 /// by decoding that block straight off the fixture object.
-const BLOCK_DECODED_BYTES: usize = 128;
+const BLOCK_DECODED_BYTES: usize = 176;
 
 /// One object of [`BLOCKS`] one-record blocks, each carrying one attribute,
 /// so no block has an `attrs_raw` page and the columnar drain never falls
@@ -235,7 +235,7 @@ where
 ///
 /// Fails against releasing the block's charge when its batches drain, before
 /// the next job is submitted (the queued check reads the batch alone, 104
-/// bytes of 232), and against releasing it once the job holds its permit but
+/// bytes of 280), and against releasing it once the job holds its permit but
 /// before the decode runs (the queued check passes, the parked one reads 104).
 #[test]
 fn columnar_block_charge_is_held_while_the_next_decode_waits_for_a_permit() {

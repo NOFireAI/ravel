@@ -2031,6 +2031,7 @@ impl LogSegmentFetcher {
                     blocks_scanned: 0,
                     pages_decoded: 0,
                     pages_skipped: 0,
+                    int_values_buffers: 0,
                     page_bytes_fetched: 0,
                     page_bytes_decoded: 0,
                     decompressed_bytes: 0,
@@ -2306,6 +2307,7 @@ impl LogSegmentFetcher {
             blocks_scanned: 0,
             pages_decoded: 0,
             pages_skipped: 0,
+            int_values_buffers: 0,
             page_bytes_fetched: 0,
             page_bytes_decoded: 0,
             decompressed_bytes: 0,
@@ -3187,6 +3189,24 @@ impl LogSegmentFetcher {
         Ok(Some(LogFetchOutput { records, stats }))
     }
 
+    /// The reader over `bytes`, taking the directories a ranged fetch already
+    /// decoded from it when it carries them (ADR-2773 decision 5).
+    fn open_reader<'a>(
+        &self,
+        bytes: &'a LogObjectBytes,
+    ) -> Result<RlogReader<'a, LogObjectBytes>, LogSegError> {
+        match bytes.fetched_directories() {
+            Some(dirs) => RlogReader::from_source_reusing(
+                bytes,
+                &self.cfg,
+                Arc::clone(&dirs.skip),
+                Arc::clone(&dirs.page_dir),
+                dirs.field_dir.clone(),
+            ),
+            None => RlogReader::from_source(bytes, &self.cfg),
+        }
+    }
+
     /// Resolve stream-attribute equalities against STREAM_DIR
     /// (over-approximating, see [`matching_streams`](Self::matching_streams)),
     /// build the combined exact predicate, and open the pruned scan with
@@ -3207,8 +3227,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         // `prune` is passed as the reader's prune-only channel, never folded
         // into `pred`: an arm there would become an exact per-row filter and
         // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
@@ -3237,8 +3258,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_subset(&pred, &query.prune, columns, indices)
             .map_err(|source| corrupt(key, source))
@@ -3263,8 +3285,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_raw_subset(&pred, &query.prune, columns, indices, expected_survivors)
             .map_err(|source| corrupt(key, source))
@@ -3311,8 +3334,9 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<(BlockScan, Arc<SegmentDirectories>), LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader =
-            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader = self
+            .open_reader(bytes)
+            .map_err(|source| corrupt(key, source))?;
         let dirs = Arc::new(reader.directories());
         let scan = reader
             .scan_blocks(&pred, &query.prune, columns)
@@ -4120,6 +4144,16 @@ struct PlacedObject {
     regions: SparseObject,
     reservations: Vec<ravel_memory::Reservation>,
     gauge: Arc<AssemblyGauge>,
+    fetched_dirs: Option<FetchedDirectories>,
+}
+
+/// The directories a version-4 ranged fetch decoded to plan its page reads,
+/// handed to the reader so the open does not decode them a second time
+/// (ADR-2773 decision 5). `field_dir` is absent when the fetch did not need it.
+struct FetchedDirectories {
+    skip: Arc<SkipIndex>,
+    page_dir: Arc<PageDir>,
+    field_dir: Option<Arc<FieldDir>>,
 }
 
 impl Drop for PlacedObject {
@@ -4146,6 +4180,13 @@ enum ObjectRepr {
 }
 
 impl LogObjectBytes {
+    fn fetched_directories(&self) -> Option<&FetchedDirectories> {
+        match &self.0 {
+            ObjectRepr::Whole(_) => None,
+            ObjectRepr::Placed(placed) => placed.fetched_dirs.as_ref(),
+        }
+    }
+
     /// The object's length in bytes, placed or not.
     pub fn len(&self) -> usize {
         match &self.0 {
@@ -4238,6 +4279,7 @@ impl ObjectAssembler {
                 regions: SparseObject::new(total_size),
                 reservations: Vec::new(),
                 gauge: Arc::clone(gauge),
+                fetched_dirs: None,
             },
         }
     }
@@ -4281,6 +4323,11 @@ impl ObjectAssembler {
 
     fn into_bytes(self) -> LogObjectBytes {
         LogObjectBytes(ObjectRepr::Placed(Arc::new(self.placed)))
+    }
+
+    fn into_bytes_with(mut self, dirs: FetchedDirectories) -> LogObjectBytes {
+        self.placed.fetched_dirs = Some(dirs);
+        self.into_bytes()
     }
 }
 
@@ -6229,10 +6276,8 @@ impl BlockRangeFetcher {
         // here: the reader built over the result takes them from `dirs`, so
         // placing them would only move bytes nobody reads, and decoding them
         // would charge a second `decompressed_bytes` for the same sections.
-        let local_skip;
-        let local_page_dir;
-        let (skip, page_dir): (&SkipIndex, &PageDir) = if let Some(dirs) = dirs {
-            (dirs.skip_index(), &**dirs.page_dir())
+        let local_dirs: Option<(Arc<SkipIndex>, Arc<PageDir>)> = if dirs.is_some() {
+            None
         } else {
             self.place_sections_coalesced(
                 seg_ref,
@@ -6248,14 +6293,25 @@ impl BlockRangeFetcher {
             let skip_raw = self
                 .placed_section_raw(key, &asm, &skip_desc, accounting)
                 .await?;
-            local_skip =
+            let skip =
                 SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
             let page_raw = self
                 .placed_section_raw(key, &asm, &page_desc, accounting)
                 .await?;
-            local_page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
-            (&local_skip, &local_page_dir)
+            let page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
+            Some((Arc::new(skip), Arc::new(page_dir)))
         };
+        let (skip, page_dir): (&SkipIndex, &PageDir) = match (dirs, &local_dirs) {
+            (Some(dirs), _) => (dirs.skip_index(), &**dirs.page_dir()),
+            (None, Some((skip, page_dir))) => (&**skip, &**page_dir),
+            (None, None) => {
+                return Err(corrupt(
+                    key,
+                    LogSegError::Corrupted("version-4 directories were not decoded".into()),
+                ));
+            }
+        };
+        let mut local_field_dir: Option<Arc<FieldDir>> = None;
         page_dir
             .validate_extents(blocks_desc.len)
             .map_err(|source| corrupt(key, source))?;
@@ -6269,11 +6325,10 @@ impl BlockRangeFetcher {
             .iter()
             .any(|p| matches!(p, Predicate::NumRange { .. }));
         let (numeric, selected) = if wants_numeric || !columns.is_all() {
-            let local_field_dir;
             let field_dir: &FieldDir = if let Some(dirs) = dirs {
                 dirs.field_dir()
             } else {
-                local_field_dir = self
+                let decoded = self
                     .place_and_decode_field_dir(
                         seg_ref,
                         tenant_hash,
@@ -6285,7 +6340,7 @@ impl BlockRangeFetcher {
                         &mut stats,
                     )
                     .await?;
-                &local_field_dir
+                local_field_dir.insert(Arc::new(decoded))
             };
             let numeric = if wants_numeric {
                 let refs: Vec<&Predicate> = prune.iter().collect();
@@ -6526,7 +6581,15 @@ impl BlockRangeFetcher {
             &mut stats,
         )
         .await?;
-        Ok((asm.into_bytes(), stats))
+        let bytes = match local_dirs {
+            Some((skip, page_dir)) => asm.into_bytes_with(FetchedDirectories {
+                skip,
+                page_dir,
+                field_dir: local_field_dir,
+            }),
+            None => asm.into_bytes(),
+        };
+        Ok((bytes, stats))
     }
 
     /// The coalesced, already-covered-filtered, request-bounded byte ranges a

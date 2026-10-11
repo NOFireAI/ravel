@@ -1914,17 +1914,16 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
     let w = phase_w.snapshot();
 
     // The ranged (version-4) fetch path decodes SKIP_IDX and PAGE_DIR itself,
-    // to resolve candidate blocks and their pages (`fetch_object_v4`), and now
+    // to resolve candidate blocks and their pages (`fetch_object_v4`), and
     // charges that decode to the scan phase (issue #1401 finding 3). `open_scan`
-    // then builds its own `RlogReader` over the fetched buffer, which decodes
-    // every directory section again to open the object -- `dirs`, `b0`, `b1`,
-    // and `b2` above already include that reader-side cost. So the ranged path
-    // legitimately double-charges SKIP_IDX and PAGE_DIR: once for locating the
-    // candidate blocks before the buffer exists, once for opening the reader
-    // over the buffer it fetched. FIELD_DIR is not part of this fixture's
-    // ranged fetch (`LogQuery::new(0, 0)` carries no NumRange arm and the scan
-    // selects every column, so `fetch_object_v4` skips it, per its own doc
-    // comment), so only these two sections double-count.
+    // hands those decoded sections to the reader it opens over the fetched
+    // buffer (ADR-2773 decision 5), so the reader decodes only the sections it
+    // was not given and each section is charged once. FIELD_DIR is not part of
+    // this fixture's ranged fetch (`LogQuery::new(0, 0)` carries no NumRange
+    // arm and the scan selects every column, so `fetch_object_v4` skips it, per
+    // its own doc comment), so the reader decodes it at open. A reader that
+    // re-decoded the passed sections would add `fetch_side_dirs` to the ranged
+    // figure.
     let footer = ravel_logseg::footer::open(&obj).expect("open");
     let mut fetch_side_dirs = 0u64;
     for k in [
@@ -1940,12 +1939,18 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
         fetch_side_dirs += desc.uncomp_len;
     }
 
+    assert!(
+        fetch_side_dirs > 0,
+        "a double charge must be visible in the ranged figure"
+    );
+
     // Each path charges exactly the reader reference for the sections it
-    // decompressed, plus the ranged path's own fetch-side directory decode.
+    // decompressed: the ranged path's fetch-side SKIP_IDX/PAGE_DIR decode
+    // replaces the reader's own, it does not add to it.
     assert_eq!(
         r.scan.decompressed_bytes,
-        dirs + b0 + fetch_side_dirs,
-        "the ranged path decoded only block 0, plus its own SKIP_IDX/PAGE_DIR fetch-side decode"
+        dirs + b0,
+        "the ranged path decoded only block 0, and each directory section once"
     );
     assert_eq!(
         w.scan.decompressed_bytes, all,
@@ -1953,14 +1958,10 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
          matches the reader reference exactly"
     );
 
-    // The whole-object figure now trails the ranged figure's directory work by
-    // fetch_side_dirs: the difference is the skipped blocks' pages minus the
-    // ranged path's extra double-charged directory bytes.
     assert_eq!(
         w.scan.decompressed_bytes - r.scan.decompressed_bytes,
-        b1 + b2 - fetch_side_dirs,
-        "the difference is the skipped blocks' pages minus the ranged path's \
-         double-charged SKIP_IDX/PAGE_DIR"
+        b1 + b2,
+        "the difference is the skipped blocks' pages and nothing else"
     );
 
     // The figure lands in the scan phase and nowhere else: these funnels open

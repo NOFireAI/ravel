@@ -294,6 +294,12 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
             "pruning".to_string(),
             ravel_sql::stats_json::pruning_json(&outcome.stats),
         );
+        if let Some(serde_json::Value::Object(accounting)) = map.get_mut("accounting") {
+            accounting.insert(
+                "intValuesBuffers".to_string(),
+                serde_json::Value::from(outcome.stats.int_values_buffers),
+            );
+        }
     }
     encode(&headers, &outcome, tenant_hash, stats)
 }
