@@ -12,6 +12,19 @@ use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 
 /// The `Abandoned` message for a flush whose lifetime ended before its gated
 /// encode returned.
+///
+/// The three flush tasks (`shard.rs`, `log_shard.rs`, `span_shard.rs`) end a
+/// gated encode one of three ways, and each arm refers here:
+///
+/// - **Gate fault** (the job panicked or the runtime cancelled it): nothing
+///   was written, and the job's charges dropped with its result. The fault is
+///   the server's, not the input's, so the waiters get the retryable
+///   `ShardUnavailable` an encode panic gave when it took the actor down. The
+///   flush counts on `flush_gate_faults` and in no `abandoned_*` counter.
+/// - **Deadline** (the flush lifetime elapsed first): the job's charges drop
+///   with it, now if it never started, when it returns if it did. The waiters
+///   get `Abandoned` with this message, counted on `abandoned_queue_deadline`.
+/// - **Result**: the flush holds the returned charges to its terminal outcome.
 pub(crate) const GATE_DEADLINE_MESSAGE: &str =
     "flush lifetime elapsed before its write gate encode returned";
 
