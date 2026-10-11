@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use crate::fetcher::{ReadCache, gate_not_run};
+use crate::phase_accounting::PhaseAccounting;
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
@@ -459,7 +460,7 @@ impl SpanSegmentFetcher {
                     predicates,
                     None,
                     BlockProjection::All,
-                    &QueryAccounting::new(),
+                    &PhaseAccounting::new(),
                 )
                 .await?;
             return Ok(Some(drain_rows(scan).await?));
@@ -557,7 +558,7 @@ impl SpanSegmentFetcher {
             status_mask,
             predicates,
             None,
-            accounting,
+            &PhaseAccounting::pooled_over(accounting),
         )
         .await
     }
@@ -598,8 +599,15 @@ impl SpanSegmentFetcher {
     ///
     /// With a read cache, every ranged read is keyed
     /// `(tenant_hash, content_hash, offset, len)`, so a repeated lookup is
-    /// served from the cache with no GET. Each GET is recorded on
-    /// `accounting` as one request plus the wire bytes it returned.
+    /// served from the cache with no GET. Each read is recorded on the phase
+    /// that issued it, as one request plus the wire bytes it returned, or as
+    /// a cache hit or miss: the tail probe, the footer chase and the
+    /// SKIP_IDX/BLOOM section reads on `accounting.plan()`, each block-run GET
+    /// on `accounting.scan()`. A run sliced out of the probe issues no GET of
+    /// its own. A query without a `trace_id` reads the whole object on
+    /// `accounting.scan()`. [`fetch_accounted`](Self::fetch_accounted) passes
+    /// [`PhaseAccounting::pooled_over`] its one handle, so every phase lands
+    /// on that handle.
     ///
     /// `blocks` without a `trace_id` is a caller error, reported as
     /// [`SpanFetchError::Corrupt`] before any GET; a block ordinal at or past
@@ -615,7 +623,7 @@ impl SpanSegmentFetcher {
         status_mask: Option<u8>,
         predicates: &[BloomPredicate<'_>],
         blocks: Option<&[u32]>,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
         let scan = self
             .open_accounted_scan(
@@ -678,7 +686,7 @@ impl SpanSegmentFetcher {
             predicates,
             projected_columns,
             None,
-            accounting,
+            &PhaseAccounting::pooled_over(accounting),
         )
         .await
     }
@@ -698,7 +706,7 @@ impl SpanSegmentFetcher {
         predicates: &[BloomPredicate<'_>],
         projected_columns: &[u32],
         blocks: Option<&[u32]>,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
         self.open_accounted_scan(
             seg_ref,
@@ -728,7 +736,7 @@ impl SpanSegmentFetcher {
         predicates: &[BloomPredicate<'_>],
         blocks: Option<&[u32]>,
         projection: BlockProjection,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
         let key = &seg_ref.data_object_key;
         if blocks.is_some() && query.trace_id.is_none() {
@@ -759,7 +767,8 @@ impl SpanSegmentFetcher {
 
         // One whole-object read for either exit (cache hit or store GET): the
         // columnar exit skips decode, not fetch, so `page_bytes_fetched` cannot
-        // diverge between the two.
+        // diverge between the two. It fetches block data, so it is a scan read.
+        let accounting = accounting.scan();
         let bytes = self
             .whole_object_bytes(seg_ref, tenant_hash, accounting)
             .await?;
@@ -803,9 +812,13 @@ impl SpanSegmentFetcher {
         predicates: &[BloomPredicate<'_>],
         blocks: Option<&[u32]>,
         projection: BlockProjection,
-        accounting: &QueryAccounting,
+        accounting: &PhaseAccounting,
     ) -> Result<SpanColumnarScan, SpanFetchError> {
         let key = &seg_ref.data_object_key;
+        // The tail probe, the footer chase and the SKIP_IDX/BLOOM sections find
+        // the trace's blocks; only the block runs are data.
+        let plan = accounting.plan();
+        let scan = accounting.scan();
         let bad = |source: SpanSegError| corrupt(key, source);
         let trace_id = query.trace_id.ok_or_else(|| {
             bad(SpanSegError::Corrupted(
@@ -818,20 +831,14 @@ impl SpanSegmentFetcher {
         let probe = Extent {
             offset: size - probe_len,
             bytes: self
-                .ranged_read(
-                    seg_ref,
-                    tenant_hash,
-                    size - probe_len,
-                    probe_len,
-                    accounting,
-                )
+                .ranged_read(seg_ref, tenant_hash, size - probe_len, probe_len, plan)
                 .await?,
         };
         let footer = match open_from_suffix(&probe.bytes, size).map_err(bad)? {
             SuffixOutcome::Ready(footer) => footer,
             SuffixOutcome::NeedRange { offset, len } => {
                 let tail = self
-                    .ranged_read(seg_ref, tenant_hash, offset, len, accounting)
+                    .ranged_read(seg_ref, tenant_hash, offset, len, plan)
                     .await?;
                 match open_from_suffix(&tail, size).map_err(bad)? {
                     SuffixOutcome::Ready(footer) => footer,
@@ -855,7 +862,7 @@ impl SpanSegmentFetcher {
             .section(kind::SKIP_IDX)
             .ok_or_else(|| bad(SpanSegError::Corrupted("missing SKIP_IDX section".into())))?;
         let skip_stored = self
-            .section_bytes(seg_ref, tenant_hash, &probe, skip_desc, accounting)
+            .section_bytes(seg_ref, tenant_hash, &probe, skip_desc, plan)
             .await?;
         let skip_raw =
             decode_section(&skip_stored, skip_desc, self.cfg.max_uncomp_section).map_err(bad)?;
@@ -878,7 +885,7 @@ impl SpanSegmentFetcher {
                 .section(kind::BLOOM)
                 .ok_or_else(|| bad(SpanSegError::Corrupted("missing BLOOM section".into())))?;
             let bloom_stored = self
-                .section_bytes(seg_ref, tenant_hash, &probe, bloom_desc, accounting)
+                .section_bytes(seg_ref, tenant_hash, &probe, bloom_desc, plan)
                 .await?;
             let bloom_raw = decode_section(&bloom_stored, bloom_desc, self.cfg.max_uncomp_section)
                 .map_err(bad)?;
@@ -947,14 +954,8 @@ impl SpanSegmentFetcher {
             let bytes = match probe.slice(run.start(), run.byte_len()) {
                 Some(bytes) => bytes,
                 None => {
-                    self.ranged_read(
-                        seg_ref,
-                        tenant_hash,
-                        run.start(),
-                        run.byte_len(),
-                        accounting,
-                    )
-                    .await?
+                    self.ranged_read(seg_ref, tenant_hash, run.start(), run.byte_len(), scan)
+                        .await?
                 }
             };
             let buffer = buffers.len();
@@ -982,7 +983,7 @@ impl SpanSegmentFetcher {
             projection,
             candidates,
             stats,
-            accounting.clone(),
+            scan.clone(),
             SpanReadPath::RangedTrace,
         ))
     }
@@ -3264,7 +3265,7 @@ mod tests {
                         None,
                         &[],
                         Some(blocks),
-                        &QueryAccounting::new(),
+                        &PhaseAccounting::new(),
                     )
                     .await
             }
@@ -3296,7 +3297,7 @@ mod tests {
                 None,
                 &[],
                 Some(&[2]),
-                &QueryAccounting::new(),
+                &PhaseAccounting::new(),
             )
             .await
             .expect_err("a block set without a trace_id");
@@ -3304,17 +3305,12 @@ mod tests {
         assert_eq!(log.total(), 0, "refused before any GET");
     }
 
-    /// A caller's set over three adjacent blocks whose middle block the query
-    /// prunes is read as two ranged GETs of exactly the outer blocks, so the
-    /// pruned block's bytes are never transferred. The object's blocks are
-    /// `[t1] [t11] [t11] [t11] [t12]`, and trace 11's middle block holds its
-    /// only long spans, which a `duration_ns` bound prunes.
-    ///
-    /// FLIP: reading the caller's set unintersected (the `Some(set)` arm's
-    /// filter replaced by `.filter(|_b| true)`) yields one run over blocks
-    /// 1..=3 and one GET spanning all three, which fails the range list.
-    #[tokio::test]
-    async fn a_block_set_with_a_pruned_middle_block_reads_two_runs() {
+    /// One object whose blocks are `[t1] [t11] [t11] [t11] [t12]`, where trace
+    /// 11's middle block holds its only long spans, so [`PRUNE_MIDDLE`] prunes
+    /// block 2 alone. Returns the store, the object, every block's absolute
+    /// range, and a probe length that holds every section and no block of
+    /// trace 11.
+    async fn pruned_middle_fixture() -> (MemoryStore, SegmentRef, Vec<(u64, u64)>, u64) {
         let memory = MemoryStore::new();
         let mut records = Vec::new();
         for t in [1u8, 12] {
@@ -3335,7 +3331,6 @@ mod tests {
             .expect("whole object")
             .data;
         let (blocks_end, blocks, _) = layout(&whole);
-        let duration_ns = Some((0, 100));
         let reader = RspanReader::new(&whole, &RspanConfig::default()).expect("reader");
         let skip = reader.skip_index();
         assert_eq!(blocks.len(), 5, "fixture geometry: five blocks");
@@ -3345,7 +3340,7 @@ mod tests {
             "fixture geometry: trace 11 is blocks 1..=3"
         );
         assert_eq!(
-            skip.candidate_blocks(Some(&trace(11)), i64::MIN, i64::MAX, duration_ns, None),
+            skip.candidate_blocks(Some(&trace(11)), i64::MIN, i64::MAX, PRUNE_MIDDLE, None),
             vec![1, 3],
             "fixture geometry: the duration bound prunes block 2 alone"
         );
@@ -3354,17 +3349,34 @@ mod tests {
             blocks[3].1 <= seg.object_size - probe,
             "fixture geometry: trace 11's blocks lie outside the probe"
         );
+        (memory, seg, blocks, probe)
+    }
 
+    /// The `duration_ns` bound that prunes the middle block of
+    /// [`pruned_middle_fixture`]'s trace-11 run.
+    const PRUNE_MIDDLE: Option<(i64, i64)> = Some((0, 100));
+
+    /// A caller's set over three adjacent blocks whose middle block the query
+    /// prunes is read as two ranged GETs of exactly the outer blocks, so the
+    /// pruned block's bytes are never transferred. The probe is charged to the
+    /// plan phase and the two block GETs to the scan phase.
+    ///
+    /// FLIP: reading the caller's set unintersected (the `Some(set)` arm's
+    /// filter replaced by `.filter(|_b| true)`) yields one run over blocks
+    /// 1..=3 and one GET spanning all three, which fails the range list.
+    #[tokio::test]
+    async fn a_block_set_with_a_pruned_middle_block_reads_two_runs() {
+        let (memory, seg, blocks, probe) = pruned_middle_fixture().await;
         let log = Arc::new(GetLog::new(memory));
         let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(probe);
         let query = SpanQuery::trace(trace(11), i64::MIN, i64::MAX);
-        let acct = QueryAccounting::new();
+        let acct = PhaseAccounting::new();
         let out = fetcher
             .fetch_accounted_in_blocks(
                 &seg,
                 TENANT,
                 &query,
-                duration_ns,
+                PRUNE_MIDDLE,
                 None,
                 &[],
                 Some(&[1, 2, 3]),
@@ -3386,16 +3398,60 @@ mod tests {
         );
         assert_eq!(log.total(), 0, "no other GET was issued");
         let snap = acct.snapshot();
-        assert_eq!(snap.s3_requests(AccountedOp::Get), 3);
+        assert_eq!(snap.plan.s3_requests(AccountedOp::Get), 1, "the probe");
+        assert_eq!(snap.plan.s3_bytes(AccountedOp::Get), probe);
+        assert_eq!(snap.scan.s3_requests(AccountedOp::Get), 2, "two block GETs");
         assert_eq!(
-            snap.s3_bytes(AccountedOp::Get),
-            probe + (blocks[1].1 - blocks[1].0) + (blocks[3].1 - blocks[3].0),
+            snap.scan.s3_bytes(AccountedOp::Get),
+            (blocks[1].1 - blocks[1].0) + (blocks[3].1 - blocks[3].0),
             "block 2's bytes were never transferred"
         );
+        assert_eq!(snap.pooled().s3_requests(AccountedOp::Get), 3);
         assert_eq!(out.records.len(), 4, "the four short trace-11 spans");
         assert!(out.records.iter().all(|r| r.record.trace_id == trace(11)));
         assert_eq!(out.stats.blocks_after_skip, 2);
         assert_eq!(out.stats.blocks_scanned, 2);
+    }
+
+    /// With no block set, the trace's whole run is one ranged GET, pruned
+    /// middle block included, and only the two candidate blocks of that run
+    /// are decoded.
+    ///
+    /// FLIP: replacing the per-run re-filter in `ranged_trace_scan` with
+    /// `.filter(|_b| true)` decodes all three blocks of the run, which fails
+    /// the `blocks_scanned` and `blocks_after_skip` counts.
+    #[tokio::test]
+    async fn a_trace_run_with_a_pruned_middle_block_decodes_two_blocks() {
+        let (memory, seg, blocks, probe) = pruned_middle_fixture().await;
+        let log = Arc::new(GetLog::new(memory));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(probe);
+        let query = SpanQuery::trace(trace(11), i64::MIN, i64::MAX);
+        let out = fetcher
+            .fetch_accounted_in_blocks(
+                &seg,
+                TENANT,
+                &query,
+                PRUNE_MIDDLE,
+                None,
+                &[],
+                None,
+                &PhaseAccounting::new(),
+            )
+            .await
+            .expect("fetch")
+            .expect("relevant");
+
+        assert_eq!(
+            log.take(&seg.data_object_key),
+            vec![
+                GetRange::Range(seg.object_size - probe, seg.object_size),
+                GetRange::Range(blocks[1].0, blocks[3].1),
+            ],
+            "the probe, then one GET of the whole run of blocks 1..=3"
+        );
+        assert_eq!(log.total(), 0, "no other GET was issued");
+        assert_eq!(out.stats.blocks_scanned, 2, "block 2 is never decoded");
+        assert_eq!(out.stats.blocks_after_skip, 2);
     }
 
     /// A ranged GET that returns one byte short is `Corrupt` and never

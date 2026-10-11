@@ -968,6 +968,12 @@ tied to the buffer it accounts for:
   fetched.
 - **RLOG / RSPAN whole-object fetch** (`whole_object_bytes`, and the RSPAN
   `fetch`): the object size, with the guard attached to the returned `Bytes`.
+- **RSPAN ranged trace read** (`SpanSegmentFetcher::read_extent`, for a
+  `trace_id` query): each extent it reads (the tail probe, a footer chase, a
+  SKIP_IDX or BLOOM section outside the probe, each block run) reserves its own
+  length before its GET, with the guard attached to the returned `Bytes`.
+  Through the read cache the reservation is marked handed off on the hit arm
+  and on the upstream arm alike, the shape the RLOG block-range path has.
 
 The guard is never released because a GET completed; it releases only when the
 buffer it accounts for drops.
@@ -4707,12 +4713,17 @@ operator was holding.
 ## Caching note
 
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
-S3-FIFO eviction, single-flighted) consulted at four funnels:
+S3-FIFO eviction, single-flighted) consulted at five funnels:
 `SegmentFetcher::guarded_get`, `Catalog::guarded_get`,
-`LogSegmentFetcher::fetch`, and, for an RLOG object above the block-range
+`LogSegmentFetcher::fetch`, for an RLOG object above the block-range
 threshold, `BlockRangeFetcher` (ADR-0107), which routes its suffix probe, each
 directory section, and each candidate block through the cache on that extent's
-own key, admitting one entry per verified block and never a coalesced range.
+own key, admitting one entry per verified block and never a coalesced range,
+and `SpanSegmentFetcher::read_extent`, which keys an RSPAN whole-object read
+on `(0, object_size)` and, for a `trace_id` query, routes the tail probe, a
+footer chase, each section read outside the probe, and each block run through
+the cache on that extent's own key, admitting no extent whose GET returned
+fewer bytes than asked.
 Cache keys are `(tenant_hash, content_hash, offset,
 len)`, so entries survive object-key churn and two writers producing
 identical bytes share one entry. Each funnel credits its own hit/miss and
