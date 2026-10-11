@@ -50,7 +50,7 @@ use ravel_catalog::SegmentRef;
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
-use ravel_rspan::footer::kind;
+use ravel_rspan::footer::{SectionDesc, kind};
 use ravel_rspan::record::{
     COL_END_TS, COL_EVENT_ATTRS_BLOB, COL_EVENT_COUNT, COL_EVENT_NAME, COL_EVENT_TS, COL_START_TS,
     COL_TRACE_ID,
@@ -58,7 +58,9 @@ use ravel_rspan::record::{
 use ravel_rspan::skip_index::BlockEntry;
 use ravel_rspan::varint::get_uvarint;
 use ravel_rspan::{
-    BloomPredicate, RspanConfig, RspanReader, ScanStats, SpanQuery, SpanRecord, SpanSegError, open,
+    BloomPredicate, BloomSection, RspanConfig, RspanRangeReader, RspanReader, ScanStats, SpanQuery,
+    SpanRecord, SpanSegError, SuffixOutcome, TraceBlockSpan, decode_section, open,
+    open_from_suffix,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -107,6 +109,53 @@ pub struct SpanFetchOutput {
 /// `(start, end, crc32c)` byte range within the whole object, ready for the
 /// cursor to re-slice without holding a borrow of the reader.
 type CandidateBlock = (usize, usize, u32);
+
+/// One candidate block located in a scan's resident buffers:
+/// `(buffer, start, end, crc32c)`, with `start..end` relative to that buffer.
+type BufferedBlock = (usize, usize, usize, u32);
+
+/// The object tail the ranged trace path GETs first, before it knows where the
+/// footer and sections start. Sized to cover the footer, SKIP_IDX and BLOOM of
+/// a typical object in one request; a section the probe does not reach costs
+/// one more ranged GET of exactly that section.
+pub const DEFAULT_TRACE_PROBE_BYTES: u64 = 64 << 10;
+
+/// Which read a span fetch issues for one object. A query carrying a
+/// `trace_id` equality takes [`RangedTrace`](Self::RangedTrace): a tail probe
+/// for the footer and sections, then one ranged GET per contiguous block run
+/// holding the trace. Every other query reads the whole object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanReadPath {
+    WholeObject,
+    RangedTrace,
+}
+
+impl SpanReadPath {
+    /// The path [`SpanSegmentFetcher`] takes for `query`.
+    #[must_use]
+    pub fn for_query(query: &SpanQuery) -> Self {
+        if query.trace_id.is_some() {
+            SpanReadPath::RangedTrace
+        } else {
+            SpanReadPath::WholeObject
+        }
+    }
+
+    /// The label explain output names the path by.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpanReadPath::WholeObject => "whole-object",
+            SpanReadPath::RangedTrace => "ranged-trace",
+        }
+    }
+}
+
+impl std::fmt::Display for SpanReadPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// One decoded block handed out by the columnar exit
 /// ([`SpanSegmentFetcher::fetch_accounted_columnar`], ADR-0110 decision 2),
@@ -212,6 +261,9 @@ pub struct SpanSegmentFetcher {
     /// The read CPU gate the row exits' block decodes run on (ADR-1702
     /// decision 4). `None`, the default, decodes inline.
     read_gate: Option<Arc<ReadGate>>,
+    /// Length of the tail probe the ranged trace path reads first
+    /// ([`DEFAULT_TRACE_PROBE_BYTES`] unless overridden).
+    trace_probe_bytes: u64,
 }
 
 impl SpanSegmentFetcher {
@@ -225,7 +277,17 @@ impl SpanSegmentFetcher {
             )),
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             read_gate: None,
+            trace_probe_bytes: DEFAULT_TRACE_PROBE_BYTES,
         }
+    }
+
+    /// Overrides the tail probe length of the ranged trace path. Values below
+    /// the 64-byte floor are raised to it, so the probe always covers the
+    /// trailer.
+    #[must_use]
+    pub fn with_trace_probe_bytes(mut self, n: u64) -> Self {
+        self.trace_probe_bytes = n.max(64);
+        self
     }
 
     /// Runs the block decodes of [`fetch`](Self::fetch) and
@@ -384,6 +446,23 @@ impl SpanSegmentFetcher {
         if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
             return Ok(None);
         }
+        if query.trace_id.is_some() {
+            // Tenant-blind and uncached, like the whole-object read below.
+            let scan = self
+                .ranged_trace_scan(
+                    seg_ref,
+                    None,
+                    *query,
+                    duration_ns,
+                    status_mask,
+                    predicates,
+                    None,
+                    BlockProjection::All,
+                    &QueryAccounting::new(),
+                )
+                .await?;
+            return Ok(Some(drain_rows(scan).await?));
+        }
 
         let key = &seg_ref.data_object_key;
         // Reserve the whole object's bytes before the GET (ADR-1170 decision 2):
@@ -453,6 +532,11 @@ impl SpanSegmentFetcher {
     /// This is the funnel a production `spans` query takes once a caller is
     /// wired in (ADR-0045 decision 5, phase 2); the unaccounted, tenant-blind
     /// [`fetch`](Self::fetch) stays for unit tests and block-stat spies.
+    ///
+    /// A query carrying a `trace_id` takes the ranged trace path
+    /// ([`SpanReadPath::RangedTrace`]): see
+    /// [`fetch_accounted_in_blocks`](Self::fetch_accounted_in_blocks), which
+    /// this calls with no block set.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_accounted(
         &self,
@@ -464,36 +548,74 @@ impl SpanSegmentFetcher {
         predicates: &[BloomPredicate<'_>],
         accounting: &QueryAccounting,
     ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
-        if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
-            return Ok(None);
-        }
-
-        let key = &seg_ref.data_object_key;
-        let bytes = self
-            .whole_object_bytes(seg_ref, tenant_hash, accounting)
-            .await?;
-
-        // Tenant identity guard: an object whose footer names a different
-        // tenant is never decoded. The footer trailer is parsed here (cheap);
-        // `open_scan` re-opens it for the BLOCKS section descriptor.
-        let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
-        if footer.tenant_hash != tenant_hash.0 {
-            return Err(SpanFetchError::TenantMismatch {
-                key: key.to_string(),
-            });
-        }
-
-        let scan = self.open_scan(
-            bytes,
-            key.to_string(),
-            *query,
+        self.fetch_accounted_in_blocks(
+            seg_ref,
+            tenant_hash,
+            query,
             duration_ns,
             status_mask,
             predicates,
-            BlockProjection::All,
-            accounting.clone(),
-        )?;
-        Ok(Some(drain_rows(scan).await?))
+            None,
+            accounting,
+        )
+        .await
+    }
+
+    /// [`fetch_accounted`](Self::fetch_accounted) with an optional set of
+    /// block ordinals already known to hold `query.trace_id` (ADR-2707
+    /// decision 7, a key-index entry's block set).
+    ///
+    /// With a `trace_id`, the object is never read whole. One ranged GET of
+    /// the object's tail ([`DEFAULT_TRACE_PROBE_BYTES`]) yields the footer and,
+    /// when the probe reaches them, SKIP_IDX and BLOOM; a section it does not
+    /// reach is one ranged GET of exactly that section. The block run comes
+    /// from [`RspanRangeReader::trace_block_span`] when `blocks` is `None`, or
+    /// from one [`RspanRangeReader::block_run_span`] per contiguous run of
+    /// `blocks` otherwise, and each run is one ranged GET (skipped when no
+    /// candidate block lies in it, served from the probe when the probe
+    /// already holds it). Only the run's blocks that pass the same skip-index
+    /// and bloom prune the whole-object path applies are decoded, so rows,
+    /// `stats` and page-byte accounting match the whole-object path; only the
+    /// wire bytes and request count differ. A failed ranged GET is a typed
+    /// [`SpanFetchError::Store`], never a fallback to a whole-object read.
+    ///
+    /// With a read cache, every ranged read is keyed
+    /// `(tenant_hash, content_hash, offset, len)`, so a repeated lookup is
+    /// served from the cache with no GET. Each GET is recorded on
+    /// `accounting` as one request plus the wire bytes it returned.
+    ///
+    /// `blocks` without a `trace_id` is a caller error, reported as
+    /// [`SpanFetchError::Corrupt`] before any GET; a block set that is not a
+    /// valid run in this object is `Corrupt` as well.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted_in_blocks(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        blocks: Option<&[u32]>,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
+        let scan = self
+            .open_accounted_scan(
+                seg_ref,
+                tenant_hash,
+                query,
+                duration_ns,
+                status_mask,
+                predicates,
+                blocks,
+                BlockProjection::All,
+                accounting,
+            )
+            .await?;
+        match scan {
+            Some(scan) => Ok(Some(drain_rows(scan).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Columnar sibling of [`fetch_accounted`](Self::fetch_accounted) (ADR-0110
@@ -529,18 +651,104 @@ impl SpanSegmentFetcher {
         projected_columns: &[u32],
         accounting: &QueryAccounting,
     ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
+        self.fetch_accounted_columnar_in_blocks(
+            seg_ref,
+            tenant_hash,
+            query,
+            duration_ns,
+            status_mask,
+            predicates,
+            projected_columns,
+            None,
+            accounting,
+        )
+        .await
+    }
+
+    /// Columnar sibling of
+    /// [`fetch_accounted_in_blocks`](Self::fetch_accounted_in_blocks): the same
+    /// ranged trace read for a `trace_id` query, with or without a known block
+    /// set, handing out a [`SpanColumnarScan`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted_columnar_in_blocks(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        projected_columns: &[u32],
+        blocks: Option<&[u32]>,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
+        self.open_accounted_scan(
+            seg_ref,
+            tenant_hash,
+            query,
+            duration_ns,
+            status_mask,
+            predicates,
+            blocks,
+            BlockProjection::columnar(projected_columns),
+            accounting,
+        )
+        .await
+    }
+
+    /// The accounted, tenant-checked funnel both exits share: the catalog ts
+    /// pre-check, then the ranged trace read for a `trace_id` query or the
+    /// whole-object read otherwise.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_accounted_scan(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        blocks: Option<&[u32]>,
+        projection: BlockProjection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
+        let key = &seg_ref.data_object_key;
+        if blocks.is_some() && query.trace_id.is_none() {
+            return Err(corrupt(
+                key,
+                SpanSegError::Corrupted("a block set needs a trace_id".into()),
+            ));
+        }
         if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
             return Ok(None);
         }
+        if query.trace_id.is_some() {
+            let scan = self
+                .ranged_trace_scan(
+                    seg_ref,
+                    Some(tenant_hash),
+                    *query,
+                    duration_ns,
+                    status_mask,
+                    predicates,
+                    blocks,
+                    projection,
+                    accounting,
+                )
+                .await?;
+            return Ok(Some(scan));
+        }
 
-        let key = &seg_ref.data_object_key;
-        // Same one whole-object read the row exit records (cache hit or store
-        // GET): this exit skips decode, not fetch, so `page_bytes_fetched`
-        // cannot diverge here.
+        // One whole-object read for either exit (cache hit or store GET): the
+        // columnar exit skips decode, not fetch, so `page_bytes_fetched` cannot
+        // diverge between the two.
         let bytes = self
             .whole_object_bytes(seg_ref, tenant_hash, accounting)
             .await?;
 
+        // Tenant identity guard: an object whose footer names a different
+        // tenant is never decoded. The footer trailer is parsed here (cheap);
+        // `open_scan` re-opens it for the BLOCKS section descriptor.
         let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
         if footer.tenant_hash != tenant_hash.0 {
             return Err(SpanFetchError::TenantMismatch {
@@ -555,10 +763,250 @@ impl SpanSegmentFetcher {
             duration_ns,
             status_mask,
             predicates,
-            BlockProjection::columnar(projected_columns),
+            projection,
             accounting.clone(),
         )?;
         Ok(Some(scan))
+    }
+
+    /// The ranged trace read behind every `trace_id` query (see
+    /// [`fetch_accounted_in_blocks`](Self::fetch_accounted_in_blocks)).
+    /// `tenant_hash` is `None` only for the unaccounted, tenant-blind
+    /// [`fetch`](Self::fetch), which neither checks the footer tenant nor
+    /// consults the cache.
+    #[allow(clippy::too_many_arguments)]
+    async fn ranged_trace_scan(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: Option<TenantHash>,
+        query: SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        blocks: Option<&[u32]>,
+        projection: BlockProjection,
+        accounting: &QueryAccounting,
+    ) -> Result<SpanColumnarScan, SpanFetchError> {
+        let key = &seg_ref.data_object_key;
+        let bad = |source: SpanSegError| corrupt(key, source);
+        let trace_id = query.trace_id.ok_or_else(|| {
+            bad(SpanSegError::Corrupted(
+                "ranged read needs a trace_id".into(),
+            ))
+        })?;
+        let size = seg_ref.object_size;
+
+        let probe_len = self.trace_probe_bytes.min(size);
+        let probe = Extent {
+            offset: size - probe_len,
+            bytes: self
+                .ranged_read(
+                    seg_ref,
+                    tenant_hash,
+                    size - probe_len,
+                    probe_len,
+                    accounting,
+                )
+                .await?,
+        };
+        let footer = match open_from_suffix(&probe.bytes, size).map_err(bad)? {
+            SuffixOutcome::Ready(footer) => footer,
+            SuffixOutcome::NeedRange { offset, len } => {
+                let tail = self
+                    .ranged_read(seg_ref, tenant_hash, offset, len, accounting)
+                    .await?;
+                match open_from_suffix(&tail, size).map_err(bad)? {
+                    SuffixOutcome::Ready(footer) => footer,
+                    SuffixOutcome::NeedRange { .. } => {
+                        return Err(bad(SpanSegError::Corrupted(
+                            "footer range did not cover the footer".into(),
+                        )));
+                    }
+                }
+            }
+        };
+        if let Some(tenant_hash) = tenant_hash
+            && footer.tenant_hash != tenant_hash.0
+        {
+            return Err(SpanFetchError::TenantMismatch {
+                key: key.to_string(),
+            });
+        }
+
+        let skip_desc = footer
+            .section(kind::SKIP_IDX)
+            .ok_or_else(|| bad(SpanSegError::Corrupted("missing SKIP_IDX section".into())))?;
+        let skip_stored = self
+            .section_bytes(seg_ref, tenant_hash, &probe, skip_desc, accounting)
+            .await?;
+        let skip_raw =
+            decode_section(&skip_stored, skip_desc, self.cfg.max_uncomp_section).map_err(bad)?;
+        let reader = RspanRangeReader::from_sections(&footer, &skip_raw).map_err(bad)?;
+        let skip = reader.skip_index();
+        let blocks_total = skip.blocks.len() as u32;
+
+        let candidate_idx = if query.ts_min > query.ts_max {
+            Vec::new()
+        } else if predicates.is_empty() {
+            skip.candidate_blocks(
+                Some(&trace_id),
+                query.ts_min,
+                query.ts_max,
+                duration_ns,
+                status_mask,
+            )
+        } else {
+            let bloom_desc = footer
+                .section(kind::BLOOM)
+                .ok_or_else(|| bad(SpanSegError::Corrupted("missing BLOOM section".into())))?;
+            let bloom_stored = self
+                .section_bytes(seg_ref, tenant_hash, &probe, bloom_desc, accounting)
+                .await?;
+            let bloom_raw = decode_section(&bloom_stored, bloom_desc, self.cfg.max_uncomp_section)
+                .map_err(bad)?;
+            let bloom = BloomSection::parse(&bloom_raw).map_err(|e| bad(SpanSegError::from(e)))?;
+            skip.candidate_blocks_with_bloom(
+                Some(&trace_id),
+                query.ts_min,
+                query.ts_max,
+                duration_ns,
+                status_mask,
+                &bloom,
+                predicates,
+            )
+            .map_err(bad)?
+        };
+
+        let runs: Vec<TraceBlockSpan> = if candidate_idx.is_empty() {
+            Vec::new()
+        } else {
+            match blocks {
+                None => reader
+                    .trace_block_span(&trace_id)
+                    .map_err(bad)?
+                    .into_iter()
+                    .collect(),
+                Some(set) => contiguous_runs(set)
+                    .iter()
+                    .map(|run| reader.block_run_span(&trace_id, run))
+                    .collect::<Result<_, _>>()
+                    .map_err(bad)?,
+            }
+        };
+
+        let mut buffers = Vec::new();
+        let mut candidates = Vec::new();
+        for run in &runs {
+            let wanted: Vec<usize> = run
+                .blocks()
+                .iter()
+                .copied()
+                .filter(|b| candidate_idx.binary_search(b).is_ok())
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let bytes = match probe.slice(run.start(), run.byte_len()) {
+                Some(bytes) => bytes,
+                None => {
+                    self.ranged_read(
+                        seg_ref,
+                        tenant_hash,
+                        run.start(),
+                        run.byte_len(),
+                        accounting,
+                    )
+                    .await?
+                }
+            };
+            let buffer = buffers.len();
+            buffers.push(bytes);
+            for b in wanted {
+                let loc = reader.block_loc(b).map_err(bad)?;
+                let crc = skip.blocks[b].block_crc32c;
+                let rel = |abs: u64| {
+                    usize::try_from(abs - run.start())
+                        .map_err(|_| bad(SpanSegError::Corrupted("block offset range".into())))
+                };
+                candidates.push((buffer, rel(loc.start())?, rel(loc.end())?, crc));
+            }
+        }
+
+        let stats = ScanStats {
+            blocks_total,
+            blocks_after_skip: candidates.len() as u32,
+            blocks_scanned: 0,
+        };
+        Ok(self.new_scan(
+            buffers,
+            key.to_string(),
+            query,
+            projection,
+            candidates,
+            stats,
+            accounting.clone(),
+            SpanReadPath::RangedTrace,
+        ))
+    }
+
+    /// A section's stored bytes: sliced from the tail probe when the probe
+    /// covers it, otherwise one ranged GET of exactly `[offset, offset + len)`.
+    async fn section_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: Option<TenantHash>,
+        probe: &Extent,
+        desc: &SectionDesc,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, SpanFetchError> {
+        match probe.slice(desc.offset, desc.len) {
+            Some(bytes) => Ok(bytes),
+            None => {
+                self.ranged_read(seg_ref, tenant_hash, desc.offset, desc.len, accounting)
+                    .await
+            }
+        }
+    }
+
+    /// One ranged read of `[offset, offset + len)`, through the read cache
+    /// keyed `(tenant_hash, content_hash, offset, len)` when one is configured
+    /// and the caller is tenant-checked. A store returning a different length
+    /// than asked is `Corrupt`.
+    async fn ranged_read(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: Option<TenantHash>,
+        offset: u64,
+        len: u64,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, SpanFetchError> {
+        let key = &seg_ref.data_object_key;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| len > 0 && *end <= seg_ref.object_size)
+            .ok_or_else(|| {
+                corrupt(
+                    key,
+                    SpanSegError::Corrupted("ranged read outside the object".into()),
+                )
+            })?;
+        let bytes = self
+            .read_extent(
+                seg_ref,
+                tenant_hash,
+                offset,
+                len,
+                GetRange::Range(offset, end),
+                accounting,
+            )
+            .await?;
+        if bytes.len() as u64 != len {
+            return Err(corrupt(
+                key,
+                SpanSegError::Corrupted("ranged read returned the wrong length".into()),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// The one primitive behind both exits (ADR-0110 decision 2): resolve
@@ -585,8 +1033,36 @@ impl SpanSegmentFetcher {
         let (candidates, stats) = self
             .plan_candidates(&bytes, &query, duration_ns, status_mask, predicates)
             .map_err(|source| corrupt(&key, source))?;
-        Ok(SpanColumnarScan {
-            bytes,
+        let candidates = candidates
+            .into_iter()
+            .map(|(start, end, crc)| (0, start, end, crc))
+            .collect();
+        Ok(self.new_scan(
+            vec![bytes],
+            key,
+            query,
+            projection,
+            candidates,
+            stats,
+            accounting,
+            SpanReadPath::WholeObject,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_scan(
+        &self,
+        buffers: Vec<Bytes>,
+        key: String,
+        query: SpanQuery,
+        projection: BlockProjection,
+        candidates: Vec<BufferedBlock>,
+        stats: ScanStats,
+        accounting: QueryAccounting,
+        read_path: SpanReadPath,
+    ) -> SpanColumnarScan {
+        SpanColumnarScan {
+            buffers,
             key,
             query,
             projection,
@@ -602,7 +1078,8 @@ impl SpanSegmentFetcher {
             read_gate: self.read_gate.clone(),
             lost: false,
             lost_to: None,
-        })
+            read_path,
+        }
     }
 
     /// Fetches one segment's whole-object bytes, consulting the ADR-0046 read
@@ -635,14 +1112,39 @@ impl SpanSegmentFetcher {
         tenant_hash: TenantHash,
         accounting: &QueryAccounting,
     ) -> Result<Bytes, SpanFetchError> {
-        let key = &seg_ref.data_object_key;
-        // Reserve the whole object's bytes before the direct whole-object GET
-        // (ADR-1170 decision 2): a refusal fails typed with zero GETs. The guard
-        // travels with the returned bytes, owned for the fetched buffer's
-        // lifetime rather than released when the GET completes.
-        let reservation = self.reserve_fetch(seg_ref.object_size)?;
+        self.read_extent(
+            seg_ref,
+            Some(tenant_hash),
+            0,
+            seg_ref.object_size,
+            GetRange::Full,
+            accounting,
+        )
+        .await
+    }
 
-        let Some(cache) = &self.cache else {
+    /// One store read of the extent `[offset, offset + len)`, issued as
+    /// `range`, through the read cache keyed `(tenant_hash, content_hash,
+    /// offset, len)` when a cache is configured and `tenant_hash` is known.
+    /// Shared by the whole-object read and the ranged trace reads, so both
+    /// account a hit, a miss and a GET the same way.
+    async fn read_extent(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: Option<TenantHash>,
+        offset: u64,
+        len: u64,
+        range: GetRange,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, SpanFetchError> {
+        let key = &seg_ref.data_object_key;
+        // Reserve the extent's bytes before the GET (ADR-1170 decision 2): a
+        // refusal fails typed with zero GETs. The guard travels with the
+        // returned bytes, owned for the fetched buffer's lifetime rather than
+        // released when the GET completes.
+        let reservation = self.reserve_fetch(len)?;
+
+        let (Some(cache), Some(tenant_hash)) = (&self.cache, tenant_hash) else {
             let _permit = self
                 .get_limiter
                 .acquire()
@@ -655,7 +1157,7 @@ impl SpanSegmentFetcher {
                 })?;
             let got = self
                 .store
-                .get(key, GetRange::Full)
+                .get(key, range)
                 .await
                 .map_err(|source| SpanFetchError::Store {
                     key: key.to_string(),
@@ -666,7 +1168,7 @@ impl SpanSegmentFetcher {
             return Ok(attach_reservation(got.data, reservation));
         };
 
-        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, offset, len);
         // One read-through call, accounted from the returned `ReadOutcome`: a
         // single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see `ReadCache::get_or_fetch`).
@@ -675,13 +1177,13 @@ impl SpanSegmentFetcher {
                 let _permit = self.get_limiter.acquire().await.map_err(|_| {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
                 })?;
-                let got = self.store.get(key, GetRange::Full).await?;
+                let got = self.store.get(key, range).await?;
                 accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                 Ok(got.data)
             })
             .await
-            // This funnel's closure is one unconditional whole-object GET
+            // This funnel's closure is one unconditional GET
             // that verifies nothing itself, so the `EtagChanged`/`Corrupt`
             // classes below are unreachable here rather than wrong; they are
             // still mapped so the match is exhaustive against the shared
@@ -798,15 +1300,18 @@ impl SpanSegmentFetcher {
 /// accounting; `finish` is idempotent, so the two paths never double-count. This
 /// mirrors `LogSegmentScan` (crate `log_fetcher`, PR #642).
 pub struct SpanColumnarScan {
-    /// The whole object. Candidate byte ranges are absolute offsets into it.
-    bytes: Bytes,
+    /// The resident object bytes: the whole object on the whole-object path,
+    /// one buffer per fetched block run on the ranged trace path.
+    buffers: Vec<Bytes>,
     /// The object key, for error attribution.
     key: String,
     query: SpanQuery,
     projection: BlockProjection,
-    /// Absolute, bounds-checked `(start, end, crc32c)` byte ranges of the
-    /// candidate blocks, in scan order.
-    candidates: Vec<CandidateBlock>,
+    /// `(buffer, start, end, crc32c)` of the candidate blocks, in scan order,
+    /// with `start..end` relative to `buffers[buffer]`.
+    candidates: Vec<BufferedBlock>,
+    /// Which read produced `buffers`.
+    read_path: SpanReadPath,
     cursor: usize,
     stats: ScanStats,
     /// This query's accounting handle, folded once at exhaustion or drop with
@@ -846,6 +1351,11 @@ impl SpanColumnarScan {
     /// consumed; read it after the last [`next_block`](Self::next_block).
     pub fn stats(&self) -> ScanStats {
         self.stats
+    }
+
+    /// Which read this scan's bytes came from, for explain output.
+    pub fn read_path(&self) -> SpanReadPath {
+        self.read_path
     }
 
     /// Candidate blocks not yet decoded.
@@ -925,18 +1435,22 @@ impl SpanColumnarScan {
                 None => span_scan_lost(&self.key),
             });
         }
-        let Some(&(start, end, crc)) = self.candidates.get(self.cursor) else {
+        let Some(&(buffer, start, end, crc)) = self.candidates.get(self.cursor) else {
             self.finish();
             return Ok(None);
         };
         self.cursor += 1;
-        if self.bytes.get(start..end).is_none() {
+        let Some(bytes) = self
+            .buffers
+            .get(buffer)
+            .filter(|bytes| bytes.get(start..end).is_some())
+        else {
             return Err(corrupt(
                 &self.key,
                 SpanSegError::Corrupted("block out of bounds".into()),
             ));
-        }
-        Ok(Some((self.bytes.slice(start..end), crc)))
+        };
+        Ok(Some((bytes.slice(start..end), crc)))
     }
 
     /// Folds one decoded block into the scan's counters and hands it out.
@@ -1293,6 +1807,39 @@ fn abs_block_range(
         .checked_add(len)
         .ok_or_else(|| SpanSegError::Corrupted("block range overflow".into()))?;
     Ok((start, end))
+}
+
+/// Bytes read from the object at absolute `offset`.
+struct Extent {
+    offset: u64,
+    bytes: Bytes,
+}
+
+impl Extent {
+    /// The absolute range `[offset, offset + len)` when this extent holds all
+    /// of it.
+    fn slice(&self, offset: u64, len: u64) -> Option<Bytes> {
+        let start = usize::try_from(offset.checked_sub(self.offset)?).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.bytes.get(start..end)?;
+        Some(self.bytes.slice(start..end))
+    }
+}
+
+/// A block set split into maximal runs of adjacent ordinals, ascending, with
+/// duplicates dropped.
+fn contiguous_runs(set: &[u32]) -> Vec<Vec<usize>> {
+    let mut ordinals: Vec<usize> = set.iter().map(|&b| b as usize).collect();
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for b in ordinals {
+        match runs.last_mut() {
+            Some(run) if run.last().is_some_and(|&last| last + 1 == b) => run.push(b),
+            _ => runs.push(vec![b]),
+        }
+    }
+    runs
 }
 
 fn corrupt(key: &str, source: SpanSegError) -> SpanFetchError {
