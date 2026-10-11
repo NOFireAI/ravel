@@ -426,8 +426,9 @@ less the `UTF-8 validation` column it contains is 16.3, 14.0, 19.2, 23.2,
 0.85 asks for 15%. Set L: the same subtraction gives 20.5, 23.4, 25.1 and
 20.1% (22.7% pooled), so 0.85 again (see the Set L amendment below: the
 band did not hold, because those remaining points were treated as
-removable when only the builder's per-cell overhead, about 11 of them on
-q23, was). Wall bands allow for the serial floor, which does not move.
+removable when only the builder's overhead was: about 11 points on q23
+in the profile's leaf frame, about 13.6 on this table's basis). Wall
+bands allow for the serial floor, which does not move.
 
 ## Rejected alternatives
 
@@ -589,10 +590,12 @@ The Set L band (q21 to q24, the `LIKE` statements over `URL` and `Title`,
 warm CPU at most 0.85) did not hold, and the model it was derived from
 was wrong. Measured by the T5 sweep on #2790 (two arms interleaved on one
 c6a.4xlarge, 3 repetitions), as new / base like every band here: 0.998
-with new = main `bb171e615` and base = main `aaebcc008` (the parent of
-the three epic commits, the pre-registered comparison), and 0.993 with
-the same new arm against base = `bb171e615` with 011d5fe11, 7e5ffb59a
-and bb171e615 reverted (the control that isolates the epic). The measured
+with new = main `bb171e615` and base = main `aaebcc008` (the pre-wave-1
+main, the parent of the first epic commit; the pre-registered comparison,
+whose 57 commits include 54 outside the epic), and 0.993 with the same
+new arm against base = `bb171e615` with 011d5fe11, 7e5ffb59a and
+bb171e615 reverted (the control, and the only arm that isolates the
+epic). The measured
 0.99 is the outcome of record; no new band is claimed for these
 statements by this ADR.
 
@@ -604,16 +607,18 @@ the validation. The error was in what remained. Of the 25.1 points left
 on q23, D3 could only remove the per-cell overhead of the builder. On
 this corpus `URL` and `Title` are dictionary pages, so the pre-D3 build
 took the dictionary arm of `build_declared_str_columnar`
-(`crates/ravel-sql/src/logs_scan.rs` at `7e5ffb59a^`): per row,
-`plan.winning_idx(i)` (line 6878), a key push into a second keys vector,
-and `append_value` of the entry's text; the entry's text came from
-`StrDictText::entry` (lines 6305 to 6309), which validated each entry
-once, lazily on its first read, through a `std::cell::OnceCell` and
-`cell_text` (lines 6273 to 6277). Read by leaf in the #2864 profile's
-control arm (the same tree minus the epic, 2 repetitions pooled), the
-overhead is the winner selection (`winner_at`, 5.1), the per-cell
-`append_value` (2.9), the second keys vector (1.8) and the builder's own
-frame (1.5): 11.3 points on q23, and 10 to 12 on q21, q22 and q24. The
+(`crates/ravel-sql/src/logs_scan.rs` at `7e5ffb59a^`): once per
+dictionary entry per chunk, before the row loop (lines 6866 to 6872),
+`append_value` of the entry's text into a fresh values array; then per
+row, `plan.winning_idx(i)` (line 6878) and a key push into a second keys
+vector. The entry's text came from `StrDictText::entry` (lines 6305 to
+6309), which validated each entry once, lazily on its first read, through
+a `std::cell::OnceCell` and `cell_text` (lines 6273 to 6277). Read by
+leaf in the #2864 profile's control arm (the same tree minus the epic, 2
+repetitions pooled), the overhead is the winner selection (`winner_at`,
+5.1), the per-entry-per-chunk `append_value` (2.9, scaling with entries
+times chunks, not rows), the second keys vector (1.8) and the builder's
+own frame (1.5): 11.3 points on q23, and 10 to 12 on q21, q22 and q24. The
 rest of the column was the validation and the read and copy of each
 entry's bytes, the cost of the column, not an overhead. Those leaves are
 read in a `build_declared_str_columnar` frame of 37.9% inclusive, while
@@ -627,9 +632,11 @@ the two runs are compared by group, not to the decimal.
 
 What landed. In the new tree the build frame is 13 to 17%: `winner_at`
 is not reached on these statements (their columns take the single
-matching branch of `build_str_block`, `crates/ravel-sql/src/logs_scan.rs`
-lines 7324 to 7332), the per-cell append and the second keys vector are
-gone, and the per-row predicate is 0.2 to 0.4% (D2). The validation is
+matching branch of `build_str_block`, the function
+`build_declared_str_columnar` now delegates the block's build to,
+`crates/ravel-sql/src/logs_scan.rs` lines 7324 to 7332), the per-entry
+append and the second keys vector are gone, and the per-row predicate is
+0.2 to 0.4% (D2). The validation is
 unchanged at 8 to 20% of each statement and still once per dictionary
 entry; what moved is when it runs: eagerly, for every entry, when the
 block's `DictValues` is built from `decode_columns`
