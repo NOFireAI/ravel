@@ -262,7 +262,13 @@ impl SpanIngestRouter {
         // (ADR-0068 decision 2). Like the log router, the span pipeline has no
         // seeded-injection caller; routing through the seam still keeps
         // `rand::rng()` and `Uuid::new_v4()` off this production path.
-        Self::with_rng(config, store, clock, Arc::new(SystemRng))
+        Self::with_rng(
+            config,
+            store,
+            clock,
+            Arc::new(SystemRng),
+            pending_ack_budget,
+        )
     }
 
     /// Like [`Self::new`] but with an injected [`RngSource`]. A
@@ -273,6 +279,7 @@ impl SpanIngestRouter {
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
         rng: Arc<dyn RngSource>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
@@ -1226,6 +1233,7 @@ mod tests {
                 },
                 Arc::clone(&store),
                 Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_write_gate(floor_zero_write_gate(1));
             router.write_gate.fail_next_encode(injected);
@@ -1333,6 +1341,7 @@ mod tests {
                 Arc::clone(&store),
                 Arc::clone(&clock),
                 Arc::new(ravel_commit::rng::SeededRng::new(0x5EED)),
+                Arc::new(PendingAckBudget::new(0)),
             );
             let router = if gated {
                 router.with_write_gate(Arc::clone(&gate))

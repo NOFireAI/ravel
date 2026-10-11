@@ -1318,6 +1318,7 @@ mod tests {
                 Arc::clone(&store),
                 Signal::Metrics,
                 Arc::new(crate::clock::SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_write_gate(gate);
             router.write_gate.fail_next_encode(injected);

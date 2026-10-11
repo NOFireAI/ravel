@@ -51,8 +51,8 @@ use prost::Message;
 use ravel_cpu_gate::{GateSite as _, WriteGate, WriteSite};
 use ravel_ingest::{
     AdmissionController, AdmissionLimits, CountLimit, IngestByteBudget, IngestByteBudgetLimit,
-    IngestConfig, IngestPoint, IngestRouter, IngestValue, LogIngestRouter, RateLimit,
-    SpanIngestRouter, SystemClock, WriteMode,
+    IngestConfig, IngestPoint, IngestRouter, IngestValue, LogIngestRouter, PendingAckBudget,
+    RateLimit, SpanIngestRouter, SystemClock, WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -596,18 +596,21 @@ fn gateway_state(
         store.clone(),
         Signal::Metrics,
         Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
     )
     .with_budget(budget.clone());
     let mut log_router = LogIngestRouter::new(
         IngestConfig::default(),
         store.clone(),
         Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
     )
     .with_budget(budget.clone());
     let mut span_router = SpanIngestRouter::new(
         IngestConfig::default(),
         store.clone(),
         Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
     )
     .with_budget(budget.clone());
     if let Some(gate) = &gate {
@@ -669,8 +672,14 @@ fn remote_write_state(gate: Option<Arc<WriteGate>>) -> (Arc<RemoteWriteState>, A
         target_bytes: 1,
         ..IngestConfig::default()
     };
-    let mut router = IngestRouter::new(config, store, Signal::Metrics, Arc::new(SystemClock))
-        .with_budget(budget.clone());
+    let mut router = IngestRouter::new(
+        config,
+        store,
+        Signal::Metrics,
+        Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(budget.clone());
     if let Some(gate) = &gate {
         router = router.with_write_gate(gate.clone());
     }
@@ -699,8 +708,14 @@ fn flush_router(gate: Option<Arc<WriteGate>>) -> Arc<IngestRouter> {
         shard_count: 1,
         ..IngestConfig::default()
     };
-    let mut router = IngestRouter::new(config, store, Signal::Metrics, Arc::new(SystemClock))
-        .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited));
+    let mut router = IngestRouter::new(
+        config,
+        store,
+        Signal::Metrics,
+        Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited));
     if let Some(gate) = gate {
         router = router.with_write_gate(gate);
     }

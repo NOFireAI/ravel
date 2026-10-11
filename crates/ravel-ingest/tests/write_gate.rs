@@ -29,7 +29,7 @@ use ravel_commit::rng::SeededRng;
 use ravel_cpu_gate::{CpuGateConfig, InstantClock, JobSize, WriteGate, WriteSite};
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, LogIngestRouter,
-    LogWriteError, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
+    LogWriteError, PendingAckBudget, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
@@ -207,6 +207,7 @@ async fn a_metrics_flush_keeps_its_charge_while_its_encode_waits() {
         Arc::new(MemoryStore::new()),
         Signal::Metrics,
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     )
     .with_budget(Arc::clone(&budget))
     .with_write_gate(Arc::clone(&gate));
@@ -229,6 +230,7 @@ async fn a_log_flush_keeps_its_charge_while_its_encode_waits() {
         flush_on_first(),
         Arc::new(MemoryStore::new()),
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     )
     .with_budget(Arc::clone(&budget))
     .with_write_gate(Arc::clone(&gate));
@@ -254,6 +256,7 @@ async fn a_span_flush_keeps_its_charge_while_its_encode_waits() {
         flush_on_first(),
         Arc::new(MemoryStore::new()),
         TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
     )
     .with_budget(Arc::clone(&budget))
     .with_write_gate(Arc::clone(&gate));
@@ -302,6 +305,7 @@ async fn flush_encode_runs_through_the_write_gate() {
             Arc::clone(&store),
             Signal::Metrics,
             TestClock::new(BASE_NS),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_write_gate(Arc::clone(&gate)),
     );
@@ -339,6 +343,7 @@ async fn a_flush_queued_past_its_lifetime_on_the_write_gate_is_abandoned_unencod
             Arc::clone(&store),
             Signal::Metrics,
             clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_budget(Arc::clone(&budget))
         .with_write_gate(Arc::clone(&gate)),
@@ -447,6 +452,7 @@ async fn a_log_flush_queued_past_its_lifetime_on_the_write_gate_is_abandoned() {
             short_lifetime(),
             Arc::new(MemoryStore::new()),
             clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_write_gate(Arc::clone(&gate)),
     );
@@ -478,6 +484,7 @@ async fn a_span_flush_queued_past_its_lifetime_on_the_write_gate_is_abandoned() 
             short_lifetime(),
             Arc::new(MemoryStore::new()),
             clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_write_gate(Arc::clone(&gate)),
     );
@@ -546,6 +553,7 @@ async fn gated_metrics_flush_stores_the_same_objects_as_inline() {
             Signal::Metrics,
             TestClock::new(BASE_NS),
             Arc::new(SeededRng::new(0x5EED)),
+            Arc::new(PendingAckBudget::new(0)),
         );
         let router = if gated {
             router.with_write_gate(Arc::clone(&gate))
@@ -582,6 +590,7 @@ async fn log_flush_encode_runs_through_the_write_gate() {
             flush_on_first(),
             Arc::clone(&store),
             TestClock::new(BASE_NS),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_write_gate(Arc::clone(&gate)),
     );
@@ -609,6 +618,7 @@ async fn span_flush_encode_runs_through_the_write_gate() {
             flush_on_first(),
             Arc::clone(&store),
             TestClock::new(BASE_NS),
+            Arc::new(PendingAckBudget::new(0)),
         )
         .with_write_gate(Arc::clone(&gate)),
     );

@@ -1875,6 +1875,7 @@ mod tests {
                 Arc::clone(&clock),
                 overlay(),
                 Arc::new(SeededRng::new(seed)),
+                Arc::new(PendingAckBudget::new(0)),
             );
             let router = match gate {
                 Some(gate) => router.with_write_gate(gate),
@@ -1935,6 +1936,7 @@ mod tests {
                 },
                 Arc::clone(&store),
                 Arc::new(FixedClock(1_700_000_000_000_000_000)),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_write_gate(floor_zero_write_gate());
             router.write_gate.fail_next_encode(injected);
