@@ -272,18 +272,23 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         let body = scrape(&client, &base).await;
         // The sampler records the purge before it writes the gate, so a scrape
         // between the two reads the count with the budget's gauges still at 0.
-        // It writes the gate before it counts the sub-floor sample, so a
-        // scrape that reads the count at the close threshold reads a closed
-        // gate.
+        // It writes the gate before it counts the sub-floor sample, but the
+        // count's Relaxed fetch_add after the gate's Release store orders
+        // nothing for a Relaxed reader, so a scrape may see the count at the
+        // close threshold with the gate still open for one interval. Every
+        // sample here is below the floor, so the close, once written, holds,
+        // and it is waited for on the budget rather than inferred from the
+        // count.
         if value(&body, "ravel_memory_gate_purge_seconds_count") >= 1.0
             && value(&body, "ravel_memory_gate_available_floor_bytes") >= 1.0
             && value(&body, "ravel_memory_gate_samples_below_floor_total") >= close_after
+            && !budget.gate_open()
         {
             break body;
         }
         assert!(
             Instant::now() < deadline,
-            "no purge and {close_after} sub-floor samples within 30 s:\n{body}"
+            "no purge, {close_after} sub-floor samples and a closed gate within 30 s:\n{body}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -332,20 +337,25 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
     let samples = value(&body, "ravel_memory_gate_samples_total");
     assert!(samples >= purges, "{body}");
     // Every sample is below the close floor, so the sub-floor count tracks
-    // the sample count, at most one behind when the scrape lands between
-    // the two increments of one sample.
+    // the sample count, within one either way: the scrape's snapshot loads
+    // `samples` before `samples_below_floor` while the sampler keeps
+    // running, so a sample that completes between the two loads shows on
+    // the second counter and not the first, and one that is mid-sample at
+    // the first load shows on the first and not the second.
     let below_floor = value(&body, "ravel_memory_gate_samples_below_floor_total");
     assert!(
-        below_floor >= close_after && below_floor <= samples && below_floor >= samples - 1.0,
+        below_floor >= close_after && below_floor <= samples + 1.0 && below_floor >= samples - 1.0,
         "samples_below_floor {below_floor} against samples {samples}:\n{body}"
     );
     assert!(
         value(&body, "ravel_memory_gate_epoch_refresh_seconds_total") > 0.0,
         "{body}"
     );
+    // The gate closed before the loop broke, and every later sample is
+    // below the floor, so it is still closed here.
     assert!(
         !budget.gate_open(),
-        "{close_after} consecutive sub-floor samples close the gate"
+        "{close_after} consecutive sub-floor samples close the gate and later ones keep it closed"
     );
     assert_eq!(budget.gate_floor(), CLOSE_FLOOR);
 
