@@ -643,6 +643,9 @@ async fn main() -> anyhow::Result<()> {
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,
+        max_pending_strict_acks: ravel_server::config::check_max_pending_strict_acks(
+            cli.max_pending_strict_acks,
+        )?,
         ingest_buffer_budget_limit: cli
             .parse_ingest_buffer_budget()
             .context("failed to parse --max-ingest-buffer-bytes")?,

@@ -3044,6 +3044,38 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
+/// The process-wide pending strict-ack family (ADR-2793 decision 4):
+/// strict writes enqueued and awaiting their acknowledgement, and the
+/// cumulative refusals at `--max-pending-strict-acks`. Mode-only labeled like
+/// `render_ingest_concurrency_family` above: one budget is shared across
+/// metrics, logs and traces with no per-signal breakdown.
+fn render_pending_strict_ack_family(out: &mut String, mode: Mode, snapshot: PendingStrictAckSnapshot) {
+    write_header(
+        out,
+        "ravel_ingest_pending_strict_acks",
+        "Strict ingest writes enqueued and awaiting their durability acknowledgement, process-wide.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_pending_strict_acks",
+        &[Label::Mode(mode)],
+        snapshot.pending_strict_acks,
+    );
+    write_header(
+        out,
+        "ravel_ingest_pending_ack_shed_total",
+        "Strict ingest writes refused by the process-wide pending strict-acknowledgement ceiling (--max-pending-strict-acks).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_pending_ack_shed_total",
+        &[Label::Mode(mode)],
+        snapshot.shed_total,
+    );
+}
+
 /// The process-wide ingest buffer byte budget family (ADR-0069 decision 1,
 /// amended): the current gauge of estimated buffered bytes plus in-flight
 /// OTLP HTTP gzip and Remote Write snappy decode state, the configured
@@ -7872,6 +7904,7 @@ pub fn render(
     query_accounting: &[QueryAccountingRow],
     ingest_concurrency_shed_total: u64,
     ingest_buffer_budget: IngestBufferBudgetSnapshot,
+    pending_strict_acks: PendingStrictAckSnapshot,
     distrib: Option<&DistribSnapshot>,
     durable_auth: Option<&DurableAuthCountersSnapshot>,
     attribution: &[TenantAttributionRow],
@@ -8035,6 +8068,7 @@ pub fn render(
         ingest_buffer_budget.ceiling,
         ingest_buffer_budget.shed_total,
     );
+    render_pending_strict_ack_family(&mut out, mode, pending_strict_acks);
     if let Some(snapshot) = distrib {
         render_distrib_family(&mut out, mode, snapshot);
     }
@@ -8067,6 +8101,15 @@ pub fn render(
 pub struct IngestBufferBudgetSnapshot {
     pub in_flight_bytes: u64,
     pub ceiling: u64,
+    pub shed_total: u64,
+}
+
+/// The process-wide pending strict-ack budget readings (ADR-2793 decision 4),
+/// read once from a router's `metrics_snapshot()`: the three routers share
+/// one budget, so any one of them reports the process-wide figures.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PendingStrictAckSnapshot {
+    pub pending_strict_acks: u64,
     pub shed_total: u64,
 }
 
@@ -8468,6 +8511,31 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         shed_total: state.ingest_buffer_budget.shed_total(),
     };
 
+    // The three routers share one pending-ack budget, so the first present
+    // router's snapshot is the process-wide figure; summing would count it
+    // once per signal.
+    let pending_strict_acks = if let Some(router) = &state.ingest_router {
+        let snapshot = router.metrics_snapshot();
+        PendingStrictAckSnapshot {
+            pending_strict_acks: snapshot.pending_strict_acks,
+            shed_total: snapshot.pending_ack_shed,
+        }
+    } else if let Some(router) = &state.log_ingest_router {
+        let snapshot = router.metrics_snapshot();
+        PendingStrictAckSnapshot {
+            pending_strict_acks: snapshot.pending_strict_acks,
+            shed_total: snapshot.pending_ack_shed,
+        }
+    } else if let Some(router) = &state.span_ingest_router {
+        let snapshot = router.metrics_snapshot();
+        PendingStrictAckSnapshot {
+            pending_strict_acks: snapshot.pending_strict_acks,
+            shed_total: snapshot.pending_ack_shed,
+        }
+    } else {
+        PendingStrictAckSnapshot::default()
+    };
+
     let distrib_snapshot = state
         .distrib
         .as_ref()
@@ -8558,6 +8626,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &query_rows,
         ingest_concurrency_shed_total,
         ingest_buffer_budget,
+        pending_strict_acks,
         distrib_snapshot.as_ref(),
         durable_auth_snapshot.as_ref(),
         &attribution,
@@ -8891,6 +8960,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9524,6 +9594,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9613,6 +9684,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9758,6 +9830,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9942,6 +10015,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10025,6 +10099,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10274,6 +10349,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10352,6 +10428,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10421,6 +10498,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10541,6 +10619,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10629,6 +10708,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10739,6 +10819,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10826,6 +10907,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10918,6 +11000,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10980,6 +11063,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11029,6 +11113,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11120,6 +11205,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11627,6 +11713,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11845,6 +11932,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11882,6 +11970,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11956,6 +12045,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12016,6 +12106,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12105,6 +12196,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12224,6 +12316,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             Some(&snapshot),
             &[],
@@ -12283,6 +12376,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12394,6 +12488,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12667,6 +12762,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             Some(&snapshot),
             None,
             &[],
@@ -12769,6 +12865,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13199,6 +13296,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13335,6 +13433,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13429,6 +13528,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13498,6 +13598,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13606,6 +13707,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13817,6 +13919,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -14322,6 +14425,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -14556,6 +14660,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -14603,6 +14708,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15083,6 +15189,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15172,6 +15279,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15260,6 +15368,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15342,6 +15451,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15459,6 +15569,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &metrics.snapshot(),
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15685,6 +15796,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             distrib,
             None,
             &[],
@@ -16567,6 +16679,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -16694,6 +16807,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],

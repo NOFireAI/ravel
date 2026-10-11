@@ -1765,6 +1765,7 @@ mod catalog_cache_tests {
             ingest_concurrency_limit: crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(
                 1024,
             ),
+            max_pending_strict_acks: 8_192,
             ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit::Unlimited,
             idle_tenant_state_ttl: Duration::from_secs(3600),
             distrib: None,
