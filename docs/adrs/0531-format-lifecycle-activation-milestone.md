@@ -258,12 +258,13 @@ raised a bucket's format floor to N+1, a build that writes N:
 - starts, and warns once per (tenant, signal, family) whose floor is above
   what it writes, for the tenants its flags name; it sets
   `ravel_format_floor_above_writer{family}` to the count;
-- refuses every ingest flush into that bucket at flush open, before any store
-  call, and answers a strict write with a retryable error; the flush's rows
-  are dropped;
-- in a `maintain` process, refuses a compaction, erasure rewrite or migration
-  of that bucket before it claims or writes anything, and moves on; an erasure
-  request whose rewrite is refused stays pending;
+- refuses ingest flushes into that bucket at flush open, before any store
+  call, once it has read the bucket's provisioning record, and answers a
+  strict write with a retryable error; a refused flush's rows are dropped;
+- in a `maintain` process, refuses a compaction or erasure rewrite of that
+  bucket before it claims or writes anything, and moves on; an erasure
+  request whose rewrite is refused stays pending; `ravel-cli maintain
+  migrate` refuses to migrate the bucket;
 - counts every refusal under `ravel_format_floor_refused_total{family}`.
 
 Queries, the fold and retention run as before, so the stance on reading is

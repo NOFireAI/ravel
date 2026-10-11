@@ -3670,7 +3670,7 @@ fn render_format_floor_family(
     write_header(
         out,
         "ravel_format_floor_refused_total",
-        "Publishes refused because the object's format version is below the bucket's recorded floor for its family: ingest flushes and maintenance compactions, erasure rewrites and migrations (ADR-1746 decision 4).",
+        "Publishes refused because the object's format version is below the bucket's recorded floor for its family: ingest flushes, and maintenance compactions and erasure rewrites (ADR-1746 decision 4).",
         "counter",
     );
     for f in families {
@@ -8655,6 +8655,55 @@ mod tests {
             assert_eq!(
                 family_samples(&body, name),
                 vec![format!("{name}{{mode=\"query\"}} {value}")],
+                "{body}"
+            );
+        }
+    }
+
+    /// The three ADR-1746 families each render one header and one sample per
+    /// format family under `{mode, family}`, each from its own snapshot field.
+    /// Every figure is distinct, so a sample reading another field fails.
+    #[test]
+    fn format_floor_family_renders_each_field_per_family() {
+        use ravel_ingest::{FormatFamily, FormatFloorFamilySnapshot};
+        let families = [
+            (FormatFamily::Rseg, 1, 2, 3),
+            (FormatFamily::Rlog, 4, 5, 6),
+            (FormatFamily::Rspan, 7, 8, 9),
+        ]
+        .map(
+            |(family, above_writer, refused, writes_below)| FormatFloorFamilySnapshot {
+                family,
+                refused,
+                writes_below,
+                above_writer,
+            },
+        );
+        let mut body = String::new();
+        render_format_floor_family(&mut body, Mode::Maintain, &families);
+        for (name, kind, values) in [
+            ("ravel_format_floor_above_writer", "gauge", [1, 4, 7]),
+            ("ravel_format_floor_refused_total", "counter", [2, 5, 8]),
+            (
+                "ravel_format_floor_writes_below_total",
+                "counter",
+                [3, 6, 9],
+            ),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {name} {kind}\n")).count(),
+                1,
+                "{body}"
+            );
+            assert_eq!(
+                family_samples(&body, name),
+                ["rseg", "rlog", "rspan"]
+                    .iter()
+                    .zip(values)
+                    .map(|(family, value)| format!(
+                        "{name}{{mode=\"maintain\",family=\"{family}\"}} {value}"
+                    ))
+                    .collect::<Vec<_>>(),
                 "{body}"
             );
         }

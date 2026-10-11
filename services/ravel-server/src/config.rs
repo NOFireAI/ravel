@@ -971,8 +971,8 @@ pub struct Cli {
 
     /// Write objects below a bucket's recorded format floor instead of
     /// refusing them (ADR-1746 decision 5). Without it an ingest flush, a
-    /// compaction, an erasure rewrite or a migration that would publish an
-    /// object below the floor for its family is refused and counted under
+    /// compaction or an erasure rewrite that would publish an object below the
+    /// floor for its family is refused and counted under
     /// `ravel_format_floor_refused_total`. With it the object is written, a
     /// warning is logged per publish and counted under
     /// `ravel_format_floor_writes_below_total`, and the floor no longer holds:
@@ -14556,6 +14556,28 @@ mod tests {
             let text = format!("{err:#}");
             assert!(text.contains("--maintain-compaction-zstd-level"), "{text}");
         }
+    }
+
+    /// `--write-below-format-floor` resolves into the format-floor policy the
+    /// compactor config carries in every mode, which is the one `start` also
+    /// hands the ingest routers: refusing without the flag, writing with it,
+    /// both counting into the process-wide counters `/metrics` renders.
+    #[test]
+    fn write_below_format_floor_resolves_into_the_one_policy() {
+        let refusing = compactor(&[])
+            .expect("default")
+            .format_floor
+            .expect("every mode installs a policy");
+        assert!(!refusing.write_below_floor());
+        assert!(std::sync::Arc::ptr_eq(
+            refusing.metrics(),
+            &ravel_ingest::format_floor_metrics()
+        ));
+        let writing = compactor(&["--write-below-format-floor"])
+            .expect("flag")
+            .format_floor
+            .expect("every mode installs a policy");
+        assert!(writing.write_below_floor());
     }
 
     /// `--maintain-claims` defaults to on and its `.mode()` maps each variant

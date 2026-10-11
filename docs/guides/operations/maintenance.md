@@ -1563,15 +1563,17 @@ What you see:
   record the router already caches for routing, so it adds no store read. A
   refused flush makes no store call, drops its rows, and answers a strict
   write with a retryable error naming the family, the floor and the version
-  (HTTP 503). A floor raised while a writer runs reaches it within the
-  router's 60-second refresh interval.
-- In a `maintain` process, a compaction, erasure rewrite or migration reads
-  the bucket's provisioning record before it claims the bucket or writes
-  anything. That is one GET per run. A refused run builds and publishes
-  nothing, and the maintenance loop moves on to the next bucket. An erasure
-  request whose rewrite is refused stays pending, so its deletion waits too.
-  `ravel-cli maintain migrate` checks the same way and stops at the first
-  refused bucket. The `ravel-cli` compaction commands do not check the floor.
+  (HTTP 503). A floor raised while a writer runs takes effect once the writer
+  reads the record again. A write does that before it routes when the
+  router's copy is more than 60 seconds old.
+- In a `maintain` process, a compaction or erasure rewrite reads the bucket's
+  provisioning record before it claims the bucket or writes anything. That is
+  one GET per run. A refused run builds and publishes nothing, and the
+  maintenance loop moves on to the next bucket. An erasure request whose
+  rewrite is refused stays pending, so its deletion waits too.
+  `ravel-cli maintain migrate` checks each bucket the same way and stops at
+  the first refused one. The `ravel-cli` compaction commands do not check the
+  floor.
 - Every refusal logs a warning and counts under
   `ravel_format_floor_refused_total{family}`.
 
