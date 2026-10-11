@@ -436,8 +436,14 @@ macro_rules! strict_arrival_tests {
                 .expect("deferred write acks on age");
             assert_eq!(receipt.tokens.len(), 1);
             let snapshot = router.metrics().snapshot();
-            assert_eq!(snapshot.flushes_by_age, 1);
-            assert_eq!(snapshot.flushes_by_arrival, 1);
+            assert_eq!(
+                snapshot.flushes_by_age, 1,
+                "the deferred buffer flushes by age"
+            );
+            assert_eq!(
+                snapshot.flushes_by_arrival, 1,
+                "the reap does not reopen the deferred buffer as an arrival flush"
+            );
             assert_eq!(snapshot.arrival_coalesced, 1);
             assert_eq!(deferred_triggers(), 1);
         }

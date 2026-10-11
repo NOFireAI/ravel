@@ -485,8 +485,14 @@ Loop over `select!`:
   flight, the write marks the buffer arrival-pending and counts one
   `arrival_coalesced`; the reap below opens it, so every arrival write that
   lands behind an in-flight flush shares the next one. An arrival-pending
-  buffer keeps its age threshold: if the in-flight flush outlasts
-  `max_flush_delay`, the tick flushes it by age as it would a strict buffer.
+  buffer keeps its age threshold, measured from its own oldest row and not
+  from when the in-flight flush started: once that row is older than the
+  threshold while the flush is still in flight, the tick flushes the buffer by
+  age as it would a strict buffer. A buffer leaves the map without its
+  arrival-pending mark whenever a trigger takes it for a flush, so one the
+  flush puts back (deferred at the queued-flush cap, refused on the clock, or
+  kept by the scan-set check) waits for its next trigger like any other
+  rather than being reopened by the reap.
 - flush reaped (a spawned flush task finished): prune the tenant shares, then
   open the flush of every arrival-pending buffer that still holds a strict
   waiter and whose tenant now has no flush in flight, in the age tick's
