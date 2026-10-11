@@ -294,7 +294,8 @@ d. **Release notes.** A guard script fails a change to a reader `VERSION`
 
 ### D6. The alert fold skips and counts an out-of-window object (#2713)
 
-In the alert history fold (`services/ravel-server/src/alerting.rs:1888`),
+In the alert history fold (`fold_commit_entries` in
+`services/ravel-server/src/alerting.rs`, at its `RlogReader::new` call),
 `LogSegError::UnsupportedVersion` skips that object and increments
 `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
 with a warn line naming the tenant. Corruption and store errors still abort
@@ -305,7 +306,7 @@ notification for a still-live condition, inside the at-least-once contract
 the watermark, and retention deletes it on its normal schedule. (The
 skipped-object amendment below bounds this for a rollback past a bump.)
 
-The `RavelAlertPipelineBlocked` description (`deploy/prometheus/ravel.rules.yaml:313-318`)
+The `RavelAlertPipelineBlocked` description (`deploy/prometheus/ravel.rules.yaml`)
 and its reprint in docs/guides/observability.md are corrected: the liveness
 gauge is process-wide, so a single stalled tenant does not trip
 `RavelAlertLoopStalled`. A per-tenant liveness signal is out of scope: ADR-0044
@@ -438,6 +439,12 @@ Property tests in `normalize.rs`, `logs_normalize.rs` and
 `traces_normalize.rs` check, per metric, per log record and per span, that
 every kept name and value has capacity equal to its length and that the
 projection is at least what normalization allocated.
+
+Each OTLP handler (metrics, logs, traces) projects a request once, charges
+that projection to the ingest budget, and passes the same
+`ProjectedLabelBytes` to the normalizer's `_projected` entry point, so a
+request is walked once (#2782). The plain normalizer entry points still
+project for themselves.
 
 ## Amendment (2026-10-11): what a skipped alert object leaves (#2713)
 

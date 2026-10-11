@@ -273,7 +273,10 @@ tenant until the old objects age out. The fold skips the object instead:
 - `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
   rises by one for each fold that reads the object.
 - A warn log line names the tenant and the object key.
-- The tick evaluates its rules and reports `outcome="evaluated"`.
+- The tick evaluates its rules and reports `outcome="evaluated"`, unless
+  another object in the same fold is corrupt or unreachable. Then the tick
+  stops with `outcome="history_unavailable"` as above, and the skip counter
+  has still risen for the object it skipped first.
 
 An object is skipped only when its bytes match the content hash in its
 commit record and its RLOG format version is outside this build's reader
