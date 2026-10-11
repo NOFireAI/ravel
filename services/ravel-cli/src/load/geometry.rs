@@ -492,8 +492,8 @@ pub struct FlushMixReport {
 pub struct LoadLayoutReport {
     pub signal: String,
     pub objects_written: usize,
-    /// `None` when a metrics or spans load decoded no rows, so no router was
-    /// built and nothing was resolved.
+    /// `None` when the load decoded no rows, on any signal, so nothing was
+    /// resolved.
     pub geometry: Option<LoadGeometry>,
     pub flush_mix: FlushMixReport,
     pub target_bytes_no_effect_warning: Option<String>,

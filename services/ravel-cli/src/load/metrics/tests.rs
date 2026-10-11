@@ -984,13 +984,22 @@ mod default_geometry {
     /// keeps every batch's estimate equal and a buffer's estimate the sum of
     /// its batches'.
     fn fixture(batch_rows: usize, batches: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        hosted_fixture(batch_rows, batches, |g| format!("b{g:03}"))
+    }
+
+    /// [`fixture`] with row group `g` on the series `host(g)`.
+    fn hosted_fixture(
+        batch_rows: usize,
+        batches: usize,
+        host: impl Fn(usize) -> String,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         use parquet::arrow::ArrowWriter;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let pq = dir.path().join("points.parquet");
         let group = |g: usize| {
             let base = NOW_NS - 60_000_000_000 + (g * batch_rows) as i64;
-            let host = format!("b{g:03}");
+            let host = host(g);
             batch(vec![
                 (
                     "ts",
@@ -1046,13 +1055,83 @@ mod default_geometry {
         }
     }
 
+    /// Data objects on shard 0.
+    async fn stored_objects(store: &dyn ObjectStoreBackend) -> usize {
+        let mut stored = 0;
+        let mut page: Option<ravel_object_store::PageToken> = None;
+        loop {
+            let p = store.list("", page).await.expect("list");
+            stored += p
+                .objects
+                .iter()
+                .filter(|o| o.key.contains("/m/l0/0000/"))
+                .count();
+            match p.next {
+                Some(t) => page = Some(t),
+                None => break,
+            }
+        }
+        stored
+    }
+
+    /// Issue #2753: one series across every batch makes the first batch
+    /// over-estimate the rest, since a buffer charges a series' bytes only at
+    /// its first sighting there. 25 batches then estimate below the derived
+    /// target (25 first batches' worth), the size trigger never fires, and
+    /// the depth flush closes each window of 25: `51 / 25` depth flushes and
+    /// one end-of-input flush for the 1-batch remainder.
+    ///
+    /// Prove-the-test: never call `window.submitted` in the metrics loader
+    /// and nothing answers the write the loop waits on at the 25th submit;
+    /// the pinned clock never fires the age trigger, so the load fails on the
+    /// Strict ack deadline and `load`'s `expect("load succeeds")` panics.
+    #[tokio::test]
+    async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
+        let (_dir, pq) = hosted_fixture(BATCH_ROWS, BATCHES, |_| "b000".to_string());
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+
+        assert_eq!(report.points_written, (BATCH_ROWS * BATCHES) as u64);
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        let depth = geometry.pipeline_depth;
+        assert_eq!(depth, 25);
+        let depth_flushes = (BATCHES / depth) as u64;
+        let manual = u64::from(BATCHES % depth != 0);
+        assert_eq!(
+            stored_objects(store.as_ref()).await as u64,
+            depth_flushes + manual
+        );
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 0,
+                age: 0,
+                depth: depth_flushes,
+                manual,
+            },
+            "no size flush is reachable, so the depth flush closes every full window"
+        );
+    }
+
     /// With `--target-bytes` and `--pipeline-depth` unset, 51 batches of
     /// 10,000 points on one shard make exactly ceil(510,000 / 250,000) = 3
     /// objects: every 25th batch reaches the derived target (250,000 times
     /// the first batch's estimate per row) and closes an object on size, and
     /// the end-of-input drain publishes the 10,000-point tail. The derived
-    /// depth is ceil(250,000 / 10,000) = 25, so the depth flush runs after
-    /// batches 25 and 50 on buffers the size trigger has just emptied.
+    /// depth is ceil(250,000 / 10,000) = 25; the size flushes at batches 25
+    /// and 50 each restart the depth window, so the depth flush never comes
+    /// due.
     ///
     /// The clock is pinned, so the age trigger cannot fire. Per-batch
     /// flushing writes 51 objects; a target the size trigger never reaches
@@ -1075,22 +1154,9 @@ mod default_geometry {
         assert_eq!(report.points_written, (BATCH_ROWS * BATCHES) as u64);
         let expected_objects = (BATCH_ROWS * BATCHES).div_ceil(DEFAULT_OBJECT_ROWS);
         assert_eq!(expected_objects, 3);
-        let mut stored = 0;
-        let mut page: Option<ravel_object_store::PageToken> = None;
-        loop {
-            let p = store.list("", page).await.expect("list");
-            stored += p
-                .objects
-                .iter()
-                .filter(|o| o.key.contains("/m/l0/0000/"))
-                .count();
-            match p.next {
-                Some(t) => page = Some(t),
-                None => break,
-            }
-        }
         assert_eq!(
-            stored, expected_objects,
+            stored_objects(store.as_ref()).await,
+            expected_objects,
             "510,000 points on one shard make ceil(510,000 / 250,000) objects"
         );
         assert_eq!(report.objects_written(), expected_objects);

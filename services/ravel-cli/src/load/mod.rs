@@ -326,8 +326,8 @@ pub struct LoadReport {
     /// from `manual` to `depth`. Sorted by shard index; a shard no depth flush
     /// released is absent.
     pub depth_flushes_by_shard: Vec<(u32, u64)>,
-    /// The flush target and pipeline depth the load ran with. `None` when no
-    /// batch was decoded, so nothing was resolved.
+    /// The flush target and pipeline depth the load ran with. `None` when the
+    /// load decoded no rows, so nothing was resolved.
     pub geometry: Option<LoadGeometry>,
     /// The target-no-effect warning ([`target_bytes_no_effect_warning`]),
     /// computed once the load finished.

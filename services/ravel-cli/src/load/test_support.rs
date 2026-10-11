@@ -56,7 +56,7 @@ pub(super) struct TestClock {
     /// actor loop iteration, every write the actor handles, and every flush
     /// task reads this clock, so the counter standing still means no task
     /// in the router is runnable: the progress signal
-    /// `yield_until_router_is_quiet` in the logs tests samples.
+    /// [`yield_until_router_is_quiet`] samples.
     reads: std::sync::atomic::AtomicU64,
     wake_tx: tokio::sync::watch::Sender<()>,
 }
@@ -79,6 +79,36 @@ impl TestClock {
 
     pub(super) fn reads(&self) -> u64 {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Consecutive scheduler rounds [`yield_until_router_is_quiet`] needs to see
+/// the clock unread before it calls the router quiet. A routed write reaches
+/// its shard buffer within a handful of rounds, so this is generous rather
+/// than tuned; it costs nothing, because a round is one `yield_now` and no
+/// wall-clock wait.
+const QUIET_ROUNDS: usize = 64;
+
+/// Yields to the runtime until the router has stopped making progress, so
+/// the caller can advance the clock knowing every dispatched write is
+/// already in its shard buffer.
+///
+/// Quiescence is read off `clock.reads()`: with the clock frozen no timer
+/// can fire, so once nothing reads it for [`QUIET_ROUNDS`] consecutive
+/// rounds, no task in the router is runnable. Nothing here waits on wall
+/// time.
+pub(super) async fn yield_until_router_is_quiet(clock: &TestClock) {
+    let mut last = clock.reads();
+    let mut still = 0usize;
+    while still < QUIET_ROUNDS {
+        tokio::task::yield_now().await;
+        let reads = clock.reads();
+        if reads == last {
+            still += 1;
+        } else {
+            last = reads;
+            still = 0;
+        }
     }
 }
 
