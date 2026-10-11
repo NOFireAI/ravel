@@ -2688,7 +2688,7 @@ fn quantile_ladder(n: usize) -> Vec<WorkloadQuantile> {
 
 /// Resource attributes with unique keys. A resource repeating a key is the
 /// one shape where the paths may differ: OTLP keeps the first in request
-/// order, OTAP the first row in table order, which the spec sorts by value.
+/// order, OTAP the first row in table order.
 fn unique_resource_attrs_strategy() -> impl Strategy<Value = Vec<(String, WorkloadResourceValue)>> {
     prop::collection::vec(resource_attr_strategy(), 0..=5).prop_map(|attrs| {
         let mut seen = BTreeSet::new();

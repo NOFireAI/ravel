@@ -379,12 +379,11 @@ async fn write_batch(
     // `normalize_decoded` wrapper's behavior plus the metadata.
     //
     // The request-scoped `ExemplarCap` and the discarded `result.exemplars` are
-    // what the `normalize_decoded` wrapper this call site used to call built
-    // internally: nothing on this path stores exemplars (it writes through
-    // `write_values`, not `write_values_with_exemplars`), and the wrapper's
-    // drop-count rejection went into a `rejected` vector this function does not
-    // read either. So points, series, and the ack are byte-for-byte what they
-    // were; the metadata tuple is the only addition.
+    // what the `normalize_decoded` wrapper builds internally: nothing on this
+    // path stores exemplars (it writes through `write_values`, not
+    // `write_values_with_exemplars`), and the wrapper's drop-count rejection
+    // goes into a `rejected` vector this function does not read either. So this
+    // call writes the points the wrapper would, plus the metadata tuple.
     // The same resolved-label-byte bound and budget charge as the OTLP path
     // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`. The batch
     // is flattened and resolved once; no label exists until the normalize
@@ -829,6 +828,7 @@ mod tests {
                 .get(),
             "the label charge is exactly the projection"
         );
+        assert!(label_bytes > 0, "the projection charged the labels");
         assert!(router_bytes > 0, "the router charged the batch");
         assert_eq!(
             label_only.in_flight_bytes(),

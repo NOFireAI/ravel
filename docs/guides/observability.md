@@ -2254,8 +2254,7 @@ such an attribute flatten to the same label set and merge into one series.
 - The count is a lower bound when a resource repeats a job/instance-source
   or allowlisted key, or gives one an empty value. Only the first occurrence
   of a repeated key is consulted: the first in request order on OTLP, the
-  first row in table order on OTAP, where the spec sorts `RESOURCE_ATTRS` rows
-  by type, key and value. An empty-value label is dropped after this
+  first row in table order on OTAP. An empty-value label is dropped after this
   count already excluded that attribute by key. Neither case is added back as
   dropped.
 

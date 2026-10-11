@@ -135,24 +135,25 @@ resource gives the same labels on both transports: `job` from
 `service.name`, prefixed `<service.namespace>/` when that is set;
 `instance` from `service.instance.id`; each key on the resource attribute
 allowlist under its sanitized name. When a resource repeats a key, the
-first row in table order wins. otap-spec.md section 6.4.3 sorts those rows
-by type, key and value, so that is the first in sorted order rather than the
-first the sender wrote, and the two transports agree whenever a resource's
-keys are unique. The same limits apply: more attributes than
-`max_resource_attributes`, or a map/slice/bytes value, rejects every point
-under that resource, and keys outside the allowlist are dropped and counted
+first row in table order wins, and the two transports agree whenever a
+resource's keys are unique. The same limits apply: more attributes than
+`max_resource_attributes` rejects every point under that resource, and so
+does a map/slice/bytes value or an overlong value on a key the builder reads
+(the three service keys and the allowlist); keys outside the allowlist are
+dropped and counted
 on `ravel_ingest_resource_attrs_dropped_total`. A null `resource` row or one
 with no matching attribute rows has no resource labels, and attribute rows
 whose `parent_id` names no resource are ignored.
 
 A resource that cannot be read is rejected, never read as no resource. A
-METRICS `resource` column of the wrong type rejects every point in the
-batch; a `RESOURCE_ATTRS` table whose `parent_id`, `key` or `type` column
-cannot be read, or whose dictionary `parent_id` has a null slot, rejects
-every point under a resource. Both count as `reason="structural"` on
-`ravel_admission_rejected_total`, with the metric type `malformed_resource`
-in the rejection message; an unrecognized `RESOURCE_ATTRS.parent_id`
-encoding names `unrecognized_id_encoding` there instead.
+METRICS `resource` column of the wrong type, or a `resource` column whose
+`id` child has the wrong type, rejects every point in the batch. A `RESOURCE_ATTRS` table rejects every point under a resource when
+its `parent_id`, `key`, `type`, `str`, `int`, `bool` or `double` column is
+present and cannot be read, when its `parent_id` has a null slot (plain or
+dictionary), or when its `parent_id` encoding is unrecognized; so does an
+unrecognized encoding on the METRICS `resource.id` child. Points under no
+resource are kept, and each rejected point is counted once. All of these
+count as `reason="structural"` on `ravel_admission_rejected_total`.
 
 A resource's point count, which its rejections carry, covers number,
 histogram and summary points. Exponential-histogram points are rejected on
@@ -164,7 +165,7 @@ are not counted.
 The attribute tables (`RESOURCE_ATTRS` and the data-point and exemplar
 `*Attrs` tables) are read whether their columns are plain or
 dictionary-encoded: `key` and `str` as `Utf8` or `Dictionary(UInt8|UInt16,
-Utf8)`, `int` as `Int64` or `Dictionary(UInt16, Int64)`, and `parent_id` as
+Utf8)`, `int` as `Int64` or `Dictionary(UInt8|UInt16, Int64)`, and `parent_id` as
 `UInt16`, `UInt32` or `Dictionary(UInt8|UInt16, UInt32)`. The `type`
 discriminants are otap-spec.md section 5.5.1's: 0=Empty, 1=Str, 2=Int,
 3=Double, 4=Bool, 5=Map, 6=Slice, 7=Bytes, matching pdata's `ValueType`.

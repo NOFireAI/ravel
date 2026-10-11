@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc aaaebe7616140dd130c9d297f7f1a86986eb33a12a470ea41ff3418563ce217c # shrinks to (resources, shapes) = ([[], [], []], [([[AttrRow { key: "a", value: Str("") }]], None)])
+cc ff952769c7048369ce14e56d1dbbce58aed4ec045bfe37fbc6c23743588b4db9 # shrinks to (resources, shapes) = ([[], [], []], [([[AttrRow { key: "a", value: Str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaa") }, AttrRow { key: "host.name", value: Str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") }]], None, Summary(0))])

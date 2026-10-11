@@ -60,8 +60,8 @@
 //! allows (otap-spec.md section 6.4). The resource columns carry no metadata
 //! and take the spec defaults a real exporter relies on: DELTA for the root's
 //! `resource.id` and QUASI-DELTA for `RESOURCE_ATTRS.parent_id`, with the
-//! `RESOURCE_ATTRS` rows sorted by (type, key, value) as section 6.4.3 requires
-//! for that encoding to round-trip.
+//! `RESOURCE_ATTRS` rows sorted by (type, key, value), the order section 6.4.3
+//! describes for that encoding.
 //!
 //! `NUMBER_DATA_POINTS` and `NUMBER_DP_ATTRS` payloads are omitted from a
 //! batch entirely when they would have zero rows, per otap-spec.md section

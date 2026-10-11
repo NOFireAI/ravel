@@ -29,11 +29,12 @@
 //! are ignored, and `SCOPE_ATTRS` is not read (OTLP builds no label from
 //! scope attributes either). A resource that cannot be read is rejected,
 //! never read as no resource. A METRICS `resource` column of the wrong type
-//! rejects every point; a `RESOURCE_ATTRS` table whose `parent_id`, `key` or
-//! `type` cannot be read, or that has a null dictionary `parent_id` slot,
-//! rejects every point under a resource. Both count as `malformed_resource`;
-//! an unrecognized `RESOURCE_ATTRS.parent_id` encoding counts as
-//! `unrecognized_id_encoding`.
+//! rejects every point; a `RESOURCE_ATTRS` table whose `parent_id`, `key`,
+//! `type`, `str`, `bool`, `int` or `double` column is present and cannot be
+//! read, or that has a null `parent_id` slot, rejects every point under a
+//! resource. Both count as `malformed_resource`. An unrecognized encoding on
+//! `RESOURCE_ATTRS.parent_id` or on the METRICS `resource.id` child rejects
+//! every point under a resource as `unrecognized_id_encoding`.
 //!
 //! One count differs from OTLP's: a resource's point count, which its
 //! rejections carry and which decides whether it is admitted at all, covers
@@ -192,8 +193,9 @@ const UNRECOGNIZED_ID_ENCODING: &str = "unrecognized_id_encoding";
 
 /// Tag for the points of metrics whose resource cannot be read: a METRICS
 /// `resource` column or `id` child of the wrong type, or a `RESOURCE_ATTRS`
-/// batch missing its `parent_id`, `key` or `type` column or holding a null
-/// dictionary `parent_id` slot. Such points are rejected, never written
+/// batch missing its `parent_id`, `key` or `type` column, holding a null
+/// `parent_id` slot, or carrying a `str`, `bool`, `int` or `double` column of
+/// a type this pass cannot read. Such points are rejected, never written
 /// without their resource labels.
 const MALFORMED_RESOURCE: &str = "malformed_resource";
 
@@ -468,15 +470,11 @@ impl<'b> ParentIds<'b> {
         (0..self.len()).map(|i| self.plain(i)).collect()
     }
 
-    /// Whether a dictionary-encoded column has a null or out-of-range slot,
-    /// which [`Self::plain`] would read as parent 0.
-    fn has_null_dictionary_slot(&self) -> bool {
-        match self {
-            Self::U16(_) | Self::U32(_) => false,
-            Self::U32Dict8(..) | Self::U32Dict16(..) => {
-                (0..self.len()).any(|i| self.get(i).is_none())
-            }
-        }
+    /// Whether any slot is null, or a dictionary key is out of range: a plain
+    /// decode would read the buffer value or parent 0 there, and a delta or
+    /// quasi-delta decode the previous row's parent.
+    fn has_null_slot(&self) -> bool {
+        (0..self.len()).any(|i| self.get(i).is_none())
     }
 
     /// DELTA decode (otap-spec.md section 6.4.2), as [`decode_delta_u32`].
@@ -542,10 +540,13 @@ impl<'b> StrCol<'b> {
     }
 }
 
-/// The `int` column of an `*Attrs` table, plain or a `UInt16` dictionary
-/// (otap-spec.md section 5.4's default for it).
+/// The `int` column of an `*Attrs` table, plain or a `UInt8` or `UInt16`
+/// dictionary. Section 5.4 lists `UInt16` keys as the default, and section 4.3
+/// lets an encoder start with smaller keys and widen them on overflow, as
+/// [`StrCol`] accepts for `str`.
 enum IntCol<'b> {
     Plain(&'b Int64Array),
+    Dict8(&'b DictionaryArray<UInt8Type>, &'b Int64Array),
     Dict16(&'b DictionaryArray<UInt16Type>, &'b Int64Array),
 }
 
@@ -555,6 +556,10 @@ impl<'b> IntCol<'b> {
         if let Some(a) = col.downcast_ref::<Int64Array>() {
             return Some(Self::Plain(a));
         }
+        if let Some(d) = col.downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let values = d.values().as_any().downcast_ref::<Int64Array>()?;
+            return Some(Self::Dict8(d, values));
+        }
         let d = col.downcast_ref::<DictionaryArray<UInt16Type>>()?;
         let values = d.values().as_any().downcast_ref::<Int64Array>()?;
         Some(Self::Dict16(d, values))
@@ -563,6 +568,7 @@ impl<'b> IntCol<'b> {
     fn get(&self, i: usize) -> Option<i64> {
         let (values, idx) = match self {
             Self::Plain(a) => (*a, Some(i)),
+            Self::Dict8(d, values) => (*values, d.key(i)),
             Self::Dict16(d, values) => (*values, d.key(i)),
         };
         let idx = idx?;
@@ -1127,6 +1133,8 @@ fn normalize_impl(
         }
     }
     exemplar_admission.count_orphans(flat_hist_dp.iter().map(|dp| dp.id), &mut rejected);
+    #[cfg(test)]
+    held::record(resources.held_bytes() + SeriesIdMemo::held_bytes(hist_memos.values()));
 
     let mut summary_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
     for dp in flat_summary_dp {
@@ -1165,6 +1173,11 @@ fn normalize_impl(
             Err(rejection) => rejected.push(rejection),
         }
     }
+    #[cfg(test)]
+    held::record(
+        resources.held_bytes()
+            + SeriesIdMemo::held_bytes(hist_memos.values().chain(summary_memos.values())),
+    );
 
     let metadata = if collect_metadata {
         build_metadata(
@@ -1199,7 +1212,8 @@ fn normalize_impl(
 /// resource, its label prefix once; per number point, the label set it builds
 /// (unless its attributes equal the previous counted point's under the same
 /// metric) and the copy every admitted point carries; per classic histogram or
-/// summary point, every exploded series. Built from the same per-label helpers,
+/// summary point, every exploded series, and per such metric, the series its
+/// [`SeriesIdMemo`] copies. Built from the same per-label helpers,
 /// so the charge per label cannot drift between the formats.
 ///
 /// Builds no label: it decodes the batch's payloads and reads value lengths.
@@ -1351,14 +1365,14 @@ impl<'b> ResourcePrefixes<'b> {
         match resource_of(root, metric_id) {
             ResourceRef::Absent => Some(&[]),
             ResourceRef::Id(id) => self.prefixes.get(&id).map(Vec::as_slice),
-            ResourceRef::Malformed => None,
+            ResourceRef::Unreadable(_) => None,
         }
     }
 
     fn prefix_bytes_for(&self, root: &[Option<RootEntry>], metric_id: u16) -> usize {
         match resource_of(root, metric_id) {
             ResourceRef::Id(id) => self.planned.get(&id).map_or(0, |p| p.bytes),
-            ResourceRef::Absent | ResourceRef::Malformed => 0,
+            ResourceRef::Absent | ResourceRef::Unreadable(_) => 0,
         }
     }
 
@@ -1530,20 +1544,22 @@ fn plan_resources<'b>(
         .collect();
     let mut blocked = vec![false; root.len()];
 
-    let malformed: usize = resources
-        .iter()
-        .zip(&metric_points)
-        .filter(|(r, _)| matches!(r, ResourceRef::Malformed))
-        .map(|(_, &n)| n)
-        .sum();
-    for (b, r) in blocked.iter_mut().zip(&resources) {
-        *b |= matches!(r, ResourceRef::Malformed);
+    for tag in [MALFORMED_RESOURCE, UNRECOGNIZED_ID_ENCODING] {
+        let count: usize = resources
+            .iter()
+            .zip(&metric_points)
+            .filter(|(r, _)| **r == ResourceRef::Unreadable(tag))
+            .map(|(_, &n)| n)
+            .sum();
+        if count > 0 {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: tag,
+                count,
+            });
+        }
     }
-    if malformed > 0 {
-        rejected.push(Rejection::UnsupportedMetricType {
-            metric_type: MALFORMED_RESOURCE,
-            count: malformed,
-        });
+    for (b, r) in blocked.iter_mut().zip(&resources) {
+        *b |= matches!(r, ResourceRef::Unreadable(_));
     }
 
     let attrs = match resource_attrs {
@@ -1704,8 +1720,9 @@ mod held {
         static HELD: Cell<usize> = const { Cell::new(0) };
     }
 
+    /// Record what one phase of the build holds; [`take`] reads the largest.
     pub(super) fn record(bytes: usize) {
-        HELD.with(|h| h.set(bytes));
+        HELD.with(|h| h.set(h.get().max(bytes)));
     }
 
     pub(super) fn take() -> usize {
@@ -1730,6 +1747,10 @@ mod held {
 /// metric with equal attribute rows) is charged twice more: for the set the
 /// [`GroupCache`] keeps, and for the cache key, which copies each attribute's
 /// key and string value.
+///
+/// Each histogram or summary metric is charged once more for its
+/// [`SeriesIdMemo`], which holds a copy of one exploded series' set: the
+/// largest series any of the metric's charged points explodes into.
 fn project_flat(
     flat: &FlatPoints<'_>,
     tables: &MetricTables,
@@ -1782,6 +1803,8 @@ fn project_flat(
         }
     }
 
+    // Per histogram or summary metric id, the largest series its memo can copy.
+    let mut memos: HashMap<u16, usize> = HashMap::new();
     for dp in &flat.hist_dp {
         let Some(decision) = hist_decision
             .get(dp.parent_id as usize)
@@ -1801,6 +1824,16 @@ fn project_flat(
             .saturating_add(kept)
             .saturating_add(explode_name_label_bytes(decision.name.len()));
         total = total.saturating_add(histogram_point_bytes(per_series, &dp.explicit_bounds));
+        let le = dp
+            .explicit_bounds
+            .iter()
+            .copied()
+            .chain([f64::INFINITY])
+            .map(le_label_bytes)
+            .max()
+            .unwrap_or(0);
+        let memo = memos.entry(dp.parent_id).or_default();
+        *memo = (*memo).max(per_series.saturating_add(le));
     }
 
     for dp in &flat.summary_dp {
@@ -1825,8 +1858,29 @@ fn project_flat(
             per_series,
             dp.quantiles.iter().map(|q| q.0),
         ));
+        let quantile = dp
+            .quantiles
+            .iter()
+            .map(|q| quantile_label_bytes(q.0))
+            .max()
+            .unwrap_or(0);
+        let memo = memos.entry(dp.parent_id).or_default();
+        *memo = (*memo).max(per_series.saturating_add(quantile));
     }
-    total
+    memos.into_values().fold(total, usize::saturating_add)
+}
+
+/// The `le` label a histogram series for `bound` carries, as
+/// [`histogram_point_bytes`] charges it.
+fn le_label_bytes(bound: f64) -> usize {
+    histogram_point_bytes(0, &[bound]).saturating_sub(histogram_point_bytes(0, &[]))
+}
+
+/// The `quantile` label a summary series for `quantile` carries, as
+/// [`summary_point_bytes`] charges it.
+fn quantile_label_bytes(quantile: f64) -> usize {
+    summary_point_bytes(0, std::iter::once(quantile))
+        .saturating_sub(summary_point_bytes(0, std::iter::empty()))
 }
 
 /// One [`MetricMetadata`] per metric id that contributed a point, in metric-id
@@ -2115,9 +2169,11 @@ enum ResourceRef {
     /// No resource: an empty prefix.
     Absent,
     Id(u16),
-    /// A `resource` column or `id` child of the wrong type: the metric's
-    /// points are rejected as [`MALFORMED_RESOURCE`].
-    Malformed,
+    /// A resource that cannot be read: the metric's points are rejected with
+    /// this tag, [`MALFORMED_RESOURCE`] for a `resource` column or `id` child
+    /// of the wrong type, [`UNRECOGNIZED_ID_ENCODING`] for an `id` child whose
+    /// encoding is not recognized.
+    Unreadable(&'static str),
 }
 
 enum RootKind {
@@ -2389,7 +2445,7 @@ fn decode_root_ids(
         .map(|rb| {
             let ids = column_as::<UInt16Array>(rb, "id")?;
             let ids = decode_id_column_u16(rb, "id", ids, rejected)?;
-            let resource_ids = decode_root_resource_ids(rb, rejected)?;
+            let resource_ids = decode_root_resource_ids(rb);
             Some(RootIds { ids, resource_ids })
         })
         .collect()
@@ -2406,64 +2462,46 @@ struct RootIds {
 /// `UInt16` child of the `resource` struct, DELTA by default, its encoding
 /// declared on the child field). A row carries no resource when the `resource`
 /// column, its `id` child, the struct slot or the id slot is absent or null.
-/// Every row is [`ResourceRef::Malformed`] when the column or child is present
+/// Every row is [`MALFORMED_RESOURCE`] when the column or child is present
 /// with the wrong type. Null slots are left out of the delta running sum, as
-/// [`decode_delta_u16`] leaves them out. An unrecognized encoding rejects the
-/// batch as [`decode_id_column_u16`] does.
-fn decode_root_resource_ids(
-    rb: &RecordBatch,
-    rejected: &mut Vec<Rejection>,
-) -> Option<Vec<ResourceRef>> {
+/// [`decode_delta_u16`] leaves them out. An unrecognized encoding makes every
+/// row that carries a resource [`UNRECOGNIZED_ID_ENCODING`], leaving the rows
+/// with none readable.
+fn decode_root_resource_ids(rb: &RecordBatch) -> Vec<ResourceRef> {
     let rows = rb.num_rows();
     let Some(column) = rb.column_by_name("resource") else {
-        return Some(vec![ResourceRef::Absent; rows]);
+        return vec![ResourceRef::Absent; rows];
     };
     let Some(resource) = column.as_any().downcast_ref::<StructArray>() else {
-        return Some(vec![ResourceRef::Malformed; rows]);
+        return vec![ResourceRef::Unreadable(MALFORMED_RESOURCE); rows];
     };
     let Some(idx) = resource.fields().iter().position(|f| f.name() == "id") else {
-        return Some(vec![ResourceRef::Absent; rows]);
+        return vec![ResourceRef::Absent; rows];
     };
     let field = &resource.fields()[idx];
     let Some(ids) = resource.column(idx).as_any().downcast_ref::<UInt16Array>() else {
-        return Some(vec![ResourceRef::Malformed; rows]);
+        return vec![ResourceRef::Unreadable(MALFORMED_RESOURCE); rows];
     };
     let present = |i: usize| !resource.is_null(i) && !ids.is_null(i);
-    match field_id_encoding(field) {
-        Ok(IdEncoding::Plain) => Some(
-            (0..rows)
-                .map(|i| {
-                    if present(i) {
-                        ResourceRef::Id(ids.value(i))
-                    } else {
-                        ResourceRef::Absent
-                    }
-                })
-                .collect(),
-        ),
-        Ok(IdEncoding::Delta) => {
-            let mut acc: u16 = 0;
-            Some(
-                (0..rows)
-                    .map(|i| {
-                        if present(i) {
-                            acc = acc.wrapping_add(ids.value(i));
-                            ResourceRef::Id(acc)
-                        } else {
-                            ResourceRef::Absent
-                        }
-                    })
-                    .collect(),
-            )
-        }
-        Ok(IdEncoding::QuasiDelta) | Err(()) => {
-            rejected.push(Rejection::UnsupportedMetricType {
-                metric_type: UNRECOGNIZED_ID_ENCODING,
-                count: rows,
-            });
-            None
-        }
-    }
+    let encoding = field_id_encoding(field);
+    let mut acc: u16 = 0;
+    (0..rows)
+        .map(|i| {
+            if !present(i) {
+                return ResourceRef::Absent;
+            }
+            match encoding {
+                Ok(IdEncoding::Plain) => ResourceRef::Id(ids.value(i)),
+                Ok(IdEncoding::Delta) => {
+                    acc = acc.wrapping_add(ids.value(i));
+                    ResourceRef::Id(acc)
+                }
+                Ok(IdEncoding::QuasiDelta) | Err(()) => {
+                    ResourceRef::Unreadable(UNRECOGNIZED_ID_ENCODING)
+                }
+            }
+        })
+        .collect()
 }
 
 fn column_as<'b, T: 'static>(rb: &'b RecordBatch, name: &str) -> Option<&'b T> {
@@ -2627,8 +2665,9 @@ fn flatten_attrs<'b>(
 }
 
 /// Flatten the `RESOURCE_ATTRS` table, or name why it cannot be read: a
-/// non-empty batch missing its `parent_id`, `key` or `type` column, or with a
-/// null dictionary `parent_id` slot, is [`MALFORMED_RESOURCE`]; an
+/// non-empty batch missing its `parent_id`, `key` or `type` column, with a
+/// null `parent_id` slot, or with a `str`, `bool`, `int` or `double` column of
+/// a type this pass cannot read, is [`MALFORMED_RESOURCE`]; an
 /// unrecognized `parent_id` encoding is [`UNRECOGNIZED_ID_ENCODING`]. Either
 /// leaves no resource readable, so [`plan_resources`] rejects every point that
 /// refers to one.
@@ -2654,23 +2693,34 @@ enum AttrBatchError {
     UnrecognizedEncoding,
 }
 
-/// Append one `*Attrs` batch's rows to `out`. With `strict_parents`, a null
-/// dictionary `parent_id` slot makes the batch unreadable rather than parent 0.
+/// Append one `*Attrs` batch's rows to `out`. With `strict`, a null
+/// `parent_id` slot, or a value column present with a type this pass cannot
+/// read, makes the batch unreadable rather than parent 0 or an empty value.
 fn flatten_attr_batch<'b>(
     rb: &'b RecordBatch,
-    strict_parents: bool,
+    strict: bool,
     out: &mut Vec<FlatAttr<'b>>,
 ) -> Result<(), AttrBatchError> {
     let parents = ParentIds::from_column(rb, "parent_id").ok_or(AttrBatchError::Unreadable)?;
     let keys = StrCol::from_column(rb, "key").ok_or(AttrBatchError::Unreadable)?;
     let types = column_as::<UInt8Array>(rb, "type").ok_or(AttrBatchError::Unreadable)?;
-    if strict_parents && parents.has_null_dictionary_slot() {
+    if strict && parents.has_null_slot() {
         return Err(AttrBatchError::Unreadable);
     }
     let strs = StrCol::from_column(rb, "str");
     let bools = column_as::<BooleanArray>(rb, "bool");
     let ints = IntCol::from_column(rb, "int");
     let doubles = column_as::<Float64Array>(rb, "double");
+    if strict {
+        let unreadable = |name: &str, read: bool| !read && rb.column_by_name(name).is_some();
+        if unreadable("str", strs.is_some())
+            || unreadable("bool", bools.is_some())
+            || unreadable("int", ints.is_some())
+            || unreadable("double", doubles.is_some())
+        {
+            return Err(AttrBatchError::Unreadable);
+        }
+    }
     // otap-spec.md section 6.4.3: `*Attrs.parent_id` defaults to
     // QUASI-DELTA (equality columns `type`, `key`, and the type's Active
     // Field value), not the DELTA default of the core id chain.
@@ -3057,6 +3107,15 @@ impl SeriesIdMemo {
         let id = SeriesId::compute(tenant, metric_name, labels)?;
         self.last = Some((labels.clone(), id));
         Ok(id)
+    }
+
+    /// Heap bytes the memos' copied sets hold.
+    #[cfg(test)]
+    fn held_bytes<'a>(memos: impl Iterator<Item = &'a SeriesIdMemo>) -> usize {
+        memos
+            .filter_map(|m| m.last.as_ref())
+            .map(|(labels, _)| held::labels(labels.len(), labels.iter()))
+            .sum()
     }
 }
 
@@ -4090,8 +4149,8 @@ mod tests {
     }
 
     use crate::encode::{
-        AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
-        ResourceAssignment,
+        AttrRow, AttrValue, DataPointRow, HistogramMetricRow, HistogramPointRow, MetricKind,
+        MetricRow, MetricsStreamEncoder, ResourceAssignment, SummaryMetricRow, SummaryPointRow,
     };
     use crate::proto::experimental::arrow::v1::BatchArrowRecords;
     use crate::stream::{StreamConfig, StreamState};
@@ -4415,6 +4474,67 @@ mod tests {
         );
     }
 
+    /// A complex or overlong value rejects the points under its resource only
+    /// on a key the builder reads; on any other key it is a dropped attribute.
+    #[test]
+    fn resource_value_limits_apply_only_to_read_keys() {
+        let limits = IngestLimits {
+            max_label_value_len: 4,
+            ..IngestLimits::default()
+        };
+        let long = "x".repeat(8);
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+        let resources = vec![
+            vec![
+                str_attr("service.name", "a"),
+                AttrRow {
+                    key: "blob".to_string(),
+                    value: AttrValue::Complex(ANY_VALUE_TYPE_MAP),
+                },
+                str_attr("other", &long),
+            ],
+            vec![AttrRow {
+                key: "service.name".to_string(),
+                value: AttrValue::Complex(ANY_VALUE_TYPE_MAP),
+            }],
+            vec![str_attr("service.name", &long)],
+        ];
+        let batch = state
+            .decode(encode(
+                &mut encoder,
+                &[
+                    gauge("m0", vec![]),
+                    gauge("m1", vec![]),
+                    gauge("m2", vec![]),
+                ],
+                &resources,
+                &[Some(0), Some(1), Some(2)],
+            ))
+            .expect("decode");
+        let out = run(&batch, &limits);
+        assert_eq!(
+            labels_by_name(&out),
+            BTreeMap::from([("m0".to_string(), pairs(&[("__name__", "m0"), ("job", "a")]))])
+        );
+        let mut rejected = out.rejected.clone();
+        rejected.sort_by_key(|r| format!("{r:?}"));
+        assert_eq!(
+            rejected,
+            vec![
+                Rejection::Grouped {
+                    reason: Box::new(Rejection::ComplexAttributeValue),
+                    count: 1,
+                },
+                Rejection::Grouped {
+                    reason: Box::new(Rejection::LabelValueTooLong { len: 8, max: 4 }),
+                    count: 1,
+                },
+                Rejection::ResourceAttributesDropped { count: 2 },
+            ]
+        );
+    }
+
     /// otap-spec.md section 5.5.1's AnyValue discriminants, which pcommon's
     /// `ValueType` and the Go encoder share. The tables in sections 5.4.1 and
     /// 5.4.2 of the vendored spec list a different order; 5.5.1 is the one the
@@ -4628,26 +4748,61 @@ mod tests {
         }
     }
 
-    /// A `RESOURCE_ATTRS` batch whose `parent_id`, `key` or `type` column
-    /// cannot be read rejects every point under a resource as
-    /// `malformed_resource`; a point under no resource is unaffected.
+    /// A `RESOURCE_ATTRS` batch whose `parent_id`, `key`, `type` or value
+    /// column is present and cannot be read rejects every point under a
+    /// resource as `malformed_resource`, rather than reading the values as
+    /// empty; a point under no resource is unaffected.
     #[test]
     fn unreadable_resource_attrs_reject_points_under_a_resource() {
         let limits = IngestLimits::default();
-        let unreadable: [(&str, ArrayRef); 3] = [
+        let unreadable: [(&str, ArrayRef); 9] = [
             ("parent_id", Arc::new(StringArray::from(vec!["0", "0"]))),
             ("key", Arc::new(Int64Array::from(vec![0, 0]))),
             ("type", Arc::new(StringArray::from(vec!["1", "1"]))),
+            (
+                "str",
+                Arc::new(arrow::array::LargeStringArray::from(vec!["a", "i"])),
+            ),
+            (
+                "str",
+                Arc::new(arrow::array::StringViewArray::from(vec!["a", "i"])),
+            ),
+            (
+                "str",
+                Arc::new(
+                    DictionaryArray::<UInt16Type>::try_new(
+                        UInt16Array::from(vec![0, 0]),
+                        Arc::new(Int64Array::from(vec![1])),
+                    )
+                    .expect("non-string str dict"),
+                ),
+            ),
+            (
+                "int",
+                Arc::new(
+                    DictionaryArray::<UInt8Type>::try_new(
+                        UInt8Array::from(vec![None, None]),
+                        Arc::new(Int32Array::from(vec![7])),
+                    )
+                    .expect("non-Int64 int dict"),
+                ),
+            ),
+            ("bool", Arc::new(Int32Array::from(vec![None, None]))),
+            (
+                "double",
+                Arc::new(arrow::array::Float32Array::from(vec![None, None])),
+            ),
         ];
         for (name, column) in unreadable {
+            let shape = format!("{name}: {}", column.data_type());
             let mut batch = resource_and_bare();
             map_payload(&mut batch, ArrowPayloadType::ResourceAttrs, |rb| {
                 with_column(rb, name, column.clone())
             });
             let out = run(&batch, &limits);
-            assert_eq!(out.rejected, malformed(MALFORMED_RESOURCE, 1), "{name}");
+            assert_eq!(out.rejected, malformed(MALFORMED_RESOURCE, 1), "{shape}");
             let got = labels_by_name(&out);
-            assert_eq!(got.len(), 1, "{name}: {got:?}");
+            assert_eq!(got.len(), 1, "{shape}: {got:?}");
             assert_eq!(got["m1"], pairs(&[("__name__", "m1"), ("host", "h")]));
         }
     }
@@ -4735,6 +4890,108 @@ mod tests {
         assert_eq!(labels_by_name(&out).len(), 1);
     }
 
+    /// `field` with its `encoding` metadata set to `encoding`.
+    fn with_encoding(field: &Field, encoding: &str) -> Field {
+        let mut metadata = field.metadata().clone();
+        metadata.insert("encoding".to_string(), encoding.to_string());
+        field.clone().with_metadata(metadata)
+    }
+
+    /// A null slot in a plain `UInt16` `RESOURCE_ATTRS.parent_id` is
+    /// `malformed_resource` under every encoding, rather than the buffer value
+    /// (plain) or the previous row's parent (delta, quasi-delta).
+    #[test]
+    fn null_plain_resource_parent_is_rejected() {
+        let limits = IngestLimits::default();
+        for encoding in ["plain", "delta", "quasidelta"] {
+            let mut batch = resource_and_bare();
+            map_payload(&mut batch, ArrowPayloadType::ResourceAttrs, |rb| {
+                let rb = with_column(
+                    rb,
+                    "parent_id",
+                    Arc::new(UInt16Array::from(vec![Some(0), None])),
+                );
+                let schema = rb.schema();
+                let fields: Vec<Field> = schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if f.name() == "parent_id" {
+                            with_encoding(f, encoding)
+                        } else {
+                            f.as_ref().clone()
+                        }
+                    })
+                    .collect();
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), rb.columns().to_vec())
+                    .expect("rebuilt batch")
+            });
+            let out = run(&batch, &limits);
+            assert_eq!(out.rejected, malformed(MALFORMED_RESOURCE, 1), "{encoding}");
+            let got = labels_by_name(&out);
+            assert_eq!(got.len(), 1, "{encoding}: {got:?}");
+            assert_eq!(got["m1"], pairs(&[("__name__", "m1"), ("host", "h")]));
+        }
+    }
+
+    /// An unrecognized encoding on the METRICS `resource.id` child rejects the
+    /// points under a resource once, counted in points, and keeps the metric
+    /// with no resource.
+    #[test]
+    fn unrecognized_resource_id_encoding_rejects_points_under_a_resource() {
+        let limits = IngestLimits::default();
+        let mut m0 = gauge("m0", vec![]);
+        m0.data_points = (0..3)
+            .map(|i| DataPointRow {
+                time_unix_nano: TS + i,
+                value: 1.0,
+                flags: 0,
+                attrs: vec![],
+                exemplars: vec![],
+            })
+            .collect();
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut batch = StreamState::new(StreamConfig::default())
+            .decode(encode(
+                &mut encoder,
+                &[
+                    m0,
+                    gauge("m1", vec![str_attr("host", "h")]),
+                    gauge("m2", vec![]),
+                ],
+                &[vec![str_attr("service.name", "a")]],
+                &[Some(0), None, Some(0)],
+            ))
+            .expect("decode");
+        map_payload(&mut batch, ArrowPayloadType::UnivariateMetrics, |rb| {
+            let resource = rb
+                .column_by_name("resource")
+                .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+                .expect("resource struct");
+            let fields: Vec<Field> = resource
+                .fields()
+                .iter()
+                .map(|f| with_encoding(f, "bogus"))
+                .collect();
+            let column: ArrayRef = Arc::new(
+                StructArray::try_new(
+                    fields.into(),
+                    resource.columns().to_vec(),
+                    resource.nulls().cloned(),
+                )
+                .expect("resource struct"),
+            );
+            with_column(rb, "resource", column)
+        });
+        let out = run(&batch, &limits);
+        assert_eq!(out.rejected, malformed(UNRECOGNIZED_ID_ENCODING, 4));
+        assert_eq!(out.points.len(), 1);
+        assert_eq!(
+            labels_by_name(&out)["m1"],
+            pairs(&[("__name__", "m1"), ("host", "h")])
+        );
+    }
+
     fn short_str() -> impl Strategy<Value = String> {
         prop_oneof![Just(String::new()), "[a-z]{1,3}", "[a-z]{20,40}"]
     }
@@ -4772,14 +5029,32 @@ mod tests {
         )
     }
 
-    /// Per metric: its points' attribute rows, and its resource slot.
-    type MetricShape = (Vec<Vec<AttrRow>>, Option<usize>);
+    /// The kind of a generated metric: a gauge, or a classic histogram or
+    /// summary with this many bounds or quantiles per point.
+    #[derive(Clone, Copy, Debug)]
+    enum ShapeKind {
+        Gauge,
+        Histogram(usize),
+        Summary(usize),
+    }
+
+    const SHAPE_BOUNDS: [f64; 4] = [0.25, 10.0, 1234.5678, 1e21];
+    const SHAPE_QUANTILES: [f64; 3] = [0.5, 0.9, 0.999];
+
+    /// Per metric: its points' attribute rows, its resource slot, and its kind.
+    type MetricShape = (Vec<Vec<AttrRow>>, Option<usize>, ShapeKind);
 
     fn metric_shapes() -> impl Strategy<Value = (Vec<Vec<AttrRow>>, Vec<MetricShape>)> {
         let point = proptest::collection::vec(attr_row(), 0..4);
+        let kind = prop_oneof![
+            Just(ShapeKind::Gauge),
+            (0..=SHAPE_BOUNDS.len()).prop_map(ShapeKind::Histogram),
+            (0..=SHAPE_QUANTILES.len()).prop_map(ShapeKind::Summary),
+        ];
         let metric = (
             proptest::collection::vec(point, 1..6),
             proptest::option::of(0usize..3),
+            kind,
         );
         (
             proptest::collection::vec(resource_rows(), 3),
@@ -4787,12 +5062,108 @@ mod tests {
         )
     }
 
+    /// Encode `shapes` under `resources`, each metric in its kind's table.
+    fn encode_shapes(resources: &[Vec<AttrRow>], shapes: &[MetricShape]) -> DecodedBatch {
+        let mut metrics = Vec::new();
+        let mut histograms = Vec::new();
+        let mut summaries = Vec::new();
+        let (mut metric_slots, mut histogram_slots, mut summary_slots) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for (m, (points, resource, kind)) in shapes.iter().enumerate() {
+            let name = format!("m{m}");
+            match *kind {
+                ShapeKind::Gauge => {
+                    metrics.push(MetricRow {
+                        name,
+                        kind: MetricKind::Gauge,
+                        data_points: points
+                            .iter()
+                            .map(|attrs| DataPointRow {
+                                time_unix_nano: TS,
+                                value: 1.0,
+                                flags: 0,
+                                attrs: attrs.clone(),
+                                exemplars: vec![],
+                            })
+                            .collect(),
+                    });
+                    metric_slots.push(*resource);
+                }
+                ShapeKind::Histogram(bounds) => {
+                    histograms.push(HistogramMetricRow {
+                        name,
+                        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                        data_points: points
+                            .iter()
+                            .map(|attrs| HistogramPointRow {
+                                time_unix_nano: TS,
+                                count: bounds as u64 + 1,
+                                sum: Some(1.0),
+                                bucket_counts: vec![1; bounds + 1],
+                                explicit_bounds: SHAPE_BOUNDS[..bounds].to_vec(),
+                                flags: 0,
+                                min: None,
+                                max: None,
+                                exemplars: vec![],
+                                attrs: attrs.clone(),
+                            })
+                            .collect(),
+                    });
+                    histogram_slots.push(*resource);
+                }
+                ShapeKind::Summary(quantiles) => {
+                    summaries.push(SummaryMetricRow {
+                        name,
+                        data_points: points
+                            .iter()
+                            .map(|attrs| SummaryPointRow {
+                                time_unix_nano: TS,
+                                count: 1,
+                                sum: 1.0,
+                                quantiles: SHAPE_QUANTILES[..quantiles]
+                                    .iter()
+                                    .map(|&q| (q, 1.0))
+                                    .collect(),
+                                flags: 0,
+                                attrs: attrs.clone(),
+                            })
+                            .collect(),
+                    });
+                    summary_slots.push(*resource);
+                }
+            }
+        }
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let records = encoder
+            .encode_batch_resources(
+                1,
+                &metrics,
+                &[],
+                &histograms,
+                &[],
+                &summaries,
+                &[],
+                &ResourceAssignment {
+                    resources,
+                    metrics: &metric_slots,
+                    histograms: &histogram_slots,
+                    summaries: &summary_slots,
+                },
+            )
+            .expect("encode");
+        StreamState::new(StreamConfig::default())
+            .decode(records)
+            .expect("decode")
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         /// The projection covers every byte the build holds at once: the
-        /// admitted points' label sets, plus the group cache's keys and sets
-        /// and the resource prefixes, measured from their real capacities.
+        /// admitted points' label sets, plus the resource prefixes and
+        /// whichever phase holds more, the group cache's keys and sets or the
+        /// histogram and summary memos' copied sets, measured from their real
+        /// capacities.
         #[test]
         fn projection_covers_held_and_output_label_bytes(
             (resources, shapes) in metric_shapes(),
@@ -4801,29 +5172,7 @@ mod tests {
                 resource_attribute_allowlist: vec!["host.name".to_string()],
                 ..IngestLimits::default()
             };
-            let metrics: Vec<MetricRow> = shapes
-                .iter()
-                .enumerate()
-                .map(|(m, (points, _))| MetricRow {
-                    name: format!("m{m}"),
-                    kind: MetricKind::Gauge,
-                    data_points: points
-                        .iter()
-                        .map(|attrs| DataPointRow {
-                            time_unix_nano: TS,
-                            value: 1.0,
-                            flags: 0,
-                            attrs: attrs.clone(),
-                            exemplars: vec![],
-                        })
-                        .collect(),
-                })
-                .collect();
-            let assigned: Vec<Option<usize>> = shapes.iter().map(|(_, r)| *r).collect();
-            let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
-            let batch = StreamState::new(StreamConfig::default())
-                .decode(encode(&mut encoder, &metrics, &resources, &assigned))
-                .expect("decode");
+            let batch = encode_shapes(&resources, &shapes);
 
             let projected = project_resolved_label_bytes(&batch, &limits).get();
             held::take();
