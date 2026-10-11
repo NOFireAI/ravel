@@ -775,9 +775,11 @@ pub fn build_session(
     // materialized output. Appended after every rule above because each of
     // them matches the aggregate shape `EnforceDistribution` chose, or walks a
     // pass-through allowlist that does not include `CompactSlicesExec`
-    // (`BoundedTopKAggregate` reads `SortExec -> CoalescePartitionsExec ->
-    // AggregateExec` directly). Placed last, it decorates the final plan and
-    // nothing has to see through it. See `crate::compact_slices`.
+    // (`BoundedTopKAggregate` walks down from its `SortExec` through
+    // `ProjectionExec` and an allowlist of `CoalescePartitionsExec`,
+    // `CooperativeExec` and `RepartitionExec` to the `AggregateExec`, and
+    // refuses on any other node). Placed last, it decorates the final plan
+    // and nothing has to see through it. See `crate::compact_slices`.
     builder = builder.with_physical_optimizer_rule(Arc::new(CompactSlices));
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
