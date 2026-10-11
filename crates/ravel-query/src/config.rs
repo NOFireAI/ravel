@@ -390,23 +390,28 @@ pub enum LogsFetchPolicy {
     /// `s3-intra-region-2026` prices, where at that commit free transfer and
     /// retrieval saturated the cost-based rate to whole-object reads (the
     /// profile carried no time term yet, ADR-2414 decision A3). Cost-first stays
-    /// the default because it is right for the bill; this is an operator
-    /// opt-in for the deployments where the clock matters more than the
-    /// request bill, at a concurrency the operator raises explicitly. It
-    /// carries a memory precondition: in-flight fetch memory at the
-    /// concurrency it needs to pay off is not bounded by a process-wide
-    /// budget today (#1170, #1007).
+    /// the default for a remote store because it is right for the bill; the
+    /// server resolves this policy as the unset default on a loopback store,
+    /// where the request bill is not a cost (ADR-2677 decision 7), and it is
+    /// an operator opt-in elsewhere. The GET permit count bounds concurrent
+    /// GETs, not bytes: a fetch reserves its object's bytes on the process
+    /// memory budget (#2086) before it takes a permit and holds them past it,
+    /// and the budget refusing a fetch it cannot hold is what bounds them
+    /// where the server knows its budget (an unlimited fallback budget
+    /// refuses nothing).
     LatencyFirst,
 }
 
 /// The process-wide object-store GET concurrency
 /// [`LogsFetchPolicy::LatencyFirst`]'s cold-time measurement ran at
-/// (issue #1196): a documentation constant only, naming the concurrency
-/// `--fetch-concurrency 256` set for the GET permits, the SQL partition
-/// count, and the PromQL fan-out together. `latency-first` resolves no
-/// concurrency default from this value; an operator who wants the measured
-/// trade sets `--store-get-concurrency` (and, for SQL,
-/// `--sql-partition-count`) to it explicitly.
+/// (issue #1196), naming the concurrency `--fetch-concurrency 256` set for
+/// the GET permits, the SQL partition count, and the PromQL fan-out together.
+/// The engine reads nothing from it. The server caps its memory-derived
+/// `--store-get-concurrency` default at this value (ADR-2677 decision 7), so
+/// a budget whose 64% share divides into more 64 MiB units still derives only
+/// the measured count; the SQL partition count does not follow it, so the
+/// measured trade for SQL still needs `--sql-partition-count` set to it
+/// explicitly.
 pub const LATENCY_FIRST_MEASURED_CONCURRENCY: usize = 256;
 
 impl LogsFetchPolicy {
