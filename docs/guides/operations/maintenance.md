@@ -1540,6 +1540,62 @@ fleet in this order and never the reverse:
    recorded floor is at or above N+1. The floors that `migrate` raised make
    that a checkable fact. Do it in its own later reviewed change.
 
+### Format crossings at startup
+
+A build whose reader window no longer covers a stored version refuses those
+objects at query and compaction time. `ravel-server` reports such entries
+when it starts, before any listener binds:
+
+```sh
+ravel-server ... --format-window-check warn     # the default
+ravel-server ... --format-window-check refuse
+```
+
+For each statically known tenant and each of metrics, logs, spans, alerts and
+audit, the check reads the catalog HEAD and every snapshot part that HEAD
+names. It counts the entries whose recorded `segment_format_version` is
+outside the reader window of that signal's format: RSEG for metrics, RLOG for
+logs, alerts and audit, RSPAN for spans. The window comes from each reader's
+own constant, the same source `audit-versions` reads.
+
+The statically known tenants are those named by `--tenant-token`,
+`--tenant-token-file`, `--maintain-tenant` and the rules in
+`--alert-rules-file`. A deployment that authenticates every tenant through
+OIDC or mTLS and names none of these checks nothing, and startup logs that
+no tenant was checked.
+
+- `warn` logs one `WARN` line per (signal, version) with the entry count, the
+  number of tenants and the reader window, then starts.
+- `refuse` exits non-zero before any listener binds. The error names each
+  signal and version, for example
+  `signal alerts version 4 (1 entries in 1 tenants; reader window RLOG 5..=5)`.
+- A store error, a corrupt HEAD, or a snapshot part that does not match the
+  blake3 its HEAD names is a check that could not run, not a clean result.
+  `warn` logs it with the tenant and signal; `refuse` exits non-zero and says
+  the check could not run.
+
+Request cost, per tenant and per signal: one GET of the HEAD, plus one GET for
+each snapshot part when a HEAD exists. A (tenant, signal) never folded costs
+the one GET that finds no HEAD, so five GETs per tenant is the floor. The
+check issues no LIST, no HEAD request and no write.
+
+Limits:
+
+- Commit records above the HEAD watermark, the hours not yet folded, are not
+  read. Finding them needs a LIST of the commit prefix. For metrics, logs
+  and spans, `ravel-cli maintain audit-versions` lists the live records and
+  covers them.
+- The server's own fold loop folds metrics, logs and spans. Alerts and audit
+  have a HEAD only where `ravel-cli` folds them, so without one those two
+  signals report nothing.
+- The version checked is the one the writer recorded in the catalog entry.
+  The reader still checks each object's own trailer when it opens it.
+
+On a pre-v1.0 build a crossing found here has one remedy, as described
+above: re-ingest or discard the objects at the retired version. Start with
+`warn` to see the counts, and use `refuse` on a deployment that must not
+serve with part of its catalog unreadable.
+
 ## Legal hold
 
 ```sh
