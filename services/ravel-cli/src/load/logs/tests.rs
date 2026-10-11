@@ -216,7 +216,8 @@ async fn load_report_carries_the_flush_trigger_mix() {
         FlushMixCounts {
             size: 1,
             age: 0,
-            final_drain: 0,
+            depth: 0,
+            manual: 0,
         },
         "the single row flushes by size, nothing ages or drains"
     );
@@ -225,7 +226,8 @@ async fn load_report_carries_the_flush_trigger_mix() {
         FlushMixCounts {
             size: 1,
             age: 0,
-            final_drain: 0,
+            depth: 0,
+            manual: 0,
         }
     );
     assert_eq!(
@@ -387,7 +389,7 @@ async fn decode_queue_batches_zero_is_rejected() {
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         0,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -436,7 +438,7 @@ async fn max_inflight_flushes_zero_is_rejected() {
         1,
         0,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -827,7 +829,7 @@ async fn load_writes_the_same_objects_across_decode_queue_depths() {
                 2,
                 DEFAULT_MAX_INFLIGHT_FLUSHES,
                 depth,
-                DEFAULT_TARGET_BYTES,
+                PER_BATCH_TARGET_BYTES,
                 None,
                 NOW_NS,
                 Arc::new(FixedClock(NOW_NS)),
@@ -1013,7 +1015,7 @@ async fn decoder_runs_ahead_bounded_by_the_queue_depth() {
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         QUEUE_DEPTH,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -1294,7 +1296,7 @@ async fn next_batch_decode_overlaps_current_batch_write() {
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
@@ -1561,7 +1563,7 @@ async fn a_larger_target_bytes_writes_strictly_fewer_objects_for_the_same_rows()
         }
     };
 
-    let (small, stored_small, records_small) = run(DEFAULT_TARGET_BYTES).await;
+    let (small, stored_small, records_small) = run(PER_BATCH_TARGET_BYTES).await;
     let (large, stored_large, records_large) = run(8 * 1024 * 1024).await;
 
     assert_eq!(small.rows_processed, n_rows);
@@ -1662,7 +1664,7 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
         }
     };
 
-    let (default, objects_default, records_default) = run(DEFAULT_TARGET_BYTES).await;
+    let (default, objects_default, records_default) = run(PER_BATCH_TARGET_BYTES).await;
     let (below, objects_below, records_below) = run(4096).await;
     let (mid, objects_mid, _) = run(24_576).await;
     let (whole, objects_whole, records_whole) = run(1024 * 1024).await;
@@ -1697,12 +1699,13 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
     // size 4 / final 8 on the mid regime, before it showed up as 12 objects.
     for (target, report, expected) in [
         (
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             &default,
             FlushMixCounts {
                 size: 16,
                 age: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
         (
@@ -1711,7 +1714,8 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 16,
                 age: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
         (
@@ -1720,7 +1724,8 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 8,
                 age: 0,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
         (
@@ -1729,7 +1734,8 @@ async fn target_bytes_regimes_are_set_by_one_batchs_per_shard_slice() {
             FlushMixCounts {
                 size: 0,
                 age: 4,
-                final_drain: 0,
+                depth: 0,
+                manual: 0,
             },
         ),
     ] {
@@ -2116,7 +2122,8 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         FlushMixCounts {
             size: 1,
             age: 0,
-            final_drain: 0,
+            depth: 0,
+            manual: 0,
         },
         "the single object is a size flush; nothing ages under a delay longer than the advance"
     );
@@ -2136,7 +2143,8 @@ async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         FlushMixCounts {
             size: 0,
             age: 1,
-            final_drain: 1,
+            depth: 0,
+            manual: 1,
         },
         "the first object is the aged-out buffer, the second is the tail the end-of-input \
              flush published"
@@ -2228,10 +2236,10 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         1,
         0,
         Some(1),
-        5, // pipeline depth above the batch count: no mid-loop ack wait
+        Some(5), // pipeline depth above the batch count: no mid-loop ack wait or depth flush
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         1,
-        TARGET,
+        Some(TARGET),
         Some(Duration::from_secs(60)),
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
@@ -2282,7 +2290,8 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         FlushMixCounts {
             size: 1,
             age: 0,
-            final_drain: 1,
+            depth: 0,
+            manual: 1,
         },
         "the tail is published by the manual end-of-input flush, not by the age trigger"
     );
@@ -2417,10 +2426,10 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         batch_rows,
         0,
         Some(1),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -2451,10 +2460,10 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         batch_rows,
         0,
         Some(4),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -2499,10 +2508,10 @@ async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
         batch_rows,
         0,
         Some(1),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -2892,7 +2901,7 @@ async fn max_inflight_flushes_bounds_concurrent_flushes_per_shard() {
             PIPELINE_DEPTH,
             flushes,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -2951,7 +2960,7 @@ async fn max_inflight_flushes_bounds_concurrent_flushes_per_shard() {
 ///
 /// Non-vacuity (prove-the-test): the shipped-defaults arm's peak of 4 fails
 /// against the pre-change defaults. Confirmed by setting
-/// `DEFAULT_PIPELINE_DEPTH` back to 1: that arm reads `left: 1, right: 4`
+/// `MEASURED_PIPELINE_DEPTH` back to 1: that arm reads `left: 1, right: 4`
 /// and its wall goes to 665.99ms, indistinguishable from the fully serial
 /// arm's 673.05ms in the same run. The `4`/`1` and `1`/`4` arms are what make
 /// the claim "both windows, not either" falsifiable: a change that only
@@ -3027,7 +3036,7 @@ async fn both_write_windows_are_needed_to_overlap_put_round_trips() {
             depth,
             flushes,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -3131,7 +3140,7 @@ async fn both_write_windows_are_needed_to_overlap_put_round_trips() {
     // gets with neither flag given must be the overlapped arm, not the
     // serial one. This is the assertion the default change is accountable
     // to; against the pre-change defaults of 1 and 1 it reads a peak of 1.
-    let a_default = arm(DEFAULT_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
+    let a_default = arm(MEASURED_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
     let (wall_default, peak_default) = (a_default.wall, a_default.peak);
     println!(
         "  shipped defaults:    wall {wall_default:?} peak {peak_default} \
@@ -3409,7 +3418,7 @@ mod load_skip_rows {
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
@@ -3622,10 +3631,10 @@ mod load_skip_rows {
             2,
             99,
             Some(1),
-            1,
+            Some(1),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -3704,10 +3713,10 @@ mod load_skip_rows {
             2,
             2,
             Some(1),
-            1,
+            Some(1),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -3757,7 +3766,8 @@ mod load_skip_rows {
 
         // The same failure under the default geometry: the figures are the
         // same numbers and are NOT an offset.
-        let multi = resume_hint(&load_err, Some(4), 4).expect("a non-setup error has figures");
+        let multi =
+            resume_hint(&load_err, Some(4), Some(4)).expect("a non-setup error has figures");
         assert!(
             multi.contains("next --skip-rows : 4 (rows_skipped + rows_written)")
                 && multi.contains("NOT a contiguous prefix of the file")

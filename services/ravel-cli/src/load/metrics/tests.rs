@@ -796,10 +796,10 @@ mod metrics_pipeline_review {
             1,
             0,
             read_cursors,
-            pipeline_depth,
+            Some(pipeline_depth),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             decode_queue_batches,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -852,7 +852,7 @@ mod metrics_pipeline_review {
             "a metrics failure never names --read-cursors: {emitted}"
         );
 
-        let hint = sequential_resume_hint(&load_err, 2).expect("a row rejection has figures");
+        let hint = sequential_resume_hint(&load_err, Some(2)).expect("a row rejection has figures");
         assert_eq!(
             hint,
             format!(

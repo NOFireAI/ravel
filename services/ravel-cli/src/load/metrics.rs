@@ -43,6 +43,14 @@ pub struct MetricsLoadReport {
     /// One token per shard acked, across every batch, in submission order.
     pub tokens: Vec<CommitToken>,
     pub elapsed: Duration,
+    /// The flush target and pipeline depth the load ran with. `None` when no
+    /// batch was decoded.
+    pub geometry: Option<LoadGeometry>,
+    /// The router's flush counts split by trigger cause. The metrics router
+    /// counts per router, so this carries totals only.
+    pub flush_mix: FlushMixReport,
+    /// [`layout_no_effect_warning`] over this load's tokens.
+    pub target_bytes_no_effect_warning: Option<String>,
 }
 
 impl MetricsLoadReport {
@@ -54,6 +62,17 @@ impl MetricsLoadReport {
             .iter()
             .filter(|t| seen.insert(t.encode()))
             .count()
+    }
+
+    /// The layout report the summary renders and prints as JSON.
+    pub fn layout_report(&self) -> LoadLayoutReport {
+        LoadLayoutReport {
+            signal: "metrics".to_string(),
+            objects_written: self.objects_written(),
+            geometry: self.geometry,
+            flush_mix: self.flush_mix.clone(),
+            target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
+        }
     }
 }
 
@@ -1057,6 +1076,42 @@ pub async fn load_metrics(
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<MetricsLoadReport, LoadError> {
+    load_metrics_with(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        GeometryRequest::explicit(target_bytes, pipeline_depth),
+        max_inflight_flushes,
+        max_flush_delay,
+        now_ns,
+        clock,
+    )
+    .await
+}
+
+/// [`load_metrics`] with the target and depth left to [`resolve_geometry`]
+/// where `request` leaves them `None`. The router is built once the first
+/// batch with points is decoded, since a derived target is read off that
+/// batch's estimate; its source rows are the rows a derived target counts.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn load_metrics_with(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &MetricsMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    request: GeometryRequest,
+    max_inflight_flushes: u32,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<MetricsLoadReport, LoadError> {
     // Same operator-facing lever guards as the logs path: a value that cannot
     // express what the flag means is rejected, never silently clamped.
     if batch_rows == 0 {
@@ -1066,13 +1121,7 @@ pub async fn load_metrics(
                 .to_string(),
         ));
     }
-    if pipeline_depth == 0 {
-        return Err(LoadError::Setup(
-            "--pipeline-depth must be at least 1 (the number of concurrent in-flight writes); 0 \
-             was given"
-                .to_string(),
-        ));
-    }
+    request.validate()?;
     if max_inflight_flushes == 0 {
         return Err(LoadError::Setup(
             "--max-inflight-flushes must be at least 1 (the number of flushes one shard may have \
@@ -1081,13 +1130,8 @@ pub async fn load_metrics(
                 .to_string(),
         ));
     }
-    if target_bytes == 0 {
-        return Err(LoadError::Setup(
-            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
-             given"
-                .to_string(),
-        ));
-    }
+    let memory_budget = request
+        .sequential_memory_budget(u64::from(shards) * u64::from(max_inflight_flushes))?;
     mapping.validate()?;
 
     let limits = IngestLimits::default();
@@ -1112,13 +1156,18 @@ pub async fn load_metrics(
         ))
     })?;
 
-    let router = Arc::new(IngestRouter::new(
-        build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
-        Arc::clone(&store),
-        Signal::Metrics,
-        clock,
-        Arc::new(PendingAckBudget::new(0)),
-    ));
+    let build_router = |target_bytes: usize| {
+        Arc::new(IngestRouter::new(
+            build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
+            Arc::clone(&store),
+            Signal::Metrics,
+            Arc::clone(&clock),
+            Arc::new(PendingAckBudget::new(0)),
+        ))
+    };
+    let mut lazy: Option<(Arc<IngestRouter>, LoadGeometry, DepthWindow)> = None;
+    let mut enqueue = EnqueueTracker::new();
+    let mut depth_flushes: u64 = 0;
     let ack_deadline = write_ack_deadline(max_flush_delay);
 
     let input = FileInput { path: parquet_path };
@@ -1159,7 +1208,7 @@ pub async fn load_metrics(
     let mapping = Arc::new(mapping.clone());
 
     let mut inflight: std::collections::VecDeque<Inflight<WriteReceipt, WriteError>> =
-        std::collections::VecDeque::with_capacity(pipeline_depth);
+        std::collections::VecDeque::new();
 
     loop {
         let tenant_for_decode = tenant_id.clone();
@@ -1221,16 +1270,50 @@ pub async fn load_metrics(
 
         let batch_points = points.len() as u64;
         let batch_rows_written = rows;
+        let points: Vec<ravel_ingest::IngestPoint> = points
+            .into_iter()
+            .map(ravel_ingest::IngestPoint::from)
+            .collect();
+        let (router, geometry, window) = lazy.get_or_insert_with(|| {
+            let resolved = resolve_geometry(
+                request.target_bytes,
+                request.pipeline_depth,
+                shards,
+                batch_rows,
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                ravel_ingest::est_points_object_bytes(&points),
+                memory_budget,
+            );
+            (
+                build_router(resolved.target_bytes),
+                resolved,
+                DepthWindow::new(&resolved),
+            )
+        });
+        let pipeline_depth = geometry.pipeline_depth;
+
         let handle = {
-            let router = Arc::clone(&router);
+            let router = Arc::clone(router);
             let tenant = tenant_id.clone();
+            let enqueued = enqueue.guard();
             tokio::spawn(async move {
-                router
-                    .write(tenant, points, WriteMode::Strict, ack_deadline)
-                    .await
+                let submitted = router
+                    .submit_values(tenant, points, WriteMode::Strict, ack_deadline)
+                    .await;
+                drop(enqueued);
+                submitted?.acks().await
             })
         };
         inflight.push_back((batch_rows_written, batch_points, handle));
+
+        // The depth flush runs before the window is resolved, so the oldest
+        // write the loop waits on below has always been flushed already.
+        if window.submitted() {
+            enqueue.wait_enqueued().await;
+            let before = router.metrics_snapshot().flushes_manual;
+            router.flush_all().await;
+            depth_flushes += router.metrics_snapshot().flushes_manual - before;
+        }
 
         // Bound true concurrency to `pipeline_depth`, resolving strictly
         // oldest-first so the token list and the first error stay in
@@ -1253,8 +1336,15 @@ pub async fn load_metrics(
     // Publish the tail buffers before draining, for the same reason the logs
     // path does: no later batch is coming to push a buffer past
     // `--target-bytes`, so its writes' acks would otherwise wait out the age
-    // trigger. The ticker sweeps a straggler whose send landed after this
-    // flush.
+    // trigger. Every submit is enqueued first, so the flush drains every
+    // buffered write; the ticker is a backstop that should find nothing.
+    let Some((router, geometry, _)) = lazy else {
+        // No batch carried a point, so nothing was submitted.
+        report.histogram_points_exploded = state.grouper.as_ref().map_or(0, |g| g.exploded);
+        report.elapsed = started.elapsed();
+        return Ok(report);
+    };
+    enqueue.wait_enqueued().await;
     router.flush_all().await;
     let drain_result = {
         let ticker_router = Arc::clone(&router);
@@ -1276,6 +1366,28 @@ pub async fn load_metrics(
     };
     drain_result?;
 
+    let m = router.metrics_snapshot();
+    let totals = FlushMixCounts {
+        size: m.flushes_by_size,
+        age: m.flushes_by_age
+            + m.flushes_by_age_adaptive
+            + m.flushes_by_age_floor
+            + m.flushes_by_arrival,
+        depth: depth_flushes,
+        manual: m.flushes_manual.saturating_sub(depth_flushes),
+    };
+    report.flush_mix = FlushMixReport {
+        shards: Vec::new(),
+        totals,
+    };
+    report.target_bytes_no_effect_warning = layout_no_effect_warning(
+        geometry.target_bytes,
+        geometry.target_source,
+        &report.tokens,
+        batch_rows,
+        shards,
+    );
+    report.geometry = Some(geometry);
     report.histogram_points_exploded = state.grouper.as_ref().map_or(0, |g| g.exploded);
     report.elapsed = started.elapsed();
     Ok(report)

@@ -73,10 +73,10 @@ async fn zero_levers_are_rejected() {
             10_000,
             0,
             read_cursors,
-            1,
+            Some(1),
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             decode_queue_batches,
-            DEFAULT_TARGET_BYTES,
+            Some(PER_BATCH_TARGET_BYTES),
             None,
             RlogZstdLevel::DEFAULT,
             None,
@@ -107,10 +107,10 @@ async fn the_entry_point_warns_about_the_levers_it_ignores() {
         10_000,
         0,
         Some(4),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         8,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -311,31 +311,6 @@ fn metrics_and_spans_warn_on_a_non_default_zstd_level_and_logs_does_not() {
         Some(
             "warning: a spans load ignores --zstd-level 19. The level applies only to \
                      the RLOG objects a logs load writes."
-        )
-    );
-}
-
-/// A `--load-memory-bytes` on a metrics or spans load is named as ignored;
-/// an unset flag, or any budget on a logs load, is not.
-#[test]
-fn metrics_and_spans_warn_on_a_set_load_memory_budget_and_logs_does_not() {
-    assert_eq!(
-        unused_load_memory_warning(Some(6_000_000_000), SignalArg::Logs),
-        None
-    );
-    assert_eq!(unused_load_memory_warning(None, SignalArg::Spans), None);
-    assert_eq!(
-        unused_load_memory_warning(Some(6_000_000_000), SignalArg::Metrics).as_deref(),
-        Some(
-            "warning: a metrics load ignores --load-memory-bytes 6000000000. The budget \
-                     applies only to the batches a logs load holds."
-        )
-    );
-    assert_eq!(
-        unused_load_memory_warning(Some(6_000_000_000), SignalArg::Spans).as_deref(),
-        Some(
-            "warning: a spans load ignores --load-memory-bytes 6000000000. The budget \
-                     applies only to the batches a logs load holds."
         )
     );
 }
@@ -986,8 +961,7 @@ async fn an_over_cap_dictionary_value_many_entries_reference_is_dropped() {
         1,
         10_000,
         0,
-        1,
-        1,
+        GeometryRequest::explicit(PER_BATCH_TARGET_BYTES, 1),
         1,
         None,
         NOW_NS,
@@ -1275,8 +1249,7 @@ async fn a_dictionary_attribute_referencing_past_the_offset_range_loads() {
         1,
         10_000,
         0,
-        1,
-        1,
+        GeometryRequest::explicit(PER_BATCH_TARGET_BYTES, 1),
         1,
         None,
         NOW_NS,
@@ -1730,8 +1703,7 @@ async fn a_failed_spans_load_says_attrs_dropped_covers_abandoned_batches() {
         1,
         10_000,
         0,
-        1,
-        1,
+        GeometryRequest::explicit(PER_BATCH_TARGET_BYTES, 1),
         1,
         None,
         NOW_NS,
@@ -1820,8 +1792,7 @@ async fn a_row_rejected_spans_load_counts_the_drops_built_before_it() {
         1,
         10_000,
         0,
-        1,
-        1,
+        GeometryRequest::explicit(PER_BATCH_TARGET_BYTES, 1),
         1,
         None,
         NOW_NS,

@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
 use ravel_catalog::{Catalog, CatalogConfig, StorageLayoutWrite};
-use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, DEFAULT_TARGET_BYTES};
+use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, PER_BATCH_TARGET_BYTES};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::storage_layout::{self, BloomScopeArg, BucketWidthArg};
 use ravel_cli::typed_attr_column;
@@ -283,10 +283,10 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         ROWS,
         0,
         None,
-        1,
+        Some(1),
         1,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::new(3).expect("in range"),
         None,

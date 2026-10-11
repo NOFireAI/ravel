@@ -478,7 +478,7 @@ pub(super) async fn load_row(
         1,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        PER_BATCH_TARGET_BYTES,
         None,
         now_ns,
         clock,
