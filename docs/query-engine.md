@@ -1366,37 +1366,56 @@ budgets at once (`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
 Those slices share the materialized batch's buffers, and
 `RecordBatch::get_array_memory_size` reports every buffer an array
 references in full, so each slice reports the size of the whole output. A
-round-robin `RepartitionExec` passes each input batch on as it is and
-reserves that figure for every batch it buffers; a `SortExec` (its TopK
-included) and a `SortPreservingMergeExec` size their input the same way.
-With `n` slices in flight at the exchange the pool is charged `n` times the
-aggregate's output, and when the charge exceeds the pool the exchange asks
-to spill, which a session without spill refuses: a plan whose live bytes
-fit the pool several times over is answered with "the query memory pool is
-full and spill is disabled" (upstream apache/datafusion#24704). The
-session's `CompactSlices` physical optimizer
+round-robin `RepartitionExec` passes a `batch_size`-row slice on as it is
+(its coalescer's large-batch bypass emits a batch of more than half a
+`batch_size` unchanged) and reserves that figure for every batch it
+buffers; a `SortExec` (its TopK included) and a `SortPreservingMergeExec`
+size each input batch with `get_record_batch_memory_size`, which counts
+each buffer the batch references once, in full, and sum it over the
+batches they hold. With `n` slices in flight at the exchange the pool is
+charged `n` times the aggregate's output, and when the charge exceeds the
+pool the exchange asks to spill, which a session without spill refuses: a
+plan whose live bytes fit the pool several times over is answered with
+"the query memory pool is full and spill is disabled" (upstream
+apache/datafusion#24704). The session's `CompactSlices` physical optimizer
 rule (`crates/ravel-sql/src/compact_slices.rs`, registered last in
 `build_session`) places a `CompactSlicesExec` directly above every
-`AggregateExec` whose output reaches a non-hash `RepartitionExec`, a
+`AggregateExec` whose output reaches a round-robin `RepartitionExec`, a
 `SortExec` or a `SortPreservingMergeExec`, looking through the
 `ProjectionExec`, `FilterExec` and `CoalescePartitionsExec` nodes between
-them, and above nothing else: a hash `RepartitionExec` rebuilds its batches
-with `take` and charges those, and an aggregate feeding the plan root or
-another aggregate is left alone. The exec is a one-child pass-through with
-its input's partitioning, ordering and distribution; its stream copies each
-batch whose charge is more than twice the bytes its rows reference into
+them, and above nothing else; an aggregate feeding the plan root or another
+aggregate is left alone. A hash or range `RepartitionExec` is left out for
+a narrower reason than owning its buffers: `partition_grouped_take` does
+one `take` over the input batch and slices the result per partition, and
+`take` reuses a Utf8View or Dictionary column's data buffers, so its pieces
+still reference the aggregate's whole buffers. What bounds the charge there
+is the exchange's coalescer, which copies a piece of at most half a
+`batch_size` into buffers of its own. The over-count survives a larger
+piece (two partitions, or skewed keys), `preserve_order`, and unbounded
+input, which run without a coalescer; that gap is accepted. The exec is a
+one-child pass-through with its input's partitioning, ordering and
+distribution. Its stream measures the bytes each batch's rows reference,
+into nested columns (a List's child range, a Dictionary's keys plus its
+values once, a Struct's sliced children, a byte-view column's referenced
+data), copies each batch whose charge is more than twice that figure into
 arrays that own buffers sized to the batch (`concat` with an empty array
-for a plain column, `gc` for a byte-view column), and passes every other
-batch through untouched, so a batch that already owns its buffers costs
-nothing. The cost is one copy of each aggregate output that feeds an
-exchange or a sort; `EXPLAIN` shows the operator and `EXPLAIN ANALYZE` its
-`copied_bytes`, `compacted_batches` and `passed_through_batches` metrics.
-The regression test (`crates/ravel-sql/tests/compact_slices.rs`) pins the
-repartition edge on the q29 shape (`HAVING ... ORDER BY count DESC LIMIT`
-over a single-partition final aggregate fanned back out to 4 partitions,
-20,000 groups in 79 `batch_size`-row slices): without the exec the peak is
-6.0x the aggregate's output, with it 2.2x, and the rows are the same. The
-sort edge is pinned by placement only (the rule's unit tests).
+for a plain column, `gc` for a byte-view column, a cast through the value
+type for a Dictionary column, offsets rebuilt over the compacted child for
+a List column), and passes every other batch through untouched, so a batch
+that already owns its buffers costs one walk over its buffers and no copy.
+The cost is one copy of each aggregate output that feeds an exchange or a
+sort; `EXPLAIN` shows the operator and `EXPLAIN ANALYZE` its `copied_bytes`
+(the referenced bytes of the batches it copied), `compacted_batches` and
+`passed_through_batches` metrics. The regression test
+(`crates/ravel-sql/tests/compact_slices.rs`) pins the repartition edge on
+the q29 shape (`HAVING ... ORDER BY count DESC LIMIT` over a
+single-partition final aggregate fanned back out to 4 partitions, 20,000
+groups in 79 `batch_size`-row slices): without the exec the peak is 6.0x
+the aggregate's output, with it 2.2x, every column of the output is the
+same on both sides, and at a pool of 4x the output (8,844,276 bytes) the
+run without the exec is refused with the spill-disabled error and the run
+with it answers. The sort and merge edges are pinned by placement (the
+rule's unit tests).
 
 `AggregateExec::execute_typed` still falls back to the legacy
 `GroupedHashAggregateStream` for every shape it has not migrated: a
