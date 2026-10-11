@@ -10,7 +10,8 @@
 //! budgeted range reservations in `SegmentFetcher::ensure_ranges`:
 //!
 //! - a PromQL query through the HTTP API of a distributed server with a 4 KiB
-//!   budget is refused with 503, where the same query at an unlimited budget
+//!   budget is refused with 422 and the budget's own message (ADR-2633
+//!   decision 3; 503 before it), where the same query at an unlimited budget
 //!   answers 200;
 //! - a fragment slice sent over gRPC to a server with a 1-byte budget ends with
 //!   a `BudgetExceeded` summary carrying the typed `FetchMemoryExhausted`
@@ -251,7 +252,16 @@ async fn start_server(
 }
 
 async fn promql_status(http: std::net::SocketAddr, query_time_s: i64) -> reqwest::StatusCode {
-    reqwest::Client::new()
+    promql_response(http, query_time_s).await.0
+}
+
+/// The status and decoded JSON body of an instant PromQL query of the
+/// segment's metric at `query_time_s`.
+async fn promql_response(
+    http: std::net::SocketAddr,
+    query_time_s: i64,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = reqwest::Client::new()
         .get(format!("http://{http}/api/v1/query"))
         .query(&[
             ("query", METRIC.to_string()),
@@ -260,8 +270,10 @@ async fn promql_status(http: std::net::SocketAddr, query_time_s: i64) -> reqwest
         .bearer_auth(TOKEN)
         .send()
         .await
-        .expect("query request")
-        .status()
+        .expect("query request");
+    let status = response.status();
+    let body = response.json().await.expect("query body is JSON");
+    (status, body)
 }
 
 /// A resolve-scope slice over the last hour, the window holding the segment.
@@ -350,7 +362,8 @@ async fn seeded_store(tenant: &TenantId, now: i64) -> Arc<FaultStore<MemoryStore
 /// Mutation proof: remove `.with_memory_budget(process_memory_budget.clone())`
 /// from the `FragmentService` construction in `ravel_server::start`, and the
 /// first assertion fails with the 4 KiB server answering the PromQL query 200
-/// instead of 503.
+/// instead of 422. Map `FetchMemoryExhausted` back to `MSG_UNAVAILABLE` in
+/// `crates/ravel-query/src/http/error.rs` and it fails with 503 instead.
 #[tokio::test]
 async fn distributed_promql_fetches_reserve_against_the_process_budget() {
     let tenant = TenantId::new(TENANT);
@@ -359,12 +372,22 @@ async fn distributed_promql_fetches_reserve_against_the_process_budget() {
 
     // A 4 KiB budget is far below the >512 KiB range this segment reserves, so
     // the coordinator's no-hop fragment fetch is refused and the refusal folds
-    // to the PromQL API's 503.
+    // to the PromQL API's 422 with the budget's own message against this
+    // server's limit (ADR-2633 decision 3).
     let small = start_server(seeded_store(&tenant, now).await, 4 * 1024).await;
+    let (status, body) = promql_response(small.http_addr, query_time_s).await;
     assert_eq!(
-        promql_status(small.http_addr, query_time_s).await,
-        reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "a distributed PromQL fetch over the process budget must be refused"
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a distributed PromQL fetch over the process budget must be refused: {body}"
+    );
+    assert_eq!(body["errorType"], "execution", "{body}");
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("fetch memory exhausted: requested ")
+            && message.ends_with(" of 4096 byte limit already reserved"),
+        "the refusal must be the typed FetchMemoryExhausted message against this \
+         server's 4 KiB limit, got: {message}"
     );
     let after = scrape(small.http_addr).await;
     assert!(
@@ -393,7 +416,7 @@ async fn distributed_promql_fetches_reserve_against_the_process_budget() {
     let first_reservation: u64 = refused_status
         .message
         .strip_prefix("fetch memory exhausted: requested ")
-        .and_then(|rest| rest.strip_suffix(" bytes, 0 of 1 byte budget already reserved"))
+        .and_then(|rest| rest.strip_suffix(" bytes, 0 of 1 byte limit already reserved"))
         .unwrap_or_else(|| {
             panic!(
                 "the refusal must be the typed FetchMemoryExhausted message against \
