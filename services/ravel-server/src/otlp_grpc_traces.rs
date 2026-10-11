@@ -36,10 +36,11 @@ impl TraceService for GrpcTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        // See `otlp_grpc::export`: normally already taken by
-        // `GrpcIngestAdmissionLayer` on the request head (issue #1705), and
-        // taken here only on the direct-call path.
-        let _permit =
+        // See `otlp_grpc::export`: normally a clone of the release handle
+        // `GrpcIngestAdmissionLayer` took on the request head (issue #1705),
+        // and a permit taken here only on the direct-call path. Read before
+        // `into_inner`, which drops the extensions.
+        let permit =
             crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
@@ -71,13 +72,14 @@ impl TraceService for GrpcTraceService {
 
         let idempotency_key = idempotency_key_from_headers(&headers);
 
-        let outcome = crate::traces_ingest::handle_export_traces(
+        let outcome = crate::traces_ingest::handle_export_traces_releasing(
             &self.state.traces_ingest,
             tenant,
             mode,
             request.into_inner(),
             now_ns(),
             idempotency_key,
+            &permit,
         )
         .await
         .map_err(|err| match err {
@@ -94,6 +96,9 @@ impl TraceService for GrpcTraceService {
             err @ SpanIngestRequestError::Write(
                 ravel_ingest::SpanWriteError::BufferBudgetExceeded,
             ) => Status::resource_exhausted(err.to_string()),
+            SpanIngestRequestError::Write(ravel_ingest::SpanWriteError::PendingAckLimitReached) => {
+                crate::otlp_grpc::pending_ack_shed_status()
+            }
             // A shard at the flush deferral cap refused the write before
             // buffering it: the same backpressure class as the budget shed.
             err @ SpanIngestRequestError::Write(

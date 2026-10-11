@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::ingest_admission::IngestPermitHeld;
 use crate::ingest_concurrency::IngestConcurrencyController;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, State};
@@ -444,6 +445,11 @@ fn negotiate_version(headers: &HeaderMap) -> Option<RemoteWriteVersion> {
 }
 
 fn write_error_response(err: WriteError) -> Response {
+    // The pending strict-ack bound (ADR-2793 decision 4): the in-flight
+    // shed's 429 with its own body text, shared with the OTLP surfaces.
+    if matches!(err, WriteError::PendingAckLimitReached) {
+        return crate::otlp_http::pending_ack_shed_response();
+    }
     // The buffer-budget shed (ADR-0069) is admission backpressure, not a
     // durability failure: 429 + `Retry-After`, matching the byte-rate
     // rejection and the in-flight shed, rather than the 503 the other
@@ -497,6 +503,7 @@ fn retry_after_seconds(retry_after_ns: i64) -> u64 {
 async fn remote_write(
     State(state): State<Arc<RemoteWriteState>>,
     Extension(tenant): Extension<TenantId>,
+    Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -642,9 +649,12 @@ async fn remote_write(
     // charge and the router's buffered charge never coexist for the same
     // request (issue #1297 finding 3).
     drop(inflate_charge);
-    let receipt = match state
+    // The in-flight permit goes back once the write is enqueued, before the
+    // strict ack is awaited (ADR-2793 decision 4): every Remote Write is
+    // strict, so this is the surface whose ack wait the permit covered most.
+    let written = match state
         .router
-        .write_values(
+        .submit_values(
             tenant,
             ingest_points,
             state.strict_flush_policy.write_mode(),
@@ -652,6 +662,13 @@ async fn remote_write(
         )
         .await
     {
+        Ok(submitted) => {
+            permit.release();
+            submitted.acks().await
+        }
+        Err(err) => Err(err),
+    };
+    let receipt = match written {
         Ok(receipt) => receipt,
         Err(err) => {
             // A partial multi-shard commit: the durable siblings are real
@@ -902,6 +919,9 @@ mod tests {
         let response = remote_write(
             State(state.clone()),
             Extension(tenant.clone()),
+            Extension(IngestPermitHeld(
+                crate::ingest_concurrency::IngestPermitHandle::default(),
+            )),
             HeaderMap::new(),
             Bytes::new(),
         )

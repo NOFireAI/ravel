@@ -19,12 +19,15 @@
 //! stream keeps going, while a corrupt IPC stream ([`DecodeError::Stream`])
 //! nacks the batch and ends the gRPC stream so the client re-establishes it.
 
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use ravel_ingest::{IngestByteShed, IngestPoint, WriteError, WriteMode, plausible_ingest_clock};
+use ravel_ingest::{
+    IngestByteShed, IngestPoint, Submitted, WriteError, WriteMode, plausible_ingest_clock,
+};
 use ravel_otap::normalize::{normalize_prepared_with_metadata, prepare_batch};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
@@ -138,16 +141,15 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     let batch_id = batch.batch_id;
 
     // Process-wide in-flight ingest ceiling (extended to OTAP): admit or shed
-    // this batch before it does any ingest work -- the
-    // same gate each unary OTLP gRPC export applies via `try_admit`
-    // (otlp_grpc.rs), so a burst of OTAP batches cannot bypass the
-    // admission-shed backpressure OTLP already respects. The `_permit` binding
-    // holds the slot across the rest of this batch (byte-rate accounting,
-    // decode, and the durable write); its RAII drop when `process_batch`
-    // returns releases the slot on every return arm below, including the error
-    // paths. A shed is RESOURCE_EXHAUSTED, matching OTLP's shed status
-    // (`ingest_concurrency_shed_status`) exactly; `IngestShed`'s Display is the
-    // single source of that message string.
+    // this batch before it does any ingest work, the same gate each unary
+    // OTLP gRPC export applies, so a burst of OTAP batches cannot bypass the
+    // admission-shed backpressure OTLP already respects. The permit covers
+    // byte-rate accounting, decode, and the submit; it is returned once the
+    // write is enqueued, after the decoded batch has dropped, so the strict
+    // ack wait holds neither (ADR-2793 decision 4). Every earlier return arm
+    // below drops it with `process_batch`. A shed is RESOURCE_EXHAUSTED,
+    // matching OTLP's shed status (`ingest_concurrency_shed_status`) exactly;
+    // `IngestShed`'s Display is the single source of that message string.
     //
     // Like the byte-rate rejection below, a shed happens before
     // `ctx.decoder.decode` ever sees this batch, so it tears the gRPC stream
@@ -155,7 +157,7 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     // messages never reach the stateful per-`DecoderKey` decoder, and every
     // later batch would then decode against state that silently missed one.
     // The client re-establishes a fresh stream with fresh decoder state.
-    let _permit = match ctx.state.ingest_concurrency.try_admit() {
+    let permit = match ctx.state.ingest_concurrency.try_admit() {
         Ok(permit) => permit,
         Err(shed) => {
             return (
@@ -220,12 +222,34 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     }
 
     match ctx.decoder.decode_gated(batch).await {
-        Ok(decoded) => write_reply(
-            batch_id,
-            write_batch(&ctx.state.ingest, &ctx.tenant, ctx.mode, &decoded, now_ns()).await,
-        ),
+        Ok(decoded) => {
+            let ingest = &ctx.state.ingest;
+            let (tenant, mode) = (&ctx.tenant, ctx.mode);
+            let submitted = submit_and_release(decoded, permit, |decoded| {
+                submit_batch(ingest, tenant, mode, decoded, now_ns())
+            })
+            .await;
+            let written = match submitted {
+                Ok(pending) => pending.acks(tenant).await,
+                Err(err) => Err(err),
+            };
+            write_reply(batch_id, written)
+        }
         Err(err) => decode_error_reply(batch_id, err),
     }
+}
+
+/// Runs `submit` on `batch`, then drops `permit`. `submit` consumes the batch,
+/// so the batch is gone by the time the future resolves, and the permit
+/// outlives both: the in-flight ceiling keeps bounding a batch's memory until
+/// that memory is freed, and stops bounding the request at enqueue.
+async fn submit_and_release<B, P, F, R>(batch: B, permit: P, submit: impl FnOnce(B) -> F) -> R
+where
+    F: Future<Output = R>,
+{
+    let submitted = submit(batch).await;
+    drop(permit);
+    submitted
 }
 
 /// The reply to a decoded batch's write. The batch already decoded cleanly,
@@ -270,7 +294,8 @@ fn write_reply(
             // matching the byte-rate rejection.
             let code = match err {
                 ravel_ingest::WriteError::BufferBudgetExceeded
-                | ravel_ingest::WriteError::DeferralCapReached => StatusCode::ResourceExhausted,
+                | ravel_ingest::WriteError::DeferralCapReached
+                | ravel_ingest::WriteError::PendingAckLimitReached => StatusCode::ResourceExhausted,
                 _ if err.is_retryable() => StatusCode::Unavailable,
                 _ => StatusCode::Internal,
             };
@@ -314,7 +339,7 @@ fn decode_error_reply(batch_id: i64, err: DecodeError) -> (BatchStatus, bool) {
     }
 }
 
-/// The result of a successful [`write_batch`]: the commit tokens a strict
+/// The result of a successful [`submit_batch`] and its acks: the commit tokens a strict
 /// write produces, and how many data points the active-series cap dropped
 /// from the batch before the write. `dropped_points` is what the ack must
 /// surface so an OTAP client sees a partial success rather than a clean ack
@@ -325,9 +350,8 @@ struct WriteOutcome {
     dropped_points: usize,
 }
 
-/// Normalize a decoded batch and write its points through the shared ingest
-/// router, returning the commit tokens a strict write produces and the count
-/// of points the active-series cap dropped. Mirrors
+/// Normalize a decoded batch and submit its points to the shared ingest
+/// router, carrying the count of points the active-series cap dropped. Mirrors
 /// [`crate::ingest::handle_export`]'s point assembly and layer-4 admission
 /// (scalar and native-histogram points feed one write so a batch shares a
 /// single receipt, and series-creation-rate/active-series-cap are enforced
@@ -336,13 +360,18 @@ struct WriteOutcome {
 /// calling it), so it carries its own copy of that wiring. OTAP carries only
 /// scalar metric points, so `histogram_points` here is the
 /// exploded-histogram output, not native histograms.
-async fn write_batch(
-    ingest: &IngestState,
+///
+/// Returns once the points are enqueued; [`PendingBatch::acks`] awaits a
+/// strict write's durability. The stream path passes the batch by value so it
+/// drops before this returns, which is what lets the caller return the
+/// in-flight permit without the batch outliving it.
+async fn submit_batch<'a>(
+    ingest: &'a IngestState,
     tenant: &TenantId,
     mode: WriteMode,
-    decoded: &DecodedBatch,
+    decoded: impl Borrow<DecodedBatch>,
     ingest_ts_ns: i64,
-) -> Result<WriteOutcome, IngestRequestError> {
+) -> Result<PendingBatch<'a>, IngestRequestError> {
     // Receiver-clock plausibility (ADR-0051 amendment): checked before
     // the normalize window is computed. A nonsense reference clock rejects the
     // batch UNAVAILABLE (counted reason="clock"); the fault is the replica's.
@@ -388,7 +417,7 @@ async fn write_batch(
     // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`. The batch
     // is flattened and resolved once; no label exists until the normalize
     // below has passed the bound.
-    let prepared = prepare_batch(decoded, &ingest.limits);
+    let prepared = prepare_batch(decoded.borrow(), &ingest.limits);
     let label_charge = crate::ingest::charge_projected_labels(
         &ingest.budget,
         prepared.projected_label_bytes().get(),
@@ -399,6 +428,7 @@ async fn write_batch(
     let (result, metadata) =
         normalize_prepared_with_metadata(tenant, prepared, &ingest.limits, ingest_ts_ns, &mut cap);
     let normalized = result.output;
+    drop(decoded);
     // Layer 3's rejections, counted exactly as the OTLP path counts them
     // (ADR-0051 section 3). OTAP has no partial-success field to carry them,
     // so before this the only trace of a structurally rejected batch was the
@@ -449,11 +479,26 @@ async fn write_batch(
     let dropped_points = points_before - points.len();
 
     drop(label_charge);
-    let receipt = ingest
+    let submitted = ingest
         .router
-        .write_values(tenant.clone(), points, mode, ingest.ack_deadline)
+        .submit_values(tenant.clone(), points, mode, ingest.ack_deadline)
         .await
-        .map_err(|err| {
+        .map_err(IngestRequestError::Write)?;
+    Ok(PendingBatch {
+        submitted,
+        dropped_points,
+    })
+}
+
+/// A batch [`submit_batch`] enqueued, waiting on its strict acks.
+struct PendingBatch<'a> {
+    submitted: Submitted<'a>,
+    dropped_points: usize,
+}
+
+impl PendingBatch<'_> {
+    async fn acks(self, tenant: &TenantId) -> Result<WriteOutcome, IngestRequestError> {
+        let receipt = self.submitted.acks().await.map_err(|err| {
             // A partial multi-shard commit: the durable siblings are real
             // data, logged the way the OTLP paths log them since OTAP has no
             // channel to hand their tokens back.
@@ -468,10 +513,11 @@ async fn write_batch(
             }
             IngestRequestError::Write(err)
         })?;
-    Ok(WriteOutcome {
-        tokens: receipt.tokens,
-        dropped_points,
-    })
+        Ok(WriteOutcome {
+            tokens: receipt.tokens,
+            dropped_points: self.dropped_points,
+        })
+    }
 }
 
 /// An OK `BatchStatus` for a written batch.
@@ -528,7 +574,64 @@ mod tests {
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_otap::stream::DecodedBatch;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    async fn write_batch(
+        ingest: &IngestState,
+        tenant: &TenantId,
+        mode: WriteMode,
+        decoded: &DecodedBatch,
+        ingest_ts_ns: i64,
+    ) -> Result<WriteOutcome, IngestRequestError> {
+        submit_batch(ingest, tenant, mode, decoded, ingest_ts_ns)
+            .await?
+            .acks(tenant)
+            .await
+    }
+
+    /// Records its label into a shared log when dropped.
+    struct DropProbe {
+        label: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(self.label);
+        }
+    }
+
+    /// The batch drops inside the submit, and the permit only after the
+    /// submit resolves: the in-flight ceiling never stops counting a batch
+    /// whose memory is still live.
+    #[tokio::test]
+    async fn submit_and_release_drops_the_batch_before_the_permit() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = |label| DropProbe {
+            label,
+            log: log.clone(),
+        };
+        let submit_log = log.clone();
+        let released = submit_and_release(probe("batch"), probe("permit"), |batch| async move {
+            submit_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("submitted");
+            drop(batch);
+            "receipt"
+        })
+        .await;
+        assert_eq!(released, "receipt");
+        let order = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(order, ["submitted", "batch", "permit"]);
+    }
 
     fn ingest_state() -> IngestState {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

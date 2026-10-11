@@ -62,6 +62,13 @@ pub(crate) fn ingest_concurrency_shed_status() -> Status {
     Status::resource_exhausted("process in-flight ingest-request limit reached")
 }
 
+/// A strict write refused by the process-wide pending strict-acknowledgement
+/// bound, as `RESOURCE_EXHAUSTED` with the HTTP body's message. Shared by
+/// every gRPC ingest service.
+pub(crate) fn pending_ack_shed_status() -> Status {
+    Status::resource_exhausted(crate::otlp_http::PENDING_ACK_SHED_MESSAGE)
+}
+
 /// A request whose tenant credential did not resolve, as `UNAUTHENTICATED`.
 /// Shared by `GrpcIngestAdmissionLayer` and every gRPC ingest handler, so a
 /// client sees one status and one message whichever of them refused it.
@@ -76,10 +83,13 @@ impl MetricsService for GrpcMetricsService {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         // Normally already taken by `GrpcIngestAdmissionLayer` on the request
-        // head, before tonic read or decoded this message (issue #1705); this
-        // is the direct-call path, where nothing in front of the handler took
-        // one. Either way exactly one permit covers the request.
-        let _permit =
+        // head, before tonic read or decoded this message (issue #1705), and
+        // this is a clone of its release handle; on the direct-call path,
+        // where nothing in front of the handler took one, the permit is taken
+        // here and this handle owns it alone. Either way exactly one permit
+        // covers the request, and it is released once the write is enqueued.
+        // Read before `into_inner`, which drops the extensions.
+        let permit =
             crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
@@ -110,12 +120,13 @@ impl MetricsService for GrpcMetricsService {
             charge.wire_bytes,
         );
 
-        let outcome = crate::ingest::handle_export(
+        let outcome = crate::ingest::handle_export_releasing(
             &self.state.ingest,
             tenant,
             mode,
             request.into_inner(),
             now_ns(),
+            &permit,
         )
         .await
         .map_err(|err| match err {
@@ -129,6 +140,11 @@ impl MetricsService for GrpcMetricsService {
             // the other retryable write failures take.
             IngestRequestError::Write(WriteError::BufferBudgetExceeded) => {
                 Status::resource_exhausted(WriteError::BufferBudgetExceeded.to_string())
+            }
+            // The pending strict-ack bound (ADR-2793 decision 4): the same
+            // status as the in-flight shed, with its own message.
+            IngestRequestError::Write(WriteError::PendingAckLimitReached) => {
+                pending_ack_shed_status()
             }
             // A shard at the flush deferral cap refused the write before
             // buffering it: the same backpressure class as the budget shed.
