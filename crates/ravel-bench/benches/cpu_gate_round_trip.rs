@@ -29,8 +29,9 @@
 //!   `page_read`;
 //! - `records/rR_aA`: R `ravel_logseg::LogRecord`s with A string attributes
 //!   each, every string built fresh per record as a decoder builds it;
-//! - `series/s2828_l10`: a remote-write-like request, 2828 series of 10
-//!   `(String, String)` labels and one sample each.
+//! - `series/s2828_l10`: a remote-write-like request, 2828 series (the #2818
+//!   sizing of a 64 KiB snappy request) of 10 `(String, String)` labels and
+//!   one sample each.
 //!
 //! In every configuration the arms (or variants) run interleaved: each run
 //! executes all three in an order shuffled by a fixed, printed seed, so
@@ -89,7 +90,8 @@ const STRUCTURED_CANDIDATE_US: f64 = 150.0;
 /// Record and attribute counts; 105 is the ClickBench hits column count.
 const RECORD_COUNTS: [usize; 2] = [1024, 8192];
 const ATTR_COUNTS: [usize; 2] = [16, 105];
-/// Series in a 64 KiB snappy remote-write request, and labels per series.
+/// Series in a 64 KiB snappy remote-write request, as #2818 sizes it (not
+/// derived here), and labels per series.
 const SERIES: usize = 2828;
 const LABELS: usize = 10;
 
