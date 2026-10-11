@@ -4,8 +4,8 @@
 //! A strict write's own ack wait is bounded by its `ack_deadline`, but nothing
 //! bounds how many such waits may be outstanding across the process at once:
 //! [`PendingAckBudget`] is that bound, a semaphore-backed gauge shared by
-//! `Arc` across the metrics, log, and span routers so one
-//! `IngestConfig::max_pending_strict_acks` ceiling bounds the sum across every
+//! `Arc` across the metrics, log, and span routers so one ceiling (sized by
+//! ravel-server from `--max-pending-strict-acks`) bounds the sum across every
 //! signal, the same sharing shape [`crate::IngestByteBudget`] uses for the
 //! buffered-byte ceiling.
 //!

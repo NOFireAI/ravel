@@ -2408,7 +2408,6 @@ pub async fn start_with_heartbeat(
                     config.max_flush_delay,
                 )
                 .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
-                max_pending_strict_acks,
                 ..IngestConfig::default()
             },
             Signal::Metrics,
@@ -2493,7 +2492,6 @@ pub async fn start_with_heartbeat(
                 max_flush_delay_idle: config.max_flush_delay_idle,
                 min_flush_bytes: config.min_flush_bytes,
                 idle_flush_byte_floor: config.idle_flush_byte_floor,
-                max_pending_strict_acks,
                 ..IngestConfig::default()
             },
             Signal::Logs,
@@ -2530,7 +2528,6 @@ pub async fn start_with_heartbeat(
                 max_flush_delay_idle: config.max_flush_delay_idle,
                 min_flush_bytes: config.min_flush_bytes,
                 idle_flush_byte_floor: config.idle_flush_byte_floor,
-                max_pending_strict_acks,
                 ..IngestConfig::default()
             },
             Signal::Spans,

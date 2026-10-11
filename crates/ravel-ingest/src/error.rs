@@ -87,8 +87,8 @@ pub enum WriteError {
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
     /// The router's pending-strict-ack budget (ADR-2793 decision 4; one
-    /// shared `Arc` sized from `IngestConfig::max_pending_strict_acks` makes it
-    /// process-wide, #2797) is at its
+    /// shared `Arc`, sized by ravel-server from `--max-pending-strict-acks`,
+    /// makes it process-wide, #2797) is at its
     /// ceiling: `submit` could not take a pending-ack permit, so the write is
     /// refused before the byte budget is charged and before any shard is
     /// touched, with no commit token issued. Retryable, classified the same as

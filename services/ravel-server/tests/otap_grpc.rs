@@ -1013,7 +1013,7 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
 /// not at its ack. `otap_grpc`'s unit tests pin that the decoded batch drops
 /// before the permit does.
 #[tokio::test]
-async fn otap_batch_is_dropped_before_the_permit() {
+async fn otap_permit_is_released_before_the_strict_ack() {
     let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
     let store: Arc<dyn ObjectStoreBackend> = fault.clone();
     let running = start_test_server_fault(store.clone(), IngestConcurrencyLimit::Bounded(1)).await;
