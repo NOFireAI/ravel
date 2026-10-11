@@ -114,8 +114,19 @@ fn cores() -> usize {
 }
 
 /// The write gate `ravel_server::start` builds for this host.
+/// `RAVEL_BENCH_WRITE_PERMITS` overrides its permits, as the server's
+/// `--cpu-gate-write-permits` does, so the decision-3 default can be
+/// compared against more permits on the same host.
 fn production_write_gate() -> Arc<WriteGate> {
-    CpuGates::new(CpuGatePermits::derive(cores())).write
+    let mut permits = CpuGatePermits::derive(cores());
+    if let Some(n) = std::env::var("RAVEL_BENCH_WRITE_PERMITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        permits.write = n;
+    }
+    CpuGates::new(permits).write
 }
 
 /// Admission that never refuses: the bench measures the gate, not the
