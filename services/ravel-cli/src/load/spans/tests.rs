@@ -2020,3 +2020,283 @@ fn the_attribute_count_caps_are_checked_against_the_mapping() {
         )
     );
 }
+
+/// Issue #2753: the derived object geometry on the spans path.
+mod default_geometry {
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    const BATCH_ROWS: usize = 10_000;
+    const BATCHES: usize = 51;
+    const HOST_BYTES: u64 = 64 << 30;
+
+    /// `batches` row groups of `batch_rows` spans with fixed-width ids and
+    /// identical names and attributes, so every span has the same estimated
+    /// footprint and `--batch-rows <batch_rows>` reads one row group per
+    /// batch.
+    fn fixture(batch_rows: usize, batches: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("spans.parquet");
+        let group = |g: usize| {
+            let ids: Vec<u64> = (0..batch_rows).map(|r| (g * batch_rows + r) as u64).collect();
+            batch(vec![
+                (
+                    "trace_id",
+                    bin_col(
+                        ids.iter()
+                            .map(|i| [[1u8; 8], i.to_be_bytes()].concat())
+                            .collect(),
+                    ),
+                ),
+                (
+                    "span_id",
+                    bin_col(ids.iter().map(|i| (i + 1).to_be_bytes().to_vec()).collect()),
+                ),
+                ("name", str_col(vec!["op"; batch_rows])),
+                ("start_ns", i64_col(vec![NOW_NS; batch_rows])),
+                ("end_ns", i64_col(vec![NOW_NS; batch_rows])),
+                ("method", str_col(vec!["GET"; batch_rows])),
+            ])
+        };
+        let first = group(0);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, first.schema(), None)
+            .expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for g in 1..batches {
+            writer.write(&group(g)).expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+        (dir, pq)
+    }
+
+    async fn load(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+    ) -> SpansLoadReport {
+        let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+        let mut report = SpansLoadReport::default();
+        load_spans_into(
+            &mut report,
+            store,
+            pq,
+            "acme",
+            &mapping,
+            1,
+            BATCH_ROWS,
+            0,
+            request,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(DEFAULT_MAX_FLUSH_DELAY),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("load succeeds");
+        report
+    }
+
+    fn host_derived() -> LoadMemoryRequest {
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(HOST_BYTES),
+        }
+    }
+
+    async fn span_objects(store: &dyn ObjectStoreBackend) -> usize {
+        let mut count = 0;
+        let mut page: Option<ravel_object_store::PageToken> = None;
+        loop {
+            let p = store.list("", page).await.expect("list");
+            count += p
+                .objects
+                .iter()
+                .filter(|o| o.key.contains("/s/l0/"))
+                .count();
+            match p.next {
+                Some(t) => page = Some(t),
+                None => break,
+            }
+        }
+        count
+    }
+
+    /// With `--target-bytes` and `--pipeline-depth` unset, 51 batches of
+    /// 10,000 spans on one shard make exactly ceil(510,000 / 250,000) = 3
+    /// objects: every 25th batch reaches the derived target (250,000 times
+    /// the first batch's estimate per span) and closes an object on size,
+    /// and the end-of-input drain publishes the 10,000-span tail. The
+    /// derived depth is ceil(250,000 / 10,000) = 25, so the depth flush runs
+    /// after batches 25 and 50 on buffers the size trigger has just emptied.
+    ///
+    /// The clock is pinned, so the age trigger cannot fire. Per-batch
+    /// flushing writes 51 objects; a target the size trigger never reaches
+    /// leaves every object to the depth flush or the drain (size 0).
+    #[tokio::test]
+    async fn default_load_merges_batches_into_target_sized_objects() {
+        let (_dir, pq) = fixture(BATCH_ROWS, BATCHES);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+
+        assert_eq!(report.rows_processed, (BATCH_ROWS * BATCHES) as u64);
+        let expected_objects = (BATCH_ROWS * BATCHES).div_ceil(DEFAULT_OBJECT_ROWS);
+        assert_eq!(expected_objects, 3);
+        assert_eq!(
+            span_objects(store.as_ref()).await,
+            expected_objects,
+            "510,000 spans on one shard make ceil(510,000 / 250,000) objects"
+        );
+        assert_eq!(report.objects_written(), expected_objects);
+
+        let layout = report.layout_report();
+        let geometry = layout.geometry.expect("a load that decoded rows resolves its geometry");
+        assert_eq!(geometry.target_source, TargetSource::Derived);
+        // `est_bytes_per_row` is the first batch's estimate per span rounded
+        // up; the target is 250,000 spans of the unrounded figure.
+        let rows = DEFAULT_OBJECT_ROWS as u64;
+        assert!(
+            (geometry.target_bytes as u64) <= rows * geometry.est_bytes_per_row
+                && (geometry.target_bytes as u64) > rows * (geometry.est_bytes_per_row - 1),
+            "the derived target is 250,000 spans of the first batch's estimate: {geometry:?}"
+        );
+        assert_eq!(geometry.rows_depth, 25);
+        assert_eq!(geometry.pipeline_depth, 25);
+        assert_eq!(geometry.depth_bound, DepthBound::Rows);
+        assert_eq!(
+            layout.flush_mix.totals,
+            FlushMixCounts {
+                size: 2,
+                age: 0,
+                depth: 0,
+                manual: 1,
+            },
+            "two full objects close on size, the tail on the end-of-input drain"
+        );
+        assert_eq!(layout.flush_mix.totals.dominant(), Some("size"));
+        assert_eq!(layout.target_bytes_no_effect_warning, None);
+    }
+
+    /// `--target-bytes 1 --batch-rows 10000` writes one object per batch on
+    /// the one shard, each closed by the size trigger.
+    #[tokio::test]
+    async fn target_bytes_one_writes_one_object_per_batch_per_shard() {
+        let batches = 3;
+        let (_dir, pq) = fixture(BATCH_ROWS, batches);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: Some(PER_BATCH_TARGET_BYTES),
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        assert_eq!(span_objects(store.as_ref()).await, batches);
+        assert_eq!(report.objects_written(), batches);
+        assert_eq!(
+            report.layout_report().flush_mix.totals,
+            FlushMixCounts {
+                size: batches as u64,
+                age: 0,
+                depth: 0,
+                manual: 0,
+            }
+        );
+    }
+
+    /// A budget of three batches at the first batch's estimate decides the
+    /// derived depth over the rows bound's 25, and the summary says so.
+    #[tokio::test]
+    async fn a_small_memory_budget_decides_the_derived_depth() {
+        let (_dir, pq) = fixture(BATCH_ROWS, 2);
+        let probe = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        let est_bytes_per_row = probe.geometry.expect("geometry resolved").est_bytes_per_row;
+        let report = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: LoadMemoryRequest::Flag(3 * BATCH_ROWS as u64 * est_bytes_per_row),
+            },
+        )
+        .await;
+        let geometry = report.geometry.clone().expect("geometry resolved");
+        assert_eq!(geometry.memory_depth, Some(3));
+        assert_eq!(geometry.pipeline_depth, 3);
+        assert_eq!(geometry.depth_bound, DepthBound::Memory);
+        let summary = render_layout_summary(&report.layout_report());
+        assert!(
+            summary.contains(
+                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+            ),
+            "{summary}"
+        );
+    }
+
+    /// The spans summary carries the trigger mix and the no-effect warning,
+    /// both as text and in the JSON line, which parses back to the report.
+    /// `--target-bytes 2` is below one batch's content, so all three writes
+    /// flush on size as their own object and the warning applies.
+    #[tokio::test]
+    async fn the_summary_and_json_carry_the_trigger_mix_and_the_warning() {
+        let (_dir, pq) = fixture(BATCH_ROWS, 3);
+        let report = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: Some(2),
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        let layout = report.layout_report();
+        let warning = layout
+            .target_bytes_no_effect_warning
+            .clone()
+            .expect("a target below one batch changes nothing and says so");
+        assert!(warning.contains("--target-bytes 2"), "{warning}");
+
+        let summary = render_layout_summary(&layout);
+        assert!(
+            summary.contains("  flush triggers   : size 3, age 0, depth 0, manual 0 (total 3)"),
+            "{summary}"
+        );
+        assert!(summary.contains(&warning), "{summary}");
+        let json = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(LOAD_REPORT_JSON_PREFIX))
+            .expect("the summary ends with the JSON report");
+        let value: serde_json::Value = serde_json::from_str(json).expect("the line is JSON");
+        assert_eq!(value["signal"], "spans");
+        assert_eq!(value["flush_mix"]["totals"]["size"], 3);
+        assert_eq!(value["flush_mix"]["totals"]["manual"], 0);
+        assert_eq!(value["target_bytes_no_effect_warning"], warning.as_str());
+        let parsed: LoadLayoutReport = serde_json::from_str(json).expect("the report round-trips");
+        assert_eq!(parsed, layout);
+    }
+}
