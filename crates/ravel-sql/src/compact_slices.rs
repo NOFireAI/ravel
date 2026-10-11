@@ -89,13 +89,14 @@
 //! `should_merge_dictionary_values`; below that `MutableArrayData` copies the
 //! values whole). A Dictionary whose value type arrow's cast cannot pack
 //! (Boolean, List, Map and others: the cast errors), or whose values hold a
-//! null (the round trip would turn a valid key that points at it null), is
-//! copied by `concat` instead and keeps its values whole unless
-//! `should_merge_dictionary_values` merges them, which it never does for a
-//! Boolean, List or Map value type. The copy follows the nesting the measure
-//! does: a List or LargeList column rebuilds its offsets from zero over its
-//! compacted child range, and a Struct column compacts its children, so a
-//! byte-view or Dictionary child is copied the same way at any depth.
+//! null (every value of a Null value type is one; the round trip would turn
+//! a valid key that points at it null), is copied by `concat` instead and
+//! keeps its values whole unless `should_merge_dictionary_values` merges
+//! them, which it never does for a Boolean, List or Map value type. The copy
+//! follows the nesting the measure does: a List or LargeList column rebuilds
+//! its offsets from zero over its compacted child range, and a Struct column
+//! compacts its children, so a byte-view or Dictionary child is copied the
+//! same way at any depth.
 //! `concat` through a Map or FixedSizeList copies exactly the rows of a
 //! plain child but keeps a byte-view or Dictionary child's buffers whole:
 //! `MutableArrayData` carries a view array's data buffers over as they are.
@@ -616,9 +617,11 @@ fn concat_copy(array: &dyn Array) -> DFResult<ArrayRef> {
 /// and others: the cast errors), or whose values hold a null (the round trip
 /// would turn a valid key that points at it null), is copied by `concat`
 /// instead, which keeps that column's values whole unless
-/// `should_merge_dictionary_values` merges them.
+/// `should_merge_dictionary_values` merges them. The nulls are counted
+/// logically: a `NullArray` has no null bitmap, so its `null_count` is 0
+/// while every value of a Null value type is null.
 fn compact_dictionary(array: &ArrayRef, value_type: &DataType) -> DFResult<ArrayRef> {
-    if array.as_any_dictionary().values().null_count() == 0
+    if array.as_any_dictionary().values().logical_null_count() == 0
         && let Ok(rows) = cast(array.as_ref(), value_type)
         && let Ok(packed) = cast(rows.as_ref(), array.data_type())
     {
@@ -661,8 +664,8 @@ mod tests {
     use super::*;
 
     use datafusion::arrow::array::{
-        BooleanArray, DictionaryArray, Int32Array, Int64Array, ListArray, MapBuilder, StringArray,
-        StringBuilder, StringViewArray,
+        BooleanArray, DictionaryArray, Int32Array, Int64Array, ListArray, MapBuilder, NullArray,
+        StringArray, StringBuilder, StringViewArray,
     };
     use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
     use datafusion::arrow::compute::{SortOptions, concat_batches};
@@ -1076,9 +1079,11 @@ mod tests {
 
     /// A `Dictionary(Int32, Utf8)` column with [`DICT_GROUPS`] distinct
     /// [`DICT_VALUE_LEN`]-byte values, one per row, and an Int64 count
-    /// column: a batch whose bytes are mostly dictionary values. Every buffer
-    /// is sized exactly to its contents (a string builder's doubling would
-    /// add slack the charge counts).
+    /// column: a batch whose bytes are mostly dictionary values. The offsets,
+    /// keys and counts are sized exactly to their contents (a string
+    /// builder's doubling would add slack the charge counts). The values'
+    /// data `Vec`, collected from `flat_map`, carries std's growth slack: a
+    /// capacity of 20,480 bytes for its 20,000.
     fn dict_dominated_batch_of() -> RecordBatch {
         let data: Vec<u8> = (0..DICT_GROUPS)
             .flat_map(|v| format!("value-{v:010}-pad").into_bytes())
@@ -1114,6 +1119,8 @@ mod tests {
     /// (40 bytes), 10 values of 20 bytes plus a 4-byte offset each (240) and
     /// 10 counts (80), 360 bytes, against the whole batch's 36,844 charged,
     /// so it is classified as sliced and copied down to its 10 values. The
+    /// 36,844 counts the data `Vec`'s capacity, growth slack included, so it
+    /// would move with std's `Vec` growth policy. The
     /// copy is charged 5,604, most of it the room for 1,024 values and 1,024
     /// data bytes that arrow's dictionary packing reserves whatever the row
     /// count, a fixed floor that dwarfs a 10-row piece.
@@ -1190,6 +1197,62 @@ mod tests {
             );
         }
     }
+
+    /// A `Dictionary(Int32, Null)` column, in a nullable and in a
+    /// non-nullable field: a `NullArray` has no null bitmap, so its
+    /// `null_count` is 0 while every value is logically null. The cast round
+    /// trip would turn every key null, so the column is copied by `concat`,
+    /// keeps its keys valid, compares equal to the piece that went in, and
+    /// the non-nullable batch is accepted.
+    ///
+    /// FLIP: test `values().null_count()` instead of `logical_null_count()`
+    /// in `compact_dictionary` and `compact_batch` fails on piece 0 of the
+    /// non-nullable batch with "Arrow error: Invalid argument error: Column
+    /// 'd' is declared as non-nullable but contains null values"; with the
+    /// nullable batch alone, piece 0 comes out with every key null and fails
+    /// the equality.
+    #[test]
+    fn a_dictionary_of_null_values_is_copied_with_its_keys_valid() {
+        let null_dictionary =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Null));
+        for nullable in [false, true] {
+            let dictionary = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from((0..ROWS).map(|i| (i % 3) as i32).collect::<Vec<_>>()),
+                Arc::new(NullArray::new(3)),
+            )
+            .expect("dictionary");
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "d",
+                null_dictionary.clone(),
+                nullable,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(dictionary) as ArrayRef])
+                .expect("batch");
+            for (i, before) in pieces_of(&batch).into_iter().enumerate() {
+                let (after, set) = compact_one(before.clone());
+                let after = after
+                    .unwrap_or_else(|e| panic!("nullable {nullable}, piece {i} compacts: {e}"));
+                assert_eq!(
+                    metric_of(&set, "compacted_batches"),
+                    1,
+                    "nullable {nullable}, piece {i} is classified as sliced and copied"
+                );
+                assert_eq!(
+                    after.column(0),
+                    before.column(0),
+                    "nullable {nullable}, piece {i} compares equal"
+                );
+                assert_eq!(
+                    after.column(0).null_count(),
+                    0,
+                    "nullable {nullable}, piece {i}: the keys stay valid"
+                );
+            }
+        }
+    }
+
+    /// An unsliced batch passes through the exec untouched: every column
+    /// comes out as the same array, and nothing is counted as copied.
     ///
     /// FLIP: make `compact_batch` always copy (drop the pass-through arm) and
     /// the pointer equality fails on every column.
