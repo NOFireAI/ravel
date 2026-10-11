@@ -4204,63 +4204,99 @@ mod tests {
     /// The `--cache-bytes` cache is not inert: attaching it to the log fetcher
     /// cuts object-store GETs and adds fetch-cache hits.
     ///
-    /// Reachability (issue #677, restated for issue #835): the bench's SQL scan
-    /// reaches the cache through `LogSegmentFetcher::tenant_bytes` (via
-    /// `plan_segment` + `scan_accounted_with_tenant_subset` in
-    /// `ravel_sql::logs_scan`), NOT the `fetch_accounted_with_tenant` funnel the
-    /// flag's ADR names. That path plans each segment and then scans it. Since
-    /// #835 the plan phase's whole-object bytes are CARRIED into the scan for
-    /// the first [`CARRY_BUDGET`] segments whose plan completes, so those
-    /// segments cross the wire once and leave the fetcher cache nothing to
-    /// absorb; the carry is charged to `bytes_reused`, not to a cache hit. The
-    /// cache's contribution is on the segments the budget does not cover: their
-    /// plan read fills the cache and their scan re-open is served from it
-    /// instead of paying a second wire GET. So the fixture writes
-    /// `CARRY_BUDGET + SURPLUS_SEGMENTS` objects against an executor whose
-    /// partition count (and therefore whose carry budget) is `CARRY_BUDGET`,
-    /// and the surplus is what the two arms differ by.
+    /// Within a run the cache saves a GET only where the run reads the same
+    /// bytes twice. A segment at or under
+    /// `LogSegmentFetcher::plan_whole_object_bound` no longer does here
+    /// (ADR-2677 decision 2, partition-count amendment): a scan holding at
+    /// least as many such segments, relevant to the window, as partitions opens
+    /// each one once, unplanned (`sub_break_even_segments_are_read_once` in
+    /// ravel-sql's `logs_selective_scan_amplification` tests). Without a cache
+    /// a scan declares at most one
+    /// partition per segment, so a scan made only of sub-bound segments always
+    /// takes that route there, and at this fixture's one partition the cached
+    /// arm takes it too: neither arm re-reads, so the cache has nothing to
+    /// absorb. The fixture therefore routes its objects ABOVE the bound, where
+    /// the planned route still re-reads: `logs_block_range_threshold: 0` with
+    /// no projection break-even makes the bound 0, which every object exceeds
+    /// (asserted below), so every segment is planned
+    /// (`LogSegmentFetcher::plans_segment`).
+    ///
+    /// On that route, with the derived suffix probe (`derive_suffix_len`, which
+    /// these small objects cap to their own length, so a probe reads the whole
+    /// object; asserted below), the uncached arm's store GETs per phase are:
+    ///
+    /// - plan: two per object, the probe and then `plan_segment`'s
+    ///   whole-object fallback, since `has_word` is not skip-decidable.
+    /// - probe and scan: one each per segment the carry budget does not cover
+    ///   (issue #835). The first [`CARRY_BUDGET`] segments to finish planning
+    ///   hand their plan bytes to the scan; each of the `SURPLUS_SEGMENTS`
+    ///   others re-opens its object with a probe and a whole-object data read.
+    ///
+    /// Every one of those reads covers the same byte range of its object, so
+    /// with the cache wired the first plan read of each object admits it and
+    /// every later read of it is a hit: the cached arm pays one plan-phase GET
+    /// per object and nothing in the probe or scan phase. The fetcher cache
+    /// alone therefore saves `OBJECTS + 2 * SURPLUS_SEGMENTS` store GETs,
+    /// 3 + 2 * 2 = 7 for this fixture.
     ///
     /// The catalog's own byte cache is on under `CatalogConfig::default()` in
     /// both arms, so an isolated, attributable comparison holds the catalog
     /// state identical (two FRESH executors, one cold run each) and reads off
-    /// the delta the fetcher cache alone makes: exactly one store GET per
-    /// surplus segment, and strictly more cache hits. This is why the literal
-    /// "warm hits == cold misses" identity does not hold and is not asserted --
-    /// the cold run already hits, and the catalog cache contributes hits of its
-    /// own. Building the cached arm without `with_cache` collapses both deltas
-    /// to zero (`get_on=9 get_off=9`), which is what flips the assertions red.
-    /// Dropping the `carried_seen < budget` bound from `compute_plan_counts` in
-    /// `ravel_sql::logs_scan` flips them red from the other side: every segment
-    /// is then carried, no scan re-open is left for the cache to serve, and both
-    /// arms read `get_on=7 get_off=7`.
+    /// the delta the fetcher cache alone makes. This is why the literal "warm
+    /// hits == cold misses" identity is not asserted: the cold run already
+    /// hits, and the catalog cache contributes hits of its own. Building the
+    /// cached arm without `with_cache` collapses the delta to zero
+    /// (`get_on=14 get_off=14`). Making `plans_segment` answer false sends all
+    /// three segments down the read-once route in both arms
+    /// (`get_on=7 get_off=7`). Dropping the `carried_seen < budget` bound from
+    /// `compute_plan_counts` in `ravel_sql::logs_scan` carries every segment,
+    /// so no scan re-open is left (`get_on=7 get_off=10`): the uncached phase
+    /// split fails first, and of the three totals checks only the exact
+    /// difference would, since the cache still cuts GETs and adds hits.
     ///
-    /// The `has_word` predicate is what keeps the query on that plan-then-scan
-    /// path (issue #739). A predicate-free full-window statement now takes
-    /// `LogsScanExec`'s whole-segment fast path, which reads each segment exactly
-    /// once and so leaves the fetcher cache nothing to absorb within a run. Since
-    /// #835 that fast path has a sibling: a carried segment on the plan-then-scan
-    /// path is also read exactly once. Both are why the fixture needs surplus
-    /// segments rather than a predicate alone. Every object holds the same
+    /// The `has_word` predicate keeps the query off `LogsScanExec`'s
+    /// predicate-free whole-segment fast path (issue #739), which reads each
+    /// segment exactly once. Every object holds the same
     /// `request 0 timeout after 30s` body, so the predicate matches all of them
     /// and every segment reaches the scan.
     #[tokio::test]
     async fn cache_flag_cuts_store_gets_within_a_run() {
         use ravel_types::accounting::AccountedOp;
 
-        // Segments beyond the carry budget. Each one's scan re-opens its object:
-        // a real store GET with the cache off, a cache hit with it on. The margin
-        // the assertion below states is this number, not whatever the fixture
-        // happens to produce.
+        // Segments beyond the carry budget. Each one's scan re-opens its object
+        // with a probe and a data read: two store GETs with the cache off, two
+        // cache hits with it on.
         const SURPLUS_SEGMENTS: usize = 2;
+        const OBJECTS: usize = CARRY_BUDGET + SURPLUS_SEGMENTS;
+        let objects_n = OBJECTS as u64;
+        let surplus = SURPLUS_SEGMENTS as u64;
 
         let store = empty_store();
         let tenant = TenantId::new("cache-tenant");
         let th = tenant.hash();
-        write_matching_objects(&store, &tenant, 0, CARRY_BUDGET + SURPLUS_SEGMENTS).await;
+        let objects = write_matching_objects(&store, &tenant, 0, OBJECTS).await;
+        let object_len = objects[0].len() as u64;
+        assert!(
+            ravel_query::derive_suffix_len(object_len) >= object_len,
+            "fixture: the derived probe must cover the whole {object_len}-byte object, \
+             so every read of it shares one cache key"
+        );
         let settings = ExecutorSettings {
+            logs_block_range_threshold: 0,
+            logs_projection_break_even_bytes: None,
             fetch_concurrency: CARRY_BUDGET,
             ..ExecutorSettings::default()
         };
+        let bound = LogSegmentFetcher::new(Arc::clone(&store))
+            .with_block_range_threshold(settings.logs_block_range_threshold)
+            .with_request_cost_bytes(settings.logs_request_cost_bytes)
+            .with_projection_break_even_bytes(settings.logs_projection_break_even_bytes)
+            .plan_whole_object_bound();
+        assert!(
+            object_len > bound,
+            "fixture: every object must sit above plan_whole_object_bound ({bound}) so \
+             the scan plans it; got {object_len} bytes"
+        );
         let req = SqlRequest {
             sql: "SELECT body FROM logs WHERE has_word(body, 'timeout')".to_string(),
             window: TimeRange {
@@ -4278,18 +4314,37 @@ mod tests {
         // Fetcher cache ON: a fresh executor (cold catalog byte cache, cold
         // fetcher cache), one run.
         let cache = build_read_cache(64 << 20);
-        let cached = cold_executor(&store, &[], Some(cache), settings)
-            .expect("build cached executor")
-            .executor;
+        let cached =
+            cold_executor(&store, &[], Some(cache), settings).expect("build cached executor");
+        let on_wire = cached.wire_bytes.clone();
+        let cached = cached.executor;
         let on = cached.execute(th, &req).await.expect("cached run");
 
         // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
         // no fetcher cache), one run. The catalog contribution is the same in
         // both, so any delta is the fetcher cache alone.
-        let uncached = cold_executor(&store, &[], None, settings)
-            .expect("build uncached executor")
-            .executor;
+        let uncached = cold_executor(&store, &[], None, settings).expect("build uncached executor");
+        let off_wire = uncached.wire_bytes.clone();
+        let uncached = uncached.executor;
         let off = uncached.execute(th, &req).await.expect("uncached run");
+
+        // The per-phase GET split the doc comment derives, for both arms.
+        let phase_gets = |w: &PhaseWireByteCounter| {
+            let s = w.snapshot();
+            [QueryPhase::Plan, QueryPhase::Probe, QueryPhase::Scan].map(|p| s.phase_requests(p))
+        };
+        assert_eq!(
+            phase_gets(&off_wire),
+            [2 * objects_n, surplus, surplus],
+            "uncached [plan, probe, scan] GETs: a probe and a whole-object fallback per \
+             object, then a probe and a data read per uncarried segment"
+        );
+        assert_eq!(
+            phase_gets(&on_wire),
+            [objects_n, 0, 0],
+            "cached [plan, probe, scan] GETs: one plan read per object, every later \
+             read a hit"
+        );
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
         let get_off = off.accounting.s3_requests(AccountedOp::Get);
@@ -4301,9 +4356,9 @@ mod tests {
         );
         assert_eq!(
             get_off - get_on,
-            SURPLUS_SEGMENTS as u64,
-            "the cache absorbs exactly the segments the carry budget does not \
-             cover: one scan re-open each; got get_on={get_on} get_off={get_off}"
+            objects_n + 2 * surplus,
+            "the cache absorbs the plan fallback of every object and the probe and \
+             data read of every uncarried segment; got get_on={get_on} get_off={get_off}"
         );
         assert!(
             on.accounting.cache_hits > off.accounting.cache_hits,
