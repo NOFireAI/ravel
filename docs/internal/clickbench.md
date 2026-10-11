@@ -744,7 +744,9 @@ No performance flags. Since #1141 the server derives all six of them from the
 host at startup. Two are host-independent and match a published entry exactly:
 a 1,000,000 sealed-segment cap and an 11-minute engine deadline. Fetch
 concurrency is CPU-derived and also matches on this box: 32, two per core on
-16 cores.
+16 cores. Store GET permits are now sized from the memory budget instead
+(ADR-2677 decision 7): 64% of the 27,775,004,672-byte budget in 64 MiB
+units, clamped to 256 on this box.
 
 ### Deriving the reference sizes
 

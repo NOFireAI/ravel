@@ -455,6 +455,14 @@ opens held at once, counting the current segment. A pushed `fetch` turns the
 pipeline off (share 1), since the partition may stop before the segments it
 would have prefetched.
 
+The share follows `store_get_concurrency`, so the memory-derived GET permit
+default (ADR-2677 decision 7) moves it. On the 16-core reference host the
+permits went from the core-derived 32 to 256 while `sql_partition_count`
+stayed at 32, so the share went from `max(2, 32 / 32) = 2` to
+`256 / 32 = 8`, on remote and loopback stores alike. A partition can then
+hold four times as many opens, and their reserved bytes, at once.
+`--store-get-concurrency 32` restores a share of 2.
+
 The prefetched opens are the same opens the sequential walk builds, polled by
 the partition stream until they resolve and consumed in owned order, so the
 rows, the per-segment counters (`segments_opened`, the route split, the
@@ -1513,8 +1521,14 @@ method:
   fan-out width PromQL's per-selector fetch streams use.
 
 `ravel-server` exposes these as `--store-get-concurrency`,
-`--sql-partition-count`, and `--promql-fetch-fanout` (each unset derives from
-host cores like `--fetch-concurrency` always has). `--fetch-concurrency`
+`--sql-partition-count`, and `--promql-fetch-fanout`. Unset, the last two
+derive from host cores, `max(8, 2 x cores)`, and
+`--store-get-concurrency` is sized from the process memory budget (ADR-2677
+decision 7): 64% of `memory_budget_bytes` divided by 64 MiB, rounded down,
+clamped to 8 and to `LATENCY_FIRST_MEASURED_CONCURRENCY` (256). With the
+budget unknown or in gateway mode it derives from cores too. On the 16-core
+reference host this moved the default from 32 to 256 on every store kind,
+remote included. `--fetch-concurrency`
 still sets all three together (source `legacy-flag` in the startup log);
 combining it with any of the three, or passing `0` to any of the four, is a
 startup error naming the offending flag(s), raised before any fetcher,
@@ -1530,6 +1544,16 @@ partially assembled reads can wait behind the limiter at once. Peak assembly
 memory therefore follows the fan-out setting times the bytes each read places
 (not the object size), and an operator who raises fan-out without raising GET
 concurrency trades store pressure for memory, not for nothing.
+
+The permit count does not bound fetch bytes either. A fetcher reserves an
+object's bytes on the process memory budget before it acquires the permit,
+and the reservation is per object: a whole-object read reserves the object's
+full size even when it is issued as several 64 MiB GETs. The reservation
+travels with the bytes through decode and is released after the permit is.
+The bytes held are bounded by the budget, which refuses a reservation it
+cannot hold with `FetchMemoryExhausted`, reported to the client as the
+retryable `upstream storage temporarily unavailable` (HTTP 503). A fallback
+budget (no host memory figure found) is unlimited and refuses nothing.
 
 `EngineConfig::validate` rejects zero on `fetch_concurrency` and on each
 knob's resolved value (an explicit override of `0`, not just an unset one),
@@ -3078,11 +3102,15 @@ leftover request, so the model is one round too many. The same sliding
   always has exactly one wave with `active_0 = 1`, reducing to
   `ceil(segment_count / promql_fetch_fanout)`, since `min(promql_fetch_fanout,
   sharedGetPermits)` is the fan-out width whenever the shared pool is at
-  least as large as one plan's own fan-out bound, as it is for any config
-  that leaves both ADR-1195 knobs unset (both then resolve to
-  `fetch_concurrency`). Lower `--store-get-concurrency` below
-  `--promql-fetch-fanout` and the limiter binds instead, for a single-plan
-  query too; this figure follows whichever bound is smaller.
+  least as large as one plan's own fan-out bound, as it is for a bare
+  `EngineConfig` that leaves both ADR-1195 knobs unset (both then resolve to
+  `fetch_concurrency`). `ravel-server` with both flags unset sizes the
+  permits from the memory budget instead, which does not guarantee that: a
+  16-core host with 4 GiB of memory (a 3 GiB budget) derives 30 permits
+  against a fan-out of 32. Lower `--store-get-concurrency` below
+  `--promql-fetch-fanout`, by flag or by that derivation, and the limiter
+  binds instead, for a single-plan query too; this figure follows whichever
+  bound is smaller.
 
   `ravel-sql`'s `SqlExecutor::sql_io_shape` computes the identical
   single-plan reduction, `ceil(segment_count / min(sql_partition_count,

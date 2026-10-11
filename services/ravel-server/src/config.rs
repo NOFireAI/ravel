@@ -254,10 +254,12 @@ pub enum LogsFetchPolicyArg {
     /// #1196): an intent, not a tuning constant. Measured at `740f94b97` over
     /// 3 reps, it traded 5.30x the GET requests for 52% less cold wall-clock
     /// (per-rep range 50.3% to 54.2%) on the reference corpus,
-    /// at a raised object-store GET concurrency the operator sets explicitly
-    /// (this policy carries no concurrency default of its own). In-flight
-    /// fetch memory at that concurrency is not yet bounded by a process-wide
-    /// budget (ADR-1196, #1170, #1007).
+    /// at an object-store GET concurrency of 256. The unset default on a
+    /// loopback store (ADR-2677 decision 7). The GET permit count is sized
+    /// from the memory budget, not from this policy, and bounds concurrent
+    /// GETs, not bytes: each fetch reserves its object's bytes on the budget
+    /// before it takes a permit, and the budget refuses a fetch it cannot
+    /// hold.
     LatencyFirst,
 }
 
@@ -1367,10 +1369,10 @@ pub struct Cli {
     /// The expert escape hatch of ADR-0996 decision 2: SET, it WINS over
     /// `--logs-fetch-policy`'s derived rate and the deployment keeps exactly
     /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate:
-    /// under `cost-based` (the unset policy, on every deployment including a
-    /// loopback `--s3-endpoint`, ADR-2023) from the active store cost
-    /// profile, and under an explicit `byte-minimal` or `latency-first` as
-    /// the compiled-in default.
+    /// under `cost-based` (the unset policy on every deployment except a
+    /// loopback `--s3-endpoint`, ADR-2023 and ADR-2677) from the active store
+    /// cost profile, and under `byte-minimal` or `latency-first` (the unset
+    /// policy on a loopback `--s3-endpoint`) as the compiled-in default.
     /// `Option`-typed for that reason: "the operator asked for this many bytes"
     /// and "nobody asked, use the compiled-in default" are different inputs to
     /// the resolution, and a `default_value_t` would erase the difference.
@@ -1381,9 +1383,10 @@ pub struct Cli {
     /// at startup into the byte quantities the fetch layer runs on
     /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
     /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it
-    /// resolves `cost-based` (ADR-1196), on every deployment including a
-    /// `--store s3` deployment against a loopback `--s3-endpoint` (ADR-2023
-    /// decision 1).
+    /// resolves `latency-first` on a `--store s3` deployment against a
+    /// loopback `--s3-endpoint` (ADR-2677 decision 7, amending ADR-2023
+    /// decision 1 for loopback only) and `cost-based` (ADR-1196) on every
+    /// other deployment.
     ///
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
@@ -1404,18 +1407,22 @@ pub struct Cli {
     /// An explicit flag always wins, including an explicit `byte-minimal` or
     /// `cost-based` on a loopback endpoint.
     /// [`crate::config::Cli::resolve_logs_fetch_policy`] is the one place this
-    /// is decided; the resolved policy's source (`flag` or `default`) is on
-    /// the `logs fetch policy resolved` startup log line.
+    /// is decided; the resolved policy's source (`flag`, `default` or
+    /// `default-loopback`) is on the `logs fetch policy resolved` startup log
+    /// line.
     ///
     /// `latency-first` is an intent, not a tuning constant: it says spend
     /// requests to save wall time, and carries no concurrency default of its
     /// own. Measured at `740f94b97` over 3 reps on the reference corpus it
     /// traded 5.30x the GET requests for 52% less cold wall-clock than
     /// `cost-based` (per-rep range 50.3% to 54.2%), at
-    /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256) -- set
-    /// explicitly with `--fetch-concurrency` or with `--store-get-concurrency`
-    /// plus `--sql-partition-count`, since both the GET permits and the SQL
-    /// scan width need to move together to reach it. At a lower concurrency
+    /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256). Unset,
+    /// `--store-get-concurrency` is sized from the memory budget (ADR-2677
+    /// decision 7) and reaches 256 once the budget is at least 26,843,545,600
+    /// bytes (25 GiB), as on the 32 GB ClickBench reference host's recorded
+    /// 27,775,004,672-byte budget; `--sql-partition-count`
+    /// still derives from cores, so reaching the measured shape for SQL also
+    /// needs `--sql-partition-count` set explicitly. At a lower concurrency
     /// the trade does not pay off, and selecting this policy alone is not
     /// inert: the byte quantities already change, so a logs read is routed the
     /// way `byte-minimal` routes it, taking ranged reads wherever they save
@@ -1423,10 +1430,12 @@ pub struct Cli {
     /// not. On the reference corpus that shape at the default concurrency
     /// measured 712.4 s against `cost-based`'s 525.0 s, 36% SLOWER, which is
     /// why the concurrency is a precondition and not a tuning suggestion.
-    /// In-flight fetch memory at the
-    /// measured concurrency is not yet bounded by a process-wide budget (see
-    /// #1170 and #1007), so raising concurrency without watching process
-    /// memory can end in an out-of-memory kill instead of a faster query.
+    /// Each fetch reserves its bytes on the process memory budget before it
+    /// takes a GET permit, so the permit count does not bound the bytes held:
+    /// the budget does, by refusing a fetch it cannot hold, which the query
+    /// reports as a retryable `upstream storage temporarily unavailable`
+    /// (HTTP 503). A fallback budget (no host memory figure found) is
+    /// unlimited, so its ledger refuses nothing.
     #[arg(long = "logs-fetch-policy", value_enum)]
     pub logs_fetch_policy: Option<LogsFetchPolicyArg>,
 
@@ -1483,7 +1492,9 @@ pub struct Cli {
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
     /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
     /// cores)`, which is 32 on the 16-core reference host and never below the
-    /// compiled-in 8 on a small one.
+    /// compiled-in 8 on a small one. Unset, `--store-get-concurrency` alone is
+    /// sized from the memory budget instead when the budget is known (ADR-2677
+    /// decision 7).
     #[arg(long = "fetch-concurrency", value_name = "N")]
     pub fetch_concurrency: Option<usize>,
 
@@ -1491,9 +1502,21 @@ pub struct Cli {
     /// process-wide (ADR-1195), threaded into
     /// `ravel_query::EngineConfig::store_get_concurrency` and from there into
     /// the single process-owned `GetLimiter` every fetcher (RSEG, RLOG, RSPAN)
-    /// shares. Default when unset: derived,
-    /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
-    /// cores)`.
+    /// shares. Default when unset (ADR-2677 decision 7): sized from the memory
+    /// budget so that the count times 64 MiB (`STORE_GET_PERMIT_BYTES`, the
+    /// fetcher's default fetch bound) is 64% of `memory_budget_bytes`
+    /// (`STORE_GET_MEMORY_PERCENT`), rounded down and clamped to 8..=256. The
+    /// 64% is chosen so the 32 GB reference host's recorded budget
+    /// (27,775,004,672 bytes) derives 256 with margin; 256 needs a budget of
+    /// at least 26,843,545,600 bytes (25 GiB). With the budget unknown
+    /// or not applicable (`--mode gateway`), `max(MIN_DERIVED_FETCH_CONCURRENCY,
+    /// FETCH_CONCURRENCY_PER_CORE * cores)`. An explicit flag wins.
+    ///
+    /// A permit bounds concurrent GETs, not bytes: each fetch reserves its
+    /// object's bytes on the memory budget before it takes a permit (a whole
+    /// object larger than 64 MiB reserves its whole size), and the
+    /// reservation outlives the permit, through decode. The budget refusing a
+    /// fetch it cannot hold is what bounds the bytes.
     ///
     /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
     /// flags below) when neither is given explicitly. Setting both
@@ -2696,7 +2719,8 @@ pub struct QueryBudgets {
     pub fetch_concurrency: usize,
     /// The resolved GET concurrency (ADR-1195): the operator's explicit
     /// `--store-get-concurrency`, else the legacy `--fetch-concurrency`
-    /// value, else the derived default -- already resolved by
+    /// value, else the default (memory-derived when the budget is known and
+    /// applies, core-derived otherwise; ADR-2677 decision 7) -- already resolved by
     /// [`resolve_performance_defaults`], never re-derived here. Reaches
     /// `EngineConfig::store_get_concurrency` as `Some(self.store_get_concurrency)`,
     /// which is what makes the accessor return exactly this value regardless
@@ -2908,10 +2932,14 @@ pub const BREAK_EVEN_SOURCE_ROUTING_THRESHOLD: &str = "routing-threshold";
 /// explicitly (ADR-1196). Wins over the default, including on a loopback
 /// endpoint.
 pub const LOGS_FETCH_POLICY_SOURCE_FLAG: &str = "flag";
-/// [`LogsFetchStamp::policy_source`] when the flag was unset: `cost-based`,
-/// exactly as ADR-1196, on every deployment including a `--store s3`
-/// deployment against a loopback `--s3-endpoint` (ADR-2023 decision 1).
+/// [`LogsFetchStamp::policy_source`] when the flag was unset on a deployment
+/// whose store is not a loopback endpoint: `cost-based`, exactly as ADR-1196
+/// (ADR-2023 decision 1).
 pub const LOGS_FETCH_POLICY_SOURCE_DEFAULT: &str = "default";
+/// [`LogsFetchStamp::policy_source`] when the flag was unset on a `--store
+/// s3` deployment against a loopback `--s3-endpoint`: `latency-first`
+/// (ADR-2677 decision 7, amending ADR-2023 decision 1 for loopback only).
+pub const LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK: &str = "default-loopback";
 
 /// The effective logs fetch configuration a process resolved at startup, the
 /// provenance stamp of ADR-0996 decision 2.
@@ -2927,7 +2955,8 @@ pub struct LogsFetchStamp {
     /// policy `--logs-fetch-policy` resolved to when it was not given.
     pub policy: &'static str,
     /// Where [`Self::policy`] came from (ADR-1196, ADR-2023):
-    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`] or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`].
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]
+    /// or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK`].
     pub policy_source: &'static str,
     /// The active profile's name, from `--store-cost-profile` or the reference
     /// profile.
@@ -3051,9 +3080,12 @@ impl LogsFetchStamp {
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = false,
                     "latency-first is an intent, not a tuning constant: its measured trade \
-                     needs both store_get_concurrency and sql_partition_count raised to \
-                     the measured concurrency explicitly, and below it this policy's \
-                     byte-minimal routing has measured slower than the default policy"
+                     needs both store_get_concurrency and sql_partition_count at the \
+                     measured concurrency, and below it this policy's byte-minimal routing \
+                     has measured slower than cost-based; unset, store_get_concurrency is \
+                     sized from the memory budget (from cores when no budget is known) and \
+                     sql_partition_count from cores, so raise whichever is below it \
+                     explicitly"
                 );
             } else {
                 tracing::info!(
@@ -3063,8 +3095,10 @@ impl LogsFetchStamp {
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = true,
                     "latency-first is running at or above the concurrency its trade was \
-                     measured at; in-flight fetch memory there is still not bounded by a \
-                     process-wide budget, so watch process memory"
+                     measured at; GET permits bound concurrent GETs, not bytes, and the \
+                     bytes fetches hold are bounded by the process memory budget's \
+                     refusals when the budget is known (a fallback budget is unlimited \
+                     and refuses nothing)"
                 );
             }
         }
@@ -3494,6 +3528,39 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// SQL remainder (ADR-2023, Acceptance).
 pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
 
+/// Share of `memory_budget_bytes` the derived `--store-get-concurrency` is
+/// sized from (ADR-2677 decision 7): the count is this share divided by
+/// [`STORE_GET_PERMIT_BYTES`], rounded down, then clamped. It sizes a count of
+/// concurrent GETs and bounds no bytes: a fetch reserves its object's bytes on
+/// the memory budget before it takes a permit, the reservation outlives the
+/// permit, and the budget's refusal is what bounds them.
+///
+/// 64 is chosen so the budget recorded on the 32 GB ClickBench reference
+/// host, 27,775,004,672 bytes at source `derived-available`, derives the 256
+/// permits W1 measured there with margin; it is not derived from a memory
+/// model. 256 needs a budget of at least 26,843,545,600 bytes (25 GiB), and
+/// the recorded budget is about 3.5% above that; 60 would derive 248 from it.
+/// It is not a carve: fetch reservations draw on `memory_remainder_bytes`
+/// beside SQL, which is 70% of the budget on a remote store and 55% on a
+/// loopback one, so on a loopback store 64% is more than the remainder could
+/// hold at once.
+pub const STORE_GET_MEMORY_PERCENT: u64 = 64;
+
+/// The per-permit size [`STORE_GET_MEMORY_PERCENT`] divides by:
+/// [`ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES`] (64 MiB), the longest
+/// covering GET the logs fetcher issues at the default
+/// `--logs-max-fetch-run-bytes`. A sizing unit, not a bound: a whole-object
+/// read reserves the object's full size even when it is split into 64 MiB
+/// GETs, and the reservation is held after the permit is released.
+pub const STORE_GET_PERMIT_BYTES: u64 = ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES;
+
+/// Ceiling on the memory-derived `--store-get-concurrency`:
+/// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256), the permit count
+/// W1 was measured at. A larger budget derives no more permits than were
+/// measured.
+pub const MAX_DERIVED_STORE_GET_CONCURRENCY: usize =
+    ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY;
+
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
 /// SEPARATE ceiling from [`CACHE_MEMORY_PERCENT`]. The fetcher cache
 /// (`store::build_cache`) and the catalog byte cache (`query::build_catalog`)
@@ -3586,6 +3653,12 @@ pub const PERF_SOURCE_BUDGET_CARVE: &str = "budget-carve";
 /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` rather than at
 /// [`CACHE_MEMORY_PERCENT`] (ADR-2023).
 pub const PERF_SOURCE_BUDGET_CARVE_LOOPBACK: &str = "budget-carve-loopback";
+/// [`ResolvedPerformanceDefaults`] source for `store_get_concurrency`:
+/// neither `--store-get-concurrency` nor `--fetch-concurrency` was set and
+/// `memory_budget_bytes` is known and applies to this mode, so the permit
+/// count was derived from the budget at [`STORE_GET_MEMORY_PERCENT`] per
+/// [`STORE_GET_PERMIT_BYTES`] (ADR-2677 decision 7).
+pub const PERF_SOURCE_BUDGET_SHARE: &str = "budget-share";
 /// [`ResolvedPerformanceDefaults`] source: this process's mode uses no part
 /// of the ADR-1170 memory budget ([`Mode::uses_memory_budget`]), so no budget
 /// was derived and no cache ceiling was carved from one.
@@ -3930,6 +4003,19 @@ fn resolve_knob(
     }
 }
 
+/// The memory-derived `--store-get-concurrency` (ADR-2677 decision 7):
+/// [`STORE_GET_MEMORY_PERCENT`] of `memory_budget_bytes` divided by
+/// [`STORE_GET_PERMIT_BYTES`], rounded down, then clamped to
+/// [`MIN_DERIVED_FETCH_CONCURRENCY`]..=[`MAX_DERIVED_STORE_GET_CONCURRENCY`].
+pub fn derive_store_get_concurrency(memory_budget_bytes: u64) -> usize {
+    let share = u128::from(memory_budget_bytes) * u128::from(STORE_GET_MEMORY_PERCENT) / 100;
+    let permits = share / u128::from(STORE_GET_PERMIT_BYTES.max(1));
+    usize::try_from(permits).unwrap_or(usize::MAX).clamp(
+        MIN_DERIVED_FETCH_CONCURRENCY,
+        MAX_DERIVED_STORE_GET_CONCURRENCY,
+    )
+}
+
 /// Resolve the six performance settings from the host and the operator's flags
 /// (ADR-0088 as amended by issue #1141).
 ///
@@ -3937,7 +4023,13 @@ fn resolve_knob(
 /// flag overrides verbatim:
 ///
 /// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
-///   FETCH_CONCURRENCY_PER_CORE * cores)`.
+///   FETCH_CONCURRENCY_PER_CORE * cores)`. `sql_partition_count` and
+///   `promql_fetch_fanout` derive the same value.
+/// - `store_get_concurrency` (ADR-2677 decision 7): with neither
+///   `--store-get-concurrency` nor `--fetch-concurrency` set and
+///   `memory_budget_bytes` known, [`derive_store_get_concurrency`] of the
+///   budget (source [`PERF_SOURCE_BUDGET_SHARE`]); with the budget unknown or
+///   not applicable, the core derivation above.
 /// - `catalog_resolve_concurrency` (ADR-1733 decision 2):
 ///   `clamp(Q * RESOLVE_CONCURRENCY_PER_QUERY, RESOLVE_CONCURRENCY_PER_QUERY,
 ///   ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY)`, then held at
@@ -4031,11 +4123,6 @@ pub fn resolve_performance_defaults(
         None => (derived_fetch_concurrency, PERF_SOURCE_DERIVED),
     };
 
-    let (store_get_concurrency, store_get_concurrency_source) = resolve_knob(
-        flags.store_get_concurrency,
-        flags.fetch_concurrency,
-        derived_fetch_concurrency,
-    );
     let (sql_partition_count, sql_partition_count_source) = resolve_knob(
         flags.sql_partition_count,
         flags.fetch_concurrency,
@@ -4197,6 +4284,20 @@ pub fn resolve_performance_defaults(
     // MemTotal (non-Linux) still carves real caches, it must not fall back to
     // `DEFAULT_CACHE_MAX_BYTES` just because `host.mem_total_bytes` is `None`.
     let memory_budget_known = memory_budget_source != PERF_SOURCE_FALLBACK;
+
+    // ADR-2677 decision 7: the GET permit count is sized from the budget, not
+    // from cores. It bounds concurrent GETs only; the budget's refusals bound
+    // the bytes fetches reserve. `sql_partition_count` and `promql_fetch_fanout` keep the core
+    // derivation. An unknown budget, or a mode outside it, has no share to
+    // size from and keeps the core derivation too.
+    let (store_get_concurrency, store_get_concurrency_source) =
+        match (flags.store_get_concurrency, flags.fetch_concurrency) {
+            (None, None) if memory_budget_known && !flags.memory_budget_not_applicable => (
+                derive_store_get_concurrency(memory_budget_bytes),
+                PERF_SOURCE_BUDGET_SHARE,
+            ),
+            (explicit, legacy) => resolve_knob(explicit, legacy, derived_fetch_concurrency),
+        };
 
     // ADR-2023: a loopback store's cache miss still costs a local disk round
     // trip, not a network one, so the fetcher cache affords a larger share of
@@ -4613,12 +4714,28 @@ impl ResolvedPerformanceDefaults {
             source = self.sources.fetch_concurrency,
             "performance default resolved"
         );
-        tracing::info!(
-            setting = "store_get_concurrency",
-            value = self.store_get_concurrency,
-            source = self.sources.store_get_concurrency,
-            "performance default resolved"
-        );
+        // ADR-2677 decision 7: a budget-derived permit count names the inputs
+        // it was derived from, so the operator can check it against the budget
+        // line without knowing the rule.
+        if self.sources.store_get_concurrency == PERF_SOURCE_BUDGET_SHARE {
+            tracing::info!(
+                setting = "store_get_concurrency",
+                value = self.store_get_concurrency,
+                source = self.sources.store_get_concurrency,
+                memory_budget_bytes = self.memory_budget_bytes,
+                share_percent = STORE_GET_MEMORY_PERCENT,
+                per_permit_bytes = STORE_GET_PERMIT_BYTES,
+                ceiling = MAX_DERIVED_STORE_GET_CONCURRENCY,
+                "performance default resolved"
+            );
+        } else {
+            tracing::info!(
+                setting = "store_get_concurrency",
+                value = self.store_get_concurrency,
+                source = self.sources.store_get_concurrency,
+                "performance default resolved"
+            );
+        }
         tracing::info!(
             setting = "sql_partition_count",
             value = self.sql_partition_count,
@@ -6083,7 +6200,8 @@ impl Cli {
     /// Whether this deployment's store is a `--store s3` deployment against a
     /// loopback `--s3-endpoint`: the single place this predicate is computed
     /// (ADR-2023 decision 3), read by [`Self::performance_flags`] to size the
-    /// fetcher cache's loopback share. Gated on `--store s3` so a stray
+    /// fetcher cache's loopback share and by [`Self::resolve_logs_fetch_policy`]
+    /// for the loopback policy default (ADR-2677 decision 7). Gated on `--store s3` so a stray
     /// exported `RAVEL_S3_ENDPOINT` cannot change behaviour for a `--store
     /// memory` start.
     pub(crate) fn store_is_loopback(&self) -> bool {
@@ -6102,14 +6220,19 @@ impl Cli {
     /// re-derive a different answer.
     ///
     /// An explicit `--logs-fetch-policy` always wins, including on a loopback
-    /// endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]). Unset, every deployment
-    /// resolves `cost-based` ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]), exactly
-    /// as ADR-1196: ADR-2023 withdrew ADR-2014's loopback-endpoint
-    /// `byte-minimal` derivation, so this no longer consults
-    /// [`Self::store_is_loopback`] at all.
+    /// endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]). Unset, a loopback store
+    /// ([`Self::store_is_loopback`]) resolves `latency-first`
+    /// ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK`], ADR-2677 decision 7,
+    /// amending ADR-2023 decision 1 for loopback only), and every other
+    /// deployment resolves `cost-based` ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]),
+    /// exactly as ADR-1196.
     pub fn resolve_logs_fetch_policy(&self) -> (LogsFetchPolicyArg, &'static str) {
         match self.logs_fetch_policy {
             Some(policy) => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG),
+            None if self.store_is_loopback() => (
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK,
+            ),
             None => (
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT,
@@ -7513,7 +7636,8 @@ impl Cli {
         if self.store_get_concurrency == Some(0) {
             anyhow::bail!(
                 "--store-get-concurrency '0' would admit no concurrent object-store GETs; omit \
-                 the flag to derive the default from host cores, or set a positive count"
+                 the flag to derive the default (from the memory budget when one is known), or \
+                 set a positive count"
             );
         }
         if self.sql_partition_count == Some(0) {
@@ -9928,7 +10052,10 @@ mod tests {
             5,
             "the running engine's sql_partition_count must be the configured flag"
         );
-        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(
+            engine.store_get_concurrency(),
+            REFERENCE_STORE_GET_CONCURRENCY
+        );
         assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
     }
 
@@ -9945,43 +10072,265 @@ mod tests {
             3,
             "the running engine's promql_fetch_fanout must be the configured flag"
         );
-        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(
+            engine.store_get_concurrency(),
+            REFERENCE_STORE_GET_CONCURRENCY
+        );
         assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
     }
 
     /// ADR-1195: with none of the four fetch-concurrency-family flags set, all
-    /// three unbundled knobs derive independently from the host, at the same
-    /// value `fetch_concurrency` itself derives to, each reported at source
-    /// `derived`.
+    /// three unbundled knobs derive independently from the host. The SQL and
+    /// PromQL knobs take the value `fetch_concurrency` itself derives to, at
+    /// source `derived`; the GET permits derive from the memory budget
+    /// (ADR-2677 decision 7), at source `budget-share`.
     #[test]
     fn reference_host_resolves_the_three_unbundled_knobs() {
         let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
-        assert_eq!(resolved.store_get_concurrency, 32);
+        assert_eq!(resolved.store_get_concurrency, 256);
         assert_eq!(resolved.sql_partition_count, 32);
         assert_eq!(resolved.promql_fetch_fanout, 32);
-        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(
+            resolved.sources.store_get_concurrency,
+            PERF_SOURCE_BUDGET_SHARE
+        );
         assert_eq!(resolved.sources.sql_partition_count, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.promql_fetch_fanout, PERF_SOURCE_DERIVED);
     }
 
-    /// ADR-1195: on a tiny host the three unbundled knobs floor at
+    /// ADR-1195: on a tiny host the core-derived knobs floor at
     /// `MIN_DERIVED_FETCH_CONCURRENCY`, exactly like `fetch_concurrency` does.
+    /// The GET permits take the same floor once the budget is unknown, since
+    /// they then fall back to the core derivation.
     #[test]
     fn small_host_floors_the_three_unbundled_knobs_at_the_minimum() {
         let tiny = resolve_performance_defaults(
-            HostProfile::new(
-                1,
-                Some(8 * 1024 * 1024 * 1024),
-                Some(8 * 1024 * 1024 * 1024),
-                None,
-                None,
-                None,
-            ),
+            HostProfile::new(1, None, None, None, None, None),
             PerformanceFlags::default(),
         );
         assert_eq!(tiny.store_get_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+        assert_eq!(tiny.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
         assert_eq!(tiny.sql_partition_count, MIN_DERIVED_FETCH_CONCURRENCY);
         assert_eq!(tiny.promql_fetch_fanout, MIN_DERIVED_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-2677 decision 7: unset, `--store-get-concurrency` is sized from the
+    /// memory budget so that the count times 64 MiB is 64% of
+    /// `memory_budget_bytes`, rounded down and clamped to 8..=256: the exact
+    /// count per host in the table, 256 from a budget of 26,843,545,600
+    /// bytes and 255 one byte below it, the floor for a tiny budget. An
+    /// explicit or legacy flag wins on every host, and the SQL partition count
+    /// and PromQL fan-out do not follow the permits. Every host has 16 cores,
+    /// so a core derivation reads 32 on every row. Driven through
+    /// `Cli::resolve_performance`, the call `main` makes. The permit count
+    /// bounds no bytes, so nothing here asserts a byte bound.
+    ///
+    /// Prove-the-test: set `STORE_GET_MEMORY_PERCENT` to 60 or 62 and the
+    /// 4 GiB row reads 28 or 29 against 30 (at 62 the 26,843,545,600 row
+    /// would read 248); drop the `/ 100` in `derive_store_get_concurrency` and
+    /// the 4 GiB row reads 256.
+    #[test]
+    fn derived_get_permits_follow_the_budget_table_and_flag_precedence() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(STORE_GET_PERMIT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_DERIVED_STORE_GET_CONCURRENCY, 256);
+
+        let unset = cli(&[]);
+        // (host MemTotal, resolved memory_budget_bytes, expected permits).
+        // Fixtures with no `MemAvailable`, so the budget is `MemTotal` less
+        // the reserve; a real Linux host derives from `MemAvailable` instead.
+        let table: [(u64, u64, usize); 4] = [
+            (4 * GIB, 3 * GIB, 30),
+            (8 * GIB, 6 * GIB, 61),
+            (16 * GIB, 14 * GIB, 143),
+            (32 * GIB, 30 * GIB, 256),
+        ];
+        for (mem, budget, permits) in table {
+            let host = HostProfile::new(16, Some(mem), Some(mem), None, None, None);
+            let resolved = unset
+                .resolve_performance(host)
+                .expect("performance defaults resolve");
+            assert_eq!(resolved.memory_budget_bytes, budget, "host {mem}");
+            assert_eq!(resolved.store_get_concurrency, permits, "host {mem}");
+            assert_eq!(
+                resolved.sources.store_get_concurrency, PERF_SOURCE_BUDGET_SHARE,
+                "host {mem}"
+            );
+            // The SQL partition count does not follow the permits.
+            assert_eq!(resolved.sql_partition_count, 32, "host {mem}");
+            assert_eq!(resolved.promql_fetch_fanout, 32, "host {mem}");
+        }
+
+        // The test reference host (30 GiB MemTotal, 28 GiB budget) reaches
+        // the measured 256. 256 needs 26,843,545,600 bytes; one byte less
+        // derives 255. The real 32 GB box's recorded budget is pinned through
+        // the `MemAvailable` path in
+        // `derived_get_permits_reach_256_on_the_recorded_reference_budget`.
+        let reference = unset
+            .resolve_performance(reference_host())
+            .expect("performance defaults resolve");
+        assert_eq!(reference.memory_budget_bytes, 28 * GIB);
+        assert_eq!(reference.store_get_concurrency, 256);
+        // A remote endpoint derives the same count: the core rule's 32 no
+        // longer applies to any store kind with a known budget.
+        let remote = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+        ])
+        .resolve_performance(reference_host())
+        .expect("performance defaults resolve");
+        assert_eq!(remote.store_get_concurrency, 256);
+        assert_eq!(
+            remote.sources.store_get_concurrency,
+            PERF_SOURCE_BUDGET_SHARE
+        );
+        for (budget, permits) in [
+            ("27775004672", 256),
+            ("26843545600", 256),
+            ("26843545599", 255),
+        ] {
+            let resolved = cli(&["--memory-budget-bytes", budget])
+                .resolve_performance(reference_host())
+                .expect("performance defaults resolve");
+            assert_eq!(resolved.store_get_concurrency, permits, "budget {budget}");
+            assert_eq!(
+                resolved.sources.store_get_concurrency, PERF_SOURCE_BUDGET_SHARE,
+                "budget {budget}"
+            );
+        }
+
+        // A budget too small for the floor derives the floor.
+        let tiny = cli(&["--memory-budget-bytes", "268435456"]);
+        let resolved = tiny
+            .resolve_performance(reference_host())
+            .expect("performance defaults resolve");
+        assert_eq!(
+            resolved.store_get_concurrency,
+            MIN_DERIVED_FETCH_CONCURRENCY
+        );
+
+        // An explicit flag wins over the derivation on every host, and so
+        // does the legacy combined knob.
+        let explicit = cli(&["--store-get-concurrency", "7"]);
+        let legacy = cli(&["--fetch-concurrency", "9"]);
+        for (mem, _, _) in table {
+            let host = HostProfile::new(16, Some(mem), Some(mem), None, None, None);
+            let resolved = explicit
+                .resolve_performance(host)
+                .expect("performance defaults resolve");
+            assert_eq!(resolved.store_get_concurrency, 7, "host {mem}");
+            assert_eq!(
+                resolved.sources.store_get_concurrency, PERF_SOURCE_FLAG,
+                "host {mem}"
+            );
+            let resolved = legacy
+                .resolve_performance(host)
+                .expect("performance defaults resolve");
+            assert_eq!(resolved.store_get_concurrency, 9, "host {mem}");
+            assert_eq!(
+                resolved.sources.store_get_concurrency, PERF_SOURCE_LEGACY_FLAG,
+                "host {mem}"
+            );
+        }
+    }
+
+    /// ADR-2677 decision 7 on the real 32 GB ClickBench reference box, not
+    /// the 30 GiB fixture: `MemTotal` 32,903,794,688 and `MemAvailable`
+    /// 29,922,488,320 with no cgroup limit resolve the budget recorded there,
+    /// 27,775,004,672 bytes at source `derived-available`, and 64% of it
+    /// derives 264 permits, clamped to 256, on a remote and a loopback store
+    /// alike. The remainders the fetch reservations share with SQL are
+    /// pinned beside it: 70% and 55% of the budget.
+    ///
+    /// Prove-the-test: set `STORE_GET_MEMORY_PERCENT` to 60 and the count
+    /// reads 248. At 62 this budget still derives 256 (62% needs at least
+    /// 27,709,466,426 bytes), so 62 fails only below that figure. Make the
+    /// budget derivation ignore `MemAvailable` (the pre-#2367 `MemTotal`
+    /// branch) and the budget reads 30,756,311,040.
+    #[test]
+    fn derived_get_permits_reach_256_on_the_recorded_reference_budget() {
+        let host = adr_reference_host_no_cgroup();
+        for (args, remainder) in [
+            (
+                &[
+                    "--store",
+                    "s3",
+                    "--s3-endpoint",
+                    "https://s3.us-east-1.amazonaws.com",
+                ][..],
+                19_442_503_271_u64,
+            ),
+            (
+                &["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"][..],
+                15_276_252_571,
+            ),
+        ] {
+            let resolved = cli(args)
+                .resolve_performance(host)
+                .expect("performance defaults resolve");
+            assert_eq!(
+                resolved.memory_budget_bytes, AVAILABLE_ADR_EXPECTED_BUDGET_BYTES,
+                "{args:?}"
+            );
+            assert_eq!(
+                resolved.sources.memory_budget_bytes, PERF_SOURCE_DERIVED_AVAILABLE,
+                "{args:?}"
+            );
+            assert_eq!(resolved.store_get_concurrency, 256, "{args:?}");
+            assert_eq!(
+                resolved.sources.store_get_concurrency, PERF_SOURCE_BUDGET_SHARE,
+                "{args:?}"
+            );
+            assert_eq!(resolved.memory_remainder_bytes, remainder, "{args:?}");
+        }
+    }
+
+    /// ADR-2677 decision 7 observability: the startup "performance default
+    /// resolved" line for `store_get_concurrency` names the derivation source
+    /// and the inputs it was derived from, on the surface `main` drives
+    /// (`Cli::resolve_performance` then `ResolvedPerformanceDefaults::emit`).
+    /// An explicit flag's line carries the `flag` source and none of the
+    /// derivation fields.
+    #[test]
+    fn store_get_concurrency_startup_line_names_the_budget_share_derivation() {
+        let host = reference_host();
+        let resolved = cli(&[])
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        resolved.emit(host);
+        let lines = captured.lock();
+        let store_get: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("setting=\"store_get_concurrency\""))
+            .collect();
+        assert_eq!(store_get.len(), 1, "lines: {lines:?}");
+        let line = store_get[0];
+        assert!(line.contains("performance default resolved"), "{line}");
+        assert!(line.contains(" value=256"), "{line}");
+        assert!(line.contains("source=\"budget-share\""), "{line}");
+        assert!(line.contains(" memory_budget_bytes=30064771072"), "{line}");
+        assert!(line.contains(" share_percent=64"), "{line}");
+        assert!(line.contains(" per_permit_bytes=67108864"), "{line}");
+        assert!(line.contains(" ceiling=256"), "{line}");
+        drop(lines);
+        drop(_guard);
+
+        let resolved = cli(&["--store-get-concurrency", "7"])
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        resolved.emit(host);
+        let lines = captured.lock();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("setting=\"store_get_concurrency\""))
+            .expect("store_get_concurrency line");
+        assert!(line.contains(" value=7"), "{line}");
+        assert!(line.contains("source=\"flag\""), "{line}");
+        assert!(!line.contains("share_percent="), "{line}");
     }
 
     /// ADR-1195 legacy precedence: `--fetch-concurrency` alone sets all three
@@ -10019,11 +10368,12 @@ mod tests {
     /// `--sql-partition-count`, no `--promql-fetch-fanout`, and no legacy
     /// `--fetch-concurrency`, all three ADR-1195 knobs must resolve to the
     /// same values AND the same sources as under `cost-based` (the shipped
-    /// default): the host-derived value, source `"derived"`.
+    /// remote default): the budget-derived GET permits (ADR-2677 decision 7)
+    /// and the core-derived SQL and PromQL knobs.
     ///
     /// Prove-the-test: reintroduce a policy-sourced override for
-    /// `store_get_concurrency` in `Cli::resolve_performance` and the first
-    /// assertion panics, reading `left: 256, right: 32`.
+    /// `sql_partition_count` in `Cli::resolve_performance` and the
+    /// `sql_partition_count` assertion panics, reading `left: 256, right: 32`.
     #[test]
     fn latency_first_resolves_all_three_knobs_exactly_like_cost_based() {
         let cost_based = Cli::try_parse_from(["ravel-server"]).expect("no flags parses");
@@ -10040,11 +10390,11 @@ mod tests {
         );
         assert_eq!(
             latency_first_resolved.store_get_concurrency,
-            REFERENCE_FETCH_CONCURRENCY
+            REFERENCE_STORE_GET_CONCURRENCY
         );
         assert_eq!(
             latency_first_resolved.sources.store_get_concurrency,
-            PERF_SOURCE_DERIVED
+            PERF_SOURCE_BUDGET_SHARE
         );
 
         assert_eq!(
@@ -10074,7 +10424,10 @@ mod tests {
         );
 
         let engine = engine_from(&latency_first);
-        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(
+            engine.store_get_concurrency(),
+            REFERENCE_STORE_GET_CONCURRENCY
+        );
         assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
         assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
     }
@@ -10297,10 +10650,11 @@ mod tests {
                 fetch_concurrency: REFERENCE_FETCH_CONCURRENCY,
                 max_segments: DERIVED_MAX_SEGMENTS,
                 // ADR-1195: `apply_to_engine` always sets the three unbundled
-                // knobs from `QueryBudgets`, which resolved them at the same
-                // derived value as `fetch_concurrency` (none of the four flags
-                // was set).
-                store_get_concurrency: Some(REFERENCE_FETCH_CONCURRENCY),
+                // knobs from `QueryBudgets`, which resolved the SQL and
+                // PromQL knobs at the same derived value as
+                // `fetch_concurrency` (none of the four flags was set) and the
+                // GET permits from the memory budget (ADR-2677 decision 7).
+                store_get_concurrency: Some(REFERENCE_STORE_GET_CONCURRENCY),
                 sql_partition_count: Some(REFERENCE_FETCH_CONCURRENCY),
                 promql_fetch_fanout: Some(REFERENCE_FETCH_CONCURRENCY),
                 ..EngineConfig::default()
@@ -10953,6 +11307,9 @@ mod tests {
             PERF_SOURCE_BUDGET_CARVE_LOOPBACK
         );
         assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
+        // The remainder fetch and SQL reservations share: 55% of the budget,
+        // less than the 16 GiB that 256 permits of 64 MiB would size to.
+        assert_eq!(resolved.memory_remainder_bytes, 16_535_624_091);
         assert_eq!(
             resolved.sources.catalog_cache_max_bytes,
             PERF_SOURCE_BUDGET_CARVE
@@ -12121,6 +12478,9 @@ mod tests {
     /// literal integers rather than recomputed from the percentages, so a
     /// change to the rule has to restate the number it produces.
     const REFERENCE_FETCH_CONCURRENCY: usize = 32;
+    /// `store_get_concurrency` on the reference host (ADR-2677 decision 7):
+    /// 64% of the 28 GiB budget is 286 permits of 64 MiB, clamped to 256.
+    const REFERENCE_STORE_GET_CONCURRENCY: usize = 256;
     const REFERENCE_CACHE_MAX_BYTES: u64 = 7_516_192_768;
     const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 16_106_127_360;
     const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
@@ -12271,21 +12631,29 @@ mod tests {
     /// Prove-the-test: stamp `Some(self.store_get_concurrency)` instead of
     /// `Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)` in
     /// `logs_fetch_stamp`, and the FIRST assertion is the one that fails,
-    /// reading `left: Some(32), right: Some(256)`: the reference host's
-    /// resolved concurrency in place of the measured constant. The assertions
-    /// after it are what keep that a real distinction rather than a tautology,
-    /// by pinning the two values apart on this host.
+    /// reading `left: Some(32), right: Some(256)`: this run's resolved
+    /// concurrency in place of the measured constant. The assertions after it
+    /// are what keep that a real distinction rather than a tautology, by
+    /// pinning the two values apart. The GET permits are set explicitly
+    /// because on the reference host they derive to the measured 256
+    /// (ADR-2677 decision 7).
     #[test]
     fn latency_first_stamps_the_measured_concurrency_and_cost_based_stamps_none() {
-        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
-            .expect("flag parses");
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-fetch-policy",
+            "latency-first",
+            "--store-get-concurrency",
+            "32",
+        ])
+        .expect("flags parse");
         let stamp = stamp_from(&cli);
         assert_eq!(
             stamp.latency_first_measured_concurrency,
             Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)
         );
         assert_eq!(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY, 256);
-        assert_eq!(stamp.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.store_get_concurrency, 32);
         assert_ne!(
             stamp.latency_first_measured_concurrency,
             Some(stamp.store_get_concurrency),
@@ -12300,9 +12668,10 @@ mod tests {
     /// ADR-1196: the startup line must not tell an operator who has already
     /// raised the concurrency to raise it. `emit` words that line from
     /// `latency_first_precondition_met`, so both of its branches are pinned
-    /// here: unmet at the reference host's derived concurrency, met once
-    /// `--fetch-concurrency` reaches the measured one, and absent under every
-    /// other policy.
+    /// here: unmet at the reference host's derived concurrency (the GET
+    /// permits derive to 256 from the budget, the partitions stay at the core
+    /// derivation), met once `--fetch-concurrency` reaches the measured one,
+    /// and absent under every other policy.
     ///
     /// Prove-the-test: weaken the comparison in
     /// `latency_first_precondition_met` from `>=` to `>` and the second
@@ -12314,7 +12683,8 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
             .expect("flag parses");
         let stamp = stamp_from(&cli);
-        assert_eq!(stamp.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.store_get_concurrency, REFERENCE_STORE_GET_CONCURRENCY);
+        assert_eq!(stamp.sql_partition_count, REFERENCE_FETCH_CONCURRENCY);
         assert_eq!(stamp.latency_first_precondition_met(), Some(false));
 
         let cli = Cli::try_parse_from([
@@ -12533,60 +12903,45 @@ mod tests {
         );
     }
 
-    /// ADR-2023 decision 1: `--logs-fetch-policy` unset resolves `cost-based`
-    /// on EVERY deployment, including a `--store s3` deployment against a
-    /// loopback `--s3-endpoint`; ADR-2014's loopback `byte-minimal`
-    /// derivation is withdrawn. An explicit flag always wins, including on a
-    /// loopback endpoint. `resolve_logs_fetch_policy` is the one function
-    /// under test; `query_budgets` and `logs_fetch_stamp` only carry its
-    /// answer forward, so a wrong derivation here is a wrong derivation
+    /// ADR-2677 decision 7, amending ADR-2023 decision 1 for loopback only:
+    /// `--logs-fetch-policy` unset resolves `latency-first` (source
+    /// `default-loopback`) on a `--store s3` deployment against a loopback
+    /// `--s3-endpoint`, and `cost-based` (source `default`) on every other
+    /// deployment, a remote endpoint included. An explicit flag always wins,
+    /// on a loopback endpoint too. `resolve_logs_fetch_policy` is the one
+    /// function under test; `query_budgets` and `logs_fetch_stamp` only carry
+    /// its answer forward, so a wrong derivation here is a wrong derivation
     /// everywhere it is consumed.
-    ///
-    /// Prove-the-test (a): add a `None if self.store_is_loopback() =>
-    /// (LogsFetchPolicyArg::ByteMinimal, "derived-loopback-endpoint")` arm
-    /// ahead of the plain `None` arm in `resolve_logs_fetch_policy`,
-    /// reintroducing ADR-2014's withdrawn derivation. Measured: this fails
-    /// `resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint`
-    /// at its case-1 assertion (the `left: (ByteMinimal,
-    /// "derived-loopback-endpoint")` / `right: (CostBased, "default")`
-    /// mismatch on the plain loopback-IPv4 case, before the hostname,
-    /// no-endpoint or explicit-flag cases are even reached).
-    ///
-    /// Prove-the-test (b): change the `match self.logs_fetch_policy { Some(policy)
-    /// => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), None => ... }` to `match
-    /// self.logs_fetch_policy { Some(policy) if !self.store_is_loopback() =>
-    /// (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), _ => ... }`, so an explicit
-    /// flag on a loopback store falls through to the default arm instead of
-    /// winning. Measured: this fails the same test at case 5 (explicit
-    /// `cost-based` on a loopback endpoint), `left: (CostBased, "default")` /
-    /// `right: (CostBased, "flag")`; case 6 (explicit `byte-minimal` on the
-    /// same endpoint) would fail identically but the test never reaches it.
     #[test]
-    fn resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint() {
-        // 1. loopback + no flag -> cost-based, default. An IPv4 literal and
-        // the `localhost` name must both resolve it: ADR-2023 withdraws the
-        // loopback derivation entirely, so neither gets special treatment.
+    fn loopback_endpoint_defaults_to_latency_first_and_remote_stays_cost_based() {
+        // 1. loopback + no flag -> latency-first, default-loopback. An IPv4
+        // literal and the `localhost` name both count as loopback.
         let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         assert_eq!(
             loopback.resolve_logs_fetch_policy(),
             (
-                LogsFetchPolicyArg::CostBased,
-                LOGS_FETCH_POLICY_SOURCE_DEFAULT
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
             )
         );
         let loopback_stamp = stamp_from(&loopback);
-        assert_eq!(loopback_stamp.policy, "cost-based");
+        assert_eq!(loopback_stamp.policy, "latency-first");
         assert_eq!(
             loopback_stamp.policy_source,
-            LOGS_FETCH_POLICY_SOURCE_DEFAULT
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+        );
+        assert_eq!(
+            engine_from(&loopback).logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::LatencyFirst,
+            "the running engine must carry the loopback default, not only the stamp"
         );
 
         let loopback_hostname = cli(&["--store", "s3", "--s3-endpoint", "http://localhost:9000"]);
         assert_eq!(
             loopback_hostname.resolve_logs_fetch_policy(),
             (
-                LogsFetchPolicyArg::CostBased,
-                LOGS_FETCH_POLICY_SOURCE_DEFAULT
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
             )
         );
 
@@ -12603,6 +12958,12 @@ mod tests {
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT
             )
+        );
+        let remote_stamp = stamp_from(&remote);
+        assert_eq!(remote_stamp.policy, "cost-based");
+        assert_eq!(
+            engine_from(&remote).logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::CostBased
         );
 
         // 3. no endpoint at all -> cost-based, default.
@@ -12635,9 +12996,7 @@ mod tests {
         );
 
         // 5. loopback + explicit cost-based -> cost-based, flag: the
-        // explicit flag wins even though it names the same policy the
-        // no-flag default now resolves anyway, so the fixed point is the
-        // case worth pinning.
+        // explicit flag wins over the loopback default.
         let explicit_cost_based_on_loopback = cli(&[
             "--store",
             "s3",
@@ -12669,7 +13028,8 @@ mod tests {
             )
         );
 
-        // 7. loopback + explicit latency-first -> latency-first, flag.
+        // 7. loopback + explicit latency-first -> latency-first, flag: the
+        // same policy the default picks, but the source says who chose it.
         let explicit_latency_first = cli(&[
             "--store",
             "s3",
@@ -12686,21 +13046,42 @@ mod tests {
             )
         );
 
-        // Concurrency is untouched by the resolution: the loopback case and
-        // the no-endpoint case must resolve the identical
-        // store_get_concurrency/sql_partition_count on the same reference
-        // host.
-        let no_endpoint_stamp = stamp_from(&no_endpoint);
+        // 8. remote + explicit latency-first -> latency-first, flag: the
+        // policy stays reachable off loopback as an explicit opt-in.
+        let explicit_latency_first_remote = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+            "--logs-fetch-policy",
+            "latency-first",
+        ]);
+        assert_eq!(
+            explicit_latency_first_remote.resolve_logs_fetch_policy(),
+            (
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_FLAG
+            )
+        );
+
+        // The policy does not move the permits: the loopback and remote
+        // cases resolve the identical store_get_concurrency and
+        // sql_partition_count on the same reference host. The SQL partition
+        // count does not follow the budget-derived permits.
         assert_eq!(
             loopback_stamp.store_get_concurrency,
-            no_endpoint_stamp.store_get_concurrency
+            remote_stamp.store_get_concurrency
         );
         assert_eq!(
             loopback_stamp.sql_partition_count,
-            no_endpoint_stamp.sql_partition_count
+            remote_stamp.sql_partition_count
         );
         assert_eq!(
             loopback_stamp.store_get_concurrency,
+            REFERENCE_STORE_GET_CONCURRENCY
+        );
+        assert_eq!(
+            loopback_stamp.sql_partition_count,
             REFERENCE_FETCH_CONCURRENCY
         );
     }
@@ -12708,10 +13089,10 @@ mod tests {
     /// The resolved policy's source must be operator-visible on the same
     /// "logs fetch policy resolved" startup line the policy itself and its
     /// request-cost source already appear on, not a second line an operator
-    /// has to correlate by hand. Pinned on a loopback endpoint (ADR-2023
-    /// decision 1: it resolves `cost-based`/`default` there too, exactly as
-    /// everywhere else) so a regression of the withdrawn ADR-2014 derivation
-    /// would also be caught here.
+    /// has to correlate by hand. Pinned on a loopback endpoint, where the
+    /// unset policy resolves `latency-first`/`default-loopback` (ADR-2677
+    /// decision 7), so the line tells an operator the loopback default chose
+    /// the policy rather than a flag.
     ///
     /// Prove-the-test: drop the `policy_source = self.policy_source` field
     /// from the `tracing::info!` call in `LogsFetchStamp::emit`, and
@@ -12720,7 +13101,10 @@ mod tests {
     fn logs_fetch_stamp_carries_the_policy_source_on_the_startup_line() {
         let cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         let stamp = stamp_from(&cli);
-        assert_eq!(stamp.policy_source, LOGS_FETCH_POLICY_SOURCE_DEFAULT);
+        assert_eq!(
+            stamp.policy_source,
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+        );
 
         let (captured, _guard) = capture_events(tracing::Level::INFO);
         stamp.emit();
@@ -12734,12 +13118,124 @@ mod tests {
             "policy_source must appear exactly once on the resolved-policy line, lines: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("policy=\"cost-based\"")
-                    && l.contains("policy_source=\"default\"")),
+            lines.iter().any(|l| l.contains("policy=\"latency-first\"")
+                && l.contains("policy_source=\"default-loopback\"")),
             "the resolved policy and its source must appear together on the same line, lines: {lines:?}"
         );
+    }
+
+    /// The default loopback case on the reference host resolves
+    /// `latency-first` with 256 GET permits and 32 partitions, so its startup
+    /// line takes the unmet branch. That line must be true there: on a loopback
+    /// store `latency-first` is itself the default, so the slower baseline is
+    /// named as `cost-based`, and the derivation clause names the core
+    /// fallback for an unknown budget.
+    ///
+    /// Prove-the-test: restore "slower than the default policy" in
+    /// `LogsFetchStamp::emit` and the `slower than cost-based` assertion fails;
+    /// flip `== Some(false)` to `== Some(true)` there and no line carries
+    /// `precondition_met=false`.
+    #[test]
+    fn default_loopback_unmet_latency_first_line_names_cost_based_as_slower() {
+        let cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.store_get_concurrency, REFERENCE_STORE_GET_CONCURRENCY);
+        assert_eq!(stamp.sql_partition_count, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        stamp.emit();
+        let lines = captured.lock();
+        let unmet: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("precondition_met=false"))
+            .collect();
+        assert_eq!(unmet.len(), 1, "lines: {lines:?}");
+        let line = unmet[0];
+        assert!(line.contains("policy=\"latency-first\""), "{line}");
+        assert!(line.contains("store_get_concurrency=256"), "{line}");
+        assert!(line.contains("sql_partition_count=32"), "{line}");
+        assert!(
+            line.contains("has measured slower than cost-based"),
+            "{line}"
+        );
+        assert!(!line.contains("default policy"), "{line}");
+        assert!(
+            line.contains("sized from the memory budget (from cores when no budget is known)"),
+            "{line}"
+        );
+    }
+
+    /// The met `latency-first` startup line names the budget's refusals as
+    /// the byte bound only where a budget is known: a fallback budget is
+    /// unlimited and refuses nothing, and the line says so.
+    ///
+    /// Prove-the-test: drop the qualifying clause from the met line in
+    /// `LogsFetchStamp::emit` and the second assertion fails; flip the
+    /// branch condition to `== Some(true)` and no line carries
+    /// `precondition_met=true`.
+    #[test]
+    fn met_latency_first_line_qualifies_the_budget_byte_bound() {
+        let cli = cli(&[
+            "--logs-fetch-policy",
+            "latency-first",
+            "--fetch-concurrency",
+            "256",
+        ]);
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(true));
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        stamp.emit();
+        let lines = captured.lock();
+        let met: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("precondition_met=true"))
+            .collect();
+        assert_eq!(met.len(), 1, "lines: {lines:?}");
+        assert!(
+            met[0].contains(
+                "bounded by the process memory budget's refusals when the budget is \
+                 known (a fallback budget is unlimited and refuses nothing)"
+            ),
+            "{}",
+            met[0]
+        );
+    }
+
+    /// ADR-2677 decision 7 applies only where the memory budget does: a
+    /// gateway's budget is not applicable (pinned to `u64::MAX`, which would
+    /// derive the 256 ceiling), so it keeps the core rule,
+    /// `max(8, 2 x cores)`, at source `derived`. The same host in the default
+    /// mode derives 256 from the budget.
+    ///
+    /// Prove-the-test: remove `&& !flags.memory_budget_not_applicable` from the
+    /// `store_get_concurrency` match in `resolve_performance_defaults` and the
+    /// gateway reads 256 at `budget-share`; replace the whole guard with
+    /// `host.mem_total_bytes.is_some()` (deriving whenever the host's memory
+    /// is readable) and it reads 256 the same way.
+    #[test]
+    fn a_gateway_keeps_the_core_rule_for_store_get_concurrency() {
+        let host = HostProfile::new(
+            16,
+            Some(32 * 1024 * 1024 * 1024),
+            Some(32 * 1024 * 1024 * 1024),
+            None,
+            None,
+            None,
+        );
+        let gateway = cli(&["--mode", "gateway"])
+            .resolve_performance(host)
+            .expect("a gateway resolves");
+        assert!(gateway.memory_budget_not_applicable);
+        assert_eq!(gateway.store_get_concurrency, 32);
+        assert_eq!(gateway.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
+
+        let all = cli(&[])
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+        assert_eq!(all.store_get_concurrency, 256);
+        assert_eq!(all.sources.store_get_concurrency, PERF_SOURCE_BUDGET_SHARE);
     }
 
     /// ADR-0996 decision 2: a zero fetch bound is refused AT SERVER CONFIG
