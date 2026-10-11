@@ -600,6 +600,12 @@ harness = false
 name = "ingest_write_gate_overhead"
 harness = false
 
+# ADR-1702 CPU gate job round trip: inline vs gated vs bare spawn_blocking
+# (issues #2795, #2818).
+[[bench]]
+name = "cpu_gate_round_trip"
+harness = false
+
 [[bin]]
 name = "page_codec_bakeoff"
 path = "src/bin/page_codec_bakeoff.rs"
