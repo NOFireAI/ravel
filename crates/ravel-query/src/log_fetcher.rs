@@ -382,6 +382,16 @@ impl LogSegmentScan {
         self.scan.as_ref().and_then(BlockScan::next_block_index)
     }
 
+    /// The whole-object block index of every block this scan's pruning kept,
+    /// ascending, including blocks already drained or skipped; see
+    /// [`BlockScan::survivor_block_indices`]. A row-ref addresses a block by
+    /// its position in this list. Empty once the cursor is lost.
+    pub fn survivor_block_indices(&self) -> Vec<usize> {
+        self.scan
+            .as_ref()
+            .map_or_else(Vec::new, BlockScan::survivor_block_indices)
+    }
+
     /// The skip index's stored `(min_ts, max_ts)` for the block the next
     /// decode call would decode; see [`BlockScan::next_block_ts_bounds`].
     /// `None` once the scan is exhausted or its cursor is lost.
@@ -1419,6 +1429,18 @@ impl LogSegmentFetcher {
     pub fn plan_whole_object_bound(&self) -> u64 {
         self.block_range_threshold
             .max(self.block_range.effective_projection_break_even())
+    }
+
+    /// Whether a scan should plan `seg_ref` before opening it (ADR-2677
+    /// decision 2): true only above [`Self::plan_whole_object_bound`]. At or
+    /// under the bound the scan reads the object whole whatever a plan says,
+    /// so the SQL scan skips [`plan_segment`](Self::plan_segment) for it and
+    /// opens it once through
+    /// [`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
+    /// pruning blocks from the directories in that one read.
+    #[must_use]
+    pub fn plans_segment(&self, seg_ref: &SegmentRef) -> bool {
+        seg_ref.object_size > self.plan_whole_object_bound()
     }
 
     /// Per-object relevance from the catalog summary alone, with no object
@@ -13942,5 +13964,67 @@ mod owned_block_plan_tests {
             assert_eq!(stats.block_bytes_fetched, end - start);
             assert_eq!(placed_blocks(&fx, &bytes), *share);
         }
+    }
+}
+
+#[cfg(test)]
+mod plans_segment_tests {
+    //! ADR-2677 decision 2: the scan plans a segment only above
+    //! `plan_whole_object_bound`, which is the projection break-even when that
+    //! is the larger of the two, not the routing threshold.
+
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+    use uuid::Uuid;
+
+    const THRESHOLD: u64 = 1_000;
+    const BREAK_EVEN: u64 = 5_000;
+
+    fn seg(object_size: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: "t/route.rlog".to_string(),
+            object_size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 1,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    fn fetcher(break_even: Option<u64>) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(Arc::new(MemoryStore::new()))
+            .with_block_range_threshold(THRESHOLD)
+            .with_projection_break_even_bytes(break_even)
+    }
+
+    #[test]
+    fn routes_on_the_projection_break_even_when_it_is_the_bound() {
+        let f = fetcher(Some(BREAK_EVEN));
+        assert_eq!(f.plan_whole_object_bound(), BREAK_EVEN);
+        assert!(!f.plans_segment(&seg(BREAK_EVEN - 1)), "just under the bound");
+        assert!(!f.plans_segment(&seg(BREAK_EVEN)), "at the bound");
+        assert!(f.plans_segment(&seg(BREAK_EVEN + 1)), "just over the bound");
+        // Above the routing threshold but under the break-even: a route on
+        // object size against the threshold alone would plan it.
+        assert!(!f.plans_segment(&seg(THRESHOLD + 1)));
+    }
+
+    #[test]
+    fn routes_on_the_threshold_with_no_break_even() {
+        let f = fetcher(None);
+        assert_eq!(f.plan_whole_object_bound(), THRESHOLD);
+        assert!(!f.plans_segment(&seg(THRESHOLD - 1)), "just under the bound");
+        assert!(!f.plans_segment(&seg(THRESHOLD)), "at the bound");
+        assert!(f.plans_segment(&seg(THRESHOLD + 1)), "just over the bound");
     }
 }

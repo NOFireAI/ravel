@@ -3160,6 +3160,7 @@ impl ExecutionPlan for LogsScanExec {
             pending_range: None,
             current_indices: Vec::new(),
             current_survivors: None,
+            current_unplanned: false,
             current_footer: None,
             current_whole_object: None,
             current_dirs: None,
@@ -3314,6 +3315,12 @@ struct SegPlan {
     /// of this segment survives: no partition opens such a segment, so it
     /// keeps no directories resident and reserves nothing.
     planned: Option<PlannedBlocks>,
+    /// The segment is at or under the fetcher's plan bound
+    /// ([`LogSegmentFetcher::plans_segment`], ADR-2677 decision 2), so it was
+    /// not planned: no GET, `planned`, `footer` and `whole_object` are `None`
+    /// and `stats` is empty. [`owned_work`] deals it whole to one partition,
+    /// which reads it once and prunes its blocks in that read.
+    unplanned: bool,
     /// The whole-segment prune stats ([`BlockMetrics::record_segment_totals`]
     /// consumes `blocks_total` and the postings drop). `blocks_scanned`/`pages`
     /// are zero here -- planning decodes nothing.
@@ -3428,6 +3435,10 @@ async fn compute_plan_counts(
     // future that borrows its argument cannot satisfy the higher-ranked bound
     // this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
+    let mut segs: Vec<Option<SegPlan>> = std::iter::repeat_with(|| None)
+        .take(segments.len())
+        .collect();
+    let mut unplanned = 0usize;
     for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
         // is a second entry point into the fetch layer alongside the three
@@ -3435,6 +3446,22 @@ async fn compute_plan_counts(
         // before the open phase can reject the version -- so without this the
         // ordering guarantee holds on the scan path and quietly fails here.
         refuse_unreadable_version(seg)?;
+        // ADR-2677 decision 2: an object the scan reads whole anyway is not
+        // planned. Its one read happens at the scan, which prunes from it.
+        if !ctx.fetcher.plans_segment(seg) {
+            if LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns)
+            {
+                unplanned += 1;
+                segs[idx] = Some(SegPlan {
+                    planned: None,
+                    unplanned: true,
+                    stats: ScanStats::default(),
+                    footer: None,
+                    whole_object: None,
+                });
+            }
+            continue;
+        }
         let prune = ctx.fetcher.plan_segment(
             seg,
             ctx.tenant_hash,
@@ -3445,9 +3472,6 @@ async fn compute_plan_counts(
     }
     let budget = plan_concurrency.max(1);
     let mut stream = futures::stream::iter(prunes).buffer_unordered(budget);
-    let mut segs: Vec<Option<SegPlan>> = std::iter::repeat_with(|| None)
-        .take(segments.len())
-        .collect();
     let mut total_blocks = 0usize;
     let mut full_reads = 0usize;
     // Only the RETAINED carried bytes -- the first `budget` segments to
@@ -3501,6 +3525,7 @@ async fn compute_plan_counts(
             };
             segs[idx] = Some(SegPlan {
                 planned,
+                unplanned: false,
                 stats,
                 footer,
                 whole_object,
@@ -3518,8 +3543,11 @@ async fn compute_plan_counts(
         .plan()
         .observe_intermediate_bytes(carried_bytes);
     // Cap the stride by the real block count (ADR-0102): with fewer blocks
-    // than partitions the extra partitions get empty work.
-    let partitions = plan_concurrency.max(1).min(total_blocks.max(1));
+    // than partitions the extra partitions get empty work. An unplanned
+    // segment is dealt whole, so it counts as one unit of work.
+    let partitions = plan_concurrency
+        .max(1)
+        .min((total_blocks + unplanned).max(1));
     for planned in segs.iter().flatten().filter_map(|s| s.planned.as_ref()) {
         planned.carried.set_owners(segment_owners(
             planned.groups.len(),
@@ -3564,6 +3592,12 @@ struct OwnedSeg {
     /// reuses them instead of decoding them again. `None` on the whole-segment
     /// fast path (no plan phase ever runs there).
     dirs: Option<Arc<CarriedDirs>>,
+    /// A segment the plan left unplanned ([`SegPlan::unplanned`]): this
+    /// partition owns it whole and opens it with one whole-object read
+    /// ([`open_segment_whole`]). `indices` is empty and `survivors`,
+    /// `footer`, `whole_object` and `dirs` are `None`; the survivor list comes
+    /// from the open's own pruning.
+    unplanned: bool,
 }
 
 /// Groups `indices` (a segment's surviving whole-object block indices,
@@ -3629,10 +3663,27 @@ fn owned_work(
     let planned_segs = order
         .iter()
         .filter_map(|&seg_idx| counts.segs.get(seg_idx).map(|plan| (seg_idx, plan)));
+    let unplanned_seg = |seg_idx: usize| OwnedSeg {
+        seg: segments[seg_idx].clone(),
+        ordinal: seg_idx,
+        indices: Vec::new(),
+        survivors: None,
+        footer: None,
+        whole_object: None,
+        dirs: None,
+        unplanned: true,
+    };
     if stripe_blocks {
         let mut global_group = 0usize;
         for (seg_idx, plan) in planned_segs {
             let Some(plan) = plan else { continue };
+            if plan.unplanned {
+                if global_group % n == partition {
+                    work.push_back(unplanned_seg(seg_idx));
+                }
+                global_group += 1;
+                continue;
+            }
             let Some(planned) = &plan.planned else {
                 continue;
             };
@@ -3652,6 +3703,7 @@ fn owned_work(
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
                     dirs: planned.carried.take(),
+                    unplanned: false,
                 });
             }
         }
@@ -3659,6 +3711,13 @@ fn owned_work(
         let mut seg_ordinal = 0usize;
         for (seg_idx, plan) in planned_segs {
             let Some(plan) = plan else { continue };
+            if plan.unplanned {
+                if seg_ordinal % n == partition {
+                    work.push_back(unplanned_seg(seg_idx));
+                }
+                seg_ordinal += 1;
+                continue;
+            }
             let Some(planned) = &plan.planned else {
                 continue;
             };
@@ -3671,6 +3730,7 @@ fn owned_work(
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
                     dirs: planned.carried.take(),
+                    unplanned: false,
                 });
             }
             seg_ordinal += 1;
@@ -3718,6 +3778,7 @@ fn owned_whole_segments(
                 footer: None,
                 whole_object: None,
                 dirs: None,
+                unplanned: false,
             });
         }
         ordinal += 1;
@@ -4740,8 +4801,13 @@ struct LogScanStream {
     /// over the SAME list (ADR-0102). Set alongside `current_seg`.
     current_indices: Vec<usize>,
     /// The segment's whole surviving-block list, for resolving a row-ref's
-    /// block position ([`OwnedSeg::survivors`]).
+    /// block position ([`OwnedSeg::survivors`]). For an unplanned segment it
+    /// is set when the open resolves, from the open's own pruning.
     current_survivors: Option<Arc<Vec<usize>>>,
+    /// [`Self::current_seg`] was left unplanned ([`OwnedSeg::unplanned`]):
+    /// it is opened and reopened whole, and its prune totals are published
+    /// when its scan ends, as on the whole-segment fast path.
+    current_unplanned: bool,
     /// The plan-phase footer for [`Self::current_seg`] (#693 part 3, deliverable
     /// 2), kept so the `attrs_raw` fallback re-opens the subset with the same
     /// footer it first used. `None` on the whole-segment fast path.
@@ -4995,13 +5061,16 @@ impl LogScanStream {
 
     /// The `attrs_raw` fallback's row-path reopen of `seg`, the current
     /// segment: the same routing decision its first open took (#862) on the
-    /// fast path, and on the striped route the same block-index list, survivor
-    /// list, footer and directories, with the carried whole object `take()`n,
-    /// so it is consumed at most once by construction.
+    /// fast path, a whole-object read for an unplanned segment, and on the
+    /// striped route the same block-index list, survivor list, footer and
+    /// directories, with the carried whole object `take()`n, so it is consumed
+    /// at most once by construction.
     fn row_reopen(&mut self, seg: SegmentRef) -> OpenFuture {
         if self.fast_whole_segment {
             let by_chunk = self.ctx.open_by_column_chunk(&seg);
             open_segment_fast(Arc::clone(&self.ctx), seg, by_chunk)
+        } else if self.current_unplanned {
+            open_segment_whole(Arc::clone(&self.ctx), seg)
         } else {
             open_segment_subset(
                 Arc::clone(&self.ctx),
@@ -5174,7 +5243,7 @@ impl LogScanStream {
         {
             let stats = scan.stats();
             self.blocks.record_scan(&stats);
-            if self.fast_whole_segment {
+            if self.fast_whole_segment || self.current_unplanned {
                 self.blocks.record_segment_totals(&stats);
             }
         }
@@ -5244,8 +5313,9 @@ impl LogScanStream {
     /// A scan still open is dropped here instead of running to its
     /// end-of-segment record, so its counters are published first: the decode
     /// counts as they stand (`record_scan` accumulates), and on the
-    /// whole-segment fast path the segment's prune totals, which are final from
-    /// the open and so are the whole segment's, not a partial count.
+    /// whole-segment fast path or an unplanned segment the segment's prune
+    /// totals, which are final from the open and so are the whole segment's,
+    /// not a partial count.
     fn finish_at_fetch(&mut self) {
         match std::mem::replace(&mut self.state, LogScanState::Done) {
             LogScanState::Columnar(scan)
@@ -5253,7 +5323,7 @@ impl LogScanStream {
             | LogScanState::RowFallbackBlock { scan, .. } => {
                 let stats = scan.stats();
                 self.blocks.record_scan(&stats);
-                if self.fast_whole_segment {
+                if self.fast_whole_segment || self.current_unplanned {
                     self.blocks.record_segment_totals(&stats);
                 }
             }
@@ -5398,8 +5468,10 @@ impl LogScanStream {
                         // Partition 0 publishes every relevant segment's
                         // whole-segment prune totals, once, so striping a segment
                         // across partitions does not multiply them.
+                        // An unplanned segment has no plan totals; its one
+                        // owning partition records them at the end of its scan.
                         if this.partition == 0 {
-                            for plan in counts.segs.iter().flatten() {
+                            for plan in counts.segs.iter().flatten().filter(|p| !p.unplanned) {
                                 this.blocks.record_segment_totals(&plan.stats);
                             }
                             this.blocks.plan_full_reads.add(counts.full_reads);
@@ -5438,6 +5510,7 @@ impl LogScanStream {
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = Vec::new();
                         this.current_survivors = None;
+                        this.current_unplanned = false;
                         this.current_footer = None;
                         this.current_dirs = None;
                         this.current_whole_object = None;
@@ -5490,6 +5563,7 @@ impl LogScanStream {
                             footer,
                             whole_object,
                             dirs,
+                            unplanned,
                         }) => {
                             // ADR-2677 decision 6: a segment whose every row
                             // is above the TopK threshold is not opened for
@@ -5502,6 +5576,7 @@ impl LogScanStream {
                             }
                             this.current_seg = Some(seg.clone());
                             this.current_seg_ordinal = ordinal;
+                            this.current_unplanned = unplanned;
                             this.current_indices = indices.clone();
                             this.current_survivors = survivors.clone();
                             this.current_footer = footer.clone();
@@ -5542,6 +5617,14 @@ impl LogScanStream {
                                     seg,
                                     by_chunk,
                                 ))
+                            } else if unplanned {
+                                // ADR-2677 decision 2: one whole-object GET,
+                                // blocks pruned from the directory it carries.
+                                // This partition owns the whole segment, so it
+                                // is the one recorder for the object.
+                                this.current_by_chunk = false;
+                                this.ctx.record_data_object_touched();
+                                LogScanState::Opening(open_segment_whole(Arc::clone(&this.ctx), seg))
                             } else {
                                 // `take()`, not the moved-in value directly: this
                                 // IS the one consumption of the carried whole
@@ -5577,6 +5660,12 @@ impl LogScanStream {
                             this.blocks.open_elapsed.add_elapsed(started);
                         }
                         this.mark_segment("seg_open_ready_offset");
+                        // An unplanned segment's survivors are known only now,
+                        // pruned by the open from the directory it read; row
+                        // refs address blocks by ordinal in this list.
+                        if this.current_unplanned {
+                            this.current_survivors = Some(Arc::new(scan.survivor_block_indices()));
+                        }
                         this.state = if this.columnar_eligible {
                             LogScanState::Columnar(Box::new(scan))
                         } else {
@@ -9353,6 +9442,7 @@ mod owned_work_tests {
                         Arc::clone(&dirs),
                         budget.reserve(0).expect("reserve"),
                     )),
+                    unplanned: false,
                     stats: ScanStats::default(),
                     footer: None,
                     whole_object: None,
@@ -9794,6 +9884,7 @@ mod carried_directory_reservation_tests {
                     dirs,
                     budget.reserve(0).expect("reserve"),
                 )),
+                unplanned: false,
                 stats: ScanStats::default(),
                 footer: None,
                 whole_object: None,
