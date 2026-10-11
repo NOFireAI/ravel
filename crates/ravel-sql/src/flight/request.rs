@@ -311,6 +311,76 @@ mod tests {
         }
     }
 
+    /// ADR-2633 decision 3 on Flight SQL: a fetch-memory refusal and a
+    /// catalog decode refusal, of either budget class, take the gRPC code the
+    /// SQL memory pool's own refusal takes (`FailedPrecondition`, the 422
+    /// class), with the budget's own message. Before this they were
+    /// `Unavailable` with the storage outage message. FLIP: drop the
+    /// memory-refusal arm from `SqlError::class` (error.rs) and the code
+    /// assertion fails with `Unavailable` against `FailedPrecondition`.
+    #[test]
+    fn memory_budget_refusals_take_the_pools_grpc_code() {
+        use ravel_catalog::CatalogError;
+        use ravel_memory::{ExhaustionCause, MemoryExhausted};
+        use ravel_query::FetchError;
+
+        let tenant = TenantHash([0u8; 16]);
+        let pool_refusal = status_from_sql(
+            &SqlError::ResourcesExhausted("needs 40 bytes, limit 8".to_string()),
+            tenant,
+        );
+        assert_eq!(pool_refusal.code(), tonic::Code::FailedPrecondition);
+
+        for (cause, text) in [
+            (
+                ExhaustionCause::Accounted,
+                "memory exhausted: requested 4096 bytes, 1024 of 2048 byte limit already reserved",
+            ),
+            (
+                ExhaustionCause::HostMemory {
+                    available: 100,
+                    floor: 200,
+                },
+                "memory exhausted: host available memory 100 bytes is below the 200 byte floor \
+                 (requested 4096)",
+            ),
+        ] {
+            let fetch = SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                requested: 4096,
+                reserved: 1024,
+                limit: 2048,
+                cause,
+            });
+            let status = status_from_sql(&fetch, tenant);
+            assert_eq!(
+                status.code(),
+                pool_refusal.code(),
+                "a {cause:?} fetch refusal takes the pool refusal's code"
+            );
+            assert_eq!(
+                status.message(),
+                format!("segment fetch failed: fetch {text}")
+            );
+
+            let decode = SqlError::Catalog(CatalogError::MemoryExhausted(MemoryExhausted {
+                requested: 4096,
+                reserved: 1024,
+                limit: 2048,
+                cause,
+            }));
+            let status = status_from_sql(&decode, tenant);
+            assert_eq!(
+                status.code(),
+                pool_refusal.code(),
+                "a {cause:?} catalog decode refusal takes the pool refusal's code"
+            );
+            assert_eq!(
+                status.message(),
+                format!("snapshot resolution failed: catalog decode refused: {text}")
+            );
+        }
+    }
+
     /// The complexity rejection's client message carries the two counts and
     /// nothing else of the caller's input, so the client can see exactly how
     /// far over the bound it was.
