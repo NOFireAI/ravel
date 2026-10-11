@@ -707,8 +707,9 @@ const TS_BODY_MAPPING: &str = "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_col
 /// Load `(ts, body)` rows into `tenant` under [`TS_BODY_MAPPING`].
 ///
 /// `batch_rows` decides the object layout, which several tests below assert
-/// on: at `1`, the loader's default `--target-bytes 1` makes every row its
-/// own Strict flush and therefore its own RLOG object, so a segment-level
+/// on: at `1`, the fixed per-batch flush target of the `load::load` entry
+/// point makes every row its own Strict flush and therefore its own RLOG
+/// object, so a segment-level
 /// bound is observable in `segments_read`. At a batch size covering every
 /// row, all rows land in one object and one block, so only a post-decode
 /// filter can separate them.

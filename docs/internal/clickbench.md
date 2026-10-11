@@ -154,9 +154,9 @@ held resident. That is the difference that matters at 100M rows: raising
 `--batch-rows` for bigger objects costs memory linearly, because each Arrow
 batch is buffered whole (measured on issue #801: 6x the batch rows reached
 27.4GB RSS on a 30GB box in 2.5 minutes), while raising `--target-bytes` costs
-one partially-filled shard buffer per shard. For reference, the default load
-geometry at `--batch-rows 65536` over 100M rows wrote 8424 objects of 1.32MB
-each: 16,850 PUTs during the load and an 8424-GET floor on every query
+one partially-filled shard buffer per shard. For reference, the load geometry
+that was the default before issue #2753 (target `1`, depth `4`) at
+`--batch-rows 65536` over 100M rows wrote 8424 objects of 1.32MB each: 16,850 PUTs during the load and an 8424-GET floor on every query
 afterward. `IngestConfig`'s own default target is 8MiB.
 
 The trade is ack timing, not durability. A Strict write's ack is still sent
@@ -198,8 +198,11 @@ took 673.9ms, depth 4 / flushes 1 took 671.9ms, depth 1 / flushes 4 took
 673.3ms, and depth 4 / flushes 4 took 169.3ms. The first three are the same
 number.
 
-Both therefore default to `4`, and the recipe for tuning further is to raise
-them together (and to raise `--shards` toward core count, which is a
+`--max-inflight-flushes` therefore defaults to `4`. `--pipeline-depth` has no
+fixed default since issue #2753: unset, it is derived as the lowest of the rows
+bound, the memory bound and 1,024 (see `docs/guides/ingest.md`), which at the
+default `--batch-rows` is 25 on one shard. The recipe for tuning further is to
+raise them together (and to raise `--shards` toward core count, which is a
 provisioning decision made when the signal is provisioned, not a per-load
 knob).
 
