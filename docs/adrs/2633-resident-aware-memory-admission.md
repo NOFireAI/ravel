@@ -596,48 +596,65 @@ refusal counts fall with it.
 
 ## Implementation tasks
 
+Tasks 1 to 3 are written as the host-memory amendment below reshaped them:
+the gate decides on host available memory against a close floor, purges
+below a purge floor, and refuses with the `HostMemory` cause. Task 2 landed
+first under the original mark (#2764) and was reworked under #2806.
+
 **Task 1: the gate state and the refusal cause in `MemoryBudget`** (crates:
 ravel-memory)
 
-- The padded group of gate atomics (an open-or-closed flag, the last reading
-  and the mark) on `MemoryBudget`, written through one setter and read with
-  relaxed loads.
+- The padded group of gate atomics (an open-or-closed flag, the last
+  available reading and the floor) on `MemoryBudget`, written through one
+  setter and read with relaxed loads.
 - `try_reserve(n)` for n > 0 refuses while closed; `MemoryExhausted` gains a
-  cause (accounted, or resident with the reading and the mark), and its
-  `Display` names it. Accounted and gate refusal counts for the `reserve`
-  site as atomics on the budget, read by the server's metrics. The
-  `admission` count is not here: task 3 puts it in `ravel-query`.
-- Acceptance: a closed gate refuses `try_reserve(1)` with the resident cause
-  and admits `try_reserve(0)`; an open gate behaves exactly as today across
-  the existing tests; the counts move by one per refusal of each kind;
-  `reserve_unchecked` is unaffected; a microbenchmark of `try_reserve` with
-  the gate open stays within 5 % of the current figure. The crate stays
-  std-only.
+  cause (accounted, or `HostMemory` with the available reading and the
+  floor), and its `Display` names it. Accounted and gate refusal counts for
+  the `reserve` site as atomics on the budget, read by the server's
+  metrics. The `admission` count is not here: task 3 puts it in
+  `ravel-query`.
+- Acceptance: a closed gate refuses `try_reserve(1)` with the `HostMemory`
+  cause and admits `try_reserve(0)`; an open gate behaves exactly as today
+  across the existing tests; the counts move by one per refusal of each
+  kind; `reserve_unchecked` is unaffected; a microbenchmark of
+  `try_reserve` with the gate open stays within 5 % of the current figure.
+  The crate stays std-only.
 
 **Task 2: the sampler, the purge, flags, stamp and metrics** (crates:
 ravel-server)
 
 - The `ravel-memory-gate` thread and the forced purge in `mem_stats.rs`,
   through the safe `Access<isize>` decay write per arena, skipping `EFAULT`.
-- Flags `--memory-gate-high-water-percent`, `--memory-gate-interval-ms`,
-  `--memory-gate-wait-ms`, `--disable-memory-gate`; the startup check against
-  the cache caps and ingest ceiling; the `memory gate resolved` stamp; the
-  five metric families in section 4.
+- Flags `--memory-gate-min-available-bytes` (the close floor),
+  `--memory-gate-purge-available-bytes` (the purge floor),
+  `--memory-gate-purge-min-interval-ms`, `--memory-gate-interval-ms`,
+  `--memory-gate-wait-ms`, `--disable-memory-gate`; the startup check that
+  the purge floor is above the close floor and both floors are below host
+  memory; the `memory gate resolved` stamp with its `available_source`; the
+  metric families of section 4 as the host-memory amendment names them.
+- The available reading through an injected file reader: the smaller of
+  `MemAvailable` and, under a finite cgroup limit, the cgroup's headroom
+  (`limit - current + inactive_file`), decided again on every sample.
 - Acceptance: in the binary's own test module, where jemalloc is the global
   allocator (beside `binary_runs_under_jemalloc`), freeing a 256 MiB
   allocation and running the purge lowers `stats::resident` by at least
-  200 MiB and restores every arena's decay values to what they were; a
-  resident reading at or above the mark closes the gate and one below opens
-  it; the purge counter counts; the stamp reports each `source`; a
-  configuration whose caps reach the mark is refused with a message naming
-  both figures; the gate is off in gateway mode and on a fallback budget;
-  the resident gauge after a purging sample holds the post-purge re-read.
+  200 MiB and restores every arena's decay values to what they were; an
+  available reading below the close floor closes the gate and one at or
+  above it opens it; the purge counter counts, at most once per minimum
+  interval while below the purge floor; the stamp reports each `source`;
+  a purge floor not above the close floor, or either floor at or above
+  host memory, is refused with a message naming both figures; the gate is
+  off in gateway mode, on a fallback budget, and when `MemAvailable`
+  cannot be read; the resident gauge after a purging sample holds the
+  post-purge re-read; the reading takes whichever term is smaller, drops
+  the cgroup term when its limit reads `max` or its usage files do not
+  parse, and is unread only when neither term can be read.
 
 **Task 3: the check sites** (crates: ravel-sql, ravel-query, ravel-server)
 
 - `TenantDelegatingPool::grow` trips `CeilingBreach` while the gate is
-  closed; `try_grow` surfaces the resident cause in its
-  `ResourcesExhausted` message.
+  closed; `try_grow` surfaces the `HostMemory` cause, the host's available
+  reading and the floor, in its `ResourcesExhausted` message.
 - One async admission call in ravel-query that checks the gate, waits up to
   the wait and the deadline, then takes the concurrency permit; used by
   `QueryControls::admit` and the Flight SQL service. It owns the
@@ -650,8 +667,8 @@ ravel-server)
   refusal status after the wait, and runs once the gate opens; a
   spill-capable query that meets a closed gate mid-run spills and returns
   the exact result; an infallible `grow` while closed fails the query with
-  422, its message names the resident reading and the mark, and it releases
-  its reservations; each site's refusal counter moves by one.
+  422, its message names the available reading and the floor, and it
+  releases its reservations; each site's refusal counter moves by one.
 
 **Task 4: the fetch and catalog-decode refusals answer 422** (crates:
 ravel-sql, ravel-query, ravel-catalog, ravel-server)
@@ -709,7 +726,7 @@ the mark and the budget.
 
 ## Amendment (2026-10-11, #2806): the gate closes on host available memory
 
-<!-- amendment-applies: sections="1. A gate that reads `stats.resident` at a bounded rate|2. A forced purge at the high-water mark, and the default mark|4. Observability|Consequences|Pre-registered acceptance test" pointer="host-memory amendment" -->
+<!-- amendment-applies: sections="1. A gate that reads `stats.resident` at a bounded rate|2. A forced purge at the high-water mark, and the default mark|4. Observability|Consequences|Pre-registered acceptance test|Implementation tasks" pointer="host-memory amendment" -->
 <!-- amendment-supersedes: phrase="The percentage applies to the budget, not the host" pointer="host-memory amendment" -->
 <!-- amendment-supersedes: phrase="default 70, accepted 1 to 100" pointer="host-memory amendment" -->
 <!-- amendment-supersedes: phrase="ingest_buffer_in_mark_check=false" pointer="host-memory amendment" -->
@@ -732,16 +749,22 @@ the fork's `ravel-v0.23.0` driver (#2730 comment 6098619649, issue #2806):
   The driver's full sweep answers 43 of 43 only because it restarts the
   server before each statement.
 
-The arithmetic, from the figures above and the tree. At the 70 % default a
-mark of 20,144,038,297 bytes is a budget of about 28.8 GB. The refusal in
-the same comment names a process limit of 16,049,231,054 bytes, which is
-`memory_remainder_bytes`, so the two cache caps (45 % of the budget on a
-loopback store) held about 12.7 GB, and the derived SQL tenant pool, capped
+The arithmetic, from the figures above and the tree. The mark and the
+process limit in that comment come from two process starts, and the budget
+is derived from available memory at each start, so they imply two budgets:
+at the 70 % default a mark of 20,144,038,297 bytes is a budget of about
+28.8 GB (two cache caps of 45 % on a loopback store, about 12.9 GB; a
+remainder of about 15.8 GB), and the refusal's process limit of
+16,049,231,054 bytes, which is `memory_remainder_bytes`, is 55 % of a
+budget of about 29.2 GB (caps of about 13.1 GB, a mark of about 20.4 GB).
+Taking the refusal's start throughout: the derived SQL tenant pool, capped
 at 90 % of the remainder (`services/ravel-server/src/config.rs`), is about
-14.4 GB. The caches plus one tenant pool, about 27.2 GB, exceed the 20.1 GB
-mark. A warm server running one heavy statement therefore sits above the
-mark with 9 to 10 GB of host memory free; the purge reclaims nothing,
-because those bytes are live, and the gate stays closed in steady state.
+14.4 GB, and the caches plus one tenant pool, about 27.6 GB, exceed the
+20.4 GB mark by 7 GB. The other start's figures differ by a few hundred
+megabytes and reach the same conclusion. A warm server running one heavy
+statement therefore sits above the mark with 9 to 10 GB of host memory
+free; the purge reclaims nothing, because those bytes are live, and the
+gate stays closed in steady state.
 
 The two 27 GB data points on this issue (#2633 comments 6099757615 and
 6099845644), same host shape, `--memory-budget-bytes 27000000000`:
@@ -781,12 +804,26 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
 1. **The gate closes on host available memory**, not on `stats.resident`
    and not on the budget. Every `--memory-gate-interval-ms` the sampler
    reads the host's available memory and `stats.resident` (one epoch
-   advance). Available memory is `MemAvailable` from `/proc/meminfo`; under
-   a finite cgroup memory limit it is `memory.max` minus `memory.current`
-   (v1: `memory.limit_in_bytes` minus `memory.usage_in_bytes`), the branch
-   the budget derivation takes (ADR-1170, available-memory amendment),
-   through the readers `config.rs` already uses for it. The gate is closed
-   when the sample's final available reading is below the close floor,
+   advance). Available memory is the smaller of two terms, over whichever
+   of them can be read on that sample: `MemAvailable` from
+   `/proc/meminfo`, and, when a finite cgroup memory limit is in effect,
+   the cgroup's headroom, `limit - current + inactive_file` saturating at
+   zero (v2 `memory.max`, `memory.current` and `memory.stat`'s
+   `inactive_file`; v1 `memory.limit_in_bytes`, `memory.usage_in_bytes`
+   and `total_inactive_file`). That is the kubelet's working-set figure:
+   `memory.current` charges page cache, which the kernel reclaims under
+   pressure, so the limit minus it alone reads toward zero on a healthy
+   container whose cache or spill directory has filled the page cache,
+   and a limit above physical memory or an overcommitted node reads high
+   while the host runs out, which the `min` with `MemAvailable` catches.
+   The limit is read on every sample, not once at startup: `memory.max`
+   reading `max`, or a usage or stat file that does not parse, drops the
+   cgroup term for that sample and `MemAvailable` stands alone. The
+   `/proc/meminfo` parser is the one `config.rs` uses for the budget
+   derivation (ADR-1170, available-memory amendment); the `memory.current`
+   and `memory.stat` readers are new, behind an injected file reader so
+   the reading is tested without `/proc`. The gate is closed when the
+   sample's final available reading is below the close floor,
    `--memory-gate-min-available-bytes`, and open otherwise; the budget's
    gate setter is written on every successful sample. The default close
    floor is `max(512 MiB, 2 % of host memory)`, where host memory is
@@ -807,9 +844,13 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
    tested without sleeping.
 3. **`stats.resident` decides nothing.** It is still read on every sample,
    stays the `ravel_memory_gate_resident_bytes` gauge, and is what the
-   purge still acts on. If available memory cannot be read on a sample the
-   gate keeps its last state and the sampler warns once, as it does for an
-   unreadable resident.
+   purge still acts on. If neither available-memory term can be read on a
+   sample the gate keeps its last state and the sampler warns once, as it
+   does for an unreadable resident. A sample whose terms differ from the
+   `available_source` resolved at startup (a cgroup limit that has gone
+   to `max`) is a reading, not an unread sample; the sampler warns once
+   about the change, and `ravel_memory_gate_available_bytes` carries what
+   was read.
 4. **Flags.** `--memory-gate-high-water-percent` is removed; it landed in
    #2764 the day before this amendment and no release carries it.
    `--memory-gate-min-available-bytes`, `--memory-gate-purge-available-bytes`
@@ -826,16 +867,22 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
    life. The Flight SQL wait and the admission site (task 3, #2731) read
    the same open flag unchanged.
 6. **Startup.** The off modes and their stamp sources stay, plus
-   `disabled-no-host-memory` when neither `/proc/meminfo` nor the cgroup
-   files can be read. The resolve refuses a purge floor not above the close
-   floor, and a close floor at or above host memory. The cache-caps check
-   of section 2 and the startup-check amendment is dropped: it compared the
-   caps with a mark on the process's own memory, which no longer exists,
-   and the stamp fields it left (`ingest_buffer_bytes`,
+   `disabled-no-host-memory` when `/proc/meminfo`'s `MemAvailable` or
+   `MemTotal` cannot be read: without the first the sampler has nothing
+   to decide on, without the second there is no host memory to take the
+   default floor of. The resolve refuses a purge floor not above the close
+   floor, and either floor at or above host memory (a purge floor there
+   would have every reading below it and run the purge at every minimum
+   interval for the process's life). The cache-caps check of section 2
+   and the startup-check amendment is dropped: it compared the caps with a
+   mark on the process's own memory, which no longer exists, and the
+   stamp fields it left (`ingest_buffer_bytes`,
    `ingest_buffer_in_mark_check`) go with it. The `memory gate resolved`
    stamp carries `enabled`, `host_memory_bytes`, `min_available_bytes`,
    `purge_available_bytes`, `purge_min_interval_ms`, `interval_ms`,
-   `wait_ms`, `memory_budget_bytes` and `source`.
+   `wait_ms`, `memory_budget_bytes`, `available_source` (`meminfo+cgroup`
+   when the host profile carries a finite cgroup limit, else `meminfo`)
+   and `source`.
 7. **Metrics.** `ravel_memory_gate_high_water_bytes` is renamed
    `ravel_memory_gate_available_floor_bytes` (the close floor);
    `ravel_memory_gate_available_bytes` (the last available reading) and
