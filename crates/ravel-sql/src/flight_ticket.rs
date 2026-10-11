@@ -127,8 +127,41 @@
 //!         limit      8   u64
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
+//! [pushdown]        optional slice pushdown block, absent unless a
+//!                   coordinator attached one (see below)
+//!   kind         1   1 = spans, 2 = logs
+//!   ts_lo        1 (+8)  flag 0 = absent, 1 = present, then i64
+//!   ts_hi        1 (+8)  same
+//!   if spans:
+//!     trace_flag 1   0 = absent, 1 = the trace id follows
+//!       trace_id 16
+//!   if logs:
+//!     prune_count 4  u32
+//!       per prune predicate:
+//!         tag     1   1 = attribute equality, 2 = attribute numeric range
+//!         key_len 4   u32
+//!         key     N   attribute key (UTF-8)
+//!         type    1   ravel_logseg FieldType byte: equality 1 = Str or
+//!                     5 = Bytes; range 2 = I64, 3 = F64 or 4 = Bool
+//!         if equality:
+//!           value_len 4  u32
+//!           value     N  UTF-8 for Str, raw for Bytes
+//!         if range:
+//!           min    1 (+8)  flag, then the NumStat bit pattern
+//!           max    1 (+8)  same
 //! mac          32   keyed BLAKE3-256 over every preceding byte
 //! ```
+//!
+//! The pushdown block (issue #2755) is how a distributed SQL coordinator
+//! hands a worker the trace id, the time bounds and the prune comparisons it
+//! extracted, so the worker's fragment reads only the blocks they admit. See
+//! [`SlicePushdown`]. It is optional and additive: a ticket without it is the
+//! no-pushdown query, and [`FlightTicket::encode`] never writes it. Only the
+//! slice surface carries it. It sits under the MAC like every other field.
+//! The version stays 8: tickets are ephemeral and minted per request by the
+//! same build that redeems them, and a decoder from before this block
+//! rejects one carrying it as [`FlightTicketError::TrailingBytes`] rather than
+//! misreading it.
 //!
 //! # Integrity: a keyed MAC, not a checksum
 //!
@@ -273,6 +306,7 @@
 //! schema change and not an ADR of its own.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
 use ravel_pqtable::names::validate_table;
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_query::erasure::ErasurePredicate;
@@ -281,7 +315,9 @@ use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
+use crate::logs_pushdown::LogsPushdown;
 use crate::parquet::{MAX_STATEMENT_TABLE_NAMES, ParquetPin};
+use crate::spans_pushdown::SpansPushdown;
 
 /// Maximum accepted SQL statement length, in bytes. 64 KiB. Longer
 /// statements are rejected at [`FlightTicket::encode`] time and refused at
@@ -462,6 +498,17 @@ impl SqlTicketKeys {
         ticket.encode(self.mint_key(surface))
     }
 
+    /// [`Self::encode`] with a slice pushdown block
+    /// ([`FlightTicket::encode_with_pushdown`]).
+    pub fn encode_with_pushdown(
+        &self,
+        ticket: &FlightTicket,
+        surface: TicketSurface,
+        pushdown: Option<&SlicePushdown>,
+    ) -> Result<Vec<u8>, FlightTicketError> {
+        ticket.encode_with_pushdown(self.mint_key(surface), pushdown)
+    }
+
     /// Decode `bytes` as a `surface` ticket, accepting a MAC under any of that
     /// surface's keys. [`FlightTicketError::MacMismatch`] when none verifies;
     /// any other error is the first key's structural refusal, which does not
@@ -471,8 +518,19 @@ impl SqlTicketKeys {
         bytes: &[u8],
         surface: TicketSurface,
     ) -> Result<FlightTicket, FlightTicketError> {
+        self.decode_with_pushdown(bytes, surface)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// [`Self::decode`], also returning the ticket's slice pushdown block
+    /// ([`FlightTicket::decode_with_pushdown`]).
+    pub fn decode_with_pushdown(
+        &self,
+        bytes: &[u8],
+        surface: TicketSurface,
+    ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
         for key in self.keys(surface) {
-            match FlightTicket::decode(bytes, key) {
+            match FlightTicket::decode_with_pushdown(bytes, key) {
                 Err(FlightTicketError::MacMismatch) => continue,
                 other => return other,
             }
@@ -701,6 +759,17 @@ impl FlightTicket {
     /// if any single length field would not fit in a `u32` (not reachable
     /// with real keys or tokens).
     pub fn encode(&self, key: &TicketKey) -> Result<Vec<u8>, FlightTicketError> {
+        self.encode_with_pushdown(key, None)
+    }
+
+    /// [`Self::encode`], plus the coordinator's scan pushdown for a
+    /// distributed slice as the optional trailing block the module doc
+    /// describes. `None` produces exactly the bytes [`Self::encode`] does.
+    pub fn encode_with_pushdown(
+        &self,
+        key: &TicketKey,
+        pushdown: Option<&SlicePushdown>,
+    ) -> Result<Vec<u8>, FlightTicketError> {
         if self.statement.len() > MAX_STATEMENT_LEN {
             return Err(FlightTicketError::StatementTooLong {
                 len: self.statement.len(),
@@ -766,6 +835,10 @@ impl FlightTicket {
 
         write_len_prefixed(&mut buf, self.statement.as_bytes())?;
 
+        if let Some(pushdown) = pushdown {
+            write_pushdown(&mut buf, pushdown)?;
+        }
+
         let tag = mac(key, &buf);
         buf.extend_from_slice(&tag);
         Ok(buf)
@@ -774,7 +847,21 @@ impl FlightTicket {
     /// Decode from the wire layout, verifying the trailing MAC against `key`.
     /// Every malformed, truncated, corrupt, tampered, or trailing-garbage
     /// input yields a typed [`FlightTicketError`], never a panic.
+    ///
+    /// A ticket carrying a slice pushdown block decodes too: the block is
+    /// validated and dropped. A caller that builds a scan from the ticket
+    /// uses [`Self::decode_with_pushdown`] instead.
     pub fn decode(bytes: &[u8], key: &TicketKey) -> Result<FlightTicket, FlightTicketError> {
+        Self::decode_with_pushdown(bytes, key).map(|(ticket, _)| ticket)
+    }
+
+    /// [`Self::decode`], also returning the slice pushdown block when the
+    /// ticket carries one. A ticket without the block decodes to `None`,
+    /// which is the no-pushdown query.
+    pub fn decode_with_pushdown(
+        bytes: &[u8],
+        key: &TicketKey,
+    ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
         if bytes.len() < MIN_ENCODED_LEN {
             return Err(FlightTicketError::Truncated);
         }
@@ -886,11 +973,17 @@ impl FlightTicket {
         let statement =
             std::str::from_utf8(stmt_bytes).map_err(|_| FlightTicketError::InvalidUtf8)?;
 
+        let pushdown = if cur.is_empty() {
+            None
+        } else {
+            Some(read_pushdown(&mut cur)?)
+        };
+
         if !cur.is_empty() {
             return Err(FlightTicketError::TrailingBytes);
         }
 
-        Ok(FlightTicket {
+        let ticket = FlightTicket {
             tenant,
             statement: statement.to_owned(),
             segments,
@@ -903,7 +996,8 @@ impl FlightTicket {
             declared_columns,
             parquet_tables,
             budgets,
-        })
+        };
+        Ok((ticket, pushdown))
     }
 
     /// Whether the ticket's validity has ended: `true` at and after
@@ -943,6 +1037,96 @@ impl FlightTicket {
                 .map(to_erasure_request)
                 .collect(),
         }
+    }
+}
+
+/// The coordinator's extracted scan pushdown for one distributed slice
+/// (issue #2755): what lets a worker decode only the blocks the statement's
+/// predicate admits instead of every block of every pinned object.
+///
+/// It carries a fixed subset of what the extractors find. For spans: the
+/// time bounds and the `trace_id =` equality. For logs: the time bounds and
+/// the prune-only attribute comparisons (`attrs['k'] = 'v'` and the declared
+/// column comparisons of ADR-0093). Every carried field only narrows which
+/// blocks a worker reads; the coordinator still evaluates the full filter
+/// above the merged slices, because the providers report every filter
+/// `Inexact` in distributed mode. A worker that ignores the block therefore
+/// returns the same rows, only after decoding more.
+///
+/// The constructors keep exactly that subset, so a value always round-trips
+/// through [`FlightTicket::encode_with_pushdown`] and
+/// [`FlightTicket::decode_with_pushdown`] unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlicePushdown(SlicePushdownKind);
+
+#[derive(Debug, Clone, PartialEq)]
+enum SlicePushdownKind {
+    Spans(SpansPushdown),
+    Logs(LogsPushdown),
+}
+
+impl SlicePushdown {
+    /// The spans subset of `pushdown`: `ts_lo`, `ts_hi` and `trace_id`.
+    pub fn spans(pushdown: &SpansPushdown) -> Self {
+        SlicePushdown(SlicePushdownKind::Spans(SpansPushdown {
+            ts_lo: pushdown.ts_lo,
+            ts_hi: pushdown.ts_hi,
+            trace_id: pushdown.trace_id,
+            ..SpansPushdown::default()
+        }))
+    }
+
+    /// The logs subset of `pushdown`: `ts_lo`, `ts_hi` and the prune
+    /// predicates the layout can carry. A prune predicate outside the
+    /// layout is dropped, which only widens what the worker reads; the
+    /// content channel is not carried.
+    pub fn logs(pushdown: &LogsPushdown) -> Self {
+        SlicePushdown(SlicePushdownKind::Logs(LogsPushdown {
+            ts_lo: pushdown.ts_lo,
+            ts_hi: pushdown.ts_hi,
+            content: Vec::new(),
+            prune: pushdown
+                .prune
+                .iter()
+                .filter(|p| prune_is_carried(p))
+                .cloned()
+                .collect(),
+        }))
+    }
+
+    /// The spans pushdown this block carries, or `None` for a logs block.
+    pub fn as_spans(&self) -> Option<&SpansPushdown> {
+        match &self.0 {
+            SlicePushdownKind::Spans(p) => Some(p),
+            SlicePushdownKind::Logs(_) => None,
+        }
+    }
+
+    /// The logs pushdown this block carries, or `None` for a spans block.
+    pub fn as_logs(&self) -> Option<&LogsPushdown> {
+        match &self.0 {
+            SlicePushdownKind::Logs(p) => Some(p),
+            SlicePushdownKind::Spans(_) => None,
+        }
+    }
+}
+
+/// Whether the slice pushdown layout carries `p`: an equality on an
+/// attribute against a string or bytes value, or a numeric range on an
+/// attribute. These are the only shapes `extract_logs` puts in its prune
+/// channel.
+fn prune_is_carried(p: &Predicate) -> bool {
+    match p {
+        Predicate::Equals {
+            field: FieldSel::Attr(_),
+            value: AttrValue::Str(_) | AttrValue::Bytes(_),
+        } => true,
+        Predicate::NumRange {
+            field: FieldSel::Attr(_),
+            ty: FieldType::I64 | FieldType::F64 | FieldType::Bool,
+            ..
+        } => true,
+        _ => false,
     }
 }
 
@@ -1019,6 +1203,16 @@ pub enum FlightTicketError {
     /// defines.
     #[error("ticket contains an invalid budget tag {0}")]
     InvalidBudgetTag(u8),
+    /// A tag byte in the slice pushdown block (its kind, an optional-bound
+    /// flag, a predicate tag, a value tag, or a range type) was not one the
+    /// layout defines.
+    #[error("ticket contains an invalid slice pushdown tag {0}")]
+    InvalidPushdownTag(u8),
+    /// A slice pushdown held a prune predicate the layout has no encoding
+    /// for. [`SlicePushdown::logs`] drops those, so this marks a value built
+    /// some other way.
+    #[error("slice pushdown holds a predicate the ticket layout cannot carry")]
+    UncarriedPushdown,
     /// Bytes remained after the last field was read.
     #[error("ticket has trailing bytes")]
     TrailingBytes,
@@ -1253,6 +1447,160 @@ fn read_budgets(cur: &mut Cursor<'_>) -> Result<Option<RequestBudgets>, FlightTi
             }))
         }
         other => Err(FlightTicketError::InvalidBudgetTag(other)),
+    }
+}
+
+const PUSHDOWN_SPANS: u8 = 1;
+const PUSHDOWN_LOGS: u8 = 2;
+const PRUNE_EQUALS: u8 = 1;
+const PRUNE_NUM_RANGE: u8 = 2;
+
+/// The slice pushdown block. The bytes land in the payload before the MAC is
+/// computed, so a client cannot narrow or widen a worker's read.
+fn write_pushdown(buf: &mut Vec<u8>, pushdown: &SlicePushdown) -> Result<(), FlightTicketError> {
+    match &pushdown.0 {
+        SlicePushdownKind::Spans(p) => {
+            buf.push(PUSHDOWN_SPANS);
+            write_opt_u64(buf, p.ts_lo.map(|v| v as u64));
+            write_opt_u64(buf, p.ts_hi.map(|v| v as u64));
+            match p.trace_id {
+                Some(tid) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&tid);
+                }
+                None => buf.push(0),
+            }
+        }
+        SlicePushdownKind::Logs(p) => {
+            buf.push(PUSHDOWN_LOGS);
+            write_opt_u64(buf, p.ts_lo.map(|v| v as u64));
+            write_opt_u64(buf, p.ts_hi.map(|v| v as u64));
+            write_u32(buf, u32_len(p.prune.len())?);
+            for predicate in &p.prune {
+                match predicate {
+                    Predicate::Equals {
+                        field: FieldSel::Attr(key),
+                        value,
+                    } => {
+                        let (ty, bytes) = match value {
+                            AttrValue::Str(s) => (FieldType::Str, s.as_bytes()),
+                            AttrValue::Bytes(b) => (FieldType::Bytes, b.as_slice()),
+                            _ => return Err(FlightTicketError::UncarriedPushdown),
+                        };
+                        buf.push(PRUNE_EQUALS);
+                        write_len_prefixed(buf, key.as_bytes())?;
+                        buf.push(ty.to_u8());
+                        write_len_prefixed(buf, bytes)?;
+                    }
+                    Predicate::NumRange {
+                        field: FieldSel::Attr(key),
+                        ty: ty @ (FieldType::I64 | FieldType::F64 | FieldType::Bool),
+                        min,
+                        max,
+                    } => {
+                        buf.push(PRUNE_NUM_RANGE);
+                        write_len_prefixed(buf, key.as_bytes())?;
+                        buf.push(ty.to_u8());
+                        write_opt_u64(buf, *min);
+                        write_opt_u64(buf, *max);
+                    }
+                    _ => return Err(FlightTicketError::UncarriedPushdown),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_pushdown(cur: &mut Cursor<'_>) -> Result<SlicePushdown, FlightTicketError> {
+    match cur.read_u8()? {
+        PUSHDOWN_SPANS => {
+            let ts_lo = read_opt_u64(cur)?.map(|v| v as i64);
+            let ts_hi = read_opt_u64(cur)?.map(|v| v as i64);
+            let trace_id = match cur.read_u8()? {
+                0 => None,
+                1 => Some(cur.read_array::<16>()?),
+                other => return Err(FlightTicketError::InvalidPushdownTag(other)),
+            };
+            Ok(SlicePushdown(SlicePushdownKind::Spans(SpansPushdown {
+                ts_lo,
+                ts_hi,
+                trace_id,
+                ..SpansPushdown::default()
+            })))
+        }
+        PUSHDOWN_LOGS => {
+            let ts_lo = read_opt_u64(cur)?.map(|v| v as i64);
+            let ts_hi = read_opt_u64(cur)?.map(|v| v as i64);
+            let count = cur.read_u32()?;
+            // Do not pre-allocate from the untrusted count; push and grow.
+            let mut prune = Vec::new();
+            for _ in 0..count {
+                let tag = cur.read_u8()?;
+                let key = cur.read_len_prefixed()?;
+                let key = std::str::from_utf8(key)
+                    .map_err(|_| FlightTicketError::InvalidUtf8)?
+                    .to_owned();
+                let ty_byte = cur.read_u8()?;
+                let ty = FieldType::from_u8(ty_byte)
+                    .ok_or(FlightTicketError::InvalidPushdownTag(ty_byte))?;
+                let predicate = match (tag, ty) {
+                    (PRUNE_EQUALS, FieldType::Str) => {
+                        let value = cur.read_len_prefixed()?;
+                        let value = std::str::from_utf8(value)
+                            .map_err(|_| FlightTicketError::InvalidUtf8)?;
+                        Predicate::Equals {
+                            field: FieldSel::Attr(key),
+                            value: AttrValue::Str(value.to_owned()),
+                        }
+                    }
+                    (PRUNE_EQUALS, FieldType::Bytes) => Predicate::Equals {
+                        field: FieldSel::Attr(key),
+                        value: AttrValue::Bytes(cur.read_len_prefixed()?.to_vec()),
+                    },
+                    (PRUNE_NUM_RANGE, FieldType::I64 | FieldType::F64 | FieldType::Bool) => {
+                        Predicate::NumRange {
+                            field: FieldSel::Attr(key),
+                            ty,
+                            min: read_opt_u64(cur)?,
+                            max: read_opt_u64(cur)?,
+                        }
+                    }
+                    (PRUNE_EQUALS | PRUNE_NUM_RANGE, _) => {
+                        return Err(FlightTicketError::InvalidPushdownTag(ty_byte));
+                    }
+                    (other, _) => return Err(FlightTicketError::InvalidPushdownTag(other)),
+                };
+                prune.push(predicate);
+            }
+            Ok(SlicePushdown(SlicePushdownKind::Logs(LogsPushdown {
+                ts_lo,
+                ts_hi,
+                content: Vec::new(),
+                prune,
+            })))
+        }
+        other => Err(FlightTicketError::InvalidPushdownTag(other)),
+    }
+}
+
+/// An optional 64-bit value: a flag byte (0 absent, 1 present), then the
+/// value when present. An `i64` travels as its two's-complement `u64`.
+fn write_opt_u64(buf: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_u64(cur: &mut Cursor<'_>) -> Result<Option<u64>, FlightTicketError> {
+    match cur.read_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(u64::from_le_bytes(cur.read_array::<8>()?))),
+        other => Err(FlightTicketError::InvalidPushdownTag(other)),
     }
 }
 

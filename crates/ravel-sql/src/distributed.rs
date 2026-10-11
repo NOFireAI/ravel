@@ -139,7 +139,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 use crate::config::SqlConfig;
 use crate::dedup::RsegDedupExec;
 use crate::error::SqlError;
-use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
+use crate::flight_ticket::{FlightTicket, SegmentPin, SlicePushdown, TicketKey};
 use crate::provider::RavelTableProvider;
 use crate::schema::internal_schema;
 
@@ -438,6 +438,24 @@ pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
         limit: Option<usize>,
         context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream>;
+
+    /// [`Self::fetch_slice`], also handing the worker the coordinator's
+    /// extracted scan pushdown for the slice ([`SlicePushdown`], issue
+    /// #2755). The default ignores it, which is correct: every pushed filter
+    /// is `Inexact` and the coordinator re-applies it above the merge, so
+    /// ignoring it only costs decoding blocks the predicate would have
+    /// skipped.
+    fn fetch_slice_with_pushdown(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        pushdown: Option<&SlicePushdown>,
+        limit: Option<usize>,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let _ = pushdown;
+        self.fetch_slice(location, ticket, limit, context)
+    }
 }
 
 /// Slice `DoGet` channels this coordinator dialed with its client TLS
@@ -534,6 +552,17 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
         &self,
         location: &str,
         ticket: &FlightTicket,
+        limit: Option<usize>,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        self.fetch_slice_with_pushdown(location, ticket, None, limit, context)
+    }
+
+    fn fetch_slice_with_pushdown(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        pushdown: Option<&SlicePushdown>,
         _limit: Option<usize>,
         // The worker decodes on its own process and accounts there.
         _context: &Arc<TaskContext>,
@@ -541,9 +570,10 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
         // Encode the slice ticket exactly as the in-process path does. A
         // `slice_count > 1` ticket routes to the worker's scan-only fragment
         // branch, which streams the internal, provenance-carrying schema for the
-        // coordinator to merge and dedup.
+        // coordinator to merge and dedup. The pushdown block rides under the
+        // ticket's MAC.
         let handle = ticket
-            .encode(&self.slice_key)
+            .encode_with_pushdown(&self.slice_key, pushdown)
             .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         // Build the channel eagerly so an unparseable location or an unusable
         // TLS configuration fails here, as a typed error, rather than inside
