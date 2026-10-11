@@ -105,7 +105,7 @@ cutoff_epoch=$(( $(date +%s) - closed_days * 86400 ))
 # that comes back full may have cut off a candidate, and a candidate that was
 # never listed reads as no overlap, so a full list is refused.
 pr_list_limit="${PR_LIST_LIMIT:-500}"
-pr_fields="number,title,state,body,headRefName,updatedAt,mergedAt,closedAt"
+pr_fields="number,title,state,isDraft,body,headRefName,updatedAt,mergedAt,closedAt"
 # Called inside a command substitution, where errexit does not apply, so each
 # failure exits explicitly; falling through here would read as an empty list.
 list_prs() {
@@ -141,7 +141,7 @@ candidates="$(jq -r --argjson cutoff "${cutoff_epoch}" '
       or ((.mergedAt // .closedAt // "") != ""
           and ((.mergedAt // .closedAt) | fromdateiso8601) >= $cutoff)
     ) ]
-  | .[] | "\(.number)\t\(.state)\t\(.title)"' <<<"${prs_json}")"
+  | .[] | "\(.number)\t\(if .state == "OPEN" and .isDraft then "DRAFT" else .state end)\t\(.title)"' <<<"${prs_json}")"
 
 # A pull request that CLOSES the issue, not one that merely cites it.
 #
@@ -236,6 +236,7 @@ fi
 
 collision=0
 overlap_report=""
+context_report=""
 while IFS=$'\t' read -r num state title; do
   [[ -z "${num}" ]] && continue
   files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[].filename')"
@@ -250,12 +251,21 @@ while IFS=$'\t' read -r num state title; do
     done <<<"${files}"
   done
   if [[ -n "${shared}" ]]; then
-    overlap_report+="      #${num} [${state}] ${title}"$'\n'"        shared: ${shared% }"$'\n'
-    [[ "${state}" == "OPEN" ]] && collision=1
+    # Only an OPEN, non-draft pull request is a collision: a draft is held
+    # work nobody is landing (a held draft once blocked two epics' tickets for
+    # a day), and a merged or closed one is already on main or abandoned, so
+    # both are reported for context under their own heading, never as the
+    # reason for the refusal.
+    if [[ "${state}" == "OPEN" ]]; then
+      overlap_report+="      #${num} [${state}] ${title}"$'\n'"        shared: ${shared% }"$'\n'
+      collision=1
+    else
+      context_report+="      #${num} [${state}] ${title}"$'\n'"        shared: ${shared% }"$'\n'
+    fi
   fi
 done <<<"${candidates}"
 
-if [[ -z "${overlap_report}" ]]; then
+if [[ -z "${overlap_report}" && -z "${context_report}" ]]; then
   echo "OK    issue #${issue}: no referencing pull request, no file overlap across ${#paths[@]} predicted path(s)"
   exit 0
 fi
@@ -263,12 +273,16 @@ fi
 if ((collision == 1)); then
   echo "COLLIDE  an OPEN pull request is already touching these files:"
   printf '%s' "${overlap_report}"
+  if [[ -n "${context_report}" ]]; then
+    echo "         Also on these files, not a collision (merged, closed or draft):"
+    printf '%s' "${context_report}"
+  fi
   echo "         Dispatching over them produces two divergent rewrites of the same code."
   echo "         Wait for it to land, or fold the work into that pull request."
   exit 66
 fi
 
-echo "NOTE  recently closed pull requests touched these files; nothing open:"
-printf '%s' "${overlap_report}"
+echo "NOTE  merged, closed or draft pull requests touched these files; nothing open and ready:"
+printf '%s' "${context_report}"
 echo "      Not a blocker. Read them before dispatching so the work is not redone."
 exit 0
