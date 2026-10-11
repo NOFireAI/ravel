@@ -25,14 +25,15 @@
 //! reserved; the peak gap is its maximum over the run. Result batches are
 //! dropped as they arrive.
 //!
-//! The pool's aggregate hold (issue #2633) closes the emit-phase part of the
-//! gap. With it, every Ravel-path row's peak gap equals its build gap, the
-//! largest gap sampled before the first result batch, in three `--release`
-//! runs. One run with the hold disabled showed the emit-phase gap again, for
-//! example 142.7 MiB of peak gap against 104.5 MiB of build gap at 8
-//! partitions with a string key and `COUNT(*)`. The plain DataFusion rows still
-//! show it: their runtime has DataFusion's default disk manager, so their
-//! aggregate consumers can spill and the pool does not hold them.
+//! On DataFusion 54.1 the emit phase widened the gap: the aggregate released
+//! its reservation before handing out its output. A pool-side hold (issue
+//! #2633) closed that part, and with it every Ravel-path row's peak gap equaled
+//! its build gap, the largest gap sampled before the first result batch, in
+//! three `--release` runs; one run without it read 142.7 MiB of peak gap
+//! against 104.5 MiB of build gap at 8 partitions with a string key and
+//! `COUNT(*)`. DataFusion 55's aggregate keeps its output reserved until the
+//! last slice is cut (`tests/aggregate_emit_reservation.rs`), so the hold is
+//! gone (issue #2720). The matrix has not been re-run on DataFusion 55.
 //!
 //! The heap-profiling matrix below (`group_by_allocation_lead_over_reservation`)
 //! is `#[ignore]`d: it is the only test in this file that samples the global
@@ -578,10 +579,12 @@ fn group_by_allocation_lead_over_reservation() {
     /// did, which is the regression this detects; below `low` means the gap
     /// closed, and the band should be tightened to the new figure.
     ///
-    /// Re-measured with the aggregate hold (issue #2633): three runs read
-    /// 83.9, 91.5 and 94.5 MiB, and one with the hold disabled 93.0 MiB. This
-    /// configuration's peak gap falls before the first result batch, which
-    /// the hold does not touch, so the band stands.
+    /// Re-measured on DataFusion 54.1 with the pool's aggregate hold (issue
+    /// #2633): three runs read 83.9, 91.5 and 94.5 MiB, and one with the hold
+    /// disabled 93.0 MiB. This configuration's peak gap falls before the
+    /// first result batch, which neither that hold nor DataFusion 55's
+    /// emit-time reservation touches, so the band stands. Not re-measured on
+    /// DataFusion 55.
     const GAP_BAND_32_PARTITION_STRING_KEY: (usize, usize) = (60 << 20, 110 << 20);
 
     /// Bound on peak live bytes of the exact `AVG` run over those of the
