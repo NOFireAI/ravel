@@ -188,7 +188,9 @@ The epoch is refreshed by this thread only, at most once per interval;
 nothing on a query path calls into the allocator's control interface.
 The reading that decides the gate is no longer `stats.resident` but the
 host's available memory, read on the same sample (see the host-memory
-amendment below); the resident reading stays a gauge.
+amendment below); the resident reading stays a gauge. The gate closes only
+after consecutive readings below the floor, and reopens on the first reading
+at or above it (see the consecutive-samples amendment below).
 
 The state is a small padded group of atomics owned by `MemoryBudget` in
 `ravel-memory`, which stays a std-only crate with no allocator dependency:
@@ -359,7 +361,9 @@ The gauges and the stamp fields in this section are as the host-memory
 amendment below renames them: `ravel_memory_gate_high_water_bytes` became
 `ravel_memory_gate_available_floor_bytes`, `ravel_memory_gate_available_bytes`
 and `ravel_memory_gate_purge_floor_bytes` were added, and the stamp carries
-the floors instead of the mark.
+the floors instead of the mark. `ravel_memory_gate_samples_below_floor_total`
+and the stamp field `close_after_samples` were added after that (see the
+consecutive-samples amendment below).
 
 - `ravel_memory_gate_resident_bytes`, gauge: the sampler's last `resident`
   reading, after the purge when one ran.
@@ -534,7 +538,9 @@ on the threads whose drops would open the gate.
 The gate now closes on host available memory below a floor, and purges at
 most once per minimum interval (see the host-memory amendment below); the
 consequences that rest on the mark and on a purge per interval read with
-that change.
+that change. It closes only once several consecutive samples are below the
+floor, so a dip shorter than that refuses nothing (see the
+consecutive-samples amendment below).
 
 More 422s under bursts: a statement that arrives while the gate is closed
 waits up to 2 s and is refused, and a running statement whose reservation
@@ -653,6 +659,8 @@ ravel-server)
   the purge floor is above the close floor and both floors are below host
   memory; the `memory gate resolved` stamp with its `available_source`; the
   metric families of section 4 as the host-memory amendment names them.
+  `--memory-gate-close-after-samples`, its stamp field and its counter came
+  after (see the consecutive-samples amendment below).
 - The available reading through an injected file reader: the smaller of
   `MemAvailable` and, under a finite cgroup limit, the cgroup's headroom
   (`limit - current + inactive_file`), decided again on every sample.
@@ -844,7 +852,8 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
    derivation (ADR-1170, available-memory amendment); the `memory.current`
    and `memory.stat` readers are new, behind an injected file reader so
    the reading is tested without `/proc`. The gate is closed when the
-   sample's final available reading is below the close floor,
+   sample's final available reading is below the close floor (see the
+   consecutive-samples amendment below: one sample no longer closes it),
    `--memory-gate-min-available-bytes`, and open otherwise; the budget's
    gate setter is written on every successful sample. The default close
    floor is `min(max(512 MiB, 2 % of host memory), host memory / 8)`,
@@ -920,7 +929,8 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
    `purge_available_bytes`, `purge_min_interval_ms`, `interval_ms`,
    `wait_ms`, `memory_budget_bytes`, `available_source` (`meminfo+cgroup`
    when the host profile carries a finite cgroup limit, else `meminfo`)
-   and `source`.
+   and `source` (and `close_after_samples`, since the consecutive-samples
+   amendment below).
 7. **Metrics.** `ravel_memory_gate_high_water_bytes` is renamed
    `ravel_memory_gate_available_floor_bytes` (the close floor);
    `ravel_memory_gate_available_bytes` (the last available reading) and
@@ -958,3 +968,73 @@ rather than a VmRSS band; section 6's items 1 and 2 carry the same change.
 Each report stamps the binary's main SHA, the `memory gate resolved` line
 and the peaks of VmRSS and `resident`, with the minimum of
 `ravel_memory_gate_available_bytes`, sampled at the same instant.
+
+## Amendment (2026-10-11, #2838): the gate closes after consecutive samples below the floor
+
+<!-- amendment-applies: sections="1. A gate that reads `stats.resident` at a bounded rate|4. Observability|Consequences|Implementation tasks" pointer="consecutive-samples amendment" -->
+<!-- amendment-supersedes: phrase="closed when the sample's final available reading is below the close floor" pointer="consecutive-samples amendment" -->
+
+### What was measured
+
+The task 6 acceptance run on main 1590f945f (#2806 comment 6105829771:
+paired fresh c6a.4xlarge boxes, fork `ravel-v0.23.0`, three 600 s
+concurrent phases on each): criteria (b), (c) and (d) passed, and criterion
+(a) missed on one phase. The stock box pooled an error ratio of 0.207
+(0.070 / 0.074 / 0.379) against the 0.10 bar; the 27 GB-budget box pooled
+0.092. In stock phase 3 the gate's own available gauge dipped to 0.53 GB,
+below the 0.66 GB floor, while the 2 s host samples of `MemAvailable` never
+went under 1.22 GB: the dips lasted well under 2 s. While the gate was
+closed, the phase's server log holds 47 fetch refusals with 0 bytes already
+reserved (the gate's signature) and 132 "upstream storage temporarily
+unavailable" errors. v0.23.0, with no gate, dipped to 0.83 GB available at
+an error ratio of about 0.07 and was not killed, so the 0.66 GB floor sits
+below the healthy operating point and the gate was closing on transients.
+
+### Decision
+
+1. **The gate closes only after consecutive samples below the floor.**
+   `--memory-gate-close-after-samples` (default 3, accepted 1 to 100) is
+   how many consecutive samples must read below the close floor,
+   `--memory-gate-min-available-bytes`, before the sampler closes the gate.
+   A sample at or above the floor resets the run to 0 and, if the gate is
+   closed, reopens it on that sample: the close is debounced, the reopen is
+   not. An unread sample neither counts nor resets, as it leaves the gate's
+   state alone. With the value 1 the behaviour is the one the host-memory
+   amendment's decision 1 describes, exactly. The purge decision is
+   unchanged; it has its own spacing.
+2. **Why 3 at 100 ms.** At the default interval a dip must last at least
+   300 ms to close the gate. The dips measured above were shorter than the
+   host sampler's own 2 s period and closed the gate for a whole phase,
+   while v0.23.0 ran at 0.83 GB available with an error ratio of about
+   0.07. Three samples is the shortest run that outlasts a dip of one or
+   two readings, and at section 1's measured 0.4 GB/s burst slope it lets
+   about 120 MB of growth go unseen before the close, small against the
+   687 MB floor on the 32 GiB host. The count is a flag, so a host whose
+   dips are longer can raise it, up to 100 (10 s at the default interval).
+3. **The setter is written on every readable sample**, with the gate's
+   decision and the sample's reading, so `ravel_memory_gate_available_bytes`
+   shows a reading below the floor while the gate is still open. For that,
+   `MemoryBudget::set_host_memory_gate` takes the open flag from the
+   sampler instead of deriving it from the reading and the floor. A closed
+   gate still always comes with a reading below the floor, which the
+   refusal path's re-check rests on.
+4. **Observability.** `ravel_memory_gate_samples_below_floor_total`,
+   counter: every sample whose final reading was below the close floor,
+   whether or not it closed the gate; this moving while
+   `ravel_memory_gate_refusals_total` does not is a dip too short to close
+   the gate. The `memory gate resolved` stamp gains `close_after_samples`.
+
+### What this supersedes
+
+The host-memory amendment's decision 1, where one sample below the close
+floor closes the gate; with `--memory-gate-close-after-samples 1` that is
+still the behaviour. Nothing else moves: the floors, their defaults, the
+purge and the refusal cause stand.
+
+### Pre-registered acceptance (criterion (a) re-run)
+
+Criterion (a) of the task 6 acceptance (the host-memory amendment above) is
+re-run on this change, by ravel-perf: paired fresh c6a.4xlarge boxes, this
+change's head against a main control, three concurrent phases each plus the
+stock run. The pooled error ratio is at most 0.058, no phase is over 0.08,
+and QPS is not below the control. Criteria (b), (c) and (d) are unchanged.
