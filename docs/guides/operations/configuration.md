@@ -1413,15 +1413,16 @@ A ranged read there spends a billed request to save bytes that cost nothing.
 Elsewhere the reverse holds.
 
 `--logs-fetch-policy` takes one of four values, spelled as in the table.
-Unset, it resolves `cost-based` on every deployment, including a `--store s3`
-deployment against a loopback `--s3-endpoint`.
+Unset, it resolves `latency-first` on a `--store s3` deployment against a
+loopback `--s3-endpoint`, where requests cost no money, and `cost-based` on
+every other deployment, a remote endpoint included.
 
 | Value | Optimizes for | Pick it when |
 |---|---|---|
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
-| `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, on every store including a loopback one, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 18,900,000 bytes of an object reads ranged and every object of 18,900,000 bytes or less reads whole. |
-| `latency-first` | Fewest transferred bytes, as `byte-minimal`. It states an intent: spend requests to save wall time. The concurrency that you configure decides how. | Cold wall-clock matters more than the request bill, and you will raise the object-store GET concurrency and the SQL scan width explicitly. See [the latency-first trade](#the-latency-first-trade). |
+| `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 18,900,000 bytes of an object reads ranged and every object of 18,900,000 bytes or less reads whole. |
+| `latency-first` | Fewest transferred bytes, as `byte-minimal`. It states an intent: spend requests to save wall time. The concurrency decides how. | Cold wall-clock matters more than the request bill. The unset default on a loopback store. See [the latency-first trade](#the-latency-first-trade). |
 
 For any policy value a query returns the same rows. Only request counts and
 timing differ.
@@ -1434,9 +1435,10 @@ policy. If a measurement shows that the default is wrong for a deployment,
 set `--logs-fetch-policy` explicitly.
 
 Startup logs the resolved policy and its source on the
-`logs fetch policy resolved` line. The source is `flag` (explicit) or
-`default` (unset). Unset always means `default`/`cost-based`, on every store
-including a loopback one.
+`logs fetch policy resolved` line. The source is `flag` (explicit),
+`default-loopback` (unset on a loopback store, resolving `latency-first`), or
+`default` (unset anywhere else, resolving `cost-based`). An explicit flag wins
+on every store.
 
 ### The latency-first trade
 
@@ -1457,9 +1459,12 @@ constant.
 - `latency-first` resolves `--store-get-concurrency`,
   `--sql-partition-count`, and `--promql-fetch-fanout` as every other policy
   does. It sets no default of its own.
-- The measured trade pays off only after you raise the GET permits and the
-  SQL scan width together to the concurrency that the measurement used.
-  `--fetch-concurrency` raises all three at once.
+- The measured trade pays off only with the GET permits and the SQL scan
+  width both at the concurrency that the measurement used, 256. Unset, the
+  GET permits derive from the memory budget and reach 256 on a 32 GB host
+  (see [Per-query budgets](#per-query-budgets)); the SQL scan width
+  still derives from cores, so for SQL set `--sql-partition-count`
+  explicitly. `--fetch-concurrency` raises all three at once.
 - The policy alone is not inert. The byte quantities change immediately, so a
   logs read is routed as `byte-minimal` routes it. It takes ranged reads
   where they save more bytes than a request costs, and whole-object reads
@@ -1469,9 +1474,9 @@ constant.
 - Treat the concurrency as a precondition. The startup line says which side
   of it this process is on. It reports the precondition met only when both
   the GET permits and the scan width are raised.
-- A concurrency raise also raises in-flight fetch memory, and no process-wide
-  budget bounds that memory yet. Watch process memory when you try this
-  policy. An under-provisioned raise can end in an out-of-memory kill.
+- A concurrency raise also raises in-flight fetch memory. Fetch reservations
+  draw on the process memory budget, which refuses a fetch it cannot hold
+  with a typed error rather than letting the process grow past it.
 
 ### The store cost profile
 
@@ -1739,7 +1744,8 @@ Six flags bound what one query can spend. Unset, each resolves at startup:
 
 | Flags | Unset, resolves from |
 |---|---|
-| `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy `--fetch-concurrency`, which sets all three) | The core count. |
+| `--store-get-concurrency` | The memory budget, falling back to the core count when the budget is unknown or does not apply. |
+| `--sql-partition-count` and `--promql-fetch-fanout` (the legacy `--fetch-concurrency` sets these and `--store-get-concurrency` together) | The core count. |
 | The two SQL ceilings | Memory: shares of `MemTotal`, capped by the cgroup memory limit when the process runs in a container. |
 | `--max-segments` | No host resource. It is a fixed 1,000,000 on every host. |
 
@@ -1753,7 +1759,7 @@ published ClickBench run used.
 | Flag | Default (unset) | Reference host | Choose against |
 |---|---|---|---|
 | `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Legacy combined knob: sets `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` together (source `legacy-flag`). Combining it with any of the three is a startup error naming both flags. |
-| `--store-get-concurrency` | derived: `max(8, 2 x cores)` | 32 | Permit count for the one process-wide `GetLimiter` every fetcher (RSEG, RLOG, RSPAN) shares. Host cores and the store's request budget. |
+| `--store-get-concurrency` | budget-share: 60% of the memory budget divided by 64 MiB, clamped to 8..=256; `max(8, 2 x cores)` when the budget is unknown or the process is a gateway | 256 | Permit count for the one process-wide `GetLimiter` every fetcher (RSEG, RLOG, RSPAN) shares. The memory each in-flight GET reserves and the store's request budget. |
 | `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. Host cores and query parallelism vs. per-partition overhead. |
 | `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
 | `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
@@ -1769,6 +1775,30 @@ A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 `--sql-partition-count`, or `--promql-fetch-fanout` is a startup error that
 names that flag. Startup raises it before any fetcher, engine, or SQL session
 exists.
+
+### GET permits
+
+Unset, `--store-get-concurrency` is sized so that every permit holding the
+largest whole-object read the fetcher reserves (64 MiB, the default
+`--logs-max-fetch-run-bytes`) stays within 60% of the memory budget. The count
+is `floor(budget x 60% / 64 MiB)`, clamped to at least 8 and at most 256, the
+concurrency the latency-first measurement used.
+
+| Host memory (16 cores) | Memory budget | GET permits |
+|---|---|---|
+| 32 GiB | 30 GiB | 256 |
+| 16 GiB | 14 GiB | 134 |
+| 8 GiB | 6 GiB | 57 |
+| 4 GiB | 3 GiB | 28 |
+
+The share is a bound on how much the permits may ask for, not a carve of its
+own: each fetch still reserves its bytes on the process memory budget, which
+refuses one it cannot hold. The SQL scan width does not follow the permits;
+`--sql-partition-count` still derives from cores. When the memory budget is
+unknown (the fallback) or does not apply (gateway mode), the permits derive
+from cores as the other two knobs do. An explicit `--store-get-concurrency` or
+`--fetch-concurrency` wins. The startup line reports source `budget-share`
+with the budget, the share, the per-permit bytes, and the ceiling it used.
 
 ### SQL ceilings
 
@@ -2002,6 +2032,7 @@ from:
 | `derived-cgroup` | `memory_budget_bytes` only: a cgroup memory limit is present, so the budget is that limit minus the reserve, ignoring `MemAvailable`. |
 | `budget-carve` | A fixed share of `memory_budget_bytes` and not of raw `MemTotal`. The two cache ceilings resolve to this on a host whose memory could be read or whose budget was set with `--memory-budget-bytes`. |
 | `budget-carve-loopback` | The larger 40% share of the fetcher cache. It is resolved in place of `budget-carve` when the store is `s3` against a loopback endpoint and `--cache-max-bytes` is unset. |
+| `budget-share` | `store_get_concurrency` only: no flag, and a known memory budget outside gateway mode, so the GET permits are sized against 60% of `memory_budget_bytes` (see [GET permits](#get-permits)). The line also carries `memory_budget_bytes`, `share_percent`, `per_permit_bytes`, and `ceiling`. |
 | `fallback` | No flag and no readable `MemTotal`, so the compiled-in constant is used. |
 
 To see what a process runs with, without reading the unit file, run
@@ -2009,7 +2040,7 @@ To see what a process runs with, without reading the unit file, run
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
-INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
+INFO performance default resolved setting="store_get_concurrency" value=256 source="budget-share" memory_budget_bytes=30064771072 share_percent=60 per_permit_bytes=67108864 ceiling=256
 INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"

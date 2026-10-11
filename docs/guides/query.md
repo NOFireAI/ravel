@@ -437,7 +437,7 @@ a silent truncation:
 | Segments touched | fixed: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
 | Distinct series | 10,000 | `query matched {count} series, exceeding the limit of {max}` |
 | Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
-| Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--promql-fetch-fanout`, or `--store-get-concurrency` for the shared object-store GET ceiling) | (not user-visible; throughput knob only) |
+| Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--promql-fetch-fanout`), and a memory-budget-derived shared object-store GET ceiling (`--store-get-concurrency`) | (not user-visible; throughput knob only) |
 | Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
 | Bytes scanned | unlimited (opt in via `query_defaults.max_bytes_scanned`) | `query scanned {scanned} bytes, exceeding the budget of {max}` |
@@ -473,9 +473,11 @@ Six of these budgets are process-wide server flags. None is per-tenant. An
 unset flag resolves at startup, and only some resolve **from host
 resources**:
 
-- `--store-get-concurrency`, `--sql-partition-count`, and
-  `--promql-fetch-fanout` follow the core count. The legacy
-  `--fetch-concurrency` sets all three.
+- `--store-get-concurrency` follows the memory budget: 60% of it divided by
+  64 MiB per permit, clamped to 8..=256. It falls back to the core count when
+  the budget is unknown or the process is a gateway.
+- `--sql-partition-count` and `--promql-fetch-fanout` follow the core count.
+  The legacy `--fetch-concurrency` sets all three.
 - The two SQL ceilings follow memory: shares of `MemTotal`, capped by the
   cgroup memory limit in a container.
 - `--max-segments` is a fixed 1,000,000 on every host.
@@ -488,7 +490,7 @@ published ClickBench run used these settings.
 | Flag | Reaches | Default (unset) | Reference host |
 |---|---|---|---|
 | `--fetch-concurrency <N>` | legacy: sets all three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
-| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)` | 32 |
+| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | budget-share: 60% of the memory budget / 64 MiB, clamped to 8..=256 (`max(8, 2 x cores)` with no known budget or in gateway mode) | 256 |
 | `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
 | `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
@@ -517,11 +519,11 @@ Startup logs both adjustments: `clamped` and `raised` on the resolved lines,
 plus a WARN.
 
 Startup logs every resolved value, one line per setting with its source
-(`derived`, `flag`, `fallback`, or `legacy-flag`):
+(`derived`, `budget-share`, `flag`, `fallback`, or `legacy-flag`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
-INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
+INFO performance default resolved setting="store_get_concurrency" value=256 source="budget-share" memory_budget_bytes=30064771072 share_percent=60 per_permit_bytes=67108864 ceiling=256
 INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
