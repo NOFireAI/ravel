@@ -517,37 +517,15 @@ fn normalize_resource(
     mut metadata_out: Option<&mut MetadataCollector>,
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
-    if resource_point_count == 0 {
+    let attrs = resource_attr_pairs(rm.resource.as_ref());
+    let Some(resource_labels) =
+        admit_resource_labels(&attrs, resource_point_count, limits, rejected)
+    else {
         return;
-    }
-
-    let resource = rm.resource.as_ref();
-    let resource_attr_count = resource.map_or(0, |r| r.attributes.len());
-    if resource_attr_count > limits.max_resource_attributes {
-        rejected.push(Rejection::TooManyResourceAttributes {
-            count: resource_point_count,
-            max: limits.max_resource_attributes,
-        });
-        return;
-    }
-
-    let resource_labels = match build_resource_labels(resource, limits) {
-        Ok((labels, dropped)) => {
-            #[cfg(test)]
-            label_capacity_stats::record_prefix(&labels, labels.capacity());
-            if dropped > 0 {
-                rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
-            }
-            labels
-        }
-        Err(reason) => {
-            rejected.push(Rejection::Grouped {
-                reason: Box::new(reason),
-                count: resource_point_count,
-            });
-            return;
-        }
     };
+    drop(attrs);
+    #[cfg(test)]
+    label_capacity_stats::record_prefix(&resource_labels, resource_labels.capacity());
 
     for sm in &mut rm.scope_metrics {
         for metric in &mut sm.metrics {
@@ -1769,14 +1747,122 @@ fn explode_summary(
 const JOB_INSTANCE_SOURCE_KEYS: [&str; 3] =
     ["service.name", "service.namespace", "service.instance.id"];
 
+/// One resource attribute value as [`build_resource_labels_from`] reads it,
+/// borrowed from whichever wire format carried it. `Complex` stands for every
+/// value with no label representation (array, kvlist, bytes, an unresolved
+/// string-table index): reading one rejects every point under the resource.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResourceAttrValue<'a> {
+    /// No value at all; reads as the empty string.
+    Empty,
+    /// A string value, kept verbatim.
+    Str(&'a str),
+    /// A bool, formatted `true`/`false`.
+    Bool(bool),
+    /// An int, formatted in decimal.
+    Int(i64),
+    /// A double, formatted with Rust's `Display` for `f64`.
+    Double(f64),
+    /// A value with no label representation.
+    Complex,
+}
+
+impl<'a> ResourceAttrValue<'a> {
+    /// The OTLP `AnyValue` mapping, matching `any_value_to_label_value`.
+    pub fn from_any_value(value: Option<&'a AnyValue>) -> Self {
+        match value.and_then(|v| v.value.as_ref()) {
+            None => Self::Empty,
+            Some(AnyValueVariant::StringValue(s)) => Self::Str(s),
+            Some(AnyValueVariant::BoolValue(b)) => Self::Bool(*b),
+            Some(AnyValueVariant::IntValue(i)) => Self::Int(*i),
+            Some(AnyValueVariant::DoubleValue(d)) => Self::Double(*d),
+            Some(AnyValueVariant::ArrayValue(_))
+            | Some(AnyValueVariant::KvlistValue(_))
+            | Some(AnyValueVariant::BytesValue(_))
+            | Some(AnyValueVariant::StringValueStrindex(_)) => Self::Complex,
+        }
+    }
+
+    fn to_label_value(self) -> Result<String, Rejection> {
+        match self {
+            Self::Empty => Ok(String::new()),
+            Self::Str(s) => Ok(s.to_string()),
+            Self::Bool(b) => Ok(b.to_string()),
+            Self::Int(i) => Ok(i.to_string()),
+            Self::Double(d) => Ok(d.to_string()),
+            Self::Complex => Err(Rejection::ComplexAttributeValue),
+        }
+    }
+}
+
+/// The OTLP resource's attributes as the key and value pairs
+/// [`build_resource_labels_from`] reads; no resource is no attributes.
+pub(crate) fn resource_attr_pairs(
+    resource: Option<&Resource>,
+) -> Vec<(&str, ResourceAttrValue<'_>)> {
+    resource.map_or_else(Vec::new, |r| {
+        r.attributes
+            .iter()
+            .map(|kv| {
+                (
+                    kv.key.as_str(),
+                    ResourceAttrValue::from_any_value(kv.value.as_ref()),
+                )
+            })
+            .collect()
+    })
+}
+
+/// Admit one resource carrying `point_count` points, in the order every
+/// metrics normalizer applies: the attribute-count cap
+/// ([`Rejection::TooManyResourceAttributes`] for every point), then
+/// [`build_resource_labels_from`] (its failure is one
+/// [`Rejection::Grouped`] carrying every point; its dropped count is one
+/// [`Rejection::ResourceAttributesDropped`]). Returns the label prefix, or
+/// `None` when every point under the resource is rejected. A resource with no
+/// points is skipped without a rejection.
+pub fn admit_resource_labels(
+    attrs: &[(&str, ResourceAttrValue<'_>)],
+    point_count: usize,
+    limits: &IngestLimits,
+    rejected: &mut Vec<Rejection>,
+) -> Option<Vec<Label>> {
+    if point_count == 0 {
+        return None;
+    }
+    if attrs.len() > limits.max_resource_attributes {
+        rejected.push(Rejection::TooManyResourceAttributes {
+            count: point_count,
+            max: limits.max_resource_attributes,
+        });
+        return None;
+    }
+    match build_resource_labels_from(attrs, limits) {
+        Ok((labels, dropped)) => {
+            if dropped > 0 {
+                rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
+            }
+            Some(labels)
+        }
+        Err(reason) => {
+            rejected.push(Rejection::Grouped {
+                reason: Box::new(reason),
+                count: point_count,
+            });
+            None
+        }
+    }
+}
+
 /// Builds the resource-derived labels, plus how many of the resource's own
 /// attributes were outside both the job/instance mapping and the configured
 /// allowlist and so were dropped. Counted per attribute occurrence on the
-/// resource (one entry in `resource.attributes` per unit), not per data
-/// point under it: a resource with 3 out-of-allowlist attributes returns 3
-/// regardless of how many points it carries, and a caller multiplies by
-/// nothing before recording it. Normative description:
-/// docs/guides/observability.md.
+/// resource (one entry in `attrs` per unit), not per data point under it: a
+/// resource with 3 out-of-allowlist attributes returns 3 regardless of how
+/// many points it carries, and a caller multiplies by nothing before
+/// recording it. Normative description: docs/guides/observability.md. Every
+/// wire format builds its resource labels here, so one resource carried by
+/// OTLP or by OTAP yields the same prefix and the same dropped count.
 ///
 /// The count is a lower bound, not an exact figure, in two edge cases where
 /// a key matches by name but produces no label: a second occurrence of a
@@ -1788,18 +1874,14 @@ const JOB_INSTANCE_SOURCE_KEYS: [&str; 3] =
 /// that happens). Both are pre-existing gaps in what "dropped" means here,
 /// not something this count was built to catch; a key match, not "produced
 /// a label", is what excludes an attribute from the count.
-fn build_resource_labels(
-    resource: Option<&Resource>,
+pub fn build_resource_labels_from(
+    attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
 ) -> Result<(Vec<Label>, usize), Rejection> {
-    let Some(resource) = resource else {
-        return Ok((Vec::new(), 0));
-    };
-
     let mut labels = Vec::new();
 
-    let service_name = find_attr_value(&resource.attributes, "service.name")?;
-    let service_namespace = find_attr_value(&resource.attributes, "service.namespace")?;
+    let service_name = find_attr_value(attrs, "service.name")?;
+    let service_namespace = find_attr_value(attrs, "service.namespace")?;
     let has_service_name = service_name.is_some();
     if let Some(name) = service_name {
         let job = match service_namespace {
@@ -1809,7 +1891,7 @@ fn build_resource_labels(
         push_checked(&mut labels, "job".to_string(), job, limits)?;
     }
 
-    if let Some(instance) = find_attr_value(&resource.attributes, "service.instance.id")? {
+    if let Some(instance) = find_attr_value(attrs, "service.instance.id")? {
         push_checked(&mut labels, "instance".to_string(), instance, limits)?;
     }
 
@@ -1820,7 +1902,7 @@ fn build_resource_labels(
         ) {
             continue;
         }
-        if let Some(value) = find_attr_value(&resource.attributes, key)? {
+        if let Some(value) = find_attr_value(attrs, key)? {
             // `key` is borrowed from the long-lived allowlist config, so it
             // cannot be moved; clone it to feed the by-value sanitiser. This is
             // once per resource attribute, not per data point.
@@ -1828,16 +1910,15 @@ fn build_resource_labels(
         }
     }
 
-    let dropped = resource
-        .attributes
+    let dropped = attrs
         .iter()
-        .filter(|kv| {
+        .filter(|(key, _)| {
             // `service.namespace` is only actually consumed above when
             // `service.name` is present; without a name its value feeds
             // nothing, so it must count as dropped like any other unused
             // attribute rather than being blanket-excluded with the two keys
             // that are always consumed.
-            let consumed = match kv.key.as_str() {
+            let consumed = match *key {
                 "service.namespace" => has_service_name,
                 key => JOB_INSTANCE_SOURCE_KEYS.contains(&key),
             };
@@ -1845,7 +1926,7 @@ fn build_resource_labels(
                 && !limits
                     .resource_attribute_allowlist
                     .iter()
-                    .any(|allowed| allowed == &kv.key)
+                    .any(|allowed| allowed == key)
         })
         .count();
 
@@ -1901,10 +1982,13 @@ fn kept_label(name: String, value: String) -> Label {
     }
 }
 
-fn find_attr_value(attrs: &[KeyValue], key: &str) -> Result<Option<String>, Rejection> {
-    match attrs.iter().find(|kv| kv.key == key) {
+fn find_attr_value(
+    attrs: &[(&str, ResourceAttrValue<'_>)],
+    key: &str,
+) -> Result<Option<String>, Rejection> {
+    match attrs.iter().find(|(k, _)| *k == key) {
         None => Ok(None),
-        Some(kv) => any_value_to_label_value(kv.value.as_ref()).map(Some),
+        Some((_, value)) => value.to_label_value().map(Some),
     }
 }
 

@@ -29,7 +29,7 @@ pub mod traces_normalize;
 
 pub use label_projection::{
     ProjectedLabelBytes, RESOLVED_LABEL_OVERHEAD_BYTES, project_log_resolved_label_bytes,
-    project_resolved_label_bytes, project_span_resolved_label_bytes,
+    project_resolved_label_bytes, project_span_resolved_label_bytes, resource_prefix_bytes,
 };
 pub use limits::{
     AdmissionClass, DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST, IngestLimits,
@@ -42,7 +42,8 @@ pub use logs_normalize::{
 pub use metadata::{MetricKind, MetricMetadata};
 pub use normalize::{
     MetricsNormalizeResult, NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint,
-    normalize_metrics, normalize_metrics_with_exemplars, normalize_metrics_with_metadata,
+    ResourceAttrValue, admit_resource_labels, build_resource_labels_from, normalize_metrics,
+    normalize_metrics_with_exemplars, normalize_metrics_with_metadata,
     normalize_metrics_with_metadata_projected,
 };
 pub use traces_limits::{SpanIngestLimits, SpanRejection};

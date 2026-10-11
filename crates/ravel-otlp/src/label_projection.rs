@@ -37,14 +37,16 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::{
     AggregationTemporality, Metric, ResourceMetrics, metric::Data as MetricData,
 };
-use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use ravel_types::METRIC_NAME_LABEL;
 
 use crate::limits::IngestLimits;
 use crate::logs_limits::LogIngestLimits;
 use crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH;
-use crate::normalize::{metric_kind_of, prometheus_family_name, sanitize_metric_name};
+use crate::normalize::{
+    ResourceAttrValue, metric_kind_of, prometheus_family_name, resource_attr_pairs,
+    sanitize_metric_name,
+};
 use crate::traces_limits::SpanIngestLimits;
 use crate::traces_normalize::{
     ATTR_EVENTS_RAW, ATTR_LINKS_RAW, ATTR_SPAN_FLAGS, ATTR_SPAN_KIND, ATTR_TRACE_STATE,
@@ -66,6 +68,13 @@ impl ProjectedLabelBytes {
     /// The projected byte count.
     pub fn get(self) -> usize {
         self.0
+    }
+
+    /// The result of a projection walk over a wire format other than the OTLP
+    /// protobuf (OTAP's Arrow batches), built from the helpers here so the
+    /// per-label charge cannot drift between formats.
+    pub fn from_walk(n: usize) -> Self {
+        Self(n)
     }
 
     /// A projection of `n` bytes that no walk produced, for tests of the
@@ -116,7 +125,7 @@ fn format_float_len(v: f64) -> usize {
 /// element slot ([`RESOLVED_LABEL_OVERHEAD_BYTES`]) plus the name and value
 /// lengths. Lengths suffice because every name and value a normalizer keeps
 /// goes through [`exact_capacity`], so its heap allocation is its length.
-pub(crate) const fn label_bytes(name_len: usize, value_len: usize) -> usize {
+pub const fn label_bytes(name_len: usize, value_len: usize) -> usize {
     name_len
         .saturating_add(value_len)
         .saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES)
@@ -160,11 +169,11 @@ pub fn project_resolved_label_bytes(
 }
 
 fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usize {
-    let resource = rm.resource.as_ref();
-    if resource.map_or(0, |r| r.attributes.len()) > limits.max_resource_attributes {
+    let attrs = resource_attr_pairs(rm.resource.as_ref());
+    if attrs.len() > limits.max_resource_attributes {
         return 0;
     }
-    let Some(prefix) = resource_prefix_bytes(resource, limits) else {
+    let Some(prefix) = resource_prefix_bytes(&attrs, limits) else {
         return 0;
     };
     let mut total = prefix;
@@ -176,14 +185,14 @@ fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usiz
     total
 }
 
-/// Bytes of the label prefix `build_resource_labels` builds, or `None` when a
-/// value it reads has no label form, which rejects every point under the
-/// resource before any point label is built.
-fn resource_prefix_bytes(resource: Option<&Resource>, limits: &IngestLimits) -> Option<usize> {
-    let Some(resource) = resource else {
-        return Some(0);
-    };
-    let attrs = &resource.attributes;
+/// Bytes of the label prefix [`crate::normalize::build_resource_labels_from`]
+/// builds from `attrs`, or `None` when a value it reads has no label form,
+/// which rejects every point under the resource before any point label is
+/// built. Shared by every wire format's projection, as the builder is.
+pub fn resource_prefix_bytes(
+    attrs: &[(&str, ResourceAttrValue<'_>)],
+    limits: &IngestLimits,
+) -> Option<usize> {
     let mut total = 0usize;
 
     if let Some(name_len) = first_attr_label_len(attrs, "service.name")? {
@@ -197,8 +206,9 @@ fn resource_prefix_bytes(resource: Option<&Resource>, limits: &IngestLimits) -> 
             total = total.saturating_add(label_bytes("job".len(), job_len));
         }
     } else {
-        // `build_resource_labels` reads `service.namespace` even without a
-        // name, so an unrepresentable value there still rejects the resource.
+        // `build_resource_labels_from` reads `service.namespace` even without
+        // a name, so an unrepresentable value there still rejects the
+        // resource.
         first_attr_label_len(attrs, "service.namespace")?;
     }
 
@@ -228,26 +238,32 @@ fn resource_prefix_bytes(resource: Option<&Resource>, limits: &IngestLimits) -> 
 
 /// `Some(Some(len))` for the first attribute named `key`, `Some(None)` when
 /// none is, and `None` when its value has no label representation.
-fn first_attr_label_len(attrs: &[KeyValue], key: &str) -> Option<Option<usize>> {
-    match attrs.iter().find(|kv| kv.key == key) {
+fn first_attr_label_len(
+    attrs: &[(&str, ResourceAttrValue<'_>)],
+    key: &str,
+) -> Option<Option<usize>> {
+    match attrs.iter().find(|(k, _)| *k == key) {
         None => Some(None),
-        Some(kv) => label_value_len(kv.value.as_ref()).map(Some),
+        Some((_, value)) => resource_value_label_len(*value).map(Some),
+    }
+}
+
+/// Length of the label value `value` converts to, or `None` where the
+/// conversion rejects.
+pub fn resource_value_label_len(value: ResourceAttrValue<'_>) -> Option<usize> {
+    match value {
+        ResourceAttrValue::Empty => Some(0),
+        ResourceAttrValue::Str(s) => Some(s.len()),
+        ResourceAttrValue::Bool(b) => Some(if b { 4 } else { 5 }),
+        ResourceAttrValue::Int(i) => Some(display_len(i)),
+        ResourceAttrValue::Double(d) => Some(display_len(d)),
+        ResourceAttrValue::Complex => None,
     }
 }
 
 /// Length of `any_value_to_label_value`'s output, or `None` where it rejects.
 fn label_value_len(value: Option<&AnyValue>) -> Option<usize> {
-    match value.and_then(|v| v.value.as_ref()) {
-        None => Some(0),
-        Some(AnyValueVariant::StringValue(s)) => Some(s.len()),
-        Some(AnyValueVariant::BoolValue(b)) => Some(if *b { 4 } else { 5 }),
-        Some(AnyValueVariant::IntValue(i)) => Some(display_len(i)),
-        Some(AnyValueVariant::DoubleValue(d)) => Some(display_len(d)),
-        Some(AnyValueVariant::ArrayValue(_))
-        | Some(AnyValueVariant::KvlistValue(_))
-        | Some(AnyValueVariant::BytesValue(_))
-        | Some(AnyValueVariant::StringValueStrindex(_)) => None,
-    }
+    resource_value_label_len(ResourceAttrValue::from_any_value(value))
 }
 
 /// Bytes of the attribute labels one point builds, or `None` when one of its
@@ -289,8 +305,8 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
     }
     let (kind, is_monotonic_sum) = metric_kind_of(data);
     let name_len = prometheus_family_name(&sanitized, &metric.unit, kind, is_monotonic_sum).len();
-    let name_label = label_bytes(METRIC_NAME_LABEL.len(), name_len);
-    let explode_name_label = name_label.saturating_add(EXPLODE_SUFFIX_MAX_LEN);
+    let name_label = name_label_bytes(name_len);
+    let explode_name_label = explode_name_label_bytes(name_len);
     let max_attrs = limits.max_attributes_per_point;
 
     match data {
@@ -336,16 +352,8 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 let per_series = prefix
                     .saturating_add(attrs)
                     .saturating_add(explode_name_label);
-                let multiplicity = dp.explicit_bounds.len().saturating_add(3);
-                let le_labels = dp
-                    .explicit_bounds
-                    .iter()
-                    .map(|b| label_bytes("le".len(), format_float_len(*b)))
-                    .fold(INF_LE_LABEL_BYTES, usize::saturating_add);
-                total = total
-                    .saturating_add(per_series.saturating_mul(multiplicity))
-                    .saturating_add(le_labels)
-                    .saturating_add(EXPLODE_UNFILLED_SLOT_BYTES);
+                total =
+                    total.saturating_add(histogram_point_bytes(per_series, &dp.explicit_bounds));
             }
             total
         }
@@ -363,20 +371,61 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 let per_series = prefix
                     .saturating_add(attrs)
                     .saturating_add(explode_name_label);
-                let multiplicity = dp.quantile_values.len().saturating_add(2);
-                let quantile_labels = dp
-                    .quantile_values
-                    .iter()
-                    .map(|q| label_bytes("quantile".len(), format_float_len(q.quantile)))
-                    .fold(0usize, usize::saturating_add);
-                total = total
-                    .saturating_add(per_series.saturating_mul(multiplicity))
-                    .saturating_add(quantile_labels)
-                    .saturating_add(EXPLODE_UNFILLED_SLOT_BYTES);
+                total = total.saturating_add(summary_point_bytes(
+                    per_series,
+                    dp.quantile_values.iter().map(|q| q.quantile),
+                ));
             }
             total
         }
     }
+}
+
+/// The `__name__` label of a family name `name_len` bytes long.
+pub const fn name_label_bytes(name_len: usize) -> usize {
+    label_bytes(METRIC_NAME_LABEL.len(), name_len)
+}
+
+/// The `__name__` label of any series a classic histogram or summary point
+/// explodes into, family name `name_len` bytes long: the longest suffix the
+/// explosion appends is charged on every series.
+pub const fn explode_name_label_bytes(name_len: usize) -> usize {
+    name_label_bytes(name_len).saturating_add(EXPLODE_SUFFIX_MAX_LEN)
+}
+
+/// Bytes one classic histogram point builds when exploded, given
+/// `per_series`, the prefix, attribute and
+/// [`explode_name_label_bytes`] charge every series of the point repeats:
+/// `bounds + 3` series (each bucket, `+Inf`, `_count`, `_sum`), each bucket's
+/// `le` label, and the slot `_count` and `_sum` reserve and leave empty.
+pub fn histogram_point_bytes(per_series: usize, bounds: &[f64]) -> usize {
+    let multiplicity = bounds.len().saturating_add(3);
+    let le_labels = bounds
+        .iter()
+        .map(|b| label_bytes("le".len(), format_float_len(*b)))
+        .fold(INF_LE_LABEL_BYTES, usize::saturating_add);
+    per_series
+        .saturating_mul(multiplicity)
+        .saturating_add(le_labels)
+        .saturating_add(EXPLODE_UNFILLED_SLOT_BYTES)
+}
+
+/// Bytes one summary point builds when exploded, given `per_series` as for
+/// [`histogram_point_bytes`]: `quantiles + 2` series (each quantile, `_count`,
+/// `_sum`), each `quantile` label, and the slot `_count` and `_sum` reserve
+/// and leave empty.
+pub fn summary_point_bytes(
+    per_series: usize,
+    quantiles: impl ExactSizeIterator<Item = f64>,
+) -> usize {
+    let multiplicity = quantiles.len().saturating_add(2);
+    let quantile_labels = quantiles
+        .map(|q| label_bytes("quantile".len(), format_float_len(q)))
+        .fold(0usize, usize::saturating_add);
+    per_series
+        .saturating_mul(multiplicity)
+        .saturating_add(quantile_labels)
+        .saturating_add(EXPLODE_UNFILLED_SLOT_BYTES)
 }
 
 /// Gauge, sum and exponential-histogram points: one label set per point,
