@@ -24,10 +24,11 @@ use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    load_generations,
+    load_view,
 };
 use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::router::WriteMode;
+use crate::format_floor::FormatFloorPolicy;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 use crate::span_shard::{SpanShardActor, SpanShardMsg, est_span_bytes};
@@ -356,6 +357,15 @@ impl SpanIngestRouter {
         self
     }
 
+    /// Sets what a flush below a tenant's recorded RSPAN format floor does
+    /// (ADR-1746 decisions 4 and 5); the span counterpart of
+    /// [`crate::IngestRouter::with_format_floor_policy`].
+    #[must_use]
+    pub fn with_format_floor_policy(self, policy: FormatFloorPolicy) -> Self {
+        self.switch.set_floor_policy(policy);
+        self
+    }
+
     /// Installs the shared process-wide ingest buffer byte budget (ADR-0069),
     /// and publishes its ceiling to this router's shard actors so the
     /// per-buffer memory backstop is a fraction of the configured limit rather
@@ -418,7 +428,7 @@ impl SpanIngestRouter {
         match self.switch.route_cached(tenant, now_ns) {
             Routed::Fresh(set) => Ok(set),
             Routed::Stale => {
-                match load_generations(
+                match load_view(
                     self.store.as_ref(),
                     ravel_types::Signal::Spans,
                     &tenant,
@@ -426,7 +436,7 @@ impl SpanIngestRouter {
                 )
                 .await
                 {
-                    Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
+                    Ok(view) => Ok(self.switch.refresh_view(tenant, view, now_ns)),
                     Err(_) => match self.switch.try_grace_extend(tenant, now_ns) {
                         Some(set) => {
                             self.metrics.record_grace_extended_stale_flush();

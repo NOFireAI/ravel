@@ -87,6 +87,12 @@ pub enum SpanWriteError {
     /// it to HTTP 429 with `Retry-After` / gRPC `RESOURCE_EXHAUSTED`.
     #[error("ingest shard flush deferral cap reached")]
     DeferralCapReached,
+    /// The span flush would have published an object below the tenant's
+    /// recorded format floor for its family (ADR-1746 decision 4); the
+    /// counterpart of [`crate::WriteError::BelowFormatFloor`]. Refused at flush
+    /// open, before any store call, with its records dropped. Retryable.
+    #[error(transparent)]
+    BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`SpanIngestRouter::write`](crate::SpanIngestRouter::write)
@@ -128,7 +134,8 @@ impl SpanWriteError {
             | SpanWriteError::StaleProvisioningView
             | SpanWriteError::BufferBudgetExceeded
             | SpanWriteError::PendingAckLimitReached
-            | SpanWriteError::DeferralCapReached => true,
+            | SpanWriteError::DeferralCapReached
+            | SpanWriteError::BelowFormatFloor(_) => true,
             SpanWriteError::SegmentBuild(_) => false,
             SpanWriteError::PartialWrite { inner, .. } => inner.is_retryable(),
         }

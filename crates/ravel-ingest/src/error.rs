@@ -109,6 +109,13 @@ pub enum WriteError {
     /// `RESOURCE_EXHAUSTED`.
     #[error("ingest shard flush deferral cap reached")]
     DeferralCapReached,
+    /// The flush would have published an object below the tenant's recorded
+    /// format floor for its family (ADR-1746 decision 4), so it was refused at
+    /// flush open, before any store call, and its rows were dropped. Retryable:
+    /// the refusal is a property of the writer's build, and a retry routed to a
+    /// writer that can write at the floor succeeds.
+    #[error(transparent)]
+    BelowFormatFloor(#[from] crate::format_floor::BelowFormatFloor),
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`IngestRouter::write`](crate::IngestRouter::write) call
@@ -151,7 +158,8 @@ impl WriteError {
             | WriteError::StaleProvisioningView
             | WriteError::BufferBudgetExceeded
             | WriteError::PendingAckLimitReached
-            | WriteError::DeferralCapReached => true,
+            | WriteError::DeferralCapReached
+            | WriteError::BelowFormatFloor(_) => true,
             WriteError::SegmentBuild(_)
             | WriteError::SeriesIdCollision(_)
             | WriteError::SeriesValueKindMismatch(_) => false,
