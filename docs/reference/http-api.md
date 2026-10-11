@@ -51,7 +51,7 @@ Served in `all` and `gateway` modes.
   `x-ravel-ingest-mode: buffered` header, on the OTLP routes only.
 - The same header picks a strict write's flush policy on the OTLP routes:
   `strict-arrival` opens the flush on arrival, `strict-aged` waits for the
-  age threshold. `strict`, an absent header, and any other value use the
+  age threshold or the size trigger. `strict`, an absent header, and any other value use the
   server's `--strict-flush-policy` (default `aged`). Both policies
   acknowledge on the same terms.
 - The request body limit is 16 MiB on the wire and 64 MiB after

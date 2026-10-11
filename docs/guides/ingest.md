@@ -161,9 +161,10 @@ with no header, and for an unknown value. Send `strict-arrival` or
 `strict-aged` to choose the policy for one request. Prometheus Remote Write
 reads no header and always uses the flag.
 
-- Latency: `arrival` drops the wait for the age threshold, so a strict
-  acknowledgement takes about one flush (the data and commit PUTs) instead
-  of up to `--max-flush-delay` plus that flush.
+- Latency: `arrival` drops the wait for the age threshold, so when your
+  tenant has no flush in flight on the shard a strict acknowledgement takes
+  about one flush (the data and commit PUTs) instead of up to
+  `--max-flush-delay` plus that flush.
 - PUT rate: `arrival` issues up to one flush per flush duration per shard
   and tenant instead of one per `--max-flush-delay`, so a tenant sending ten
   strict requests per second on one shard can pay up to 20 times the PUTs.
