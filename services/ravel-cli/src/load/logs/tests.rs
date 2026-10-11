@@ -3981,6 +3981,94 @@ async fn partial_window_failure_reports_every_batch_that_committed() {
     );
 }
 
+/// Issue #2753: a failed write reports at once even while a later write is
+/// still buffered. Two shards, `--target-bytes 5000 --pipeline-depth 2`, two
+/// 2-row batches: batch 1's rows carry 5,000-byte bodies on a stream routed
+/// to shard 0, so it reaches the target and flushes on size into a PUT that
+/// fails; batch 2's rows have 1-byte bodies on shard 1, below the target.
+/// The second submit fills the window, the loop resolves batch 1's failure,
+/// and the pinned clock never fires the age trigger, so only the harvest's
+/// own flush (`harvest_after_failure`) can publish batch 2: the load returns
+/// the flush failure with batch 2's one token durable.
+///
+/// Prove-the-test: delete the `router.flush_all().await` in
+/// `harvest_after_failure` and batch 2 waits until its Strict ack deadline
+/// expires on wall time; the harvest keeps only that write's recovered
+/// tokens, none, and the `durable.len()` assertion fails with 0.
+#[tokio::test]
+async fn a_failed_write_flushes_the_buffered_writes_before_it_reports() {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    let shards = 2;
+    let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+    let fat = "x".repeat(5_000);
+    let (_dir, pq) = write_parquet(&batch(vec![
+        ("ts", i64_col(vec![NOW_NS; 4])),
+        ("svc", str_col(vec!["api"; 4])),
+        (
+            "host",
+            str_col(vec![
+                hosts[0].as_str(),
+                hosts[0].as_str(),
+                hosts[1].as_str(),
+                hosts[1].as_str(),
+            ]),
+        ),
+        ("msg", str_col(vec![fat.as_str(), fat.as_str(), "y", "y"])),
+    ]));
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"msg\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+        )
+        .with_key_contains("/l0/0000/")
+        .with_occurrence(Occurrence::Always),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+    let err = load_instrumented(
+        fault.clone() as Arc<dyn ObjectStoreBackend>,
+        &pq,
+        "acme",
+        &m,
+        shards,
+        2,
+        0,
+        None,
+        2,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        5_000,
+        Some(DEFAULT_MAX_FLUSH_DELAY),
+        NOW_NS,
+        Arc::new(FixedClock(NOW_NS)),
+        LoadPath::Columnar,
+        None,
+        None,
+    )
+    .await
+    .expect_err("batch 1's permanent PUT failure fails the load");
+
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 1);
+    let LoadError::Flush { durable, .. } = &err else {
+        panic!("expected LoadError::Flush, got {err:?}");
+    };
+    assert_eq!(durable.len(), 1, "batch 2 acked: {durable:?}");
+    assert_eq!(durable[0].shard, 1);
+    let landed = list_data_objects(fault.as_ref()).await;
+    assert_eq!(landed.len(), 1, "{landed:?}");
+    assert!(landed[0].0.contains("/l0/0001/"), "{landed:?}");
+}
+
 /// `--skip-rows` (issue #1713): a positional resume with no idempotency
 /// marker. These tests exercise `load_instrumented` directly (rather than
 /// the public [`load`] wrapper, which hardcodes `skip_rows: 0` to avoid

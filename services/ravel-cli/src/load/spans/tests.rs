@@ -2110,10 +2110,24 @@ mod default_geometry {
         shards: u32,
         batch_rows: usize,
     ) -> SpansLoadReport {
-        let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
         let mut report = SpansLoadReport::default();
+        try_load_into(&mut report, store, pq, request, shards, batch_rows)
+            .await
+            .expect("load succeeds");
+        report
+    }
+
+    async fn try_load_into(
+        report: &mut SpansLoadReport,
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+    ) -> Result<(), LoadError> {
+        let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
         load_spans_into(
-            &mut report,
+            report,
             store,
             pq,
             "acme",
@@ -2129,8 +2143,6 @@ mod default_geometry {
             Arc::new(FixedClock(NOW_NS)),
         )
         .await
-        .expect("load succeeds");
-        report
     }
 
     fn host_derived() -> LoadMemoryRequest {
@@ -2484,5 +2496,75 @@ mod default_geometry {
         assert_eq!(shard_span_objects(store.as_ref(), shard_b).await, 1);
         assert_eq!(report.objects_written() as u64, mix.total());
         assert_eq!(report.realign_gave_up, 0);
+    }
+
+    /// Issue #2753: a failed write reports at once even while a later write
+    /// is still buffered. Two shards, `--target-bytes 2000 --pipeline-depth
+    /// 2`, two 2-span batches: batch 1's spans carry 1,000-byte names on a
+    /// trace routed to shard 0, so it reaches the target and flushes on
+    /// size into a PUT that fails; batch 2's spans are small and on shard 1,
+    /// below the target. The second submit fills the window, the loop
+    /// resolves batch 1's failure, and the pinned clock never fires the age
+    /// trigger, so only the harvest's own flush
+    /// (`harvest_sequential_after_failure`) can publish batch 2: the load
+    /// returns the flush failure with batch 2's one token durable.
+    ///
+    /// Prove-the-test: delete the `flush_buffered(router, enqueue).await` in
+    /// `harvest_sequential_after_failure` and batch 2 waits until its Strict
+    /// ack deadline expires on wall time; the harvest discards that write's
+    /// timeout and the `durable.len()` assertion fails with 0.
+    #[tokio::test]
+    async fn a_failed_write_flushes_the_buffered_writes_before_it_reports() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        const SHARDS: u32 = 2;
+        const TARGET: usize = 2_000;
+        let trace_on = |shard: u32| {
+            (0u64..)
+                .map(unique_trace)
+                .find(|t| ravel_ingest::shard_for_span(t, SHARDS) == shard)
+                .expect("some trace id routes to every shard")
+        };
+        let (a, b) = (trace_on(0), trace_on(1));
+        let fat = "x".repeat(1_000);
+        let (_dir, pq) = row_fixture(2, 2, |g, _| match g {
+            0 => (a, fat.clone()),
+            _ => (b, "op".to_string()),
+        });
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+            )
+            .with_key_contains("/s/l0/0000/")
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let mut report = SpansLoadReport::default();
+        let err = try_load_into(
+            &mut report,
+            fault.clone() as Arc<dyn ObjectStoreBackend>,
+            &pq,
+            GeometryRequest {
+                target_bytes: Some(TARGET),
+                pipeline_depth: Some(2),
+                load_memory: host_derived(),
+            },
+            SHARDS,
+            2,
+        )
+        .await
+        .expect_err("batch 1's permanent PUT failure fails the load");
+
+        assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 1);
+        let LoadError::Flush { durable, .. } = &err else {
+            panic!("expected LoadError::Flush, got {err:?}");
+        };
+        assert_eq!(durable.len(), 1, "batch 2 acked: {durable:?}");
+        assert_eq!(durable[0].shard, 1);
+        assert_eq!(shard_span_objects(fault.as_ref(), 1).await, 1);
+        assert_eq!(shard_span_objects(fault.as_ref(), 0).await, 0);
     }
 }

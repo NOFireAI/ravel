@@ -1049,6 +1049,18 @@ mod default_geometry {
         shards: u32,
         batch_rows: usize,
     ) -> MetricsLoadReport {
+        try_load_sharded(store, pq, request, shards, batch_rows)
+            .await
+            .expect("load succeeds")
+    }
+
+    async fn try_load_sharded(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+    ) -> Result<MetricsLoadReport, LoadError> {
         load_metrics_with(
             store,
             pq,
@@ -1065,7 +1077,6 @@ mod default_geometry {
             Arc::new(FixedClock(NOW_NS)),
         )
         .await
-        .expect("load succeeds")
     }
 
     fn host_derived() -> LoadMemoryRequest {
@@ -1401,5 +1412,59 @@ mod default_geometry {
         assert_eq!(shard_keys(store.as_ref(), shard_b).await.len(), 1);
         assert_eq!(report.objects_written() as u64, mix.total());
         assert_eq!(report.realign_gave_up, 0);
+    }
+
+    /// Issue #2753: a decode refusal at the default geometry reports at once.
+    /// Three 2-point batches on one shard, the third opening with a point a
+    /// day in the future, which the decoder rejects. The derived target is
+    /// far above the two buffered batches and the pinned clock never fires
+    /// the age trigger, so only the refusal path's own flush
+    /// (`drain_sequential_before_refusal`) can answer their acks: the load
+    /// returns the row rejection with both earlier batches durable as one
+    /// object.
+    ///
+    /// Prove-the-test: delete the `flush_buffered(router, enqueue).await` in
+    /// `drain_sequential_before_refusal` and nothing answers the buffered
+    /// acks until the Strict ack deadline expires on wall time; the drain
+    /// then fails, the rejection carries that failure's empty durable list,
+    /// and the `durable.len()` assertion fails with 0.
+    #[tokio::test]
+    async fn a_refused_batch_flushes_the_buffered_writes_before_it_reports() {
+        let host = "b000";
+        let mut ts: Vec<i64> = (0..6).map(|r| NOW_NS - 60_000_000_000 + r).collect();
+        ts[4] = NOW_NS + 86_400_000_000_000;
+        let (_dir, pq) = write_parquet(&batch(vec![
+            ("ts", i64_col(ts)),
+            (
+                "value",
+                Arc::new(Float64Array::from(vec![1.0; 6])) as ArrayRef,
+            ),
+            ("host", str_col(vec![host; 6])),
+        ]));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let err = try_load_sharded(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+            1,
+            2,
+        )
+        .await
+        .expect_err("row 4 is a day in the future");
+
+        let LoadError::RowRejected { row, durable, .. } = &err else {
+            panic!("expected the row rejection, got {err:?}");
+        };
+        assert_eq!(*row, 4);
+        assert_eq!(durable.len(), 2, "both earlier batches acked: {durable:?}");
+        assert_eq!(
+            stored_objects(store.as_ref()).await,
+            1,
+            "the refusal flush published the two buffered batches as one object"
+        );
     }
 }
