@@ -2555,7 +2555,8 @@ mod tests {
                 ParquetReadError::MemoryExhausted {
                     requested: 11,
                     reserved: 0,
-                    limit: 10
+                    limit: 10,
+                    cause: ravel_memory::ExhaustionCause::Accounted,
                 }
             ),
             "{err:?}"
