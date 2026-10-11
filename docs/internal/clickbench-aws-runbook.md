@@ -218,6 +218,18 @@ curl -s -H "X-aws-ec2-metadata-token: $T" \
   http://169.254.169.254/latest/meta-data/instance-type
 ```
 
+**With the kit.** `benchmarks/clickbench/kit/launch.sh run.toml` (copy
+`benchmarks/clickbench/kit/run.example.toml` and fill it in) replaces this
+section for an A/B pass. It refuses a band file that still holds a `FILL-IN`
+value, naming the key, and refuses with the role's name when
+`simulate-principal-policy` says the instance profile's role cannot read the
+run's `in/` prefix or write its `out/` prefix. It then uploads the kit to
+`s3://<bucket>/<prefix>/runs/<run-id>/in/` and launches one instance per arm
+under that run id, each with the instance profile, a 500 GB gp3 root volume,
+`--instance-initiated-shutdown-behavior terminate` and a user-data that arms
+`shutdown -h +600`. It prints the run id, both instance ids and the `out/`
+prefix; `--dry-run` prints every command and both user-data scripts instead.
+
 ## 6. Bootstrap the box
 
 Run as root. Builds the toolchain, both binaries, and downloads the dataset in
@@ -273,6 +285,15 @@ echo "BOOT DONE"
 
 `hits.parquet` is about 14 GB. Watch with `tail -f /root/bootstrap.log`; the
 run is finished when `/root/BOOT_DONE` or `/root/BOOT_FAILED` appears.
+
+**With the kit.** Nobody logs in. The user-data checks the sha256 of the kit
+and of every file in it, writes the arm name to `/root/kit/ARM` and starts
+`box/run.sh` under `nohup`; a failed check uploads `FAILED` to the arm's
+`out/` prefix and shuts the box down before `run.sh` starts. `run.sh` runs
+this section's packages, toolchain, clone of the arm's SHA and frame-pointer
+build itself, then the section 7 load, compact, fold and declare against a
+loopback RustFS store whose keys it generates on the box, so no SSM parameter
+is read. Each step is stamped in `/root/kit/progress.log`.
 
 ## 7. Load, compact, fold, declare
 
@@ -504,6 +525,17 @@ stock result records the `MemAvailable` reading next to the resolved
 against each other (an A/B, a regression check) pins `--memory-budget-bytes`
 to one value on both runs instead, so the budget is not the variable that
 differs between them.
+
+**With the kit.** `run.toml`'s `memory_budget_bytes` is that pinned value,
+the same on both arms. `box/run.sh` writes the binaries and every server flag
+to `/root/kit/arm.env` once and every server start sources it, so a restart
+runs the flags the first start ran. Its `benchmark` phase runs each statement
+cold (server restarted, page cache dropped) and then twice hot, and every
+call goes through `run_query`, which records it in
+`out/benchmark/calls.jsonl`. The box
+then writes `results.json`, `evidence.tgz` and `progress.log`, uploads them
+with `DONE` (or `FAILED`, naming the step) to its `out/<arm>/` prefix, and
+terminates itself.
 
 ## 9. Check the report before reading the headline
 
@@ -966,6 +998,17 @@ Rules that make a pass trustworthy:
   half, because the report counts GET requests, not distinct objects touched;
   the comment above that `SKIP` in the script gives the figures.
 
+**With the kit.** The bands are pre-registered in the lane's band file under
+`benchmarks/clickbench/bands/`, and the box asserts the absolute ones itself:
+a miss writes `DONE` with `bands=miss`. `benchmarks/clickbench/kit/fetch.sh
+--run-toml run.toml <run-id>` polls both arms' `out/` prefixes every 60 s (no
+single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
+each arm's absolute bands and then arm B's relative bands against arm A, and
+exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
+3 on timeout and 4 when S3 is unreachable. The script above reads
+`sql_latency_bench`'s `bench.json`, not the kit's `results.json`; the kit
+does not feed it.
+
 ## 10. Profiling a statement
 
 The `profiling` feature emits a flamegraph. Use `--runs 1` so one execution
@@ -1055,6 +1098,15 @@ aws ssm delete-parameter --name /ravel-clickbench/bucket
 ```
 
 An idle instance bills at its full on-demand rate. Stop it when a run finishes.
+
+**With the kit.** A kit box does not wait to be stopped: after uploading
+`DONE` or `FAILED` it terminates itself through the instance role, falling
+back to `shutdown -h now`, which the terminate behaviour turns into a
+termination, and the `shutdown -h +600` timer covers a box whose run hangs.
+Nothing on its volume is kept; the results live under the run's `out/`
+prefix. If `launch.sh` fails on the second arm, it terminates the first. The
+run's `s3://<bucket>/<prefix>/runs/<run-id>/` objects stay until removed
+with `aws s3 rm --recursive`.
 
 ## Troubleshooting
 

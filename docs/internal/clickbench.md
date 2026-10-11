@@ -955,7 +955,7 @@ It lives under `benchmarks/clickbench/parquet/`:
 |---|---|
 | `create.sql`, `queries.sql` | upstream text, never edited |
 | `suite.toml` | Ravel's `CREATE EXTERNAL TABLE` template and the per-statement comparator overrides |
-| `prereg.toml` | the pre-registered bar every report is judged against |
+| `prereg.toml` | a pointer: the pre-registered bar every report is judged against is `benchmarks/clickbench/bands/parquet.toml` |
 | `make-reference.sh` | writes datafusion-cli's answers to `ref/` |
 | `ref/` | those answers, checked in once generated |
 
@@ -1032,12 +1032,16 @@ a `Date32`, which is what both upstream's view and Ravel's
 reference that differs here compares Ravel with a different table. Commit
 `ref/` once it passes.
 
-### 3. Fill prereg.toml before any Ravel run
+### 3. Fill the band file before any Ravel run
 
-`prereg.toml` ships with `memory_cap_bytes`, `arm_b_hot_s` and `arm_b_cold_s`
-set to a placeholder string, and the bench refuses the file, naming each key,
-until all three are numbers. Fill them before the first suite run and commit
-the filled file with the reports:
+The lane's band file is `benchmarks/clickbench/bands/parquet.toml`, one band
+file per lane (ADR-2867 change 2); `parquet/prereg.toml` is a pointer to it
+and holds no key. The band file ships with `memory_cap_bytes`, `arm_b_hot_s`
+and `arm_b_cold_s` set to a placeholder string, and the bench refuses the
+file, naming each key, until all three are numbers. Fill them before the
+first suite run and commit the filled file with the reports. Its `#@
+relative.*` comment lines are the ClickBench kit's relative bands
+(`benchmarks/clickbench/kit/fetch.sh`); the bench ignores them as comments.
 
 - `memory_cap_bytes` is the per-query memory cap the pre-registered failures
   are stated against. Start the server once (step 5) and copy the
@@ -1050,7 +1054,7 @@ the filled file with the reports:
 `failures`, `rlog_hot_ceiling_s` and `concurrency_qps_floor` already hold
 D7's figures; change them only with a reason recorded on #2055. There is no
 error-ratio key: `concurrency_error_ratio_ceiling` was removed (issue
-#2055, step 7), and the bench refuses a `prereg.toml` that still carries it.
+#2055, step 7), and the bench refuses a band file that still carries it.
 
 ### 4. Build at one SHA
 
@@ -1119,7 +1123,7 @@ target/release/clickbench_parquet_bench \
   --server http://127.0.0.1:4318 --token-env TOKEN \
   --arm b --location s3://clickbench-parquet/hits.parquet \
   --reference benchmarks/clickbench/parquet/ref \
-  --prereg benchmarks/clickbench/parquet/prereg.toml \
+  --prereg benchmarks/clickbench/bands/parquet.toml \
   --server-log server.log --out arm-b.json \
   --sql-max-query-bytes <from server.log> --sql-tenant-max-bytes <from server.log>
 ```
@@ -1224,7 +1228,7 @@ checked.
 
 ### 8. Post the reports
 
-Post each arm's report on #2055 with the filled `prereg.toml`, the server
-log, the `CLONE_SHA` and the bench's exit code. A report is stamped when its
+Post each arm's report on #2055 with the filled `bands/parquet.toml`, the
+server log, the `CLONE_SHA` and the bench's exit code. A report is stamped when its
 `provenance` carries the five server settings, the reference's `VERSION`,
 and the mounted file count; one that exited 2 has no report to post.
