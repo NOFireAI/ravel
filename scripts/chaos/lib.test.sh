@@ -366,28 +366,30 @@ check "scenario 2 never seals from the last ack" "0" \
 # a baseline of 0 is a rise.
 # ---------------------------------------------------------------------------
 
-# Modelled on tracing's default fmt output for MergeInFlight::start in
-# crates/ravel-maintain/src/compact.rs, the publish line in publish.rs, and
-# the pass line in services/ravel-server/src/maintain.rs. The bucket= / key=
-# relation is pinned on the Rust side by
-# merge_start_line_names_the_prefix_of_the_published_key.
+# Modelled on tracing's default fmt output for MergeInFlight::start and its
+# Drop in crates/ravel-maintain/src/compact.rs, the publish line in
+# publish.rs, and the pass line in services/ravel-server/src/maintain.rs. The
+# bucket= / key= relation and the end line's outcomes are pinned on the Rust
+# side by crates/ravel-maintain/tests/compactions_in_flight_gauge.rs.
 BUCKET_X='t/0123456789abcdef/m/c/0001/2026101004/'
 BUCKET_Y='t/0123456789abcdef/m/c/0002/2026101004/'
 BUCKET_Z='t/0123456789abcdef/m/c/0003/2026101004/'
 start_line() { printf '2026-10-10T05:30:00Z  INFO ravel_maintain::compact: compaction merge started bucket=%s\n' "$1"; }
 pub_line() { printf '2026-10-10T05:30:01Z  INFO ravel_maintain::publish: compaction record published key=%sl1.00112233445566ff.cmt parts=1\n' "$1"; }
+# Args: bucket [outcome, default published].
+end_line() { printf '2026-10-10T05:30:01Z  INFO ravel_maintain::compact: compaction merge ended bucket=%s outcome=%s\n' "$1" "${2:-published}"; }
 PUB_LINE="$(pub_line "${BUCKET_X}")"
 OTHER_LINE='2026-10-10T05:29:00Z  INFO ravel_server: other work'
 pass_line() { printf '2026-10-10T05:30:0%sZ  INFO ravel_server::maintain: maintenance: retention + compaction pass complete tenant=ab signal=Metrics shard=%s retired=0 compacted=%s already_done=0 not_sealed=0\n' "$1" "$1" "$2"; }
 # A published X, then started Y and was killed merging it.
 LOG_A_MERGING="${SCRATCH}/a-merging.log"
-{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; } >"${LOG_A_MERGING}"
+{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; end_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; } >"${LOG_A_MERGING}"
 # A was killed in its first merge, Y, having published nothing.
 LOG_A_FIRST="${SCRATCH}/a-first.log"
 { printf '%s\n' "${OTHER_LINE}"; start_line "${BUCKET_Y}"; } >"${LOG_A_FIRST}"
-# A published every merge it started.
+# A ended every merge it started.
 LOG_A_ALL_DONE="${SCRATCH}/a-all-done.log"
-{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; pass_line 0 1; } >"${LOG_A_ALL_DONE}"
+{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; end_line "${BUCKET_X}"; pass_line 0 1; } >"${LOG_A_ALL_DONE}"
 # A started no merge at all.
 LOG_A_NO_START="${SCRATCH}/a-no-start.log"
 { printf '%s\n' "${OTHER_LINE}"; pass_line 0 0; } >"${LOG_A_NO_START}"
@@ -402,23 +404,42 @@ LOG_B_SAME="${SCRATCH}/b-same.log"
 # B published Y only before the kill.
 LOG_B_PRE_KILL="${SCRATCH}/b-pre-kill.log"
 { pub_line "${BUCKET_Y}"; printf '%s\n' "${OTHER_LINE}"; } >"${LOG_B_PRE_KILL}"
+# B started Y after the kill and has not published it.
+LOG_B_STARTED="${SCRATCH}/b-started.log"
+{ printf '%s\n' "${OTHER_LINE}"; start_line "${BUCKET_Y}"; } >"${LOG_B_STARTED}"
 
 interrupted() { local out rc=0; out="$(chaos_interrupted_bucket "$@")" || rc=$?; printf 'rc=%s %s\n' "${rc}" "${out}"; }
-check "interrupted: the last start with no publish after it" "rc=0 ${BUCKET_Y}" \
+check "interrupted: the last start with no end line after it" "rc=0 ${BUCKET_Y}" \
   "$(interrupted "${LOG_A_MERGING}")"
-check "interrupted: a first merge with no publish at all" "rc=0 ${BUCKET_Y}" \
+check "interrupted: a first merge with no end line at all" "rc=0 ${BUCKET_Y}" \
   "$(interrupted "${LOG_A_FIRST}")"
-check "interrupted: every start published is none" "rc=1 " "$(interrupted "${LOG_A_ALL_DONE}")"
+check "interrupted: every start ended is none" "rc=1 " "$(interrupted "${LOG_A_ALL_DONE}")"
 check "interrupted: no start line is none" "rc=1 " "$(interrupted "${LOG_A_NO_START}")"
 check "interrupted: a missing log is none" "rc=1 " "$(interrupted "${SCRATCH}/no-such.log")"
 LOG_A_CONCURRENT="${SCRATCH}/a-concurrent.log"
-{ start_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; pub_line "${BUCKET_Y}"; } >"${LOG_A_CONCURRENT}"
-check "interrupted: concurrent merges, the later one published, the earlier is interrupted" \
+{ start_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; pub_line "${BUCKET_Y}"; end_line "${BUCKET_Y}"; } >"${LOG_A_CONCURRENT}"
+check "interrupted: concurrent merges, the later one ended, the earlier is interrupted" \
   "rc=0 ${BUCKET_X}" "$(interrupted "${LOG_A_CONCURRENT}")"
 LOG_A_RESTART="${SCRATCH}/a-restart.log"
-{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; start_line "${BUCKET_X}"; } >"${LOG_A_RESTART}"
-check "interrupted: a publish before a later start of the same bucket does not match it" \
+{ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; end_line "${BUCKET_X}"; start_line "${BUCKET_X}"; } >"${LOG_A_RESTART}"
+check "interrupted: an end before a later start of the same bucket does not end it" \
   "rc=0 ${BUCKET_X}" "$(interrupted "${LOG_A_RESTART}")"
+# A merge of X that started after the one of Y and ended without a publish
+# must not shadow Y, which was still open at the kill.
+LOG_A_LATER_FAILED="${SCRATCH}/a-later-failed.log"
+{ start_line "${BUCKET_Y}"; start_line "${BUCKET_X}"; end_line "${BUCKET_X}" failed; } >"${LOG_A_LATER_FAILED}"
+check "interrupted: a later merge that ended failed does not shadow an earlier unended one" \
+  "rc=0 ${BUCKET_Y}" "$(interrupted "${LOG_A_LATER_FAILED}")"
+for outcome in published converged abandoned skipped held failed cancelled dry-run dropped; do
+  check "interrupted: an end line with outcome=${outcome} ends its merge" "rc=1 " \
+    "$(interrupted <({ start_line "${BUCKET_X}"; end_line "${BUCKET_X}" "${outcome}"; }))"
+done
+check "interrupted: a publish with no end line leaves the merge open (killed after the publish)" \
+  "rc=0 ${BUCKET_X}" "$(interrupted <({ start_line "${BUCKET_X}"; pub_line "${BUCKET_X}"; }))"
+check "interrupted: another bucket's end line does not end it" "rc=0 ${BUCKET_X}" \
+  "$(interrupted <({ start_line "${BUCKET_X}"; end_line "${BUCKET_Y}"; }))"
+check "interrupted: one end closes one of two starts of the same bucket" "rc=0 ${BUCKET_X}" \
+  "$(interrupted <({ start_line "${BUCKET_X}"; start_line "${BUCKET_X}"; end_line "${BUCKET_X}"; }))"
 LOG_A_ANSI="${SCRATCH}/a-ansi.log"
 printf '\e[32m INFO\e[0m \e[2mravel_maintain::compact\e[0m\e[2m:\e[0m compaction merge started \e[3mbucket\e[0m\e[2m=\e[0m%s\n' \
   "${BUCKET_Y}" >"${LOG_A_ANSI}"
@@ -434,6 +455,66 @@ check "published: a publish before the line count does not count" "1" \
 check "published: a prefix of a longer bucket does not count" "1" \
   "$(published "${LOG_B_SAME}" 1 't/0123456789abcdef/m/c/')"
 check "published: an empty bucket never counts" "1" "$(published "${LOG_B_SAME}" 0 "")"
+started() { rc_of chaos_started_bucket_since "$@"; }
+check "started: a start of the bucket past the line count" "0" \
+  "$(started "${LOG_B_STARTED}" 1 "${BUCKET_Y}")"
+check "started: a start before the line count does not count" "1" \
+  "$(started "${LOG_B_STARTED}" 2 "${BUCKET_Y}")"
+check "started: a start of another bucket does not count" "1" \
+  "$(started "${LOG_B_STARTED}" 1 "${BUCKET_X}")"
+check "started: a publish is not a start" "1" "$(started "${LOG_B_SAME}" 1 "${BUCKET_Y}")"
+
+# Merge durations, paired per log, from tracing's UTC timestamps.
+LOG_DUR_A="${SCRATCH}/dur-a.log"
+{
+  printf '2026-10-10T05:30:00.000000Z  INFO x: compaction merge started bucket=%s\n' "${BUCKET_X}"
+  printf '2026-10-10T05:30:01Z  INFO x: compaction merge started bucket=%s\n' "${BUCKET_Y}"
+  printf '2026-10-10T05:30:02.500000Z  INFO x: compaction merge ended bucket=%s outcome=published\n' "${BUCKET_X}"
+  printf '2026-10-10T05:30:11Z  INFO x: compaction merge ended bucket=%s outcome=failed\n' "${BUCKET_Y}"
+  printf '2026-10-10T05:31:00Z  INFO x: compaction merge started bucket=%s\n' "${BUCKET_Z}"
+} >"${LOG_DUR_A}"
+LOG_DUR_B="${SCRATCH}/dur-b.log"
+{
+  printf '2026-10-31T23:59:59Z  INFO x: compaction merge started bucket=%s\n' "${BUCKET_Z}"
+  printf '2026-11-01T00:00:03Z  INFO x: compaction merge ended bucket=%s outcome=published\n' "${BUCKET_Z}"
+} >"${LOG_DUR_B}"
+check "durations: each log paired on its own, an unended start left out" \
+  "2.500 10.000 4.000" "$(chaos_merge_durations "${LOG_DUR_A}" "${LOG_DUR_B}" | tr '\n' ' ' | sed 's/ $//')"
+check "durations: the summary line, nearest-rank p50" "merge durations: n=3 p50=4.000 max=10.000" \
+  "$(chaos_merge_durations_line "${LOG_DUR_A}" "${LOG_DUR_B}")"
+check "durations: nothing paired" "merge durations: n=0 p50=none max=none" \
+  "$(chaos_merge_durations_line "${LOG_A_FIRST}" "${SCRATCH}/no-such.log")"
+check "durations: a line with no timestamp pairs nothing" "merge durations: n=0 p50=none max=none" \
+  "$(chaos_merge_durations_line <(printf 'INFO compaction merge started bucket=a/\nINFO compaction merge ended bucket=a/ outcome=failed\n'))"
+
+# The store LIST behind the conservation verdict goes through chaos_aws,
+# replaced here like curl. AWS_MODE: absent (no key under the prefix, which
+# the AWS CLI prints as None), present (a record and a non-record key under
+# it), or error (the CLI's exit 255).
+AWS_ARGS_FILE="${SCRATCH}/aws-args"
+AWS_MODE="absent"
+chaos_aws() {
+  printf '%s\n' "$@" >"${AWS_ARGS_FILE}"
+  local prefix="" prev="" arg
+  for arg in "$@"; do
+    [[ "${prev}" == "--prefix" ]] && prefix="${arg}"
+    prev="${arg}"
+  done
+  case "${AWS_MODE}" in
+    absent) printf 'None\n' ;;
+    present) printf '%s00112233445566ff.cmt\t%s00112233445566ff.tmp\n' "${prefix}" "${prefix}" ;;
+    error) return 255 ;;
+  esac
+}
+records() { local out rc=0; out="$(chaos_compaction_records_under "$@")" || rc=$?; printf 'rc=%s %s\n' "${rc}" "${out}"; }
+check "records: a .cmt key under the prefix counts, another key does not" "rc=0 1" \
+  "$(AWS_MODE=present records "${BUCKET_Y}")"
+check "records: an empty LIST is 0" "rc=0 0" "$(AWS_MODE=absent records "${BUCKET_Y}")"
+check "records: a LIST that fails returns the CLI's code and prints nothing" "rc=255 " \
+  "$(AWS_MODE=error records "${BUCKET_Y}")"
+AWS_MODE=absent records "${BUCKET_Y}" >/dev/null
+check "records: the LIST is of <bucket>l1. in the chaos bucket" "yes" \
+  "$(grep -qxF -- "${BUCKET_Y}l1." "${AWS_ARGS_FILE}" && grep -qxF -- "${RAVEL_S3_BUCKET}" "${AWS_ARGS_FILE}" && grep -qxF list-objects-v2 "${AWS_ARGS_FILE}" && echo yes || echo no)"
 
 # The scenario-2 trigger reads ravel_maintain_compactions_in_flight, as
 # render_maintain_ownership_family renders it.
@@ -460,18 +541,45 @@ check "in-flight trigger records the units owned it read" "4" \
   "$(METRICS_SAMPLE="$(inflight_body 1)" wait_for_compaction_in_flight http://stub 1 >/dev/null 2>&1; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
 
 # Args: A's log, B's log, aborts baseline, CHAOS_KILL_ON_GAUGE. B's line
-# count at the kill is 1, and the wait is 0 (one read).
+# count at the kill is 1, and the wait is 0 (one read). The store LIST reads
+# AWS_MODE, absent unless a case sets it: a case where B published sets
+# present too, as the store would be after that publish.
 cons() {
   CHAOS_KILL_ON_GAUGE="${4:-1}" rc_of oracle_conservation_or_unmeasured "$1" http://stub "${3:-1}" "$2" 1
 }
 check "classifier: B published another bucket after the kill, not A's, fails" "1" \
   "$(cons "${LOG_A_MERGING}" "${LOG_B_OTHER}")"
 check "classifier: B published A's interrupted bucket after the kill passes" "0" \
-  "$(cons "${LOG_A_MERGING}" "${LOG_B_SAME}")"
-check "classifier: gauge seen, A killed in its first merge, B silent fails" "1" \
+  "$(AWS_MODE=present cons "${LOG_A_MERGING}" "${LOG_B_SAME}")"
+check "classifier: gauge seen, A killed in its first merge, B silent, no record fails" "1" \
   "$(cons "${LOG_A_FIRST}" "${LOG_B_SILENT}")"
 check "classifier: gauge seen, A killed in its first merge, B published it passes" "0" \
-  "$(cons "${LOG_A_FIRST}" "${LOG_B_SAME}")"
+  "$(AWS_MODE=present cons "${LOG_A_FIRST}" "${LOG_B_SAME}")"
+check "classifier: the store holds the bucket's record and B is silent passes" "0" \
+  "$(AWS_MODE=present cons "${LOG_A_FIRST}" "${LOG_B_SILENT}")"
+check "classifier: B's publish line with no record in the store fails" "1" \
+  "$(AWS_MODE=absent cons "${LOG_A_FIRST}" "${LOG_B_SAME}")"
+check "classifier: a LIST that fails is could-not-measure (3), even with a B publish" "3" \
+  "$(AWS_MODE=error cons "${LOG_A_FIRST}" "${LOG_B_SAME}")"
+check "classifier: a LIST that fails never hides risen aborts" "1" \
+  "$(AWS_MODE=error cons "${LOG_A_FIRST}" "${LOG_B_SAME}" 0)"
+check "classifier: a later failed merge in A's log does not shadow the interrupted one" "0" \
+  "$(AWS_MODE=present cons "${LOG_A_LATER_FAILED}" "${LOG_B_SAME}")"
+# The FAIL detail says whether B started the bucket, and carries the
+# durations line. Args: B's log.
+cons_detail() {
+  (
+    ORACLE_FAIL=()
+    CHAOS_KILL_ON_GAUGE=1 oracle_conservation_or_unmeasured "${LOG_A_FIRST}" http://stub 1 "$1" 1 >/dev/null 2>&1
+    printf '%s\n' "${ORACLE_FAIL[*]}"
+  )
+}
+check "classifier: a FAIL with B having started the bucket says so" "yes" \
+  "$(d="$(cons_detail "${LOG_B_STARTED}")"; [[ "${d}" == *"merge start of ${BUCKET_Y}: yes; publish line: no;"* && "${d}" == *"merge durations: n=0 p50=none max=none"* ]] && echo yes || echo no)"
+check "classifier: a FAIL with B never having started the bucket says so" "yes" \
+  "$(d="$(cons_detail "${LOG_B_SILENT}")"; [[ "${d}" == *"merge start of ${BUCKET_Y}: no; publish line: no;"* ]] && echo yes || echo no)"
+check "classifier: the oracle logs the durations line" "yes" \
+  "$(d="$(CHAOS_KILL_ON_GAUGE=1 oracle_conservation_or_unmeasured "${LOG_DUR_A}" http://stub 1 "${LOG_DUR_B}" 0 2>&1 >/dev/null)"; [[ "${d}" == *'conservation: merge durations: n=3 p50=4.000 max=10.000'* ]] && echo yes || echo no)"
 check "classifier: gauge never seen is could-not-measure (3)" "3" \
   "$(cons "${LOG_A_FIRST}" "${LOG_B_SILENT}" 1 0)"
 check "classifier: gauge never seen is could-not-measure even with a B publish" "3" \
@@ -566,7 +674,11 @@ check "summary: B aborts rose while A finished and published is exit 2, conserva
 check "summary: A interrupted in Y, B published only Z is exit 2" "rc=2 conservation-fail=1" \
   "$(scenario2_summary "${LOG_A_MERGING}" "${LOG_B_OTHER}" 1 "")"
 check "summary: A interrupted in Y, B published Y is exit 0" "rc=0 conservation-fail=0" \
-  "$(scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SAME}" 1 "")"
+  "$(AWS_MODE=present scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SAME}" 1 "")"
+check "summary: A interrupted in Y, Y's record in the store, B silent is exit 0" "rc=0 conservation-fail=0" \
+  "$(AWS_MODE=present scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SILENT}" 1 "")"
+check "summary: a LIST that fails with nothing else failed exits 3" "rc=3 conservation-fail=0" \
+  "$(AWS_MODE=error scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SAME}" 1 "")"
 
 scenario2_body="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"
 universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"
@@ -584,19 +696,20 @@ check "scenario 2 headers make no 'provably' claim" "no" \
 check "scenario 2 triggers on the gauge, not on worker A's log" "yes" \
   "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
 
-# The conservation oracle waits, from the kill, for a survivor publish of A's
-# interrupted bucket that lands after the kill line. Args: A's log, B's log,
-# wait seconds. B's log starts as one pre-kill line, so the kill line count
-# is 1. The gauge was seen unless a case says otherwise.
+# The conservation oracle waits, from the kill, until the bound or a survivor
+# publish of A's interrupted bucket that lands after the kill line, then
+# lists the store. Args: A's log, B's log, wait seconds. B's log starts as one
+# pre-kill line, so the kill line count is 1. Each case sets
+# CHAOS_KILL_ON_GAUGE, and AWS_MODE when the store holds the record.
 LOG_B_WAIT="${SCRATCH}/b-wait.log"
 cons_wait() {
-  CHAOS_KILL_ON_GAUGE="${CHAOS_KILL_ON_GAUGE:-1}" CHAOS_CONSERVATION_WAIT_SECONDS="$3" \
+  CHAOS_CONSERVATION_WAIT_SECONDS="$3" \
     rc_of oracle_conservation_or_unmeasured "$1" http://stub 1 "$2" 1 "$(date +%s)"
 }
 printf '%s\n' "${OTHER_LINE}" >"${LOG_B_WAIT}"
 ( sleep 1; pub_line "${BUCKET_Y}" >>"${LOG_B_WAIT}" ) &
 check "conservation wait: a publish of A's bucket landing during the wait passes" "0" \
-  "$(CHAOS_KILL_ON_GAUGE=1 cons_wait "${LOG_A_FIRST}" "${LOG_B_WAIT}" 5)"
+  "$(AWS_MODE=present CHAOS_KILL_ON_GAUGE=1 cons_wait "${LOG_A_FIRST}" "${LOG_B_WAIT}" 5)"
 wait
 cons_wait_timed() {
   local t0 rc
@@ -605,8 +718,14 @@ cons_wait_timed() {
   printf 'rc=%s waited=%s\n' "${rc}" "$([[ $(( $(date +%s) - t0 )) -ge "$3" ]] && echo yes || echo no)"
 }
 printf '%s\n' "${OTHER_LINE}" >"${LOG_B_WAIT}"
-check "conservation wait: no publish of A's bucket by the bound fails after waiting" "rc=1 waited=yes" \
-  "$(CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: no record of A's bucket by the bound fails after waiting" "rc=1 waited=yes" \
+  "$(AWS_MODE=absent CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: a record in the store with B silent passes after the bound" "rc=0 waited=yes" \
+  "$(AWS_MODE=present CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: a LIST that fails after the bound is could-not-measure" "rc=3 waited=yes" \
+  "$(AWS_MODE=error CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: B's publish of A's bucket ends the wait early" "rc=0 waited=no" \
+  "$(AWS_MODE=present CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_FIRST}" "${LOG_B_SAME}" 3)"
 check "conservation wait: B's own publishes do not end the wait" "rc=1 waited=yes" \
   "$(CHAOS_KILL_ON_GAUGE=1 cons_wait_timed "${LOG_A_MERGING}" "${LOG_B_OTHER}" 2)"
 check "conservation wait: a pre-kill publish does not end the wait" "rc=1 waited=yes" \

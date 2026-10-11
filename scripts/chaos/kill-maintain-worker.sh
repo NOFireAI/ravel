@@ -33,13 +33,16 @@
 # warning, and CHAOS_KILL_ON_GAUGE is 0.
 #
 # CONSERVATION: after the kill, A's log names the bucket it was merging: its
-# last "compaction merge started" line whose bucket has no later "compaction
-# record published" line. The oracle passes only on a survivor publish of
-# that bucket after the kill, and waits for it up to
+# latest "compaction merge started" line with no "compaction merge ended"
+# line for the same bucket. The oracle waits up to
 # chaos_conservation_wait_seconds from the kill (the takeover bound, one more
 # tick, and CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS; 1080 s at the
-# defaults). With the gauge seen and the bucket known, no such publish by
-# then is a FAIL; without either, the run could not measure conservation.
+# defaults), ending the wait early on a survivor publish line for that
+# bucket, then lists `<bucket>l1.` in the store: a compaction record there
+# passes, whichever worker wrote it. With the gauge seen and the bucket known,
+# no record by then is a FAIL; without either, or with a LIST that fails, the
+# run could not measure conservation. It also logs the merge durations it can
+# pair from both workers' logs and whether the survivor started the bucket.
 #
 # SEAL WAIT: an ingest hour is compactable once the compactor's seal margin
 # has passed the end of the hour (CompactorConfig::seal_margin_ns, 3900 s at
@@ -60,7 +63,8 @@
 # parseable `seal_margin_secs=`, or when conservation could not be measured
 # and no other assertion failed. Could-not-measure means the survivor's
 # conservation-abort counter did not rise and either the kill did not fire on
-# the gauge or worker A's log at the kill names no interrupted bucket
+# the gauge, worker A's log at the kill names no interrupted bucket, or the
+# store LIST of that bucket's compaction records failed
 # (oracle_conservation_or_unmeasured in lib.sh); 64 on a usage error.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
@@ -140,7 +144,7 @@ if [[ "$MODE" == "check" ]]; then
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
   echo "mid-compaction trigger: worker A ravel_maintain_compactions_in_flight>=1, scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape"
-  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance) for a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}' of the bucket worker A's last unmatched '${CHAOS_COMPACTION_START_MARKER}' names"
+  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance, ended early by a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'), then a store LIST of <bucket>l1. for a compaction record of the bucket worker A's latest unended '${CHAOS_COMPACTION_START_MARKER}' names"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
   echo "load: ${EXPORT_COUNT} exports of ${CHAOS_MAINTAIN_FIXTURE_SERIES} series x ${CHAOS_MAINTAIN_FIXTURE_POINTS} points, at most one per ${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS}s"
   echo "seal wait: end of the ingest server's exit hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
@@ -330,8 +334,8 @@ log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; worker A's interrupted bucket: $(cha
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
 oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
 # Worker A is dead, so its log is its state at the kill: the bucket it was
-# merging, read from it, is the one the survivor must publish. The oracle
-# also reads CHAOS_KILL_ON_GAUGE, set above.
+# merging, read from it, is the one the store must hold a compaction record
+# for. The oracle also reads CHAOS_KILL_ON_GAUGE, set above.
 oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
   "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
