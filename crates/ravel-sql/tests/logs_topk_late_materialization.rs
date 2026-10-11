@@ -418,6 +418,10 @@ struct Setup {
     partitions: usize,
     /// Row group size in blocks; `None` is the writer's default.
     group_blocks: Option<usize>,
+    /// Zero the fetcher's plan bound so every segment is planned. Off, every
+    /// fixture object is under the default bound and is opened once without a
+    /// plan read (ADR-2677 decision 2).
+    planned: bool,
 }
 
 impl Setup {
@@ -429,7 +433,12 @@ impl Setup {
             cache: true,
             partitions: 1,
             group_blocks: None,
+            planned: false,
         }
+    }
+    fn planned(mut self) -> Self {
+        self.planned = true;
+        self
     }
     fn rule(mut self, rule: bool) -> Self {
         self.rule = rule;
@@ -469,6 +478,7 @@ async fn run(sql: &str, setup: Setup) -> Run {
         tied,
         cache,
         group_blocks,
+        planned,
         ..
     } = setup;
     let base = Arc::new(MemoryStore::new());
@@ -477,6 +487,11 @@ async fn run(sql: &str, setup: Setup) -> Run {
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let accounting = QueryAccounting::new();
     let fetcher = LogSegmentFetcher::new(store);
+    let fetcher = if planned {
+        fetcher.with_block_range_threshold(0)
+    } else {
+        fetcher
+    };
     let fetcher = if cache {
         fetcher.with_cache(read_cache())
     } else {
@@ -813,34 +828,44 @@ async fn a_predicate_matching_nothing_fetches_no_block() {
 }
 
 /// A `has_word` predicate IS pushed into the fetch as an exact content arm, so
-/// the scan takes the plan-then-stripe path and a partition's block-index list
-/// is explicit rather than empty. The row refs must address the same rows
-/// through it.
+/// the scan leaves the whole-segment fast path and a segment's block list is
+/// its pruned survivors rather than every block. The row refs must address the
+/// same rows through it on both routes: planned, where the plan phase lists
+/// the survivors, and unplanned (ADR-2677 decision 2), where the one open
+/// prunes them and a row ref's position indexes that open's survivor list.
 #[tokio::test]
 async fn has_word_reaches_the_same_rows_through_the_striped_path() {
     let sql = format!("SELECT * FROM logs WHERE has_word(body, '{NEEDLE}') ORDER BY ts LIMIT 4");
-    let with = run(&sql, Setup::new()).await;
     let without = run(&sql, Setup::new().rule(false)).await;
-    report("has_word rule=on", &with);
     report("has_word rule=off", &without);
-
-    assert!(with.has_fetch_node(), "the rule fires:\n{}", with.explain);
     // The content arm is bloom-pruned at decode, so only the ten blocks
     // holding a match can be scanned. The first four of them fill the TopK
     // (indices 0, 7, 14, 21), and its threshold then skips the other six
     // (ADR-2677 decision 6): the remaining block of segment 1 starts at index
-    // 28, and segments 2 and 3 start at 32 and 48.
-    assert_eq!(
-        with.blocks_scanned, 4,
-        "the four winners' blocks are scanned, the six later matches skipped"
-    );
-    assert_eq!(with.blocks_total, TOTAL_BLOCKS);
-    assert_eq!(with.row_count(), 4);
-    assert_eq!(
-        with.blocks_fetched, 4,
-        "four winners in four distinct blocks"
-    );
-    assert_eq!(with.rows, without.rows, "the rewrite changed the result");
+    // 28, and segments 2 and 3 start at 32 and 48. Unplanned, segments 2 and 3
+    // are never opened, so their blocks are not in `blocks_total`.
+    for (setup, route, blocks_total) in [
+        (Setup::new().planned(), "planned", TOTAL_BLOCKS),
+        (Setup::new(), "unplanned", 2 * BLOCKS_PER_SEG),
+    ] {
+        let with = run(&sql, setup).await;
+        report(&format!("has_word rule=on {route}"), &with);
+        assert!(with.has_fetch_node(), "the rule fires:\n{}", with.explain);
+        assert_eq!(
+            with.blocks_scanned, 4,
+            "{route}: the four winners' blocks are scanned, the six later matches skipped"
+        );
+        assert_eq!(with.blocks_total, blocks_total, "{route}");
+        assert_eq!(with.row_count(), 4, "{route}");
+        assert_eq!(
+            with.blocks_fetched, 4,
+            "{route}: four winners in four distinct blocks"
+        );
+        assert_eq!(
+            with.rows, without.rows,
+            "{route}: the rewrite changed the result"
+        );
+    }
 }
 
 /// The same `has_word` statement fanned across four partitions. With the

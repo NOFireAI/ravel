@@ -689,16 +689,27 @@ is resolved against the object's own FIELD_DIR
 A predicate the skip index cannot decide (a `has_word`/text arm, which bloom
 prunes only at decode; an `attrs['k']='v'` POSTINGS equality; a stream filter)
 still reads the whole object in the plan phase and is counted in the
-`plan_full_reads` metric, so a report can see which statements still pay it. A
-segment at or below the larger of the block-range threshold and the projection
-break-even (set under `cost-based` only, below) counts there too: the fetch
-reads such an object whole in one GET regardless, so planning it from the skip
-index would cost a second read rather than save one
+`plan_full_reads` metric, so a report can see which statements still pay it.
+
+The planned route covers only segments above
+`LogSegmentFetcher::plan_whole_object_bound`, the larger of the block-range
+threshold and the projection break-even (set under `cost-based` only, below)
+(ADR-2677 decision 2). The fetch reads an object at or under that bound whole
+in one GET regardless, so planning it would cost a second read rather than save
+one. Such a segment is never planned: the plan pass issues no read for it and
+it is not counted in `plan_full_reads`, `owned_work` gives it whole to one
+partition, and that partition opens it with one whole-object GET and prunes
+blocks from the directory it already holds (`RlogReader::scan_pruned`), taking
+the survivor list for row refs from that open. `LogsScanExec` publishes
+`segments_unplanned` with the count. The TopK threshold skip applies to it
+before the open, so a skipped one is never read. With a read cache wired, such
+a segment is no longer striped across partitions. `plan_segment` itself still
+reads an object under the bound whole for a direct caller
 (`the_planned_route_reads_an_object_under_the_break_even_whole`). Above the
-break-even the planned route probes before the scan's coverage crossover
-decides, and it does not weigh the projected fraction, so a wide statement
-whose surviving ranges cover at least 75% of the object pays the probe and
-then reads it whole.
+bound the planned route probes before the scan's coverage crossover decides,
+and it does not weigh the projected fraction, so a wide statement whose
+surviving ranges cover at least 75% of the object pays the probe and then reads
+it whole.
 
 That plan-phase whole-object read is carried forward into the scan
 (`ravel_query::CarriedWholeObject`) for the first `plan_concurrency`

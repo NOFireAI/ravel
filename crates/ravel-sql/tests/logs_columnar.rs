@@ -414,10 +414,14 @@ async fn run_scan(
 
 /// A logs fetcher with ADR-0046's read cache wired, sized to hold any fixture
 /// in this file with room to spare so the striping's repeated whole-object reads
-/// coalesce rather than evict each other.
+/// coalesce rather than evict each other. Its plan bound is zero: an object at
+/// or under the bound is not planned and so not striped (ADR-2677 decision 2),
+/// and every fixture object here is under the default bound.
 fn cached_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
     let cache: Cache<CacheFetchError> = Cache::new(CacheLimits::new(1 << 26, 1 << 20, 1 << 26));
-    LogSegmentFetcher::new(store).with_cache(Arc::new(cache))
+    LogSegmentFetcher::new(store)
+        .with_cache(Arc::new(cache))
+        .with_block_range_threshold(0)
 }
 
 /// The result of executing a `LogsScanExec` across ALL of its declared

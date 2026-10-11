@@ -63,10 +63,12 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::TableProvider;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, col, lit};
@@ -545,6 +547,8 @@ struct CountingStore {
     suffix: AtomicU64,
     range: AtomicU64,
     bytes: AtomicU64,
+    /// GETs per key, any range.
+    per_key: Mutex<BTreeMap<String, u64>>,
 }
 
 impl CountingStore {
@@ -555,7 +559,11 @@ impl CountingStore {
             suffix: AtomicU64::new(0),
             range: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            per_key: Mutex::new(BTreeMap::new()),
         })
+    }
+    fn gets_per_key(&self) -> BTreeMap<String, u64> {
+        self.per_key.lock().unwrap().clone()
     }
     fn gets(&self) -> u64 {
         self.full.load(Ordering::SeqCst)
@@ -589,6 +597,12 @@ impl ObjectStoreBackend for CountingStore {
             GetRange::Suffix(_) => self.suffix.fetch_add(1, Ordering::SeqCst),
             GetRange::Range(_, _) => self.range.fetch_add(1, Ordering::SeqCst),
         };
+        *self
+            .per_key
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert(0) += 1;
         let got = self.inner.get(key, range).await?;
         self.bytes
             .fetch_add(got.data.len() as u64, Ordering::SeqCst);
@@ -651,6 +665,18 @@ fn fetcher_uncached(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
         .with_block_range_threshold(0)
 }
 
+/// [`fetcher_uncached`] with its plan bound set by the projection break-even
+/// alone: `block_range_threshold` stays zero, so an object at or under
+/// `break_even` is at or under [`LogSegmentFetcher::plan_whole_object_bound`]
+/// and is opened once without a plan read (ADR-2677 decision 2), while routing
+/// by `block_range_threshold` alone would plan it.
+fn fetcher_sub_break_even(
+    store: Arc<dyn ObjectStoreBackend>,
+    break_even: u64,
+) -> LogSegmentFetcher {
+    fetcher_uncached(store).with_projection_break_even_bytes(Some(break_even))
+}
+
 fn provider(
     snapshot: Snapshot,
     fetcher: LogSegmentFetcher,
@@ -707,6 +733,14 @@ fn code_le(v: i64) -> Expr {
 /// One measured shape.
 struct Shape {
     label: &'static str,
+    /// The result rows as rendered table lines (header included), sorted, so
+    /// two routes' results compare without depending on partition order.
+    row_lines: Vec<String>,
+    /// GETs per object key, any range.
+    gets_per_key: BTreeMap<String, u64>,
+    /// Segments the scan opened without planning them (ADR-2677 decision 2).
+    unplanned: usize,
+    acc_objects_touched: u64,
     gets: u64,
     full_gets: u64,
     suffix_gets: u64,
@@ -786,13 +820,34 @@ async fn measure_with_snapshot(
     base: Arc<MemoryStore>,
     snapshot: Snapshot,
 ) -> Shape {
+    measure_with_fetcher(
+        label,
+        filters,
+        plan_concurrency,
+        base,
+        snapshot,
+        |store| match cache_bytes {
+            Some(bytes) => fetcher(store, bytes),
+            None => fetcher_uncached(store),
+        },
+    )
+    .await
+}
+
+/// [`measure_with_snapshot`] with the fetcher built by `make_fetcher` over the
+/// counting store.
+async fn measure_with_fetcher(
+    label: &'static str,
+    filters: &[Expr],
+    plan_concurrency: usize,
+    base: Arc<MemoryStore>,
+    snapshot: Snapshot,
+    make_fetcher: impl FnOnce(Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher,
+) -> Shape {
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let acc = QueryAccounting::new();
-    let fetch = match cache_bytes {
-        Some(bytes) => fetcher(store, bytes),
-        None => fetcher_uncached(store),
-    };
+    let fetch = make_fetcher(store);
     let wire_bytes = fetch.phase_wire_byte_counter();
     let prov = provider(snapshot, fetch, acc.clone());
     let plan = if filters.is_empty() {
@@ -801,11 +856,26 @@ async fn measure_with_snapshot(
         prov.plan_filters(plan_concurrency, filters)
             .expect("plan_filters")
     };
-    let rows = drain(Arc::clone(&plan)).await;
+    let batches = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
+        .await
+        .expect("collect");
+    let rows = batches.iter().map(|b| b.num_rows()).sum();
+    let mut row_lines: Vec<String> = pretty_format_batches(&batches)
+        .expect("rows render")
+        .to_string()
+        .lines()
+        .filter(|l| l.starts_with("| "))
+        .map(str::to_string)
+        .collect();
+    row_lines.sort();
     let snap = acc.snapshot();
     let phases = wire_bytes.snapshot();
     Shape {
         label,
+        row_lines,
+        gets_per_key: counting.gets_per_key(),
+        unplanned: sum_metric(&plan, "segments_unplanned"),
+        acc_objects_touched: snap.data_objects_touched,
         gets: counting.gets(),
         full_gets: counting.full_gets(),
         suffix_gets: counting.suffix_gets(),
@@ -1409,6 +1479,11 @@ async fn text_predicate_prunes_most_scan_adds_no_gets() {
 /// block-striping assignment needs all of them at once), so this test does
 /// not claim the barrier waits any less long -- only that what it retains
 /// meanwhile no longer scales with corpus size.
+///
+/// The carry exists only above the plan bound (ADR-2677 decision 2): the
+/// fetcher here sets the bound to 0 so every object is planned. The second
+/// half runs the same query with the bound at exactly `S`, where no object is
+/// planned, and asserts no key is GET twice and nothing is carried.
 #[tokio::test]
 async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
     const BUDGET: usize = 2;
@@ -1508,6 +1583,204 @@ async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
     assert_eq!(
         s.acc_gets, s.gets,
         "accounting GET count agrees with the raw store GETs"
+    );
+
+    // The same query with the plan bound at exactly `S`: every object is at
+    // the bound, so none is planned and none is carried. Each object is GET
+    // once, whole, by the partition that owns it.
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot_uniform(base.as_ref()).await;
+    assert_eq!(
+        snapshot.segments[0].object_size, object_size,
+        "the rebuilt uniform fixture has the same object size"
+    );
+    let at_bound = measure_with_fetcher(
+        "text_fallback (objects at the plan bound)",
+        &[has_word(MARKER_FEW)],
+        BUDGET,
+        base,
+        snapshot,
+        |store| fetcher_sub_break_even(store, object_size),
+    )
+    .await;
+    report(&at_bound);
+    assert_eq!(
+        at_bound.gets_per_key.len(),
+        SEGMENTS,
+        "every object is read: {:?}",
+        at_bound.gets_per_key
+    );
+    assert!(
+        at_bound.gets_per_key.values().all(|&n| n == 1),
+        "no second GET of the same key for an object at the bound: {:?}",
+        at_bound.gets_per_key
+    );
+    assert_eq!(
+        (at_bound.gets, at_bound.full_gets),
+        (SEGMENTS as u64, SEGMENTS as u64),
+        "one whole-object GET per object and nothing else"
+    );
+    assert_eq!(
+        at_bound.bytes,
+        SEGMENTS as u64 * object_size,
+        "the wire carries the corpus exactly once"
+    );
+    assert_eq!(
+        (at_bound.plan_phase_gets, at_bound.plan_full_reads),
+        (0, 0),
+        "no plan read for an object at the bound"
+    );
+    assert_eq!(
+        at_bound.unplanned, SEGMENTS,
+        "every object at the bound is opened without a plan"
+    );
+    assert_eq!(
+        (
+            at_bound.acc_bytes_reused,
+            at_bound.acc_peak_intermediate_bytes
+        ),
+        (0, 0),
+        "nothing is carried, so nothing is reused or retained at a barrier"
+    );
+    assert_eq!(at_bound.rows, SEGMENTS, "one matching record per segment");
+    assert_eq!(
+        at_bound.row_lines, s.row_lines,
+        "the unplanned route returns the planned route's rows"
+    );
+    assert_eq!(
+        (at_bound.acc_gets, at_bound.acc_bytes),
+        (at_bound.gets, at_bound.bytes),
+        "accounting agrees with the raw store counters"
+    );
+}
+
+/// ADR-2677 decision 2 on the q20 shape (an I64 equality the skip index
+/// decides): when every object is under the projection break-even, the scan
+/// opens each one once and prunes blocks from the directory it already holds,
+/// instead of a suffix probe in the plan phase followed by the scan's own
+/// reads. The planned route over the same corpus is measured beside it, both
+/// to pin what the bound saves and to compare rows.
+#[tokio::test]
+async fn sub_break_even_segments_are_read_once() {
+    const BREAK_EVEN: u64 = 1 << 20;
+    // Below the segment count, as on any corpus larger than the plan fan-out:
+    // a plan-phase whole read is carried for at most this many segments, so
+    // planning these objects would show as a second GET of the rest.
+    const PLAN_CONCURRENCY: usize = 2;
+    let filters = [code_eq(2)];
+
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(base.as_ref()).await;
+    let corpus: u64 = snapshot.segments.iter().map(|s| s.object_size).sum();
+    assert!(
+        snapshot
+            .segments
+            .iter()
+            .all(|seg| seg.object_size <= BREAK_EVEN),
+        "fixture precondition: every object is under the break-even"
+    );
+    let unplanned = measure_with_fetcher(
+        "q20 equality (sub-break-even, unplanned)",
+        &filters,
+        PLAN_CONCURRENCY,
+        base,
+        snapshot,
+        |store| fetcher_sub_break_even(store, BREAK_EVEN),
+    )
+    .await;
+
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(base.as_ref()).await;
+    let planned = measure_with_snapshot(
+        "q20 equality (planned)",
+        &filters,
+        None,
+        PLAN_CONCURRENCY,
+        base,
+        snapshot,
+    )
+    .await;
+    report(&unplanned);
+    report(&planned);
+
+    assert_eq!(
+        unplanned.gets_per_key.len(),
+        SEGMENTS,
+        "every object is read: {:?}",
+        unplanned.gets_per_key
+    );
+    assert!(
+        unplanned.gets_per_key.values().all(|&n| n == 1),
+        "at most one GET per object: {:?}",
+        unplanned.gets_per_key
+    );
+    assert_eq!(
+        (unplanned.gets, unplanned.full_gets, unplanned.suffix_gets),
+        (SEGMENTS as u64, SEGMENTS as u64, 0),
+        "one whole-object GET per object, no suffix probe"
+    );
+    assert_eq!(
+        (unplanned.bytes, corpus),
+        (630_401, 630_401),
+        "the wire carries each object exactly once"
+    );
+    assert!(
+        unplanned.bytes * 100 <= corpus * 105,
+        "at most 1.05x corpus bytes on the wire"
+    );
+    assert_eq!(
+        (unplanned.plan_phase_gets, unplanned.plan_full_reads),
+        (0, 0),
+        "no plan read for a sub-break-even object"
+    );
+    assert_eq!(
+        (
+            unplanned.acc_bytes_reused,
+            unplanned.acc_peak_intermediate_bytes
+        ),
+        (0, 0),
+        "no plan read is carried into the scan"
+    );
+    assert_eq!(
+        unplanned.unplanned, SEGMENTS,
+        "every sub-break-even object takes the unplanned route"
+    );
+    assert_eq!(
+        unplanned.acc_objects_touched, SEGMENTS as u64,
+        "each object is recorded as touched once, by its owner"
+    );
+    assert_eq!(
+        (unplanned.blocks_scanned, unplanned.blocks_total),
+        (SEGMENTS, TOTAL_BLOCKS),
+        "the equality keeps one block per segment, pruned from the directory \
+         the open already holds"
+    );
+    assert_eq!(unplanned.rows, SEGMENTS, "one matching record per segment");
+    assert_eq!(
+        (unplanned.acc_gets, unplanned.acc_bytes),
+        (unplanned.gets, unplanned.bytes),
+        "accounting agrees with the raw store counters"
+    );
+
+    assert_eq!(planned.unplanned, 0, "bound 0 plans every object");
+    assert_eq!(planned.rows, SEGMENTS, "planned: one record per segment");
+    assert_eq!(
+        unplanned.row_lines, planned.row_lines,
+        "both routes return the same rows"
+    );
+    // The planned route, per object: two plan-phase GETs, two metadata GETs
+    // when the scan opens it, and four block-data GETs. Fewer bytes than the
+    // corpus, eight times the requests.
+    assert_eq!(
+        (
+            planned.gets,
+            planned.plan_phase_gets,
+            planned.probe_phase_gets,
+            planned.scan_phase_gets,
+            planned.bytes
+        ),
+        (64, 16, 16, 32, 197_690),
+        "planned route cost on the same corpus"
     );
 }
 

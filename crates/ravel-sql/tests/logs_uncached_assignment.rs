@@ -11,11 +11,11 @@
 //! path segment-granular: relevant segment `j` (snapshot order) goes to
 //! partition `j % n` and drains all of that segment's surviving blocks. That
 //! #693 fix left one read per phase per segment (a plan read plus a separate
-//! scan read); #835 removes the second read only for the segments whose plan
-//! completes inside the carry budget, which is the SQL partition count,
-//! `PARTS` here. The other `SEGMENTS - PARTS` segments still pay both reads,
-//! so the un-cached cost is `SEGMENTS + (SEGMENTS - PARTS)`, not `SEGMENTS`.
-//! The cached path keeps the intra-segment block striping unchanged.
+//! scan read). Every fixture object here is under the fetcher's default plan
+//! bound, so since ADR-2677 decision 2 no segment is planned and each is read
+//! once, by its owning partition: the un-cached cost is `SEGMENTS`. The cached
+//! test sets the bound to zero so its segments are planned and their row
+//! groups striped.
 //!
 //! Every fixture here carries a pending erasure predicate that matches nothing
 //! ([`non_matching_erasure`]), which changes no row and prunes no block but does
@@ -306,20 +306,16 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
     )))
 }
 
-/// The pinned request-count property (#693, #680, amended by #835). The name
-/// is #693's property: no segment is opened by more than one partition in the
-/// scan phase. It is not a claim that a segment's object crosses the wire only
-/// once per statement, and the assertion below says so.
+/// The pinned request-count property (#693, #680, #835, ADR-2677 decision 2):
+/// no segment is opened by more than one partition, and since every fixture
+/// object is under the plan bound, none is planned, so each crosses the wire
+/// exactly once.
 ///
-/// Without a read cache the plan phase reads all `SEGMENTS = 6` objects whole.
-/// Before #835 those bytes were discarded once the predicate was decided, so
-/// the scan (uncached, nothing to coalesce a re-open onto) issued its own
-/// second GET per segment: `2 * 6 = 12`. Since #835 the plan's fetch is
-/// carried forward (`CarriedWholeObject`) for as many segments as the carry
-/// budget holds, which is the SQL partition count `PARTS = 4`; the other
-/// `SEGMENTS - PARTS = 2` are re-fetched by the scan exactly as before. The
-/// un-cached cost is therefore `SEGMENTS + (SEGMENTS - PARTS) = 8`, between
-/// the old 12 and the 6 a corpus-sized cache reaches.
+/// Before ADR-2677 decision 2 the plan phase read all `SEGMENTS = 6` objects
+/// whole and carried the bytes forward for only `PARTS = 4` of them (the carry
+/// budget is the plan concurrency), so the scan re-fetched the other two:
+/// `SEGMENTS + (SEGMENTS - PARTS) = 8`. Before #835 nothing was carried and the
+/// cost was `2 * 6 = 12`.
 ///
 /// Against the pre-#693 ADR-0102 code this fails much worse: block striping
 /// puts every segment's four blocks into all four partitions, each partition
@@ -344,24 +340,18 @@ async fn uncached_scan_opens_each_segment_once() {
     let _ = collect_plan(Arc::clone(&plan)).await;
     assert_declined_fast_path(&plan);
 
-    // SEGMENTS (6) exceeds PARTS (4), and this fixture's plan_concurrency is
-    // PARTS, so the issue #835 follow-up carry budget lets only PARTS of the
-    // SEGMENTS whole-object reads survive to the scan; the other
-    // SEGMENTS - PARTS (2) pay one real re-fetch GET each. Which segments
-    // those are is scheduling-dependent (`buffer_unordered`), but the count
-    // is not: SEGMENTS plan-phase reads plus SEGMENTS - PARTS scan-phase
-    // re-fetches, never SEGMENTS alone and never 2 * SEGMENTS.
+    assert_eq!(
+        sum_metric(&plan, "segments_unplanned"),
+        SEGMENTS,
+        "every fixture object is under the plan bound"
+    );
     assert_eq!(
         counting.gets(),
-        (SEGMENTS + (SEGMENTS - PARTS)) as u64,
-        "un-cached scan opens each segment once in the plan phase \
-         ({SEGMENTS} GETs), and re-fetches the SEGMENTS - PARTS segments \
-         whose carry the plan_concurrency budget dropped ({} GETs) -- \
-         since #835 this is far below the pre-#835 {} (= 2 * {SEGMENTS}), \
-         and the pre-#693 striped path cost {} (= {SEGMENTS} + \
-         {SEGMENTS} * {PARTS}).",
-        SEGMENTS - PARTS,
-        2 * SEGMENTS,
+        SEGMENTS as u64,
+        "un-cached scan reads each unplanned segment once ({SEGMENTS} GETs); \
+         planning them cost {} (= {SEGMENTS} + {SEGMENTS} - {PARTS}), and \
+         the pre-#693 striped path cost {} (= {SEGMENTS} + {SEGMENTS} * {PARTS}).",
+        SEGMENTS + (SEGMENTS - PARTS),
         SEGMENTS + SEGMENTS * PARTS,
     );
 }
@@ -424,7 +414,10 @@ async fn cached_path_still_stripes_blocks_across_partitions() {
     snapshot.pending_erasure = non_matching_erasure();
 
     let cache = build_read_cache(64 << 20);
-    let fetcher = LogSegmentFetcher::new(Arc::clone(&store)).with_cache(cache);
+    // A zero plan bound plans every segment, which is what stripes row groups.
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_cache(cache)
+        .with_block_range_threshold(0);
     assert!(
         fetcher.has_cache(),
         "this fixture must exercise the cached path"

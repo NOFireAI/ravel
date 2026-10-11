@@ -371,6 +371,15 @@ impl LogSegmentScan {
         self.scan.as_ref().map_or(0, BlockScan::remaining_blocks)
     }
 
+    /// The whole-object block index of every block this scan's pruning kept,
+    /// ascending; see [`BlockScan::survivor_block_indices`]. Empty once the
+    /// cursor is lost to a gate failure.
+    pub fn survivor_block_indices(&self) -> Vec<usize> {
+        self.scan
+            .as_ref()
+            .map_or_else(Vec::new, BlockScan::survivor_block_indices)
+    }
+
     /// The whole-object block index of the block the next
     /// [`next_block`](Self::next_block) or
     /// [`next_block_columnar`](Self::next_block_columnar) call will decode, or
@@ -1419,6 +1428,18 @@ impl LogSegmentFetcher {
     pub fn plan_whole_object_bound(&self) -> u64 {
         self.block_range_threshold
             .max(self.block_range.effective_projection_break_even())
+    }
+
+    /// Whether a scan should plan `seg_ref` before opening it (ADR-2677
+    /// decision 2): true only above [`Self::plan_whole_object_bound`]. At or
+    /// under the bound [`plan_segment`](Self::plan_segment) would read the
+    /// whole object only to count survivors, so the scan skips it and opens
+    /// the object once through
+    /// [`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
+    /// which prunes blocks from the directories that one read holds.
+    #[must_use]
+    pub fn plans_segment(&self, seg_ref: &SegmentRef) -> bool {
+        seg_ref.object_size > self.plan_whole_object_bound()
     }
 
     /// Per-object relevance from the catalog summary alone, with no object
@@ -10513,6 +10534,36 @@ mod fetch_stream_dir_tests {
         assert_eq!(gets, 1, "the routing threshold still bounds the read");
         assert_eq!(get_bytes, size);
         assert_eq!(probes, 0);
+    }
+
+    /// ADR-2677 decision 2: a scan plans a segment only above
+    /// `plan_whole_object_bound`, checked one byte under, at, and one byte
+    /// over it, once with the break-even setting the bound and once with the
+    /// routing threshold setting it.
+    ///
+    /// Fails against routing on the threshold alone (the first fetcher plans
+    /// the under and at cases), against routing on the break-even alone (the
+    /// second fetcher plans the under and at cases), and against `>=` (both
+    /// plan the at case).
+    #[test]
+    fn plans_segment_only_above_the_whole_object_bound() {
+        let records = [record(0)];
+        let fetcher = |threshold: u64, break_even: u64| {
+            LogSegmentFetcher::new(Arc::new(MemoryStore::new()))
+                .with_block_range_threshold(threshold)
+                .with_projection_break_even_bytes(Some(break_even))
+        };
+        for (threshold, break_even, bound) in [(1_000, 5_000, 5_000), (9_000, 5_000, 9_000)] {
+            let f = fetcher(threshold, break_even);
+            assert_eq!(f.plan_whole_object_bound(), bound);
+            for (size, planned) in [(bound - 1, false), (bound, false), (bound + 1, true)] {
+                assert_eq!(
+                    f.plans_segment(&seg_ref(size, &records)),
+                    planned,
+                    "threshold {threshold}, break-even {break_even}, size {size}"
+                );
+            }
+        }
     }
 }
 
