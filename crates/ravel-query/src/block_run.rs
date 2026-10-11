@@ -22,8 +22,15 @@ pub struct BlockRun {
 }
 
 /// The run [`LogSegmentFetcher`](crate::LogSegmentFetcher) and
-/// [`SpanSegmentFetcher`](crate::SpanSegmentFetcher) default to.
-pub const DEFAULT_BLOCK_RUN: BlockRun = BlockRun::SINGLE;
+/// [`SpanSegmentFetcher`](crate::SpanSegmentFetcher) default to: up to 8
+/// blocks, and no further block once the run holds 16 MiB. One job per block
+/// cost about 15% of hot time on the reference box (issue #2795); spread over
+/// 8 blocks, a per-job cost of that size is under 2%. The cap bounds the
+/// decoded bytes one run holds.
+pub const DEFAULT_BLOCK_RUN: BlockRun = BlockRun {
+    max_blocks: 8,
+    max_decoded_bytes: 16 << 20,
+};
 
 impl BlockRun {
     /// One block per job.

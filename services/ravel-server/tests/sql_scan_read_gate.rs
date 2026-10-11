@@ -370,10 +370,12 @@ async fn read_gate_site(client: &reqwest::Client, base: &str, site: &str) -> (u6
 }
 
 /// A `logs` and a `spans` statement against a started server each count
-/// exactly [`BLOCKS`] decodes at their scan's read gate site, all inline under
-/// the default floor. Fails with the gate left off either fetcher in
-/// `build_sql_state_inner`, or with `start` passing no gate: that site then
-/// reads `(0, 0)`.
+/// exactly one decode at their scan's read gate site, inline under the
+/// default floor: each object's [`BLOCKS`] blocks are one part, so the
+/// default run of up to eight blocks decodes them in one job, and four
+/// one-record blocks together stay under the 256 KiB floor. Fails with the
+/// gate left off either fetcher in `build_sql_state_inner`, or with `start`
+/// passing no gate: that site then reads `(0, 0)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn started_server_runs_sql_scan_block_decodes_through_its_read_gate() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -403,8 +405,8 @@ async fn started_server_runs_sql_scan_block_decodes_through_its_read_gate() {
     );
     assert_eq!(
         read_gate_site(&client, &base, "log_block").await,
-        (0, BLOCKS),
-        "every logs block decode was counted at the read gate"
+        (0, 1),
+        "the logs blocks' one run was counted at the read gate"
     );
 
     assert_eq!(
@@ -413,8 +415,8 @@ async fn started_server_runs_sql_scan_block_decodes_through_its_read_gate() {
     );
     assert_eq!(
         read_gate_site(&client, &base, "span_block").await,
-        (0, BLOCKS),
-        "every spans block decode was counted at the read gate"
+        (0, 1),
+        "the spans blocks' one run was counted at the read gate"
     );
 
     running.shutdown().await.expect("graceful shutdown");

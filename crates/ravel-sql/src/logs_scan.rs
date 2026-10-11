@@ -4993,8 +4993,8 @@ struct LogScanStream {
     /// The charge for what `decoded` holds: each columnar block's built
     /// batches and each row block's records, taken by the job as it builds
     /// or decodes them. A block's bytes move from here to `held` when the
-    /// stream takes the block, so each is charged from the moment it exists
-    /// until its last batch has been handed on.
+    /// stream takes the block, so each is charged from when the job has
+    /// built or decoded it until the stream has handed on its batches.
     run_charge: MemoryReservation,
     /// The `fetch` pushed into the exec (issue #362), carried unchanged from
     /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
@@ -11605,7 +11605,8 @@ mod fast_path_prefetch_tests {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod read_gate_tests {
     //! ADR-1702 task 8: with a read gate on the fetcher, the logs scan
-    //! decodes each block as one `log_block` job. The placement test, that a
+    //! decodes each run of blocks as one `log_block` job (issue #2795). The
+    //! placement test, that a
     //! parked block decode leaves the runtime free, is
     //! `tests/logs_scan_read_gate.rs`, in a binary of its own.
 
@@ -11844,13 +11845,17 @@ mod read_gate_tests {
             .sum()
     }
 
-    /// With the floor at 0, a scan moves the `log_block` job count by exactly
-    /// the fixture's [`BLOCKS`], on the columnar path and on the row path, runs
-    /// nothing inline, and returns what the same scan returns with no gate.
+    /// With the floor at 0 and the fetcher's default run, a scan moves the
+    /// `log_block` job count by exactly one, on the columnar path and on the
+    /// row path: the fixture's [`BLOCKS`] blocks are one part, and four
+    /// blocks fit in one run of [`ravel_query::DEFAULT_BLOCK_RUN`]'s eight, with their
+    /// few hundred bytes of batches far under its 16 MiB cap. It runs nothing
+    /// inline, and returns what the same scan returns with no gate.
     ///
     /// Fails with the columnar path's `gate.run` wrap removed (the columnar
-    /// case reads `(0, 0)`), and with the row path back on the inline
-    /// `next_block` (the row case reads `(0, 0)`).
+    /// case reads `(0, 0)`), with the row path back on the inline
+    /// `next_block` (the row case reads `(0, 0)`), and with the default run
+    /// back at one block (both read `(4, 0)`).
     #[tokio::test]
     async fn log_block_decodes_run_through_the_read_gate() {
         let (store, segments) = fixture().await;
@@ -11860,8 +11865,8 @@ mod read_gate_tests {
             let got = collect(&gated).await;
             assert_eq!(
                 site_counts(&gate, ReadSite::LogBlock),
-                (BLOCKS, 0),
-                "one log_block job per fixture block (rows path: {rows})"
+                (1, 0),
+                "one log_block job for the fixture's one run (rows path: {rows})"
             );
             assert_eq!(total_inline(&gate), 0, "nothing ran inline (rows: {rows})");
             let path_batches = if rows {

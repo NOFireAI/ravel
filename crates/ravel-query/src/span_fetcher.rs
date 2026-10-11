@@ -2168,14 +2168,16 @@ mod tests {
     }
 
     /// ADR-1702 follow-up task 7, RSPAN site: with the byte floor at 0, the
-    /// accounted row exit decodes each candidate block as exactly one
+    /// accounted row exit decodes the object's candidate blocks in exactly one
     /// `SpanBlock` job, reaching exhaustion submits none, nothing runs inline,
     /// and the rows equal the ungated fetch's. Six records at two per block
-    /// make three blocks.
+    /// make three blocks, one run of the default eight and under its 16 MiB
+    /// cap.
     ///
     /// FLIP: in `next_block_on_gate`, read the gate as `None` so every block
     /// takes the inline `next_block`; the `SpanBlock` assertion then reads
-    /// `left: (0, 0), right: (3, 0)`.
+    /// `left: (0, 0), right: (1, 0)`. With `DEFAULT_BLOCK_RUN` back at one
+    /// block it reads `left: (3, 0), right: (1, 0)`.
     #[tokio::test]
     async fn span_block_decodes_run_through_the_read_gate() {
         use crate::read_gate_test_support::{floor_zero_gate, site_counts, total_inline};
@@ -2224,7 +2226,7 @@ mod tests {
         assert_eq!(inline.stats.blocks_scanned, 3);
         assert_eq!(gated.records, inline.records);
         assert_eq!(gated.stats, inline.stats);
-        assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (3, 0));
+        assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (1, 0));
         assert_eq!(total_inline(&gate), 0);
     }
 

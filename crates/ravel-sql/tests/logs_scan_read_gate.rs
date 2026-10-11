@@ -3,7 +3,7 @@
 //!
 //! The park sits inside the decode itself: the fetcher enters its `decode`
 //! span around every block decode, and this binary's global subscriber parks
-//! the entry that lands in the last block's gate job. The binary holds this
+//! the first entry that lands in the last run's gate job. The binary holds this
 //! one test because `tracing` caches a callsite's interest process-wide, so a
 //! test in the same process reaching the `decode` callsite with no subscriber
 //! could leave the span disabled and the probe blind.
@@ -25,7 +25,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, PhaseAccounting};
+use ravel_query::{BlockRun, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{LOG_COL_TS, LogsScanExec, logs_schema_with_declared};
 use ravel_test_support::{ParkOnFirstArmedCall, run_with_watchdog};
 use ravel_types::TenantHash;
@@ -41,6 +41,13 @@ const TENANT: TenantHash = TenantHash([7u8; 16]);
 /// predicate and a window over every record each block survives pruning and
 /// is decoded exactly once.
 const BLOCKS: u64 = 4;
+/// Blocks one gate job decodes here: the fixture's [`BLOCKS`] blocks are one
+/// part, so they make [`RUNS`] jobs of two blocks each.
+const RUN: BlockRun = BlockRun {
+    max_blocks: 2,
+    max_decoded_bytes: u64::MAX,
+};
+const RUNS: u64 = 2;
 const KEY: &str = "t/gate0.rlog";
 const WATCHDOG: Duration = Duration::from_secs(30);
 
@@ -130,13 +137,13 @@ fn log_block_counts(gate: &ReadGate) -> (u64, u64) {
 }
 
 /// A one-partition `ts` scan (the columnar fast path) over the whole fixture
-/// window, with `gate` on the fetcher when given.
+/// window, decoding [`RUN`]s, with `gate` on the fetcher when given.
 fn exec(
     store: &Arc<dyn ObjectStoreBackend>,
     segments: &[SegmentRef],
     gate: Option<Arc<ReadGate>>,
 ) -> LogsScanExec {
-    let fetcher = LogSegmentFetcher::new(Arc::clone(store));
+    let fetcher = LogSegmentFetcher::new(Arc::clone(store)).with_block_run(RUN);
     let fetcher = match gate {
         Some(gate) => fetcher.with_read_gate(gate),
         None => fetcher,
@@ -189,15 +196,15 @@ where
     }
 }
 
-/// With the last block's decode parked inside its gate job, a concurrent task
-/// on the `current_thread` runtime completes; released, the scan's output
-/// equals, batch for batch, the same scan run with no gate.
+/// With a block decode parked inside the last run's gate job, a concurrent
+/// task on the `current_thread` runtime completes; released, the scan's
+/// output equals, batch for batch, the same scan run with no gate.
 ///
 /// Fails against a wrap placed after the decode (the block decoded inline and
 /// its result moved into the `gate.run` closure: every decode is entered on
 /// the runtime thread, no job decodes, and the scan finishes unparked), and
-/// against offloading only a part's first block (the `log_block` job count
-/// never reaches [`BLOCKS`], so nothing parks).
+/// against offloading only a part's first run (the `log_block` job count
+/// never reaches [`RUNS`], so nothing parks).
 #[test]
 fn log_scan_yields_while_a_block_decodes() {
     run_with_watchdog(
@@ -217,7 +224,7 @@ fn log_scan_yields_while_a_block_decodes() {
                 ),
                 gate: Arc::clone(&gate),
                 runtime_thread: std::thread::current().id(),
-                target: BLOCKS,
+                target: RUNS,
                 on_runtime_thread: Arc::clone(&on_runtime_thread),
             };
             tracing::subscriber::set_global_default(tracing_subscriber::registry().with(probe))
@@ -263,7 +270,7 @@ fn log_scan_yields_while_a_block_decodes() {
                     0,
                     "no decode ran on the runtime thread"
                 );
-                assert_eq!(log_block_counts(&gate), (BLOCKS, 0));
+                assert_eq!(log_block_counts(&gate), (RUNS, 0));
                 let inline = exec(&store, &segments, None);
                 let want: Vec<RecordBatch> = inline
                     .execute(0, Arc::new(TaskContext::default()))
