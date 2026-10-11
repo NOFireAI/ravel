@@ -1,9 +1,11 @@
 //! `ravel_maintain_compactions_in_flight` (issue #2666): the gauge reads 1
 //! while a bucket merge is in progress and returns to 0 on every way a merge
 //! ends: a publish, a failed input read, and the merge future being dropped
-//! mid-flight. It stays at 0 through the claim, the format-floor read, and a
-//! bucket the gates turn away, and the merge-start log line names the prefix
-//! the publish line's key carries.
+//! mid-flight. Each of those, an abandoned publish and a dry run, logs exactly
+//! one merge-end line naming its outcome. The gauge stays at 0 through the
+//! claim, the format-floor read, and a bucket the gates turn away, and the
+//! merge-start and merge-end lines name the prefix the publish line's key
+//! carries.
 //!
 //! The gauge is process-wide, so the tests in this binary run one at a time
 //! under [`SERIAL`] and each asserts absolute values. A merge is parked with a
@@ -42,6 +44,9 @@ const L0_KEYS: &str = "/l0/";
 
 /// The message `MergeInFlight::start` logs.
 const START_LINE: &str = "compaction merge started";
+
+/// The message `MergeInFlight`'s `Drop` logs.
+const END_LINE: &str = "compaction merge ended";
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -103,6 +108,14 @@ fn field<'a>(line: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no {name}= on {line}"));
     let rest = &line[at + name.len() + 2..];
     rest.split(' ').next().unwrap_or_default()
+}
+
+/// The `outcome=` of every merge-end line past the first `from`.
+fn end_outcomes_since(from: usize) -> Vec<String> {
+    lines_with(END_LINE)[from..]
+        .iter()
+        .map(|line| field(line, "outcome").to_string())
+        .collect()
 }
 
 async fn seeded(plan: FaultPlan) -> FaultStore<MemoryStore> {
@@ -250,10 +263,15 @@ async fn gauge_reads_one_while_parked_and_zero_after_publish() {
     let config = CompactorConfig::default();
     let bucket = bucket();
     assert_eq!(compactions_in_flight(), 0, "no merge before the run");
+    let ends = lines_with(END_LINE).len();
 
     let mut merge = Box::pin(compact_bucket(&store, &clock, &config, &bucket));
     let id = park(&mut merge, &gate).await;
     assert_eq!(compactions_in_flight(), 1, "the parked merge is in flight");
+    assert!(
+        end_outcomes_since(ends).is_empty(),
+        "a parked merge has not ended"
+    );
     assert!(gate.release(id), "the parked GET was released");
     let outcome = merge.await.expect("compaction");
 
@@ -272,6 +290,86 @@ async fn gauge_reads_one_while_parked_and_zero_after_publish() {
         0,
         "a published merge is not in flight"
     );
+    assert_eq!(
+        end_outcomes_since(ends),
+        ["published"],
+        "a published merge logs one end line"
+    );
+}
+
+/// A merge whose `max_compaction_lifetime` passes before its record PUT
+/// abandons without publishing and logs one end line saying so.
+#[tokio::test]
+async fn an_abandoned_merge_logs_one_abandoned_end_line() {
+    let _serial = SERIAL.lock().await;
+    capture();
+    let store = seeded(FaultPlan::empty()).await;
+    let gate = store.hold(Op::Get, Some(L0_KEYS.to_string()), Occurrence::Nth(1));
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = CompactorConfig::default();
+    let bucket = bucket();
+    let ends = lines_with(END_LINE).len();
+
+    let mut merge = Box::pin(compact_bucket(&store, &clock, &config, &bucket));
+    let id = park(&mut merge, &gate).await;
+    clock.set(clock.now_ns() + config.max_compaction_lifetime_ns + 1);
+    assert!(gate.release(id), "the parked GET was released");
+    let outcome = merge.await.expect("compaction");
+
+    assert!(
+        matches!(
+            outcome,
+            CompactionOutcome::Compacted {
+                publish: PublishOutcome::Abandoned,
+                ..
+            }
+        ),
+        "the merge abandoned: {outcome:?}"
+    );
+    assert_eq!(
+        compactions_in_flight(),
+        0,
+        "an abandoned merge is not in flight"
+    );
+    assert_eq!(
+        end_outcomes_since(ends),
+        ["abandoned"],
+        "an abandoned merge logs one end line"
+    );
+}
+
+/// A dry run reports a publish it never made; its end line names it a dry run.
+#[tokio::test]
+async fn a_dry_run_merge_logs_one_dry_run_end_line() {
+    let _serial = SERIAL.lock().await;
+    capture();
+    let store = seeded(FaultPlan::empty()).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = CompactorConfig {
+        dry_run: true,
+        ..CompactorConfig::default()
+    };
+    let ends = lines_with(END_LINE).len();
+
+    let outcome = compact_bucket(&store, &clock, &config, &bucket())
+        .await
+        .expect("compaction");
+
+    assert!(
+        matches!(
+            outcome,
+            CompactionOutcome::Compacted {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ),
+        "a dry run reports a publish: {outcome:?}"
+    );
+    assert_eq!(
+        end_outcomes_since(ends),
+        ["dry-run"],
+        "a dry run logs one end line"
+    );
 }
 
 #[tokio::test]
@@ -288,6 +386,7 @@ async fn gauge_returns_to_zero_after_an_input_read_fails() {
     .await;
     let clock = FixedClock::new(sealed_now_ns());
     let config = CompactorConfig::default();
+    let ends = lines_with(END_LINE).len();
 
     let result = compact_bucket(&store, &clock, &config, &bucket()).await;
 
@@ -304,6 +403,11 @@ async fn gauge_returns_to_zero_after_an_input_read_fails() {
         0,
         "a failed merge is not in flight"
     );
+    assert_eq!(
+        end_outcomes_since(ends),
+        ["failed"],
+        "a failed merge logs one end line"
+    );
 }
 
 #[tokio::test]
@@ -315,6 +419,7 @@ async fn gauge_returns_to_zero_when_the_merge_future_is_dropped() {
     let clock = FixedClock::new(sealed_now_ns());
     let config = CompactorConfig::default();
     let bucket = bucket();
+    let ends = lines_with(END_LINE).len();
 
     let mut merge = Box::pin(compact_bucket(&store, &clock, &config, &bucket));
     park(&mut merge, &gate).await;
@@ -325,6 +430,11 @@ async fn gauge_returns_to_zero_when_the_merge_future_is_dropped() {
         compactions_in_flight(),
         0,
         "a dropped merge is not in flight"
+    );
+    assert_eq!(
+        end_outcomes_since(ends),
+        ["dropped"],
+        "a dropped merge logs one end line"
     );
 }
 
@@ -424,8 +534,8 @@ async fn gauge_reads_zero_while_the_format_floor_read_is_parked() {
 }
 
 /// A bucket with fewer inputs than `min_compaction_inputs` is turned away by
-/// its listing and never starts a merge: the gauge reads 0 while that LIST is
-/// parked and after the run, and no merge-start line is logged.
+/// its listing and never starts a merge: no merge-start or merge-end line is
+/// logged and the gauge reads 0 after the run.
 #[tokio::test]
 async fn a_bucket_below_min_inputs_never_moves_the_gauge() {
     let _serial = SERIAL.lock().await;
@@ -446,14 +556,14 @@ async fn a_bucket_below_min_inputs_never_moves_the_gauge() {
     let config = CompactorConfig::default();
     let bucket = bucket();
     let starts = lines_with(START_LINE).len();
+    let ends = lines_with(END_LINE).len();
 
+    // The LIST comes before every gate, so the gauge reads 0 while it is
+    // parked whatever the gates decide. The hold is there to show the run got
+    // past the seal gate and listed the bucket: the min-inputs gate, not the
+    // seal gate, is what the start-line count below is about.
     let mut merge = Box::pin(compact_bucket(&store, &clock, &config, &bucket));
     let id = park_on(&mut merge, &list_gate, Op::List, "/m/c/").await;
-    assert_eq!(
-        compactions_in_flight(),
-        0,
-        "a bucket still being listed is not merging"
-    );
     assert!(list_gate.release(id), "the parked LIST was released");
     let outcome = merge.await.expect("compaction");
 
@@ -465,6 +575,10 @@ async fn a_bucket_below_min_inputs_never_moves_the_gauge() {
         lines_with(START_LINE).len(),
         starts,
         "a bucket below min-inputs logs no merge start"
+    );
+    assert!(
+        end_outcomes_since(ends).is_empty(),
+        "a bucket below min-inputs logs no merge end"
     );
     assert_eq!(
         compactions_in_flight(),
@@ -514,9 +628,10 @@ async fn a_bucket_refused_by_its_format_floor_never_moves_the_gauge() {
     );
 }
 
-/// The merge-start line's `bucket=` is the bucket's commit prefix, and the
-/// publish line's `key=` is that prefix plus a file name. The chaos oracle
-/// (scripts/chaos/lib.sh) pairs the two lines by exactly this relation.
+/// The merge-start line's `bucket=` is the bucket's commit prefix, the
+/// merge-end line repeats it, and the publish line's `key=` is that prefix
+/// plus a file name. The chaos oracle (scripts/chaos/lib.sh) pairs the lines
+/// by exactly this relation.
 #[tokio::test]
 async fn merge_start_line_names_the_prefix_of_the_published_key() {
     let _serial = SERIAL.lock().await;
@@ -526,6 +641,7 @@ async fn merge_start_line_names_the_prefix_of_the_published_key() {
     let config = CompactorConfig::default();
     let bucket = bucket();
     let starts = lines_with(START_LINE).len();
+    let ends = lines_with(END_LINE).len();
     let publishes = lines_with("compaction record published").len();
 
     let outcome = compact_bucket(&store, &clock, &config, &bucket)
@@ -558,6 +674,13 @@ async fn merge_start_line_names_the_prefix_of_the_published_key() {
         )
         .expect("prefix"),
         "the start line names the bucket's commit prefix"
+    );
+    let end_lines = lines_with(END_LINE);
+    assert_eq!(end_lines.len(), ends + 1, "one merge-end line");
+    assert_eq!(
+        field(&end_lines[ends], "bucket"),
+        prefix,
+        "the end line names the start line's prefix"
     );
     let file = key
         .strip_prefix(prefix)

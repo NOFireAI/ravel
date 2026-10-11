@@ -196,15 +196,21 @@ pub fn compactions_in_flight() -> u64 {
     COMPACTIONS_IN_FLIGHT.load(Ordering::Relaxed)
 }
 
-/// One merge counted in [`COMPACTIONS_IN_FLIGHT`]. The decrement is in `Drop`
-/// so an error return, a panic unwinding through the pipeline, or a dropped
-/// future each release it.
-struct MergeInFlight;
+/// One merge counted in [`COMPACTIONS_IN_FLIGHT`]. The decrement and the
+/// merge-end line are in `Drop`, so an error return, a panic unwinding through
+/// the pipeline, or a dropped future each release the count and log the end.
+struct MergeInFlight {
+    /// The bucket's commit prefix, as the start line logged it.
+    bucket: String,
+    /// The `outcome=` the end line logs; `dropped` until [`Self::end`] sets it.
+    outcome: &'static str,
+}
 
 impl MergeInFlight {
     /// Count the merge and log the bucket's commit prefix. A published record's
-    /// key is that prefix plus its file name, which is how the chaos oracle
-    /// (scripts/chaos/lib.sh) matches a publish to the merge it ends.
+    /// key is that prefix plus its file name, and the end line repeats the
+    /// prefix, which is how the chaos oracle (scripts/chaos/lib.sh) pairs a
+    /// start with the end and the publish of the same merge.
     fn start(bucket: &Bucket) -> Result<Self> {
         let prefix = ravel_commit::keys::commit_shard_hour_prefix(
             &bucket.tenant_hash,
@@ -214,13 +220,48 @@ impl MergeInFlight {
         )?;
         COMPACTIONS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
         tracing::info!(bucket = %prefix, "compaction merge started");
-        Ok(MergeInFlight)
+        Ok(MergeInFlight {
+            bucket: prefix,
+            outcome: "dropped",
+        })
+    }
+
+    /// End the merge with `outcome` on its end line.
+    fn end(mut self, outcome: &'static str) {
+        self.outcome = outcome;
     }
 }
 
 impl Drop for MergeInFlight {
     fn drop(&mut self) {
         COMPACTIONS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        tracing::info!(
+            bucket = %self.bucket,
+            outcome = %self.outcome,
+            "compaction merge ended"
+        );
+    }
+}
+
+/// The merge-end line's `outcome=` for a pipeline result. `cancelled` is
+/// whether the run's claim was cancelled at a checkpoint; a dry run reports a
+/// publish it did not make, so it is named apart.
+fn merge_end_outcome(
+    result: &Result<CompactionOutcome>,
+    cancelled: bool,
+    dry_run: bool,
+) -> &'static str {
+    match result {
+        Err(MaintainError::InputOutOfWindow { .. }) => "held",
+        Err(_) => "failed",
+        Ok(_) if cancelled => "cancelled",
+        Ok(CompactionOutcome::Compacted { publish, .. }) => match publish {
+            PublishOutcome::Published if dry_run => "dry-run",
+            PublishOutcome::Published => "published",
+            PublishOutcome::Converged { .. } => "converged",
+            PublishOutcome::Abandoned => "abandoned",
+        },
+        Ok(_) => "skipped",
     }
 }
 
@@ -548,7 +589,11 @@ async fn compact_bucket_scoped(
             "compaction is not implemented for signal {other:?}"
         ))),
     };
-    drop(in_flight);
+    let cancelled = match guard.as_ref() {
+        Some(guard) => guard.cancelled_at().await.is_some(),
+        None => false,
+    };
+    in_flight.end(merge_end_outcome(&outcome, cancelled, run_config.dry_run));
     let outcome = match outcome {
         Err(MaintainError::InputOutOfWindow {
             object_key,
