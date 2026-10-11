@@ -950,9 +950,10 @@ fn amplification(scan_wire_bytes: u64, page_stored_bytes_decoded: u64) -> f64 {
 ///   `ravel-catalog`, which records them on the query's pooled
 ///   `QueryAccounting` and holds no handle on the per-phase counter. Every
 ///   statement pays this, so the residual is never zero.
-/// - Only `LogSegmentFetcher` attributes by phase. A metrics or spans statement
-///   reads through `SegmentFetcher`/`SpanSegmentFetcher`, which have no phase
-///   counter at all, so its whole read is residual.
+/// - Only `LogSegmentFetcher` feeds this per-phase wire counter. A metrics or
+///   spans statement reads through `SegmentFetcher`/`SpanSegmentFetcher`, which
+///   never write it (the spans ranged trace read splits `stats.phases`, a
+///   different counter), so its whole read is residual here.
 /// - `object_store_bytes` sums every operation kind, so a LIST response's bytes
 ///   are in it and in no phase. Check 2 uses the GET-only figure for exactly
 ///   this reason; check 3 uses the all-kinds total because that is the

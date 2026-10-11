@@ -126,6 +126,10 @@ impl QueryPhase {
 ///   snapshot resolve's commit-record GETs are issued by `ravel-catalog`, which
 ///   has no handle on this counter.
 ///
+/// The RSPAN ranged trace read (`SpanSegmentFetcher`, a data read) follows the
+/// same rule: its tail probe, footer chase and SKIP_IDX/BLOOM section reads
+/// are [`QueryPhase::Probe`], each block run is [`QueryPhase::Scan`].
+///
 /// Cache hits move no bytes over the wire and are recorded here as nothing at
 /// all; they stay on `QueryAccounting::cache_bytes`, which is a different
 /// quantity from every figure in this type.

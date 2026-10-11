@@ -3,7 +3,8 @@
 //!
 //! Partitions the snapshot's segments round-robin into
 //! `N = min(target_partitions, segment_count)` partitions. Each partition
-//! fetches its segments through [`SpanSegmentFetcher::fetch_accounted`] with one shared
+//! fetches its segments through
+//! [`SpanSegmentFetcher::fetch_accounted_in_blocks`] (no block set) with one shared
 //! [`ravel_rspan::SpanQuery`] (the extracted ts window, plus the trace_id
 //! fast-path key when a `trace_id =` equality was pushed), decodes the returned
 //! [`ravel_rspan::SpanRecord`]s into Arrow arrays matching
@@ -76,6 +77,7 @@ use datafusion::physical_plan::{
 };
 use futures::Stream;
 use ravel_catalog::SegmentRef;
+use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, is_erased_span};
 use ravel_rspan::block::DecodedBlock;
 use ravel_rspan::record::{
@@ -211,7 +213,7 @@ pub struct SpansScanExec {
     status_mask: Option<u8>,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2). Applied per decoded [`SpanRow`] via
-    /// [`is_erased_span`] immediately after `fetcher.fetch_accounted` returns, before
+    /// [`is_erased_span`] immediately after `fetcher.fetch_accounted_in_blocks` returns, before
     /// rows are sorted or built into batches. A no-op when empty.
     erasure: Arc<Vec<ErasurePredicate>>,
     /// The pushed-down column projection (ADR-0110 decision 4). `SpansTableProvider`
@@ -228,10 +230,11 @@ pub struct SpansScanExec {
     columnar_eligible: bool,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
-    /// This query's accounting handle (ADR-0044), threaded into every
+    /// This query's accounting handles (ADR-0044), threaded into every
     /// per-partition fetch so span fetches are recorded like every other
-    /// funnel, mirroring `LogsScanExec`.
-    accounting: QueryAccounting,
+    /// funnel, mirroring `LogsScanExec`. A trace lookup's footer and section
+    /// reads land on the probe phase and its block runs on the scan phase.
+    accounting: PhaseAccounting,
     /// Partition metrics (ADR-0110 decision 5): `columnar_batches`/
     /// `rowpath_batches` show which path a partition ran, and
     /// `pages_decoded`/`pages_skipped` show projection reaching decode, so
@@ -298,9 +301,17 @@ impl SpansScanExec {
             columnar_eligible,
             schema,
             properties,
-            accounting,
+            accounting: PhaseAccounting::pooled_over(&accounting),
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Record this scan's reads on `phases`, split by the phase that issued
+    /// each, instead of on the one handle [`new`](Self::new) took.
+    #[must_use]
+    pub fn with_phase_accounting(mut self, phases: PhaseAccounting) -> Self {
+        self.accounting = phases;
+        self
     }
 
     /// The [`SpanQuery`] this scan issues. Exposed so tests can prove a
@@ -557,7 +568,7 @@ async fn prepare_partition(
     erasure: Arc<Vec<ErasurePredicate>>,
     attempt_columnar: bool,
     projection: Option<Arc<Vec<usize>>>,
-    accounting: QueryAccounting,
+    accounting: PhaseAccounting,
 ) -> DFResult<Prepared> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
@@ -616,13 +627,14 @@ async fn prepare_partition(
     let mut out: Vec<SpanRow> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
-            .fetch_accounted(
+            .fetch_accounted_in_blocks(
                 seg,
                 tenant_hash,
                 &query,
                 duration_ns,
                 status_mask,
                 &predicates,
+                None,
                 &accounting,
             )
             .await
@@ -674,7 +686,7 @@ async fn prepare_columnar(
     status_mask: Option<u8>,
     predicates: &[BloomPredicate<'_>],
     projection: &Arc<Vec<usize>>,
-    accounting: &QueryAccounting,
+    accounting: &PhaseAccounting,
 ) -> DFResult<ColumnarAttempt> {
     let union = union_projected_columns(projection);
     let mut blocks: Vec<HeldBlock> = Vec::new();
@@ -682,7 +694,7 @@ async fn prepare_columnar(
     let mut pages_skipped = 0usize;
     for seg in segs {
         let Some(mut scan) = fetcher
-            .fetch_accounted_columnar(
+            .fetch_accounted_columnar_in_blocks(
                 seg,
                 tenant_hash,
                 query,
@@ -690,6 +702,7 @@ async fn prepare_columnar(
                 status_mask,
                 predicates,
                 &union,
+                None,
                 accounting,
             )
             .await

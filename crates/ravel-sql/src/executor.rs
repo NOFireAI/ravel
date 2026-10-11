@@ -2126,24 +2126,28 @@ impl SqlExecutor {
                     .with_segment_timing(config.segment_timing),
                 ))
             }
-            // The spans, alerts, and audit providers are not yet threaded onto
-            // the per-phase seam (issue #1367 scoped its phase split to the
+            // The alerts and audit providers are not yet threaded onto the
+            // per-phase seam (issue #1367 scoped its phase split to the
             // `samples`/`logs` tables): each still takes one pooled
             // `QueryAccounting`, fed here by extracting the Scan-phase handle,
             // matching where every other pooled reader in this crate now
-            // lands (`RowFetchSource`, `distributed_samples_plan`). Every span,
-            // alert, or audit GET is still recorded, just not split by phase.
+            // lands (`RowFetchSource`, `distributed_samples_plan`). Every
+            // alert or audit GET is still recorded, just not split by phase.
             //
-            // The spans provider drives `SpanSegmentFetcher::fetch_accounted`
-            // for every scanned segment: the handle is cloned in so each span
-            // GET is recorded against this query, and the fetch is
-            // tenant-checked (fails closed on a footer tenant_hash mismatch).
-            TargetSignal::Spans => SessionTable::Spans(Arc::new(SpansTableProvider::new(
-                snapshot,
-                tenant_hash,
-                self.span_fetcher.clone(),
-                phase_accounting.scan().clone(),
-            ))),
+            // The spans provider takes the per-phase handles (issue #2754): a
+            // trace lookup's footer and section reads land on the plan phase
+            // and its block runs on the scan phase; a whole-object span read
+            // lands on the scan phase. Every fetch is tenant-checked (fails
+            // closed on a footer tenant_hash mismatch).
+            TargetSignal::Spans => SessionTable::Spans(Arc::new(
+                SpansTableProvider::new(
+                    snapshot,
+                    tenant_hash,
+                    self.span_fetcher.clone(),
+                    phase_accounting.scan().clone(),
+                )
+                .with_phase_accounting(phase_accounting.clone()),
+            )),
             // The two RLOG-backed tables (ADR-1101 decision 1) read through the
             // executor's existing `log_fetcher`: an alert and an audit record
             // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
