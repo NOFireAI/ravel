@@ -574,9 +574,10 @@ impl SpanSegmentFetcher {
     /// `blocks` otherwise, and each run is one ranged GET (skipped when no
     /// candidate block lies in it, served from the probe when the probe
     /// already holds it). Only the run's blocks that pass the same skip-index
-    /// and bloom prune the whole-object path applies are decoded, so rows,
-    /// `stats` and page-byte accounting match the whole-object path; only the
-    /// wire bytes and request count differ. A failed ranged GET is a typed
+    /// and bloom prune the whole-object path applies are decoded, through the
+    /// same per-block decode that accumulates page bytes, so rows and `stats`
+    /// match the whole-object path; the wire bytes and request count are what
+    /// differ. A failed ranged GET is a typed
     /// [`SpanFetchError::Store`], never a fallback to a whole-object read.
     ///
     /// With a read cache, every ranged read is keyed
