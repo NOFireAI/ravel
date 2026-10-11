@@ -1479,8 +1479,9 @@ struct BlockMetrics {
     int_values_buffers: Count,
     /// String dictionary values arrays this partition's declared `Str` columns
     /// built: one per row group dictionary per scan opening, one per per-block
-    /// dictionary page, one per plain-page block ([`StrValuesCache`],
-    /// ADR-2773 decision D3).
+    /// dictionary page, one per plain-page block, and one per extended copy
+    /// built for a set of fallback values, again after the copy was freed
+    /// ([`StrValuesCache`], ADR-2773 decision D3).
     str_dict_values_built: Count,
     /// Output batches this partition built through the columnar fast path
     /// (ADR-0099 decisions 2-3), straight from a [`ColumnarBlockView`] with no
