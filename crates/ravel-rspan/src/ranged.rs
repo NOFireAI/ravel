@@ -83,6 +83,11 @@ impl TraceBlockSpan {
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }
+
+    /// The candidate block ordinals, ascending and contiguous.
+    pub fn blocks(&self) -> &[usize] {
+        &self.blocks
+    }
 }
 
 /// The absolute byte range of one block in the BLOCKS section, addressed by
@@ -168,8 +173,28 @@ impl RspanRangeReader {
         if blocks.is_empty() {
             return Ok(None);
         }
+        self.block_run_span(trace_id, &blocks).map(Some)
+    }
+
+    /// The [`TraceBlockSpan`] covering one explicit run of block ordinals,
+    /// for a caller that chose the blocks itself (for example the
+    /// intersection of a key-index block set with the SKIP_IDX candidates,
+    /// split into its contiguous runs). `blocks` must be one contiguous run:
+    /// non-empty, ascending, each ordinal one more than the previous, and
+    /// every ordinal below [`block_count`](Self::block_count); anything else
+    /// is `Corrupted`. The returned span is the one
+    /// [`trace_block_span`](Self::trace_block_span) returns for the same run,
+    /// and [`decode_trace`](Self::decode_trace) reads it the same way.
+    pub fn block_run_span(
+        &self,
+        trace_id: &[u8; 16],
+        blocks: &[usize],
+    ) -> Result<TraceBlockSpan, SpanSegError> {
+        if blocks.is_empty() {
+            return Err(SpanSegError::Corrupted("empty trace block run".into()));
+        }
         for w in blocks.windows(2) {
-            if w[1] != w[0] + 1 {
+            if w[0].checked_add(1) != Some(w[1]) {
                 return Err(SpanSegError::Corrupted(
                     "trace blocks not contiguous".into(),
                 ));
@@ -177,7 +202,7 @@ impl RspanRangeReader {
         }
         let mut start = u64::MAX;
         let mut end = 0u64;
-        for &b in &blocks {
+        for &b in blocks {
             let entry =
                 self.skip.blocks.get(b).ok_or_else(|| {
                     SpanSegError::Corrupted("skip block index out of range".into())
@@ -186,12 +211,19 @@ impl RspanRangeReader {
             start = start.min(abs);
             end = end.max(abs_end);
         }
-        Ok(Some(TraceBlockSpan {
+        Ok(TraceBlockSpan {
             trace_id: *trace_id,
             start,
             end,
-            blocks,
-        }))
+            blocks: blocks.to_vec(),
+        })
+    }
+
+    /// The decoded SKIP_IDX this reader was built from, for a caller that
+    /// prunes candidate blocks on more than the trace id (the ts window, the
+    /// duration and status axes, the BLOOM) before reading a run.
+    pub fn skip_index(&self) -> &SkipIndex {
+        &self.skip
     }
 
     /// Decode every record of `span`'s trace from the fetched span bytes.
@@ -457,6 +489,87 @@ mod tests {
              half the {}-byte object across {n_traces} traces",
             obj.len()
         );
+    }
+
+    /// Seven traces of seven spans over four-record blocks: 49 records in 13
+    /// blocks, so every trace crosses at least one block boundary.
+    fn multi_block_object() -> Vec<u8> {
+        let cfg = RspanConfig {
+            block_target_records: 4,
+            ..RspanConfig::default()
+        };
+        let recs: Vec<SpanRecord> = (0..7u8)
+            .flat_map(|t| {
+                (0..7u8).map(move |s| {
+                    span(
+                        t,
+                        s,
+                        i64::from(t) * 100 + i64::from(s),
+                        i64::from(t) * 100 + i64::from(s) + 1,
+                    )
+                })
+            })
+            .collect();
+        build(cfg, recs)
+    }
+
+    #[test]
+    fn block_run_span_refuses_a_non_contiguous_run() {
+        let obj = multi_block_object();
+        let (footer, ranged) = open_range_reader(&obj);
+        assert_eq!(footer.block_count, 13, "fixture geometry");
+        let trace_id = [1u8; 16];
+
+        // The accepted shape first, so each refusal below is about its one
+        // defect and not about the trace or the ordinals in general.
+        let ok = ranged
+            .block_run_span(&trace_id, &[1, 2, 3])
+            .expect("an adjacent ascending in-range run is accepted");
+        assert_eq!(ok.blocks(), &[1, 2, 3]);
+
+        for (what, run) in [
+            ("a gap", vec![1usize, 3]),
+            ("a descending pair", vec![3, 2]),
+            ("a repeated ordinal", vec![2, 2]),
+            ("an empty run", vec![]),
+            ("an ordinal past the last block", vec![12, 13]),
+        ] {
+            let err = ranged
+                .block_run_span(&trace_id, &run)
+                .expect_err(&format!("{what} must be refused"));
+            assert!(
+                matches!(err, SpanSegError::Corrupted(_)),
+                "{what} must be Corrupted, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_run_span_matches_trace_block_span_on_its_own_run() {
+        let obj = multi_block_object();
+        let (_footer, ranged) = open_range_reader(&obj);
+        for t in 0..7u8 {
+            let trace_id = [t; 16];
+            let derived = ranged
+                .trace_block_span(&trace_id)
+                .expect("trace_block_span")
+                .expect("trace present");
+            assert!(
+                derived.block_count() >= 2,
+                "trace {t} must cross a block boundary for the run to be a run"
+            );
+            let explicit = ranged
+                .block_run_span(&trace_id, derived.blocks())
+                .expect("block_run_span on the SKIP_IDX run");
+            assert_eq!(explicit, derived, "trace {t}");
+
+            let bytes = &obj[derived.start() as usize..derived.end() as usize];
+            assert_eq!(
+                ranged.decode_trace(&explicit, bytes).expect("decode"),
+                ranged.decode_trace(&derived, bytes).expect("decode"),
+                "trace {t}"
+            );
+        }
     }
 
     #[test]
