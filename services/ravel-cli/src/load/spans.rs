@@ -735,8 +735,10 @@ fn read_span_attrs_map(
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for i in start..end {
         // Before the null-value skip, so an entry with both null is refused.
-        // `MapArray::try_new` refuses nullable keys, the Parquet reader path
-        // does not, so the refusal stays reachable.
+        // Only `MapArray::try_new` refuses a nullable key field: the Parquet
+        // map reader builds its array from `ArrayData` unvalidated, so a file
+        // whose key column is OPTIONAL delivers its null keys here, and a
+        // dictionary key child can point a valid key at a null value.
         let key = map
             .keys
             .get(i)?

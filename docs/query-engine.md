@@ -1396,7 +1396,10 @@ rule (`crates/ravel-sql/src/compact_slices.rs`, registered last in
 `SortExec` or a `SortPreservingMergeExec`, looking through the
 `ProjectionExec`, `FilterExec` and `CoalescePartitionsExec` nodes between
 them, and above nothing else; an aggregate feeding the plan root or another
-aggregate is left alone. A hash or range `RepartitionExec` is left out for
+aggregate is left alone. The left (build) input of a `NestedLoopJoinExec` or
+a `CrossJoinExec` counts as such a consumer, since both collect it and
+reserve `get_array_memory_size` per batch, while a `HashJoinExec`'s build
+counter charges a shared buffer once and gets no exec. A hash or range `RepartitionExec` is left out for
 a narrower reason than owning its buffers: `partition_grouped_take` does
 one `take` over the input batch and slices the result per partition, and
 `take` reuses a Utf8View or Dictionary column's data buffers, so its pieces
