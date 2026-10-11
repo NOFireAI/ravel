@@ -20,7 +20,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ravel_cache::{Cache, CacheLimits};
-use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_catalog::{Catalog, CatalogConfig, CatalogError};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
@@ -382,6 +382,18 @@ fn promql_harness(
 ) -> (ravel_query::http::AppState, Router, Router) {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    promql_harness_on(store, process_memory_budget, cache, catalog)
+}
+
+/// [`promql_harness`] over a caller-built `Catalog`, for a test that charges
+/// the catalog's decodes to the process budget (`Catalog::with_memory_budget`)
+/// the way `crate::start` does.
+fn promql_harness_on(
+    store: Arc<dyn ObjectStoreBackend>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    cache: Option<ReadCache>,
+    catalog: Arc<Catalog>,
+) -> (ravel_query::http::AppState, Router, Router) {
     let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
@@ -508,6 +520,7 @@ async fn fetch_reservation_steps(
                 requested,
                 reserved,
                 limit: refused_at,
+                cause: ravel_memory::ExhaustionCause::Accounted,
             })) => {
                 assert_eq!(refused_at, limit);
                 limit = reserved + requested;
@@ -583,6 +596,26 @@ async fn post_sql(app: &Router, query: &str) -> (StatusCode, serde_json::Value) 
         .header(header::AUTHORIZATION, "Bearer acme-token")
         .body(Body::from(sql_body(query)))
         .expect("build request");
+    json_response(app, request).await
+}
+
+/// An instant PromQL query of `metric` at `query_time_s` through the real
+/// router, as the status and the decoded JSON body.
+async fn get_promql_instant(
+    app: &Router,
+    metric: &str,
+    query_time_s: i64,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/query?query={metric}&time={query_time_s}"))
+        .header(header::AUTHORIZATION, "Bearer acme-token")
+        .body(Body::empty())
+        .expect("build request");
+    json_response(app, request).await
+}
+
+async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
     let response = app.clone().oneshot(request).await.expect("oneshot");
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -591,6 +624,111 @@ async fn post_sql(app: &Router, query: &str) -> (StatusCode, serde_json::Value) 
     let value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|e| panic!("body not JSON ({e}): {}", String::from_utf8_lossy(&bytes)));
     (status, value)
+}
+
+/// The `error` and `errorType` of a refused query's body.
+fn error_fields(body: &serde_json::Value) -> (&str, &str) {
+    (
+        body["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no error string: {body}")),
+        body["errorType"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no errorType string: {body}")),
+    )
+}
+
+/// Publishes a small RSEG segment for `metric`, three hours before `now` in
+/// its own ingest hour, and folds that hour into a snapshot part, so a query
+/// over it resolves through the catalog's decoded-part path and charges the
+/// part's decode to the catalog's memory budget (ADR-1702 decision 6) before
+/// any segment fetch. Returns the instant (seconds) at which to query it.
+async fn publish_folded_segment(
+    store: &Arc<dyn ObjectStoreBackend>,
+    tenant: &TenantId,
+    metric: &str,
+    now: i64,
+) -> i64 {
+    let tenant_hash = tenant.hash();
+    let hour = now / NS_PER_HOUR - 3;
+    let base_ts_ns = hour * NS_PER_HOUR + 30 * 60 * NS_PER_SEC;
+    let label_set = LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: metric.to_string(),
+    }])
+    .expect("valid labels");
+    let series = vec![SeriesInput {
+        series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+        labels: label_set,
+        samples: (0..60)
+            .map(|i| Sample {
+                ts_ns: base_ts_ns + i * NS_PER_SEC,
+                value: i as f64,
+            })
+            .collect(),
+    }];
+    let writer_id = Uuid::from_u128(4_000);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let written = SegmentWriter::write(
+        series,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: base_ts_ns + 60 * NS_PER_SEC,
+        ingest_hour_bucket: u32::try_from(hour).expect("hour bucket"),
+    })
+    .expect("valid commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store.as_ref(), &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+
+    // Three hours back is past the hour's end plus the flush lifetime, the
+    // clock-skew allowance and the fold safety margin, so the fold seals it.
+    Catalog::new(Arc::clone(store), CatalogConfig::default())
+        .expect("fold catalog")
+        .fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now,
+            &[],
+            None,
+        )
+        .await
+        .expect("fold produces a snapshot HEAD");
+
+    (base_ts_ns + 59 * NS_PER_SEC) / NS_PER_SEC
 }
 
 async fn scrape_metrics(app: &Router) -> String {
@@ -796,19 +934,14 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
 /// ACCEPTANCE TEST: a PromQL fetch whose real execution outgrows the
 /// ADR-1170 process-wide memory budget is refused typed
 /// (`FetchError::FetchMemoryExhausted`), and, through the real HTTP router,
-/// as `StatusCode::SERVICE_UNAVAILABLE`. This is the PromQL-path counterpart
-/// of `a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving`
+/// as `StatusCode::UNPROCESSABLE_ENTITY` / `errorType: "execution"` with the
+/// budget's own message (ADR-2633 decision 3; before it, 503 `unavailable`
+/// with the storage outage message). This is the PromQL-path counterpart of
+/// `a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving`
 /// above: it exercises `crate::query::build_app_state`'s
 /// `.with_memory_budget(process_memory_budget)` wiring, not a hand-built
-/// `QueryEngine`.
-///
-/// Notable divergence from the SQL path: PromQL redacts every fetch failure
-/// (including `FetchMemoryExhausted`) to `MSG_UNAVAILABLE` / HTTP 503
-/// (`crates/ravel-query/src/http/error.rs`), while the SQL path above answers
-/// 422 for the same underlying condition. Both are correct for their own
-/// error-mapping tables, but a caller cannot tell "process memory exhausted"
-/// apart from "the object store is down" on the PromQL surface the way it can
-/// on the SQL surface.
+/// `QueryEngine`. `a_promql_fetch_over_the_process_budget_answers_422` below
+/// pins the HTTP answer for the host-memory gate class as well.
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
 /// `build_app_state` (services/ravel-server/src/query.rs). The typed check
@@ -846,6 +979,7 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
             requested,
             reserved,
             limit,
+            cause: ravel_memory::ExhaustionCause::Accounted,
         })) => {
             assert_eq!(
                 limit,
@@ -854,7 +988,7 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
             );
             (requested, reserved)
         }
-        other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        other => panic!("expected an accounted FetchMemoryExhausted, got {other:?}"),
     };
     assert!(
         requested > 4 * 1024 - reserved,
@@ -905,19 +1039,27 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
         assert_eq!(exact.reserved(), 0);
     }
 
-    // The same refusal, through the real HTTP router: distinct status from
-    // the SQL path's 422 for the same underlying condition (see doc comment
-    // above).
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!(
-            "/api/v1/query?query=big_gauge_budget&time={query_time_s}"
-        ))
-        .header(header::AUTHORIZATION, "Bearer acme-token")
-        .body(Body::empty())
-        .expect("build request");
-    let response = promql.clone().oneshot(request).await.expect("oneshot");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // The same refusal, through the real HTTP router: the same 422 the SQL
+    // path answers for its own memory pool, with the budget's message and
+    // the refusal's own figures.
+    let (status, body) = get_promql_instant(&promql, "big_gauge_budget", query_time_s).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused fetch must answer 422 execution: {body}"
+    );
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!(
+                "fetch memory exhausted: requested {requested} bytes, {reserved} of 4096 byte \
+                 limit already reserved"
+            )
+            .as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
 
     // The refusal left nothing behind: the shared budget reads 0 again, so the
     // next query's reservations start from the full limit. That is the proof
@@ -938,6 +1080,293 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
         response.status(),
         StatusCode::OK,
         "the engine must still answer a query that needs no reservation after a refusal"
+    );
+}
+
+/// ACCEPTANCE TEST (ADR-2633 task 4, issue #2732): a PromQL fetch the
+/// process memory budget refuses answers HTTP 422 `execution` with the
+/// budget's own message, in both budget classes. The accounted class (a 4 KiB
+/// ledger the >512 KiB range read cannot fit) names the figures the typed
+/// refusal carries; the host-memory gate class (an unlimited ledger whose gate
+/// the test closes with the budget's own setter, available 0 below a 1-byte
+/// floor) names the reading and the floor. Reopening the gate makes the same
+/// query answer 200, so the gate alone caused the refusal. Before ADR-2633
+/// both answered 503 `unavailable` with "upstream storage temporarily
+/// unavailable".
+///
+/// Prove-the-test: map `FetchError::FetchMemoryExhausted` back to
+/// `MSG_UNAVAILABLE` in `crates/ravel-query/src/http/error.rs`; both status
+/// assertions fail with 503 against 422.
+#[tokio::test]
+async fn a_promql_fetch_over_the_process_budget_answers_422() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let now = real_now_ns();
+    publish_large_segment(store.as_ref(), &tenant, "big_gauge_422", now).await;
+    let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
+
+    // Accounted class: the ledger's limit refuses the range read.
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * 1024));
+    let (state, promql, _metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
+    let refusal = match state
+        .engine
+        .instant(
+            tenant.hash(),
+            "big_gauge_422",
+            query_time_s * 1000,
+            &[],
+            now,
+            Duration::from_secs(30),
+        )
+        .await
+    {
+        Err(QueryError::Fetch(fetch @ FetchError::FetchMemoryExhausted { .. })) => fetch,
+        other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+    };
+    let FetchError::FetchMemoryExhausted {
+        requested,
+        reserved,
+        limit,
+        cause,
+    } = &refusal
+    else {
+        unreachable!("matched above");
+    };
+    assert_eq!(*cause, ravel_memory::ExhaustionCause::Accounted);
+    assert_eq!(*limit, 4 * 1024);
+    let (status, body) = get_promql_instant(&promql, "big_gauge_422", query_time_s).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an accounted fetch refusal answers 422: {body}"
+    );
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!(
+                "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} \
+                 byte limit already reserved"
+            )
+            .as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
+    assert_eq!(budget.reserved(), 0);
+    assert_eq!(
+        budget.accounted_refusals(),
+        2,
+        "the typed check and the HTTP query"
+    );
+    assert_eq!(budget.gate_refusals(), 0);
+
+    // Host-memory gate class: an unlimited ledger, gate closed.
+    let gated = Arc::new(ravel_memory::MemoryBudget::unlimited());
+    gated.set_host_memory_gate(0, 1);
+    let (state, promql, _metrics) = promql_harness(Arc::clone(&store), Arc::clone(&gated), None);
+    let requested = match state
+        .engine
+        .instant(
+            tenant.hash(),
+            "big_gauge_422",
+            query_time_s * 1000,
+            &[],
+            now,
+            Duration::from_secs(30),
+        )
+        .await
+    {
+        Err(QueryError::Fetch(FetchError::FetchMemoryExhausted {
+            requested,
+            cause:
+                ravel_memory::ExhaustionCause::HostMemory {
+                    available: 0,
+                    floor: 1,
+                },
+            ..
+        })) => requested,
+        other => panic!("expected a host-memory FetchMemoryExhausted, got {other:?}"),
+    };
+    let (status, body) = get_promql_instant(&promql, "big_gauge_422", query_time_s).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a host-memory fetch refusal answers 422: {body}"
+    );
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!(
+                "fetch memory exhausted: host available memory 0 bytes is below the 1 byte \
+                 floor (requested {requested})"
+            )
+            .as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
+    assert_eq!(gated.reserved(), 0);
+    assert_eq!(
+        gated.gate_refusals(),
+        2,
+        "the typed check and the HTTP query"
+    );
+    assert_eq!(gated.accounted_refusals(), 0);
+
+    // The gate alone refused it: reopened, the same query answers.
+    gated.set_host_memory_gate(1, 1);
+    let (status, body) = get_promql_instant(&promql, "big_gauge_422", query_time_s).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "success", "{body}");
+    assert_eq!(gated.reserved(), 0);
+}
+
+/// ACCEPTANCE TEST (ADR-2633 task 4, issue #2732): a PromQL query whose
+/// catalog decode charge the process memory budget refuses
+/// (`CatalogError::MemoryExhausted`, ADR-1702 decision 6) answers HTTP 422
+/// `execution` with the budget's own message, in both budget classes. The
+/// fixture is a folded hour, so the query resolves through a snapshot part
+/// whose decode is charged to the catalog's budget before any segment fetch:
+/// a 1-byte ledger refuses it in the accounted class, and an unlimited ledger
+/// with its gate closed refuses it in the host-memory class without running
+/// the catalog's eviction pass (`decode_reserve_retries` stays 0). Reopening
+/// the gate makes the same query answer 200. Before ADR-2633 both answered 503
+/// `unavailable` with "upstream storage temporarily unavailable".
+///
+/// Prove-the-test: map `CatalogError::MemoryExhausted` back to
+/// `MSG_UNAVAILABLE` in `crates/ravel-query/src/http/error.rs`; both status
+/// assertions fail with 503 against 422. Drop the `HostMemory` early return
+/// from `Catalog::reserve_decoded` and the `decode_reserve_retries` assertion
+/// fails with 1 against 0.
+#[tokio::test]
+async fn a_promql_catalog_decode_refusal_answers_422() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let now = real_now_ns();
+    let query_time_s = publish_folded_segment(&store, &tenant, "folded_gauge_422", now).await;
+
+    // Accounted class: a 1-byte ledger cannot hold the part's decode.
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(1));
+    let catalog = Arc::new(
+        Catalog::new(Arc::clone(&store), CatalogConfig::default())
+            .expect("catalog")
+            .with_memory_budget(Arc::clone(&budget)),
+    );
+    let (state, promql, _metrics) = promql_harness_on(
+        Arc::clone(&store),
+        Arc::clone(&budget),
+        None,
+        Arc::clone(&catalog),
+    );
+    let refusal = match state
+        .engine
+        .instant(
+            tenant.hash(),
+            "folded_gauge_422",
+            query_time_s * 1000,
+            &[],
+            now,
+            Duration::from_secs(30),
+        )
+        .await
+    {
+        Err(QueryError::Catalog(CatalogError::MemoryExhausted(refusal))) => refusal,
+        other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+    };
+    assert_eq!(refusal.cause, ravel_memory::ExhaustionCause::Accounted);
+    assert_eq!(refusal.limit, 1);
+    assert!(refusal.requested > 1, "{refusal:?}");
+    let (status, body) = get_promql_instant(&promql, "folded_gauge_422", query_time_s).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an accounted catalog decode refusal answers 422: {body}"
+    );
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!("catalog decode refused: {refusal}").as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
+    assert_eq!(budget.reserved(), 0);
+    assert_eq!(budget.fetch_reserved(), 0, "no fetch ran after the refusal");
+
+    // Host-memory gate class: an unlimited ledger, gate closed, no eviction
+    // pass.
+    let gated = Arc::new(ravel_memory::MemoryBudget::unlimited());
+    gated.set_host_memory_gate(0, 1);
+    let catalog = Arc::new(
+        Catalog::new(Arc::clone(&store), CatalogConfig::default())
+            .expect("catalog")
+            .with_memory_budget(Arc::clone(&gated)),
+    );
+    let (state, promql, _metrics) = promql_harness_on(
+        Arc::clone(&store),
+        Arc::clone(&gated),
+        None,
+        Arc::clone(&catalog),
+    );
+    let refusal = match state
+        .engine
+        .instant(
+            tenant.hash(),
+            "folded_gauge_422",
+            query_time_s * 1000,
+            &[],
+            now,
+            Duration::from_secs(30),
+        )
+        .await
+    {
+        Err(QueryError::Catalog(CatalogError::MemoryExhausted(refusal))) => refusal,
+        other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+    };
+    assert_eq!(
+        refusal.cause,
+        ravel_memory::ExhaustionCause::HostMemory {
+            available: 0,
+            floor: 1,
+        }
+    );
+    let (status, body) = get_promql_instant(&promql, "folded_gauge_422", query_time_s).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a host-memory catalog decode refusal answers 422: {body}"
+    );
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!("catalog decode refused: {refusal}").as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
+    assert_eq!(
+        catalog.decode_reserve_retries(),
+        0,
+        "a host-memory decode refusal runs no eviction pass"
+    );
+    assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+    assert_eq!(
+        gated.gate_refusals(),
+        2,
+        "the typed check and the HTTP query"
+    );
+    assert_eq!(gated.reserved(), 0);
+
+    // The gate alone refused it: reopened, the same query answers from the
+    // folded part.
+    gated.set_host_memory_gate(1, 1);
+    let (status, body) = get_promql_instant(&promql, "folded_gauge_422", query_time_s).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "success", "{body}");
+    assert_eq!(
+        body["data"]["result"].as_array().map(Vec::len),
+        Some(1),
+        "the folded series answers once the gate reopens: {body}"
     );
 }
 
@@ -1538,11 +1967,14 @@ async fn publish_small_span_segment(
         .expect("publish span commit");
 }
 
-/// ACCEPTANCE TEST (issue #2086): a SQL `samples` (RSEG) fetch whose real
-/// execution outgrows the ADR-1170 process-wide memory budget is refused
-/// typed (`SqlError::Fetch(FetchError::FetchMemoryExhausted)`) and, through
-/// the real HTTP router, as `StatusCode::SERVICE_UNAVAILABLE` /
-/// `errorType: "unavailable"`. This exercises `crate::query::build_sql_state`'s
+/// ACCEPTANCE TEST (issue #2086; ADR-2633 task 4, issue #2732): a SQL
+/// `samples` (RSEG) fetch whose real execution outgrows the ADR-1170
+/// process-wide memory budget is refused typed
+/// (`SqlError::Fetch(FetchError::FetchMemoryExhausted)`) and, through the real
+/// HTTP router, as `StatusCode::UNPROCESSABLE_ENTITY` /
+/// `errorType: "execution"` with the budget's own message carrying the
+/// refusal's figures (before ADR-2633: 503 `unavailable` with "upstream
+/// storage temporarily unavailable"). This exercises `crate::query::build_sql_state`'s
 /// `.with_memory_budget(process_memory_budget)` wiring on the metrics
 /// fetcher, not a hand-built `SegmentFetcher` (`harness` above never calls
 /// `.with_memory_budget` at all).
@@ -1555,8 +1987,10 @@ async fn publish_small_span_segment(
 /// from the metrics fetcher in `build_sql_state`
 /// (services/ravel-server/src/query.rs). The fetch then reserves nothing and
 /// the same tiny budget refuses the query in the SQL pool instead, as
-/// `ResourcesExhausted` (422), so both the typed check and the 503 assertion
-/// fail.
+/// `ResourcesExhausted` (422 too), so the typed check and the message
+/// assertion fail. Prove-the-test for the status: give the fetch refusals
+/// back `ErrorClass::Unavailable` in `crates/ravel-sql/src/error.rs` and the
+/// status assertion fails with 503 against 422.
 #[tokio::test]
 async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1583,11 +2017,12 @@ async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_
         .execute(tenant.hash(), &request)
         .await
         .expect_err("a 4 KiB budget must refuse a >512 KiB range read");
-    match err {
+    let (requested, reserved) = match err {
         SqlError::Fetch(FetchError::FetchMemoryExhausted {
             requested,
             reserved,
             limit,
+            cause: ravel_memory::ExhaustionCause::Accounted,
         }) => {
             assert_eq!(
                 limit,
@@ -1599,9 +2034,12 @@ async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_
                 "the refused reservation must need more than the budget remainder: \
                  requested {requested}, reserved {reserved}"
             );
+            (requested, reserved)
         }
-        other => panic!("expected SqlError::Fetch(FetchMemoryExhausted), got {other:?}"),
-    }
+        other => {
+            panic!("expected an accounted SqlError::Fetch(FetchMemoryExhausted), got {other:?}")
+        }
+    };
     assert_eq!(
         budget.reserved(),
         0,
@@ -1611,10 +2049,21 @@ async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_
     let (status, body) = post_sql(&sql, "SELECT ts, value FROM samples ORDER BY ts").await;
     assert_eq!(
         status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a refused fetch must answer 503 unavailable: {body}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused fetch must answer 422 execution: {body}"
     );
-    assert_eq!(body["errorType"], "unavailable", "body: {body}");
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!(
+                "segment fetch failed: fetch memory exhausted: requested {requested} bytes, \
+                 {reserved} of 4096 byte limit already reserved"
+            )
+            .as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
 
     assert_eq!(budget.reserved(), 0);
     let (status, body) = post_sql(&sql, "SELECT 1").await;
@@ -1625,12 +2074,14 @@ async fn a_sql_metrics_fetch_over_the_process_budget_is_refused_and_the_process_
     );
 }
 
-/// ACCEPTANCE TEST (issue #2086): a SQL `logs` (RLOG) fetch whose real
-/// execution outgrows the ADR-1170 process-wide memory budget is refused
-/// typed (`SqlError::LogFetch(LogFetchError::FetchMemoryExhausted)`) and,
-/// through the real HTTP router, as `StatusCode::SERVICE_UNAVAILABLE` /
-/// `errorType: "unavailable"`. Sibling of the metrics test above, for the
-/// logs fetcher's own `.with_memory_budget` wiring in `build_sql_state`.
+/// ACCEPTANCE TEST (issue #2086; ADR-2633 task 4, issue #2732): a SQL `logs`
+/// (RLOG) fetch whose real execution outgrows the ADR-1170 process-wide
+/// memory budget is refused typed
+/// (`SqlError::LogFetch(LogFetchError::FetchMemoryExhausted)`) and, through
+/// the real HTTP router, as `StatusCode::UNPROCESSABLE_ENTITY` /
+/// `errorType: "execution"` with the budget's own message (before ADR-2633:
+/// 503 `unavailable`). Sibling of the metrics test above, for the logs
+/// fetcher's own `.with_memory_budget` wiring in `build_sql_state`.
 ///
 /// A single tiny log record is enough to force the reservation: unlike RSEG,
 /// RLOG's whole-object read path reserves for any object at or below the
@@ -1671,11 +2122,12 @@ async fn a_sql_logs_fetch_over_the_process_budget_is_refused_and_the_process_kee
         .execute(tenant.hash(), &request)
         .await
         .expect_err("a 1-byte budget must refuse any whole-object logs read");
-    match err {
+    let (requested, reserved) = match err {
         SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
             requested,
             reserved,
             limit,
+            cause: ravel_memory::ExhaustionCause::Accounted,
         }) => {
             assert_eq!(limit, 1, "the refusal must name the configured limit");
             assert!(
@@ -1683,9 +2135,12 @@ async fn a_sql_logs_fetch_over_the_process_budget_is_refused_and_the_process_kee
                 "the refused reservation must need more than the budget remainder: \
                  requested {requested}, reserved {reserved}"
             );
+            (requested, reserved)
         }
-        other => panic!("expected SqlError::LogFetch(FetchMemoryExhausted), got {other:?}"),
-    }
+        other => {
+            panic!("expected an accounted SqlError::LogFetch(FetchMemoryExhausted), got {other:?}")
+        }
+    };
     assert_eq!(
         budget.reserved(),
         0,
@@ -1695,10 +2150,21 @@ async fn a_sql_logs_fetch_over_the_process_budget_is_refused_and_the_process_kee
     let (status, body) = post_sql(&sql, "SELECT ts, body FROM logs").await;
     assert_eq!(
         status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a refused fetch must answer 503 unavailable: {body}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused fetch must answer 422 execution: {body}"
     );
-    assert_eq!(body["errorType"], "unavailable", "body: {body}");
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!(
+                "log segment fetch failed: fetch memory exhausted: requested {requested} \
+                 bytes, {reserved} of 1 byte limit already reserved"
+            )
+            .as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
 
     assert_eq!(budget.reserved(), 0);
     let (status, body) = post_sql(&sql, "SELECT 1").await;
@@ -1709,11 +2175,13 @@ async fn a_sql_logs_fetch_over_the_process_budget_is_refused_and_the_process_kee
     );
 }
 
-/// ACCEPTANCE TEST (issue #2086): a SQL `spans` (RSPAN) fetch whose real
-/// execution outgrows the ADR-1170 process-wide memory budget is refused
-/// typed (`SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted)`) and,
-/// through the real HTTP router, as `StatusCode::SERVICE_UNAVAILABLE` /
-/// `errorType: "unavailable"`. Sibling of the two tests above, for the spans
+/// ACCEPTANCE TEST (issue #2086; ADR-2633 task 4, issue #2732): a SQL `spans`
+/// (RSPAN) fetch whose real execution outgrows the ADR-1170 process-wide
+/// memory budget is refused typed
+/// (`SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted)`) and, through
+/// the real HTTP router, as `StatusCode::UNPROCESSABLE_ENTITY` /
+/// `errorType: "execution"` with the budget's own message (before ADR-2633:
+/// 503 `unavailable`). Sibling of the two tests above, for the spans
 /// fetcher's own `.with_memory_budget` wiring in `build_sql_state`.
 ///
 /// A single tiny span is enough to force the reservation:
@@ -1750,11 +2218,12 @@ async fn a_sql_spans_fetch_over_the_process_budget_is_refused_and_the_process_ke
         .execute(tenant.hash(), &request)
         .await
         .expect_err("a 1-byte budget must refuse any whole-object spans read");
-    match err {
+    let (requested, reserved) = match err {
         SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted {
             requested,
             reserved,
             limit,
+            cause: ravel_memory::ExhaustionCause::Accounted,
         }) => {
             assert_eq!(limit, 1, "the refusal must name the configured limit");
             assert!(
@@ -1762,9 +2231,12 @@ async fn a_sql_spans_fetch_over_the_process_budget_is_refused_and_the_process_ke
                 "the refused reservation must need more than the budget remainder: \
                  requested {requested}, reserved {reserved}"
             );
+            (requested, reserved)
         }
-        other => panic!("expected SqlError::SpanFetch(FetchMemoryExhausted), got {other:?}"),
-    }
+        other => {
+            panic!("expected an accounted SqlError::SpanFetch(FetchMemoryExhausted), got {other:?}")
+        }
+    };
     assert_eq!(
         budget.reserved(),
         0,
@@ -1778,10 +2250,21 @@ async fn a_sql_spans_fetch_over_the_process_budget_is_refused_and_the_process_ke
     .await;
     assert_eq!(
         status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a refused fetch must answer 503 unavailable: {body}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused fetch must answer 422 execution: {body}"
     );
-    assert_eq!(body["errorType"], "unavailable", "body: {body}");
+    assert_eq!(
+        error_fields(&body),
+        (
+            format!(
+                "span segment fetch failed: fetch memory exhausted: requested {requested} \
+                 bytes, {reserved} of 1 byte limit already reserved"
+            )
+            .as_str(),
+            "execution"
+        ),
+        "body: {body}"
+    );
 
     assert_eq!(budget.reserved(), 0);
     let (status, body) = post_sql(&sql, "SELECT 1").await;

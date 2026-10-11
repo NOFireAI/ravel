@@ -1031,7 +1031,8 @@ running server today wherever the segment fetcher runs under the process
 budget: PromQL evaluation (`QueryEngine::with_memory_budget`, wired in
 `ravel-server`), cache warming (`ravel-server`'s `cache_warm.rs`) and
 distributed query fragments (`ravel-server`'s `distrib.rs`). A read whose
-decode does not fit is refused with the 503 `FetchMemoryExhausted` maps to.
+decode does not fit is refused with the 422 `FetchMemoryExhausted` maps to
+(ADR-2633 decision 3).
 The SQL samples scan reaches the same `decode_selected`, and its fetcher now
 reserves against the same process budget (see the SQL-path paragraph above),
 so its decodes are charged and refused by the same code as the PromQL path's.
@@ -1170,20 +1171,19 @@ from those two, because their counts fold at the coordinator.
 
 A worker's budget refusal keeps its type end to end: the coordinator turns it
 back into `TooManyBytesScanned`, `TooManySeries`, `TooManySamples`, or
-`TooManySegments`, so it renders as the same 422 a local budget trip does. A
-503 means the fan-out itself failed or a worker was out of fetch memory, never
-that one of the query caps (bytes, series, samples, requests) was hit. The
-memory case is backpressure: the same slice can succeed once the worker has
-room, which is why it stays retryable while a cap refusal does not.
+`TooManySegments`, or into `FetchMemoryExhausted` with the class the worker's
+budget reported (its ledger's limit, or its host-memory gate), so it renders
+as the same 422 a local refusal does, with the worker's own budget message
+(ADR-2633 decision 3). A 503 means the fan-out itself failed, never that one
+of the query caps (bytes, series, samples, requests) was hit and never that a
+worker was out of fetch memory.
 
 That holds on the cross-cluster path too. A remote answering `BudgetExceeded`
 refused the query under its own caps (its wire-budget clamp, or the
 `max_series`/`max_samples` a resolve-scope slice enforces over its own
-result), so the coordinator renders it as the same typed 422, not as the
-`Federation` error it redacts to 503. The fetch-memory carve-out applies here
-too: a remote out of fetch memory answers `BudgetExceeded` like a cap refusal
-does, and it keeps the retryable 503, because it is backpressure rather than a
-verdict on the query. A refusal is told apart from a fan-out
+result) or its own memory budget, so the coordinator renders it as the same
+typed 422, not as the `Federation` error it redacts to 503. A refusal is told
+apart from a fan-out
 failure by the wire status code, which only a remote that answered can set: a
 remote that was unreachable or timed out produces no status at all and keeps
 the retryable 503. The remote's message text selects only which cap is
@@ -1326,10 +1326,11 @@ the sql figure may briefly over-read by at most the size of the reservation in
 flight, and because a scrape reads the two counters with separate loads, a
 reservation made or dropped between them can also make one reading low by its
 size. A PromQL or SQL fetch that needs more than the budget's remainder fails
-with `FetchMemoryExhausted`, which both HTTP APIs answer as 503 (the SQL
-memory pool's own refusal, `ResourcesExhausted`, is the one the SQL path
-answers 422); the refused query holds no reservation afterwards, so the next
-query is admitted against the same remainder as before.
+with `FetchMemoryExhausted`, which both HTTP APIs answer as 422 with the
+budget's own message, the same status the SQL memory pool's own refusal,
+`ResourcesExhausted`, takes (ADR-2633 decision 3; ADR-1170 had these at
+503); the refused query holds no reservation afterwards, so the next query is
+admitted against the same remainder as before.
 
 The SQL query memory pool (`TenantDelegatingPool`) holds the bytes a grouped
 hash aggregate releases instead of returning them to the query, tenant and

@@ -819,11 +819,81 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "bad_data",
             ),
+            // ADR-2633 decision 3: a memory-budget refusal on the fetch path
+            // (metrics, logs, spans) or on a catalog or column-statistics
+            // decode is the budget class, 422, the status the SQL memory
+            // pool's own refusal takes, in both budget classes. ADR-1170 had
+            // these at 503 `unavailable`.
+            (
+                SqlError::ResourcesExhausted("needs 40 bytes, limit 8".to_string()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
+            (
+                SqlError::Fetch(ravel_query::FetchError::FetchMemoryExhausted {
+                    requested: 4096,
+                    reserved: 1024,
+                    limit: 2048,
+                    cause: ravel_memory::ExhaustionCause::Accounted,
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
+            (
+                SqlError::LogFetch(ravel_query::LogFetchError::FetchMemoryExhausted {
+                    requested: 4096,
+                    reserved: 1024,
+                    limit: 2048,
+                    cause: ravel_memory::ExhaustionCause::HostMemory {
+                        available: 100,
+                        floor: 200,
+                    },
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
+            (
+                SqlError::SpanFetch(ravel_sql::SpanFetchError::FetchMemoryExhausted {
+                    requested: 4096,
+                    reserved: 1024,
+                    limit: 2048,
+                    cause: ravel_memory::ExhaustionCause::Accounted,
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
+            (
+                SqlError::Catalog(ravel_catalog::CatalogError::MemoryExhausted(
+                    ravel_memory::MemoryExhausted {
+                        requested: 4096,
+                        reserved: 1024,
+                        limit: 2048,
+                        cause: ravel_memory::ExhaustionCause::HostMemory {
+                            available: 100,
+                            floor: 200,
+                        },
+                    },
+                )),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
+            (
+                SqlError::ColumnStats(ravel_catalog::LoadColumnStatsError::MemoryExhausted(
+                    ravel_memory::MemoryExhausted {
+                        requested: 4096,
+                        reserved: 1024,
+                        limit: 2048,
+                        cause: ravel_memory::ExhaustionCause::Accounted,
+                    },
+                )),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
         ];
         for (err, status, error_type) in cases {
             let api = ServiceError::from_sql(err, tenant);
-            assert_eq!(api.status, status);
-            assert_eq!(api.error_type, error_type);
+            assert_eq!(api.status, status, "{}", api.message);
+            assert_eq!(api.error_type, error_type, "{}", api.message);
         }
     }
 
