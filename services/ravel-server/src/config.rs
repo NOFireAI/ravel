@@ -969,6 +969,19 @@ pub struct Cli {
     #[arg(long = "maintain-claims", value_enum, default_value_t = MaintainClaimsArg::On)]
     pub maintain_claims: MaintainClaimsArg,
 
+    /// Write objects below a bucket's recorded format floor instead of
+    /// refusing them (ADR-1746 decision 5). Without it an ingest flush, a
+    /// compaction, an erasure rewrite or a migration that would publish an
+    /// object below the floor for its family is refused and counted under
+    /// `ravel_format_floor_refused_total`. With it the object is written, a
+    /// warning is logged per publish and counted under
+    /// `ravel_format_floor_writes_below_total`, and the floor no longer holds:
+    /// the next `ravel-cli maintain audit-versions` classifies it
+    /// `contradicted`. The floor itself is never lowered. Meant for keeping a
+    /// rolled-back binary ingesting until a roll forward and a `migrate` run.
+    #[arg(long = "write-below-format-floor")]
+    pub write_below_format_floor: bool,
+
     /// Age past which the maintenance loop deletes alert transition records,
     /// as a humantime duration (e.g. `90d`), ADR-1688 decision 5. Each alert
     /// identity's current-state record is kept whatever its age. A tenant
@@ -6844,6 +6857,10 @@ impl Cli {
             claim_lease_duration,
             claim_min_input_bytes,
             rlog_zstd_level,
+            format_floor: Some(ravel_ingest::FormatFloorPolicy::new(
+                self.write_below_format_floor,
+                ravel_ingest::format_floor_metrics(),
+            )),
             ..ravel_maintain::CompactorConfig::default()
         };
         let memory_target = self.resolve_l1_part_memory_target(
