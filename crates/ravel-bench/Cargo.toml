@@ -245,6 +245,17 @@ proptest = { workspace = true }
 # Corpus-loader tests write malformed and well-formed corpus files to a temp
 # directory that cleans itself up; workspace pin, no new external crate.
 tempfile = { workspace = true }
+# The `ingest_write_gate_overhead` bench (issue #2669) drives the real OTLP-HTTP
+# and Remote Write handlers through their axum routers, so it links ravel-server
+# (default features, named by path as the optional `saturation` entry above
+# names it) and the request types those handlers decode. Every entry reuses a
+# workspace pin; no new external crate.
+ravel-server = { path = "../../services/ravel-server", version = "0.23.0" }
+ravel-cpu-gate = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+flate2 = { workspace = true }
+opentelemetry-proto = { workspace = true }
 
 [lib]
 # Only the criterion `[[bench]]` targets below understand `cargo bench`'s
@@ -577,6 +588,12 @@ harness = false
 
 [[bench]]
 name = "series_id_hash"
+harness = false
+
+# ADR-1702 write gate overhead on the ingest codec paths (issue #2669). Not part
+# of the tier B set: it is a run-by-hand measurement for a gate review.
+[[bench]]
+name = "ingest_write_gate_overhead"
 harness = false
 
 [[bin]]
