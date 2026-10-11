@@ -1106,6 +1106,26 @@ check_eq "shape guard exit 1: prints the guard's finding" \
   "$(printf '%s\n' "${struct_hit_out}" | sed -n 3p)"
 check_eq "shape guard exit 1: no merge line" \
   "0" "$(printf '%s\n' "${struct_hit_out}" | grep -c 'gh pr merge' || true)"
+# Catches: a refusal that never names the override.
+check_eq "shape guard exit 1: points at the override, last" \
+  "  -> if every site above is verified by hand as a false positive, re-run with ALLOW_STALE_SHAPE_SITES=1" \
+  "$(printf '%s\n' "${struct_hit_out}" | sed -n '$p')"
+
+# ALLOW_STALE_SHAPE_SITES=1 lets a hit through to the merge line. Catches: the
+# variable ignored (no merge line), the hits dropped once overridden, and the
+# override reported as a could-not-check warning.
+struct_override_out="$(ALLOW_STALE_SHAPE_SITES=1 E2E_STRUCT_RC=1 E2E_STRUCT_OUT="${STRUCT_HIT}" e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard exit 1 overridden: the clean verdict, the note, the hits, the merge line" \
+  "$(printf '%s\n%s\n%s\n%s' \
+    "  -> clean: CI green, review at the current head with zero findings" \
+    "  -> NOTE: the shape guard's refusal was overridden with ALLOW_STALE_SHAPE_SITES=1; these are the sites it reported:" \
+    "       src/server/audit.rs: struct ServerConfig literal (line 2; changed on origin/main by ab46fe9 feat(server): audit wiring (#2809))" \
+    "${MERGE_LINE}")" \
+  "$(printf '%s\n' "${struct_override_out}" | sed -n '2,$p')"
+# Catches: the note printed whenever the variable is set, hit or not.
+struct_override_clean_out="$(ALLOW_STALE_SHAPE_SITES=1 e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard clean with the override set: output unchanged" \
+  "${struct_clean_out}" "${struct_override_clean_out}"
 
 # A merge queue does not lift it: the queue's rebase is where the break shows.
 struct_queue_out="$(E2E_RULES="${QUEUE_RULES}" E2E_STRUCT_RC=1 E2E_STRUCT_OUT="${STRUCT_HIT}" e2e "${CLEAN_BODY_JSON}")"
