@@ -2659,6 +2659,9 @@ impl ShardActor {
             ..
         } = buf;
         self.metrics.record_flush(trigger);
+        if trigger == FlushTrigger::Size {
+            self.metrics.record_shard_size_flush(self.shard);
+        }
         // The deadline pinned here is the flush-open deadline. It bounds how
         // long the flush may sit queued for a permit: the spawned task checks it
         // before acquiring and abandons a flush already past it without taking a

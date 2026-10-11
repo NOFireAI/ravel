@@ -79,25 +79,10 @@ const LE_LABEL: &str = "le";
 /// behavior from the writer unchanged (it writes no overflow logic of its own).
 pub const LOADER_MAX_ATTRIBUTES_PER_RECORD: usize = 1024;
 
-/// Default rows per Strict write. Each write is one flush per involved shard,
-/// so this bounds the RLOG object size and the memory held while building a
-/// batch. Every successful write is fully durable before the next batch starts.
+/// Default rows per Strict write. With the derived flush target a shard
+/// buffer holds several batches' slices before it flushes, so this bounds the
+/// memory held while building one batch, not the object size.
 pub const DEFAULT_BATCH_ROWS: usize = 10_000;
-
-/// Default flush target size, in bytes, for a shard's buffer. `1` makes every
-/// Strict write flush inside its own `handle_write`, so one batch is one RLOG
-/// object per involved shard and every ack is answered by that write's own
-/// flush. A larger value lets a shard hold several batches' records in one
-/// buffer before it flushes, which defers those earlier batches' acks (see
-/// [`load_instrumented`]).
-///
-/// The target is compared against the shard buffer's estimated *uncompressed
-/// object content*, not against encoded RLOG bytes, and the comparison
-/// runs once per write after a whole batch's slice has merged, so a target at or
-/// below one batch's per-shard slice produces exactly the layout `1` does. See
-/// [`target_bytes_no_effect_warning`] for the arithmetic and for what the loader
-/// reports when a target turns out to change nothing.
-pub const DEFAULT_TARGET_BYTES: usize = 1;
 
 /// Default number of decoded batches allowed to sit queued between the Parquet
 /// decode/build stage and the shard-write stage (issue #680). The decoder runs
@@ -107,9 +92,14 @@ pub const DEFAULT_TARGET_BYTES: usize = 1;
 /// with `--pipeline-depth`'s own in-flight-write working set.
 pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
 
-/// Default number of Strict batch writes the loader keeps outstanding (issues
-/// #800, #807), the `--pipeline-depth` lever and the OUTER of the two write
-/// concurrency windows.
+/// The fixed pipeline depth ADR-0807 measured and the CLI defaulted to before
+/// issue #2753 (issues #800, #807): the `--pipeline-depth` lever is the OUTER
+/// of the two write concurrency windows. The CLI default is now derived from
+/// [`DEFAULT_OBJECT_ROWS`] and the memory budget ([`resolve_geometry`]); this
+/// value remains the depth [`DEFAULT_MAX_INFLIGHT_FLUSHES`] is pinned to and
+/// the explicit depth the library entry points' callers pass.
+///
+/// The measurement behind it:
 ///
 /// At `1` the submit loop awaits a batch's every-shard ack before it submits the
 /// next, so each batch's encode, data PUT, and commit-record PUT are serial with
@@ -133,17 +123,17 @@ pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
 ///   count, which is a provisioning decision an operator may set far above 4.
 ///   The loader holds at most `--pipeline-depth` built batches for their
 ///   in-flight writes, plus `--decode-queue-batches` queued ahead, so this
-///   default takes the resident batch working set from `1 + 2` to `4 + 2`
+///   depth takes the resident batch working set from `1 + 2` to `4 + 2`
 ///   batches of `--batch-rows` rows.
 /// - It is at least the default `--shards` (4), so every shard of a
 ///   default-provisioned signal can hold a write at once.
-pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
+pub const MEASURED_PIPELINE_DEPTH: usize = 4;
 
 /// Default per-shard bound on concurrently in-flight flushes (issues #800,
 /// #807), the `--max-inflight-flushes` lever and the INNER of the two write
 /// concurrency windows.
 ///
-/// Pinned to [`DEFAULT_PIPELINE_DEPTH`] by
+/// Pinned to [`MEASURED_PIPELINE_DEPTH`] by
 /// `default_max_inflight_flushes_matches_pipeline_depth`, because the two
 /// windows compose as
 /// `shards * min(pipeline_depth, max_inflight_flushes, max_queued_flushes)`
@@ -175,23 +165,23 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// own default (4, ADR-2708 D3): that default governs the client-facing
 /// serving path, whose Strict ack contract ADR-0067 froze, and the bulk loader
 /// is a different workload with a different memory owner.
-pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = DEFAULT_PIPELINE_DEPTH as u32;
+pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = MEASURED_PIPELINE_DEPTH as u32;
 
 /// Build the router [`IngestConfig`] a load drives, given the three
 /// operator-facing flush levers.
 ///
-/// `max_flush_delay` is `None` when `--max-flush-delay` is unset: the field is
-/// then left at its [`IngestConfig::default`] value, so an unset flag produces
-/// a byte-for-byte default config and changes nothing. `Some(d)` overrides only
+/// `max_flush_delay` `None` leaves the field at its [`IngestConfig::default`]
+/// value, so it produces a byte-for-byte default config. The CLI never passes
+/// `None`: an unset `--max-flush-delay` is [`DEFAULT_MAX_FLUSH_DELAY`] there,
+/// and `None` is what a library caller gets. `Some(d)` overrides only
 /// the router's age trigger, the third binding constraint on object layout
 /// beside `target_bytes` and a batch's per-shard slice footprint (issue #801):
 /// a shard buffer flushes when it reaches `target_bytes`, when its oldest point
 /// ages past `max_flush_delay`, or on a drain (the final drain, or the
-/// loader's budget-stall and straggler flushes). At the default 2s a
-/// buffer that fills slower than one target's worth every 2s is released by age
-/// before it ever reaches a large `target_bytes`, so a bulk load that wants
-/// target-sized objects must raise this delay past the time one target takes to
-/// fill.
+/// loader's depth, budget-stall and straggler flushes). At the library default
+/// of 2s a buffer that fills slower than one target's worth every 2s is
+/// released by age before it ever reaches a large `target_bytes`, which is why
+/// the CLI defaults the delay to 60s.
 pub(crate) fn build_ingest_config(
     shards: u32,
     target_bytes: usize,
@@ -268,6 +258,8 @@ mod sequential;
 use sequential::*;
 mod spans;
 pub use spans::*;
+mod geometry;
+pub use geometry::*;
 
 /// Result of a successful (or partially-durable) load, for the summary output.
 #[derive(Debug, Clone, Default)]
@@ -291,8 +283,8 @@ pub struct LoadReport {
     /// The file's total row count, read from the Parquet footer.
     pub file_total_rows: u64,
     /// One token per shard acked, across every batch, in submission order. At
-    /// the default `--target-bytes 1` that is one token per object written; at
-    /// a larger target one flush answers several batches' acks with the same
+    /// `--target-bytes 1` that is one token per object written; at a larger
+    /// or derived target one flush answers several batches' acks with the same
     /// token, so the list repeats it once per batch that flush carried. Use
     /// [`LoadReport::objects_written`] for the object count.
     pub tokens: Vec<CommitToken>,
@@ -320,15 +312,30 @@ pub struct LoadReport {
     /// return path for a per-load signal (`LogIngestRouter::metrics()` is only
     /// reachable by whoever constructed the router, which is `load` itself).
     pub metrics: LogIngestMetricsSnapshot,
-    /// Per-shard flush counts split by trigger cause (size / age / final drain),
-    /// snapshotted with `metrics` once the load finished (issue #983). This is
-    /// the honest basis for comparing two loads of the same input: the raw
-    /// object count is not a function of the command line (input order
-    /// concentrates consecutive rows on one shard, and the 2-second age trigger
-    /// makes host speed change the layout), but the trigger mix that produced it
-    /// is. Sorted by shard index; a shard that never flushed is absent. Empty on
-    /// a tenant loaded before this change, which is not an error.
+    /// Per-shard flush counts split by the router's trigger causes (size, age,
+    /// arrival, final drain), snapshotted with `metrics` once the load
+    /// finished (issue #983). This is the honest basis for comparing two loads
+    /// of the same input: the raw object count is not a function of the
+    /// command line (input order concentrates consecutive rows on one shard,
+    /// and the age trigger makes host speed change the layout), but the
+    /// trigger mix that produced it is. Sorted by shard index; a shard that
+    /// never flushed is absent.
     pub flush_trigger_mix: Vec<(u32, FlushTriggerMix)>,
+    /// Per shard, how many of its `final_drain` flushes the loader's depth
+    /// flush opened (issue #2753). [`LoadReport::flush_mix_report`] moves them
+    /// from `manual` to `depth`. Sorted by shard index; a shard no depth flush
+    /// released is absent.
+    pub depth_flushes_by_shard: Vec<(u32, u64)>,
+    /// The flush target and pipeline depth the load ran with. `None` when the
+    /// load decoded no rows, so nothing was resolved.
+    pub geometry: Option<LoadGeometry>,
+    /// The target-no-effect warning ([`target_bytes_no_effect_warning`]),
+    /// computed once the load finished.
+    pub target_bytes_no_effect_warning: Option<String>,
+    /// How many times the depth window gave up realigning on size flushes
+    /// (`DepthWindow::realign_gave_up`): 0, or 1 when the shards had not
+    /// handled a batch within the 30 s settle timeout.
+    pub realign_gave_up: u64,
     /// The early shard-skew warning (issue #560), set at most once, the first
     /// time the check at [`SKEW_CHECK_AFTER_BATCHES`](logs::SKEW_CHECK_AFTER_BATCHES) data batches finds the
     /// spread at or below the [`SKEW_WARN_DENOMINATOR`](logs::SKEW_WARN_DENOMINATOR) threshold. `None` when
@@ -386,21 +393,34 @@ impl LoadReport {
     }
 
     /// The machine-readable per-shard flush trigger mix plus its totals (issue
-    /// #983), the serializable projection of [`LoadReport::flush_trigger_mix`].
-    /// Empty `shards` on a tenant loaded before this change, which is not an
-    /// error.
+    /// #983), the serializable projection of [`LoadReport::flush_trigger_mix`]
+    /// and [`LoadReport::depth_flushes_by_shard`]. The router counts
+    /// strict-arrival flushes apart from age and so does this report: the
+    /// five keys (`size`, `age`, `arrival`, `depth`, `manual`) are disjoint
+    /// and sum to the flushes. The loader writes only `WriteMode::Strict`, so
+    /// `arrival` is 0 on every load. The drains split into `depth` and
+    /// `manual`.
     pub fn flush_mix_report(&self) -> FlushMixReport {
         let shards: Vec<ShardFlushMix> = self
             .flush_trigger_mix
             .iter()
-            .map(|(shard, mix)| ShardFlushMix {
-                shard: *shard,
-                counts: FlushMixCounts {
-                    size: mix.size,
-                    age: mix.age,
-                    arrival: mix.arrival,
-                    final_drain: mix.final_drain,
-                },
+            .map(|(shard, mix)| {
+                let depth = self
+                    .depth_flushes_by_shard
+                    .iter()
+                    .find(|(s, _)| s == shard)
+                    .map_or(0, |(_, d)| *d)
+                    .min(mix.final_drain);
+                ShardFlushMix {
+                    shard: *shard,
+                    counts: FlushMixCounts {
+                        size: mix.size,
+                        age: mix.age,
+                        arrival: mix.arrival,
+                        depth,
+                        manual: mix.final_drain - depth,
+                    },
+                }
             })
             .collect();
         let mut totals = FlushMixCounts::default();
@@ -408,9 +428,22 @@ impl LoadReport {
             totals.size += s.counts.size;
             totals.age += s.counts.age;
             totals.arrival += s.counts.arrival;
-            totals.final_drain += s.counts.final_drain;
+            totals.depth += s.counts.depth;
+            totals.manual += s.counts.manual;
         }
         FlushMixReport { shards, totals }
+    }
+
+    /// The layout report the summary renders and prints as JSON.
+    pub fn layout_report(&self) -> LoadLayoutReport {
+        LoadLayoutReport {
+            signal: "logs".to_string(),
+            objects_written: self.objects_written(),
+            geometry: self.geometry,
+            flush_mix: self.flush_mix_report(),
+            target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
+            realign_gave_up: self.realign_gave_up,
+        }
     }
 }
 
@@ -445,60 +478,6 @@ pub struct LoadFold {
     /// Compaction and rewrite records the coverage check fetched from those
     /// buckets.
     pub records_read: usize,
-}
-
-/// Flush counts split by trigger cause: how many flushes each of the four
-/// disjoint triggers opened (issue #983). The serializable counterpart of
-/// [`ravel_ingest::FlushTriggerMix`], carried per shard and as load totals. The
-/// `final` drain is serialized under that name (a Rust keyword, so the field is
-/// `final_drain`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlushMixCounts {
-    /// Flushes opened because a shard buffer reached `--target-bytes`.
-    pub size: u64,
-    /// Flushes opened because a shard buffer aged past `max_flush_delay`.
-    pub age: u64,
-    /// Flushes opened by a strict-arrival write ([`ravel_ingest::FlushTrigger::Arrival`]),
-    /// kept apart from `age`. Always `0` on a load: the loader writes
-    /// `WriteMode::Strict` only, so none of its writes carries the arrival
-    /// policy. Carried so the report shape matches the ingest counters.
-    pub arrival: u64,
-    /// Flushes opened by a drain: the final drain at load close, and the
-    /// loader's budget-stall and straggler flushes, which publish through the
-    /// same `FlushNow` path ([`FlushTrigger::Manual`]).
-    ///
-    /// [`FlushTrigger::Manual`]: ravel_ingest::FlushTrigger::Manual
-    #[serde(rename = "final")]
-    pub final_drain: u64,
-}
-
-impl FlushMixCounts {
-    /// The flushes-opened count, the sum of the four disjoint causes. On a load
-    /// that abandons nothing this equals the objects written.
-    pub fn total(&self) -> u64 {
-        self.size + self.age + self.arrival + self.final_drain
-    }
-}
-
-/// One shard's flush trigger mix, keyed by shard index (issue #983).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShardFlushMix {
-    pub shard: u32,
-    #[serde(flatten)]
-    pub counts: FlushMixCounts,
-}
-
-/// The load's per-shard flush trigger mix and its totals (issue #983), the
-/// machine-readable form of the same figures [`print_summary`](cli::print_summary) prints. Object
-/// count is not a function of the command line, so this states the trigger mix
-/// that produced it, which is comparable between two loads of the same input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlushMixReport {
-    /// One row per shard that flushed, sorted by shard index. Empty on a tenant
-    /// loaded before issue #983, which is not an error.
-    pub shards: Vec<ShardFlushMix>,
-    /// The size / age / final counts summed across every shard.
-    pub totals: FlushMixCounts,
 }
 
 /// The two figures a failed run has to hand back for `--skip-rows` to be

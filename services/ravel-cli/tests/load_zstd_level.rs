@@ -16,7 +16,7 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
-use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, DEFAULT_TARGET_BYTES};
+use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, PER_BATCH_TARGET_BYTES};
 use ravel_cli::maintain::SignalArg;
 use ravel_ingest::RlogZstdLevel;
 use ravel_logseg::footer::{self, COMP_ZSTD, kind};
@@ -111,10 +111,10 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         ROWS,
         0,
         None,
-        1,
+        Some(1),
         1,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::new(level).expect("in range"),
         None,

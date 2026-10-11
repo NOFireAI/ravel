@@ -102,10 +102,10 @@ async fn the_entry_point_emits_the_overflow_warning() {
         10_000,
         0,
         None,
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -216,11 +216,13 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
                 16,
                 0,
                 Some(shards as usize),
-                4,
+                Some(4),
                 DEFAULT_MAX_INFLIGHT_FLUSHES,
                 DEFAULT_DECODE_QUEUE_BATCHES,
-                target_bytes,
-                None,
+                Some(target_bytes),
+                // The 1 MiB case parks on an ack that only the age trigger
+                // answers, on the wall clock; 2 s keeps that wait short.
+                Some(Duration::from_secs(2)),
                 RlogZstdLevel::DEFAULT,
                 None,
                 NOW_NS,
@@ -260,7 +262,7 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
 /// accumulating case starts warning (its `is_none` assertion fails at
 /// "a repeated token is a flush that answered two batches"); delete the
 /// `< 2` writes-per-shard guard and the one-write-per-shard case starts
-/// warning; change the `target_bytes <= DEFAULT_TARGET_BYTES` guard to `<`
+/// warning; change the `target_bytes <= PER_BATCH_TARGET_BYTES` guard to `<`
 /// and the default-target case starts warning.
 #[test]
 fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
@@ -290,7 +292,7 @@ fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
     );
 
     assert!(
-        target_bytes_no_effect_warning(DEFAULT_TARGET_BYTES, &inert, 16, 4).is_none(),
+        target_bytes_no_effect_warning(PER_BATCH_TARGET_BYTES, &inert, 16, 4).is_none(),
         "the default target is not a no-op, it is the documented per-batch layout"
     );
 
@@ -357,10 +359,10 @@ async fn a_failed_load_still_prints_the_one_batch_warning() {
         2,
         0,
         Some(1),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         LoadMemoryRequest::Derived {
@@ -444,5 +446,300 @@ fn fold_summary_names_the_outcome() {
          (see the error below), seal_through_hour 472222, watermark_hour 472222, entries 0, \
          parts read 1, buckets listed 0, records read 0, elapsed 0.000s (included in \
          elapsed)\n"
+    );
+}
+
+/// A warnings sink the test can read while the load still holds it.
+#[derive(Clone, Default)]
+struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl SharedSink {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("sink not poisoned").clone())
+            .expect("warnings are utf-8")
+    }
+}
+
+impl std::io::Write for SharedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("sink not poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A one-column logs fixture of `ts` values and its mapping file.
+fn ts_only_fixture(ts: Vec<i64>) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (dir, pq) = write_parquet(&batch(vec![("ts", i64_col(ts))]));
+    let mapping_path = dir.path().join("mapping.toml");
+    std::fs::write(&mapping_path, "ts_column = \"ts\"\nts_unit = \"nanos\"\n")
+        .expect("write mapping");
+    (dir, pq, mapping_path)
+}
+
+/// Router-quiet periods on the injected clock [`yield_until_geometry_printed`]
+/// sits through before it calls the line missing. Decoding the first batch
+/// runs on a blocking thread that reads no clock, so the router reads as quiet
+/// while it runs; this many quiet periods is far longer than that decode and
+/// still fails a load that never prints in well under a second.
+const GEOMETRY_QUIET_PERIODS: usize = 10_000;
+
+/// Yields until `sink` holds the load's geometry line. The loader prints it
+/// once the first batch is decoded, which happens on a blocking thread this
+/// task cannot otherwise wait on. Panics once the router has been quiet on
+/// `clock` [`GEOMETRY_QUIET_PERIODS`] times with no line, so a load that never
+/// calls the geometry hook fails the test instead of hanging it.
+async fn yield_until_geometry_printed(sink: &SharedSink, clock: &TestClock) {
+    for _ in 0..GEOMETRY_QUIET_PERIODS {
+        if sink.text().contains(GEOMETRY_LINE_PREFIX) {
+            return;
+        }
+        yield_until_router_is_quiet(clock).await;
+    }
+    panic!(
+        "no geometry line after {GEOMETRY_QUIET_PERIODS} quiet periods on the injected clock: {}",
+        sink.text()
+    );
+}
+
+/// A store that records, at its first data-object PUT, whether `sink` already
+/// held the geometry line.
+struct GeometryBeforePutStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    sink: SharedSink,
+    printed_at_first_put: std::sync::Mutex<Option<bool>>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for GeometryBeforePutStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: ravel_object_store::PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        if key.contains("/l0/") {
+            let printed = self.sink.text().contains(GEOMETRY_LINE_PREFIX);
+            self.printed_at_first_put
+                .lock()
+                .expect("first-put lock")
+                .get_or_insert(printed);
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+    {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Issue #2753: with `--max-flush-delay` unset the CLI hands the router 60 s,
+/// not the library's 2 s default. One 2-row batch at a 1 GiB target and
+/// `--pipeline-depth 1` parks the loader on that batch's ack, which only the
+/// age trigger can answer. 59 s on the injected clock leaves the store empty;
+/// 2 s more ages the buffer out and the load finishes with one object.
+///
+/// Prove-the-test: delete the `max_flush_delay.unwrap_or(
+/// DEFAULT_MAX_FLUSH_DELAY)` line in `run_fold_warning_to` and the router
+/// keeps its 2 s default, so the 59 s advance publishes the object and the
+/// load completes into the `panic!` arm.
+#[tokio::test]
+async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
+    use ravel_object_store::memory::MemoryStore;
+
+    const SECOND_NS: i64 = 1_000_000_000;
+    assert_eq!(DEFAULT_MAX_FLUSH_DELAY, Duration::from_secs(60));
+    let (_dir, pq, mapping_path) = ts_only_fixture(vec![NOW_NS; 2]);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(NOW_NS);
+    let sink = SharedSink::default();
+    let mut warnings = sink.clone();
+    let load = run_fold_warning_to(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(1 << 30),
+        None,
+        RlogZstdLevel::DEFAULT,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(64 << 30),
+        },
+        false,
+        NOW_NS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        &mut warnings,
+    );
+    tokio::pin!(load);
+
+    tokio::select! {
+        biased;
+        result = &mut load => panic!(
+            "the load must not finish before 60 s on the injected clock: {result:?}"
+        ),
+        () = async {
+            yield_until_geometry_printed(&sink, &clock).await;
+            yield_until_router_is_quiet(&clock).await;
+            clock.advance_ns(59 * SECOND_NS);
+            yield_until_router_is_quiet(&clock).await;
+        } => {}
+    }
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len(),
+        0,
+        "a 59 s old buffer is inside the 60 s delay"
+    );
+    let emitted = sink.text();
+    assert!(
+        emitted.contains(
+            "load geometry: logs: flush target 1073741824 bytes (--target-bytes), pipeline \
+             depth 1 (--pipeline-depth)"
+        ),
+        "{emitted}"
+    );
+
+    clock.advance_ns(2 * SECOND_NS);
+    load.await
+        .expect("the buffer ages out at 60 s and the load finishes");
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), 1);
+}
+
+/// Issue #2753: a load at the default geometry that fails on a later batch
+/// reports at once. The derived target is far above the two buffered
+/// batches and the injected [`TestClock`] never advances, so neither the
+/// size nor the age trigger can answer their acks: only the failure path's
+/// own `flush_all` (`drain_inflight`) can. The load returns the row
+/// rejection with the first two batches durable as one object, and the
+/// geometry line was already in the warnings sink at the first data-object
+/// PUT.
+///
+/// Prove-the-test: delete the `router.flush_all()` in `drain_inflight` and
+/// the buffered acks are answered by nothing, so the load fails only once
+/// the Strict ack deadline (120 s of wall time at the 60 s default delay)
+/// expires, with a write error instead of the row rejection. Drop the
+/// `rx.recv()` arm in `printing_geometry` and the line is written only once
+/// the load returns, after that PUT.
+#[tokio::test]
+async fn a_failed_default_load_flushes_before_it_reports() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let limits = LogIngestLimits::default();
+    let mut ts = vec![NOW_NS; 6];
+    // Row 4 is the first row of the third 2-row batch.
+    ts[4] = NOW_NS + limits.max_future_skew_ns + 1;
+    let (_dir, pq, mapping_path) = ts_only_fixture(ts);
+    let clock = TestClock::new(NOW_NS);
+    let sink = SharedSink::default();
+    let probe = Arc::new(GeometryBeforePutStore {
+        inner: Arc::new(MemoryStore::new()),
+        sink: sink.clone(),
+        printed_at_first_put: std::sync::Mutex::new(None),
+    });
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&probe) as Arc<dyn ObjectStoreBackend>;
+    let mut warnings = sink.clone();
+    let err = run_fold_warning_to(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        None,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(64 << 30),
+        },
+        false,
+        NOW_NS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        &mut warnings,
+    )
+    .await
+    .expect_err("row 4 is past the future-skew limit");
+
+    match err.downcast_ref::<LoadError>() {
+        Some(LoadError::RowRejected { row, durable, .. }) => {
+            assert_eq!(*row, 4);
+            assert_eq!(durable.len(), 2, "both earlier batches acked: {durable:?}");
+        }
+        other => panic!("expected the row rejection, got {other:?}: {err:#}"),
+    }
+    assert_eq!(
+        list_data_objects(store.as_ref()).await.len(),
+        1,
+        "the failure flush published the two buffered batches as one object"
+    );
+    let emitted = sink.text();
+    assert!(
+        emitted.contains("load geometry: logs: flush target "),
+        "{emitted}"
+    );
+    assert_eq!(
+        *probe.printed_at_first_put.lock().expect("first-put lock"),
+        Some(true),
+        "the geometry line was in the sink at the first data-object PUT"
     );
 }

@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use ravel_ingest::{IngestByteBudget, IngestByteBudgetLimit};
 
+use crate::load::GeometryHook;
+
 const MIB: u64 = 1024 * 1024;
 
 /// Process baseline outside every batch, cursor and flush: the runtime, the
@@ -106,6 +108,10 @@ pub struct LoadMemoryOptions {
     /// load gives it. The report carries it too, but a failed load drops the
     /// report.
     pub one_batch_warning: Arc<OnceLock<String>>,
+    /// Called with the resolved geometry before the first write is
+    /// submitted. It rides here because this is the logs load's one options
+    /// carrier for hooks.
+    pub on_geometry: Option<GeometryHook>,
 }
 
 impl LoadMemoryOptions {
@@ -115,6 +121,7 @@ impl LoadMemoryOptions {
             stall_flush_period: LOAD_STALL_FLUSH_PERIOD,
             on_budget: None,
             one_batch_warning: Arc::default(),
+            on_geometry: None,
         }
     }
 }

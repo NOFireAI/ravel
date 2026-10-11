@@ -90,9 +90,9 @@ pub fn dynamic_column_warnings(
     Vec::new()
 }
 
-/// Warning for a load whose `--target-bytes` above [`DEFAULT_TARGET_BYTES`] laid
+/// Warning for a load whose `--target-bytes` above [`PER_BATCH_TARGET_BYTES`] laid
 /// the objects out exactly as `1` would have (issue #971). `None` when the
-/// target was the default, when some buffer did span several writes, or when no
+/// target was `1`, when some buffer did span several writes, or when no
 /// shard ever received two writes to accumulate in the first place.
 ///
 /// Why a target of a few MiB is a no-op on a wide corpus. The value reaches
@@ -120,11 +120,34 @@ pub fn target_bytes_no_effect_warning(
     batch_rows: usize,
     shards: u32,
 ) -> Option<String> {
-    if target_bytes <= DEFAULT_TARGET_BYTES {
+    layout_no_effect_warning(
+        target_bytes,
+        TargetSource::Flag,
+        &report.tokens,
+        batch_rows,
+        shards,
+    )
+}
+
+/// [`target_bytes_no_effect_warning`] over any signal's ack tokens, for a
+/// target given by the flag or derived from [`DEFAULT_OBJECT_ROWS`]. Every
+/// signal's loader computes it once the load finished and stores it on its
+/// report.
+pub fn layout_no_effect_warning(
+    target_bytes: usize,
+    source: TargetSource,
+    tokens: &[CommitToken],
+    batch_rows: usize,
+    shards: u32,
+) -> Option<String> {
+    if target_bytes <= PER_BATCH_TARGET_BYTES {
         return None;
     }
-    let writes = report.tokens.len();
-    let objects = report.objects_written();
+    let writes = tokens.len();
+    let objects = {
+        let mut seen = std::collections::HashSet::new();
+        tokens.iter().filter(|t| seen.insert(t.encode())).count()
+    };
     if objects < writes {
         // At least one flush answered more than one batch: the target held a
         // buffer open, which is what it is for.
@@ -132,7 +155,7 @@ pub fn target_bytes_no_effect_warning(
     }
     let mut writes_per_shard: std::collections::HashMap<u32, usize> =
         std::collections::HashMap::new();
-    for token in &report.tokens {
+    for token in tokens {
         *writes_per_shard.entry(token.shard).or_default() += 1;
     }
     if writes_per_shard.values().copied().max().unwrap_or(0) < 2 {
@@ -140,8 +163,15 @@ pub fn target_bytes_no_effect_warning(
         // target. Saying the target did nothing would blame the wrong lever.
         return None;
     }
+    let target = match source {
+        TargetSource::Flag => format!("--target-bytes {target_bytes}"),
+        TargetSource::Derived => format!(
+            "the derived flush target of {target_bytes} bytes ({DEFAULT_OBJECT_ROWS} rows at the \
+             first batch's estimated bytes per row)"
+        ),
+    };
     Some(format!(
-        "warning: --target-bytes {target_bytes} did not change this load's object layout. All \
+        "warning: {target} did not change this load's object layout. All \
          {writes} (batch, shard) writes flushed as their own object ({objects} objects), which is \
          what --target-bytes 1 produces, and at least one shard took two or more writes without \
          accumulating them. This is the OBSERVED layout, not proof the target was the lever: \
@@ -149,8 +179,7 @@ pub fn target_bytes_no_effect_warning(
          max-flush-delay clock, the age trigger flushes a waiting buffer before the next \
          batch arrives and no target value can make it accumulate -- check the pipeline \
          depth and write cadence before changing the target. Separately, the target is compared \
-         against the buffer's estimated UNCOMPRESSED object content (body, severity text, stream \
-         attributes, attribute names and values, fixed per-row fields), not the stored object \
+         against the buffer's estimated UNCOMPRESSED object content, not the stored object \
          size, and the check runs once per write after a whole batch has merged. So a target at \
          or below one batch's per-shard slice (about {slice} rows here, at --batch-rows \
          {batch_rows} over {shards} shards) is already exceeded by the first write into an empty \
@@ -185,10 +214,10 @@ pub async fn run(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     load_memory_bytes: Option<u64>,
@@ -214,6 +243,7 @@ pub async fn run(
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         now_ns,
+        Arc::new(SystemClock),
         &mut std::io::stderr(),
     )
     .await
@@ -238,10 +268,10 @@ pub(crate) async fn run_warning_to(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     load_memory_bytes: Option<u64>,
@@ -285,10 +315,10 @@ pub(crate) async fn run_memory_warning_to(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     load_memory: LoadMemoryRequest,
@@ -314,6 +344,7 @@ pub(crate) async fn run_memory_warning_to(
         load_memory,
         false,
         now_ns,
+        Arc::new(SystemClock),
         warnings,
     )
     .await
@@ -333,15 +364,16 @@ pub(crate) async fn run_fold_warning_to(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
     now_ns: i64,
+    clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     let refused = match signal {
@@ -356,10 +388,7 @@ pub(crate) async fn run_fold_warning_to(
              `ravel-cli catalog fold --signal {name} --writers-stopped` once the load has exited"
         );
     }
-    let load_memory_bytes = match load_memory {
-        LoadMemoryRequest::Flag(bytes) => Some(bytes),
-        LoadMemoryRequest::Derived { .. } | LoadMemoryRequest::Unbudgeted => None,
-    };
+    let max_flush_delay = Some(max_flush_delay.unwrap_or(DEFAULT_MAX_FLUSH_DELAY));
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
     let admission_warning = match signal {
@@ -371,7 +400,9 @@ pub(crate) async fn run_fold_warning_to(
     if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
-    if let Some(warning) = unused_load_memory_warning(load_memory_bytes, signal) {
+    // Every signal's loader resolves the budget once it knows the read-cursor
+    // count the floor depends on; metrics and spans read one cursor.
+    if let Some(warning) = load_memory.fallback_warning() {
         let _ = writeln!(warnings, "{warning}");
     }
 
@@ -394,7 +425,9 @@ pub(crate) async fn run_fold_warning_to(
                 decode_queue_batches,
                 target_bytes,
                 max_flush_delay,
+                load_memory,
                 now_ns,
+                Arc::clone(&clock),
                 warnings,
             )
             .await;
@@ -414,7 +447,9 @@ pub(crate) async fn run_fold_warning_to(
                 decode_queue_batches,
                 target_bytes,
                 max_flush_delay,
+                load_memory,
                 now_ns,
+                Arc::clone(&clock),
                 warnings,
             )
             .await;
@@ -422,45 +457,43 @@ pub(crate) async fn run_fold_warning_to(
         MappingSection::Logs(logs) => logs,
     };
 
-    // The loader resolves the budget once it knows the read-cursor count the
-    // floor depends on.
-    if let Some(warning) = load_memory.fallback_warning() {
-        let _ = writeln!(warnings, "{warning}");
-    }
-    let memory_options = LoadMemoryOptions::new(load_memory);
+    let mut memory_options = LoadMemoryOptions::new(load_memory);
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
 
     // The production entry point drives the columnar fast path (ADR-0109) with
     // the operator-configured decode-queue depth; `load` keeps a stable
     // signature for tests and callers that want the default depth.
-    match load_instrumented_at(
-        store,
-        parquet_path,
-        tenant,
-        &mapping,
-        shards,
-        batch_rows,
-        skip_rows,
-        read_cursors,
-        pipeline_depth,
-        max_inflight_flushes,
-        decode_queue_batches,
-        target_bytes,
-        max_flush_delay,
-        now_ns,
-        Arc::new(SystemClock),
-        LoadPath::Columnar,
-        None,
-        None,
-        zstd_level,
-        Some(memory_options),
-        fold_after_load,
-    )
-    .await
-    {
+    let loaded = printing_geometry("logs", warnings, |on_geometry| {
+        memory_options.on_geometry = Some(on_geometry);
+        load_instrumented_at(
+            store,
+            parquet_path,
+            tenant,
+            &mapping,
+            shards,
+            batch_rows,
+            skip_rows,
+            read_cursors,
+            pipeline_depth,
+            max_inflight_flushes,
+            decode_queue_batches,
+            target_bytes,
+            max_flush_delay,
+            now_ns,
+            clock,
+            LoadPath::Columnar,
+            None,
+            None,
+            zstd_level,
+            Some(memory_options),
+            fold_after_load,
+        )
+    })
+    .await;
+    match loaded {
         Ok(report) => {
             print_summary(&report, true);
-            write_report_warnings(warnings, &report, target_bytes, batch_rows, shards);
+            write_report_warnings(warnings, &report);
             Ok(())
         }
         Err(err) => {
@@ -470,7 +503,7 @@ pub(crate) async fn run_fold_warning_to(
             // run, and re-running the load is not the remedy that would show
             // them again.
             if let Some(report) = err.finished_report() {
-                write_report_warnings(warnings, report, target_bytes, batch_rows, shards);
+                write_report_warnings(warnings, report);
             }
             // The failed load dropped the report that carried this warning, and
             // it still explains the run: the load went one batch at a time.
@@ -489,18 +522,42 @@ pub(crate) async fn run_fold_warning_to(
     }
 }
 
+/// Drive one load while writing its resolved geometry line to `warnings`. The
+/// loader yields right after calling the hook, and the channel is polled ahead
+/// of the load, so the line is written before the first batch is submitted.
+async fn printing_geometry<F: std::future::Future>(
+    signal: &'static str,
+    warnings: &mut dyn std::io::Write,
+    load: impl FnOnce(GeometryHook) -> F,
+) -> F::Output {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let hook: GeometryHook = Arc::new(move |geometry: &LoadGeometry| {
+        let _ = tx.send(render_geometry_line(signal, geometry));
+    });
+    let load = load(hook);
+    tokio::pin!(load);
+    loop {
+        tokio::select! {
+            biased;
+            Some(line) = rx.recv() => {
+                let _ = writeln!(warnings, "{line}");
+            }
+            output = &mut load => {
+                while let Ok(line) = rx.try_recv() {
+                    let _ = writeln!(warnings, "{line}");
+                }
+                return output;
+            }
+        }
+    }
+}
+
 /// The end-of-load warnings a finished report carries: the load-memory note,
 /// a `--skip-rows` past the end of the file, shard skew, a `--target-bytes`
 /// that changed nothing, and dynamic-column pressure. Printed after a
 /// successful logs load, and after a `--fold-after-load` failure whose
 /// objects all landed.
-fn write_report_warnings(
-    warnings: &mut dyn std::io::Write,
-    report: &LoadReport,
-    target_bytes: usize,
-    batch_rows: usize,
-    shards: u32,
-) {
+fn write_report_warnings(warnings: &mut dyn std::io::Write, report: &LoadReport) {
     if let Some(warning) = &report.load_memory_warning {
         let _ = writeln!(warnings, "{warning}");
     }
@@ -522,13 +579,12 @@ fn write_report_warnings(
     if let Some(skew) = &report.skew_warning {
         let _ = writeln!(warnings, "{skew}");
     }
-    // A `--target-bytes` above the default that laid the objects out
-    // exactly as the default would have is reported rather than left
-    // silent (issue #971): the flag's threshold is a footprint estimate
-    // the operator cannot see, so the only honest place to state that
-    // the value did nothing is after the load that proves it.
-    if let Some(warning) = target_bytes_no_effect_warning(target_bytes, report, batch_rows, shards)
-    {
+    // A target above 1 that laid the objects out exactly as `--target-bytes 1`
+    // would have is reported rather than left silent (issue #971): the
+    // threshold is a footprint estimate the operator cannot see, so the only
+    // honest place to state that it did nothing is after the load that
+    // proves it.
+    if let Some(warning) = &report.target_bytes_no_effect_warning {
         let _ = writeln!(warnings, "{warning}");
     }
     // The loader's writer uses `RlogConfig::default()` apart from its zstd
@@ -561,12 +617,14 @@ async fn run_metrics(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
+    load_memory: LoadMemoryRequest,
     now_ns: i64,
+    clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -576,28 +634,37 @@ async fn run_metrics(
         warnings,
     )?;
 
-    match load_metrics(
-        store,
-        parquet_path,
-        tenant,
-        mapping,
-        shards,
-        batch_rows,
-        skip_rows,
-        pipeline_depth,
-        max_inflight_flushes,
-        target_bytes,
-        max_flush_delay,
-        now_ns,
-        Arc::new(SystemClock),
-    )
-    .await
-    {
+    let loaded = printing_geometry("metrics", warnings, |on_geometry| {
+        load_metrics_with(
+            store,
+            parquet_path,
+            tenant,
+            mapping,
+            shards,
+            batch_rows,
+            skip_rows,
+            GeometryRequest {
+                target_bytes,
+                pipeline_depth,
+                load_memory,
+            },
+            Some(on_geometry),
+            max_inflight_flushes,
+            max_flush_delay,
+            now_ns,
+            clock,
+        )
+    })
+    .await;
+    match loaded {
         Ok(report) => {
             print_metrics_summary(&report);
             if let Some(warning) =
                 skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
             {
+                let _ = writeln!(warnings, "{warning}");
+            }
+            if let Some(warning) = &report.target_bytes_no_effect_warning {
                 let _ = writeln!(warnings, "{warning}");
             }
             Ok(())
@@ -642,12 +709,14 @@ async fn run_spans(
     batch_rows: usize,
     skip_rows: u64,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
-    target_bytes: usize,
+    target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
+    load_memory: LoadMemoryRequest,
     now_ns: i64,
+    clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -662,29 +731,38 @@ async fn run_spans(
     // carries, and a failure does not undo the approximation in the batches
     // that did land.
     let mut report = SpansLoadReport::default();
-    match load_spans_into(
-        &mut report,
-        store,
-        parquet_path,
-        tenant,
-        mapping,
-        shards,
-        batch_rows,
-        skip_rows,
-        pipeline_depth,
-        max_inflight_flushes,
-        target_bytes,
-        max_flush_delay,
-        now_ns,
-        Arc::new(SystemClock),
-    )
-    .await
-    {
+    let loaded = printing_geometry("spans", warnings, |on_geometry| {
+        load_spans_into(
+            &mut report,
+            store,
+            parquet_path,
+            tenant,
+            mapping,
+            shards,
+            batch_rows,
+            skip_rows,
+            GeometryRequest {
+                target_bytes,
+                pipeline_depth,
+                load_memory,
+            },
+            Some(on_geometry),
+            max_inflight_flushes,
+            max_flush_delay,
+            now_ns,
+            clock,
+        )
+    })
+    .await;
+    match loaded {
         Ok(()) => {
             print_spans_summary(&report);
             if let Some(warning) =
                 skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
             {
+                let _ = writeln!(warnings, "{warning}");
+            }
+            if let Some(warning) = &report.target_bytes_no_effect_warning {
                 let _ = writeln!(warnings, "{warning}");
             }
             Ok(())
@@ -809,26 +887,6 @@ pub(super) fn unused_zstd_level_warning(
     })
 }
 
-/// The warning for a `--load-memory-bytes` a metrics or spans load cannot
-/// use, or `None` when the flag is unset or the load is a logs load. Only the
-/// logs loader's columnar path charges its batches to the budget.
-pub(super) fn unused_load_memory_warning(
-    load_memory_bytes: Option<u64>,
-    signal: SignalArg,
-) -> Option<String> {
-    let noun = match signal {
-        SignalArg::Logs => return None,
-        SignalArg::Metrics => "metrics",
-        SignalArg::Spans => "spans",
-    };
-    load_memory_bytes.map(|bytes| {
-        format!(
-            "warning: a {noun} load ignores --load-memory-bytes {bytes}. The budget applies \
-             only to the batches a logs load holds."
-        )
-    })
-}
-
 /// Print the metrics load's completion summary to stdout.
 fn print_metrics_summary(report: &MetricsLoadReport) {
     let secs = report.elapsed.as_secs_f64();
@@ -851,6 +909,7 @@ fn print_metrics_summary(report: &MetricsLoadReport) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    print!("{}", render_layout_summary(&report.layout_report()));
 }
 
 /// Print the spans load's completion summary to stdout.
@@ -871,6 +930,7 @@ fn print_spans_summary(report: &SpansLoadReport) {
     println!("  objects written  : {}", report.objects_written());
     print_spans_attrs_dropped(report, AttrsDroppedScope::Complete);
     println!("  elapsed          : {secs:.3}s");
+    print!("{}", render_layout_summary(&report.layout_report()));
 }
 
 /// Print the attributes a spans load dropped for a value over the OTLP
@@ -979,7 +1039,7 @@ fn print_summary(report: &LoadReport, fold_covered: bool) {
             report.load_memory_waits,
         );
     }
-    print_flush_mix(report);
+    print!("{}", render_layout_summary(&report.layout_report()));
     #[cfg(feature = "stage-timing")]
     print_stage_timings(report);
 }
@@ -1014,38 +1074,6 @@ pub(super) fn fold_summary(fold: &LoadFold, covered: bool) -> String {
         fold.records_read,
         fold.elapsed.as_secs_f64(),
     )
-}
-
-/// Print the per-shard flush trigger mix (issue #983) under the summary totals.
-/// Object count is not a function of the command line, so the mix that produced
-/// it is what makes two loads of the same input comparable. A load whose
-/// metrics carry no per-shard mix (a router that never flushed) prints nothing
-/// rather than a zeroed line.
-fn print_flush_mix(report: &LoadReport) {
-    let mix = report.flush_mix_report();
-    if mix.shards.is_empty() {
-        return;
-    }
-    let t = &mix.totals;
-    println!(
-        "  flush triggers   : size {}, age {}, arrival {}, final {} (total {})",
-        t.size,
-        t.age,
-        t.arrival,
-        t.final_drain,
-        t.total(),
-    );
-    for s in &mix.shards {
-        println!(
-            "    shard {:>3}      : size {}, age {}, arrival {}, final {} (total {})",
-            s.shard,
-            s.counts.size,
-            s.counts.age,
-            s.counts.arrival,
-            s.counts.final_drain,
-            s.counts.total(),
-        );
-    }
 }
 
 /// Display name for the stage-timings table (ADR-0104 decision 1). `Bloom` is
@@ -1184,10 +1212,10 @@ fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
 pub(super) fn resume_hint(
     err: &LoadError,
     read_cursors: Option<usize>,
-    pipeline_depth: usize,
+    pipeline_depth: Option<usize>,
 ) -> Option<String> {
     let resume = err.resume_figures()?;
-    let sequential = read_cursors == Some(1) && pipeline_depth == 1;
+    let sequential = read_cursors == Some(1) && pipeline_depth == Some(1);
     let verdict = if sequential {
         "this run used --read-cursors 1 --pipeline-depth 1, so the rows that landed are a \
          contiguous prefix of the file and this offset loses nothing. One batch straddles \
@@ -1202,8 +1230,9 @@ pub(super) fn resume_hint(
                 "--read-cursors unset (sized automatically to min(shards, row groups))".to_string()
             }
         };
+        let depth = depth_phrase(pipeline_depth);
         format!(
-            "this run used {cursors} and --pipeline-depth {pipeline_depth}, so the rows that \
+            "this run used {cursors} and {depth}, so the rows that \
              landed are NOT a contiguous prefix of the file: the cursors read far-apart \
              partitions concurrently, and a batch submitted after the failing one can still have \
              committed. Resuming at this offset would both re-ingest committed rows and skip rows \
@@ -1217,9 +1246,12 @@ pub(super) fn resume_hint(
 /// [`resume_hint`] for a metrics or spans load. Both paths always read one
 /// sequential cursor and ignore `--read-cursors`, so the pipeline depth is the
 /// only setting the verdict names.
-pub(super) fn sequential_resume_hint(err: &LoadError, pipeline_depth: usize) -> Option<String> {
+pub(super) fn sequential_resume_hint(
+    err: &LoadError,
+    pipeline_depth: Option<usize>,
+) -> Option<String> {
     let resume = err.resume_figures()?;
-    let verdict = if pipeline_depth == 1 {
+    let verdict = if pipeline_depth == Some(1) {
         "this run used --pipeline-depth 1, so the rows that landed are a contiguous prefix of \
          the file and this offset loses nothing. One batch straddles every shard it touches, \
          though, and the failing batch can have committed on some shards and not others; those \
@@ -1227,8 +1259,9 @@ pub(super) fn sequential_resume_hint(err: &LoadError, pipeline_depth: usize) -> 
          resuming here re-ingests them"
             .to_string()
     } else {
+        let depth = depth_phrase(pipeline_depth);
         format!(
-            "this run used --pipeline-depth {pipeline_depth}, so the rows that landed are NOT a \
+            "this run used {depth}, so the rows that landed are NOT a \
              contiguous prefix of the file: a batch submitted after the failing one can still \
              have committed. Resuming at this offset would both re-ingest committed rows and skip \
              rows that never landed. Only a load started with --pipeline-depth 1 is resumable \
@@ -1236,6 +1269,15 @@ pub(super) fn sequential_resume_hint(err: &LoadError, pipeline_depth: usize) -> 
         )
     };
     Some(resume_block(resume, &verdict))
+}
+
+/// How a resume verdict names the run's pipeline depth. An unset flag is
+/// derived and is never treated as depth 1.
+fn depth_phrase(pipeline_depth: Option<usize>) -> String {
+    match pipeline_depth {
+        Some(depth) => format!("--pipeline-depth {depth}"),
+        None => "--pipeline-depth unset (derived from the object-row target)".to_string(),
+    }
 }
 
 /// The figures and verdict both resume hints print.

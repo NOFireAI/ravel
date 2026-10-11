@@ -1210,30 +1210,66 @@ unsorted input costs every later query the fetch of the bulk objects.
 
 ### `--batch-rows` and object count
 
-`load` writes each batch as one Strict write. At the default
-`--target-bytes 1`, each write flushes at once, and one flush is one RLOG
-object per involved shard. So at that default `--batch-rows` sets the
-batch size (default 10000) and with it how many RLOG objects a load leaves
-behind. A 100M-row load at the default is on the order of 10000 flushes,
-each an RLOG object per shard.
+`load` writes each batch as one Strict write, and each shard merges the
+slices of several batches into one object. With `--target-bytes` unset,
+the loader derives the flush target from the first decoded batch: 250,000
+rows times that batch's estimated bytes per row. While one shard's slice
+of a batch (`--batch-rows` / `--shards` rows) is at most 250,000 rows and
+the memory bound (below) does not lower the pipeline depth, each shard's
+objects hold about 250,000 rows on logs, metrics and spans alike.
+`--batch-rows` (default 10000) then sets the batch size, the memory held
+per batch and the derived pipeline depth, not the object size. A load of
+510,000 rows on one shard writes three objects: two of 250,000 rows closed
+by the size trigger, and the 10,000-row tail published at the end of the
+input.
+
+Three cases fall outside that. When `--batch-rows` / `--shards` is above
+250,000 the rows bound is 1 and every slice is over the target on its
+own, so each object holds one slice, `--batch-rows` / `--shards` rows.
+When the memory bound is lower than the rows bound, the depth flush
+closes each shard's buffer every `--pipeline-depth` batches, so objects
+hold about depth x `--batch-rows` / `--shards` rows, below 250,000.
+When `--batch-rows` / `--shards` is below about 244 the rows bound is
+above the 1,024 cap, so the cap decides the depth and the depth flush
+closes each buffer after 1,024 batches: objects hold about 1,024 x
+`--batch-rows` / `--shards` rows (`--batch-rows 500 --shards 4` gives
+about 128,000).
+
+The derived target is a per-row estimate read off one batch. Rows
+narrower than the first batch's never reach it in 250,000 rows; the depth
+flush closes them instead. When the rows bound decided the depth and the
+rows spread evenly across the shards, that object holds about 250,000
+rows anyway; with an uneven spread, the shards that received fewer rows
+close below that, and with a memory-bound or capped depth objects hold
+about depth x `--batch-rows` / `--shards` rows. Only rows wider than the
+first batch's move the size trigger, which then closes objects of fewer
+rows.
 
 Object count is a first-order query-cost variable. Every later query over
 the affected range pays the per-object cost (LIST, footer read, per-object
-decode setup). A larger `--batch-rows` writes fewer, larger objects, with
-less per-object overhead and more memory held per batch. A smaller one
-writes more, smaller objects.
+decode setup).
+
+`--target-bytes 1 --batch-rows N` restores the layout every load had
+when `1` was the default target: each write flushes at once,
+one flush is one object per involved shard, and `--batch-rows` sets how
+many objects a load leaves behind. A 100M-row load at `--batch-rows 10000`
+is then on the order of 10000 flushes, each an object per shard. A larger
+`--batch-rows` writes fewer, larger objects, with less per-object overhead
+and more memory held per batch.
 
 `--batch-rows 0` is rejected with an error.
 
 ### Object size by bytes: `--target-bytes`
 
-`--target-bytes` above `1` makes each shard merge several batches' slices
-into one buffer and flush it as one object once the buffer's estimate
-reaches the target, so objects grow without growing the batch.
+`--target-bytes` replaces the derived target with a byte figure. Above `1`
+each shard merges several batches' slices into one buffer and flushes it
+as one object once the buffer's estimate reaches the target, so objects
+grow without growing the batch.
 
-The target counts the buffer's estimated **uncompressed** content (body,
-severity text, stream attributes, attribute names and values, and fixed
-per-row fields), not the stored object size. Stored objects come out much
+The target, derived or given, counts the buffer's estimated
+**uncompressed** content (on logs: body, severity text, stream attributes,
+attribute names and values, and fixed per-row fields), not the stored
+object size. Stored objects come out much
 smaller. On ClickBench `hits.parquet` the estimate counts about 7.4 KB per
 row and a stored object holds about 102 bytes per row, so stored objects
 are about 65 to 75 times below the target: a target of 375,000,000 stored
@@ -1242,19 +1278,120 @@ and 1,850,000,000 25.1 MB (mean, 74 times). The ratio is a
 property of that corpus, not a rule; measure your own stored objects
 before sizing the target from it.
 
+### Pipeline depth and the depth flush: `--pipeline-depth`
+
 A Strict write's ack waits for the flush that holds its rows, and the
 loader keeps at most `--pipeline-depth` writes in flight, so one object
-merges at most `--pipeline-depth` batches' slices. Above `1` a batch's ack
-can wait for later batches to fill the buffer. Set `--pipeline-depth` to
-at least the number of batches whose slices fill one object on a shard;
-otherwise every flush waits out the router's age trigger
-(`--max-flush-delay`, 2s by default). A buffer that never reaches the
-target flushes on that trigger, or at the end of the input, so
-`--max-flush-delay` must also be long enough for one object to fill. When
-two checks 250 ms apart both find the decoder waiting for room in
-`--load-memory-bytes` and the bytes charged not lower than at the first,
-the loader flushes every shard buffer early, so a target the budget cannot
-hold yields smaller objects rather than a stalled load.
+merges at most `--pipeline-depth` batches' slices. Above a target of `1` a
+batch's ack can wait for later batches to fill the buffer.
+
+With `--pipeline-depth` unset the loader derives it once the first batch
+is decoded, on every signal, as the lowest of three bounds:
+
+- the rows bound, ceil(250,000 x `--shards` / `--batch-rows`): enough
+  batches for every shard to fill one 250,000-row object. 25 at the
+  defaults on one shard, 100 on four;
+- the memory bound, `--load-memory-bytes` (or the budget derived from
+  host memory when the flag is unset) divided by the estimated object
+  bytes of one batch (`--batch-rows` times the first batch's estimated
+  bytes per row), and at least 1;
+- the cap, 1,024 (`MAX_DERIVED_PIPELINE_DEPTH`): a very small
+  `--batch-rows` would otherwise put more than a thousand writes in
+  flight.
+
+The summary names the cap when it decided the depth (`cap decided it:
+cap 1024, rows bound <N>, memory bound <N>`), including when the memory
+bound is above the cap.
+
+The memory bound compares the budget with the estimate the size trigger
+uses, which is the content of the objects, not the in-memory size of the
+batches. A logs load also charges each built batch against the budget as
+it runs (see `--load-memory-bytes` below). A metrics or spans load applies
+the budget only through this bound and charges nothing at run time.
+
+With `--target-bytes` unset, the loader also flushes every shard once the
+oldest batch pending on any shard is `--pipeline-depth` batches old, so a
+full window never waits out the age trigger. A shard's buffer is pending
+from the first batch that reached it after its last size flush or depth
+flush. The trigger mix counts those flushes under `depth`. A size flush
+restarts only its own shard's window: on every signal the loader reads
+each shard's size-flush count after every submit, and a shard whose count
+rose starts its next window at its next batch while the other shards keep
+their oldest pending batch. Age flushes and a logs load's budget-stall
+flushes restart no window. A depth flush that finds a buffer the size
+trigger has just emptied writes nothing and counts nothing.
+
+To read those counts, the loader waits after each submit until the
+shards have merged that batch before it submits the next. That wait is
+bounded by one batch's merge, not by a flush, since a flush runs in a
+task of its own. If the shards have not merged a batch within 30 s on the
+loader's clock, the loader stops reading the counts for the rest of the
+load: size flushes then restart no window, so a depth flush can come
+early but never late, and the summary's `depth realign` line and the
+JSON `realign_gave_up` field report it. With several
+shards, a depth flush also publishes the part of each buffer that has not
+reached the target yet, so a multi-shard load leaves some objects below
+250,000 rows. An explicit `--pipeline-depth` below the rows bound caps
+objects at about depth x `--batch-rows` / `--shards` rows per shard.
+
+An explicit `--target-bytes` turns the depth flush off: buffers close on
+the size trigger, the age trigger or the loader's own flushes, and the
+measured recipe below still holds because it also sets `--max-flush-delay`
+and `--pipeline-depth` by hand. Three things changed for every load, an
+explicit target included: `--max-flush-delay` defaults to 60 s instead of
+the router's 2 s, the end-of-input flush runs once every submitted batch
+has reached its shard, and a failed load flushes its buffered writes
+before waiting on their acks. `--target-bytes 1` without
+`--pipeline-depth` still gets the derived depth, not the earlier default
+of 4; add `--pipeline-depth 4` for that too.
+
+`--max-flush-delay` defaults to 60s on every signal, so at the defaults
+the size trigger and the depth flush, not the age trigger, close objects.
+A buffer that reaches neither the target nor a depth flush flushes on the
+age trigger, or at the end of the input. When two checks 250 ms apart both
+find a logs load's decoder waiting for room in `--load-memory-bytes` and
+the bytes charged not lower than at the first, the loader flushes every
+shard buffer early, so a target the budget cannot hold yields smaller
+objects rather than a stalled load.
+
+### The layout report
+
+Every load's summary ends with the geometry it ran with and the trigger
+mix that produced its objects, on logs, metrics and spans alike:
+
+```text
+  flush target     : <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row)
+  pipeline depth   : <N> (rows bound decided it: rows bound <N>, memory bound <N>)
+  depth realign    : per shard on size flushes
+  flush triggers   : size <N>, age <N>, arrival <N>, depth <N>, manual <N> (total <N>)
+    shard   0      : size <N>, age <N>, arrival <N>, depth <N>, manual <N> (total <N>)
+  target warning   : <WARNING>
+load report json : {"signal":"logs","objects_written":<N>,"geometry":{...},"flush_mix":{...},"target_bytes_no_effect_warning":null,"realign_gave_up":0}
+```
+
+Before the first batch is written, the loader prints the same geometry as
+one line on stderr, so a long load shows what it resolved without waiting
+for the summary:
+
+```text
+load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N>, memory bound <N>)
+```
+
+The flush target names `--target-bytes` when the flag set it. The depth
+line names which bound decided it (`memory bound decided it: ...`), or
+`--pipeline-depth` when the flag set it. The `depth realign` line appears
+only while the depth flush is on, and reads `gave up 1 time(s): ...` with
+`realign_gave_up` 1 in the JSON when the loader stopped reading the
+size-flush counts (above). `size` counts flushes a buffer
+opened by reaching the target (or its memory backstop), `age` flushes it opened by aging past
+`--max-flush-delay`, `arrival` strict-arrival flushes (always 0 on a load,
+which writes strict only), `depth` the depth flushes above, and `manual` every
+other loader-requested flush: the end-of-input drain and a logs load's
+budget-stall flushes. Only a logs load prints per-shard rows; the metrics
+and spans routers count per router. The `target warning` line appears
+only when a target above `1` laid the objects out exactly as `1` would
+have, and the same text goes to stderr. The JSON line carries the same
+report for a script to parse.
 
 #### Measured recipe for large objects
 
@@ -1271,16 +1408,20 @@ Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
 - `--target-bytes 1850000000` stored 25.1 MB mean objects on this
-  corpus, 74 times below the target: the run wrote 408 objects (the mean
-  is over the 407 above 100 KB), split size 390, age 14, final 4, so the
+  corpus, 74 times below the target. The target is explicit, so the depth
+  flush stays off and these figures still describe the loader: the run
+  wrote 408 objects (the mean
+  is over the 407 above 100 KB), split size 390, age 14, final 4 (the final drain, which the trigger mix
+  now counts under `manual`), so the
   target is what closed almost all of them,
   not the age trigger. At 1,650,000,000 the objects were about 22 MB
   (median, 75 times below) and at 375,000,000 5.7 MB (66 times below).
   The ratio was measured at these three target values only; scaling
   `--target-bytes` above 1,850,000,000 for still larger objects was not
   measured.
-- `--max-flush-delay 30s` lets a buffer live long enough to fill. At the
-  2s default, 798 of 916 objects closed on age and the median object was
+- `--max-flush-delay 30s` lets a buffer live long enough to fill. At 2s,
+  the earlier default, 798 of 916 objects closed on age and the median
+  object was
   10.2 MB.
 - `--pipeline-depth` sets the load time once objects are large, because
   each Strict write waits for its batch's flush. At a 1,650,000,000
@@ -1364,8 +1505,10 @@ peak loader RSS of each run against its budget. On the 4 GB host, under a
 1,200,000,000-byte budget, the peak charge reached 1,198,284,910 bytes.
 Size a host from the run whose target and depth you use.
 
-A metrics or spans load ignores `--load-memory-bytes` and warns when it is
-set.
+A metrics or spans load charges nothing to `--load-memory-bytes` while it
+runs. There the budget (set, or derived from host memory with the floor
+taken at one read cursor) only bounds the derived `--pipeline-depth`, as
+[above](#pipeline-depth-and-the-depth-flush---pipeline-depth).
 
 ### The dynamic-column budget and its warnings
 
