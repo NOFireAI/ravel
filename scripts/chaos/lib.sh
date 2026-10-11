@@ -582,7 +582,8 @@ CHAOS_EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
 # catalog on its own, so one of hundreds of inputs takes longer than that
 # spacing suggests. The kill script logs the /metrics scrapes it made and the
 # seconds it waited before the gauge read >= 1, and the conservation oracle
-# logs how long after the kill the survivor's publish came; the first nightly
+# logs how long after the kill it stopped waiting and a `merge durations:`
+# line paired from both workers' merge start and end lines; the first nightly
 # with this fixture sets the final figures.
 CHAOS_MAINTAIN_FIXTURE_SERIES="${CHAOS_MAINTAIN_FIXTURE_SERIES:-1000}"
 CHAOS_MAINTAIN_FIXTURE_POINTS="${CHAOS_MAINTAIN_FIXTURE_POINTS:-100}"
@@ -889,11 +890,14 @@ wait_for_metric_at_least() {
 # claimed run, its claim, before its first catalog or block read, and falls
 # when the merge publishes, fails, or is abandoned
 # (crates/ravel-maintain/src/compact.rs, MergeInFlight). The same point logs
-# `"compaction merge started"` with `bucket=<commit prefix>`, and a publish
-# logs `"compaction record published"` with `key=<commit prefix><file>`
-# (crates/ravel-maintain/src/publish.rs). The conservation oracle pairs the
-# two to find the bucket A was merging at the kill; see
-# chaos_interrupted_bucket.
+# `"compaction merge started"` with `bucket=<commit prefix>`, the point the
+# gauge falls logs `"compaction merge ended"` with the same `bucket=` and an
+# `outcome=` (published, converged, abandoned, skipped, held, failed,
+# cancelled, dry-run, or dropped), and a publish logs
+# `"compaction record published"` with `key=<commit prefix><file>`
+# (crates/ravel-maintain/src/publish.rs). A killed process logs no end line,
+# so the conservation oracle finds the bucket A was merging at the kill as a
+# start with no end; see chaos_interrupted_bucket.
 # ---------------------------------------------------------------------------
 
 CHAOS_FLUSH_METRICS=(
@@ -914,6 +918,7 @@ CHAOS_FLUSH_POLLS_PER_SECOND="${CHAOS_FLUSH_POLLS_PER_SECOND:-5}"
 # reached.
 CHAOS_COMPACTION_POLL_SECONDS="${CHAOS_COMPACTION_POLL_SECONDS:-0.05}"
 CHAOS_COMPACTION_START_MARKER="compaction merge started"
+CHAOS_COMPACTION_END_MARKER="compaction merge ended"
 CHAOS_COMPACTION_PUBLISH_MARKER="compaction record published"
 CHAOS_COMPACTION_PASS_MARKER="maintenance: retention + compaction pass complete"
 # Flush-attempt count read by the poll that saw the rise; empty until then.
@@ -1013,46 +1018,142 @@ kill_timing_line() {
 }
 
 # Print the bucket a maintain worker was merging when its log ends: the
-# `bucket=` of its last CHAOS_COMPACTION_START_MARKER line that no later
-# CHAOS_COMPACTION_PUBLISH_MARKER line matches. A publish matches a start
-# when its `key=` minus the file name equals the start's `bucket=`, the
-# bucket's commit prefix. Returns 1 and prints nothing when every start has a
-# publish after it, or the log has none. Args: log_file [from_line]. A merge
-# that failed or was abandoned also leaves an unmatched start, so with merges
-# running concurrently this is the latest-started unmatched one.
+# `bucket=` of its latest CHAOS_COMPACTION_START_MARKER line that no
+# CHAOS_COMPACTION_END_MARKER line of the same `bucket=` ends. Each end line
+# ends the earliest still-open start of its bucket. A merge that published,
+# failed, was held or cancelled, or whose future was dropped logs its end
+# line, so only a merge the process died inside stays open. Returns 1 and
+# prints nothing when every start has an end, or the log has none. Args:
+# log_file [from_line].
 chaos_interrupted_bucket() {
   local file="$1" from="${2:-0}" body="" bucket
   if [[ -r "$file" ]]; then
     body="$(tail -n "+$(( from + 1 ))" "$file")"
   fi
-  bucket="$(CHAOS_START="$CHAOS_COMPACTION_START_MARKER" CHAOS_PUB="$CHAOS_COMPACTION_PUBLISH_MARKER" awk '
-    BEGIN { start = ENVIRON["CHAOS_START"]; pub = ENVIRON["CHAOS_PUB"]; n = 0 }
+  bucket="$(CHAOS_START="$CHAOS_COMPACTION_START_MARKER" CHAOS_END="$CHAOS_COMPACTION_END_MARKER" awk '
+    BEGIN { start = ENVIRON["CHAOS_START"]; end_marker = ENVIRON["CHAOS_END"]; n = 0 }
     {
       line = $0
       gsub(/\033\[[0-9;]*m/, "", line)
       if ((i = index(line, start)) > 0) {
         rest = substr(line, i + length(start))
         if (match(rest, / bucket=[^ ]+/)) {
+          b = substr(rest, RSTART + 8, RLENGTH - 8)
           n++
-          sb[n] = substr(rest, RSTART + 8, RLENGTH - 8)
-          sl[n] = NR
+          sb[n] = b
+          q[b, tail[b]++] = n
         }
-      } else if ((i = index(line, pub)) > 0) {
-        rest = substr(line, i + length(pub))
-        if (match(rest, / key=[^ ]+/)) {
-          k = substr(rest, RSTART + 5, RLENGTH - 5)
-          sub(/[^\/]*$/, "", k)
-          published[k] = NR
+      } else if ((i = index(line, end_marker)) > 0) {
+        rest = substr(line, i + length(end_marker))
+        if (match(rest, / bucket=[^ ]+/)) {
+          b = substr(rest, RSTART + 8, RLENGTH - 8)
+          if (head[b] < tail[b]) ended[q[b, head[b]++]] = 1
         }
       }
     }
     END {
       for (j = n; j >= 1; j--) {
-        if (!(sb[j] in published) || published[sb[j]] < sl[j]) { print sb[j]; exit }
+        if (!(j in ended)) { print sb[j]; exit }
       }
     }' <<<"$body")"
   [[ -n "$bucket" ]] || return 1
   printf '%s\n' "$bucket"
+}
+
+# Return 0 when the log past line `from` carries a CHAOS_COMPACTION_START_MARKER
+# line whose `bucket=` is `bucket`. Args: log_file from_line bucket.
+chaos_started_bucket_since() {
+  local file="$1" from="$2" bucket="$3" body=""
+  [[ -n "$bucket" ]] || return 1
+  if [[ -r "$file" ]]; then
+    body="$(tail -n "+$(( from + 1 ))" "$file")"
+  fi
+  CHAOS_START="$CHAOS_COMPACTION_START_MARKER" CHAOS_BUCKET="$bucket" awk '
+    BEGIN { start = ENVIRON["CHAOS_START"]; want = ENVIRON["CHAOS_BUCKET"]; found = 0 }
+    {
+      line = $0
+      gsub(/\033\[[0-9;]*m/, "", line)
+      if ((i = index(line, start)) > 0) {
+        rest = substr(line, i + length(start))
+        if (match(rest, / bucket=[^ ]+/) && substr(rest, RSTART + 8, RLENGTH - 8) == want) found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }' <<<"$body"
+}
+
+# Print, one per line, the seconds between each merge start and the end line
+# that ends it (paired as chaos_interrupted_bucket pairs them), for every pair
+# in each log given whose two lines both begin with a UTC timestamp in
+# tracing's default form (`2026-10-10T05:30:00.123456Z`). Each log is paired on
+# its own. Args: log_file...
+chaos_merge_durations() {
+  local file
+  for file in "$@"; do
+    [[ -r "$file" ]] || continue
+    CHAOS_START="$CHAOS_COMPACTION_START_MARKER" CHAOS_END="$CHAOS_COMPACTION_END_MARKER" awk '
+      function epoch(t,   y, m, d, s, era, yoe, mp, doe) {
+        if (length(t) < 20 || substr(t, 5, 1) != "-" || substr(t, 8, 1) != "-" \
+            || substr(t, 11, 1) != "T" || substr(t, 14, 1) != ":" \
+            || substr(t, 17, 1) != ":" || substr(t, length(t), 1) != "Z") return -1
+        y = substr(t, 1, 4) + 0; m = substr(t, 6, 2) + 0; d = substr(t, 9, 2) + 0
+        s = substr(t, 18, length(t) - 18) + 0
+        if (m <= 2) y--
+        era = int(y / 400); yoe = y - era * 400; mp = (m + 9) % 12
+        doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + int((153 * mp + 2) / 5) + d - 1
+        return (era * 146097 + doe - 719468) * 86400 \
+          + substr(t, 12, 2) * 3600 + substr(t, 15, 2) * 60 + s
+      }
+      BEGIN { start = ENVIRON["CHAOS_START"]; end_marker = ENVIRON["CHAOS_END"] }
+      {
+        line = $0
+        gsub(/\033\[[0-9;]*m/, "", line)
+        split(line, f, " ")
+        t = epoch(f[1])
+        if ((i = index(line, start)) > 0) {
+          rest = substr(line, i + length(start))
+          if (match(rest, / bucket=[^ ]+/)) {
+            b = substr(rest, RSTART + 8, RLENGTH - 8)
+            q[b, tail[b]++] = t
+          }
+        } else if ((i = index(line, end_marker)) > 0) {
+          rest = substr(line, i + length(end_marker))
+          if (match(rest, / bucket=[^ ]+/)) {
+            b = substr(rest, RSTART + 8, RLENGTH - 8)
+            if (head[b] < tail[b]) {
+              s0 = q[b, head[b]++]
+              if (s0 >= 0 && t >= 0) printf "%.3f\n", t - s0
+            }
+          }
+        }
+      }' "$file"
+  done
+}
+
+# The merge-duration summary line from chaos_merge_durations over the given
+# logs: `merge durations: n=<count> p50=<s> max=<s>`, p50 being the
+# nearest-rank median; `p50=none max=none` when nothing paired.
+# Args: log_file...
+chaos_merge_durations_line() {
+  local durations
+  durations="$(chaos_merge_durations "$@")"
+  sort -n <<<"$durations" | awk '
+    NF { v[++n] = $1 }
+    END {
+      if (n == 0) { print "merge durations: n=0 p50=none max=none"; exit }
+      printf "merge durations: n=%d p50=%s max=%s\n", n, v[int((n + 1) / 2)], v[n]
+    }'
+}
+
+# Print the number of compaction records (`*.cmt` keys) under
+# `<bucket>l1.` in the chaos store, from an `s3api list-objects-v2` through
+# chaos_aws. Returns the CLI's non-zero code, printing nothing, when the LIST
+# cannot be run. Args: bucket (a commit prefix ending in `/`).
+chaos_compaction_records_under() {
+  local bucket="$1" keys rc=0
+  keys="$(chaos_aws s3api list-objects-v2 --bucket "$RAVEL_S3_BUCKET" \
+    --prefix "${bucket}l1." --query 'Contents[].Key' --output text)" || rc=$?
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\.cmt$/) n++ } END { print n + 0 }' <<<"$keys"
 }
 
 # Return 0 when the log past line `from` carries a CHAOS_COMPACTION_PUBLISH_MARKER
@@ -1385,7 +1486,8 @@ chaos_line_count() {
 
 # Seconds past the takeover window the conservation oracle allows for the
 # survivor's own merge of the interrupted bucket. Not measured: no merge at
-# the scenario 2 fan-in has been timed (see the fixture note above). 300 s is
+# the scenario 2 fan-in has been timed (see the fixture note above); the
+# oracle's `merge durations:` line is where a run reports one. 300 s is
 # one more maintenance tick; the chaos job's worst case with it is in the
 # comment above `timeout-minutes` in .github/workflows/k8s-nightly.yml.
 CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS="${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS:-300}"
@@ -1429,10 +1531,13 @@ chaos_conservation_aborts_ok() {
 }
 
 # 4. conservation-holds, with a could-not-measure outcome.
-#    The survivor published a compaction record for the bucket worker A was
-#    merging when it was killed, and its conservation-abort counter did not
-#    advance across the interruption (the gate never had to reject a
-#    record-dropping publish).
+#    The store holds a compaction record for the bucket worker A was merging
+#    when it was killed, whoever wrote it, and the survivor's
+#    conservation-abort counter did not advance across the interruption (the
+#    gate never had to reject a record-dropping publish). The store decides,
+#    not the survivor's log: A's record PUT can land before A logs its
+#    publish, or server-side after the SIGKILL, and the survivor then finds
+#    the bucket compacted and logs nothing.
 #
 #    Args: worker_a_log_file (read after the SIGKILL, so it is A's state at
 #    the kill), survivor_base_url, conservation_aborts_baseline,
@@ -1445,17 +1550,22 @@ chaos_conservation_aborts_ok() {
 #    - the survivor line count is not an integer: FAIL;
 #    - the abort counter is unreadable or above the baseline: FAIL;
 #    - CHAOS_KILL_ON_GAUGE is not 1 (the kill did not fire on the gauge), or
-#      A's log has no merge-start line without a matching publish
+#      A's log has no merge-start line without a merge-end line
 #      (chaos_interrupted_bucket): could-not-measure, recorded in
 #      ORACLE_UNMEASURED with CHAOS_UNMEASURED_EXIT returned, and no wait;
 #    - otherwise the survivor's log is read every
 #      CHAOS_CONSERVATION_POLL_SECONDS, at least once, until it shows a
-#      publish for that bucket past the kill line or the wait
-#      (chaos_conservation_wait_seconds) has passed since kill_epoch; the
-#      abort counter is read again (unreadable or risen: FAIL); then a
-#      publish for the bucket passes and none fails. A publish for another
-#      bucket does not count: both workers merge their own buckets
-#      throughout.
+#      publish for that bucket past the kill line (an early exit only) or the
+#      wait (chaos_conservation_wait_seconds) has passed since kill_epoch.
+#      The merge durations paired from both logs, whether the survivor
+#      logged a merge start for the bucket past the kill line, and whether it
+#      logged the publish are logged. The abort counter is read again
+#      (unreadable or risen: FAIL). Then `<bucket>l1.` is listed in the
+#      store (chaos_compaction_records_under): a LIST that fails is
+#      could-not-measure, a `.cmt` record passes, and none FAILs, with the
+#      survivor and duration figures in the FAIL detail. A record or publish
+#      for another bucket does not count: both workers merge their own
+#      buckets throughout.
 oracle_conservation_or_unmeasured() {
   local worker_a_log="$1"
   local survivor_url="$2"
@@ -1481,8 +1591,9 @@ oracle_conservation_or_unmeasured() {
   local bucket
   bucket="$(chaos_interrupted_bucket "$worker_a_log")" || bucket=""
   if [[ -z "$bucket" ]]; then
-    ORACLE_UNMEASURED+=("${name}: could not measure: worker A's log has no '${CHAOS_COMPACTION_START_MARKER}' line without a matching publish, so the interrupted bucket is unknown")
-    log "could not measure: no unmatched '${CHAOS_COMPACTION_START_MARKER}' line in worker A's log"
+    log "conservation: $(chaos_merge_durations_line "$worker_a_log" "$survivor_log")"
+    ORACLE_UNMEASURED+=("${name}: could not measure: worker A's log has no '${CHAOS_COMPACTION_START_MARKER}' line without a matching '${CHAOS_COMPACTION_END_MARKER}', so the interrupted bucket is unknown")
+    log "could not measure: no unended '${CHAOS_COMPACTION_START_MARKER}' line in worker A's log"
     return "$CHAOS_UNMEASURED_EXIT"
   fi
   log "conservation: worker A was merging ${bucket} at the kill"
@@ -1496,15 +1607,32 @@ oracle_conservation_or_unmeasured() {
     (( $(date +%s) - kill_epoch < wait_seconds )) || break
     sleep "$CHAOS_CONSERVATION_POLL_SECONDS"
   done
-  log "conservation: survivor publish of ${bucket} after the kill: $([[ "$published" -eq 1 ]] && echo seen || echo none) within $(( $(date +%s) - kill_epoch ))s of the kill (wait bound ${wait_seconds}s)"
+  local waited=$(( $(date +%s) - kill_epoch ))
+  local b_started=no b_published=no
+  chaos_started_bucket_since "$survivor_log" "$survivor_from" "$bucket" && b_started=yes
+  [[ "$published" -eq 1 ]] && b_published=yes
+  local durations
+  durations="$(chaos_merge_durations_line "$worker_a_log" "$survivor_log")"
+  log "conservation: ${durations} (worker A and survivor logs)"
+  local survivor_line="survivor after the kill: merge start of ${bucket}: ${b_started}; publish line: ${b_published}; ${waited}s after the kill (wait bound ${wait_seconds}s)"
+  log "conservation: ${survivor_line}"
 
   chaos_conservation_aborts_ok "$name" "$survivor_url" "$aborts_baseline" || return 1
-  if [[ "$published" -eq 1 ]]; then
+
+  local records list_rc=0
+  records="$(chaos_compaction_records_under "$bucket")" || list_rc=$?
+  if [[ "$list_rc" -ne 0 || ! "$records" =~ ^[0-9]+$ ]]; then
+    ORACLE_UNMEASURED+=("${name}: could not measure: the LIST of ${bucket}l1. in ${RAVEL_S3_BUCKET} failed (exit ${list_rc}), so whether the interrupted bucket was compacted is unknown")
+    log "could not measure: LIST ${bucket}l1. failed (exit ${list_rc})"
+    return "$CHAOS_UNMEASURED_EXIT"
+  fi
+  log "conservation: LIST ${bucket}l1.: ${records} compaction record(s)"
+  if [[ "$records" -ge 1 ]]; then
     oracle_ok "$name"
     return 0
   fi
   oracle_bad "$name" \
-    "no '${CHAOS_COMPACTION_PUBLISH_MARKER}' for ${bucket} within ${wait_seconds}s of the kill: the interrupted compaction did not complete"
+    "no compaction record under ${bucket}l1. ${waited}s after the kill (wait bound ${wait_seconds}s): the interrupted compaction did not complete; ${survivor_line}; ${durations}"
   return 1
 }
 

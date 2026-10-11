@@ -199,16 +199,22 @@ jobs:
     # the hour plus the catalog's compiled-in seal margin (4800 s), so the
     # script sleeps up to about 2 h 22 min (scripts/chaos/kill-maintain-worker.sh,
     # "SEAL WAIT"). Worst case at the scenario 2 defaults
-    # (scripts/chaos/lib.sh):
-    #     9     before scenario 2 (release builds warm, scenario 1)
+    # (scripts/chaos/lib.sh), in minutes:
+    #     21    before scenario 2, cold: nightly run 38107468154 spent 17.3 in
+    #           the release build alone and started scenario 2 about 21 in
+    #   + 9     three startup waits (ingest server, worker A, worker B), each
+    #           60 attempts 1 s apart, up to 3 when every probe runs to its
+    #           2 s timeout
     #   + 24.6  load: 650 strict-ack exports at 2.27 s each
     #   + 142   seal wait after ingest exits: up to 60 to the end of the
     #           hour, + 80 seal margin + 2 safety
     #   + 7     in-flight wait: one maintenance tick + 120 s
     #   + 18    conservation wait from the kill: 3 * H + one tick (the
     #           takeover bound, 8) + one tick (5) + 300 s merge allowance (5)
-    #   + 1     verification
-    #   = 201.6 minutes, under the 220 the fixture is held to, inside 240.
+    #   = 221.6 minutes, plus the verification after the conservation wait
+    #     (its store LIST, verify-custody, catalog verify), which has not
+    #     been measured at the 650-export scale: 18.4 minutes are left for it
+    #     inside 240. The load is held to 25 minutes (lib.sh).
     timeout-minutes: 240
     env:
       RUSTC_WRAPPER: sccache
