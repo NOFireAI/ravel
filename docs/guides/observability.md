@@ -2531,18 +2531,43 @@ The gate is full when `ravel_cpu_gate_running` equals
 | A rising mean wait and a full gate. | The node needs more replicas or more permits. On a node shared with other CPU-heavy work, lower the read gate's permits instead. |
 | A per-worker busy rate near 1 on every worker, from `rate(ravel_runtime_worker_busy_seconds_total[5m])`. | The runtime workers are saturated, which the gates do not cover. |
 
-### Memory gate (`ravel_memory_gate_*`)
+### Memory gate (`ravel_memory_gate_*`, `ravel_memory_budget_refusals_total`)
 
-Labels: `mode` on the gauges and counters below; `ravel_memory_gate_refusals_total` also carries `site` (its row is in the label table above) and the purge histogram carries `le`. The `ravel-memory-gate` sampler reads the host's
+Labels: `mode` on every family below; the two refusal counters also carry
+`site` (its row is in the label table above) and the purge histogram carries
+`le`. The `ravel-memory-gate` sampler reads the host's
 available memory every `--memory-gate-interval-ms` and closes the memory gate
 once `--memory-gate-close-after-samples` consecutive readings are below
 `ravel_memory_gate_available_floor_bytes`; one reading at or above the floor
 reopens it. The last reading is `ravel_memory_gate_available_bytes`, written
 on every sample, so it shows a dip below the floor while the gate is still
-open.
+open. While the reading is below `ravel_memory_gate_purge_floor_bytes` the
+sampler forces a jemalloc purge, at most one per
+`--memory-gate-purge-min-interval-ms`. A query whose fetch, catalog decode or
+SQL memory reservation a closed gate refuses answers HTTP 422. A refused
+fetch or catalog decode carries "memory exhausted: host available memory A
+bytes is below the F byte floor (requested N)" in its message.
+
+The families render in every mode. The gate is off in `gateway` mode, with a
+fallback-sized memory budget, in a build whose allocator is not jemalloc,
+when `MemAvailable` or `MemTotal` cannot be read, and under
+`--disable-memory-gate`; the four gauges then read 0. The startup line
+`memory gate resolved` carries `enabled`, the two floors, the purge spacing,
+the sampling interval, `close_after_samples`, `wait_ms`, `available_source`
+and `source` (who set the floors, or why the gate is off).
 
 | Metric | Meaning |
 |---|---|
+| `ravel_memory_gate_available_bytes` | Gauge. Host available memory as the sampler last read it, after the forced purge when one ran: `MemAvailable`, or under a finite cgroup memory limit the smaller of `MemAvailable` and the limit minus its usage plus its inactive file cache. 0 when the gate is off or before its first sample. |
+| `ravel_memory_gate_available_floor_bytes` | Gauge. The close floor, `--memory-gate-min-available-bytes`. 0 when the gate is off or before its first sample. |
+| `ravel_memory_gate_purge_floor_bytes` | Gauge. The purge floor, `--memory-gate-purge-available-bytes`. 0 when the gate is off. |
+| `ravel_memory_gate_resident_bytes` | Gauge. jemalloc `stats.resident` as the sampler last read it, after the forced purge when one ran. Reported only; the gate decides on available memory. 0 when the gate is off or before its first reading. |
+| `ravel_memory_gate_purges_total` | Counter. Forced jemalloc purges the sampler ran. |
+| `ravel_memory_gate_purge_seconds` | Histogram, buckets from 0.0001 to 1 s. Wall time of each forced purge, on the sampler thread. |
+| `ravel_memory_gate_samples_total` | Counter. Samples that read host available memory. |
+| `ravel_memory_gate_epoch_refresh_seconds_total` | Counter. Wall time the sampler spent reading host available memory, refreshing the jemalloc stats epoch and reading `stats.resident`, the post-purge re-read included. The purge itself is not counted here. |
+| `ravel_memory_gate_refusals_total{site}` | Counter. Memory reservations refused because the gate was closed, by check site: `admission`, `reserve` or `grow`. Only `reserve` counts today; the admission and `grow` checks are not implemented yet, so those two sites read 0. |
+| `ravel_memory_budget_refusals_total{site}` | Counter. Memory reservations refused because the process memory budget's ledger was full, by check site: `reserve` or `grow`. `grow` reads 0. A rise here with a flat `ravel_memory_gate_refusals_total` means the budget, not the host, is the limit. |
 | `ravel_memory_gate_samples_below_floor_total` | Counter. Samples whose available reading was below the close floor, whether or not the sample closed the gate. Rising while the gate stays open (`ravel_memory_gate_available_floor_bytes` above `ravel_memory_gate_available_bytes` only briefly, no `ravel_memory_gate_refusals_total` movement) means dips too short to close the gate; raise `--memory-gate-close-after-samples` only if the refusals that do come are from dips you would rather ride out. |
 
 ## Reading estimate against actual
