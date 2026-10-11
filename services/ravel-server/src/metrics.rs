@@ -5018,6 +5018,8 @@ fn render_maintain_safety_family(
 pub struct MaintenanceOwnershipSnapshot {
     pub workers_live: u64,
     pub units_owned: u64,
+    /// Bucket merges started and not yet finished in this process.
+    pub compactions_in_flight: u64,
     pub units_stalled: u64,
     pub memo_warm_start_units: u64,
     pub full_sweep_passes_total: u64,
@@ -5065,6 +5067,21 @@ fn render_maintain_ownership_family(
         "ravel_maintain_units_owned",
         &[Label::Mode(mode)],
         snapshot.units_owned,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_compactions_in_flight",
+        "Bucket merges this process has started and not yet published, failed, or \
+         abandoned. A merge starts once its claim is held, before its first input \
+         read.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_compactions_in_flight",
+        &[Label::Mode(mode)],
+        snapshot.compactions_in_flight,
     );
 
     write_header(
@@ -8295,6 +8312,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .map(|metrics| MaintenanceOwnershipSnapshot {
                 workers_live: metrics.workers_live(),
                 units_owned: metrics.units_owned(),
+                compactions_in_flight: metrics.compactions_in_flight(),
                 units_stalled: metrics.units_stalled(),
                 memo_warm_start_units: metrics.memo_warm_start_units(),
                 full_sweep_passes_total: metrics.full_sweep_passes_total(),
@@ -11227,6 +11245,7 @@ mod tests {
         let snapshot = MaintenanceOwnershipSnapshot {
             workers_live: 1,
             units_owned: 4,
+            compactions_in_flight: 3,
             units_stalled: 0,
             memo_warm_start_units: 0,
             full_sweep_passes_total: 7,
@@ -11250,6 +11269,7 @@ mod tests {
             "ravel_maintain_last_cycle_completed_timestamp_seconds{mode=\"all\"} 1758000123.5",
             "ravel_maintain_loop_panics_total{mode=\"all\"} 2",
             "ravel_maintain_full_sweep_passes_total{mode=\"all\"} 7",
+            "ravel_maintain_compactions_in_flight{mode=\"all\"} 3",
         ] {
             assert_eq!(
                 out.lines().filter(|line| *line == expected).count(),

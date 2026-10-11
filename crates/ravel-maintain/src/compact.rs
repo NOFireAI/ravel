@@ -184,6 +184,36 @@ pub fn buckets_held_out_of_window_total() -> u64 {
     BUCKETS_HELD_OUT_OF_WINDOW.load(Ordering::Relaxed)
 }
 
+/// Gauge seam for `ravel_maintain_compactions_in_flight`: bucket merges this
+/// process has started and not yet finished. A merge starts once the bucket
+/// passed every gate and its claim is held, before the first input catalog or
+/// block read, and ends when its pipeline returns (published, abandoned, or
+/// failed) or its future is dropped.
+static COMPACTIONS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`COMPACTIONS_IN_FLIGHT`]. Zero whenever no bucket is merging.
+pub fn compactions_in_flight() -> u64 {
+    COMPACTIONS_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// One merge counted in [`COMPACTIONS_IN_FLIGHT`]. The decrement is in `Drop`
+/// so an error return, a panic unwinding through the pipeline, or a dropped
+/// future each release it.
+struct MergeInFlight;
+
+impl MergeInFlight {
+    fn start() -> Self {
+        COMPACTIONS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        MergeInFlight
+    }
+}
+
+impl Drop for MergeInFlight {
+    fn drop(&mut self) {
+        COMPACTIONS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Decide what an input the reader refused for its format version means. The
 /// readers check the trailer version before the footer CRC, so a flipped
 /// version byte reads the same as an object a newer build wrote; only the
@@ -471,6 +501,7 @@ async fn compact_bucket_scoped(
     // signal and run the identical shared pipeline (canonical ordering,
     // input_set_hash, publish) around it (ADR-0032).
     let planned = &listing;
+    let in_flight = MergeInFlight::start();
     let outcome = match bucket.signal {
         Signal::Metrics => {
             run_pipeline::<RsegCodec>(store, clock, &run_config, bucket, inputs, start_ns, planned)
@@ -507,6 +538,7 @@ async fn compact_bucket_scoped(
             "compaction is not implemented for signal {other:?}"
         ))),
     };
+    drop(in_flight);
     let outcome = match outcome {
         Err(MaintainError::InputOutOfWindow {
             object_key,

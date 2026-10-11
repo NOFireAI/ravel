@@ -390,6 +390,15 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
             "ravel_maintain_full_sweep_passes_total must be reachable on worker {name}'s /metrics"
         );
         assert!(
+            sample_value(
+                body,
+                "ravel_maintain_compactions_in_flight{mode=\"maintain\"}"
+            )
+            .is_some(),
+            "ravel_maintain_compactions_in_flight must be reachable on worker {name}'s /metrics \
+             (issue #2666)"
+        );
+        assert!(
             body.contains(
                 "ravel_maintain_rlog_merge_peak_bytes{mode=\"maintain\",kind=\"transient\"}"
             ) && body
