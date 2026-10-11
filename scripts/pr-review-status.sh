@@ -58,8 +58,10 @@ merge_base_guard() {
 # 1 means a struct literal or call site that landed on the base after the fork
 # still uses a shape this pull request changes, which a queue rebase turns into
 # a red CI cycle (issue #2811). Any other non-zero, 127 included, is "could not
-# check", which is not "clean". PR_REVIEW_STATUS_STRUCT_GUARD replaces the guard
-# so this script's own tests can run it offline.
+# check", which is not "clean". ALLOW_STALE_SHAPE_SITES=1 lets an exit 1 through
+# to the merge line, with the hits still printed beside a note saying so.
+# PR_REVIEW_STATUS_STRUCT_GUARD replaces the guard so this script's own tests
+# can run it offline.
 struct_rc=0
 struct_out=""
 struct_guard="${PR_REVIEW_STATUS_STRUCT_GUARD:-${script_dir}/guards/assert-struct-literals-current.sh}"
@@ -407,9 +409,12 @@ elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   fi
 # Last before the merge line, and regardless of any merge queue: the queue's
 # rebase is exactly where this break surfaces, as a failed CI cycle.
-elif struct_sites_block; then
+# ALLOW_STALE_SHAPE_SITES=1 is the way past a hit verified by hand as a false
+# positive; the clean branch below still prints the hits.
+elif struct_sites_block && [[ "${ALLOW_STALE_SHAPE_SITES:-}" != "1" ]]; then
   echo "  -> code landed on origin/${base_ref} after this PR forked still uses a shape the PR changes; rebase onto origin/${base_ref}, update the site, and let CI re-run before merging"
   echo "${struct_out//guard: /     }"
+  echo "  -> if every site above is verified by hand as a false positive, re-run with ALLOW_STALE_SHAPE_SITES=1"
 else
   if [[ "${inline_comments}" != "0" && "${outside_diff}" != "0" ]]; then
     echo "  -> clean (operator confirmed all ${inline_comments} inline comment(s) and ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
@@ -420,7 +425,10 @@ else
   else
     echo "  -> clean: ${ci_phrase}, review at the current head with zero findings"
   fi
-  if [[ "${struct_rc}" != "0" ]]; then
+  if [[ "${struct_rc}" == "1" ]]; then
+    echo "  -> NOTE: the shape guard's refusal was overridden with ALLOW_STALE_SHAPE_SITES=1; these are the sites it reported:"
+    echo "${struct_out//guard: /     }"
+  elif [[ "${struct_rc}" != "0" ]]; then
     echo "  -> WARNING: could not check for post-fork struct literals and call sites (guard exit ${struct_rc}), which is not the same as none; check by hand before running the merge line"
     echo "${struct_out//guard: /     }"
   fi
