@@ -72,6 +72,9 @@ flowchart LR
 | `--sql-partition-count` | count of partitions | DataFusion `target_partitions` (`crates/ravel-sql/src/session.rs:540`) | `max(8, 2 x cores)` |
 | `--promql-fetch-fanout` | count of in-flight futures | `buffer_unordered` width (`crates/ravel-query/src/engine.rs:1366,1784,2092`) | `max(8, 2 x cores)` |
 
+The `--store-get-concurrency` row no longer holds when the memory budget is
+known: see the ADR-2677 budget-share amendment below.
+
 Every unit is a positive integer count. Zero is rejected during configuration
 resolution, before any fetcher or SQL session is constructed, and
 `EngineConfig::validate` gains the same check for direct construction. Today
@@ -79,14 +82,16 @@ nothing rejects it: `with_max_concurrent_gets` silently converts zero to one
 and the SQL session applies `.max(1)` to the partition count, so an operator
 who sets zero gets one without being told. A refused startup is the honest
 answer to a value that has no meaning. All three
-formulas are today's single derived default, so **no default moves**: the split
+formulas are today's single derived default, so **no default moves** (the
+ADR-2677 budget-share amendment below later moves the GET permit one): the split
 changes which knob an operator turns, not what an untouched deployment does. The
 `max(8, ...)` floor and the `2 x cores` factor come from
 `MIN_DERIVED_FETCH_CONCURRENCY` and `FETCH_CONCURRENCY_PER_CORE`
 (`services/ravel-server/src/config.rs:1548-1553`) and are carried over unchanged
 so that the three can diverge later, deliberately, rather than by accident here.
 
-No default moves. The SQL partition default in particular stays where it is:
+No default moves (the GET permit default moves later, by the ADR-2677
+budget-share amendment below). The SQL partition default in particular stays where it is:
 `crates/ravel-sql/src/session.rs:540-544` sets `target_partitions` immediately
 above `with_repartition_aggregations`, which ADR-0094 and ADR-0954 depend on, and
 moving it silently would put those in scope.
@@ -164,3 +169,26 @@ changing that default pulls ADR-0094's aggregation gate into scope.
   the derived-defaults table both change.
 - No performance claim. If a benchmark moves on this change alone, that is a
   finding to investigate, not the expected outcome.
+
+## Amendment (2026-10-11, Refs: #2683): the GET permit default is sized from the memory budget
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-2677 budget-share amendment" -->
+<!-- amendment-supersedes: phrase="no default moves" pointer="ADR-2677 budget-share amendment" -->
+
+This is the ADR-2677 budget-share amendment, ADR-2677 decision 7 applied to
+the `--store-get-concurrency` row of the Decision table. With both
+`--store-get-concurrency` and `--fetch-concurrency` unset, a known memory
+budget, and a mode the budget applies to (not gateway), the permit count is
+64% of `memory_budget_bytes` divided by 64 MiB, rounded down and clamped to
+8..=256, and startup logs its source as `budget-share`. The 64% is chosen
+so the reference box's recorded budget, 27,775,004,672 bytes, clears the
+26,843,545,600-byte (25 GiB) threshold for 256 with margin; it is not
+derived from a memory model. On 16 cores that moves the default from
+`max(8, 2 x cores)`, 32, to 256 on every store kind. A fallback budget (no
+host memory figure) and gateway mode keep `max(8, 2 x cores)`. The count
+bounds concurrent GETs, not bytes: each fetch reserves its object's bytes on
+the process memory budget before it takes a permit, and the budget's
+refusal (HTTP 503, `upstream storage temporarily unavailable`) bounds them.
+`--sql-partition-count` and `--promql-fetch-fanout` keep the Decision
+table's `max(8, 2 x cores)`, so they and the permit count now diverge by
+default, which this ADR's own "diverge later, deliberately" anticipated.

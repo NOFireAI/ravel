@@ -284,7 +284,9 @@ flag: the upstream default entry stays stock and gains it through a
 release.
 
 Rule: `resolve_performance_defaults` derives `store_get_concurrency`
-(ADR-1195) so that the permits' worst-case in-flight bytes, the permit
+(ADR-1195) so that the permits' worst-case in-flight bytes (corrected by
+the permit-bytes correction amendment below: the count sizes GETs, not
+bytes), the permit
 count times the largest whole-object read the fetcher reserves, stay a
 fixed share of `memory_budget_bytes`, beside the loopback cache carve of
 ADR-2023 decision 3. The implementing task pins the share and the
@@ -314,7 +316,8 @@ route measured a higher concurrent QPS than stock (0.727 against 0.653)
 with a higher error ratio (0.103 against 0.084), which is why this default
 waits for the bar below. #1191 keeps
 #1170 (the in-flight fetch buffers' own design gate); this decision bounds
-the permits by memory, it does not change what each permit reserves.
+the permits by memory (it sizes them; see the permit-bytes correction
+amendment below), it does not change what each permit reserves.
 
 What it moves: the stock entry gets W1's cold gain on every host where it
 is safe and nothing on a host where it is not. The acceptance arm reports
@@ -444,7 +447,8 @@ and its result stays separate from stock.
   endpoint, `cost-based` elsewhere, with the permits derived from memory.
   The tuned entry's `RAVEL_HOLD_STOCK_QUERY_BYTES` probe becomes
   unnecessary once a release carries the derivation; #1196's flag-doc
-  precondition is met by the derivation rather than by prose.
+  precondition is met by the derivation rather than by prose (only its
+  permit half is: see the permit-bytes correction amendment below).
 - Three levers leave this epic as numbers on #2677: either closed, or a
   follow-up ADR under the format-change procedure.
 
@@ -476,7 +480,10 @@ Before it, one measurement: how much of the fetch figure is cache-hit
 bytes charged a second time (`handoff_overlap`); if most of it, removing
 that double charge goes first. T6 also renames the client message a
 refused fetch reservation carries, which today reads as a storage error.
-T5 does not dispatch before T6 lands and its arm meets the bar.
+T5 does not dispatch before T6 lands and its arm meets the bar (T6's pull
+request #2747 closed unmerged; #2044 stays open and keeps the baseline
+condition, and T5 lands only once it is met: see the permit-bytes
+correction amendment below).
 
 T7 (#2694, medium) is the ordered block skip decision 6's measurement
 cleared: blocks visited 0.42% for q25 and 2.8% for q24 on the stored
@@ -487,7 +494,9 @@ guard.
 Wave 1: T1, T2, T3, concurrently (T3 since deferred: see the decision 3
 deferral amendment). Then T6 and T7 once T2 has landed (both
 touch ravel-sql), and T8 once T1 has landed (same `fold.rs`). T5 after
-T6's arm clears. T4 last: the entry recipe writes 25 MB objects, above the
+T6's arm clears (see the permit-bytes correction amendment below: T6's
+pull request #2747 closed unmerged, #2044 keeps the baseline, and #2806's
+gate change merged without bringing stock under the bar). T4 last: the entry recipe writes 25 MB objects, above the
 18.9 MB bound decision 2 acts under, so T4 moves no statement in the
 ranked entry; T7 shares `logs_scan.rs` and `log_fetcher.rs` with it and
 goes first. The high-risk-solo wave rule is relaxed for wave 1 on the
@@ -618,3 +627,55 @@ What stays exposed: a commit that lands after its hour's natural seal, or
 with no fold running between its publish and that seal, is not folded and
 stays invisible to non-token queries until a HEAD rebuild. The flags' help
 text and the consistency model say so in those terms.
+
+## Amendment (2026-10-11, Refs: #2683): decision 7's permits size GETs, not bytes, and T5's gate stays with #2044
+
+<!-- amendment-applies: sections="7. GET permits and the loopback fetch policy resolve from host memory|Plan|Consequences" pointer="permit-bytes correction amendment" -->
+<!-- amendment-supersedes: phrase="worst-case in-flight bytes" pointer="permit-bytes correction amendment" -->
+<!-- amendment-supersedes: phrase="T5 after T6's arm clears" pointer="permit-bytes correction amendment" -->
+
+This is the permit-bytes correction amendment. It corrects two things in
+decision 7 and the Plan and states the share T5 pins.
+
+**The permit count does not bound in-flight bytes.** Decision 7 premised
+the derivation on the permit count times the largest whole-object read
+staying a fixed share of `memory_budget_bytes`. The fetchers do not work
+that way. A fetch reserves its object's bytes on the process memory budget
+(#2086) before it acquires a permit, once per object: a whole-object read
+reserves the object's full size even when it is split into 64 MiB GETs,
+and the reservation is held after the permit is released, through decode.
+So nothing ties reserved bytes to the permit count: more objects can hold
+reservations than there are permits, and one object can reserve more than
+64 MiB. What the derivation does is size the GET count:
+`store_get_concurrency` is 64% of `memory_budget_bytes` divided by 64 MiB,
+rounded down and clamped to 8..=256, so that the count times 64 MiB is 64%
+of the budget. The 64% is chosen so the reference box's recorded budget
+derives 256 with margin, not derived from a memory model or a byte bound:
+c6a.4xlarge resolves a 27,775,004,672-byte budget from `MemAvailable`
+(source `derived-available`), 256 needs at least 26,843,545,600 bytes
+(25 GiB), and the recorded budget is about 3.5% above that, where 60%
+would derive 248. A 14 GiB budget derives 143, 6 GiB 61 and 3 GiB 30. It
+is not a carve beside ADR-2023 decision 3's loopback
+cache share either: fetch reservations draw on the remainder the caches
+leave, which SQL shares, and on a loopback store that remainder is 55% of
+the budget. What bounds the bytes is the budget refusing a reservation it
+cannot hold, which reaches the client as the retryable `upstream storage
+temporarily unavailable` (HTTP 503). On the 16-core reference host the
+derivation moves the default from 32 to 256 on remote stores as well as
+loopback ones, and the SQL ranged fast path's per-partition prefetch share
+follows it from 2 to 8. The Consequences claim that #1196's flag-doc
+precondition is met by the derivation holds for the permit half only: the
+SQL partition count stays at its core derivation, so a stock loopback
+deployment still reports the `latency-first` concurrency precondition unmet.
+
+**"T5 after T6's arm clears" still holds, with #2044 as the owner.**
+T6's pull request, #2747, closed unmerged on 2026-10-11. T6 itself,
+#2044, stays open and keeps decision 7's baseline condition: the stock
+concurrent error ratio at or under 0.058 (ADR-2023 decision 4's bar).
+#2806, the host memory admission gate of ADR-2633's 2026-10-11 amendment,
+is closed: its gate change merged, and stock still pooled 0.207, over the
+bar, so it does not take the condition over. Decision 7's own text stands
+as written: the permits derivation and the loopback policy default land
+only on a baseline that meets the bar, and must meet it themselves. T5's
+code is ready, and it lands only when #2044's baseline and T5's own arm
+meet decision 8's concurrent-phase row.
