@@ -26,11 +26,19 @@ const MIB: u64 = 1 << 20;
 /// The lowest `--memory-gate-min-available-bytes` accepted: 64 MiB.
 pub const MIN_AVAILABLE_FLOOR_BYTES: u64 = 64 * MIB;
 /// The default close floor is the larger of this, 512 MiB, and
-/// [`DEFAULT_MIN_AVAILABLE_PERCENT`] of host memory.
+/// [`DEFAULT_MIN_AVAILABLE_PERCENT`] of host memory, clamped to host memory
+/// over [`DEFAULT_MIN_AVAILABLE_HOST_DIVISOR`].
 pub const DEFAULT_MIN_AVAILABLE_BYTES: u64 = 512 * MIB;
 /// The share of host memory the default close floor takes when it is above
 /// [`DEFAULT_MIN_AVAILABLE_BYTES`].
 pub const DEFAULT_MIN_AVAILABLE_PERCENT: u8 = 2;
+/// The default close floor is at most host memory divided by this: an
+/// eighth, so a 1 GiB host gets 128 MiB rather than a floor it can never be
+/// above.
+pub const DEFAULT_MIN_AVAILABLE_HOST_DIVISOR: u64 = 8;
+/// The default purge floor is twice the close floor, at most host memory
+/// divided by this: a quarter, always above a derived close floor.
+pub const DEFAULT_PURGE_AVAILABLE_HOST_DIVISOR: u64 = 4;
 /// Default `--memory-gate-purge-min-interval-ms`.
 pub const DEFAULT_PURGE_MIN_INTERVAL_MS: u64 = 5000;
 /// The accepted range of `--memory-gate-purge-min-interval-ms`.
@@ -197,6 +205,15 @@ pub enum MemoryGateFloorError {
         purge_available_bytes: u64,
         host_memory_bytes: u64,
     },
+    /// `--memory-gate-purge-available-bytes` was not passed and the default
+    /// purge floor, the smaller of twice the flagged close floor and a
+    /// quarter of host memory, is not above the close floor. Only a flagged
+    /// close floor reaches this: a derived one is at most an eighth of host
+    /// memory.
+    PurgeFloorNotDerivable {
+        close_floor: u64,
+        host_memory_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for MemoryGateFloorError {
@@ -230,6 +247,17 @@ impl std::fmt::Display for MemoryGateFloorError {
                  forced purge would run at every --memory-gate-purge-min-interval-ms for the \
                  process's life. Lower the floor or pass --disable-memory-gate"
             ),
+            Self::PurgeFloorNotDerivable {
+                close_floor,
+                host_memory_bytes,
+            } => write!(
+                f,
+                "--memory-gate-min-available-bytes ({close_floor}) is at or above a quarter of \
+                 host memory ({host_memory_bytes} bytes), so the default purge floor, the smaller \
+                 of twice the close floor and a quarter of host memory, is not above it: pass \
+                 --memory-gate-purge-available-bytes explicitly (above the close floor and below \
+                 host memory), lower the close floor, or pass --disable-memory-gate"
+            ),
         }
     }
 }
@@ -243,17 +271,36 @@ fn percent_of(total: u64, percent: u8) -> u64 {
 }
 
 /// The default close floor for `host_memory_bytes` of host memory:
-/// `max(512 MiB, 2 % of host memory)`.
+/// `min(max(512 MiB, 2 % of host memory), host memory / 8)`. From 4 GiB up
+/// the clamp does not bind; below it the floor is an eighth of host memory,
+/// which on a host under 512 MiB is below the flag's 64 MiB minimum and is
+/// accepted as derived.
 pub fn default_min_available_bytes(host_memory_bytes: u64) -> u64 {
-    DEFAULT_MIN_AVAILABLE_BYTES.max(percent_of(host_memory_bytes, DEFAULT_MIN_AVAILABLE_PERCENT))
+    DEFAULT_MIN_AVAILABLE_BYTES
+        .max(percent_of(host_memory_bytes, DEFAULT_MIN_AVAILABLE_PERCENT))
+        .min(host_memory_bytes / DEFAULT_MIN_AVAILABLE_HOST_DIVISOR)
+}
+
+/// The default purge floor for a close floor of `min_available_bytes` on
+/// `host_memory_bytes` of host memory: `min(2 x close floor, host memory /
+/// 4)`. Above a derived close floor on every host size (that is at most an
+/// eighth of host memory); not above a flagged close floor at or above a
+/// quarter of host memory, which [`resolve`] refuses.
+pub fn default_purge_available_bytes(min_available_bytes: u64, host_memory_bytes: u64) -> u64 {
+    min_available_bytes
+        .saturating_mul(2)
+        .min(host_memory_bytes / DEFAULT_PURGE_AVAILABLE_HOST_DIVISOR)
 }
 
 /// Resolves the gate from its flags and the facts that turn it off. The off
 /// reasons are checked in the order the stamp's sources list them: gateway
 /// mode, a fallback budget, `--disable-memory-gate`, a build without
 /// jemalloc, a host whose `MemAvailable` or `MemTotal` could not be read.
-/// An enabled gate's floors are then checked: the purge floor must be above
-/// the close floor, and both floors below host memory.
+/// An enabled gate's flagged floors are then checked: a flagged close floor
+/// must be below host memory, a flagged purge floor above the close floor
+/// and below host memory, and a close floor flagged at or above a quarter of
+/// host memory needs the purge floor flagged too. Derived floors are never
+/// refused.
 pub fn resolve(
     flags: MemoryGateFlags,
     mode: Mode,
@@ -295,30 +342,45 @@ pub fn resolve(
         return Ok(gate);
     }
 
-    let min_available_bytes = flags
-        .min_available_bytes
-        .unwrap_or_else(|| default_min_available_bytes(gate.host_memory_bytes));
-    let purge_available_bytes = flags
-        .purge_available_bytes
-        .unwrap_or_else(|| min_available_bytes.saturating_mul(2));
-    if purge_available_bytes <= min_available_bytes {
-        return Err(MemoryGateFloorError::PurgeFloorNotAboveCloseFloor {
-            purge_available_bytes,
-            min_available_bytes,
-        });
-    }
-    if min_available_bytes >= gate.host_memory_bytes {
-        return Err(MemoryGateFloorError::CloseFloorReachesHostMemory {
-            min_available_bytes,
-            host_memory_bytes: gate.host_memory_bytes,
-        });
-    }
-    if purge_available_bytes >= gate.host_memory_bytes {
-        return Err(MemoryGateFloorError::PurgeFloorReachesHostMemory {
-            purge_available_bytes,
-            host_memory_bytes: gate.host_memory_bytes,
-        });
-    }
+    // Only a flagged value is checked: a derived close floor is at most an
+    // eighth of host memory and a derived purge floor is above it, so a
+    // derived configuration resolves on every host size.
+    let host_memory_bytes = gate.host_memory_bytes;
+    let min_available_bytes = match flags.min_available_bytes {
+        Some(flagged) if flagged >= host_memory_bytes => {
+            return Err(MemoryGateFloorError::CloseFloorReachesHostMemory {
+                min_available_bytes: flagged,
+                host_memory_bytes,
+            });
+        }
+        Some(flagged) => flagged,
+        None => default_min_available_bytes(host_memory_bytes),
+    };
+    let purge_available_bytes = match flags.purge_available_bytes {
+        Some(flagged) if flagged <= min_available_bytes => {
+            return Err(MemoryGateFloorError::PurgeFloorNotAboveCloseFloor {
+                purge_available_bytes: flagged,
+                min_available_bytes,
+            });
+        }
+        Some(flagged) if flagged >= host_memory_bytes => {
+            return Err(MemoryGateFloorError::PurgeFloorReachesHostMemory {
+                purge_available_bytes: flagged,
+                host_memory_bytes,
+            });
+        }
+        Some(flagged) => flagged,
+        None => {
+            let derived = default_purge_available_bytes(min_available_bytes, host_memory_bytes);
+            if derived <= min_available_bytes {
+                return Err(MemoryGateFloorError::PurgeFloorNotDerivable {
+                    close_floor: min_available_bytes,
+                    host_memory_bytes,
+                });
+            }
+            derived
+        }
+    };
     gate.enabled = true;
     gate.min_available_bytes = min_available_bytes;
     gate.purge_available_bytes = purge_available_bytes;
@@ -817,7 +879,9 @@ fn next_sleep(interval: Duration, elapsed: Duration) -> Duration {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::config::PERF_SOURCE_FLAG;
+    use crate::config::{
+        MIN_DERIVED_MEMORY_BUDGET_BYTES, PERF_SOURCE_DERIVED_CGROUP, PERF_SOURCE_FLAG,
+    };
 
     const GIB: u64 = 1 << 30;
     const GB: u64 = 1_000_000_000;
@@ -870,6 +934,44 @@ mod tests {
             Some(20 * GIB),
             None,
         )
+    }
+
+    /// A bare host of `mem_total` bytes with no cgroup limit and half of it
+    /// available.
+    fn host_of(mem_total: u64) -> HostProfile {
+        HostProfile::new(
+            4,
+            Some(mem_total),
+            Some(mem_total),
+            None,
+            Some(mem_total / 2),
+            None,
+        )
+    }
+
+    /// A container under a `limit`-byte cgroup memory limit on the 32 GiB
+    /// host: host memory is the limit.
+    fn container_of(limit: u64) -> HostProfile {
+        HostProfile::new(
+            4,
+            Some(limit),
+            Some(32 * GIB),
+            Some(limit),
+            Some(20 * GIB),
+            None,
+        )
+    }
+
+    /// Resolved defaults with no `--memory-budget-bytes`, so the budget is
+    /// derived from `host`.
+    fn derived_performance(mode: Mode, host: HostProfile) -> ResolvedPerformanceDefaults {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "ravel-server".to_string(),
+            "--mode".to_string(),
+            mode_arg(mode).to_string(),
+        ])
+        .expect("flags parse");
+        cli.resolve_performance(host).expect("performance resolves")
     }
 
     /// `Cli` from `args` alone, for the flag range tests.
@@ -1326,9 +1428,16 @@ mod tests {
     #[test]
     fn the_default_floors_on_a_32_gib_host_are_687_mb_and_twice_that() {
         assert_eq!(default_min_available_bytes(32 * GIB), FLOOR_32G);
-        // Below 25.6 GiB the 512 MiB floor wins over 2 %.
+        // Below 25.6 GiB the 512 MiB floor wins over 2 %, and from 4 GiB up
+        // an eighth of host memory is at or above 512 MiB, so the clamp does
+        // not bind.
         assert_eq!(default_min_available_bytes(8 * GIB), 512 * MIB);
-        assert_eq!(default_min_available_bytes(0), 512 * MIB);
+        assert_eq!(default_min_available_bytes(4 * GIB), 512 * MIB);
+        assert_eq!(
+            default_purge_available_bytes(FLOOR_32G, 32 * GIB),
+            PURGE_FLOOR_32G
+        );
+        assert_eq!(default_purge_available_bytes(512 * MIB, 4 * GIB), GIB);
 
         let on = performance(Mode::Query, 27 * GB, host());
         assert_eq!(on.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
@@ -1343,6 +1452,172 @@ mod tests {
         assert_eq!(gate.available_source, HostMemorySource::MemInfo);
         assert_eq!(gate.available_source.as_str(), "meminfo");
         assert_eq!(gate.floors(), floors());
+    }
+
+    /// The derived floors are clamped to an eighth and a quarter of host
+    /// memory, so a host of 1 GiB or less still starts at the defaults
+    /// (ADR-1170's small-host amendment, #2607, keeps those hosts bootable).
+    ///
+    /// FLIP: derive the floors as `max(512 MiB, 2 %)` and twice that, with
+    /// no clamp, and the 1 GiB container refuses with
+    /// `PurgeFloorReachesHostMemory { 1 GiB, 1 GiB }`, the 512 MiB host with
+    /// `CloseFloorReachesHostMemory`, and the 256 MiB host the same.
+    #[test]
+    fn the_default_floors_are_clamped_to_an_eighth_and_a_quarter_of_a_small_host() {
+        assert_eq!(default_min_available_bytes(2 * GIB), 256 * MIB);
+        assert_eq!(default_min_available_bytes(GIB), 128 * MIB);
+        assert_eq!(default_min_available_bytes(512 * MIB), 64 * MIB);
+        assert_eq!(default_min_available_bytes(256 * MIB), 32 * MIB);
+        assert_eq!(default_purge_available_bytes(128 * MIB, GIB), 256 * MIB);
+
+        // The 1 GiB container derives its budget on main and keeps doing so;
+        // the gate resolves at the defaults beside it.
+        let container = container_of(GIB);
+        let on = derived_performance(Mode::Query, container);
+        assert_eq!(on.sources.memory_budget_bytes, PERF_SOURCE_DERIVED_CGROUP);
+        assert!(on.memory_budget_bytes >= MIN_DERIVED_MEMORY_BUDGET_BYTES);
+        let gate = resolve(flags(), Mode::Query, &on, container, true).expect("resolves on 1 GiB");
+        assert!(gate.enabled);
+        assert_eq!(gate.source, SOURCE_DEFAULT);
+        assert_eq!(gate.host_memory_bytes, GIB);
+        assert_eq!(gate.min_available_bytes, 134_217_728);
+        assert_eq!(gate.purge_available_bytes, 268_435_456);
+        assert_eq!(gate.available_source, HostMemorySource::MemInfoAndCgroup);
+
+        for (mem_total, min_available_bytes, purge_available_bytes) in [
+            (512 * MIB, 67_108_864, 134_217_728),
+            (256 * MIB, 33_554_432, 67_108_864),
+        ] {
+            let host = host_of(mem_total);
+            let on = performance(Mode::Query, 200 * MIB, host);
+            let gate = resolve(flags(), Mode::Query, &on, host, true)
+                .unwrap_or_else(|refused| panic!("{mem_total} bytes of host memory: {refused}"));
+            assert!(gate.enabled);
+            assert_eq!(gate.source, SOURCE_DEFAULT);
+            assert_eq!(gate.host_memory_bytes, mem_total);
+            assert_eq!(gate.min_available_bytes, min_available_bytes);
+            assert_eq!(gate.purge_available_bytes, purge_available_bytes);
+            // The derived close floor on these hosts is below the flag's
+            // 64 MiB minimum, or at it, and is accepted.
+            assert!(gate.min_available_bytes <= MIN_AVAILABLE_FLOOR_BYTES);
+        }
+    }
+
+    /// A flagged floor on a small host keeps the flag refusals, and a flagged
+    /// close floor the derived purge floor cannot clear is refused with a
+    /// pointer at the purge flag rather than resolved to a floor below the
+    /// close floor.
+    ///
+    /// FLIP: derive the purge floor as twice the close floor with no clamp,
+    /// and the 400 MiB close floor resolves with an 800 MiB purge floor
+    /// instead of `PurgeFloorNotDerivable`, and the 200 MiB one gets 400 MiB
+    /// instead of 256 MiB.
+    #[test]
+    fn a_flagged_floor_on_a_1_gib_host_keeps_the_flag_refusals() {
+        let host = host_of(GIB);
+        let on = performance(Mode::Query, 768 * MIB, host);
+
+        // A flagged close floor at host memory is refused before the purge
+        // floor is derived, so the message names the close flag.
+        let refused = resolve(
+            MemoryGateFlags {
+                min_available_bytes: Some(GIB),
+                ..flags()
+            },
+            Mode::Query,
+            &on,
+            host,
+            true,
+        )
+        .expect_err("close floor at host memory");
+        assert_eq!(
+            refused,
+            MemoryGateFloorError::CloseFloorReachesHostMemory {
+                min_available_bytes: GIB,
+                host_memory_bytes: GIB,
+            }
+        );
+
+        // A flagged close floor at or above a quarter of host memory has no
+        // derivable purge floor: the smaller of twice it and a quarter of
+        // host memory is not above it.
+        for min_available_bytes in [400 * MIB, 256 * MIB, GIB - 1] {
+            let refused = resolve(
+                MemoryGateFlags {
+                    min_available_bytes: Some(min_available_bytes),
+                    ..flags()
+                },
+                Mode::Query,
+                &on,
+                host,
+                true,
+            )
+            .expect_err("purge floor not derivable");
+            assert_eq!(
+                refused,
+                MemoryGateFloorError::PurgeFloorNotDerivable {
+                    close_floor: min_available_bytes,
+                    host_memory_bytes: GIB,
+                }
+            );
+            let message = refused.to_string();
+            assert!(
+                message.contains(&format!(
+                    "--memory-gate-min-available-bytes ({min_available_bytes})"
+                )),
+                "{message}"
+            );
+            assert!(
+                message.contains("pass --memory-gate-purge-available-bytes explicitly"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("host memory ({GIB} bytes)")),
+                "{message}"
+            );
+        }
+
+        // The same close floor with the purge floor flagged resolves.
+        let gate = resolve(
+            MemoryGateFlags {
+                min_available_bytes: Some(400 * MIB),
+                purge_available_bytes: Some(500 * MIB),
+                ..flags()
+            },
+            Mode::Query,
+            &on,
+            host,
+            true,
+        )
+        .expect("both floors flagged");
+        assert!(gate.enabled);
+        assert_eq!(gate.source, SOURCE_FLAG);
+        assert_eq!(gate.min_available_bytes, 400 * MIB);
+        assert_eq!(gate.purge_available_bytes, 500 * MIB);
+
+        // A flagged close floor the clamp does not reach derives twice
+        // itself; one between an eighth and a quarter of host memory derives
+        // the quarter.
+        for (min_available_bytes, purge_available_bytes) in [
+            (100 * MIB, 200 * MIB),
+            (128 * MIB, 256 * MIB),
+            (200 * MIB, 256 * MIB),
+        ] {
+            let gate = resolve(
+                MemoryGateFlags {
+                    min_available_bytes: Some(min_available_bytes),
+                    ..flags()
+                },
+                Mode::Query,
+                &on,
+                host,
+                true,
+            )
+            .expect("purge floor derives");
+            assert_eq!(gate.source, SOURCE_FLAG);
+            assert_eq!(gate.min_available_bytes, min_available_bytes);
+            assert_eq!(gate.purge_available_bytes, purge_available_bytes);
+        }
     }
 
     #[test]
@@ -1473,8 +1748,14 @@ mod tests {
                 "{message}"
             );
         }
-        // A flagged close floor whose default purge floor (twice it) reaches
-        // host memory is refused the same way.
+        // A flagged close floor at or above a quarter of host memory with no
+        // purge flag has no derivable purge floor: the default is the smaller
+        // of twice the close floor and a quarter of host memory, 8 GiB here,
+        // which is not above 16 GiB.
+        //
+        // FLIP: derive the purge floor as twice the close floor with no
+        // clamp and this refuses with `PurgeFloorReachesHostMemory` at
+        // 32 GiB instead.
         let refused = resolve(
             MemoryGateFlags {
                 min_available_bytes: Some(16 * GIB),
@@ -1485,14 +1766,27 @@ mod tests {
             host(),
             true,
         )
-        .expect_err("default purge floor at host memory");
+        .expect_err("default purge floor not derivable");
         assert_eq!(
             refused,
-            MemoryGateFloorError::PurgeFloorReachesHostMemory {
-                purge_available_bytes: 32 * GIB,
+            MemoryGateFloorError::PurgeFloorNotDerivable {
+                close_floor: 16 * GIB,
                 host_memory_bytes: 32 * GIB,
             }
         );
+        // One below the quarter derives the quarter.
+        let gate = resolve(
+            MemoryGateFlags {
+                min_available_bytes: Some(8 * GIB - 1),
+                ..flags()
+            },
+            Mode::Query,
+            &on,
+            host(),
+            true,
+        )
+        .expect("purge floor derives as a quarter of host memory");
+        assert_eq!(gate.purge_available_bytes, 8 * GIB);
 
         // An off gate checks nothing.
         let off = resolve(
