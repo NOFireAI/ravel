@@ -147,9 +147,13 @@ than passing the leaf's `Exact` count through. So
 logs_provider.rs) reports `Exact` for a filter that resolves purely to a
 `ts` bound and/or a `has_word` content predicate, which
 deletes it from the plan: both land in the channel the RLOG reader
-re-verifies against each decoded row's own value (`ravel_logseg`'s `eval`,
-its `Predicate::TsRange` and `Predicate::HasWord` arms), so no residual is
-needed. A `COUNT(*)` over a contained `ts` bound therefore takes the same
+re-verifies exactly against each decoded block (`ravel_logseg`'s
+`block_survivors`, over its `Predicate::TsRange` and `Predicate::HasWord`
+arms), so no residual is needed. The reader evaluates that channel a block at
+a time (ADR-2773 decision D2): a `ts` window or stream set whose skip-index
+bounds hold for the whole block is dropped for that block, and the remaining
+arms run over the decoded column buffers, with only an attribute arm that has
+no FIELD_DIR column of its type falling back to a per-row `attrs_raw` lookup. A `COUNT(*)` over a contained `ts` bound therefore takes the same
 zero-GET path the genuinely predicate-free query does.
 
 Every other filter stays `Inexact`. An `attrs['k'] = 'v'` equality and
@@ -210,7 +214,7 @@ cannot be proven. The full set of decline conditions:
   brackets the data, so a time filter does not by itself retire it.
 - A non-empty `content` predicate (e.g. `has_word`) or a non-empty `prune`
   channel is present: both also survive pushdown as `Exact` (deleted
-  `FilterExec`, evaluated per row inside the scan), and neither is reflected in
+  `FilterExec`, evaluated exactly inside the scan), and neither is reflected in
   the whole-segment dictionary counts.
 - A `Str`-typed typed attribute column, a predicate or group key over a
   column that is not declared, or a segment with no loaded statistics.
@@ -2951,8 +2955,14 @@ and block-level reported independently:
   path its footer and directories were already read at plan time and its
   blocks are in `blocksTotal`. On the striped scan path a segment is counted
   once per partition that owned a share of its blocks.
+- `blocksPredicateDropped`: scanned blocks whose rows the exact content
+  predicate kept without evaluating any: every arm was a `ts` window or stream
+  set the block's skip-index bounds proved true for all of its rows, or there
+  was no arm (ADR-2773 decision D2).
+- `rowsPredicateEvaluated`: rows of the other scanned blocks, which the
+  predicate's remaining arms evaluated a block at a time.
 
-All six counts after `segments` are 0 for a statement with no logs scan.
+All eight counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
 while `segments` counts the one snapshot all of them read. With one scan,
 `segmentsPrunedByStats` is a subset of `segments`; with two, each scan
