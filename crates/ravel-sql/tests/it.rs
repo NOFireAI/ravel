@@ -78,6 +78,8 @@ mod logs_scan_fetch_pushdown;
 mod logs_selective_scan_amplification;
 #[path = "logs_stats_load.rs"]
 mod logs_stats_load;
+#[path = "logs_str_dict_charge.rs"]
+mod logs_str_dict_charge;
 #[path = "logs_striped_directory_accounting.rs"]
 mod logs_striped_directory_accounting;
 #[path = "logs_topk_late_materialization.rs"]
