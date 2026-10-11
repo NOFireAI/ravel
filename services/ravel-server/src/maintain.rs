@@ -1178,6 +1178,12 @@ impl MaintenanceOwnershipMetrics {
         self.units_owned.load(Ordering::Relaxed)
     }
 
+    /// Bucket merges in progress in this process, read from
+    /// [`ravel_maintain::compactions_in_flight`] at scrape time.
+    pub fn compactions_in_flight(&self) -> u64 {
+        ravel_maintain::compactions_in_flight()
+    }
+
     pub fn memo_warm_start_units(&self) -> u64 {
         self.memo_warm_start_units.load(Ordering::Relaxed)
     }
