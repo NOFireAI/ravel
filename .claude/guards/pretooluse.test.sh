@@ -49,6 +49,12 @@ check deny  "guard captured through a pipe"    "$(bash_payload 'out=$(scripts/gu
 check deny  "guard piped to grep"              "$(bash_payload 'scripts/guards/check-disk-headroom.sh . 20 | grep LOW')"
 check allow "guard with no pipe"               "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556')"
 check allow "guard output read from a file"    "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556 > /tmp/g.txt 2>&1')"
+# The pre-push hook's refusal is the push's exit code; piped through tail it
+# read as 0 and the chain after it requested a review on a head that never moved.
+check deny  "git push piped through tail"      "$(bash_payload 'git push -q origin land/x:refs/heads/fix/x 2>&1 | tail -3')"
+check deny  "git -c push piped through grep"   "$(bash_payload 'git -c push.default=simple push origin HEAD 2>&1 | grep -v remote')"
+check allow "git push alone"                   "$(bash_payload 'git push -q origin land/x:refs/heads/fix/x')"
+check allow "git push output to a file"        "$(bash_payload 'git push -q -f origin land/x:refs/heads/fix/x > /tmp/push.txt 2>&1')"
 # An allow case only has teeth when something could deny it. This one carried
 # no pipe and no `&& echo`, so no rule could ever have fired on it and it
 # passed against every mutation of the prefix list. What the harmless-prefix

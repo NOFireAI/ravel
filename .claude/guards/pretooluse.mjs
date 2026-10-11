@@ -52,8 +52,12 @@ function readStdin() {
 // refuse. Flags take an `=value` form only here; a flag with a separate
 // value argument would need the value consumed too, and over-consuming
 // turns a false allow into a false deny.
+// `git push` is in the list because the pre-push hook is a guard too: its
+// refusal is the push's exit code, and `git push ... | tail -3` reported 0 on
+// a refused push, so the chain after it requested a review on a head that
+// never moved.
 const GATE_HEAD =
-  /^(cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
+  /^(cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+(clippy|test|nextest|fmt|build|check)|git(\s+(-[A-Za-z]|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?|-c\s+\S+))*\s+push|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
 // Things that may legitimately precede a gate on the same command line.
 // A bare assignment may precede a gate (`FOO=1 cargo test`). One plain
 // alternative for it: an earlier version added a separate `NAME=$(`
