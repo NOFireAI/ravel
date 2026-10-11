@@ -106,9 +106,12 @@ STUB
 
 cat >"$STUBS/curl" <<'STUB'
 #!/usr/bin/env bash
-# IMDS and readiness answer at once. A SQL call writes an answer to -o and
-# prints "<status> <seconds>": STUB_SQL_TIME seconds (default 0.5), and a 422
-# resource_exhausted refusal for statement STUB_SQL_REFUSE_N.
+# IMDS and readiness answer at once. A SQL call logs its request body to
+# sql-bodies, writes an answer to -o and prints "<status> <seconds>":
+# STUB_SQL_TIME seconds (default 0.5), and a 422 resource_exhausted refusal
+# for statement STUB_SQL_REFUSE_N. An answer holds the statement's expected
+# row count from the index.tsv beside its body (3 rows where the corpus states
+# none), or STUB_SQL_ROWS rows for statement STUB_SQL_ROWS_N.
 out=""
 body=""
 url=""
@@ -128,11 +131,19 @@ case "$url" in
   */readyz) echo ready ;;
   */api/v1/sql)
     echo "sql $(basename "$body")" >>"$STUB_DIR/curl-sql"
-    if [ "$(basename "$body" .json)" = "${STUB_SQL_REFUSE_N:-none}" ]; then
+    n="$(basename "$body" .json)"
+    { cat "$body"; echo; } >>"$STUB_DIR/sql-bodies"
+    if [ "$n" = "${STUB_SQL_REFUSE_N:-none}" ]; then
       printf '{"status":"error","errorType":"resource_exhausted","error":"query pool exhausted"}' >"$out"
       printf '422 0.1'
     else
-      printf '{"status":"success","data":[]}' >"$out"
+      rows="$(awk -F'\t' -v n="$n" '$1 == n { print $3 }' "$(dirname "$body")/index.tsv")"
+      case "$rows" in ''|-) rows=3 ;; esac
+      [ "$n" != "${STUB_SQL_ROWS_N:-none}" ] || rows="$STUB_SQL_ROWS"
+      json=""
+      for ((i = 0; i < rows; i++)); do json="${json:+$json,}[$i]"; done
+      json="[$json]"
+      printf '{"status":"success","data":{"columns":["c"],"rows":%s},"stats":{}}' "$json" >"$out"
       printf '200 %s' "${STUB_SQL_TIME:-0.5}"
     fi
     ;;
@@ -179,20 +190,26 @@ export PATH="$STUBS:$PATH"
 SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
-# A filled copy of the parquet lane's band file.
-BANDS="$TMP/parquet.toml"
-sed -e 's/^memory_cap_bytes = .*/memory_cap_bytes = 16451897344/' \
-  -e 's/^arm_b_hot_s = .*/arm_b_hot_s = 57.5/' \
-  -e 's/^arm_b_cold_s = .*/arm_b_cold_s = 251.7/' \
-  "$REPO_ROOT/benchmarks/clickbench/bands/parquet.toml" >"$BANDS"
+# A filled copy of the rlog lane's band file: 43 statements at 0.5 s sum to
+# 21.5 s hot and cold, under 30; at 2.0 s they miss.
+BANDS="$TMP/rlog.toml"
+sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
+  -e 's/^cold_sum_s_max = .*/cold_sum_s_max = 30/' \
+  -e 's/^error_pooled_max = .*/error_pooled_max = 0.1/' \
+  -e 's/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
+  "$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml" >"$BANDS"
+DATASET_SHA=1111111111111111111111111111111111111111111111111111111111111111
 
-# write_run_toml FILE BANDS_PATH
+# write_run_toml FILE BANDS_PATH [BAND_SECTIONS_ARRAY]
 write_run_toml() {
+  local sections='["relative", "absolute"]'
+  [ -z "${3:-}" ] || sections="$3"
   cat >"$1" <<EOF
 sha_a = "$SHA_A"
 sha_b = "$SHA_B"
-lanes = ["parquet"]
+lanes = ["rlog"]
 phases = ["benchmark"]
+band_sections = $sections
 instance_type = "c6a.4xlarge"
 region = "us-east-1"
 bucket = "kit-test-bucket"
@@ -203,13 +220,14 @@ tenant = "clickbench-v4"
 shards = 8
 corpus = "benchmarks/clickbench/hits.corpus.json"
 dataset_url = "https://example.invalid/hits.parquet"
+dataset_sha256 = "$DATASET_SHA"
 rustfs_url = "https://example.invalid/rustfs.zip"
 rustfs_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 memory_budget_bytes = 25769803776
 audit_mode = "off"
 
 [bands]
-parquet = "$2"
+rlog = "$2"
 EOF
 }
 RUN_TOML="$TMP/run.toml"
@@ -259,30 +277,44 @@ fi
 DRY_STAGE="$(sed -n 's/^launch: staged in\/ files kept in //p' "$TMP/dry.err")"
 [ -z "$DRY_STAGE" ] || rm -rf "$DRY_STAGE"
 
-# Catches: a band file still holding a FILL-IN placeholder reaching the launch,
-# or a refusal that does not name the key. The checked-in parquet.toml is not
-# filled in yet, so it is the case.
+# Catches: a band file still holding a FILL-IN placeholder in a section the
+# run selects reaching the launch, or a refusal that does not name the keys.
+# The checked-in rlog.toml's absolute section is not filled in yet.
 reset_log
-write_run_toml "$TMP/run-placeholder.toml" "benchmarks/clickbench/bands/parquet.toml"
+write_run_toml "$TMP/run-placeholder.toml" "benchmarks/clickbench/bands/rlog.toml"
 code=0
 bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-placeholder.toml" >"$TMP/ph.out" 2>"$TMP/ph.err" || code=$?
-if [ "$code" = 64 ] && grep -q 'placeholder value in arm_b_cold_s, arm_b_hot_s, memory_cap_bytes' "$TMP/ph.err" \
-  && ! grep -q 'DRY-RUN' "$TMP/ph.err"; then
-  pass "a placeholder in the band file is refused, naming the keys"
+if [ "$code" = 64 ] \
+  && grep -q 'placeholder value in absolute.hot_sum_s_max, absolute.cold_sum_s_max, absolute.error_pooled_max, absolute.hot_s_max.q01, ' "$TMP/ph.err" \
+  && grep -q 'absolute.hot_s_max.q43; fill it in' "$TMP/ph.err" && ! grep -q 'DRY-RUN' "$TMP/ph.err"; then
+  pass "a placeholder in a selected band section is refused, naming the keys"
 else
   fail "placeholder" "exit $code: $(head -c 300 "$TMP/ph.err")"
 fi
 
-# Catches: a placeholder on a kit (#@) band line slipping through, since
-# parse_prereg never reads those lines.
-sed 's/^#@ relative.qps_min_ratio = .*/#@ relative.qps_min_ratio = "FILL-IN-LATER"/' "$BANDS" >"$TMP/parquet-kitph.toml"
-write_run_toml "$TMP/run-kitph.toml" "$TMP/parquet-kitph.toml"
+# Catches: placeholders refused in a section the run does not select, which
+# would block every run until the absolute bands are measured.
+write_run_toml "$TMP/run-relonly.toml" "benchmarks/clickbench/bands/rlog.toml" '["relative"]'
 code=0
-bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-kitph.toml" >/dev/null 2>"$TMP/kitph.err" || code=$?
-if [ "$code" = 64 ] && grep -q 'placeholder value in relative.qps_min_ratio' "$TMP/kitph.err"; then
-  pass "a placeholder on a #@ band line is refused, naming the key"
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-relonly.toml" >/dev/null 2>"$TMP/relonly.err" || code=$?
+if [ "$code" = 0 ] && grep -q '^DRY-RUN: aws ec2 run-instances' "$TMP/relonly.err"; then
+  pass "placeholders in an unselected band section are allowed"
 else
-  fail "kit band placeholder" "exit $code: $(head -c 300 "$TMP/kitph.err")"
+  fail "unselected placeholder" "exit $code: $(head -c 300 "$TMP/relonly.err")"
+fi
+DRY_STAGE="$(sed -n 's/^launch: staged in\/ files kept in //p' "$TMP/relonly.err")"
+[ -z "$DRY_STAGE" ] || rm -rf "$DRY_STAGE"
+
+# Catches: a placeholder in the relative section slipping through when only
+# the absolute section was checked.
+sed 's/^qps_min_ratio = .*/qps_min_ratio = "FILL-IN-LATER"/' "$BANDS" >"$TMP/rlog-relph.toml"
+write_run_toml "$TMP/run-relph.toml" "$TMP/rlog-relph.toml" '["relative"]'
+code=0
+bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-relph.toml" >/dev/null 2>"$TMP/relph.err" || code=$?
+if [ "$code" = 64 ] && grep -q 'placeholder value in relative.qps_min_ratio;' "$TMP/relph.err"; then
+  pass "a placeholder in the relative section is refused, naming the key"
+else
+  fail "relative placeholder" "exit $code: $(head -c 300 "$TMP/relph.err")"
 fi
 
 # Catches: launching (or uploading) when the instance role could not write
@@ -317,7 +349,7 @@ RUN_ID="$(sed -n 's/^run id: *//p' "$TMP/launch.out")"
 RUN_DIR="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/$RUN_ID"
 tar_list="$(tar -tzf "$RUN_DIR/in/kit.tgz" 2>/dev/null | grep -v '/$' | LC_ALL=C sort | tr '\n' ' ')"
 if [ "$code" = 0 ] && [ -f "$RUN_DIR/in/kit.tgz" ] && [ -f "$RUN_DIR/in/kit.sha256" ] && [ -f "$RUN_DIR/in/run.toml" ] \
-  && [ "$tar_list" = "kit/SHA256SUMS kit/bands/parquet.toml kit/box/run.sh kit/corpus.json kit/lib/kit.py " ] \
+  && [ "$tar_list" = "kit/SHA256SUMS kit/bands/rlog.toml kit/box/run.sh kit/corpus.json kit/lib/kit.py " ] \
   && [ "$(sort -u "$STUB_DIR/client-tokens" | wc -l | tr -d ' ')" = 2 ] \
   && [ -s "$STUB_DIR/userdata-A" ] && [ -s "$STUB_DIR/userdata-B" ]; then
   pass "launch uploads kit.tgz, kit.sha256 and run.toml to in/ and launches both arms"
@@ -444,16 +476,17 @@ run_box() {
   local arm="$1" name="$2" box="$TMP/$2" code=0
   shift 2
   reset_log
-  rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/curl-sql" "$STUB_DIR/run_query-calls" "$STUB_DIR/objects"
+  rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/curl-sql" "$STUB_DIR/run_query-calls" \
+    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies"
   boot_box "$arm" "$box" || return 1
   env "$@" bash "$TMP/box-driver.sh" "$box" >"$box/kit/run.log" 2>&1 || code=$?
   return "$code"
 }
 
-# The happy path: arm A, statement 19 (a registered failure) refused.
+# The happy path: arm A, every statement answered with its expected rows.
 BOX_A="$TMP/box-a"
 code=0
-run_box A box-a STUB_SQL_REFUSE_N=19 STUB_SQL_TIME=0.5 || code=$?
+run_box A box-a STUB_SQL_TIME=0.5 || code=$?
 OUT_A="$RUN_DIR/out/A"
 
 # Catches: a run that does not end in DONE with results.json, evidence.tgz and
@@ -466,28 +499,36 @@ else
   fail "box run" "exit $code; $(cat "$OUT_A/FAILED" 2>/dev/null | head -n 3); run.log: $(tail -n 5 "$BOX_A/kit/run.log")"
 fi
 
-# Catches: results.json losing a ClickBenchParquetReport field, a provenance
-# stamp, the fold or BurstBalance stamps, the bands block, or the refusal
-# class of a refused statement.
-check="$(python3 - "$OUT_A/results.json" "$SHA_A" <<'PY'
+# Catches: results.json leaving SqlLatencyReport's statement shape (entries of
+# EntryReport, failed of FailedEntry), losing a provenance stamp, the fold,
+# BurstBalance or query window stamps, the per-statement answer check, or the
+# bands block; or a band row carrying a q-prefixed id, which analyse.py would
+# count as a second report row.
+check="$(python3 - "$OUT_A/results.json" "$SHA_A" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" "$DATASET_SHA" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
+corpus = {e["id"]: e.get("expected_rows") for e in json.load(open(sys.argv[3]))["entries"]}
 p = r["provenance"]
 bad = []
 def want(cond, what):
     if not cond:
         bad.append(what)
-for k in ("provenance", "statements", "totals", "registered_failures_answered", "concurrency",
-          "concurrency_error", "phases", "bands"):
+for k in ("provenance", "entries", "skipped", "failed", "totals", "error_pooled", "concurrency",
+          "phases", "bands"):
     want(k in r, "field " + k)
-for k in ("git_sha", "binary", "arm", "location", "server", "server_log", "server_settings",
-          "sql_max_query_bytes", "sql_tenant_max_bytes", "reference_dir", "reference_version",
-          "ddl_files", "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
-          "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold", "object_counts"):
+for k in ("git_sha", "binary", "arm", "tenant", "server", "server_logs", "server_settings",
+          "band_sections", "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
+          "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold", "object_counts",
+          "query_window"):
     want(k in p, "provenance." + k)
 want(p.get("git_sha") == sys.argv[2], "git_sha")
 want(p.get("arm") == "a" and p.get("kit_arm") == "A", "arm")
-want(p.get("sql_max_query_bytes") == 16451897344, "sql_max_query_bytes")
+want(p.get("server_settings", {}).get("sql_max_query_bytes") == 16451897344, "sql_max_query_bytes")
+want(len(p.get("server_logs", [])) == 43, "one server log per cold start")
+want(p.get("band_sections") == ["relative", "absolute"], "band_sections")
+w = p.get("query_window", {})
+want(w.get("window_hours") == 200000 and w.get("end", 0) - w.get("start", 0) == 720000000, "query_window")
+want(p.get("corpus_digest", {}).get("dataset_sha256") == sys.argv[4], "dataset_sha256")
 want(p.get("fold", {}).get("precondition") == "met" and p["fold"].get("seal_through_hour") == "Some(491234)"
      and p["fold"].get("objects_written_by_load") == 100 and p["fold"].get("entry_count") == 100, "fold stamp")
 want(p.get("object_counts") == {"before_load": 10, "after_load": 110}, "object_counts")
@@ -501,37 +542,88 @@ want(p.get("hardware", {}).get("instance_type") == "c6a.4xlarge", "hardware")
 want(p.get("backend", {}).get("store") == "rustfs", "backend")
 want(len(p.get("corpus_digest", {}).get("corpus_sha256", "")) == 64, "corpus_digest")
 want(p.get("toolchain", "").startswith("rustc 1.90.0"), "toolchain")
-want(len(r["statements"]) == 43, "43 statements")
-s19 = [s for s in r["statements"] if s["number"] == 19][0]
-want(s19["hot_s"] is None and "resource_exhausted" in (s19["error"] or ""), "q19 refusal")
-s1 = r["statements"][0]
-want(s1["cold_s"] == 0.5 and s1["hot_s"] == 0.5, "q1 timings")
-want(r["totals"]["failed"] == [19] and r["totals"]["answered"] == 42, "totals")
-want(r["phases"]["benchmark"]["calls"] == 129 and r["phases"]["benchmark"]["errors"] == 3
-     and r["phases"]["benchmark"]["refusal_classes"] == {"resource_exhausted": 3}, "phases block")
+entries = r.get("entries", [])
+want([e["id"] for e in entries] == list(corpus), "43 entries in corpus order")
+want(r.get("failed") == [] and r.get("skipped") == [], "no failed or skipped statements")
+for e in entries:
+    want(e["min_ms"] == 500.0 and e["median_ms"] == 500.0 and e["max_ms"] == 500.0
+         and e["cold_ms"] == 500.0, e["id"] + " timings")
+    want(e["per_run_accounting"] is None and e["error"] is None, e["id"] + " accounting/error")
+    exp = corpus[e["id"]]
+    want(e["answer"] == {"answered": True, "rows": exp if exp is not None else 3,
+                         "expected_rows": exp, "match": True if exp is not None else None},
+         e["id"] + " answer " + json.dumps(e["answer"]))
+    want(e["rows_returned"] == e["answer"]["rows"], e["id"] + " rows_returned")
+want(r["totals"] == {"answered": 43, "failed": [], "hot_sum_s": 21.5, "cold_sum_s": 21.5}, "totals")
+want(r["error_pooled"] == {"calls": 129, "errors": 0, "ratio": 0.0}, "error_pooled")
+want(r["phases"]["benchmark"]["calls"] == 129 and r["phases"]["benchmark"]["errors"] == 0
+     and r["phases"]["benchmark"]["refusal_classes"] == {}, "phases block")
 verdicts = {b["band"]: b["verdict"] for b in r["bands"]}
-want(verdicts.get("hot_sum_s <= 1.25 x arm_b_hot_s") == "pass", "hot band")
-want(verdicts.get("concurrency qps >= concurrency_qps_floor") == "inconclusive", "qps band")
-want(all(b.get("lane") == "parquet" for b in r["bands"]), "band lanes")
+want(len(r["bands"]) == 46 and set(verdicts.values()) == {"pass"}, "46 passing absolute bands")
+want(verdicts.get("hot_sum_s <= hot_sum_s_max") == "pass", "hot band")
+want(verdicts.get("q01 hot_s <= hot_s_max.q01") == "pass", "q01 band")
+want(all(b.get("lane") == "rlog" and "id" not in b for b in r["bands"]), "band lanes and ids")
 print(",".join(bad))
 PY
 )" || check="python failed"
 if [ -z "$check" ] && python3 "$KIT_SRC/lib/kit.py" validate "$OUT_A/results.json"; then
-  pass "results.json carries the report fields, the provenance stamps and the bands"
+  pass "results.json is SqlLatencyReport-shaped with the answer checks, the provenance stamps and the bands"
 else
   fail "results.json" "missing or wrong: $check"
 fi
 
-# Catches: a call record losing one of its fields, or a statement reaching the
-# SQL endpoint without run_query (the curl count would exceed the wrapper's).
+# Catches: a request body without an explicit window (the server's default is
+# the last hour, which would hide the load), a window other than 200000 h, a
+# window that differs between statements or from the provenance stamp, or a
+# body sending a statement other than the corpus's.
+window_ok="$(python3 - "$STUB_DIR/sql-bodies" "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" <<'PY'
+import json, sys
+bodies = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+w = json.load(open(sys.argv[2]))["provenance"]["query_window"]
+sqls = [e["sql"] for e in json.load(open(sys.argv[3]))["entries"]]
+ok = len(bodies) == 129
+ok = ok and all(sorted(b) == ["end", "query", "start"] and b["start"] == w["start"]
+                and b["end"] == w["end"] and b["end"] - b["start"] == 200000 * 3600 for b in bodies)
+ok = ok and [b["query"] for b in bodies[::3]] == sqls
+print("yes" if ok else "no")
+PY
+)"
+if [ "$window_ok" = yes ]; then
+  pass "every request body carries an explicit start and end 200000 hours apart"
+else
+  fail "query window" "$(head -c 300 "$STUB_DIR/sql-bodies")"
+fi
+
+# Catches: the kit's results.json no longer reading in the runbook's analyse.py
+# (section 9) unchanged: a duplicate or missing q row, a band row with a q id,
+# or hot and cold figures other than the kit's sums. With no executor
+# accounting over HTTP, its cost-class bands fail and nothing else may.
+sed -n '/^```python$/,/^```$/p' "$REPO_ROOT/docs/internal/clickbench-aws-runbook.md" | sed '1d;$d' >"$TMP/analyse.py"
+code=0
+python3 "$TMP/analyse.py" "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" \
+  >"$TMP/analyse.out" 2>&1 || code=$?
+other="$(grep '^  - ' "$TMP/analyse.out" | grep -vc ': no per_run_accounting; cold cost not emitted$')"
+if [ "$code" = 3 ] && grep -q '^measured 43  failed 0 \[\]$' "$TMP/analyse.out" \
+  && grep -q '^hot  21.50 s$' "$TMP/analyse.out" && grep -q '^cold 21.50 s$' "$TMP/analyse.out" \
+  && grep -q '^  - q01: no per_run_accounting; cold cost not emitted$' "$TMP/analyse.out" && [ "$other" = 0 ]; then
+  pass "analyse.py reads results.json unchanged: 43 measured, sums match, only the cost bands fail"
+else
+  fail "analyse.py" "exit $code, $other other failures: $(head -c 400 "$TMP/analyse.out")"
+fi
+
+# Catches: a call record losing one of its fields (rows included), or a
+# statement reaching the SQL endpoint without run_query (the curl count would
+# exceed the wrapper's).
 calls="$BOX_A/kit/out/benchmark/calls.jsonl"
 fields_ok="$(python3 - "$calls" <<'PY'
 import json, sys
-need = ("statement", "number", "arm", "phase", "try", "start", "duration_s", "http_status", "outcome", "refusal_class")
+need = ("statement", "number", "arm", "phase", "try", "start", "duration_s", "http_status", "rows",
+        "outcome", "refusal_class", "error")
 rows = [json.loads(l) for l in open(sys.argv[1])]
-ok = len(rows) == 129 and all(all(k in r for k in need) and r["arm"] == "A" and r["phase"] == "benchmark" for r in rows)
-ref = [r for r in rows if r["number"] == 19]
-ok = ok and all(r["http_status"] == 422 and r["outcome"] == "error" and r["refusal_class"] == "resource_exhausted" for r in ref)
+ok = len(rows) == 129 and all(all(k in r for k in need) and r["arm"] == "A" and r["phase"] == "benchmark"
+                              and r["outcome"] == "ok" and r["http_status"] == 200 for r in rows)
+ok = ok and [r["rows"] for r in rows if r["number"] == 1] == [1, 1, 1]
+ok = ok and [r["rows"] for r in rows if r["number"] == 8] == [3, 3, 3]
 print("yes" if ok else "no")
 PY
 )"
@@ -593,12 +685,55 @@ run_box A box-miss STUB_SQL_TIME=2.0 || code=$?
 abs=0
 python3 "$KIT_SRC/lib/kit.py" absolute A "$OUT_A/results.json" >"$TMP/abs.out" 2>&1 || abs=$?
 if [ "$code" = 0 ] && grep -q '^DONE bands=miss ' "$OUT_A/DONE" 2>/dev/null && [ "$abs" = 1 ] \
-  && grep -q '^MISS  *A  *hot_sum_s <= 1.25 x arm_b_hot_s' "$TMP/abs.out"; then
+  && grep -q '^MISS  *A  *hot_sum_s <= hot_sum_s_max  *86.000  *30$' "$TMP/abs.out" \
+  && grep -q '^MISS  *A  *q01 hot_s <= hot_s_max.q01  *2.000  *1.000$' "$TMP/abs.out"; then
   pass "an absolute band miss exits 1 on the box and DONE records bands=miss"
 else
   fail "absolute miss" "box exit $code, absolute exit $abs, DONE: $(cat "$OUT_A/DONE" 2>/dev/null)"
 fi
 mv "$OUT_A" "$TMP/fixture-miss"
+
+# Catches: a wrong answer read as a pass. Statement 2 (corpus expected_rows 1)
+# answers 5 rows on every try and statement 19 is refused: both must land in
+# `failed` with their class, count as errors in the phases and pooled error
+# figures, and miss their absolute statement band as not answered.
+code=0
+run_box A box-errors STUB_SQL_REFUSE_N=19 STUB_SQL_ROWS_N=02 STUB_SQL_ROWS=5 || code=$?
+check="$(python3 - "$OUT_A/results.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+failed = {f["id"]: f for f in r["failed"]}
+want(sorted(failed) == ["q02_count_adv_engine", "q19_user_minute_phrase"], "failed ids %s" % sorted(failed))
+q2 = failed.get("q02_count_adv_engine", {})
+want(q2.get("run") == 0 and "wrong_answer" in q2.get("error", "")
+     and "answer has 5 rows, expected 1" in q2.get("error", ""), "q02 error %r" % q2.get("error"))
+want(q2.get("answer") == {"answered": False, "rows": 5, "expected_rows": 1, "match": False},
+     "q02 answer %r" % q2.get("answer"))
+q19 = failed.get("q19_user_minute_phrase", {})
+want(q19.get("run") == 0 and "resource_exhausted" in q19.get("error", ""), "q19 error")
+want(q19.get("answer", {}).get("answered") is False, "q19 answer")
+want(len(r["entries"]) == 41 and r["totals"]["answered"] == 41 and r["totals"]["hot_sum_s"] == 20.5, "totals")
+want(r["phases"]["benchmark"]["errors"] == 6 and r["phases"]["benchmark"]["refusal_classes"]
+     == {"resource_exhausted": 3, "wrong_answer": 3}, "phases %r" % r["phases"]["benchmark"])
+want(r["error_pooled"] == {"calls": 129, "errors": 6, "ratio": 6 / 129}, "error_pooled")
+rows = {b["band"]: b for b in r["bands"]}
+for q in ("q02", "q19"):
+    b = rows.get("%s hot_s <= hot_s_max.%s" % (q, q), {})
+    want(b.get("verdict") == "miss" and b.get("note") == "not answered", q + " band")
+want(rows.get("error_pooled <= error_pooled_max", {}).get("verdict") == "pass", "error band")
+print(",".join(bad))
+PY
+)" || check="python failed"
+if [ "$code" = 0 ] && grep -q '^DONE bands=miss ' "$OUT_A/DONE" 2>/dev/null && [ -z "$check" ]; then
+  pass "a wrong row count and a refusal are errors: failed, counted, and absolute misses"
+else
+  fail "wrong answer" "box exit $code: $check"
+fi
+mv "$OUT_A" "$TMP/fixture-errors"
 
 # Catches: an unchecked fold precondition: a fold that sealed nothing must
 # fail the run at step fold, before any statement runs.
@@ -684,19 +819,25 @@ fixture() {
   [ -z "$3" ] || cp -R "$3" "$d/out/B"
 }
 
-# as_arm_b DIR: DIR's results relabelled as arm B, with an optional python
-# edit applied to the report r.
-as_arm_b() {
+# edit_arm SRC DST [EDIT]: a copy of SRC's outputs with an optional python edit
+# applied to its report r.
+edit_arm() {
   local src="$1" dst="$2" edit="${3:-}"
   rm -rf "$dst"
   cp -R "$src" "$dst"
   python3 - "$dst/results.json" "$SHA_B" "$edit" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
-r["provenance"].update(arm="b", kit_arm="B", git_sha=sys.argv[2])
+sha_b = sys.argv[2]
 exec(sys.argv[3])
 json.dump(r, open(sys.argv[1], "w"))
 PY
+}
+
+# as_arm_b SRC DST [EDIT]: SRC's outputs relabelled as arm B, then edited.
+as_arm_b() {
+  edit_arm "$1" "$2" 'r["provenance"].update(arm="b", kit_arm="B", git_sha=sha_b)
+'"${3:-}"
 }
 
 fetch() {
@@ -711,7 +852,9 @@ fetch() {
 as_arm_b "$TMP/fixture-pass" "$TMP/fixture-pass-b"
 fixture run-pass "$TMP/fixture-pass" "$TMP/fixture-pass-b"
 fetch pass run-pass --timeout 30
-if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A' "$TMP/fetch-pass.out" \
+if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *error_pooled <= A + 0.02' "$TMP/fetch-pass.out" \
+  && grep -q '^INCONCLUSIVE  *B vs A  *qps >= 0.95 x A' "$TMP/fetch-pass.out" \
   && grep -q '^PASS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-pass.out" \
   && [ -f "$TMP/fetch-pass/A/evidence.tgz" ] && [ -f "$TMP/fetch-pass/B/evidence.tgz" ]; then
   pass "fetch passes two matching arms and downloads both arms' results and evidence"
@@ -722,7 +865,7 @@ fi
 # Catches: a relative per-statement band that is never judged: q01 hot 0.75 s
 # against A's 0.5 s is over max(1.15 x 0.5, 0.2).
 as_arm_b "$TMP/fixture-pass" "$TMP/fixture-rel-b" \
-  'r["statements"][0]["hot_s"] = 0.75'
+  'r["entries"][0]["min_ms"] = 750.0'
 fixture run-rel "$TMP/fixture-pass" "$TMP/fixture-rel-b"
 fetch rel run-rel --timeout 30
 if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-rel.out" \
@@ -737,11 +880,53 @@ fi
 as_arm_b "$TMP/fixture-miss" "$TMP/fixture-miss-b"
 fixture run-abs "$TMP/fixture-miss" "$TMP/fixture-miss-b"
 fetch abs run-abs --timeout 30
-if [ "$code" = 1 ] && grep -q '^MISS  *A  *hot_sum_s <= 1.25 x arm_b_hot_s' "$TMP/fetch-abs.out" \
+if [ "$code" = 1 ] && grep -q '^MISS  *A  *hot_sum_s <= hot_sum_s_max' "$TMP/fetch-abs.out" \
   && ! grep -q '^MISS  *B vs A' "$TMP/fetch-abs.out"; then
   pass "an absolute band miss on either arm makes fetch exit 1"
 else
   fail "absolute miss in fetch" "exit $code: $(grep MISS "$TMP/fetch-abs.out" | head -n 3)"
+fi
+
+# Catches: wrong answers not counted as errors in the relative error band, or
+# a statement arm A answered and arm B did not dropping out of the comparison
+# instead of missing by id. Arm B is the wrong-answer box run above.
+as_arm_b "$TMP/fixture-errors" "$TMP/fixture-errors-b"
+fixture run-errors "$TMP/fixture-pass" "$TMP/fixture-errors-b"
+fetch errors run-errors --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *error_pooled <= A + 0.02  *0.047  *0.020$' "$TMP/fetch-errors.out" \
+  && grep -q '^MISS  *B vs A  *q02 answered by B .*answered by A, not by B$' "$TMP/fetch-errors.out" \
+  && grep -q '^MISS  *B vs A  *q19 answered by B .*answered by A, not by B$' "$TMP/fetch-errors.out" \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (41 both answered)' "$TMP/fetch-errors.out"; then
+  pass "wrong answers miss the relative error band and each statement B lost is a miss by id"
+else
+  fail "relative errors" "exit $code: $(grep -v '^PASS' "$TMP/fetch-errors.out" | head -n 6)"
+fi
+
+# Catches: hot and cold sums taken over each arm's own answered set instead of
+# the statements both arms answered. Arm A's q05 takes 5 s and arm B failed it;
+# arm B is 10% slower on the other 42. Over both-answered statements both sums
+# miss (23.1 s against 1.05 x 21.0 s); summing each arm's own set would put A's
+# 5 s in and pass.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-sums-a" '
+for e in r["entries"]:
+    if e["id"].startswith("q05"):
+        e["min_ms"] = e["cold_ms"] = 5000.0'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-sums-b" '
+q5 = [e for e in r["entries"] if e["id"].startswith("q05")][0]
+r["entries"].remove(q5)
+r["failed"].append({"id": q5["id"], "run": 0, "error": "error HTTP 500 internal: stub",
+                    "answer": dict(q5["answer"], answered=False)})
+for e in r["entries"]:
+    e["min_ms"] = e["cold_ms"] = 550.0'
+fixture run-sums "$TMP/fixture-sums-a" "$TMP/fixture-sums-b"
+fetch sums run-sums --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *hot_sum_s <= 1.05 x A (42 both answered)  *23.100  *22.050$' "$TMP/fetch-sums.out" \
+  && grep -q '^MISS  *B vs A  *cold_sum_s <= 1.05 x A (42 both answered)  *23.100  *22.050$' "$TMP/fetch-sums.out" \
+  && grep -q '^MISS  *B vs A  *q05 answered by B .*answered by A, not by B$' "$TMP/fetch-sums.out" \
+  && ! grep -q '^MISS  *B vs A  *q[0-9]* hot_s' "$TMP/fetch-sums.out"; then
+  pass "relative sums run over the statements both arms answered"
+else
+  fail "relative sums" "exit $code: $(grep -v '^PASS' "$TMP/fetch-sums.out" | head -n 6)"
 fi
 
 # Catches: a FAILED arm read as a pass, or its reason not shown.

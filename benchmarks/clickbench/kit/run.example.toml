@@ -9,9 +9,18 @@ sha_a = "FILL-IN-BASELINE-COMMIT"
 sha_b = "FILL-IN-CANDIDATE-COMMIT"
 
 # Lanes whose band files the run is judged by, and the phases box/run.sh runs
-# in order. `benchmark` (the 43 statements, cold and hot) is the only phase.
-lanes = ["parquet"]
+# in order. `benchmark` (the 43 statements over HTTP, cold and hot) is the only
+# phase, and `rlog` the only lane. The parquet lane (clickbench_parquet_bench,
+# bands/parquet.toml) is not run by the kit yet; check-run refuses it.
+lanes = ["rlog"]
 phases = ["benchmark"]
+
+# Which sections of each lane's band file the run is judged by: "relative"
+# (arm B against arm A, in fetch.sh) and "absolute" (each arm on its own, on
+# the box). A placeholder value is refused only in a selected section, and
+# rlog.toml's absolute section is still placeholders: select it once those are
+# filled in on the reference machine. Optional; the default is both.
+band_sections = ["relative"]
 
 # Where the boxes run and where the run's in/ and out/ live:
 # s3://<bucket>/<prefix>/runs/<run-id>/.
@@ -40,7 +49,9 @@ shards = 8
 # run the same statements whatever their own checkout holds.
 corpus = "benchmarks/clickbench/hits.corpus.json"
 dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
-# Optional: dataset_sha256 = "..." refuses a dataset with another digest.
+# The dataset's sha256. A box whose download has another digest fails, and
+# fetch.sh refuses two arms that did not load the same dataset.
+dataset_sha256 = "FILL-IN-DATASET-SHA256"
 
 # The loopback RustFS release the store runs on, pinned by digest.
 rustfs_url = "FILL-IN-RUSTFS-RELEASE-URL"
@@ -53,8 +64,11 @@ memory_budget_bytes = 25769803776
 audit_mode = "off"
 
 # Optional: expected_statements (default 43), fold_min_entry_ratio (default
-# 0.8), query_timeout_s (default 900).
+# 0.8), query_timeout_s (default 900), window_hours (default 200000). Every
+# statement is sent with an explicit start and end window_hours apart, ending
+# when the benchmark phase starts, as sql_latency_bench --window-hours does;
+# without one the server reads only the last hour.
 
 # One band file per lane, relative to the repository root.
 [bands]
-parquet = "benchmarks/clickbench/bands/parquet.toml"
+rlog = "benchmarks/clickbench/bands/rlog.toml"

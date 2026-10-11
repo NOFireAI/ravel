@@ -24,9 +24,11 @@
 #               the objects the load wrote, and its figures are stamped
 #   phases      each phase run.toml names, in order; phase NAME is the
 #               function phase_NAME and writes /root/kit/out/NAME/
-#   results     /root/kit/results.json (ClickBenchParquetReport's shape plus
-#               the provenance stamps and an absolute bands block),
-#               evidence.tgz, then both and progress.log uploaded to
+#   results     /root/kit/results.json (SqlLatencyReport's entries and failed
+#               rows, which the runbook's analyse.py reads, plus the
+#               provenance stamps and the absolute bands when run.toml's
+#               band_sections selects them), evidence.tgz, then both and
+#               progress.log uploaded to
 #               s3://<bucket>/<prefix>/runs/<run-id>/out/<arm>/
 #
 # It ends by uploading DONE (or FAILED, naming the step that failed) beside
@@ -37,8 +39,13 @@
 #
 # Every statement goes through run_query, which records one JSON line per call
 # in out/<phase>/calls.jsonl: statement, arm, phase, start, duration, HTTP
-# status, outcome and refusal class. A new phase is a phase_NAME function plus
-# its name in kit.py's KNOWN_PHASES; wrapping run_query wraps every call.
+# status, rows, outcome and refusal class. A 200 answer whose row count is not
+# the expected one (the corpus's expected_rows, else the first try's) is an
+# error of class wrong_answer, not a success. Every request body names its
+# window: start window_hours (default 200000, the runbook's --window-hours)
+# before end, the epoch second the phase began. A new phase is a phase_NAME
+# function plus its name in kit.py's KNOWN_PHASES; wrapping run_query wraps
+# every call.
 #
 # KIT_ROOT (default /root) relocates every path, and KIT_RUN_SH_LIB=1 defines
 # the functions without running main; kit.test.sh uses both.
@@ -169,6 +176,8 @@ load_config() {
   EXPECTED_STATEMENTS="$(toml_or expected_statements 43)"
   FOLD_MIN_RATIO="$(toml_or fold_min_entry_ratio 0.8)"
   QUERY_TIMEOUT_S="$(toml_or query_timeout_s 900)"
+  WINDOW_HOURS="$(toml_or window_hours 200000)"
+  BAND_SECTIONS="$(toml_or band_sections "$(printf 'relative\nabsolute')" | tr '\n' ' ')"
   PHASES="$(toml phases | tr '\n' ' ')" || return 1
   LANES="$(toml lanes | tr '\n' ' ')" || return 1
   CORPUS="$SRC/corpus.json"
@@ -561,12 +570,14 @@ do_declare() {
 
 # --- queries ---------------------------------------------------------------
 
-# run_query PHASE NUMBER STATEMENT TRY BODY_FILE: one SQL call, recorded as a
-# line of out/<phase>/calls.jsonl. Sets RQ_OUTCOME (ok, error, timeout or
-# unreachable), RQ_HTTP, RQ_DURATION and RQ_CLASS. Returns non-zero only when
-# the record could not be written.
+# run_query PHASE NUMBER STATEMENT TRY BODY_FILE [EXPECT_ROWS]: one SQL call,
+# recorded as a line of out/<phase>/calls.jsonl. Sets RQ_OUTCOME (ok, error,
+# timeout or unreachable), RQ_HTTP, RQ_DURATION, RQ_ROWS and RQ_CLASS. A 200
+# answer with a row count other than EXPECT_ROWS is an error of class
+# wrong_answer, and one whose rows cannot be read is unreadable_answer.
+# Returns non-zero only when the record could not be written.
 run_query() {
-  local phase="$1" number="$2" statement="$3" try="$4" body="$5"
+  local phase="$1" number="$2" statement="$3" try="$4" body="$5" expect="${6:-}"
   local dir="$OUT/$phase" resp w code=0 parsed err=""
   mkdir -p "$dir/responses" || return 1
   resp="$dir/responses/$number-$try.json"
@@ -577,6 +588,7 @@ run_query() {
   RQ_HTTP="${w%% *}"
   RQ_DURATION="${w##* }"
   RQ_CLASS=""
+  RQ_ROWS=""
   if [ "$code" -eq 28 ]; then
     RQ_OUTCOME=timeout
     RQ_CLASS=client_timeout
@@ -586,7 +598,20 @@ run_query() {
     RQ_CLASS=transport
     err="curl exit $code: $(head -c 300 "$dir/responses/$number-$try.curl" 2>/dev/null)"
   elif [ "$RQ_HTTP" = 200 ]; then
-    RQ_OUTCOME=ok
+    RQ_ROWS="$(python3 -c 'import json, sys
+print(len(json.load(open(sys.argv[1]))["data"]["rows"]))' "$resp" 2>/dev/null)" || RQ_ROWS=""
+    if ! [[ "$RQ_ROWS" =~ ^[0-9]+$ ]]; then
+      RQ_ROWS=""
+      RQ_OUTCOME=error
+      RQ_CLASS=unreadable_answer
+      err="HTTP 200 without a readable data.rows array"
+    elif [ -n "$expect" ] && [ "$RQ_ROWS" != "$expect" ]; then
+      RQ_OUTCOME=error
+      RQ_CLASS=wrong_answer
+      err="answer has $RQ_ROWS rows, expected $expect"
+    else
+      RQ_OUTCOME=ok
+    fi
   else
     RQ_OUTCOME=error
     parsed="$(python3 -c 'import json, sys
@@ -598,31 +623,42 @@ print("%s\t%s" % (d.get("errorType", ""), str(d.get("error", ""))[:300]))' "$res
   fi
   # Keep the first try's answer and every error; later ok answers repeat it.
   [ "$RQ_OUTCOME" = ok ] && [ "$try" != 1 ] && rm -f "$resp"
-  printf '{"statement": %s, "number": %s, "arm": %s, "phase": %s, "try": %s, "start": %s, "duration_s": %s, "http_status": %s, "outcome": %s, "refusal_class": %s, "error": %s}\n' \
+  printf '{"statement": %s, "number": %s, "arm": %s, "phase": %s, "try": %s, "start": %s, "duration_s": %s, "http_status": %s, "rows": %s, "outcome": %s, "refusal_class": %s, "error": %s}\n' \
     "$(json_str "$statement")" "$(json_num "$((10#$number))")" "$(json_str "$ARM")" \
     "$(json_str "$phase")" "$(json_num "$try")" "$(json_str "$RQ_START")" \
-    "$(json_num "$RQ_DURATION")" "$(json_num "${RQ_HTTP:-0}")" "$(json_str "$RQ_OUTCOME")" \
-    "$(json_str "$RQ_CLASS")" "$(json_str "$err")" >>"$dir/calls.jsonl"
+    "$(json_num "$RQ_DURATION")" "$(json_num "${RQ_HTTP:-0}")" "$(json_num "$RQ_ROWS")" \
+    "$(json_str "$RQ_OUTCOME")" "$(json_str "$RQ_CLASS")" "$(json_str "$err")" >>"$dir/calls.jsonl"
 }
 
 # --- phases ----------------------------------------------------------------
 
 # phase_benchmark: every corpus statement three times. Try 1 is cold (server
-# restarted and the page cache dropped first); tries 2 and 3 are hot.
+# restarted and the page cache dropped first); tries 2 and 3 are hot. Tries 2
+# and 3 must return try 1's row count when the corpus states none.
 phase_benchmark() {
-  local dir="$OUT/benchmark" count n id try
-  count="$(kit_py request-bodies "$CORPUS" "$dir/requests")" || return 1
+  local dir="$OUT/benchmark" count n id exp expect try end start
+  end="$(date -u +%s)"
+  start=$((end - WINDOW_HOURS * 3600))
+  mkdir -p "$STAMPS"
+  printf '{"start": %s, "end": %s, "window_hours": %s}\n' "$start" "$end" "$WINDOW_HOURS" \
+    >"$STAMPS/query_window"
+  count="$(kit_py request-bodies "$CORPUS" "$dir/requests" "$start" "$end")" || return 1
   [ "$count" = "$EXPECTED_STATEMENTS" ] \
     || { say "corpus holds $count statements, run.toml expects $EXPECTED_STATEMENTS"; return 1; }
   : >"$dir/calls.jsonl"
   start_samplers benchmark
-  while IFS=$'\t' read -r n id; do
+  BENCHMARK_SERVER_LOGS=""
+  while IFS=$'\t' read -r n id exp; do
     stop_server
     drop_caches || { stop_samplers; return 1; }
     start_server || { stop_samplers; return 1; }
-    [ -n "${BENCHMARK_SERVER_LOG:-}" ] || BENCHMARK_SERVER_LOG="$SERVER_LOG"
+    BENCHMARK_SERVER_LOGS="${BENCHMARK_SERVER_LOGS:+$BENCHMARK_SERVER_LOGS,}$SERVER_LOG"
+    expect=""
+    [ "$exp" = - ] || expect="$exp"
     for try in 1 2 3; do
-      run_query benchmark "$n" "$id" "$try" "$dir/requests/$n.json" || { stop_samplers; return 1; }
+      run_query benchmark "$n" "$id" "$try" "$dir/requests/$n.json" "$expect" \
+        || { stop_samplers; return 1; }
+      [ -n "$expect" ] || expect="$RQ_ROWS"
     done
   done <"$dir/requests/index.tsv"
   stop_server
@@ -682,16 +718,17 @@ write_stamps() {
 }
 
 write_results() {
-  local lane bands="" code=0
+  local lane bands="" sections code=0
   write_stamps || return 1
   for lane in $LANES; do bands="${bands:+$bands,}$lane:$SRC/bands/$lane.toml"; done
   # shellcheck disable=SC2086 # PHASES is a space-separated list of names
   kit_py phases "$OUT" $PHASES >"$KIT/phases.json" || return 1
   load_arm_env || return 1
+  sections="$(printf '%s' "$BAND_SECTIONS" | tr -s ' ' ',')"
   kit_py assemble out="$KIT/results.json" calls="$OUT/benchmark/calls.jsonl" \
-    index="$OUT/benchmark/requests/index.tsv" server_log="$BENCHMARK_SERVER_LOG" \
-    bands="$bands" provenance="$STAMPS" arm="$ARM" sha="$SHA" binary="$SERVER_BIN" \
-    tenant="$TENANT" phases_json="$KIT/phases.json" || return 1
+    index="$OUT/benchmark/requests/index.tsv" server_logs="$BENCHMARK_SERVER_LOGS" \
+    bands="$bands" sections="${sections%,}" provenance="$STAMPS" arm="$ARM" sha="$SHA" \
+    binary="$SERVER_BIN" tenant="$TENANT" phases_json="$KIT/phases.json" || return 1
   kit_py absolute "$ARM" "$KIT/results.json" >/dev/null || code=$?
   case "$code" in
     0) BANDS_VERDICT=pass ;;
@@ -721,7 +758,8 @@ main() {
   step config load_config
   step check-run kit_py check-run "$RUN_TOML"
   for lane in $LANES; do
-    step "bands-$lane" kit_py check-bands "$SRC/bands/$lane.toml"
+    # shellcheck disable=SC2086 # BAND_SECTIONS is a space-separated list of names
+    step "bands-$lane" kit_py check-bands "$lane" "$SRC/bands/$lane.toml" $BAND_SECTIONS
   done
   step burst-start record_burst start
   step packages bootstrap_packages

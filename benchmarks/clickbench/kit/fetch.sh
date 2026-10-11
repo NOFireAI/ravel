@@ -8,17 +8,21 @@
 # evidence.tgz, and in/kit.tgz for the band files the run actually used,
 # under --out (default ./clickbench-runs/<run-id>/), and prints each arm's
 # absolute band table followed by every lane's relative bands, arm B against
-# arm A:
+# arm A, when run.toml's band_sections selected them:
 #
-#   pooled error rate   at most A's + relative.error_pooled_max_delta
+#   pooled error rate   at most A's + relative.error_pooled_max_delta; a
+#                       wrong-answer call counts as an error
 #   QPS                 at least relative.qps_min_ratio x A's
 #   each statement hot  at most max(relative.hot_statement_max_ratio x A's,
 #                       relative.hot_statement_floor_s)
 #   hot sum, cold sum   each at most relative.hot_sum_max_ratio /
-#                       relative.cold_sum_max_ratio x A's
+#                       relative.cold_sum_max_ratio x A's, both summed over
+#                       the statements both arms answered
+#   each statement      a statement A answered and B did not is a miss,
+#                       named by id
 #
 # A band that cannot be judged (QPS with no concurrency phase, a statement
-# one arm failed) is printed INCONCLUSIVE and is not a miss.
+# arm A failed) is printed INCONCLUSIVE and is not a miss.
 #
 # Written for bash 3.2 (macOS /bin/bash).
 #
