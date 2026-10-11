@@ -246,7 +246,8 @@ rule on thread placement.
     `ravel_cpu_gate_jobs_total{gate,site}` and
     `ravel_cpu_gate_inline_total{gate,site}` (decision 4), where `site` is a
     static string set at the call. The gate measures with an injected
-    monotonic clock.
+    monotonic clock. (Extended by the handoff and post-return amendment
+    below, which adds two per-site summaries.)
     From the stable tokio `RuntimeMetrics` set: `ravel_runtime_workers`,
     `ravel_runtime_alive_tasks`, `ravel_runtime_global_queue_depth` and, on
     64-bit targets, `ravel_runtime_worker_busy_seconds_total{worker}`.
@@ -804,3 +805,43 @@ decode, which stays inline. Each job owns the fetched bytes it reads and
 returns its output, so its input stays resident until it returns, as it did
 inline. A read-gate job here is a synchronous codec call with no gate in
 reach, so none waits on another job.
+
+## Amendment (2026-10-11): the handoff and post-return amendment (issue #2880)
+
+<!-- amendment-applies: sections="Decision" pointer="handoff and post-return amendment" -->
+
+Decision 11 gives each gate a permit wait and a run time, per gate only. A
+gated job also spends time between the two that neither counts: the trip from
+`spawn_blocking` onto a blocking thread, and the trip from the job's return
+back to the task awaiting it. Two regressions, #2795 (logs block decode on the
+read gate) and #2818 (ingest decode on the write gate), took a day of serial
+experiments partly because that time showed in no counter. An idle-runtime
+microbench put each at about 8 to 11 us at p50; under load it is unknown,
+which is what these counters are for.
+
+Two summaries with no quantiles, rendered as `_sum` / `_count` pairs like the
+wait and run families, carrying `{mode, gate, site}`, one sample for every
+site in the gate's closed set:
+
+- `ravel_cpu_gate_handoff_seconds{gate,site}`: from the clock reading taken
+  after the permit is acquired and immediately before the job is handed to
+  `spawn_blocking`, to the job closure's first clock reading on the blocking
+  thread, before the job's own code runs. That second reading is also the
+  start of the run time, so the two do not overlap. Permit wait is excluded.
+- `ravel_cpu_gate_return_seconds{gate,site}`: from the clock reading taken on
+  the blocking thread right after the job's code returns, which is also the
+  end of the run time, to the clock reading the awaiting task takes right
+  after `handle.await` resumes. A caller's work after `run` returns, such as
+  freeing or using the returned value, is not in it.
+
+Both read the gate's injected monotonic clock. What each excludes:
+
+- A job below the inline floor records neither; it has no handoff.
+- A job that started records its handoff whatever happens next, including a
+  panic and a waiter dropped while it ran.
+- A job that panicked, or whose waiter was gone when it returned, records no
+  post-return: no caller resumed with its output. A job cancelled before it
+  started records neither.
+
+The counters are per-site atomics in the gate, beside the job and inline
+counts: no lock and no extra allocation per job.
