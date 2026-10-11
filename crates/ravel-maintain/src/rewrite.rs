@@ -144,17 +144,24 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         .request_ledger
         .as_ref()
         .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
-    let outcome = load_then_rewrite::<C>(
-        store,
-        clock,
-        config,
-        bucket,
-        commit_keys,
-        conservation,
-        start_ns,
-        None,
-    )
-    .await
+    // ADR-1746 decision 4: checked before the inputs are read and every PUT.
+    let checked = crate::format_floor::check_output_floor(store, config, bucket, "rewrite").await;
+    let outcome = match checked {
+        Ok(()) => {
+            load_then_rewrite::<C>(
+                store,
+                clock,
+                config,
+                bucket,
+                commit_keys,
+                conservation,
+                start_ns,
+                None,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
     .and_then(|fenced| match fenced {
         FencedRewrite::Ran(outcome) => Ok(outcome),
         // Unreachable by construction: with no planned listing there is no
@@ -216,6 +223,8 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
             // payloads are built inside `ravel_fleet::claim` and do not cross
             // this crate's seam, so its byte figures stay zero.
             coordinate_requests = r.coordinate.requests,
+            floor_read_requests = r.floor_read.requests,
+            floor_read_wire_bytes_received = r.floor_read.wire_bytes_received,
             total_requests = r.total_requests(),
             total_wire_bytes_received = r.total_wire_bytes_received(),
             total_wire_bytes_sent = r.total_wire_bytes_sent(),
@@ -735,6 +744,8 @@ async fn migrate_bucket_format_scoped(
     if !needs_migration {
         return Ok(MigrateOutcome::UpToDate);
     }
+    // ADR-1746 decision 4: checked before the claim and every PUT.
+    crate::format_floor::check_output_floor(store, config, bucket, "migration").await?;
 
     // The bucket claim, the same one a compaction or an erasure rewrite of this
     // bucket takes, held from here through the record PUT. A pass refused it
@@ -1104,6 +1115,8 @@ async fn reencode_compaction_parts_scoped(
     {
         return Ok(ReencodeOutcome::UpToDate);
     }
+    // ADR-1746 decision 4: checked before the claim and every PUT.
+    crate::format_floor::check_output_floor(store, config, bucket, "re-encode").await?;
 
     // The bucket claim, the one compaction, the erasure rewrite and `migrate`
     // take, held from here through the record PUT.

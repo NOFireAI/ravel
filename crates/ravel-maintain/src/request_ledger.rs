@@ -107,11 +107,15 @@ pub enum RequestPhase {
     /// here and never pooled into the merge's own phases, so a bucket's merge
     /// cost stays comparable between a claimed and an unclaimed run.
     Coordinate,
+    /// The provisioning-record GET that reads the bucket's format floor before
+    /// a run builds anything (ADR-1746 decision 4), issued only when a
+    /// [`crate::config::CompactorConfig::format_floor`] policy is installed.
+    FloorRead,
 }
 
 impl RequestPhase {
     /// Every phase, in report order.
-    pub const ALL: [RequestPhase; 7] = [
+    pub const ALL: [RequestPhase; 8] = [
         RequestPhase::List,
         RequestPhase::RecordRead,
         RequestPhase::CatalogRead,
@@ -119,6 +123,7 @@ impl RequestPhase {
         RequestPhase::PartPut,
         RequestPhase::Publish,
         RequestPhase::Coordinate,
+        RequestPhase::FloorRead,
     ];
 
     /// Stable snake_case name, used as the tracing field prefix.
@@ -131,6 +136,7 @@ impl RequestPhase {
             RequestPhase::PartPut => "part_put",
             RequestPhase::Publish => "publish",
             RequestPhase::Coordinate => "coordinate",
+            RequestPhase::FloorRead => "floor_read",
         }
     }
 
@@ -143,6 +149,7 @@ impl RequestPhase {
             RequestPhase::PartPut => 4,
             RequestPhase::Publish => 5,
             RequestPhase::Coordinate => 6,
+            RequestPhase::FloorRead => 7,
         }
     }
 }
@@ -188,6 +195,8 @@ pub struct RunRequestReport {
     pub publish: PhaseRequests,
     /// The advisory claim protocol ([`RequestPhase::Coordinate`]).
     pub coordinate: PhaseRequests,
+    /// The format-floor read ([`RequestPhase::FloorRead`]).
+    pub floor_read: PhaseRequests,
 }
 
 impl RunRequestReport {
@@ -201,6 +210,7 @@ impl RunRequestReport {
             RequestPhase::PartPut => self.part_put,
             RequestPhase::Publish => self.publish,
             RequestPhase::Coordinate => self.coordinate,
+            RequestPhase::FloorRead => self.floor_read,
         }
     }
 
@@ -387,6 +397,7 @@ impl RequestLedger {
             part_put: read(RequestPhase::PartPut),
             publish: read(RequestPhase::Publish),
             coordinate: read(RequestPhase::Coordinate),
+            floor_read: read(RequestPhase::FloorRead),
         }
     }
 }

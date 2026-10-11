@@ -544,9 +544,15 @@ pub(crate) async fn maintain_bucket_observed(
         | RetentionOutcome::SweptPartial
         | RetentionOutcome::BlockedBySnapshot(_) => (None, None),
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
-            let (compaction, acquisition) =
-                compact_bucket_claimed_with_acquisition(store, clock, config, bucket).await?;
-            (Some(compaction), acquisition)
+            match compact_bucket_claimed_with_acquisition(store, clock, config, bucket).await {
+                Ok((compaction, acquisition)) => (Some(compaction), acquisition),
+                // A compaction refused below the format floor took no claim
+                // and wrote nothing, and is already logged and counted. It
+                // must not stop the pass: retention of the shard's other
+                // buckets runs as normal (ADR-1746 decision 3).
+                Err(MaintainError::BelowFormatFloor(_)) => (None, None),
+                Err(err) => return Err(err),
+            }
         }
     };
     Ok((outcome, expiry, compaction, acquisition))
