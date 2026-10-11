@@ -4432,55 +4432,105 @@ fn duplicate_partial_series_id_is_a_hard_error() {
 }
 
 /// The coordinator reconstructs a worker's memory refusal by parsing the
-/// figures back out of the gRPC status message, because today's `Status`
-/// carries only a code and a message: `parse_fetch_memory_exhausted` is the
-/// exact inverse of `FetchMemoryExhausted`'s `Display`. That is a stopgap, not
-/// a constraint -- the proto evolves additively, so three `uint64` fields would
-/// carry the figures and delete this coupling. Three independently-editable
-/// `#[error(..)]` strings render that variant -- `FetchError` (series fold,
-/// `distrib/mod.rs:355`), `LogFetchError` (log fold, `:529`), and
-/// `SpanFetchError` (span fold, `:682`) -- and nothing but this test keeps them
-/// textually identical to each other and to the parser. This pins all three:
-/// a reword of any one of them, alone, fails the corresponding `assert_eq`
-/// below rather than silently degrading that fold's coordinator-side
-/// reconstruction to a generic `Distrib`.
+/// figures and the class back out of the gRPC status message, because today's
+/// `Status` carries only a code and a message: `parse_fetch_memory_exhausted`
+/// is the exact inverse of `FetchMemoryExhausted`'s `Display`. That is a
+/// stopgap, not a constraint -- the proto evolves additively, so a few
+/// `uint64` fields and a class tag would carry the figures and delete this
+/// coupling. Three `#[error(..)]` attributes render that variant --
+/// `FetchError` (series fold), `LogFetchError` (log fold), and
+/// `SpanFetchError` (span fold) -- through the one `fetcher::memory_exhausted`
+/// helper, and nothing but this test keeps them identical to each other and to
+/// the parser. This pins all three, in both budget classes: a reword of any
+/// one of them, alone, fails the corresponding `assert_eq` below rather than
+/// silently degrading that fold's coordinator-side reconstruction to a generic
+/// `Distrib`. The host-memory class carries no `reserved` or `limit` in its
+/// text, so those read 0 after the round trip; its `Display` is unchanged by
+/// that, which the re-render assertion pins.
 #[test]
 fn fetch_memory_exhausted_message_round_trips() {
-    let original = crate::fetcher::FetchError::FetchMemoryExhausted {
-        requested: 4_194_304,
-        reserved: 268_435_456,
-        limit: 268_500_000,
-    };
-    let rendered = original.to_string();
-    assert_eq!(
-        super::parse_fetch_memory_exhausted(&rendered),
-        Some((4_194_304, 268_435_456, 268_500_000)),
-        "parser must invert the Display of FetchError::FetchMemoryExhausted {rendered:?}"
-    );
+    use ravel_memory::{ExhaustionCause, MemoryExhausted};
 
-    let original = LogFetchError::FetchMemoryExhausted {
+    let accounted = MemoryExhausted {
         requested: 4_194_304,
         reserved: 268_435_456,
         limit: 268_500_000,
+        cause: ExhaustionCause::Accounted,
     };
-    let rendered = original.to_string();
-    assert_eq!(
-        super::parse_fetch_memory_exhausted(&rendered),
-        Some((4_194_304, 268_435_456, 268_500_000)),
-        "parser must invert the Display of LogFetchError::FetchMemoryExhausted {rendered:?}"
-    );
+    let host_memory = MemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+        cause: ExhaustionCause::HostMemory {
+            available: 402_653_184,
+            floor: 687_194_767,
+        },
+    };
+    let host_memory_round_tripped = MemoryExhausted {
+        reserved: 0,
+        limit: 0,
+        ..host_memory
+    };
 
-    let original = SpanFetchError::FetchMemoryExhausted {
-        requested: 4_194_304,
-        reserved: 268_435_456,
-        limit: 268_500_000,
-    };
-    let rendered = original.to_string();
-    assert_eq!(
-        super::parse_fetch_memory_exhausted(&rendered),
-        Some((4_194_304, 268_435_456, 268_500_000)),
-        "parser must invert the Display of SpanFetchError::FetchMemoryExhausted {rendered:?}"
-    );
+    for (refusal, expected) in [
+        (accounted, accounted),
+        (host_memory, host_memory_round_tripped),
+    ] {
+        let MemoryExhausted {
+            requested,
+            reserved,
+            limit,
+            cause,
+        } = refusal;
+        let rendered = crate::fetcher::FetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+            cause,
+        }
+        .to_string();
+        assert_eq!(
+            rendered,
+            format!("fetch {refusal}"),
+            "the fetch refusal renders the budget's own message under a fetch prefix"
+        );
+        assert_eq!(
+            super::parse_fetch_memory_exhausted(&rendered),
+            Some(expected),
+            "parser must invert the Display of FetchError::FetchMemoryExhausted {rendered:?}"
+        );
+        assert_eq!(
+            format!("fetch {expected}"),
+            rendered,
+            "the round-tripped refusal renders the same text the worker sent"
+        );
+
+        let rendered = LogFetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+            cause,
+        }
+        .to_string();
+        assert_eq!(
+            super::parse_fetch_memory_exhausted(&rendered),
+            Some(expected),
+            "parser must invert the Display of LogFetchError::FetchMemoryExhausted {rendered:?}"
+        );
+
+        let rendered = SpanFetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+            cause,
+        }
+        .to_string();
+        assert_eq!(
+            super::parse_fetch_memory_exhausted(&rendered),
+            Some(expected),
+            "parser must invert the Display of SpanFetchError::FetchMemoryExhausted {rendered:?}"
+        );
+    }
 
     // A message that is not this error's Display parses to None, so the fold
     // falls back to a generic Distrib rather than fabricating figures.
@@ -4489,6 +4539,65 @@ fn fetch_memory_exhausted_message_round_trips() {
         None,
         "an unrelated message must not parse as a memory refusal"
     );
+    // The pre-ADR-2633 wording is not this error's Display either.
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(
+            "fetch memory exhausted: requested 1 bytes, 0 of 1 byte budget already reserved"
+        ),
+        None,
+        "the retired wording must not parse as a memory refusal"
+    );
+}
+
+/// ADR-2633 decision 3 on the coordinator path: a worker's fetch-memory
+/// refusal, of either class, folds to the typed `Fetch(FetchMemoryExhausted)`
+/// and answers HTTP 422 `execution` with the worker's own message, the same
+/// status and text the local path gives. FLIP: map `FetchMemoryExhausted` back
+/// to `MSG_UNAVAILABLE` in `crates/ravel-query/src/http/error.rs` and the
+/// status assertion fails with 503 against the expected 422.
+#[test]
+fn budget_exceeded_fold_answers_422_for_both_memory_classes() {
+    use axum::http::StatusCode;
+    use ravel_memory::ExhaustionCause;
+
+    for cause in [
+        ExhaustionCause::Accounted,
+        ExhaustionCause::HostMemory {
+            available: 402_653_184,
+            floor: 687_194_767,
+        },
+    ] {
+        let msg = crate::fetcher::FetchError::FetchMemoryExhausted {
+            requested: 4_194_304,
+            reserved: 268_435_456,
+            limit: 268_500_000,
+            cause,
+        }
+        .to_string();
+        let err =
+            super::budget_exceeded_error(1_000, crate::config::ByteLimit::Bounded(1_000_000), &msg);
+        assert!(
+            matches!(
+                err,
+                crate::error::QueryError::Fetch(crate::fetcher::FetchError::FetchMemoryExhausted {
+                    cause: folded,
+                    ..
+                }) if folded == cause
+            ),
+            "a worker's {cause:?} refusal must fold to a typed FetchMemoryExhausted of the same class, got {err:?}"
+        );
+        let response = crate::http::QueryErrorResponse::from_query_error(err);
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a worker's {cause:?} refusal answers 422 on the coordinator"
+        );
+        assert_eq!(response.error_type, "execution");
+        assert_eq!(
+            response.message, msg,
+            "the coordinator answers with the worker's own budget message"
+        );
+    }
 }
 
 /// The coordinator's `BudgetExceeded` fold surfaces a fetch-layer memory refusal
@@ -4505,6 +4614,7 @@ fn budget_exceeded_fold_renders_memory_refusal_typed() {
         requested: 4_194_304,
         reserved: 268_435_456,
         limit: 268_500_000,
+        cause: ravel_memory::ExhaustionCause::Accounted,
     }
     .to_string();
 
@@ -4518,6 +4628,7 @@ fn budget_exceeded_fold_renders_memory_refusal_typed() {
                 requested: 4_194_304,
                 reserved: 268_435_456,
                 limit: 268_500_000,
+                cause: ravel_memory::ExhaustionCause::Accounted,
             })
         ),
         "a memory refusal under the bytes cap must fold to a typed FetchMemoryExhausted, got {err:?}"

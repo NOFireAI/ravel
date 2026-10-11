@@ -135,6 +135,18 @@ impl From<QueryError> for ApiError {
             QueryError::Catalog(CatalogError::WindowTooWide { .. }) => {
                 ApiError::Unsupported(e.to_string())
             }
+            // A memory-budget refusal on the fetch path or the catalog decode
+            // path is a budget refusal of a well-formed query, not a storage
+            // fault: the same 422 "execution" the SQL surface answers for its
+            // own memory pool (ADR-2633 decision 3, superseding the 503 of
+            // ADR-1170). The text is the budget's own message, class included
+            // (the ledger's limit, or the host-memory gate), carrying only
+            // byte figures, so it is echoed rather than redacted.
+            // `redacted_storage_message` returns `None` for both.
+            QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
+            | QueryError::Catalog(CatalogError::MemoryExhausted(_)) => {
+                ApiError::Unsupported(e.to_string())
+            }
             QueryError::DeadlineExceeded { .. } => ApiError::Timeout(e.to_string()),
             QueryError::Eval(inner) => from_eval_error(inner, &e),
             // Handled above by `redacted_storage_message`.
@@ -207,8 +219,8 @@ impl From<QueryError> for ApiError {
 /// it is classified.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
-        QueryError::Fetch(fetch) => Some(match fetch {
-            FetchError::Corrupt { .. } => MSG_CORRUPT,
+        QueryError::Fetch(fetch) => match fetch {
+            FetchError::Corrupt { .. } => Some(MSG_CORRUPT),
             // An RLOG fault reaches this enum as `Store` carrying a
             // `Corrupted` source, because `FetchError::Corrupt` can only hold
             // an RSEG `SegmentError`: `engine`'s log-series mapper folds
@@ -219,18 +231,20 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             FetchError::Store {
                 source: StoreError::Corrupted(_),
                 ..
-            } => MSG_CORRUPT,
-            // A memory-budget refusal is transient backpressure carrying only
-            // byte counts, not a storage fault; redacted to the retryable
-            // transient message alongside the other non-corrupt Store causes.
-            FetchError::Store { .. }
-            | FetchError::EtagChanged { .. }
-            | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE,
-        }),
+            } => Some(MSG_CORRUPT),
+            FetchError::Store { .. } | FetchError::EtagChanged { .. } => Some(MSG_UNAVAILABLE),
+            // A memory-budget refusal carries only byte figures and the
+            // budget class, never a key, and is not a storage fault: it is
+            // echoed, not redacted (the `From` impl maps it to a 422).
+            FetchError::FetchMemoryExhausted { .. } => None,
+        },
         // An over-wide-window refusal carries only counts and is
         // safe to show; like the budget errors it is not a storage fault, so
         // it is not redacted (the `From` impl maps it to a 422).
         QueryError::Catalog(CatalogError::WindowTooWide { .. }) => None,
+        // A catalog decode charge the budget refused is the same budget class
+        // as a fetch refusal: echoed, mapped to a 422 by the `From` impl.
+        QueryError::Catalog(CatalogError::MemoryExhausted(_)) => None,
         QueryError::Catalog(catalog) => Some(match catalog {
             CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
 
@@ -285,12 +299,15 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             // not match the checksum stored with them. 500.
             CatalogError::Store(StoreError::Corrupted(_)) => MSG_CORRUPT,
 
-            // Transient storage faults, fold progress/liveness failures, and
-            // resource backpressure stay retryable.
+            // Never reached: the outer arm returns None for MemoryExhausted.
+            // Matched only for exhaustiveness.
+            CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
+
+            // Transient storage faults and fold progress/liveness failures
+            // stay retryable.
             CatalogError::InvalidConfig(_)
             | CatalogError::Store(_)
-            | CatalogError::FoldCasRetriesExhausted { .. }
-            | CatalogError::MemoryExhausted(_) => MSG_UNAVAILABLE,
+            | CatalogError::FoldCasRetriesExhausted { .. } => MSG_UNAVAILABLE,
         }),
         QueryError::NonMonotonicSamples { .. } => Some(MSG_CORRUPT),
         QueryError::SnapshotInvalidated => Some(MSG_UNAVAILABLE),
@@ -1496,5 +1513,69 @@ mod tests {
             "{cancelled:?}"
         );
         assert_eq!(status_code(QueryError::Fetch(cancelled)), 503);
+    }
+
+    /// ADR-2633 decision 3: a fetch-memory refusal and a catalog decode
+    /// refusal answer 422 `execution` with the budget's own message, class
+    /// included, on the PromQL surface; before this they redacted to
+    /// `MSG_UNAVAILABLE` and answered 503. Both classes of both refusals are
+    /// pinned, status, error type and exact text. FLIP: move
+    /// `FetchMemoryExhausted` back under `MSG_UNAVAILABLE` in
+    /// `redacted_storage_message` and the first status assertion fails with
+    /// 503 against 422.
+    #[test]
+    fn memory_budget_refusals_answer_422_with_the_budget_class() {
+        use ravel_memory::{ExhaustionCause, MemoryExhausted};
+
+        let accounted = MemoryExhausted {
+            requested: 4096,
+            reserved: 1024,
+            limit: 2048,
+            cause: ExhaustionCause::Accounted,
+        };
+        let host_memory = MemoryExhausted {
+            requested: 4096,
+            reserved: 1024,
+            limit: 2048,
+            cause: ExhaustionCause::HostMemory {
+                available: 100,
+                floor: 200,
+            },
+        };
+        let accounted_text =
+            "memory exhausted: requested 4096 bytes, 1024 of 2048 byte limit already reserved";
+        let host_memory_text = "memory exhausted: host available memory 100 bytes is below the 200 byte floor \
+             (requested 4096)";
+
+        for (refusal, text) in [(accounted, accounted_text), (host_memory, host_memory_text)] {
+            let fetch = QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                requested: refusal.requested,
+                reserved: refusal.reserved,
+                limit: refusal.limit,
+                cause: refusal.cause,
+            });
+            let response = QueryErrorResponse::from_query_error(fetch);
+            assert_eq!(
+                response.status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a {:?} fetch refusal answers 422",
+                refusal.cause
+            );
+            assert_eq!(response.error_type, "execution");
+            assert_eq!(response.message, format!("fetch {text}"));
+            assert_redacted(&response.message);
+
+            let decode = QueryError::Catalog(CatalogError::MemoryExhausted(refusal));
+            let response = QueryErrorResponse::from_query_error(decode);
+            assert_eq!(
+                response.status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a {:?} catalog decode refusal answers 422",
+                refusal.cause
+            );
+            assert_eq!(response.error_type, "execution");
+            assert_eq!(response.message, format!("catalog decode refused: {text}"));
+            assert_redacted(&response.message);
+        }
     }
 }

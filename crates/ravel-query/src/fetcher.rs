@@ -339,17 +339,39 @@ pub enum FetchError {
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
     /// reservation for the bytes this GET would materialize, or for the bytes
     /// a catalog decode would produce (ADR-1702 decision 6). Carries only the
-    /// three accounting figures, never an object key or tenant value: the
-    /// refusal is a resource condition, not data corruption, and its message
-    /// must not leak which object or tenant provoked it.
-    #[error(
-        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
-    )]
+    /// budget's figures and the class of the refusal (`cause`: the ledger's
+    /// limit, or the host-memory gate of ADR-2633), never an object key or
+    /// tenant value: the refusal is a resource condition, not data
+    /// corruption, and its message must not leak which object or tenant
+    /// provoked it. The `Display` is the budget's own message under a
+    /// `fetch` prefix, so the client sees which class refused (ADR-2633
+    /// decision 3).
+    #[error("fetch {}", memory_exhausted(.requested, .reserved, .limit, .cause))]
     FetchMemoryExhausted {
         requested: u64,
         reserved: u64,
         limit: u64,
+        cause: ravel_memory::ExhaustionCause,
     },
+}
+
+/// The budget refusal behind a [`FetchError::FetchMemoryExhausted`] and its
+/// log and span siblings, rebuilt from the variant's fields so the three
+/// `Display` forms are the budget's own text ([`ravel_memory::MemoryExhausted`])
+/// and cannot drift from each other or from the coordinator's parser in
+/// `distrib`.
+pub(crate) fn memory_exhausted(
+    requested: &u64,
+    reserved: &u64,
+    limit: &u64,
+    cause: &ravel_memory::ExhaustionCause,
+) -> ravel_memory::MemoryExhausted {
+    ravel_memory::MemoryExhausted {
+        requested: *requested,
+        reserved: *reserved,
+        limit: *limit,
+        cause: *cause,
+    }
 }
 
 /// The error channel for a cache-routed GET's `get_or_fetch` closure
@@ -1135,6 +1157,7 @@ impl SegmentFetcher {
                 requested: e.requested,
                 reserved: e.reserved,
                 limit: e.limit,
+                cause: e.cause,
             })
     }
 
@@ -5490,6 +5513,7 @@ mod tests {
                 requested,
                 reserved,
                 limit: refused_limit,
+                cause: ravel_memory::ExhaustionCause::Accounted,
             } => {
                 assert_eq!(requested, catalog_len, "the catalog's declared length");
                 assert_eq!(reserved, opened, "only the open segment's bytes are held");
