@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use ravel_test_support::run_with_watchdog;
@@ -495,8 +495,10 @@ fn one_job_with_jump(jump_at: u64, site: WriteSite) -> CpuGateSnapshot<WriteSite
     })
 }
 
-/// A delay between handing the job to the blocking pool and its first
-/// instruction lands in the site's handoff sum and nowhere else.
+/// A clock jump from the run-start read on, the fourth read of one job's
+/// fixed order, adds to the site's handoff sum and to no other sum. Which
+/// thread takes that read is pinned by
+/// `handoff_and_resume_stamps_are_taken_on_the_caller_thread`.
 #[test]
 fn delay_before_the_job_starts_lands_in_handoff_only() {
     run_with_watchdog(
@@ -528,8 +530,10 @@ fn delay_before_the_job_starts_lands_in_handoff_only() {
     );
 }
 
-/// A delay between the job's last instruction and its caller resuming lands
-/// in the site's post-return sum and nowhere else.
+/// A clock jump at the resume read, the sixth and last read of one job's
+/// fixed order, adds to the site's post-return sum and to no other sum. Which
+/// thread takes that read is pinned by
+/// `handoff_and_resume_stamps_are_taken_on_the_caller_thread`.
 #[test]
 fn delay_before_the_caller_resumes_lands_in_post_return_only() {
     run_with_watchdog(
@@ -550,6 +554,64 @@ fn delay_before_the_caller_resumes_lands_in_post_return_only() {
             );
             assert_eq!(snapshot.wait_nanos_sum, 10, "nor permit wait");
             assert_eq!(snapshot.run_nanos_sum, 10, "nor run time");
+        },
+    );
+}
+
+/// Records the thread that takes each read, and returns 0, 10, 20, ...
+struct ThreadClock {
+    reads: Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl MonotonicClock for ThreadClock {
+    fn now_nanos(&self) -> u64 {
+        let mut reads = self.reads.lock().unwrap();
+        reads.push(std::thread::current().id());
+        (reads.len() as u64 - 1) * 10
+    }
+}
+
+/// The wait, handoff and resume stamps are taken on the caller's runtime
+/// thread, and the run start and run end stamps on another thread, the
+/// blocking pool's. So the handoff starts before `spawn_blocking` and the
+/// post-return time ends after `handle.await`, not inside the job.
+#[test]
+fn handoff_and_resume_stamps_are_taken_on_the_caller_thread() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running one job"),
+        || {
+            let clock = Arc::new(ThreadClock {
+                reads: Mutex::new(Vec::new()),
+            });
+            let caller = current_thread_runtime().block_on({
+                let clock = Arc::clone(&clock);
+                async move {
+                    let gate = CpuGate::<WriteSite>::new(
+                        CpuGateConfig {
+                            permits: 1,
+                            inline_floor_bytes: 0,
+                            eval_floor_samples: 0,
+                        },
+                        clock,
+                    );
+                    let caller = std::thread::current().id();
+                    assert_eq!(
+                        gate.run(WriteSite::LogFlush, JobSize::Bytes(0), || 1).await,
+                        Ok(1)
+                    );
+                    caller
+                }
+            });
+            let reads = clock.reads.lock().unwrap().clone();
+            let on_caller: Vec<bool> = reads.iter().map(|&thread| thread == caller).collect();
+            assert_eq!(
+                on_caller,
+                [true, true, true, false, false, true],
+                "wait start, wait end, handoff on the caller; run start, run end \
+                 off it; resume on the caller"
+            );
+            assert_eq!(reads[3], reads[4], "run start and run end share a thread");
         },
     );
 }
