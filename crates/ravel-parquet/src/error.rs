@@ -2,6 +2,24 @@ use std::sync::Arc;
 
 use ravel_object_store::StoreError;
 
+/// The budget refusal behind a [`ParquetReadError::MemoryExhausted`], rebuilt
+/// from the variant's fields so its `Display` is the budget's own text
+/// ([`ravel_memory::MemoryExhausted`]), the same form the segment fetchers
+/// render.
+fn memory_exhausted(
+    requested: &u64,
+    reserved: &u64,
+    limit: &u64,
+    cause: &ravel_memory::ExhaustionCause,
+) -> ravel_memory::MemoryExhausted {
+    ravel_memory::MemoryExhausted {
+        requested: *requested,
+        reserved: *reserved,
+        limit: *limit,
+        cause: *cause,
+    }
+}
+
 /// Why a read of one manifest file failed.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ParquetReadError {
@@ -34,15 +52,15 @@ pub enum ParquetReadError {
     /// Reserving the bytes of a range against the process memory budget was
     /// refused, so the range was not requested. The same facts as
     /// `ravel_query::FetchError::FetchMemoryExhausted`, which the SQL layer
-    /// maps it to.
-    #[error(
-        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget \
-         already reserved"
-    )]
+    /// maps it to: the budget's figures and the class of the refusal
+    /// (`cause`), rendered as the budget's own message so the client sees
+    /// which class refused (ADR-2633 decision 3).
+    #[error("fetch {}", memory_exhausted(.requested, .reserved, .limit, .cause))]
     MemoryExhausted {
         requested: u64,
         reserved: u64,
         limit: u64,
+        cause: ravel_memory::ExhaustionCause,
     },
     /// The request would have taken the query's S3 request count past its
     /// budget, so it was not issued. `requests` is the count it would have

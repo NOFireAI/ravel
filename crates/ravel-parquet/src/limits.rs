@@ -85,6 +85,7 @@ impl ReadLimits {
                 requested: e.requested,
                 reserved: e.reserved,
                 limit: e.limit,
+                cause: e.cause,
             })
     }
 
@@ -272,7 +273,8 @@ mod tests {
                 ParquetReadError::MemoryExhausted {
                     requested: 3,
                     reserved: 8,
-                    limit: 10
+                    limit: 10,
+                    cause: ravel_memory::ExhaustionCause::Accounted,
                 }
             ),
             "{err:?}"
