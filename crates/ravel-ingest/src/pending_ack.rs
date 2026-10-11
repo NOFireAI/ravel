@@ -10,10 +10,15 @@
 //!
 //! A strict `submit` takes a permit before charging the byte budget and before
 //! touching any shard, so a refused submit holds no byte charge. The permit is
-//! released by [`PendingAckPermit`]'s `Drop`, which covers every way the wait
-//! can end: `acks()` resolving (ack success or a shard-level error), the
-//! submit-time deadline elapsing, or the `Submitted` value being dropped
-//! unawaited.
+//! released by [`PendingAckPermit`]'s `Drop`: when `acks()` resolves (ack
+//! success or a shard-level error), when its `ack_deadline` elapses (the
+//! duration is captured at submit and the clock starts at the first poll of
+//! `acks()`), or when the `Submitted` value is dropped. A `Submitted` that is
+//! never polled holds its permit until it is dropped.
+//!
+//! The gauge and counter are process-wide only when every router is built
+//! from one shared `Arc<PendingAckBudget>`; each router reports the budget it
+//! was given through its `metrics_snapshot()`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,9 +44,15 @@ pub struct PendingAckBudget {
 }
 
 impl PendingAckBudget {
+    /// A budget of `limit` permits, `0` for unlimited. A limit above
+    /// [`Semaphore::MAX_PERMITS`] is clamped to it, since tokio's semaphore
+    /// cannot hold more permits than that.
     pub fn new(limit: u64) -> Self {
+        let permits = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(Semaphore::MAX_PERMITS);
         PendingAckBudget {
-            semaphore: (limit > 0).then(|| Arc::new(Semaphore::new(limit as usize))),
+            semaphore: (permits > 0).then(|| Arc::new(Semaphore::new(permits))),
             held: Arc::new(AtomicU64::new(0)),
             shed_total: AtomicU64::new(0),
         }
@@ -80,11 +91,11 @@ impl PendingAckBudget {
     }
 }
 
-/// A held pending-ack permit. Releases on `Drop`, exactly once, whichever of
-/// the three ways a submit's ack wait can end: `acks()` resolving (ack success
-/// or a shard-level error), the submit-time deadline passing, or the
-/// `Submitted` value being dropped unawaited -- a plain RAII guard gives all
-/// three for free, with no explicit release call on any path.
+/// A held pending-ack permit. Releases on `Drop`, exactly once: when `acks()`
+/// resolves (ack success or a shard-level error), when its deadline elapses
+/// after `acks()` is first polled, or when the `Submitted` value is dropped.
+/// A plain RAII guard gives all three, with no explicit release call on any
+/// path.
 #[derive(Debug)]
 pub struct PendingAckPermit {
     held: Arc<AtomicU64>,
@@ -127,6 +138,16 @@ mod tests {
         let _c = budget.try_acquire().expect("room freed after drop");
         assert_eq!(budget.held(), 2);
         drop(b);
+    }
+
+    #[test]
+    fn limit_above_semaphore_max_is_clamped() {
+        let budget = PendingAckBudget::new(u64::MAX);
+        let permit = budget.try_acquire().expect("a clamped budget still admits");
+        assert_eq!(budget.held(), 1);
+        assert_eq!(budget.shed_total(), 0);
+        drop(permit);
+        assert_eq!(budget.held(), 0);
     }
 
     #[test]

@@ -715,6 +715,9 @@ pub struct IngestConfig {
     /// the ceiling. Default 8,192: the in-flight ingest ceiling times eight,
     /// generous headroom above ordinary strict-mode concurrency so the ceiling
     /// only fires under a genuine pending-ack pile-up, not normal load.
+    /// No constructor in this crate reads it: each router takes its
+    /// `Arc<PendingAckBudget>` as an argument, and ravel-server builds that
+    /// from this value in #2797.
     pub max_pending_strict_acks: u64,
 }
 

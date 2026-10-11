@@ -82,9 +82,10 @@ pub struct SpanWriteReceipt {
 /// to do in one step.
 ///
 /// Holds the strict-mode pending-ack permit this submit took, and releases
-/// it -- a plain RAII permit gives all three -- when [`Self::acks`] resolves
-/// (either way), when its ack deadline passes, and when `self` is dropped
-/// without calling [`Self::acks`] at all.
+/// it when [`Self::acks`] resolves (either way), when its ack deadline
+/// elapses after [`Self::acks`] is first polled, or when `self` is dropped.
+/// A `SpanSubmitted` that is never polled holds its permit until it is
+/// dropped.
 pub struct SpanSubmitted<'a> {
     router: &'a SpanIngestRouter,
     state: SpanSubmittedState,
@@ -101,14 +102,16 @@ enum SpanSubmittedState {
         ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, SpanWriteError>>>,
         ack_deadline: Duration,
         /// Held until `acks()` resolves, its deadline elapses, or this value
-        /// is dropped unawaited; never read directly.
+        /// is dropped; never read directly.
         _permit: Option<PendingAckPermit>,
     },
 }
 
 impl SpanSubmitted<'_> {
-    /// Awaits every involved shard's strict ack within the deadline captured
-    /// at submit time, exactly as [`SpanIngestRouter::write`] used to inline.
+    /// Awaits every involved shard's strict ack within the `ack_deadline`
+    /// duration captured at submit; the clock starts at the first poll of
+    /// this future, so [`SpanIngestRouter::write`], which polls it at once,
+    /// keeps the deadline it always had.
     /// Returns a receipt with one token per shard that acked durable, maps a
     /// deadline elapse to [`SpanWriteError::AckTimeout`], and otherwise
     /// applies the same partial-write classification `write` always has
@@ -237,10 +240,11 @@ pub struct SpanIngestRouter {
     /// limit. Written by [`SpanIngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
-    /// Process-wide ceiling on outstanding strict acks (ADR-2793 decision 4),
-    /// shared by `Arc` with the metrics and log routers. A strict
-    /// [`Self::submit`] takes a permit here before the byte budget is
-    /// charged; [`SpanSubmitted::acks`] releases it.
+    /// Ceiling on outstanding strict acks (ADR-2793 decision 4). Process-wide
+    /// when the caller hands the same `Arc` to the metrics and log routers;
+    /// otherwise it bounds this router alone. A strict [`Self::submit`] takes
+    /// a permit here before the byte budget is charged; the [`SpanSubmitted`]
+    /// it returns releases it.
     pending_ack_budget: Arc<PendingAckBudget>,
 }
 

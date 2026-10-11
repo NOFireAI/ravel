@@ -50,9 +50,9 @@ pub struct WriteReceipt {
 /// [`IngestRouter::write`] used to do in one step.
 ///
 /// Holds the strict-mode pending-ack permit this submit took, and releases
-/// it -- a plain RAII permit gives all three -- when [`Self::acks`]
-/// resolves (either way), when its ack deadline passes, and when `self` is
-/// dropped without calling [`Self::acks`] at all.
+/// it when [`Self::acks`] resolves (either way), when its ack deadline
+/// elapses after [`Self::acks`] is first polled, or when `self` is dropped.
+/// A `Submitted` that is never polled holds its permit until it is dropped.
 pub struct Submitted<'a> {
     router: &'a IngestRouter,
     state: SubmittedState,
@@ -71,14 +71,16 @@ enum SubmittedState {
         ack_deadline: Duration,
         set: Arc<Vec<ShardHandle>>,
         /// Held until `acks()` resolves, its deadline elapses, or this value
-        /// is dropped unawaited; never read directly.
+        /// is dropped; never read directly.
         _permit: Option<PendingAckPermit>,
     },
 }
 
 impl Submitted<'_> {
-    /// Awaits every involved shard's strict ack within the deadline captured
-    /// at submit time, exactly as [`IngestRouter::write`] used to inline.
+    /// Awaits every involved shard's strict ack within the `ack_deadline`
+    /// duration captured at submit; the clock starts at the first poll of
+    /// this future, so [`IngestRouter::write`], which polls it at once,
+    /// keeps the deadline it always had.
     /// Returns a receipt with one token per shard that acked durable, maps a
     /// deadline elapse to [`WriteError::AckTimeout`], and otherwise applies
     /// the same partial-write classification `write` always has (issue
@@ -293,13 +295,14 @@ pub struct IngestRouter {
     /// limit. Written by [`IngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
-    /// Process-wide pending-strict-ack budget (ADR-2793 decision 4). Shared by
-    /// `Arc` with the log and span routers so one ceiling bounds the sum of
-    /// outstanding strict acks across every signal. A strict
+    /// Pending-strict-ack budget (ADR-2793 decision 4). Process-wide when the
+    /// caller hands the same `Arc` to the log and span routers, so one
+    /// ceiling bounds the sum of outstanding strict acks across every signal;
+    /// otherwise it bounds this router alone. A strict
     /// [`IngestRouter::submit`] takes a permit from this before the byte
     /// budget is charged; the permit releases when [`Submitted::acks`]
-    /// resolves, its deadline passes, or the `Submitted` is dropped
-    /// unawaited.
+    /// resolves, its deadline elapses after `acks()` is first polled, or the
+    /// `Submitted` is dropped.
     pending_ack_budget: Arc<PendingAckBudget>,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the

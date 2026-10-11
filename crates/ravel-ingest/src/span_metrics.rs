@@ -339,7 +339,7 @@ pub struct SpanIngestMetricsSnapshot {
     /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
     /// directly for that.
     pub flush_trigger_deferred_total: u64,
-    /// Pending strict-mode acks outstanding against the process-wide
+    /// Pending strict-mode acks outstanding against the router's
     /// [`crate::PendingAckBudget`] (ADR-2793 decision 4). A gauge. Always 0 from
     /// a bare [`SpanIngestMetrics::snapshot`], which has no budget to read;
     /// populated by [`crate::SpanIngestRouter::metrics_snapshot`], the
