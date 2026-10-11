@@ -302,7 +302,8 @@ the fold and report `history_unavailable`. The affected identity keeps its
 memo copy, or is absent on a cold fold; the worst outcome is a duplicate
 notification for a still-live condition, inside the at-least-once contract
 (ADR-0043), never a missed page. The memo advances, the object falls below
-the watermark, and retention deletes it on its normal schedule.
+the watermark, and retention deletes it on its normal schedule. (The
+skipped-object amendment below bounds this for a rollback past a bump.)
 
 The `RavelAlertPipelineBlocked` description (`deploy/prometheus/ravel.rules.yaml:313-318`)
 and its reprint in docs/guides/observability.md are corrected: the liveness
@@ -437,3 +438,24 @@ Property tests in `normalize.rs`, `logs_normalize.rs` and
 `traces_normalize.rs` check, per metric, per log record and per span, that
 every kept name and value has capacity equal to its length and that the
 projection is at least what normalization allocated.
+
+## Amendment (2026-10-11): what a skipped alert object leaves (#2713)
+
+<!-- amendment-applies: sections="D6. The alert fold skips and counts an out-of-window object (#2713)" pointer="skipped-object amendment" -->
+
+D6 says a skipped object's alert keeps its memo copy or is absent, so the
+worst outcome is one duplicate notification. That holds when the skipped
+object is older than every readable transition for its alert, which is the
+forward-bump case D6 was written for. The fold actually keeps, for each
+alert, the memo copy, else the newest readable transition, else nothing. If
+a deployment is rolled back to a build that cannot read the newest objects,
+the skipped object can be the alert's latest transition while an older
+readable one remains, and that older state stands in for it. An alert whose
+resolve was skipped then still reads as firing, so a new firing episode pages
+only at the rule's next repeat window, and not at all on a rule with repeats
+disabled. This is accepted: before 1.0 the format posture is forward-only (D5, and
+the N/N-1 reader window is #16 T11), so a rollback past a bump is the case
+already expected to lose readability, and the skip still keeps the tenant's
+other rules evaluating. The skip also applies only to an object whose bytes match its
+commit record's content hash, since the RLOG reader checks the trailer
+version before the footer CRC.

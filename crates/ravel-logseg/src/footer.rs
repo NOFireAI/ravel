@@ -460,6 +460,39 @@ pub fn write_footer_and_trailer_versioned(out: &mut Vec<u8>, footer: &LogFooter,
     out.extend_from_slice(&MAGIC);
 }
 
+/// Rewrites the trailer version of a whole `.rlog` object in place and
+/// recomputes `footer_crc32c` over it, so the object differs from a valid one
+/// only in its version and a reader rejects it with
+/// [`LogSegError::UnsupportedVersion`], never as corruption.
+///
+/// For a test that needs an object of another version written through the
+/// normal writer path. Fails `Corrupted` when `bytes` is too short to hold
+/// the trailer and the footer it names.
+#[cfg(feature = "test-support")]
+pub fn rewrite_trailer_version(bytes: &mut [u8], version: u16) -> Result<(), LogSegError> {
+    let footer_end = bytes
+        .len()
+        .checked_sub(TRAILER_LEN)
+        .ok_or_else(|| LogSegError::Corrupted("object smaller than trailer".into()))?;
+    let trailer = &bytes[footer_end..];
+    let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let signal = trailer[10];
+    let reserved = trailer[11];
+    let footer_start = footer_end
+        .checked_sub(footer_len as usize)
+        .ok_or_else(|| LogSegError::Corrupted("footer_len past object".into()))?;
+    let crc = footer_crc(
+        &bytes[footer_start..footer_end],
+        footer_len,
+        version,
+        signal,
+        reserved,
+    );
+    bytes[footer_end + 4..footer_end + 8].copy_from_slice(&crc.to_le_bytes());
+    bytes[footer_end + 8..footer_end + 10].copy_from_slice(&version.to_le_bytes());
+    Ok(())
+}
+
 /// Outcome of opening a `.rlog` object from a suffix probe (the ranged reader
 /// protocol): either the footer parsed, or the suffix did not reach the whole
 /// footer and the caller must fetch the named absolute byte range (itself a
@@ -908,6 +941,32 @@ mod tests {
         assert!(matches!(
             open(&obj),
             Err(LogSegError::UnsupportedVersion(3))
+        ));
+    }
+
+    /// `rewrite_trailer_version` changes only the version: the rewritten
+    /// object is refused as `UnsupportedVersion`, not as a crc mismatch, and
+    /// rewriting it back to [`VERSION`] reopens to the original footer.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rewrite_trailer_version_yields_unsupported_version_not_corruption() {
+        let footer = sample_footer(sample_sections());
+        let mut obj = vec![0u8; 5];
+        write_footer_and_trailer(&mut obj, &footer);
+        let original = obj.clone();
+
+        rewrite_trailer_version(&mut obj, 3).expect("rewrite");
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(3))
+        ));
+
+        rewrite_trailer_version(&mut obj, VERSION).expect("rewrite back");
+        assert_eq!(obj, original);
+        assert_eq!(open(&obj).expect("reopen"), footer);
+        assert!(matches!(
+            rewrite_trailer_version(&mut [0u8; 4], 3),
+            Err(LogSegError::Corrupted(_))
         ));
     }
 

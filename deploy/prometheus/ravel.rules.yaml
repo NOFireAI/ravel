@@ -312,11 +312,17 @@ groups:
           summary: >-
             Ravel alert evaluation is blocked on object storage
           description: >-
-            The evaluator can neither read the tenant's alert history nor hold
-            its lease, so no rule is evaluated on these ticks. The liveness
-            gauge does not advance on them either, so a sustained case also
-            trips RavelAlertLoopStalled; this rule names the cause. Check the
-            store reachability family.
+            The evaluator can neither read a tenant's alert history nor hold
+            its lease, so none of that tenant's rules is evaluated on these
+            ticks. The liveness gauge is process-wide and advances on any
+            tenant's completed tick, so RavelAlertLoopStalled trips only when
+            every tenant in the process is blocked; for a single blocked
+            tenant this rule is the only one that fires. An alert history
+            object whose bytes match its commit record's content hash and
+            whose RLOG version this build cannot read does not block
+            evaluation: it is skipped and counted instead.
+            Check the store reachability family and the evaluator's warn logs,
+            which name the tenant.
           runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
 
   - name: ravel-ingest-rejections

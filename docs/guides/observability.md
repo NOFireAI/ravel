@@ -1726,6 +1726,7 @@ which keeps the alert rules below quiet there.
 | `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first, counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue. A rising value has two causes: a sink too slow to drain the queue within a tick, or a tick whose work before delivery (history fold, rule evaluation, memo write) already ran past the deadline, in which case every notification after the first is deferred even when every sink answers at once. |
 | `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, summed over this process's evaluators, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks by `outcome`. |
+| `ravel_alert_history_records_skipped_total` | Alert history objects skipped instead of aborting the history fold, by `reason`. `reason="unsupported_version"` is an RLOG object whose format version this build cannot read. Only an object whose bytes match its commit record's content hash is skipped; one that does not match is corruption and fails the tick. Counted once per fold that reads the object, so it rises every tick until the state memo's watermark passes the object's hour, and again on any tick whose memo is missing, corrupt, or at a version this build cannot read, since that tick folds the whole history; it stops for good once retention deletes the object. Rendered at 0 before any skip. A warn log line names the tenant and object key. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Gauge. Unix time the alert loop last completed a tick in this process, `0` if none has completed since it started. Its age is the alert-loop liveness signal. |
 
 The `outcome` label carries one of four values, one per tick:
@@ -1735,7 +1736,7 @@ The `outcome` label carries one of four values, one per tick:
 | `evaluated` | This replica held the tenant's alert lease and evaluated every rule. |
 | `lease_not_held` | A peer replica held the lease, so this one skipped evaluation. Healthy, and the steady state of every replica that is not the holder. |
 | `lease_unavailable` | The lease read or write failed against object storage. Evaluation was skipped and is retried next tick. |
-| `history_unavailable` | The tenant's alert history could not be read, so nothing was evaluated. The evaluator never acts on a partial history, because a partial history re-fires an alert that is already firing. |
+| `history_unavailable` | The tenant's alert history could not be read, so nothing was evaluated. The evaluator never acts on a partial history, because a partial history re-fires an alert that is already firing. The one exception is an object whose bytes match its commit record's content hash and whose RLOG version this build cannot read: it is skipped and counted on `ravel_alert_history_records_skipped_total`, and the tick evaluates. An object that reads as an unsupported version but does not match that hash is corrupt and counts here. |
 
 Do not sum `lease_not_held` with the two failure outcomes. In a multi-replica
 deployment every replica but one reports it on every tick, so a rule that
@@ -1861,11 +1862,17 @@ groups:
           summary: >-
             Ravel alert evaluation is blocked on object storage
           description: >-
-            The evaluator can neither read the tenant's alert history nor hold
-            its lease, so no rule is evaluated on these ticks. The liveness
-            gauge does not advance on them either, so a sustained case also
-            trips RavelAlertLoopStalled; this rule names the cause. Check the
-            store reachability family.
+            The evaluator can neither read a tenant's alert history nor hold
+            its lease, so none of that tenant's rules is evaluated on these
+            ticks. The liveness gauge is process-wide and advances on any
+            tenant's completed tick, so RavelAlertLoopStalled trips only when
+            every tenant in the process is blocked; for a single blocked
+            tenant this rule is the only one that fires. An alert history
+            object whose bytes match its commit record's content hash and
+            whose RLOG version this build cannot read does not block
+            evaluation: it is skipped and counted instead.
+            Check the store reachability family and the evaluator's warn logs,
+            which name the tenant.
 ```
 
 The `600s` staleness threshold is ten default 60s evaluation intervals. It is

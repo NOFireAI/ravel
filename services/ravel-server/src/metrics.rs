@@ -331,6 +331,10 @@ pub enum Label {
     /// [`crate::alerting`], since the outcomes are the alerting loop's own, not
     /// a dimension this renderer invents.
     AlertOutcome(crate::alerting::AlertTickOutcome),
+    /// Why the alert history fold skipped an object (ADR-2708 decision D6):
+    /// `unsupported_version`. Shares the `reason` key with the other reason
+    /// variants.
+    AlertHistorySkipReason(crate::alerting::AlertHistorySkipReason),
     /// Which leading keyword routed a SQL DDL statement (issue #2374):
     /// `create` or `drop`. Shares the `kind` key with `MergeMemoryKind` and
     /// `DeletedObjectKind`.
@@ -602,6 +606,7 @@ impl Label {
             Label::MergeMemoryKind(_) => "kind",
             Label::DeletedObjectKind(_) => "kind",
             Label::AlertOutcome(_) => "outcome",
+            Label::AlertHistorySkipReason(_) => "reason",
             #[cfg(feature = "sql")]
             Label::DdlKind(_) => "kind",
             #[cfg(feature = "sql")]
@@ -647,6 +652,7 @@ impl Label {
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
             Label::DeletedObjectKind(kind) => kind.name().to_string(),
             Label::AlertOutcome(outcome) => alert_outcome_name(*outcome).to_string(),
+            Label::AlertHistorySkipReason(reason) => reason.name().to_string(),
             #[cfg(feature = "sql")]
             Label::DdlKind(kind) => kind.name().to_string(),
             #[cfg(feature = "sql")]
@@ -5098,6 +5104,10 @@ pub struct AlertSnapshot {
     pub ticks_lease_unavailable: u64,
     /// Ticks that evaluated nothing because the alert history was unreadable.
     pub ticks_history_unavailable: u64,
+    /// Alert history objects the fold skipped because their RLOG version is
+    /// unreadable by this build. Rendered as
+    /// `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`.
+    pub history_skipped_unsupported_version: u64,
     /// Unix nanoseconds the alert loop last completed a tick, `0` if none has
     /// completed yet. Rendered as
     /// `ravel_alert_last_tick_completed_timestamp_seconds`; its age is the
@@ -5251,6 +5261,26 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
             "ravel_alert_ticks_total",
             &[Label::Mode(mode), Label::AlertOutcome(outcome)],
             snapshot.ticks(outcome),
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_alert_history_records_skipped_total",
+        "Alert history objects (one transition record each) the alert evaluator's history fold skipped instead of aborting, by reason, counted once per fold that read one, so an object still in the fold's tail is counted again on each tick until the state memo's watermark passes its hour. reason=\"unsupported_version\": an RLOG object whose format version this build cannot read. A skipped record's alert keeps its state memo copy, or on a full fold is treated as absent, so a still-live condition can notify once more. A warn log line names the tenant and object key.",
+        "counter",
+    );
+    for reason in crate::alerting::AlertHistorySkipReason::ALL {
+        let value = match reason {
+            crate::alerting::AlertHistorySkipReason::UnsupportedVersion => {
+                snapshot.history_skipped_unsupported_version
+            }
+        };
+        write_sample(
+            out,
+            "ravel_alert_history_records_skipped_total",
+            &[Label::Mode(mode), Label::AlertHistorySkipReason(reason)],
+            value,
         );
     }
 
@@ -7789,6 +7819,9 @@ pub fn render(
                 ticks_lease_not_held: metrics.ticks(AlertTickOutcome::LeaseNotHeld),
                 ticks_lease_unavailable: metrics.ticks(AlertTickOutcome::LeaseUnavailable),
                 ticks_history_unavailable: metrics.ticks(AlertTickOutcome::HistoryUnavailable),
+                history_skipped_unsupported_version: metrics.history_records_skipped(
+                    crate::alerting::AlertHistorySkipReason::UnsupportedVersion,
+                ),
                 last_tick_completed_unix_ns: metrics.last_tick_completed_unix_ns(),
             },
         );
@@ -8730,6 +8763,9 @@ mod tests {
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
             Label::DeletedObjectKind(DeletedObjectKind::QuarantineReaped),
             Label::AlertOutcome(crate::alerting::AlertTickOutcome::Evaluated),
+            Label::AlertHistorySkipReason(
+                crate::alerting::AlertHistorySkipReason::UnsupportedVersion,
+            ),
             Label::Allocator("jemalloc"),
             Label::AllocatorStat(AllocatorStat::Allocated),
             Label::MemoryComponent(MemoryComponent::Sql),
@@ -8766,6 +8802,7 @@ mod tests {
                 Label::MergeMemoryKind(_) => "kind",
                 Label::DeletedObjectKind(_) => "kind",
                 Label::AlertOutcome(_) => "outcome",
+                Label::AlertHistorySkipReason(_) => "reason",
                 // Asserted by `sql_ddl_family_renders_exact_samples`, since
                 // `one_of_each` is the default build's set.
                 #[cfg(feature = "sql")]
@@ -8835,6 +8872,9 @@ mod tests {
                 // it.
                 "kind",
                 "outcome",
+                // AlertHistorySkipReason (ADR-2708 decision D6) reuses the
+                // `reason` key.
+                "reason",
                 "allocator",
                 "stat",
                 "component",
@@ -8862,8 +8902,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            32,
-            "exactly 32 label variants every build has, 21 distinct keys (sql adds DdlKind, \
+            33,
+            "exactly 33 label variants every build has, 21 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
@@ -11054,6 +11094,7 @@ mod tests {
             ticks_lease_not_held: 8,
             ticks_lease_unavailable: 9,
             ticks_history_unavailable: 10,
+            history_skipped_unsupported_version: 14,
             // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
             last_tick_completed_unix_ns: 1_758_000_123_500_000_000,
         };
@@ -11070,6 +11111,7 @@ mod tests {
             "# TYPE ravel_alert_notifications_deferred_total counter",
             "# TYPE ravel_alert_undelivered_notifications gauge",
             "# TYPE ravel_alert_ticks_total counter",
+            "# TYPE ravel_alert_history_records_skipped_total counter",
             "# TYPE ravel_alert_last_tick_completed_timestamp_seconds gauge",
         ] {
             assert_eq!(
@@ -11092,6 +11134,7 @@ mod tests {
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_not_held\"} 8",
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_unavailable\"} 9",
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"history_unavailable\"} 10",
+            "ravel_alert_history_records_skipped_total{mode=\"query\",reason=\"unsupported_version\"} 14",
             "ravel_alert_last_tick_completed_timestamp_seconds{mode=\"query\"} 1758000123.5",
         ] {
             assert_eq!(
@@ -11109,6 +11152,20 @@ mod tests {
             .filter(|line| line.starts_with("ravel_alert_ticks_total{"))
             .count();
         assert_eq!(tick_samples, 4, "one series per outcome, always:\n{out}");
+    }
+
+    /// The history skip counter renders its zero before any skip, so an alert
+    /// rule's `increase()` over it is defined from the first scrape.
+    #[test]
+    fn alert_history_skip_counter_renders_zero_before_any_skip() {
+        let mut out = String::new();
+        render_alert_family(&mut out, Mode::All, &AlertSnapshot::default());
+        let expected = "ravel_alert_history_records_skipped_total{mode=\"all\",reason=\"unsupported_version\"} 0";
+        assert_eq!(
+            out.lines().filter(|line| *line == expected).count(),
+            1,
+            "expected exactly one `{expected}` sample line:\n{out}"
+        );
     }
 
     /// The scrape path reads the fold figures off the live `Catalog`, not off

@@ -257,6 +257,46 @@ other sink. Remove a sink that is down from the configuration.
 Every alert record keeps the labels that the rule's query returns, and the
 rule's own labels. No erasure path reaches alert history today.
 
+### History objects this build cannot read
+
+Each tick folds the tenant's alert history into the current state of every
+alert. A history object that cannot be read stops the tick with
+`outcome="history_unavailable"`, and no rule is evaluated: a partial history
+would re-fire an alert that is already firing. That covers an object that
+is corrupt or unreachable.
+
+An object written at an RLOG format version this build cannot read is the
+exception. After a format bump, every alert object written before it has
+the retired version, so aborting on it would stop alert evaluation for that
+tenant until the old objects age out. The fold skips the object instead:
+
+- `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
+  rises by one for each fold that reads the object.
+- A warn log line names the tenant and the object key.
+- The tick evaluates its rules and reports `outcome="evaluated"`.
+
+An object is skipped only when its bytes match the content hash in its
+commit record and its RLOG format version is outside this build's reader
+window. The version is read before the footer checksum, so a bit flip in
+the version bytes also reads as an unsupported version; the hash mismatch
+is what marks that object corrupt, and it stops the tick as above.
+
+The skipped object held one transition. If the alert state memo already
+holds that alert, the memo copy stands. Otherwise the newest readable
+transition for that alert stands, and with none the alert is treated as
+absent. After a forward format bump the skipped objects are older than any
+readable one, so the worst case is a condition that is still true raising
+the alert again and notifying once; the next memo write records it, and
+later ticks do not notify it again. After a rollback to a build that cannot
+read the newest objects, an older readable state can stand in for a newer
+one: an alert whose resolve was skipped still reads as firing, so if it
+fires again it pages only at its next repeat window, and not at all on a
+rule with `"repeat_interval": "0s"`. The counter keeps rising while the object is inside
+the fold's tail, and stops once the memo's watermark passes the object's
+hour. A tick with no usable memo (missing, corrupt, or at a version this
+build cannot read) folds the whole history and counts the object again
+whatever its hour, until retention deletes it.
+
 ### Upgrade from per-rule alerts
 
 Releases before per-series evaluation raised one alert per rule, with the
@@ -414,6 +454,7 @@ looks the same as a condition that never occurred.
 | `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. Counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue. |
 | `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
+| `ravel_alert_history_records_skipped_total` | Alert history objects skipped by the history fold instead of failing the tick, by `reason`. `unsupported_version` is an object written at an RLOG version this build cannot read. Exported at 0 before any skip. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
 
 `outcome="lease_not_held"` is healthy. Only the replica that holds the alert
