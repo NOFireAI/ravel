@@ -52,6 +52,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::block_run::BlockRun;
 use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs, gate_not_run};
@@ -352,6 +353,9 @@ pub struct LogSegmentScan {
     /// block in the object's PAGE_DIR, since the cursor does not say which
     /// block it decodes next.
     block_job_bytes: u64,
+    /// The fetcher's [`BlockRun`], for a caller that moves this scan into its
+    /// own gate jobs.
+    block_run: BlockRun,
     /// Test hook: makes the next gated block decode panic inside the job, the
     /// only way to drive a real [`CpuGateError::Panicked`] through this path.
     #[cfg(test)]
@@ -406,6 +410,13 @@ impl LogSegmentScan {
         self.read_gate
             .as_ref()
             .map(|gate| (Arc::clone(gate), JobSize::Bytes(self.block_job_bytes)))
+    }
+
+    /// The run of blocks such a caller decodes per job, set by
+    /// [`LogSegmentFetcher::with_block_run`]. A job of `n` blocks is sized at
+    /// `n` times the [`block_gate`](Self::block_gate) size.
+    pub fn block_run(&self) -> BlockRun {
+        self.block_run
     }
 
     /// Arms the test hook: the next gated block decode panics inside its job.
@@ -752,6 +763,9 @@ pub struct LogSegmentFetcher {
     /// The read CPU gate [`LogSegmentScan::next_block_on_gate`] decodes blocks
     /// on (ADR-1702 decision 4). `None`, the default, decodes inline.
     read_gate: Option<Arc<ReadGate>>,
+    /// How many blocks a caller that moves a scan into its own gate job
+    /// decodes per job; read through [`LogSegmentScan::block_run`].
+    block_run: BlockRun,
 }
 
 impl LogSegmentFetcher {
@@ -773,6 +787,7 @@ impl LogSegmentFetcher {
             wire_bytes,
             memory_budget,
             read_gate: None,
+            block_run: BlockRun::default(),
         }
     }
 
@@ -934,6 +949,15 @@ impl LogSegmentFetcher {
     pub fn with_read_gate(mut self, gate: Arc<ReadGate>) -> Self {
         self.block_range = self.block_range.with_read_gate(Arc::clone(&gate));
         self.read_gate = Some(gate);
+        self
+    }
+
+    /// Sets the run of blocks one gate job decodes for a caller that drives
+    /// a scan's decodes in its own jobs ([`LogSegmentScan::block_run`]).
+    /// Default [`DEFAULT_BLOCK_RUN`](crate::DEFAULT_BLOCK_RUN).
+    #[must_use]
+    pub fn with_block_run(mut self, run: BlockRun) -> Self {
+        self.block_run = run;
         self
     }
 
@@ -1161,6 +1185,7 @@ impl LogSegmentFetcher {
             finished: false,
             read_gate: self.read_gate.clone(),
             block_job_bytes,
+            block_run: self.block_run,
             #[cfg(test)]
             panic_next_gate_job: false,
         }

@@ -1,6 +1,7 @@
 //! Query engine: snapshot resolve, segment pruning, footer-first reads,
 //! sample iterators feeding the PromQL evaluator (ADR-0006).
 
+mod block_run;
 #[cfg(test)]
 mod cache_correctness;
 mod config;
@@ -26,6 +27,7 @@ pub mod span_fetcher;
 #[cfg(test)]
 pub(crate) mod test_tracing;
 
+pub use block_run::{BlockRun, DEFAULT_BLOCK_RUN};
 pub use config::{
     ALERT_DELIVERY_SLACK, BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, ByteLimit,
     COST_BASED_RANGED_REQUESTS, DEFAULT_BUDGET_REFERENCE_SHARDS, DEFAULT_DEADLINE,

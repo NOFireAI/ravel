@@ -40,8 +40,11 @@
 //! Object-level relevance (does the segment's ts span overlap the window?) is
 //! still decided from the catalog summary before any GET.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::block_run::{BlockRun, StopOnDrop};
 use crate::fetcher::{ReadCache, gate_not_run};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
@@ -212,6 +215,8 @@ pub struct SpanSegmentFetcher {
     /// The read CPU gate the row exits' block decodes run on (ADR-1702
     /// decision 4). `None`, the default, decodes inline.
     read_gate: Option<Arc<ReadGate>>,
+    /// The run of blocks one gated decode job takes.
+    block_run: BlockRun,
 }
 
 impl SpanSegmentFetcher {
@@ -225,16 +230,27 @@ impl SpanSegmentFetcher {
             )),
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             read_gate: None,
+            block_run: BlockRun::default(),
         }
     }
 
     /// Runs the block decodes of [`fetch`](Self::fetch) and
     /// [`fetch_accounted`](Self::fetch_accounted), and of a columnar scan
     /// drained through [`SpanColumnarScan::next_block_on_gate`], on `gate`
-    /// (ADR-1702 decision 4). Each block, with all its pages, is one job.
+    /// (ADR-1702 decision 4). Each run of blocks
+    /// ([`with_block_run`](Self::with_block_run)), each block with all its
+    /// pages, is one job.
     #[must_use]
     pub fn with_read_gate(mut self, gate: Arc<ReadGate>) -> Self {
         self.read_gate = Some(gate);
+        self
+    }
+
+    /// Sets the run of consecutive blocks one gated decode job takes.
+    /// Default [`DEFAULT_BLOCK_RUN`](crate::DEFAULT_BLOCK_RUN).
+    #[must_use]
+    pub fn with_block_run(mut self, run: BlockRun) -> Self {
+        self.block_run = run;
         self
     }
 
@@ -600,6 +616,8 @@ impl SpanSegmentFetcher {
             pages_skipped: 0,
             finished: false,
             read_gate: self.read_gate.clone(),
+            block_run: self.block_run,
+            decoded: VecDeque::new(),
             lost: false,
             lost_to: None,
         })
@@ -829,6 +847,12 @@ pub struct SpanColumnarScan {
     /// The read CPU gate [`next_block_on_gate`](Self::next_block_on_gate)
     /// decodes on; `None` decodes inline.
     read_gate: Option<Arc<ReadGate>>,
+    /// The run of blocks one [`next_block_on_gate`](Self::next_block_on_gate)
+    /// job decodes.
+    block_run: BlockRun,
+    /// Blocks the last gated run decoded and no call has handed out yet, in
+    /// scan order. The cursor is already past them.
+    decoded: VecDeque<DecodedRows>,
     /// Set once a gated block decode failed or was abandoned. The cursor had
     /// already moved past that block, so every later call fails rather than
     /// hand out the next block of a partial segment.
@@ -848,9 +872,10 @@ impl SpanColumnarScan {
         self.stats
     }
 
-    /// Candidate blocks not yet decoded.
+    /// Candidate blocks not yet handed out, counting those a run decoded
+    /// ahead.
     pub fn remaining_blocks(&self) -> usize {
-        self.candidates.len() - self.cursor
+        self.candidates.len() - self.cursor + self.decoded.len()
     }
 
     /// Column pages the blocks drained so far decompressed. Read after the last
@@ -873,6 +898,9 @@ impl SpanColumnarScan {
     /// candidate block can survive pruning yet hold no row inside the ts window.
     /// Only `None` ends the scan and triggers the accounting fold.
     pub fn next_block(&mut self) -> Result<Option<ColumnarBlock>, SpanFetchError> {
+        if let Some(decoded) = self.decoded.pop_front() {
+            return self.record_block(decoded).map(Some);
+        }
         let Some((block_bytes, crc)) = self.next_candidate()? else {
             return Ok(None);
         };
@@ -880,27 +908,64 @@ impl SpanColumnarScan {
         self.record_block(decoded).map(Some)
     }
 
-    /// [`next_block`](Self::next_block) with the block decode run on the
-    /// fetcher's read gate (ADR-1702 decision 4): the whole block, all its
-    /// pages, is one job sized by the uncompressed lengths its header lists.
-    /// Without a gate this is `next_block`. Reaching exhaustion submits no
-    /// job.
+    /// [`next_block`](Self::next_block) with the block decodes run on the
+    /// fetcher's read gate (ADR-1702 decision 4): a run of consecutive
+    /// candidate blocks, each with all its pages, is one job, bounded by the
+    /// fetcher's [`BlockRun`] and sized by the uncompressed lengths their
+    /// headers list. The run takes a further block only while those lengths
+    /// sum below the run's byte cap, and its blocks are handed out one per
+    /// call before the next job is submitted. A block that fails its decode
+    /// ends the run. Without a gate this is `next_block`. Reaching exhaustion
+    /// submits no job.
     pub async fn next_block_on_gate(&mut self) -> Result<Option<ColumnarBlock>, SpanFetchError> {
         let Some(gate) = self.read_gate.clone() else {
             return self.next_block();
         };
-        let Some((block_bytes, crc)) = self.next_candidate()? else {
+        if let Some(decoded) = self.decoded.pop_front() {
+            return self.record_block(decoded).map(Some);
+        }
+        let Some(first) = self.next_candidate()? else {
             return Ok(None);
         };
-        let size = JobSize::Bytes(block_uncompressed_len(&block_bytes));
+        let mut size = block_uncompressed_len(&first.0);
+        let mut blocks = vec![first];
+        // The candidates after the first are taken without moving the cursor,
+        // which moves past only the blocks the job decodes.
+        while self.block_run.takes_another(blocks.len(), size) {
+            let Some(&(start, end, crc)) = self.candidates.get(self.cursor + blocks.len() - 1)
+            else {
+                break;
+            };
+            if self.bytes.get(start..end).is_none() {
+                break;
+            }
+            let block_bytes = self.bytes.slice(start..end);
+            size = size.saturating_add(block_uncompressed_len(&block_bytes));
+            blocks.push((block_bytes, crc));
+        }
         let projection = self.projection.clone();
         let query = self.query;
+        let stop = Arc::new(AtomicBool::new(false));
+        let job_stop = Arc::clone(&stop);
+        let _stop = StopOnDrop(stop);
         // Cleared only once the job returns: a failed job, or this future
         // dropped while the job is queued or running, leaves the scan lost.
         self.lost = true;
         let decoded = match gate
-            .run(ReadSite::SpanBlock, size, move || {
-                decode_block_rows(&block_bytes, crc, &projection, &query)
+            .run(ReadSite::SpanBlock, JobSize::Bytes(size), move || {
+                let mut decoded = VecDeque::with_capacity(blocks.len());
+                for (block_bytes, crc) in &blocks {
+                    if !decoded.is_empty() && job_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let rows = decode_block_rows(block_bytes, *crc, &projection, &query);
+                    let failed = !matches!(rows, Ok((_, Ok(_))));
+                    decoded.push_back(rows);
+                    if failed {
+                        break;
+                    }
+                }
+                decoded
             })
             .await
         {
@@ -913,7 +978,12 @@ impl SpanColumnarScan {
             }
         };
         self.lost = false;
-        self.record_block(decoded).map(Some)
+        self.cursor += decoded.len().saturating_sub(1);
+        self.decoded = decoded;
+        match self.decoded.pop_front() {
+            Some(first) => self.record_block(first).map(Some),
+            None => Err(span_scan_lost(&self.key)),
+        }
     }
 
     /// Advances to the next candidate block and returns its bytes, or `None`
@@ -2332,6 +2402,127 @@ mod tests {
             } => assert!(message.contains("panicked"), "{message}"),
             other => panic!("expected the decode error, got {other:?}"),
         }
+    }
+
+    /// Opens `seg`'s columnar scan on `fetcher` and drains it through
+    /// `next_block_on_gate`, returning each block's surviving rows in scan
+    /// order, or the error that ended the drain.
+    async fn drain_columnar(
+        fetcher: &SpanSegmentFetcher,
+        seg: &SegmentRef,
+    ) -> Vec<Result<Vec<usize>, String>> {
+        let mut scan = fetcher
+            .fetch_accounted_columnar(
+                seg,
+                TENANT,
+                &all_query(),
+                None,
+                None,
+                &[],
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("open")
+            .expect("relevant");
+        let mut out = Vec::new();
+        loop {
+            match scan.next_block_on_gate().await {
+                Ok(Some(block)) => out.push(Ok(block.rows)),
+                Ok(None) => break,
+                Err(e) => {
+                    out.push(Err(e.to_string()));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// One `SpanBlock` job decodes a run of consecutive candidate blocks,
+    /// handed out one per call in scan order: the same blocks the inline exit
+    /// hands out. Three blocks make three runs of one block, two runs at two
+    /// blocks a run (2 + 1), and one run at eight; a byte cap of 1 stops each
+    /// run after its first block. A block whose decode fails ends its run and
+    /// surfaces where it does with one job per block: with block 2 corrupt,
+    /// blocks 0 and 1 come out first and the third call fails.
+    ///
+    /// FLIP: taking one candidate per job in `next_block_on_gate` reads
+    /// `left: (3, 0), right: (2, 0)` on the two-block count.
+    #[tokio::test]
+    async fn a_span_block_job_decodes_a_run_of_blocks() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts};
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| bare_span(trace(i + 1), span(i + 1), 100, 200))
+            .collect();
+        let seg = write_object(&store, 0, &records).await;
+
+        // The same object with one byte flipped inside block 2, which fails
+        // that block's crc.
+        let mut bytes = store
+            .get(&seg.data_object_key, GetRange::Full)
+            .await
+            .expect("get")
+            .data
+            .to_vec();
+        let reader = RspanReader::new(&bytes, &RspanConfig::default()).expect("reader");
+        let entry = reader.skip_index().blocks[2].clone();
+        let blocks = *open(&bytes)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS");
+        let (start, end) = abs_block_range(blocks.offset, blocks.len, &entry).expect("range");
+        bytes[(start + end) / 2] ^= 0xFF;
+        let corrupt = SegmentRef {
+            data_object_key: "spans/corrupt.rspan".to_string(),
+            ..seg.clone()
+        };
+        store
+            .put(
+                &corrupt.data_object_key,
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put corrupt");
+
+        let capped = BlockRun {
+            max_blocks: 8,
+            max_decoded_bytes: 1,
+        };
+        let run_of = |n| BlockRun {
+            max_blocks: n,
+            max_decoded_bytes: u64::MAX,
+        };
+        for (object, want_blocks) in [(&seg, 3), (&corrupt, 3)] {
+            let inline = drain_columnar(&SpanSegmentFetcher::new(store.clone()), object).await;
+            assert_eq!(inline.len(), want_blocks);
+            for (run, jobs) in [
+                (BlockRun::SINGLE, 3),
+                (run_of(2), 2),
+                (run_of(8), 1),
+                (capped, 3),
+            ] {
+                let gate = floor_zero_gate();
+                let fetcher = SpanSegmentFetcher::new(store.clone())
+                    .with_read_gate(gate.clone())
+                    .with_block_run(run);
+                let gated = drain_columnar(&fetcher, object).await;
+                assert_eq!(gated, inline, "{run:?} on {}", object.data_object_key);
+                if object.data_object_key == seg.data_object_key {
+                    assert_eq!(
+                        site_counts(&gate, ReadSite::SpanBlock),
+                        (jobs, 0),
+                        "{run:?}"
+                    );
+                }
+            }
+        }
+        let corrupt_inline =
+            drain_columnar(&SpanSegmentFetcher::new(store.clone()), &corrupt).await;
+        assert!(corrupt_inline[0].is_ok() && corrupt_inline[1].is_ok());
+        assert!(corrupt_inline[2].is_err(), "{corrupt_inline:?}");
     }
 }
 
