@@ -279,18 +279,16 @@ impl LogsFetchPolicyArg {
 /// write mode a request is resolved to when the `x-ravel-ingest-mode`
 /// header does not name one explicitly (`strict`, no header, or an unknown
 /// value). The header's own `strict-arrival`/`strict-aged` values override
-/// this per request on the OTLP HTTP and gRPC paths; Remote Write reads no
+/// this per request on the OTLP HTTP, OTLP gRPC and OTAP paths; Remote Write reads no
 /// header at all (ADR-2793 decision 1) and is governed by this flag alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum StrictFlushPolicy {
-    /// Strict writes flush on the existing age/size triggers only
-    /// (`WriteMode::Strict`). Matches today's behavior.
+    /// A strict write's flush opens on the age threshold or the size
+    /// trigger.
     #[default]
     Aged,
-    /// Strict writes also flush as soon as every pending write in the
-    /// buffer has been acknowledged (`WriteMode::StrictArrival`, ADR-2793
-    /// decision 1), trading a flush per quiet period for lower strict-write
-    /// latency.
+    /// A strict write opens its flush on arrival, or when the tenant's
+    /// in-flight flush on the shard completes.
     Arrival,
 }
 
@@ -1874,16 +1872,18 @@ pub struct Cli {
     #[arg(long = "adaptive-flush-delay")]
     pub adaptive_flush_delay: bool,
 
-    /// The process default strict flush policy (ADR-2793 decision 1):
-    /// `aged` keeps today's age/size-triggered strict flush
-    /// (`WriteMode::Strict`); `arrival` flushes a strict write's buffer as
-    /// soon as every pending write in it has been acknowledged
-    /// (`WriteMode::StrictArrival`). A per-request `x-ravel-ingest-mode`
-    /// header value of `strict-arrival` or `strict-aged` overrides this flag
-    /// for that request on the OTLP HTTP and gRPC ingest paths (the header's
-    /// other values, and an absent or unknown header, mean "strict under
-    /// this flag's value"); Remote Write reads no header at all and is
-    /// always governed by this flag alone.
+    /// When a strict write's flush opens, process-wide (ADR-2793 decision
+    /// 1). `aged` (the default) flushes on the `--max-flush-delay` age
+    /// threshold or the size trigger, whichever comes first. `arrival`
+    /// opens the flush as soon as the write is buffered, or as soon as the
+    /// tenant's in-flight flush on that shard completes, which cuts strict
+    /// write latency at the cost of more object-store PUTs. The
+    /// acknowledgement contract is the same under both. On OTLP HTTP, OTLP
+    /// gRPC and OTAP, the `x-ravel-ingest-mode` header values
+    /// `strict-arrival` and `strict-aged` override this flag for one
+    /// request; `strict`, an absent header, and an unknown value use it, and
+    /// `buffered` is unaffected. Prometheus Remote Write reads no header
+    /// and always uses this flag.
     #[arg(
         long = "strict-flush-policy",
         value_enum,
