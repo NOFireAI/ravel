@@ -18370,4 +18370,22 @@ mod tests {
         let resolved = all.resolve_performance(large).expect("8 GiB starts");
         assert_eq!(resolved.memory_overhead_reserve_ingest_limit, None);
     }
+
+    #[test]
+    fn format_window_check_defaults_to_warn_and_parses_both_values() {
+        let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
+        assert_eq!(cli.format_window_check, FormatWindowCheck::Warn);
+        for (value, expected) in [
+            ("warn", FormatWindowCheck::Warn),
+            ("refuse", FormatWindowCheck::Refuse),
+        ] {
+            let cli =
+                Cli::parse_validated_from(["ravel-server", "--format-window-check", value])
+                    .expect("a known value validates");
+            assert_eq!(cli.format_window_check, expected, "{value}");
+        }
+        let err = Cli::parse_validated_from(["ravel-server", "--format-window-check", "ignore"])
+            .expect_err("an unknown value is rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
 }
