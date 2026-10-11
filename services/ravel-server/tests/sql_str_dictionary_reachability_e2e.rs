@@ -9,7 +9,9 @@
 //! one object: a `web` stream whose records set `Region` from a pool of three
 //! values, over several blocks, and a `batch` stream whose records omit
 //! `Region` and whose resource carries `Region = "emea"`, so those rows read
-//! the resource value.
+//! the resource value. The two streams fill exactly three default-size blocks,
+//! so the `batch` rows share a block, and its dictionary page, with `web`
+//! rows.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -37,10 +39,11 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// The `web` stream's `Region` values, assigned round robin.
 const POOL: [&str; 3] = ["apac", "eu", "us"];
-/// Rows of the `web` stream: three default-size blocks' worth.
-const WEB_ROWS: usize = 3 * 8192;
 /// Rows of the `batch` stream, none of which sets `Region`.
 const BATCH_ROWS: usize = 10;
+/// Rows of the `web` stream: with the `batch` rows, three default-size
+/// blocks' worth.
+const WEB_ROWS: usize = 3 * 8192 - BATCH_ROWS;
 /// The `batch` stream's resource value of `Region`.
 const FALLBACK: &str = "emea";
 
@@ -197,10 +200,11 @@ impl Fixture {
         );
     }
 
-    /// The written object's blocks, and the values arrays a scan of `Region`
-    /// builds over them: one per distinct dictionary its blocks read, plus one
-    /// per block whose `Region` cells are not on a dictionary page.
-    async fn region_layout(&self) -> (usize, u64) {
+    /// How the written object lays out `Region`: its blocks, the distinct
+    /// dictionaries they read, the blocks whose `Region` cells are not on a
+    /// dictionary page, and the dictionary-page blocks holding a row that sets
+    /// no `Region` (the `batch` rows).
+    async fn region_layout(&self) -> (usize, usize, usize, usize) {
         let keys = self.data_keys().await;
         assert_eq!(keys.len(), 1, "one data object");
         let key = keys.first().expect("one key");
@@ -216,7 +220,7 @@ impl Fixture {
             .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
             .expect("scan");
         let mut dicts: Vec<Arc<DictValues>> = Vec::new();
-        let (mut blocks, mut plain) = (0, 0);
+        let (mut blocks, mut plain, mut with_fallback) = (0, 0, 0);
         while let Some(view) = scan.next_block_columnar(&bytes).expect("columnar block") {
             blocks += 1;
             let page = view
@@ -228,11 +232,14 @@ impl Fixture {
                     if !dicts.iter().any(|d| Arc::ptr_eq(d, page.values())) {
                         dicts.push(Arc::clone(page.values()));
                     }
+                    if (0..view.surviving_count()).any(|i| page.key_at(i).is_none()) {
+                        with_fallback += 1;
+                    }
                 }
                 None => plain += 1,
             }
         }
-        (blocks, dicts.len() as u64 + plain)
+        (blocks, dicts.len(), plain, with_fallback)
     }
 
     /// `POST /api/v1/sql` over a window around every exported row.
@@ -332,13 +339,14 @@ fn str_dict_values_built(value: &serde_json::Value) -> u64 {
 /// GROUP BY and COUNT(DISTINCT) over the declared `Region` column equal the
 /// counts computed from the written records, the `batch` stream's rows
 /// grouped under its resource value. The column keeps its
-/// `Dictionary(Int32, Utf8)` type, and each statement builds one values
-/// array per dictionary its scan reads plus one per plain-page block, fewer
-/// than the blocks it reads.
+/// `Dictionary(Int32, Utf8)` type. The object is three blocks on one row group
+/// dictionary, the last also holding the `batch` rows, and each statement
+/// builds 2 values arrays: the dictionary's, and that dictionary with the
+/// resource value appended for the block whose rows read it.
 ///
 /// Flipped: `StrValuesCache::values` in ravel-sql's `logs_scan.rs` looking
 /// up no cached entry rebuilds the values per block, and the counter reads
-/// one per block (4) instead.
+/// 4: one per block plus the appended copy.
 #[tokio::test]
 async fn declared_str_dictionary_answers_group_by_through_http() {
     let fx = Fixture::start().await;
@@ -384,13 +392,13 @@ async fn declared_str_dictionary_answers_group_by_through_http() {
         assert_eq!(row[0], serde_json::json!(FALLBACK), "{projected}");
     }
 
-    let (blocks, builds) = fx.region_layout().await;
-    assert!(
-        builds < blocks as u64,
-        "the web blocks share a row group dictionary: {builds} builds over {blocks} blocks"
+    assert_eq!(
+        fx.region_layout().await,
+        (3, 1, 0, 1),
+        "(blocks, dictionaries, plain-page blocks, dictionary blocks with batch rows)"
     );
     for value in [&grouped, &distinct] {
-        assert_eq!(str_dict_values_built(value), builds, "{value}");
+        assert_eq!(str_dict_values_built(value), 2, "{value}");
     }
 
     fx.running.shutdown().await.expect("graceful shutdown");
