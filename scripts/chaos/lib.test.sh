@@ -408,7 +408,13 @@ LOG_B_PRE_KILL="${SCRATCH}/b-pre-kill.log"
 LOG_B_STARTED="${SCRATCH}/b-started.log"
 { printf '%s\n' "${OTHER_LINE}"; start_line "${BUCKET_Y}"; } >"${LOG_B_STARTED}"
 
-interrupted() { local out rc=0; out="$(chaos_interrupted_bucket "$@")" || rc=$?; printf 'rc=%s %s\n' "${rc}" "${out}"; }
+interrupted() { local out rc=0; out="$(chaos_interrupted_buckets "$@")" || rc=$?; printf 'rc=%s %s\n' "${rc}" "$(printf '%s' "${out}" | tr '\n' ' ')"; }
+LOG_A_TWO_OPEN="${SCRATCH}/a-two-open.log"
+{ start_line "${BUCKET_X}"; start_line "${BUCKET_Y}"; } >"${LOG_A_TWO_OPEN}"
+check "interrupted: two merges open at the kill are both printed, in start order" \
+  "rc=0 ${BUCKET_X} ${BUCKET_Y}" "$(interrupted "${LOG_A_TWO_OPEN}")"
+check "interrupted: a bucket open twice is printed once" "rc=0 ${BUCKET_X}" \
+  "$(interrupted <({ start_line "${BUCKET_X}"; start_line "${BUCKET_X}"; }))"
 check "interrupted: the last start with no end line after it" "rc=0 ${BUCKET_Y}" \
   "$(interrupted "${LOG_A_MERGING}")"
 check "interrupted: a first merge with no end line at all" "rc=0 ${BUCKET_Y}" \
@@ -504,6 +510,17 @@ chaos_aws() {
     absent) printf 'None\n' ;;
     present) printf '%s00112233445566ff.cmt\t%s00112233445566ff.tmp\n' "${prefix}" "${prefix}" ;;
     error) return 255 ;;
+    # A record only under AWS_ONLY_BUCKET; the LIST of any other bucket is
+    # empty (or fails, with AWS_OTHERS=error).
+    only)
+      if [[ "${prefix}" == "${AWS_ONLY_BUCKET}l1." ]]; then
+        printf '%s00112233445566ff.cmt\n' "${prefix}"
+      elif [[ "${AWS_OTHERS:-absent}" == error ]]; then
+        return 255
+      else
+        printf 'None\n'
+      fi
+      ;;
   esac
 }
 records() { local out rc=0; out="$(chaos_compaction_records_under "$@")" || rc=$?; printf 'rc=%s %s\n' "${rc}" "${out}"; }
@@ -575,9 +592,9 @@ cons_detail() {
   )
 }
 check "classifier: a FAIL with B having started the bucket says so" "yes" \
-  "$(d="$(cons_detail "${LOG_B_STARTED}")"; [[ "${d}" == *"merge start of ${BUCKET_Y}: yes; publish line: no;"* && "${d}" == *"merge durations: n=0 p50=none max=none"* ]] && echo yes || echo no)"
+  "$(d="$(cons_detail "${LOG_B_STARTED}")"; [[ "${d}" == *"${BUCKET_Y}: no record, survivor start yes, publish no"* && "${d}" == *"merge durations: n=0 p50=none max=none"* ]] && echo yes || echo no)"
 check "classifier: a FAIL with B never having started the bucket says so" "yes" \
-  "$(d="$(cons_detail "${LOG_B_SILENT}")"; [[ "${d}" == *"merge start of ${BUCKET_Y}: no; publish line: no;"* ]] && echo yes || echo no)"
+  "$(d="$(cons_detail "${LOG_B_SILENT}")"; [[ "${d}" == *"${BUCKET_Y}: no record, survivor start no, publish no"* ]] && echo yes || echo no)"
 check "classifier: the oracle logs the durations line" "yes" \
   "$(d="$(CHAOS_KILL_ON_GAUGE=1 oracle_conservation_or_unmeasured "${LOG_DUR_A}" http://stub 1 "${LOG_DUR_B}" 0 2>&1 >/dev/null)"; [[ "${d}" == *'conservation: merge durations: n=3 p50=4.000 max=10.000'* ]] && echo yes || echo no)"
 check "classifier: gauge never seen is could-not-measure (3)" "3" \
@@ -679,6 +696,33 @@ check "summary: A interrupted in Y, Y's record in the store, B silent is exit 0"
   "$(AWS_MODE=present scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SILENT}" 1 "")"
 check "summary: a LIST that fails with nothing else failed exits 3" "rc=3 conservation-fail=0" \
   "$(AWS_MODE=error scenario2_summary "${LOG_A_MERGING}" "${LOG_B_SAME}" 1 "")"
+# A had X and Y open at the kill. A survivor that recovers only Y must not
+# pass: conservation has to hold for every merge the kill interrupted.
+check "summary: two buckets open at the kill, a record only for the later one is exit 2" \
+  "rc=2 conservation-fail=1" \
+  "$(AWS_MODE=only AWS_ONLY_BUCKET="${BUCKET_Y}" scenario2_summary "${LOG_A_TWO_OPEN}" "${LOG_B_SILENT}" 1 "")"
+check "summary: two buckets open at the kill, a record only for the earlier one is exit 2" \
+  "rc=2 conservation-fail=1" \
+  "$(AWS_MODE=only AWS_ONLY_BUCKET="${BUCKET_X}" scenario2_summary "${LOG_A_TWO_OPEN}" "${LOG_B_SILENT}" 1 "")"
+check "summary: two buckets open at the kill, records for both is exit 0" "rc=0 conservation-fail=0" \
+  "$(AWS_MODE=present scenario2_summary "${LOG_A_TWO_OPEN}" "${LOG_B_SILENT}" 1 "")"
+check "summary: two buckets open, one recorded and the other's LIST fails is exit 3" \
+  "rc=3 conservation-fail=0" \
+  "$(AWS_MODE=only AWS_ONLY_BUCKET="${BUCKET_Y}" AWS_OTHERS=error scenario2_summary "${LOG_A_TWO_OPEN}" "${LOG_B_SILENT}" 1 "")"
+two_open_detail() {
+  ORACLE_PASS=()
+  ORACLE_FAIL=()
+  ORACLE_UNMEASURED=()
+  AWS_MODE=only AWS_ONLY_BUCKET="${BUCKET_Y}" CHAOS_KILL_ON_GAUGE=1 \
+    oracle_conservation_or_unmeasured "${LOG_A_TWO_OPEN}" http://stub 1 "${LOG_B_SILENT}" 1 >/dev/null 2>&1 || true
+  printf '%s\n' "${ORACLE_FAIL[@]}"
+}
+check "conservation: the FAIL detail names each open bucket's verdict" "yes" \
+  "$(d="$(two_open_detail)"; [[ "${d}" == *"1 of 2 interrupted bucket(s)"* && "${d}" == *"${BUCKET_X}: no record"* && "${d}" == *"${BUCKET_Y}: 1 record(s)"* ]] && echo yes || echo no)"
+check "scenario 2 stops its load at a deadline, not only at the export count" "yes" \
+  "$([[ "$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")" == *'>= CHAOS_MAINTAIN_LOAD_MAX_SECONDS'* ]] && echo yes || echo no)"
+check "scenario 2 goes on after a partly rejected load and stops only below the minimum" "yes" \
+  "$(b="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"; [[ "${b}" == *'"$SENT" -lt "$CHAOS_MAINTAIN_MIN_EXPORTS"'* && "${b}" != *'"$SENT" -lt "$EXPORT_COUNT"'* ]] && echo yes || echo no)"
 
 scenario2_body="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"
 universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"

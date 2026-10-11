@@ -144,9 +144,9 @@ if [[ "$MODE" == "check" ]]; then
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
   echo "mid-compaction trigger: worker A ravel_maintain_compactions_in_flight>=1, scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape"
-  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance, ended early by a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'), then a store LIST of <bucket>l1. for a compaction record of the bucket worker A's latest unended '${CHAOS_COMPACTION_START_MARKER}' names"
+  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance, ended early by a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'), then a store LIST of <bucket>l1. for a compaction record of every bucket an unended '${CHAOS_COMPACTION_START_MARKER}' in worker A's log names"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
-  echo "load: ${EXPORT_COUNT} exports of ${CHAOS_MAINTAIN_FIXTURE_SERIES} series x ${CHAOS_MAINTAIN_FIXTURE_POINTS} points, at most one per ${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS}s"
+  echo "load: ${EXPORT_COUNT} exports of ${CHAOS_MAINTAIN_FIXTURE_SERIES} series x ${CHAOS_MAINTAIN_FIXTURE_POINTS} points, at most one per ${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS}s, stopped at ${CHAOS_MAINTAIN_LOAD_MAX_SECONDS}s, at least ${CHAOS_MAINTAIN_MIN_EXPORTS} accepted to go on"
   echo "seal wait: end of the ingest server's exit hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
   rc=0
   check_dependencies || rc=$?
@@ -241,15 +241,25 @@ chaos_wait_for "ingest server to accept connections" 60 ingest_reachable
 # A fresh fixture per export: identical bytes would carry identical
 # timestamps, and deduplication would fold the repeats into one export's data.
 SENT=0
+ATTEMPTED=0
 LAST_ACK_UNIX_S=""
+LOAD_START_S="$(date +%s)"
 # The pacing sleep runs beside each export, so an iteration lasts at least
 # CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS. A strict-ack export normally takes
 # longer than that (see the sizing note in lib.sh), so this is a floor that
-# keeps the load under the ingest byte rate, not the load's pace.
+# keeps the load under the ingest byte rate, not the load's pace. The load
+# stops at CHAOS_MAINTAIN_LOAD_MAX_SECONDS whatever count it has reached, so
+# a slower ingest shrinks the load instead of pushing the job past its
+# timeout with no verdict.
 for _ in $(seq 1 "$EXPORT_COUNT"); do
+  if (( $(date +%s) - LOAD_START_S >= CHAOS_MAINTAIN_LOAD_MAX_SECONDS )); then
+    log "load deadline: ${CHAOS_MAINTAIN_LOAD_MAX_SECONDS}s reached after ${ATTEMPTED}/${EXPORT_COUNT} exports"
+    break
+  fi
   sleep "$CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS" &
   PACE_PID=$!
   chaos_gen_fixture "$CHAOS_MAINTAIN_FIXTURE_SERIES" "$CHAOS_MAINTAIN_FIXTURE_POINTS" > "$FIXTURE_PATH"
+  ATTEMPTED=$(( ATTEMPTED + 1 ))
   if drive_one_export "$INGEST_HTTP" "$FIXTURE_PATH" >/dev/null; then
     SENT=$(( SENT + 1 ))
     LAST_ACK_UNIX_S="$(chaos_now_unix_s)"
@@ -257,14 +267,20 @@ for _ in $(seq 1 "$EXPORT_COUNT"); do
   wait "$PACE_PID"
   PACE_PID=""
 done
-# Every export must land: the seal wait is paid for a known compaction input,
-# and a rejected export (a 429 under the ingest byte rate, say) would shrink
-# it with nothing else in the output to say so.
-if [[ "$SENT" -lt "$EXPORT_COUNT" ]]; then
-  log "only ${SENT}/${EXPORT_COUNT} exports were accepted; the compaction input is short"
+LOAD_SECONDS=$(( $(date +%s) - LOAD_START_S ))
+# The oracles key on the merges that actually ran, not on the export count,
+# so a short or partly rejected load is reported and the scenario goes on.
+# Below CHAOS_MAINTAIN_MIN_EXPORTS accepted exports (the 20-export load that
+# did compact in nightly run 38050587878) there may be nothing to merge, and
+# the scenario stops as could-not-measure.
+if [[ "$SENT" -lt "$CHAOS_MAINTAIN_MIN_EXPORTS" ]]; then
+  log "only ${SENT}/${ATTEMPTED} exports were accepted in ${LOAD_SECONDS}s, below the ${CHAOS_MAINTAIN_MIN_EXPORTS} minimum; the compaction input is too short"
   exit 3
 fi
-log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server (last ack at unix ${LAST_ACK_UNIX_S})"
+if [[ "$SENT" -lt "$ATTEMPTED" ]]; then
+  log "warning: $(( ATTEMPTED - SENT ))/${ATTEMPTED} exports were rejected"
+fi
+log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports (${ATTEMPTED} attempted) in ${LOAD_SECONDS}s, $(awk -v s="$LOAD_SECONDS" -v n="$ATTEMPTED" 'BEGIN { if (n > 0) printf "%.2f", s / n; else printf "n/a" }')s each (last ack at unix ${LAST_ACK_UNIX_S})"
 
 # Stop ingest before the wait, so nothing writes into a later hour while the
 # scenario waits for the hours it wrote to seal.
@@ -328,7 +344,7 @@ WORKER_A_PID=""
 B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"
 log "worker A max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}; /metrics scrapes: ${CHAOS_COMPACTION_POLLS:-0} in $(( KILL_EPOCH - INFLIGHT_WAIT_START ))s"
 log "$(chaos_worker_activity_line worker-a "$WORKER_A_LOG")"
-log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; worker A's interrupted bucket: $(chaos_interrupted_bucket "$WORKER_A_LOG" || echo none)"
+log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; worker A's interrupted buckets: $(chaos_interrupted_buckets "$WORKER_A_LOG" | tr '\n' ' ' || true)"
 
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
