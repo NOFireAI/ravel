@@ -1,8 +1,9 @@
-//! ADR-2633 section 4, as amended for issue #2806: every memory gate family
-//! appears on a scraped `/metrics`, reading the server's own process memory
-//! budget and the sampler thread's stats. Before the sampler starts, all
-//! four gate gauges read the off state; once it runs, they carry its
-//! readings.
+//! ADR-2633 section 4, as amended for issues #2806 and #2838: every memory
+//! gate family appears on a scraped `/metrics`, reading the server's own
+//! process memory budget and the sampler thread's stats. Before the sampler
+//! starts, all four gate gauges read the off state; once it runs, they
+//! carry its readings, and the sub-floor sample counter moves with every
+//! reading below the close floor.
 //!
 //! The sampler reads host available memory from `/proc/meminfo`, so this
 //! runs on Linux only; on every other target the gate resolves off and the
@@ -110,7 +111,7 @@ async fn scrape(client: &reqwest::Client, base: &str) -> String {
 /// Each family, its type, and a phrase its HELP line must carry: the one
 /// that tells it from its neighbour (the two floors, the two refusal
 /// counters), so a renderer that swaps two families' text fails here.
-const FAMILIES: [(&str, &str, &str); 10] = [
+const FAMILIES: [(&str, &str, &str); 11] = [
     (
         "ravel_memory_gate_available_bytes",
         "gauge",
@@ -140,6 +141,11 @@ const FAMILIES: [(&str, &str, &str); 10] = [
         "ravel_memory_gate_samples_total",
         "counter",
         "Memory gate samples that read host available memory",
+    ),
+    (
+        "ravel_memory_gate_samples_below_floor_total",
+        "counter",
+        "whether or not the sample closed the gate",
     ),
     (
         "ravel_memory_gate_epoch_refresh_seconds_total",
@@ -213,11 +219,13 @@ fn assert_every_family(body: &str) {
 }
 
 /// Floors above any host's available memory put every reading below both,
-/// so each sample closes the gate, the first one purges, and the scrape
-/// shows the purge, the readings and both floors. The floors are 4 and 8
-/// PiB: above any host, and each exactly representable as an f64 and
-/// distinct from the other once rendered, so a renderer that swaps the two
-/// floor families fails the value assertions below.
+/// so every sample is below the close floor, the third consecutive one
+/// closes the gate at the default `close_after_samples`, the first one
+/// purges, and the scrape shows the purge, the readings, both floors and
+/// the sub-floor sample count. The floors are 4 and 8 PiB: above any host,
+/// and each exactly representable as an f64 and distinct from the other
+/// once rendered, so a renderer that swaps the two floor families fails the
+/// value assertions below.
 #[tokio::test]
 async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
     const CLOSE_FLOOR: u64 = 1 << 52;
@@ -249,6 +257,7 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         purge_available_bytes: PURGE_FLOOR,
         purge_min_interval_ms: memory_gate::MIN_PURGE_MIN_INTERVAL_MS,
         interval_ms: 10,
+        close_after_samples: memory_gate::DEFAULT_CLOSE_AFTER_SAMPLES,
         wait_ms: memory_gate::DEFAULT_WAIT_MS,
         memory_budget_bytes: 100,
         available_source: HostMemorySource::MemInfo,
@@ -257,17 +266,25 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
     let budget = running.process_memory_budget();
     assert!(memory_gate::start_sampler(&gate, budget.clone()).expect("sampler thread spawns"));
 
+    let close_after = f64::from(memory_gate::DEFAULT_CLOSE_AFTER_SAMPLES);
     let deadline = Instant::now() + Duration::from_secs(30);
     let body = loop {
         let body = scrape(&client, &base).await;
         // The sampler records the purge before it writes the gate, so a scrape
         // between the two reads the count with the budget's gauges still at 0.
+        // It writes the gate before it counts the sub-floor sample, so a
+        // scrape that reads the count at the close threshold reads a closed
+        // gate.
         if value(&body, "ravel_memory_gate_purge_seconds_count") >= 1.0
             && value(&body, "ravel_memory_gate_available_floor_bytes") >= 1.0
+            && value(&body, "ravel_memory_gate_samples_below_floor_total") >= close_after
         {
             break body;
         }
-        assert!(Instant::now() < deadline, "no purge within 30 s:\n{body}");
+        assert!(
+            Instant::now() < deadline,
+            "no purge and {close_after} sub-floor samples within 30 s:\n{body}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_every_family(&body);
@@ -312,15 +329,24 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         .parse()
         .expect("bucket count parses");
     assert_eq!(inf_count, purges, "{body}");
+    let samples = value(&body, "ravel_memory_gate_samples_total");
+    assert!(samples >= purges, "{body}");
+    // Every sample is below the close floor, so the sub-floor count tracks
+    // the sample count, at most one behind when the scrape lands between
+    // the two increments of one sample.
+    let below_floor = value(&body, "ravel_memory_gate_samples_below_floor_total");
     assert!(
-        value(&body, "ravel_memory_gate_samples_total") >= purges,
-        "{body}"
+        below_floor >= close_after && below_floor <= samples && below_floor >= samples - 1.0,
+        "samples_below_floor {below_floor} against samples {samples}:\n{body}"
     );
     assert!(
         value(&body, "ravel_memory_gate_epoch_refresh_seconds_total") > 0.0,
         "{body}"
     );
-    assert!(!budget.gate_open());
+    assert!(
+        !budget.gate_open(),
+        "{close_after} consecutive sub-floor samples close the gate"
+    );
     assert_eq!(budget.gate_floor(), CLOSE_FLOOR);
 
     // A reservation against the closed gate counts on the reserve site of
