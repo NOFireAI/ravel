@@ -453,6 +453,10 @@ jobs:
       # something rather than by nothing.
       - name: Duplicate-work guard cases
         run: bash scripts/guards/check-duplicate-work.test.sh
+      # Fixture git repositories with a main and a forked branch; git only,
+      # no network (issue #2811).
+      - name: Post-fork struct literal and call site guard cases
+        run: bash scripts/guards/assert-struct-literals-current.test.sh
       # The orchestration guards. Each of these suites drives the real script
       # against stubbed `gh` (and, for the pre-push hook, real local
       # repositories), so they need no toolchain and no network.

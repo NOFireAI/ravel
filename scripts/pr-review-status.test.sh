@@ -350,6 +350,17 @@ esac
 SHIM
 chmod +x "${E2E_DIR}/bin/git"
 
+# Stand-in for assert-struct-literals-current.sh, which has its own suite
+# against real git. Clean by default, so every case above is unaffected;
+# E2E_STRUCT_RC and E2E_STRUCT_OUT drive the cases at the end.
+cat >"${E2E_DIR}/bin/struct-guard" <<'SHIM'
+#!/usr/bin/env bash
+[[ -n "${FIXTURES:-}" ]] && echo "$*" >>"${FIXTURES}/struct-args.log"
+[[ -n "${E2E_STRUCT_OUT:-}" ]] && printf '%s\n' "${E2E_STRUCT_OUT}"
+exit "${E2E_STRUCT_RC:-0}"
+SHIM
+chmod +x "${E2E_DIR}/bin/struct-guard"
+
 # Everything except the review body is held constant and clean: CI green,
 # mergeState CLEAN, one COMMENTED review at head, zero inline comments, and a
 # task comment saying the review for the head was posted. So the only thing
@@ -393,6 +404,7 @@ e2e() {
   local default_rules='[{"type":"pull_request"},{"type":"required_status_checks"}]'
   printf '%s\n' "${E2E_RULES:-$default_rules}" >"${fx}/rules.json"
   FIXTURES="${fx}" PATH="${E2E_DIR}/bin:${PATH}" \
+    PR_REVIEW_STATUS_STRUCT_GUARD="${E2E_STRUCT_GUARD:-${E2E_DIR}/bin/struct-guard}" \
     bash "${E2E_SCRIPT:-$(dirname "$0")/pr-review-status.sh}" 908 "$@"
 }
 
@@ -1070,6 +1082,53 @@ check_eq "one pass beside one skip: both counted, separately" \
 check_eq "one pass beside one skip: the verdict still says CI green" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${mixed_out}" | sed -n 2p)"
+
+# The post-fork shape guard (issue #2811) sits last before the merge line. A
+# hit refuses the merge line outright; a guard that could not answer prints a
+# warning but keeps the line, since "could not check" is not "clean" and must
+# not hide the command either.
+STRUCT_HIT="guard:   src/server/audit.rs: struct ServerConfig literal (line 2; changed on origin/main by ab46fe9 feat(server): audit wiring (#2809))"
+MERGE_LINE="  -> scripts/guards/assert-fresh-merge-base.sh 908 origin main && ALLOW_LITERAL_SHA=1 gh pr merge 908 --rebase --match-head-commit ${SHA}"
+
+struct_clean_out="$(e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard: asked about the pull request head against origin/<base>" \
+  "refs/pull/908/head origin/main" "$(cat "${E2E_DIR}/fx/struct-args.log")"
+check_eq "shape guard clean: output is the clean verdict and the merge line, nothing more" \
+  "$(printf '%s\n%s' "  -> clean: CI green, review at the current head with zero findings" "${MERGE_LINE}")" \
+  "$(printf '%s\n' "${struct_clean_out}" | sed -n '2,$p')"
+
+struct_hit_out="$(E2E_STRUCT_RC=1 E2E_STRUCT_OUT="${STRUCT_HIT}" e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard exit 1: refuses with the rebase advice" \
+  "  -> code landed on origin/main after this PR forked still uses a shape the PR changes; rebase onto origin/main, update the site, and let CI re-run before merging" \
+  "$(printf '%s\n' "${struct_hit_out}" | sed -n 2p)"
+check_eq "shape guard exit 1: prints the guard's finding" \
+  "       src/server/audit.rs: struct ServerConfig literal (line 2; changed on origin/main by ab46fe9 feat(server): audit wiring (#2809))" \
+  "$(printf '%s\n' "${struct_hit_out}" | sed -n 3p)"
+check_eq "shape guard exit 1: no merge line" \
+  "0" "$(printf '%s\n' "${struct_hit_out}" | grep -c 'gh pr merge' || true)"
+
+# A merge queue does not lift it: the queue's rebase is where the break shows.
+struct_queue_out="$(E2E_RULES="${QUEUE_RULES}" E2E_STRUCT_RC=1 E2E_STRUCT_OUT="${STRUCT_HIT}" e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard exit 1 under a merge queue: no merge line" \
+  "0" "$(printf '%s\n' "${struct_queue_out}" | grep -c 'gh pr merge' || true)"
+
+struct_err_out="$(E2E_STRUCT_RC=2 E2E_STRUCT_OUT="guard: git fetch origin main failed" e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard exit 2: warns" \
+  "  -> WARNING: could not check for post-fork struct literals and call sites (guard exit 2), which is not the same as none; check by hand before running the merge line" \
+  "$(printf '%s\n' "${struct_err_out}" | sed -n 3p)"
+check_eq "shape guard exit 2: prints the guard's output" \
+  "     git fetch origin main failed" "$(printf '%s\n' "${struct_err_out}" | sed -n 4p)"
+check_eq "shape guard exit 2: the merge line is still printed, last" \
+  "${MERGE_LINE}" "$(printf '%s\n' "${struct_err_out}" | sed -n '$p')"
+
+# A checkout behind the commit that added the guard has no such file: 127 from
+# the shell, which must read as could-not-check, never as clean or as a hit.
+struct_missing_out="$(E2E_STRUCT_GUARD="${E2E_DIR}/no-such-guard" e2e "${CLEAN_BODY_JSON}")"
+check_eq "shape guard missing: warns with exit 127" \
+  "  -> WARNING: could not check for post-fork struct literals and call sites (guard exit 127), which is not the same as none; check by hand before running the merge line" \
+  "$(printf '%s\n' "${struct_missing_out}" | sed -n 3p)"
+check_eq "shape guard missing: the merge line is still printed, last" \
+  "${MERGE_LINE}" "$(printf '%s\n' "${struct_missing_out}" | sed -n '$p')"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

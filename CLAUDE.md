@@ -620,6 +620,30 @@ than passing for "no pull request open".
   hand-rolled version using `git fetch origin main <other-ref>` and then
   `rev-parse FETCH_HEAD` reads back MAIN, so it compares main with itself
   and reports every branch fresh.
+- `scripts/guards/assert-struct-literals-current.sh <branch> [base]`:
+  refuses a branch whose change to a struct's field set (a field added,
+  removed, or its type or visibility changed; a reorder is not a change) or
+  to a function's parameter count or `self` receiver breaks a `Name {`
+  literal or a `name(` call in a `.rs` file that landed on `[base]`
+  (default `origin/main`, fetched with an explicit destination refspec)
+  after the branch forked and that the branch does not touch. Exit 1 names
+  each file, line and landing commit and says to rebase and update the
+  site; 0 prints one line saying how many structs, functions and post-fork
+  files it checked; 2 is could-not-answer (a git failure, an unknown ref),
+  never 0; 64 is usage. Both halves of this break are green on their own
+  base and it surfaces only when the merge queue rebases, at the cost of a
+  CI cycle and a review round. Two instances on 2026-10-11: #2804 made
+  `ServerConfig.audit_pipeline` an `Option` while #2809 landed a literal
+  of the old shape (E0308), and #2842 gave `set_host_memory_gate` a third
+  argument while #2841 landed six two-argument calls (E0061). It is
+  textual and over-approximates on purpose: a pattern match on `Name {`
+  or a different function sharing the identifier is reported too, which
+  costs one grep, while a miss costs a queue cycle; renames and tuple
+  structs are out of scope. `scripts/pr-review-status.sh` runs it for the
+  pull request head before the merge line: exit 1 withholds the line, any
+  other non-zero prints a warning and keeps it. Cases in
+  `scripts/guards/assert-struct-literals-current.test.sh`, run by
+  `gates.sh` and CI's doc-scripts job.
 - `scripts/guards/assert-gh-auth.sh [hostname]`: exits non-zero when gh
   cannot complete an authenticated API call. Run it before any landing
   sequence: tokens die mid-session, and a failure found at push time
