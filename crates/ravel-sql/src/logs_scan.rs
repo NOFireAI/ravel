@@ -309,6 +309,7 @@ use datafusion::arrow::array::{
     Int64Builder, MapBuilder, NullBufferBuilder, StringArray, StringBuilder,
     StringDictionaryBuilder, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
+use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::ColumnStatistics;
@@ -3169,6 +3170,7 @@ impl ExecutionPlan for LogsScanExec {
             reservation,
             held: 0,
             emitted: 0,
+            str_values_charge: 0,
             pending: Pending::None,
             row_refs: self.row_refs,
             current_seg: None,
@@ -4516,8 +4518,8 @@ enum Pending {
     /// borrows the scan) is dropped before the next block is decoded. The
     /// decoded block itself is still resident behind the reader until then; it
     /// is charged in `LogScanStream::resident`, not in the charge for these
-    /// batches.
-    Batches(VecDeque<RecordBatch>),
+    /// batches. Each batch carries its own charge ([`columnar_charges`]).
+    Batches(VecDeque<(RecordBatch, usize)>),
 }
 
 /// The address a run of consecutive output rows carries in the synthetic
@@ -4648,8 +4650,12 @@ struct LogScanStream {
     columnar_eligible: bool,
     blocks: BlockMetrics,
     /// The Arrow values of the shared string dictionaries this partition's
-    /// columnar blocks read, built once per dictionary (ADR-2773 decision D3).
+    /// columnar blocks read, built once per dictionary and fallback list
+    /// (ADR-2773 decision D3).
     str_values: SharedStrValuesCache,
+    /// Reservation bytes covering the live entries of [`Self::str_values`],
+    /// charged once per entry rather than once per batch sharing it.
+    str_values_charge: usize,
     /// This stream's DataFusion partition index. Together with the shared
     /// [`PlanCounts`] it determines which `(segment, block-index-list)` units
     /// this partition owns (ADR-0102).
@@ -5133,12 +5139,11 @@ impl LogScanStream {
                 "emit_next_columnar_batch called without columnar batches held".into(),
             ));
         };
-        let Some(batch) = queue.pop_front() else {
+        let Some((batch, bytes)) = queue.pop_front() else {
             return Err(DataFusionError::Internal(
                 "emit_next_columnar_batch called on an empty queue".into(),
             ));
         };
-        let bytes = batch.get_array_memory_size();
         // The batch's bytes were reserved as part of `held`; moving it
         // downstream relabels that charge rather than growing or releasing it.
         self.held = self.held.saturating_sub(bytes);
@@ -5159,17 +5164,46 @@ impl LogScanStream {
     }
 
     /// Take ownership of one block's pre-built columnar batches, charging the
-    /// pool for their total Arrow footprint. The decoded block they were built
-    /// from is charged separately, in [`Self::resident`].
+    /// pool for their Arrow footprint as [`columnar_charges`] splits it. The
+    /// decoded block they were built from is charged separately, in
+    /// [`Self::resident`], and the shared dictionary values the scan's
+    /// [`StrValuesCache`] holds in [`Self::str_values_charge`], resized here to
+    /// the cache's live entries.
     ///
-    /// [`Self::emit_next_columnar_batch`] moves each emitted batch's bytes
-    /// from `held` to `emitted`.
+    /// [`Self::emit_next_columnar_batch`] moves each emitted batch's own
+    /// charge from `held` to `emitted`; the block's shared values stay in
+    /// `held` until [`Self::release_block`].
     fn hold_batches(&mut self, batches: Vec<RecordBatch>) -> DFResult<()> {
-        let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-        self.reservation.try_grow(bytes)?;
+        let (charged, shared, live) = {
+            let mut cache = lock_str_values(&self.str_values);
+            let live = cache.live_bytes();
+            let (charged, shared) = columnar_charges(batches, &cache);
+            (charged, shared, live)
+        };
+        self.release_dead_str_values(live);
+        let bytes = charged.iter().map(|(_, c)| c).sum::<usize>() + shared;
+        let growth = live.saturating_sub(self.str_values_charge);
+        self.reservation.try_grow(bytes + growth)?;
+        self.str_values_charge += growth;
         self.held = bytes;
-        self.pending = Pending::Batches(batches.into());
+        self.pending = Pending::Batches(charged);
         Ok(())
+    }
+
+    /// Shrink [`Self::str_values_charge`] to `live` when the cache's live
+    /// entries have fallen below it.
+    fn release_dead_str_values(&mut self, live: usize) {
+        if live < self.str_values_charge {
+            self.reservation.shrink(self.str_values_charge - live);
+            self.str_values_charge = live;
+        }
+    }
+
+    /// Drop every shared dictionary values array the scan's cache holds and
+    /// release their charge: the stream has nothing left to read them for.
+    fn release_str_values(&mut self) {
+        lock_str_values(&self.str_values).entries.clear();
+        self.release_dead_str_values(0);
     }
 
     /// True when the current block still has a batch to emit.
@@ -5260,6 +5294,8 @@ impl LogScanStream {
     fn finish_segment(&mut self) {
         self.current_dirs = None;
         self.state = LogScanState::NextSegment;
+        let live = lock_str_values(&self.str_values).live_bytes();
+        self.release_dead_str_values(live);
     }
 
     /// This partition has emitted its pushed `fetch` rows: stop, mid-segment
@@ -5299,6 +5335,7 @@ impl LogScanStream {
         self.prefetch_pool.clear(self.partition);
         self.release_block();
         self.resident.free();
+        self.release_str_values();
     }
 
     /// Abandon the stream on error, releasing everything the scan still holds.
@@ -5309,6 +5346,7 @@ impl LogScanStream {
         self.prefetch_pool.clear(self.partition);
         self.release_block();
         self.resident.free();
+        self.release_str_values();
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         Poll::Ready(Some(Err(e)))
     }
@@ -5586,6 +5624,7 @@ impl LogScanStream {
                         }
                         None => {
                             this.state = LogScanState::Done;
+                            this.release_str_values();
                         }
                     }
                 }
@@ -6285,8 +6324,8 @@ thread_local! {
 }
 
 /// A `Str` cell's bytes as text, or `None` when they are not UTF-8. The
-/// columnar path validates every attribute `Str` cell and dictionary entry
-/// through here.
+/// columnar path validates every plain-page attribute `Str` cell through here;
+/// a dictionary page's entries were validated when the reader decoded them.
 fn cell_text(bytes: &[u8]) -> Option<&str> {
     #[cfg(test)]
     CELL_TEXT_VALIDATIONS.with(|n| n.set(n.get() + 1));
@@ -6385,7 +6424,7 @@ impl StrValuesCache {
         let at = match self.entries.iter().position(|e| Arc::ptr_eq(&e.dict, dict)) {
             Some(at) => at,
             None => {
-                self.entries.retain(|e| Arc::strong_count(&e.dict) > 1);
+                self.retain_live();
                 self.built.add(1);
                 self.entries.push(SharedStrValues {
                     dict: Arc::clone(dict),
@@ -6402,10 +6441,73 @@ impl StrValuesCache {
         if let Some((_, values)) = entry.extended.iter().find(|(e, _)| *e == extra) {
             return Arc::clone(values);
         }
+        self.built.add(1);
         let values = dict_values_array(dict, &extra);
         entry.extended.push((extra, Arc::clone(&values)));
         values
     }
+
+    fn retain_live(&mut self) {
+        self.entries.retain(|e| Arc::strong_count(&e.dict) > 1);
+    }
+
+    /// The Arrow bytes of every array the live entries hold, after dropping
+    /// the entries whose row group the reader has moved past.
+    fn live_bytes(&mut self) -> usize {
+        self.retain_live();
+        self.arrays().map(|a| a.get_array_memory_size()).sum()
+    }
+
+    /// Whether `values` is one of the arrays this cache holds.
+    fn owns(&self, values: &ArrayRef) -> bool {
+        self.arrays().any(|a| Arc::ptr_eq(a, values))
+    }
+
+    fn arrays(&self) -> impl Iterator<Item = &ArrayRef> {
+        self.entries
+            .iter()
+            .flat_map(|e| std::iter::once(&e.values).chain(e.extended.iter().map(|(_, v)| v)))
+    }
+}
+
+/// Each of one block's columnar batches paired with its pool charge, and the
+/// charge for the dictionary values its batches share.
+///
+/// A batch is charged its Arrow footprint less the values of each dictionary
+/// column. Those values are shared by every chunk of the block, and a row group
+/// dictionary's by every block of its group, so `get_array_memory_size` would
+/// count them once per batch. A values array the scan's [`StrValuesCache`]
+/// holds is charged once per cache entry, by [`LogScanStream::hold_batches`];
+/// any other is charged once for the block, in the returned total.
+fn columnar_charges(
+    batches: Vec<RecordBatch>,
+    cache: &StrValuesCache,
+) -> (VecDeque<(RecordBatch, usize)>, usize) {
+    use datafusion::arrow::array::{Array, AsArray};
+    let mut seen: Vec<ArrayRef> = Vec::new();
+    let mut shared = 0;
+    let charged = batches
+        .into_iter()
+        .map(|batch| {
+            let mut charge = 0;
+            for column in batch.columns() {
+                let bytes = column.get_array_memory_size();
+                let Some(dict) = column.as_any_dictionary_opt() else {
+                    charge += bytes;
+                    continue;
+                };
+                let values = dict.values();
+                let values_bytes = values.get_array_memory_size();
+                charge += bytes.saturating_sub(values_bytes);
+                if !cache.owns(values) && !seen.iter().any(|v| Arc::ptr_eq(v, values)) {
+                    shared += values_bytes;
+                    seen.push(Arc::clone(values));
+                }
+            }
+            (batch, charge)
+        })
+        .collect();
+    (charged, shared)
 }
 
 /// A partition scan's [`StrValuesCache`], shared by the block jobs it submits.
@@ -6417,9 +6519,8 @@ fn lock_str_values(cache: &SharedStrValuesCache) -> std::sync::MutexGuard<'_, St
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `dict`'s entries then `extra` as one `StringArray`. A dictionary whose
-/// entries are all UTF-8 is copied with no validation; one holding a non-UTF-8
-/// entry reads each entry through [`cell_text`], that entry as NULL.
+/// `dict`'s entries then `extra` as one `StringArray`, a non-UTF-8 entry as
+/// NULL. The entries' text was validated once when the dictionary decoded.
 fn dict_values_array(dict: &DictValues, extra: &[String]) -> ArrayRef {
     let extra = extra.iter().map(String::as_str);
     if dict.all_valid() {
@@ -6427,11 +6528,7 @@ fn dict_values_array(dict: &DictValues, extra: &[String]) -> ArrayRef {
             dict.texts().flatten().chain(extra),
         ))
     } else {
-        Arc::new(StringArray::from_iter(
-            (0..dict.len())
-                .map(|k| dict.entry(k).and_then(cell_text))
-                .chain(extra.map(Some)),
-        ))
+        Arc::new(StringArray::from_iter(dict.texts().chain(extra.map(Some))))
     }
 }
 
@@ -6955,7 +7052,7 @@ fn build_declared_str_columnar(
     };
     let built = if start <= end && end <= block.keys.len() {
         DictionaryArray::<Int32Type>::try_new(
-            block.keys.slice(start, end - start),
+            chunk_keys(&block.keys, start, end),
             Arc::clone(&block.values),
         )
         .map(|dict| Arc::new(dict) as ArrayRef)
@@ -6968,6 +7065,22 @@ fn build_declared_str_columnar(
     };
     resolver.str_block = Some(block);
     built
+}
+
+/// The keys of rows `start..end` (in bounds) in buffers of their own, so a
+/// chunk's footprint counts its own keys and not the whole block's. A chunk
+/// covering the block shares the block's buffers.
+fn chunk_keys(keys: &Int32Array, start: usize, end: usize) -> Int32Array {
+    use datafusion::arrow::array::Array;
+    if start == 0 && end == keys.len() {
+        return keys.clone();
+    }
+    let slice = keys.slice(start, end - start);
+    let nulls = slice
+        .nulls()
+        .filter(|n| n.null_count() > 0)
+        .map(|n| NullBuffer::new(n.iter().collect()));
+    Int32Array::new(slice.values().iter().copied().collect(), nulls)
 }
 
 /// The declared `Str` column for every surviving row of the block.
@@ -9918,23 +10031,59 @@ mod tests {
         (validations() - before, dict_page, cells)
     }
 
+    /// The synthetic per-key column (issue #1768) over `block` in two chunks:
+    /// the UTF-8 validations the build ran and the cells.
+    fn count_attr_key_build(block: &Block) -> (u64, Vec<Option<String>>) {
+        use datafusion::arrow::array::Array;
+        let cfg = cfg();
+        let obj = encode(block, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&window(block), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let n = view.surviving_count();
+        let before = validations();
+        let plan = AttrKeyPlan::build(&view, KEY);
+        let mut resolver = AttrKeyResolver::new(&plan);
+        let mut cache = HashMap::new();
+        let mut cells = Vec::new();
+        for (start, end) in [(0, n / 2), (n / 2, n)] {
+            let built = build_attr_key_columnar_array(&view, &mut resolver, start, end, &mut cache)
+                .expect("per-key array");
+            let strings = built
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 per-key column");
+            cells.extend(
+                (0..strings.len()).map(|i| strings.is_valid(i).then(|| strings.value(i).into())),
+            );
+        }
+        (validations() - before, cells)
+    }
+
     /// ADR-2121 D3: a declared `Str` cell's UTF-8 is validated at most once per
     /// block. On a plain page each surviving cell is validated once, whether
     /// the key has one occurrence (the fused read) or also an `I64` one (the
     /// presence search's validation is the text appended). On a dictionary page
-    /// each entry is validated once for the block, however many rows and
-    /// chunks read it, and a row costs no validation.
+    /// each entry was validated once when the reader decoded the dictionary
+    /// (counted in ravel-logseg's `a_mixed_dictionary_page_validates_each_entry_once_per_block`),
+    /// so neither the declared column nor the per-key column validates
+    /// anything, however many rows and chunks read the page, a non-UTF-8 entry
+    /// among them.
     ///
     /// Flipped assertions, each seen failing:
     /// - the plain-page multi-occurrence build re-reading the winner's text
     ///   (`matching_str.and_then(|c| c.text_at(i))` in place of the presence
     ///   search's `text`) counts 9 where 6 is expected;
-    /// - a dictionary-page presence test that validates the row's entry bytes
-    ///   (`cell_text(self.cells.at(i)?)` in `StrCursor::text_at`'s dictionary
-    ///   arm) counts one per row on top of the entries, 15 where 3 is expected;
-    /// - dropping the `OnceCell` from `StrDictText::entry` (a plain
-    ///   `cell_text` per call) validates each entry per chunk and per row, 18
-    ///   where 3 is expected.
+    /// - `dict_values_array` reading each entry through `cell_text` (its
+    ///   former non-UTF-8 arm) counts 3 where 0 is expected;
+    /// - `StrCursor::text_at`'s dictionary arm validating the entry bytes
+    ///   (`d.values().entry(k).and_then(cell_text)`) counts 8 per-key reads
+    ///   where 0 is expected.
     #[test]
     fn a_declared_str_cell_is_validated_at_most_once_per_block() {
         // Plain page, one occurrence: rows 1..=6 survive, and 1, 3, 4 and 6 of
@@ -10013,13 +10162,17 @@ mod tests {
             dict_page,
             "three distinct of twelve encode as a dictionary page"
         );
-        assert_eq!(
-            count, 3,
-            "one validation per dictionary entry, none per row"
-        );
+        assert_eq!(count, 0, "entries validated at decode, none per row");
         let want: Vec<Option<String>> = (0..12)
             .map(|r| ["a", "bc"].get(r % 3).map(|s| s.to_string()))
             .collect();
+        assert_eq!(cells, want);
+
+        let (count, cells) = count_attr_key_build(&dict);
+        assert_eq!(
+            count, 0,
+            "a per-key read of a dictionary page validates nothing"
+        );
         assert_eq!(cells, want);
     }
 }
