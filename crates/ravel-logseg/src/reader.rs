@@ -6860,6 +6860,35 @@ mod tests {
             assert_eq!(kernel_arms() - kernels, 0, "the ts and stream arms dropped");
             assert_eq!(stats.blocks_predicate_dropped, 0);
             assert_eq!(stats.rows_predicate_evaluated, 24);
+
+            // A window cutting the two blocks that hold ts 100..=102 runs the
+            // ts kernel on both, and the overflow arm only on the three rows
+            // it kept.
+            let cut = vec![
+                Predicate::TsRange {
+                    min_ns: 100,
+                    max_ns: 102,
+                },
+                Predicate::Equals {
+                    field: FieldSel::Attr("zz".into()),
+                    value: AttrValue::Str("q".into()),
+                },
+            ];
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(cut), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 1, "ts 101, the one row in the window whose zz is \"q\"");
+            assert_eq!(stats.blocks_scanned, 2);
+            assert_eq!(kernel_arms() - kernels, 2, "one ts kernel per block");
+            assert_eq!(eval_calls() - evals, 3, "one eval per row the ts arm kept");
+            assert_eq!(stats.blocks_predicate_dropped, 0);
+            assert_eq!(stats.rows_predicate_evaluated, 12);
         }
     }
 }
