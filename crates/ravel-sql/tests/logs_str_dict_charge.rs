@@ -190,6 +190,26 @@ fn main_chunk_charge() -> usize {
 /// `get_array_memory_size` charges (the whole values array and the whole
 /// block's key buffer, twice).
 ///
+/// The three figures, from `get_array_memory_size` (buffer capacities plus the
+/// array structs):
+///
+/// - this scan, `V + 2K` = 151,736 + 2 x 32,912. `V` is the group values
+///   array: 5,120 entries of 24 bytes, 122,880 string bytes in a buffer grown
+///   to 131,072, then 5,121 offsets of 4 bytes, 20,484 bytes rounded up to
+///   20,544, then the 120-byte `StringArray`. `K` is one chunk's keys: 8,192
+///   of 4 bytes, 32,768, plus the 144-byte `DictionaryArray`.
+/// - main, `2 (M + K)` = 2 x (147,592 + 32,912). `M` is a chunk's narrowed
+///   dictionary from a fresh `StringBuilder`: 3,072 entries, 73,728 string
+///   bytes in a buffer grown to 131,072, 3,073 offsets, 12,292 bytes in a
+///   buffer grown to 16,400, plus 120.
+/// - per batch, `2 (V + B)` = 2 x (151,736 + 65,680). `B` is the block's whole
+///   key buffer, 16,384 keys, 65,536 bytes, plus 144, which a chunk's slice
+///   still reports.
+///
+/// Once the stream is exhausted and before it drops, the pool holds only the
+/// last batch's keys, `K`: finishing the last segment released the values'
+/// charge, so the drop releases only `K`.
+///
 /// Flipped: charging `get_array_memory_size` per batch in `hold_batches`, and
 /// slicing the block's keys rather than copying a chunk's, reads 434,832.
 #[tokio::test]
@@ -255,6 +275,7 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
         }
         batches.push(batch);
     }
+    let exhausted = pool.reserved();
     assert_eq!(batches.len(), 2 * BLOCKS, "two chunks per block");
     let values: &ArrayRef = batches[0].column(0).as_any_dictionary().values();
     assert_eq!(
@@ -292,8 +313,32 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
         (217_560, 361_008, 434_832),
         "the fixture's charges: this scan's, main's, per-batch"
     );
+    let strings = values.as_string::<i32>();
+    let (string_buffer, offset_buffer) = (
+        strings.values().capacity(),
+        strings.offsets().inner().inner().capacity(),
+    );
+    assert_eq!(
+        (string_buffer, offset_buffer),
+        (131_072, 20_544),
+        "V's string and offset buffer capacities"
+    );
+    assert_eq!(
+        values_bytes,
+        string_buffer + offset_buffer + std::mem::size_of::<StringArray>(),
+        "V"
+    );
+    assert_eq!(
+        keys_bytes,
+        CHUNK_ROWS * std::mem::size_of::<i32>() + std::mem::size_of::<DictionaryArray<Int32Type>>(),
+        "K"
+    );
     assert!(after <= main, "no more than main's narrowed dictionaries");
     assert_eq!(charged, vec![after; BLOCKS], "each block's charge");
+    assert_eq!(
+        exhausted, keys_bytes,
+        "exhausted, before the drop: the last batch's keys and no values"
+    );
 
     drop(stream);
     assert_eq!(pool.reserved(), 0, "the dropped stream released everything");

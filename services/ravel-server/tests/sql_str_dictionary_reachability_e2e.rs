@@ -395,7 +395,7 @@ async fn declared_str_dictionary_answers_group_by_through_http() {
     assert_eq!(
         fx.region_layout().await,
         (3, 1, 0, 1),
-        "(blocks, dictionaries, plain-page blocks, dictionary blocks with batch rows)"
+        "(blocks, distinct dictionaries, plain-page blocks, dictionary blocks holding rows with no Region)"
     );
     for value in [&grouped, &distinct] {
         assert_eq!(str_dict_values_built(value), 2, "{value}");
