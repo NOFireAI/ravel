@@ -18,8 +18,9 @@
 #   the branch touches the file holding the literal -> 0
 #     (catches: branch-touched files not excluded)
 #   fields only reordered -> 0 (catches: comparing field order, not the set)
-#   the #2842 shape, a pub fn gains a parameter, two-argument calls landed
-#     after the fork -> 1 (catches: parameter counts not compared)
+#   the #2842 shape, a pub fn gains a parameter, six two-argument calls landed
+#     after the fork -> 1 (catches: parameter counts not compared; a method
+#     call matched against the count with the receiver)
 #   a method call spelled `.name(` -> 1, and a path call `Type::name(` -> 1
 #     (catches: a search anchored on a bare call or on whitespace before it)
 #   the self receiver changes while the count does not -> 1
@@ -32,8 +33,40 @@
 #     `-> Name {`, `struct Name {`, `fn name(`) -> 0
 #     (catches: declaration lines reported as literals or calls)
 #   a `Name { .. } =>` pattern, or a call of a different function sharing
-#     the identifier, landed after the fork -> 1 (pins the accepted
-#     over-approximation)
+#     the identifier with an old argument count, landed after the fork -> 1
+#     (pins the accepted over-approximation)
+#   `Vec::new()` against an old `fn new(limit: u64)` -> 0
+#     (catches: a call reported without comparing its argument count)
+#   `it.new(5)` against an old receiver-less `fn new(limit: u64)` -> 0
+#     (catches: a method call matched against a function with no receiver)
+#   an unchanged `fn new()` in another touched file beside the changed one,
+#     `Vec::new()` landed -> 0 (catches: counts taken from every old shape
+#     rather than the ones the branch removed)
+#   the branch only adds a second `fn new` shape, `Pool::new(5)` landed -> 1
+#     (catches: no counts at all when no old shape was removed)
+#   a three-argument call against the old two-argument method -> 0
+#     (catches: counts taken from the new shape, or not compared)
+#   a call spanning lines -> 1, marked "(uncounted)"
+#     (catches: an unclosed call dropped, or reported without the mark)
+#   a closure `|a, b, c|` at the top level of the arguments -> 1, marked
+#     "(uncounted)" (catches: a closure's commas counted as arguments)
+#   a comma inside a string argument -> 0 (catches: strings not blanked)
+#   a turbofish `Vec::<u8, A>::new()` argument -> 1, counted
+#     (catches: commas inside a turbofish counted)
+#   `min(x, y), x < y` as arguments -> 1, counted (catches: commas inside a
+#     nested call counted, or a bare `<` treated as an opening bracket)
+#   `fn gate(limit: u64)` to `fn gate(limit: Option<u64>)`, `gate(5)`
+#     landed -> 1 (catches: parameter types left out of the shape)
+#   a parameter renamed only -> 0 (catches: parameter names in the shape)
+#   a braced enum variant gains a field, `Ev::Tick { .. }` and a bare
+#     `Tick { .. }` landed -> 1 naming `variant Ev::Tick`
+#     (catches: enum variants not extracted, or dropped on the search side)
+#   the variant literal was on main before the fork -> 0
+#     (catches: variant sites searched outside the post-fork files)
+#   a tuple variant's fields change -> 0, and a unit variant made braced
+#     -> 0 (pins: both out of scope)
+#   a struct with `where T: Fn(u64) -> u64` gains a field -> 1
+#     (catches: a `(` in the header abandoning the struct)
 #   no `.rs` change on the branch -> 0 with the "checked" line
 #   base defaulted (no second argument) -> origin/main is used
 #   base `main`, not <remote>/<branch> -> resolved locally and checked
@@ -255,6 +288,10 @@ put "${r}" tests/memory_gate.rs 'fn gate_test() {
     let b = MemoryBudget::new();
     b.set_host_memory_gate(0, 1);
     b.set_host_memory_gate(1, 2);
+    b.set_host_memory_gate(2, 3);
+    b.set_host_memory_gate(3, 4);
+    b.set_host_memory_gate(4, 5);
+    b.set_host_memory_gate(5, 6);
 }'
 commit_on "${r}" main 'test: memory gate cases (#2841)'
 landed="$(git -C "${r}" rev-parse --short main)"
@@ -357,10 +394,235 @@ check_eq "pattern match: exits 1 (accepted over-count)" "1" "${rc}"
 # --- the accepted over-approximation: a different function, same identifier ---
 r="$(new_repo)"
 branch_adds_param "${r}"
-put "${r}" src/other.rs 'fn o(t: &Throttle) { t.set_host_memory_gate(5); }'
+put "${r}" src/other.rs 'fn o(t: &Throttle) { t.set_host_memory_gate(5, 6); }'
 commit_on "${r}" main 'feat: throttle gate'
 run "${r}" feature origin/main
 check_eq "same identifier, other function: exits 1 (accepted over-count)" "1" "${rc}"
+
+# fork_with <repo> <file> <old> <new>: main gains <old>, feature forks there
+# and changes it to <new>.
+fork_with() {
+  put "$1" "$2" "$3"
+  commit_on "$1" main 'pre-fork item'
+  git -C "$1" branch -f feature main
+  put "$1" "$2" "$4"
+  commit_on "$1" feature 'feat: change the item'
+}
+
+# --- a call whose argument count fits no old shape is not reported ---
+r="$(new_repo)"
+fork_with "${r}" src/pool.rs 'impl Pool {
+    pub fn new(limit: u64) -> Pool { todo() }
+}' 'impl Pool {
+    pub fn new(limit: u64, floor: u64) -> Pool { todo() }
+}'
+put "${r}" src/vec.rs 'fn f() {
+    let v: Vec<u8> = Vec::new();
+}'
+commit_on "${r}" main 'feat: vec'
+run "${r}" feature origin/main
+check_eq       "Vec::new() against an old fn new(limit): exits 0" "0" "${rc}"
+check_contains "Vec::new() against an old fn new(limit): the function was checked" \
+  "checked 0 struct(s) and 1 function(s)" "${out}"
+
+# --- a call with the old count against a fn without a receiver, as a method ---
+r="$(new_repo)"
+fork_with "${r}" src/pool.rs 'impl Pool {
+    pub fn new(limit: u64) -> Pool { todo() }
+}' 'impl Pool {
+    pub fn new(limit: u64, floor: u64) -> Pool { todo() }
+}'
+put "${r}" src/m.rs 'fn f(it: &Builder) { it.new(5); }'
+commit_on "${r}" main 'feat: builder'
+run "${r}" feature origin/main
+check_eq "method call of a receiver-less old fn: exits 0" "0" "${rc}"
+
+# --- counts come from the old shapes the branch removed, not every old one ---
+r="$(new_repo)"
+put "${r}" src/empty.rs 'impl Empty {
+    pub fn new() -> Empty { todo() }
+}'
+fork_with "${r}" src/pool.rs 'impl Pool {
+    pub fn new(limit: u64) -> Pool { todo() }
+}' 'impl Pool {
+    pub fn new(limit: u64, floor: u64) -> Pool { todo() }
+}'
+put "${r}" src/empty.rs 'impl Empty {
+    pub fn new() -> Empty { Empty }
+}'
+commit_on "${r}" feature 'refactor: empty body'
+put "${r}" src/vec.rs 'fn f() { let v: Vec<u8> = Vec::new(); }'
+commit_on "${r}" main 'feat: vec'
+run "${r}" feature origin/main
+check_eq "an unchanged fn new() beside the changed one: Vec::new() exits 0" "0" "${rc}"
+
+# --- a branch that only adds a shape: every old shape counts ---
+r="$(new_repo)"
+fork_with "${r}" src/pool.rs 'impl Pool {
+    pub fn new(limit: u64) -> Pool { todo() }
+}' 'impl Pool {
+    pub fn new(limit: u64) -> Pool { todo() }
+}
+impl Lane {
+    pub fn new(limit: u64, floor: u64) -> Lane { todo() }
+}'
+put "${r}" src/p.rs 'fn f() { let p = Pool::new(5); }'
+commit_on "${r}" main 'feat: pool'
+run "${r}" feature origin/main
+check_eq       "shape only added: an old-count call exits 1" "1" "${rc}"
+check_contains "shape only added: names the call" "src/p.rs: call new( (line 1;" "${out}"
+
+# --- an argument count matching the new shape is not reported ---
+r="$(new_repo)"
+branch_adds_param "${r}"
+put "${r}" src/use.rs 'fn u(b: &MemoryBudget) { b.set_host_memory_gate(0, 1, 2); }'
+commit_on "${r}" main 'feat: three-argument call'
+run "${r}" feature origin/main
+check_eq "three-argument call against an old two-argument method: exits 0" "0" "${rc}"
+
+# --- a call spanning lines cannot be counted and is reported ---
+r="$(new_repo)"
+branch_adds_param "${r}"
+put "${r}" src/use.rs 'fn u(b: &MemoryBudget) {
+    b.set_host_memory_gate(
+        0,
+        1,
+    );
+}'
+commit_on "${r}" main 'feat: wrapped call'
+run "${r}" feature origin/main
+check_eq       "call spanning lines: exits 1" "1" "${rc}"
+check_contains "call spanning lines: marked uncounted" \
+  "src/use.rs: call set_host_memory_gate( (uncounted) (line 2;" "${out}"
+
+# --- a closure at the top level of the arguments cannot be counted ---
+r="$(new_repo)"
+branch_adds_param "${r}"
+put "${r}" src/use.rs 'fn u(b: &MemoryBudget) { b.set_host_memory_gate(|a, b, c| a, 1); }'
+commit_on "${r}" main 'feat: closure argument'
+run "${r}" feature origin/main
+check_eq       "closure argument: exits 1" "1" "${rc}"
+check_contains "closure argument: marked uncounted" "call set_host_memory_gate( (uncounted)" "${out}"
+
+# --- commas in a string, a turbofish and a comparison ---
+r="$(new_repo)"
+branch_adds_param "${r}"
+put "${r}" src/use.rs 'fn u(b: &MemoryBudget) { b.set_host_memory_gate("a, b"); }'
+commit_on "${r}" main 'feat: string argument'
+run "${r}" feature origin/main
+check_eq "a comma inside a string argument: exits 0" "0" "${rc}"
+
+r="$(new_repo)"
+branch_adds_param "${r}"
+put "${r}" src/use.rs 'fn u(b: &MemoryBudget) { MemoryBudget::set_host_memory_gate(b, Vec::<u8, A>::new(), 1); }'
+commit_on "${r}" main 'feat: turbofish argument'
+run "${r}" feature origin/main
+check_eq       "turbofish argument: exits 1" "1" "${rc}"
+check_absent   "turbofish argument: counted" "(uncounted)" "${out}"
+
+r="$(new_repo)"
+branch_adds_param "${r}"
+put "${r}" src/use.rs 'fn u(b: &MemoryBudget) { b.set_host_memory_gate(min(x, y), x < y); }'
+commit_on "${r}" main 'feat: comparison argument'
+run "${r}" feature origin/main
+check_eq     "comparison argument: exits 1" "1" "${rc}"
+check_absent "comparison argument: counted" "(uncounted)" "${out}"
+
+# --- a parameter type changed, count unchanged ---
+r="$(new_repo)"
+fork_with "${r}" src/gate.rs 'pub fn gate(limit: u64) {}' 'pub fn gate(limit: Option<u64>) {}'
+put "${r}" src/use.rs 'fn u() { gate(5); }'
+commit_on "${r}" main 'feat: gate'
+run "${r}" feature origin/main
+check_eq       "parameter type changed: exits 1" "1" "${rc}"
+check_contains "parameter type changed: names the call" "src/use.rs: call gate( (line 1;" "${out}"
+
+# --- a parameter renamed only ---
+r="$(new_repo)"
+fork_with "${r}" src/gate.rs 'pub fn gate(limit: u64) {}' 'pub fn gate(mut max: u64) {}'
+put "${r}" src/use.rs 'fn u() { gate(5); }'
+commit_on "${r}" main 'feat: gate'
+run "${r}" feature origin/main
+check_eq       "parameter renamed only: exits 0" "0" "${rc}"
+check_contains "parameter renamed only: no changed function" "checked 0 struct(s) and 0 function(s)" "${out}"
+
+# --- a braced enum variant gains a field ---
+r="$(new_repo)"
+fork_with "${r}" src/ev.rs 'pub enum Ev {
+    Tick { at: u64 },
+    Stop,
+}' 'pub enum Ev {
+    Tick { at: u64, seq: u32 },
+    Stop,
+}'
+put "${r}" src/use.rs 'fn u() { let e = Ev::Tick { at: 1 }; }'
+put "${r}" src/bare.rs 'use Ev::*;
+fn b() { let e = Tick { at: 2 }; }'
+commit_on "${r}" main 'feat: tick'
+run "${r}" feature origin/main
+check_eq       "enum variant field added: exits 1" "1" "${rc}"
+check_contains "enum variant field added: names the variant" \
+  "src/use.rs: variant Ev::Tick literal (line 1;" "${out}"
+check_contains "enum variant field added: a bare Variant { literal is found" \
+  "src/bare.rs: variant Ev::Tick literal (line 2;" "${out}"
+
+# --- the variant literal was on main before the fork ---
+r="$(new_repo)"
+put "${r}" src/use.rs 'fn u() { let e = Ev::Tick { at: 1 }; }'
+fork_with "${r}" src/ev.rs 'pub enum Ev {
+    Tick { at: u64 },
+}' 'pub enum Ev {
+    Tick { at: u64, seq: u32 },
+}'
+put "${r}" src/other.rs 'fn other() {}'
+commit_on "${r}" main 'feat: unrelated'
+run "${r}" feature origin/main
+check_eq       "pre-fork variant literal: exits 0" "0" "${rc}"
+check_contains "pre-fork variant literal: the variant was checked" "checked 1 struct(s)" "${out}"
+
+# --- a tuple variant is out of scope ---
+r="$(new_repo)"
+fork_with "${r}" src/ev.rs 'pub enum Ev {
+    Tock(u8),
+}' 'pub enum Ev {
+    Tock(u8, u8),
+}'
+put "${r}" src/use.rs 'fn u() { let e = Ev::Tock(1); }'
+commit_on "${r}" main 'feat: tock'
+run "${r}" feature origin/main
+check_eq "tuple variant: exits 0 (out of scope)" "0" "${rc}"
+
+# --- a unit variant that becomes braced is out of scope ---
+r="$(new_repo)"
+fork_with "${r}" src/ev.rs 'pub enum Ev {
+    Stop,
+}' 'pub enum Ev {
+    Stop { at: u64 },
+}'
+put "${r}" src/use.rs 'fn u() { let e = Ev::Stop; }'
+commit_on "${r}" main 'feat: stop'
+run "${r}" feature origin/main
+check_eq "unit variant made braced: exits 0 (out of scope)" "0" "${rc}"
+
+# --- a struct whose where clause carries parentheses ---
+r="$(new_repo)"
+fork_with "${r}" src/mapper.rs 'pub struct Mapper<T>
+where
+    T: Fn(u64) -> u64,
+{
+    pub f: T,
+}' 'pub struct Mapper<T>
+where
+    T: Fn(u64) -> u64,
+{
+    pub f: T,
+    pub g: T,
+}'
+put "${r}" src/use.rs 'fn u() { let m = Mapper { f: id }; }'
+commit_on "${r}" main 'feat: mapper'
+run "${r}" feature origin/main
+check_eq       "where clause with Fn(..): exits 1" "1" "${rc}"
+check_contains "where clause with Fn(..): names the literal" "src/use.rs: struct Mapper literal" "${out}"
 
 # --- no .rs change on the branch ---
 r="$(new_repo)"
