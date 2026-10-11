@@ -876,7 +876,12 @@ impl Catalog {
     /// would flush every tenant's decoded caches on each such query and still
     /// refuse. Such a refusal is counted in neither
     /// [`Catalog::decoded_cache_memory_evictions`] nor
-    /// [`Catalog::decode_reserve_retries`]. `held` counts an entry a live
+    /// [`Catalog::decode_reserve_retries`]. A refusal of the host-memory
+    /// gate class ([`ravel_memory::ExhaustionCause::HostMemory`], ADR-2633)
+    /// skips the pass the same way: the gate refuses every reservation
+    /// whatever the ledger holds, so eviction cannot admit the retry, and
+    /// flushing every tenant's decoded caches while the host is short of
+    /// memory would only add decode work. `held` counts an entry a live
     /// resolve also holds, which frees nothing when evicted, so the figure
     /// overstates what eviction can free and the test errs toward running the
     /// pass; a pass it lets through can still end in a refused retry. The two
@@ -914,6 +919,15 @@ impl Catalog {
             Ok(reservation) => return Ok(reservation),
             Err(refusal) => refusal,
         };
+        // A closed host-memory gate (ADR-2633) refuses every reservation
+        // whatever the ledger holds, so giving cached bytes back cannot admit
+        // the retry: no pass, no retry, the gate's refusal is the answer.
+        if matches!(
+            refusal.cause,
+            ravel_memory::ExhaustionCause::HostMemory { .. }
+        ) {
+            return Err(refusal);
+        }
         let want = ravel_memory::decoded_charge(declared, ceiling);
         let limit = self.memory_budget.limit();
         // The test below also refuses this; checking it first skips the two
@@ -950,7 +964,8 @@ impl Catalog {
     /// [`Catalog::reserve_decoded`]) skips the pass and counts nothing; that
     /// includes one wanting more than the budget's whole limit, and a 0-byte
     /// charge (declared over its ceiling) on a budget whose bytes held outside
-    /// the caches alone exceed its limit.
+    /// the caches alone exceed its limit. A refusal of the host-memory gate
+    /// class runs no pass either, so it counts nothing here.
     pub fn decode_reserve_retries(&self) -> u64 {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }
@@ -12557,6 +12572,95 @@ mod tests {
         assert_eq!(catalog.part_cache().entry_count(&second), 1);
         budget.release(foreign);
         assert_eq!(budget.reserved(), cached_len);
+    }
+
+    /// ADR-2633 task 4 (issue #2732): a decode charge the host-memory gate
+    /// refuses runs no eviction pass and is not retried. Two tenants' parts
+    /// fill the budget exactly; with the gate closed, a one-byte charge the
+    /// ledger could admit after one eviction is refused with the
+    /// `HostMemory` cause, `decode_reserve_retries` stays 0, no entry is
+    /// evicted, and both parts stay cached. Reopening the gate and repeating
+    /// the same charge takes the accounted path: the pass runs, one entry
+    /// goes, the retry is counted once, and the charge is admitted.
+    ///
+    /// FLIP: drop the `HostMemory` early return from `Catalog::reserve_decoded`
+    /// (catalog.rs). The gate-closed charge then runs the pass before its
+    /// retry is refused again by the gate: the first `assert_eq` fails with
+    /// the refusal's `reserved` at one part's bytes against both parts'
+    /// (the pass evicted the first tenant's part), and past it
+    /// `decode_reserve_retries()` reads 1 against the expected 0.
+    #[tokio::test]
+    async fn a_host_memory_decode_refusal_runs_no_eviction_pass() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let first = TenantHash([0x66; 16]);
+        let second = TenantHash([0x67; 16]);
+        let first_len = fold_one_part_for(&store, first, sealed_hour, 1).await;
+        let second_len = fold_one_part_for(&store, second, sealed_hour, 1).await;
+        let cached_len = first_len + second_len;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(cached_len));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        for tenant in [&first, &second] {
+            catalog
+                .resolve(tenant, Signal::Metrics, range, &[], now_ns)
+                .await
+                .expect("each tenant resolves within the budget");
+        }
+        assert_eq!(catalog.part_cache().total_entries(), 2);
+        assert_eq!(budget.reserved(), cached_len);
+
+        // Host available memory below the floor: the gate is closed.
+        budget.set_host_memory_gate(0, 1);
+        const CEILING: u64 = 4_096;
+        let err = catalog
+            .reserve_decoded(1, CEILING)
+            .expect_err("a closed gate refuses a one-byte decode charge");
+        assert_eq!(
+            err,
+            ravel_memory::MemoryExhausted {
+                requested: 1,
+                reserved: cached_len,
+                limit: cached_len,
+                cause: ravel_memory::ExhaustionCause::HostMemory {
+                    available: 0,
+                    floor: 1,
+                },
+            },
+            "the gate's own refusal, with the ledger untouched"
+        );
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            0,
+            "a host-memory refusal runs no eviction pass and no retry"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        assert_eq!(catalog.part_cache().entry_count(&first), 1);
+        assert_eq!(catalog.part_cache().entry_count(&second), 1);
+        assert_eq!(budget.gate_refusals(), 1);
+        assert_eq!(budget.accounted_refusals(), 0);
+
+        // The same charge with the gate open is an accounted refusal, and
+        // that class keeps the pass and the single retry.
+        budget.set_host_memory_gate(1, 1);
+        let reservation = catalog
+            .reserve_decoded(1, CEILING)
+            .expect("one evicted part makes room for a one-byte charge");
+        assert_eq!(reservation.size(), 1);
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            1,
+            "the accounted refusal ran the pass and retried once"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(catalog.part_cache().entry_count(&first), 0);
+        assert_eq!(catalog.part_cache().entry_count(&second), 1);
+        assert_eq!(budget.accounted_refusals(), 1);
+        drop(reservation);
     }
 
     /// Issue #2108: on a finite budget shared with other holders, a decode
