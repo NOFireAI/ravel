@@ -684,6 +684,27 @@ mod tests {
         assert_eq!(zstd_job_bytes(&over_cap, CAP), CAP);
     }
 
+    /// A payload whose frames declare a total above the cap is refused at the
+    /// cap, not returned at its declared size: the declared total only bounds
+    /// the read when it is below the cap. The undeclared bomb test does not
+    /// reach this branch, because `zstd::stream::encode_all` pledges no
+    /// content size; `zstd::bulk::compress` does.
+    #[test]
+    fn a_declared_payload_over_the_cap_is_rejected_at_the_cap() {
+        let over_cap = declaring(&vec![0u8; 17 * MIB]);
+        assert!(matches!(
+            decompress_capped(&over_cap, CAP),
+            Err(BatchError::DecompressedPayloadTooLarge { limit }) if limit == CAP
+        ));
+        let under_cap = declaring(&vec![0u8; MIB]);
+        assert_eq!(
+            decompress_capped(&under_cap, CAP)
+                .expect("under the cap")
+                .len(),
+            MIB
+        );
+    }
+
     /// With any frame undeclared, the size is the compressed length times
     /// zstd's maximum expansion, capped.
     #[test]

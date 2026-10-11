@@ -1556,7 +1556,7 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         out,
         "ravel_ingest_abandoned_queue_deadline_total",
         "Flushes abandoned by their flush-open deadline while queued for a \
-         permit, before any store call, by signal.",
+         permit or waiting on the write gate, before any store call, by signal.",
         "counter",
     );
     for pipeline in pipelines {

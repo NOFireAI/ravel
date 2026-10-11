@@ -28,6 +28,8 @@
 //!   and `flushes_manual`) summed, minus `abandoned_retry_exhausted`,
 //!   `abandoned_input_rejected`, `abandoned_queue_deadline`,
 //!   `abandoned_hour_bound`, and `flush_gate_faults`; the bare
+//!   `abandoned_input_rejected`, `abandoned_queue_deadline`,
+//!   `abandoned_hour_bound`, and `flush_gate_faults`; the bare
 //!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
 //!   waiters are acked, i.e. at the flush's terminal outcome. They count
@@ -783,9 +785,9 @@ pub struct IngestMetricsSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
-    /// Flushes abandoned by their flush-open deadline while queued for a permit,
-    /// before any store call (issue #1739). Distinct from
-    /// `abandoned_retry_exhausted` (a store failure).
+    /// Flushes abandoned by their flush-open deadline while queued for a permit
+    /// or waiting on the write gate, before any store call (issue #1739).
+    /// Distinct from `abandoned_retry_exhausted` (a store failure).
     pub abandoned_queue_deadline: u64,
     /// Flushes abandoned without a PUT because their permit was granted past
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
@@ -1101,8 +1103,8 @@ impl IngestMetrics {
     }
 
     /// A flush abandoned because its flush-open deadline elapsed while it was
-    /// queued for a permit, before any store call (`WriteError::Abandoned`,
-    /// issue #1739): a contention signal, retryable.
+    /// queued for a permit or waiting on the write gate, before any store call
+    /// (`WriteError::Abandoned`, issue #1739): a contention signal, retryable.
     pub(crate) fn record_abandoned_queue_deadline(&self) {
         self.abandoned_queue_deadline
             .fetch_add(1, Ordering::Relaxed);
