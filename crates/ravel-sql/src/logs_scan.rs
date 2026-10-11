@@ -36,11 +36,13 @@
 //!
 //! A segment at or under [`LogSegmentFetcher::plan_whole_object_bound`] (the
 //! larger of the block-range threshold and the projection break-even) is not
-//! planned (ADR-2677 decision 2, [`LogSegmentFetcher::plans_segment`]): the
-//! plan pass issues no read for it, [`owned_work`] gives it whole to one
-//! partition, and that partition opens it with one whole-object read and
-//! prunes blocks from the directory that read already holds. Only segments
-//! above the bound take the plan-then-stripe route described here.
+//! planned when the scan holds at least `target_partitions` such segments
+//! relevant to the query window (ADR-2677 decision 2,
+//! [`LogSegmentFetcher::plans_segment`], [`skips_sub_bound_plans`]): the plan
+//! pass issues no read for it, [`owned_work`] gives it whole to one partition,
+//! and that partition opens it with one whole-object read and prunes blocks
+//! from the directory that read already holds. With fewer such segments, every
+//! segment takes the plan-then-stripe route described here.
 //!
 //! # Object-store request count, and the cache gate
 //!
@@ -1575,9 +1577,9 @@ struct BlockMetrics {
     /// `blocks_total`. A segment at or under the plan bound that is skipped
     /// here is never read at all, and its blocks are not in `blocks_total`.
     segments_skipped_by_threshold: Count,
-    /// Segments at or under [`LogSegmentFetcher::plan_whole_object_bound`]
-    /// this partition opened without a plan read (ADR-2677 decision 2): one
-    /// whole-object GET each, pruned in the scan.
+    /// Segments this partition opened without a plan read
+    /// ([`PlanCounts::unplanned`], ADR-2677 decision 2): one whole-object GET
+    /// each, pruned in the scan.
     unplanned_segments: Count,
     /// The fast path's ranged-open prefetch depth this partition ran with
     /// (`1` is no prefetch), added once at execute, so the plan-wide sum is
@@ -3197,8 +3199,9 @@ impl ExecutionPlan for LogsScanExec {
 struct PlanCounts {
     segs: Vec<Option<SegPlan>>,
     /// Per segment, in snapshot order: relevant and at or under
-    /// [`LogSegmentFetcher::plan_whole_object_bound`], so never planned
-    /// (ADR-2677 decision 2). Its owner opens it whole, once, and prunes its
+    /// [`LogSegmentFetcher::plan_whole_object_bound`] in a scan that
+    /// [`skips_sub_bound_plans`], so not planned (ADR-2677 decision 2). All
+    /// false otherwise. Its owner opens it whole, once, and prunes its
     /// blocks from that read ([`open_segment_whole`]); its `segs` entry is
     /// `None`.
     unplanned: Vec<bool>,
@@ -3404,6 +3407,36 @@ type PlanSegmentResult = Option<(
     Option<CarriedWholeObject>,
 )>;
 
+/// Whether this scan opens its segments at or under
+/// [`LogSegmentFetcher::plan_whole_object_bound`] unplanned (ADR-2677
+/// decision 2): true when the scan holds at least `target_partitions` of them
+/// that are relevant to the query window. Counted over the whole segment list
+/// once, inside the shared plan pass, so every partition routes every segment
+/// the same way.
+///
+/// An unplanned segment has one owner, so with fewer such segments than
+/// partitions the unplanned route would leave partitions idle that the planned
+/// route stripes blocks over when a read cache is wired (ADR-0102). Those
+/// scans keep planning every segment.
+fn skips_sub_bound_plans(
+    ctx: &PartitionCtx,
+    segments: &[SegmentRef],
+    target_partitions: usize,
+) -> bool {
+    let sub_bound = segments
+        .iter()
+        .filter(|seg| {
+            !ctx.fetcher.plans_segment(seg)
+                && LogSegmentFetcher::ts_range_relevant(
+                    seg,
+                    ctx.query.ts_min_ns,
+                    ctx.query.ts_max_ns,
+                )
+        })
+        .count();
+    sub_bound >= target_partitions.max(1)
+}
+
 /// Prune every segment once (no block decode) to build the shared block plan.
 ///
 /// The prunes run `plan_concurrency` at a time (`buffer_unordered`, consumed
@@ -3454,6 +3487,7 @@ async fn compute_plan_counts(
     // this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
     let mut unplanned = vec![false; segments.len()];
+    let skip_sub_bound = skips_sub_bound_plans(ctx, segments, plan_concurrency);
     for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
         // is a second entry point into the fetch layer alongside the three
@@ -3463,8 +3497,9 @@ async fn compute_plan_counts(
         refuse_unreadable_version(seg)?;
         // ADR-2677 decision 2: at or under the bound the plan would read the
         // object whole only to count its survivors, so the scan reads it once
-        // instead.
-        if !ctx.fetcher.plans_segment(seg) {
+        // instead, when the scan has enough such segments to fill its
+        // partitions (see `skips_sub_bound_plans`).
+        if skip_sub_bound && !ctx.fetcher.plans_segment(seg) {
             unplanned[idx] =
                 LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns);
             continue;
@@ -3929,8 +3964,9 @@ impl PartitionCtx {
     /// fire for a given object.
     ///
     /// On the planned route a segment at or under
-    /// [`LogSegmentFetcher::plan_whole_object_bound`] is not planned (ADR-2677
-    /// decision 2): [`compute_plan_counts`] never calls `plan_segment` for it,
+    /// [`LogSegmentFetcher::plan_whole_object_bound`] in a scan that
+    /// [`skips_sub_bound_plans`] is not planned (ADR-2677 decision 2):
+    /// [`compute_plan_counts`] never calls `plan_segment` for it,
     /// so the fetch-layer recorder cannot fire, and [`owned_work`] gives it to
     /// exactly one partition, whose open records the touch here instead.
     fn record_data_object_touched(&self) {
@@ -4614,7 +4650,7 @@ struct RowRefRange {
 /// segment's whole surviving-block list; a row-ref carries a block's position
 /// in it, not its whole-object index.
 ///
-/// An unplanned segment (at or under the plan bound) passes the survivor list
+/// An unplanned segment ([`PlanCounts::unplanned`]) passes the survivor list
 /// its own open pruned to, so it resolves like a planned one.
 ///
 /// The whole-segment fast path passes `None`: it has no plan-phase survivor
