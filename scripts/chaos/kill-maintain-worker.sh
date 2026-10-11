@@ -22,18 +22,21 @@
 # ordinary failure, and from >2 setup/usage errors) so the distinction is
 # legible to the ADR-0077 section 3 rehearsal record.
 #
-# MID-COMPACTION TRIGGER (named explicitly): the compaction lifecycle as
-# worker A's log shows it. The SIGKILL fires once A owns a unit
-# (ravel_maintain_units_owned >= 1) and its log shows unfinished compaction
-# work: no "compaction record published" line
-# (crates/ravel-maintain/src/publish.rs:331) yet, or none of its
-# "maintenance: retention + compaction pass complete" lines with
-# compacted>=1 after the last one. No per-bucket start signal exists to read,
-# so this cannot tell a merge in progress from a pass still in its retention
-# or sweep work; see compaction_unfinished_in_log in lib.sh. Nor can it tell
-# a first unit being merged from a pass with nothing to compact, so when A
-# published nothing before the kill and the survivor publishes nothing after
-# it, conservation reports could-not-measure rather than a failure.
+# MID-COMPACTION TRIGGER (named explicitly): worker A's
+# ravel_maintain_compactions_in_flight gauge. The SIGKILL fires on the first
+# scrape that reads it >= 1: a bucket merge has started (claim held, inputs
+# listed) and has not yet published, failed, or been abandoned. A is scraped
+# every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the scrape itself,
+# expected under 100 ms a poll (the run logs scrapes and seconds waited), and
+# the scenario 2 fixture (CHAOS_MAINTAIN_* in lib.sh) is sized for a merge of
+# at least 1 s. If the gauge never reads >= 1 within the
+# window the kill still happens, with a warning. The conservation oracle
+# still decides could-not-measure from A's log: when A published nothing
+# before the kill and the survivor publishes nothing after it, or A's last
+# publish is followed by a finished pass, a missing survivor publish is not a
+# verdict. The oracle waits for that publish up to the takeover bound (3 * H
+# plus one tick) from the kill, since the survivor picks up the dead worker's
+# unit only once its lease expires.
 #
 # SEAL WAIT: an ingest hour is compactable once the compactor's seal margin
 # has passed the end of the hour (CompactorConfig::seal_margin_ns, 3900 s at
@@ -91,8 +94,9 @@ INGEST_GRPC="${CHAOS_INGEST_GRPC:-127.0.0.1:14317}"
 
 # Number of strict-ack exports to drive into the ingest server so the bucket
 # carries real, compactable data for the maintain workers to own and compact.
-# Each carries CHAOS_FIXTURE_SERIES x CHAOS_FIXTURE_POINTS points (lib.sh).
-EXPORT_COUNT="${CHAOS_EXPORT_COUNT}"
+# Each carries CHAOS_MAINTAIN_FIXTURE_SERIES x CHAOS_MAINTAIN_FIXTURE_POINTS
+# points; see lib.sh for the sizing.
+EXPORT_COUNT="${CHAOS_MAINTAIN_EXPORT_COUNT}"
 
 # Total ownable units across the world under test; the survivor must own all
 # of them after takeover. Sized by the load the setup drives (tenants x
@@ -133,9 +137,10 @@ if [[ "$MODE" == "check" ]]; then
   echo "== kill-maintain-worker.sh --check (scenario 2: kill maintain worker mid-compaction) =="
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
-  echo "mid-compaction trigger marker: units_owned>=1 and no '${CHAOS_COMPACTION_PASS_MARKER}' (compacted>=1) after the last '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
+  echo "mid-compaction trigger: worker A ravel_maintain_compactions_in_flight>=1, scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape"
+  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_takeover_bound_seconds)}s after the kill for a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
-  echo "load: ${EXPORT_COUNT} exports of ${CHAOS_FIXTURE_SERIES} series x ${CHAOS_FIXTURE_POINTS} points"
+  echo "load: ${EXPORT_COUNT} exports of ${CHAOS_MAINTAIN_FIXTURE_SERIES} series x ${CHAOS_MAINTAIN_FIXTURE_POINTS} points, at most one per ${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS}s"
   echo "seal wait: end of the ingest server's exit hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
   rc=0
   check_dependencies || rc=$?
@@ -230,12 +235,18 @@ chaos_wait_for "ingest server to accept connections" 60 ingest_reachable
 # timestamps, and deduplication would fold the repeats into one export's data.
 SENT=0
 LAST_ACK_UNIX_S=""
+# The pacing sleep runs beside each export, so an iteration lasts at least
+# CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS and the load stays under the ingest
+# byte rate.
 for _ in $(seq 1 "$EXPORT_COUNT"); do
-  chaos_gen_fixture "$CHAOS_FIXTURE_SERIES" "$CHAOS_FIXTURE_POINTS" > "$FIXTURE_PATH"
+  sleep "$CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS" &
+  PACE_PID=$!
+  chaos_gen_fixture "$CHAOS_MAINTAIN_FIXTURE_SERIES" "$CHAOS_MAINTAIN_FIXTURE_POINTS" > "$FIXTURE_PATH"
   if drive_one_export "$INGEST_HTTP" "$FIXTURE_PATH" >/dev/null; then
     SENT=$(( SENT + 1 ))
     LAST_ACK_UNIX_S="$(chaos_now_unix_s)"
   fi
+  wait "$PACE_PID"
 done
 # Every export must land: the seal wait is paid for a known compaction input,
 # and a rejected export (a 429 under the ingest byte rate, say) would shrink
@@ -291,7 +302,8 @@ log "waiting for worker A to be mid-compaction"
 # One maintenance tick plus two minutes, so worker A runs at least one pass
 # after its startup pass inside the window.
 INFLIGHT_BUDGET_SECONDS=$(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))
-if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" "$INFLIGHT_BUDGET_SECONDS"; then
+INFLIGHT_WAIT_START="$(date +%s)"
+if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"; then
   KILL_EPOCH="$(date +%s)"
   sigkill_pid "$WORKER_A_PID"
   log "worker A observed mid-compaction -- SIGKILL issued"
@@ -303,7 +315,7 @@ else
 fi
 WORKER_A_PID=""
 B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"
-log "worker A max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}"
+log "worker A max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}; /metrics scrapes: ${CHAOS_COMPACTION_POLLS:-0} in $(( KILL_EPOCH - INFLIGHT_WAIT_START ))s"
 log "$(chaos_worker_activity_line worker-a "$WORKER_A_LOG")"
 
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
@@ -311,9 +323,9 @@ oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$K
 oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
 # Worker A is dead, so its log is its state at the kill: whether it shows
 # unfinished compaction work decides whether a survivor that published
-# nothing is a failure or could not be measured.
+# nothing by the takeover bound is a failure or could not be measured.
 oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
-  "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" || true
+  "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
 log "$(chaos_worker_activity_line worker-b "$WORKER_B_LOG")"
 log "$(chaos_worker_activity_line worker-b-after-kill "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL")"
