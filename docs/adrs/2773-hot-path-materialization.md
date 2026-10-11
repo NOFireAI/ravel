@@ -424,7 +424,10 @@ pooled, which is the 0.70 band; q4, the lowest at 25%, may land near
 less the `UTF-8 validation` column it contains is 16.3, 14.0, 19.2, 23.2,
 24.0 and 24.1% (19.6% pooled); D3 removes most of it, and the band of
 0.85 asks for 15%. Set L: the same subtraction gives 20.5, 23.4, 25.1 and
-20.1% (22.7% pooled), so 0.85 again. Wall bands allow for the serial
+20.1% (22.7% pooled), so 0.85 again (see the Set L amendment below: that
+subtraction kept only the validation frames under the builder's own
+`from_utf8` and missed the 15 points reached through the lazy cell
+accessor, and the band did not hold). Wall bands allow for the serial
 floor, which does not move.
 
 ## Rejected alternatives
@@ -577,3 +580,50 @@ runs overflow-attribute arms after the column arms, where `eval` ran the
 `And` in written order, so on a block with an absent `ts` or `stream_ref`
 cell or an undecodable `attrs_raw` cell, which error or exclusion a row
 gets can differ from main's; no well-formed object changes result.
+
+## Amendment (2026-10-11): the Set L band
+
+<!-- amendment-applies: sections="Targets and bars" pointer="the Set L amendment below" -->
+<!-- amendment-supersedes: phrase="so 0.85 again" pointer="the Set L amendment below" -->
+
+The Set L band (q21 to q24, the `LIKE` statements over `URL` and `Title`,
+warm CPU at most 0.85) did not hold, and the model it was derived from
+was wrong. Measured by the T5 sweep on #2790 (two arms interleaved on one
+c6a.4xlarge, 3 repetitions): 0.998 for main `aaebcc008` against main
+`bb171e615`, and 0.993 for `bb171e615` against the same tree with the
+three epic commits reverted. The measured 0.99 is the outcome of record;
+no new band is claimed for these statements by this ADR.
+
+What the derivation got wrong. "Targets and bars" took the `Declared Str
+build` column of the profile table less the `UTF-8 validation` column it
+contains (22.7% pooled) as the part D3 removes. The validation column only
+counted the frames under the builder's own `from_utf8` (5.0% on q23); the
+other 15 points of validation on q23 sat under the columnar view's lazy
+cell accessor (`entry > get_or_try_init`), inside the same build frame,
+and were counted as removable. Read by leaf, the build on q23 was 37.9%:
+validation 19.4, the winner selection 5.1, the per-cell `append_value`
+2.9, the second keys vector 1.8, the builder itself 1.5, and the copy of
+the cell bytes. D3 could remove the winner, the append and the keys vector
+(about 15 points on q23, 12 to 16 on the others) and did; the validation
+and the copy are the cost of the column.
+
+What landed. The profile on #2864 (`bb171e615` against the same tree minus
+the epic, frame pointers, same box, interleaved, 2 repetitions) shows the
+build frame at 13 to 17% in the new tree with `winner_at`, `append_value`
+and the keys vector at 0.0%, the per-row predicate at 0.2 to 0.4% (D2),
+the UTF-8 validation unchanged at 8 to 20% but now reached through
+`decode_columns` when a block's `DictValues` is built, with the entry copy
+moved with it, and the shared values array and cache (D3) at 4 to 5%.
+Net per statement: q21 1.00, q22 1.00, q23 0.97, q24 0.95. The dominant
+phase on these statements is the decode of the long cells and their
+once-per-cell validation (zstd 18 to 20 points, validation 8 to 20, copy),
+which D1 to D3 do not touch and which this ADR's Rejected alternatives
+leave to a format-level validated flag.
+
+What moves Set L. A `LIKE '%literal%'` arm evaluated on the raw page bytes
+before the block's values are validated and built, so that only the
+surviving rows (15,911 of 99,997,497 on q21) pay the validation, the
+copy, the build and the `LIKE` kernel. That changes the pushed predicate
+language D2 holds fixed, so it is its own decision: issue #2865, which
+sizes it at about 0.5 to 0.6 for Set L ahead of `DictValues` and about
+0.8 behind it.
