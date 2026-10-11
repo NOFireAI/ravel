@@ -980,8 +980,9 @@ mod default_geometry {
     /// `batches` row groups of `batch_rows` points. Each row group is one
     /// series of its own (a fixed-width `host` value), with a distinct
     /// timestamp per point: the points estimate charges a series' bytes once
-    /// per write that carries it, so one series per batch keeps every batch's
-    /// estimate equal and a buffer's estimate the sum of its batches'.
+    /// per buffer, at its first sighting there, so a distinct series per batch
+    /// keeps every batch's estimate equal and a buffer's estimate the sum of
+    /// its batches'.
     fn fixture(batch_rows: usize, batches: usize) -> (tempfile::TempDir, std::path::PathBuf) {
         use parquet::arrow::ArrowWriter;
 
@@ -1029,6 +1030,7 @@ mod default_geometry {
             BATCH_ROWS,
             0,
             request,
+            None,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             Some(DEFAULT_MAX_FLUSH_DELAY),
             NOW_NS,

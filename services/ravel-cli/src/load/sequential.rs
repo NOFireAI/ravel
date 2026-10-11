@@ -50,6 +50,34 @@ impl WriteFailure for SpanWriteError {
     }
 }
 
+/// The router call that publishes every shard buffer, so a wait on buffered
+/// writes is answered by a flush rather than by the age trigger.
+pub(super) trait FlushAll {
+    async fn flush_all(&self);
+}
+
+impl FlushAll for IngestRouter {
+    async fn flush_all(&self) {
+        IngestRouter::flush_all(self).await;
+    }
+}
+
+impl FlushAll for SpanIngestRouter {
+    async fn flush_all(&self) {
+        SpanIngestRouter::flush_all(self).await;
+    }
+}
+
+/// Publish every shard buffer once every submitted write is enqueued ahead
+/// of the flush request. `None` when no router was built, so nothing was
+/// submitted.
+pub(super) async fn flush_buffered<R: FlushAll>(router: Option<&R>, enqueue: &mut EnqueueTracker) {
+    if let Some(router) = router {
+        enqueue.wait_enqueued().await;
+        router.flush_all().await;
+    }
+}
+
 /// The load-report surface the shared in-flight window writes through.
 pub(super) trait SequentialReport {
     /// Fold one acked write's tokens and counts into the report.
@@ -132,13 +160,20 @@ pub(super) async fn resolve_sequential_write<A: WriteAck, F: WriteFailure, P: Se
 /// error every later write is still resolved and whatever it committed is
 /// folded into that error's durable-token list
 /// ([`harvest_sequential_after_failure`]), as the steady-state loop does.
-pub(super) async fn drain_sequential_inflight<A: WriteAck, F: WriteFailure, P: SequentialReport>(
+pub(super) async fn drain_sequential_inflight<
+    A: WriteAck,
+    F: WriteFailure,
+    P: SequentialReport,
+    R: FlushAll,
+>(
     inflight: &mut std::collections::VecDeque<Inflight<A, F>>,
     report: &mut P,
+    router: Option<&R>,
+    enqueue: &mut EnqueueTracker,
 ) -> Result<(), LoadError> {
     while let Some(entry) = inflight.pop_front() {
         if let Err(mut e) = resolve_sequential_write(entry, report).await {
-            harvest_sequential_after_failure(inflight, &mut e).await;
+            harvest_sequential_after_failure(inflight, &mut e, router, enqueue).await;
             return Err(e);
         }
     }
@@ -150,17 +185,22 @@ pub(super) async fn drain_sequential_inflight<A: WriteAck, F: WriteFailure, P: S
 /// does not replace the refusal: its tokens (including any it harvested from
 /// later writes) become the refusal's durable list and its cause is appended
 /// to the reason, since the resume figures then stop at that write rather than
-/// at the refused row.
+/// at the refused row. Every shard buffer is flushed first, so the drain does
+/// not wait out the age trigger on writes no later batch will push out.
 pub(super) async fn drain_sequential_before_refusal<
     A: WriteAck,
     F: WriteFailure,
     P: SequentialReport,
+    R: FlushAll,
 >(
     inflight: &mut std::collections::VecDeque<Inflight<A, F>>,
     report: &mut P,
     reason: String,
+    router: Option<&R>,
+    enqueue: &mut EnqueueTracker,
 ) -> (Vec<CommitToken>, String) {
-    match drain_sequential_inflight(inflight, report).await {
+    flush_buffered(router, enqueue).await;
+    match drain_sequential_inflight(inflight, report, router, enqueue).await {
         Ok(()) => (report.tokens().to_vec(), reason),
         Err(e) => (
             e.durable_tokens().to_vec(),
@@ -172,11 +212,18 @@ pub(super) async fn drain_sequential_before_refusal<
 /// Fold whatever the still-outstanding writes committed into an error's
 /// durable-token list. The loader cannot stop a shard-actor flush it already
 /// handed off, so awaiting the outcome is what keeps the report equal to what
-/// landed (issue #800's reasoning on the logs path).
-pub(super) async fn harvest_sequential_after_failure<A: WriteAck, F: WriteFailure>(
+/// landed (issue #800's reasoning on the logs path). Every shard buffer is
+/// flushed first, so those writes are answered by that flush rather than by
+/// the age trigger.
+pub(super) async fn harvest_sequential_after_failure<A: WriteAck, F: WriteFailure, R: FlushAll>(
     inflight: &mut std::collections::VecDeque<Inflight<A, F>>,
     err: &mut LoadError,
+    router: Option<&R>,
+    enqueue: &mut EnqueueTracker,
 ) {
+    if !inflight.is_empty() {
+        flush_buffered(router, enqueue).await;
+    }
     let mut recovered: Vec<CommitToken> = Vec::new();
     while let Some((_, _, handle)) = inflight.pop_front() {
         match handle.await {

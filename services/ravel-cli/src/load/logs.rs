@@ -626,6 +626,15 @@ pub(super) async fn load_with_drain_reflush_period(
         first_est_bytes,
         budget.is_some().then_some(load_memory.budget_bytes),
     );
+    // Resolved over no rows, the geometry describes nothing the load did, so
+    // it is neither announced nor reported, as on the metrics and spans paths.
+    let geometry_resolved = first_rows > 0;
+    if let (true, Some(on_geometry)) = (geometry_resolved, &memory_options.on_geometry) {
+        on_geometry(&geometry);
+        // Lets a caller driving this future print the line before the first
+        // submit.
+        tokio::task::yield_now().await;
+    }
     let pipeline_depth = geometry.pipeline_depth;
     let router = build_router(geometry.target_bytes);
     let mut window = DepthWindow::new(&geometry);
@@ -672,6 +681,8 @@ pub(super) async fn load_with_drain_reflush_period(
                 // one, exactly as the former serial loop ordered them.
                 drain_inflight(
                     &mut inflight,
+                    &router,
+                    &mut enqueue,
                     &mut report,
                     &mut shards_seen,
                     &mut data_batches_flushed,
@@ -687,6 +698,8 @@ pub(super) async fn load_with_drain_reflush_period(
             Some(Prefetched::RowRejected { row, reason }) => {
                 drain_inflight(
                     &mut inflight,
+                    &router,
+                    &mut enqueue,
                     &mut report,
                     &mut shards_seen,
                     &mut data_batches_flushed,
@@ -754,6 +767,8 @@ pub(super) async fn load_with_drain_reflush_period(
                     }
                     drain_inflight(
                         &mut inflight,
+                        &router,
+                        &mut enqueue,
                         &mut report,
                         &mut shards_seen,
                         &mut data_batches_flushed,
@@ -805,19 +820,34 @@ pub(super) async fn load_with_drain_reflush_period(
 
         // The depth flush runs before the window is resolved, so the oldest
         // write the loop waits on below has always been flushed already.
-        if window.submitted() {
+        if window.enabled() {
             enqueue.wait_enqueued().await;
-            let _flushing = flush_lock.lock().await;
-            let before = router.metrics().flush_trigger_mix_by_shard();
-            router.flush_all().await;
-            for (shard, mix) in router.metrics().flush_trigger_mix_by_shard() {
-                let prior = before
-                    .iter()
-                    .find(|(s, _)| *s == shard)
-                    .map_or(0, |(_, m)| m.final_drain);
-                let delta = mix.final_drain.saturating_sub(prior);
-                if delta > 0 {
-                    *depth_flushes_by_shard.entry(shard).or_default() += delta;
+            let observed = settle_shards(|| router.metrics().shard_skew_by_shard())
+                .await
+                .map(|enqueued| ShardObservation {
+                    enqueued,
+                    size_flushes: SizeFlushes::PerShard(
+                        router
+                            .metrics()
+                            .flush_trigger_mix_by_shard()
+                            .into_iter()
+                            .map(|(shard, mix)| (shard, mix.size))
+                            .collect(),
+                    ),
+                });
+            if window.submitted(observed) {
+                let _flushing = flush_lock.lock().await;
+                let before = router.metrics().flush_trigger_mix_by_shard();
+                router.flush_all().await;
+                for (shard, mix) in router.metrics().flush_trigger_mix_by_shard() {
+                    let prior = before
+                        .iter()
+                        .find(|(s, _)| *s == shard)
+                        .map_or(0, |(_, m)| m.final_drain);
+                    let delta = mix.final_drain.saturating_sub(prior);
+                    if delta > 0 {
+                        *depth_flushes_by_shard.entry(shard).or_default() += delta;
+                    }
                 }
             }
         }
@@ -856,7 +886,7 @@ pub(super) async fn load_with_drain_reflush_period(
             )
             .await
             {
-                harvest_after_failure(&mut inflight, &mut e).await;
+                harvest_after_failure(&mut inflight, &mut e, &router, &mut enqueue).await;
                 report.write_wait += write_wait_start.elapsed();
                 return Err(e);
             }
@@ -871,6 +901,8 @@ pub(super) async fn load_with_drain_reflush_period(
     if !decoder_done {
         drain_inflight(
             &mut inflight,
+            &router,
+            &mut enqueue,
             &mut report,
             &mut shards_seen,
             &mut data_batches_flushed,
@@ -931,6 +963,8 @@ pub(super) async fn load_with_drain_reflush_period(
         });
         let result = drain_inflight(
             &mut inflight,
+            &router,
+            &mut enqueue,
             &mut report,
             &mut shards_seen,
             &mut data_batches_flushed,
@@ -956,7 +990,7 @@ pub(super) async fn load_with_drain_reflush_period(
         batch_rows,
         shards,
     );
-    report.geometry = Some(geometry);
+    report.geometry = geometry_resolved.then_some(geometry);
     #[cfg(feature = "stage-timing")]
     {
         report.stage_timings = router.stage_timings().snapshot();
@@ -1500,21 +1534,28 @@ async fn resolve_write_entry(
 /// error every remaining (later) write is resolved too and whatever it
 /// committed is folded into that error's durable-token list; see
 /// [`harvest_after_failure`] for why the loader waits rather than aborts.
+/// Buffered writes are flushed first so none of them waits out the age trigger.
 async fn drain_inflight(
     inflight: &mut std::collections::VecDeque<(
         u64,
         tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
     )>,
+    router: &LogIngestRouter,
+    enqueue: &mut EnqueueTracker,
     report: &mut LoadReport,
     shards_seen: &mut std::collections::HashSet<u32>,
     data_batches_flushed: &mut u64,
     shards: u32,
 ) -> Result<(), LoadError> {
+    if !inflight.is_empty() {
+        enqueue.wait_enqueued().await;
+        router.flush_all().await;
+    }
     while let Some(entry) = inflight.pop_front() {
         if let Err(mut e) =
             resolve_write_entry(entry, report, shards_seen, data_batches_flushed, shards).await
         {
-            harvest_after_failure(inflight, &mut e).await;
+            harvest_after_failure(inflight, &mut e, router, enqueue).await;
             return Err(e);
         }
     }
@@ -1559,7 +1600,15 @@ async fn harvest_after_failure(
         tokio::task::JoinHandle<Result<LogWriteReceipt, LogWriteError>>,
     )>,
     err: &mut LoadError,
+    router: &LogIngestRouter,
+    enqueue: &mut EnqueueTracker,
 ) {
+    if !inflight.is_empty() {
+        // A still-buffered write would otherwise wait out the age trigger
+        // before its ack, so the failure would report a minute late.
+        enqueue.wait_enqueued().await;
+        router.flush_all().await;
+    }
     let Some(durable) = err.durable_tokens_mut() else {
         // `Setup` carries no token list because it cannot occur once a batch
         // could have flushed; there is nothing outstanding to harvest into.

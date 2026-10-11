@@ -44,6 +44,71 @@ pub(super) fn attr(key: &str, column: &str, ty: ColType) -> AttrMap {
     }
 }
 
+/// A deterministic clock the test advances by hand, whose `sleep` the shard
+/// actor's flush tick waits on (mirrors `ravel-ingest`'s own unit-test
+/// `TestClock`, restated here because that clock is private to that crate's
+/// test module). Advancing it past `max_flush_delay` is what drives an age
+/// flush with no real-time sleep, so the age trigger can be exercised
+/// through the loader deterministically.
+pub(super) struct TestClock {
+    now_ns: std::sync::atomic::AtomicI64,
+    /// Clock reads and sleep registrations since construction. Every shard
+    /// actor loop iteration, every write the actor handles, and every flush
+    /// task reads this clock, so the counter standing still means no task
+    /// in the router is runnable: the progress signal
+    /// `yield_until_router_is_quiet` in the logs tests samples.
+    reads: std::sync::atomic::AtomicU64,
+    wake_tx: tokio::sync::watch::Sender<()>,
+}
+
+impl TestClock {
+    pub(super) fn new(start_ns: i64) -> std::sync::Arc<Self> {
+        let (wake_tx, _rx) = tokio::sync::watch::channel(());
+        std::sync::Arc::new(TestClock {
+            now_ns: std::sync::atomic::AtomicI64::new(start_ns),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            wake_tx,
+        })
+    }
+
+    pub(super) fn advance_ns(&self, delta_ns: i64) {
+        self.now_ns
+            .fetch_add(delta_ns, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.wake_tx.send(());
+    }
+
+    pub(super) fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Clock for TestClock {
+    fn now_ns(&self) -> i64 {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.now_ns.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn sleep(
+        &self,
+        dur: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let deadline = self
+            .now_ns()
+            .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+        let mut rx = self.wake_tx.subscribe();
+        Box::pin(async move {
+            loop {
+                if self.now_ns() >= deadline {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
+
 /// A clock pinned to `NOW_NS`, so the router buckets and routes against the
 /// same instant the provisioning `now_ns` uses (as the loader integration
 /// tests do).

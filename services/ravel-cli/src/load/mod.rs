@@ -390,9 +390,11 @@ impl LoadReport {
 
     /// The machine-readable per-shard flush trigger mix plus its totals (issue
     /// #983), the serializable projection of [`LoadReport::flush_trigger_mix`]
-    /// and [`LoadReport::depth_flushes_by_shard`]. The router's arrival
-    /// trigger is an age trigger measured from first arrival, so it counts as
-    /// `age`; its drains split into `depth` and `manual`.
+    /// and [`LoadReport::depth_flushes_by_shard`]. The router counts
+    /// strict-arrival flushes apart from age and never folds them in; this
+    /// report puts them under `age` only so the four keys still sum to the
+    /// flushes. The loader writes only `WriteMode::Strict`, so that count is
+    /// 0 on every load. The drains split into `depth` and `manual`.
     pub fn flush_mix_report(&self) -> FlushMixReport {
         let shards: Vec<ShardFlushMix> = self
             .flush_trigger_mix

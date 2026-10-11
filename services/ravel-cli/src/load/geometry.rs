@@ -10,6 +10,7 @@
 //! the shard actors themselves sum, so `DEFAULT_OBJECT_ROWS` rows of the same
 //! shape reach the derived target exactly when the size trigger fires.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
@@ -33,6 +34,16 @@ pub const DEFAULT_MAX_FLUSH_DELAY: Duration = Duration::from_secs(60);
 /// the first write into an empty buffer already exceeds it. See
 /// [`target_bytes_no_effect_warning`].
 pub const PER_BATCH_TARGET_BYTES: usize = 1;
+
+/// The largest pipeline depth a load derives. A depth is a count of writes
+/// held in flight at once, each with its own task and ack, so a tiny
+/// `--batch-rows` on many shards must not turn the rows bound into tens of
+/// thousands of them. `--pipeline-depth` is not capped.
+pub const MAX_DERIVED_PIPELINE_DEPTH: usize = 1_024;
+
+/// Called once a load's geometry is resolved, before its first write is
+/// submitted, so a caller can report it while the load runs.
+pub type GeometryHook = Arc<dyn Fn(&LoadGeometry) + Send + Sync>;
 
 /// What the caller asked for before the first batch is decoded: each lever
 /// `None` is derived by [`resolve_geometry`], and the memory request bounds a
@@ -111,6 +122,8 @@ pub enum DepthBound {
     /// The memory budget divided by one batch's estimated bytes, which was
     /// below the rows bound.
     Memory,
+    /// [`MAX_DERIVED_PIPELINE_DEPTH`], which was below both bounds.
+    Cap,
 }
 
 /// The flush target and pipeline depth a load ran with, and how each was
@@ -131,12 +144,12 @@ pub struct LoadGeometry {
 }
 
 impl LoadGeometry {
-    /// Whether the loader flushes every shard each time `pipeline_depth`
-    /// batches have been submitted since the last such flush. Off at
-    /// [`PER_BATCH_TARGET_BYTES`] or below, where every write already flushes
-    /// on its own.
+    /// Whether the loader runs the depth flush (see [`DepthWindow`]). Only a
+    /// derived target turns it on: an explicit `--target-bytes` keeps the
+    /// layout it has always produced, closed by the size and age triggers
+    /// alone, whatever `--pipeline-depth` says.
     pub fn depth_flush_enabled(&self) -> bool {
-        self.target_bytes > PER_BATCH_TARGET_BYTES
+        self.target_source == TargetSource::Derived && self.target_bytes > PER_BATCH_TARGET_BYTES
     }
 }
 
@@ -181,8 +194,11 @@ pub fn resolve_geometry(
     });
     let (pipeline_depth, depth_bound) = match (pipeline_depth, memory_depth) {
         (Some(d), _) => (d, DepthBound::Flag),
-        (None, Some(m)) if m < rows_depth => (m, DepthBound::Memory),
-        (None, _) => (rows_depth, DepthBound::Rows),
+        (None, Some(m)) if m < rows_depth && m <= MAX_DERIVED_PIPELINE_DEPTH => {
+            (m, DepthBound::Memory)
+        }
+        (None, _) if rows_depth <= MAX_DERIVED_PIPELINE_DEPTH => (rows_depth, DepthBound::Rows),
+        (None, _) => (MAX_DERIVED_PIPELINE_DEPTH, DepthBound::Cap),
     };
     LoadGeometry {
         target_bytes,
@@ -240,38 +256,169 @@ impl EnqueueTracker {
     }
 }
 
-/// Counts batches since the last depth flush. Every `pipeline_depth`
-/// submitted batches the loader flushes every shard: at the rows-bound depth
-/// that is one target's worth of rows per shard, so a shard the size trigger
-/// has not released yet is released here rather than by the age trigger,
-/// and every write still in the window is answered by the time the flush
-/// returns.
-pub(super) struct DepthWindow {
-    depth: usize,
-    enabled: bool,
-    since_flush: usize,
+/// How long [`settle_shards`] waits for the shard actors to handle every
+/// enqueued write before the depth window stops trusting size flushes.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait until every shard actor has handled every write enqueued so far, and
+/// return each shard's enqueued count. `None` when that has not happened
+/// within [`SETTLE_TIMEOUT`].
+///
+/// A shard actor counts a write processed only after `handle_write` returns,
+/// and a size flush is opened (and counted) inside `handle_write`, so once
+/// processed has caught up with enqueued the router's size-flush counters
+/// cover every write submitted so far.
+pub(super) async fn settle_shards(
+    skew: impl Fn() -> Vec<(u32, ravel_ingest::ShardSkewStats)>,
+) -> Option<BTreeMap<u32, u64>> {
+    let started = Instant::now();
+    let mut round = 0u32;
+    loop {
+        let stats = skew();
+        if stats
+            .iter()
+            .all(|(_, s)| s.messages_processed >= s.messages_enqueued)
+        {
+            return Some(
+                stats
+                    .into_iter()
+                    .map(|(shard, s)| (shard, s.messages_enqueued))
+                    .collect(),
+            );
+        }
+        if started.elapsed() >= SETTLE_TIMEOUT {
+            return None;
+        }
+        round = round.saturating_add(1);
+        if round < 64 {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 }
+
+/// The size flushes a router has opened so far: per shard where the router
+/// counts per shard (logs), a router-wide total otherwise.
+pub(super) enum SizeFlushes {
+    PerShard(BTreeMap<u32, u64>),
+    Total(u64),
+}
+
+/// The router state the depth window reads after each submit, once
+/// [`settle_shards`] returned.
+pub(super) struct ShardObservation {
+    pub(super) enqueued: BTreeMap<u32, u64>,
+    pub(super) size_flushes: SizeFlushes,
+}
+
+/// Decides when the loader flushes every shard. A shard's buffer is pending
+/// from the first batch that reached it after its last flush; once the oldest
+/// pending batch on any shard is `pipeline_depth` batches old, the loader
+/// flushes every shard. At the rows-bound depth that is one target's worth of
+/// rows per shard, so a buffer the size trigger has not closed by then (the
+/// first batch over-estimated the rest) is closed here rather than by the age
+/// trigger. It also runs no later than the loop's wait on the oldest
+/// in-flight write, which is `pipeline_depth` batches back, so that wait never
+/// sits on a buffer nothing will flush.
+///
+/// A size flush clears its shard, so the next window starts at the shard's
+/// next batch: the depth flush never closes a buffer the size trigger has
+/// just emptied. Per-shard counts attribute a size flush exactly. A
+/// router-wide count attributes it only when it equals the number of shards
+/// the batch reached (a write opens at most one size flush per shard);
+/// otherwise nothing is cleared and the depth flush may come early, never
+/// late. Only a write opens a size flush, so a flush counted after a batch
+/// was handled covers that batch.
+pub(super) struct DepthWindow {
+    depth: u64,
+    enabled: bool,
+    submits: u64,
+    oldest_pending: BTreeMap<u32, u64>,
+    enqueued: BTreeMap<u32, u64>,
+    size_per_shard: BTreeMap<u32, u64>,
+    size_total: u64,
+    /// Cleared once an observation is missing, after which size flushes no
+    /// longer clear anything.
+    realign: bool,
+}
+
+/// The `oldest_pending` key for batches whose shards are unknown.
+const ANY_SHARD: u32 = u32::MAX;
 
 impl DepthWindow {
     pub(super) fn new(geometry: &LoadGeometry) -> Self {
         Self {
-            depth: geometry.pipeline_depth.max(1),
+            depth: geometry.pipeline_depth.max(1) as u64,
             enabled: geometry.depth_flush_enabled(),
-            since_flush: 0,
+            submits: 0,
+            oldest_pending: BTreeMap::new(),
+            enqueued: BTreeMap::new(),
+            size_per_shard: BTreeMap::new(),
+            size_total: 0,
+            realign: true,
         }
     }
 
-    /// Record one submitted batch; `true` when the depth flush is due now.
-    pub(super) fn submitted(&mut self) -> bool {
+    /// Whether the loader observes the router after each submit at all.
+    pub(super) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Record one submitted batch and the router state once it was handled
+    /// (`None` when [`settle_shards`] timed out); `true` when the depth flush
+    /// is due now.
+    pub(super) fn submitted(&mut self, observed: Option<ShardObservation>) -> bool {
         if !self.enabled {
             return false;
         }
-        self.since_flush += 1;
-        if self.since_flush >= self.depth {
-            self.since_flush = 0;
-            true
-        } else {
-            false
+        self.submits += 1;
+        let batch = self.submits;
+        match observed {
+            Some(observed) if self.realign => self.realign_to(batch, observed),
+            _ => {
+                self.realign = false;
+                self.oldest_pending.entry(ANY_SHARD).or_insert(batch);
+            }
+        }
+        let due = self
+            .oldest_pending
+            .values()
+            .min()
+            .is_some_and(|&oldest| batch - oldest + 1 >= self.depth);
+        if due {
+            self.oldest_pending.clear();
+        }
+        due
+    }
+
+    fn realign_to(&mut self, batch: u64, observed: ShardObservation) {
+        let mut reached = Vec::new();
+        for (&shard, &count) in &observed.enqueued {
+            if count > self.enqueued.get(&shard).copied().unwrap_or(0) {
+                reached.push(shard);
+                self.oldest_pending.entry(shard).or_insert(batch);
+            }
+        }
+        self.enqueued = observed.enqueued;
+        match observed.size_flushes {
+            SizeFlushes::PerShard(counts) => {
+                for (&shard, &count) in &counts {
+                    if count > self.size_per_shard.get(&shard).copied().unwrap_or(0) {
+                        self.oldest_pending.remove(&shard);
+                    }
+                }
+                self.size_per_shard = counts;
+            }
+            SizeFlushes::Total(total) => {
+                let opened = total.saturating_sub(self.size_total);
+                if opened > 0 && opened == reached.len() as u64 {
+                    for shard in &reached {
+                        self.oldest_pending.remove(shard);
+                    }
+                }
+                self.size_total = total;
+            }
         }
     }
 }
@@ -355,6 +502,69 @@ pub struct LoadLayoutReport {
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.
 pub const LOAD_REPORT_JSON_PREFIX: &str = "load report json : ";
 
+/// What chose the flush target, as the summary and the geometry line print
+/// it. A derived target prints its per-row figure as the exact decimal
+/// `target_bytes / DEFAULT_OBJECT_ROWS`, so the printed product is the
+/// printed target.
+fn target_source_text(g: &LoadGeometry) -> String {
+    match g.target_source {
+        TargetSource::Flag => "--target-bytes".to_string(),
+        TargetSource::Derived => {
+            let rows = DEFAULT_OBJECT_ROWS;
+            let whole = g.target_bytes / rows;
+            // 1,000,000 / DEFAULT_OBJECT_ROWS is a whole number, so six
+            // decimal places hold the remainder exactly.
+            let millionths = (g.target_bytes % rows) * (1_000_000 / rows);
+            let per_row = if millionths == 0 {
+                whole.to_string()
+            } else {
+                let frac = format!("{millionths:06}");
+                format!("{whole}.{}", frac.trim_end_matches('0'))
+            };
+            format!("derived: {rows} rows x {per_row} estimated bytes per row")
+        }
+    }
+}
+
+/// What decided the pipeline depth, naming every bound that was weighed.
+fn depth_bound_text(g: &LoadGeometry) -> String {
+    let memory_depth = g
+        .memory_depth
+        .map_or_else(|| "no budget".to_string(), |d| d.to_string());
+    match g.depth_bound {
+        DepthBound::Flag => "--pipeline-depth".to_string(),
+        DepthBound::Rows => format!(
+            "rows bound decided it: rows bound {}, memory bound {memory_depth}",
+            g.rows_depth
+        ),
+        DepthBound::Memory => format!(
+            "memory bound decided it: memory bound {memory_depth}, rows bound {}",
+            g.rows_depth
+        ),
+        DepthBound::Cap => format!(
+            "cap decided it: cap {MAX_DERIVED_PIPELINE_DEPTH}, rows bound {}, memory bound \
+             {memory_depth}",
+            g.rows_depth
+        ),
+    }
+}
+
+/// The prefix of the line a load prints on stderr once its geometry is
+/// resolved, before its first write.
+pub const GEOMETRY_LINE_PREFIX: &str = "load geometry: ";
+
+/// The one-line geometry report printed as soon as the geometry is resolved:
+/// the target and the depth, with what decided each.
+pub fn render_geometry_line(signal: &str, g: &LoadGeometry) -> String {
+    format!(
+        "{GEOMETRY_LINE_PREFIX}{signal}: flush target {} bytes ({}), pipeline depth {} ({})",
+        g.target_bytes,
+        target_source_text(g),
+        g.pipeline_depth,
+        depth_bound_text(g),
+    )
+}
+
 /// The layout lines of an end-of-load summary: the target and depth with
 /// what chose each, the trigger mix (per shard where the router counts per
 /// shard), the no-effect warning when it applies, and the whole report as
@@ -363,36 +573,17 @@ pub fn render_layout_summary(report: &LoadLayoutReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     if let Some(g) = &report.geometry {
-        let target_source = match g.target_source {
-            TargetSource::Flag => "--target-bytes".to_string(),
-            TargetSource::Derived => format!(
-                "derived: {DEFAULT_OBJECT_ROWS} rows x {} estimated bytes per row",
-                g.est_bytes_per_row
-            ),
-        };
         let _ = writeln!(
             out,
-            "  flush target     : {} bytes ({target_source})",
-            g.target_bytes
+            "  flush target     : {} bytes ({})",
+            g.target_bytes,
+            target_source_text(g)
         );
-        let memory_depth = g
-            .memory_depth
-            .map_or_else(|| "no budget".to_string(), |d| d.to_string());
-        let depth_bound = match g.depth_bound {
-            DepthBound::Flag => "--pipeline-depth".to_string(),
-            DepthBound::Rows => format!(
-                "rows bound decided it: rows bound {}, memory bound {memory_depth}",
-                g.rows_depth
-            ),
-            DepthBound::Memory => format!(
-                "memory bound decided it: memory bound {memory_depth}, rows bound {}",
-                g.rows_depth
-            ),
-        };
         let _ = writeln!(
             out,
-            "  pipeline depth   : {} ({depth_bound})",
-            g.pipeline_depth
+            "  pipeline depth   : {} ({})",
+            g.pipeline_depth,
+            depth_bound_text(g)
         );
     }
     let t = &report.flush_mix.totals;
@@ -482,15 +673,120 @@ mod tests {
         assert!(!g.depth_flush_enabled());
     }
 
+    /// One shard that received `enqueued` writes and opened `size` size
+    /// flushes so far.
+    fn one_shard(enqueued: u64, size: u64) -> Option<ShardObservation> {
+        Some(ShardObservation {
+            enqueued: BTreeMap::from([(0, enqueued)]),
+            size_flushes: SizeFlushes::PerShard(BTreeMap::from([(0, size)])),
+        })
+    }
+
     #[test]
-    fn depth_window_fires_every_depth_batches_and_never_per_batch() {
-        let mut g = resolve_geometry(Some(1_000), Some(3), 1, 10, 10, 10, None);
+    fn depth_window_fires_every_depth_batches_without_size_flushes() {
+        // Derived target, depth 3.
+        let g = resolve_geometry(None, Some(3), 1, 10, 10, 10, None);
         let mut w = DepthWindow::new(&g);
-        let fired: Vec<bool> = (0..7).map(|_| w.submitted()).collect();
+        let fired: Vec<bool> = (1..=7).map(|n| w.submitted(one_shard(n, 0))).collect();
         assert_eq!(fired, [false, false, true, false, false, true, false]);
-        g.target_bytes = PER_BATCH_TARGET_BYTES;
+    }
+
+    #[test]
+    fn depth_window_is_off_for_an_explicit_target() {
+        for target in [PER_BATCH_TARGET_BYTES, 1_000, 1_850_000_000] {
+            let g = resolve_geometry(Some(target), Some(3), 1, 10, 10, 10, None);
+            assert!(!g.depth_flush_enabled());
+            let mut w = DepthWindow::new(&g);
+            assert!(!w.enabled());
+            assert!((1..=7).all(|n| !w.submitted(one_shard(n, 0))));
+        }
+    }
+
+    #[test]
+    fn a_size_flush_restarts_the_window_at_the_next_batch() {
+        let g = resolve_geometry(None, Some(3), 1, 10, 10, 10, None);
         let mut w = DepthWindow::new(&g);
-        assert!((0..7).all(|_| !w.submitted()));
+        // The size trigger closes the buffer on batch 2, so batch 3 starts
+        // the next window and batch 5 is its third batch.
+        let size = [0, 1, 1, 1, 1, 1];
+        let fired: Vec<bool> = (1..=6)
+            .map(|n| w.submitted(one_shard(n, size[n as usize - 1])))
+            .collect();
+        assert_eq!(fired, [false, false, false, false, true, false]);
+    }
+
+    #[test]
+    fn a_router_wide_count_clears_only_what_it_can_attribute() {
+        let g = resolve_geometry(None, Some(2), 2, 10, 10, 10, None);
+        let both = |enqueued: u64, size: u64| {
+            Some(ShardObservation {
+                enqueued: BTreeMap::from([(0, enqueued), (1, enqueued)]),
+                size_flushes: SizeFlushes::Total(size),
+            })
+        };
+        // One size flush for a batch that reached two shards cannot be
+        // placed, so the window still fires on batch 2.
+        let mut w = DepthWindow::new(&g);
+        assert!(!w.submitted(both(1, 0)));
+        assert!(w.submitted(both(2, 1)));
+        // Two size flushes on batch 2 close both shards.
+        let mut w = DepthWindow::new(&g);
+        assert!(!w.submitted(both(1, 0)));
+        assert!(!w.submitted(both(2, 2)));
+        assert!(!w.submitted(both(3, 2)));
+        assert!(w.submitted(both(4, 2)));
+    }
+
+    #[test]
+    fn a_missing_observation_falls_back_to_counting_batches() {
+        let g = resolve_geometry(None, Some(3), 1, 10, 10, 10, None);
+        let mut w = DepthWindow::new(&g);
+        assert!(!w.submitted(one_shard(1, 0)));
+        assert!(!w.submitted(None));
+        // Size flushes no longer clear anything once one was missed.
+        assert!(w.submitted(one_shard(3, 1)));
+    }
+
+    #[test]
+    fn a_derived_depth_is_capped() {
+        // ceil(250,000 x 4 / 1) = 1,000,000 batches.
+        let g = resolve_geometry(None, None, 4, 1, 1, 100, Some(1 << 40));
+        assert_eq!(g.rows_depth, 1_000_000);
+        assert_eq!(g.pipeline_depth, MAX_DERIVED_PIPELINE_DEPTH);
+        assert_eq!(g.depth_bound, DepthBound::Cap);
+        assert!(
+            render_geometry_line("logs", &g).contains(
+                "pipeline depth 1024 (cap decided it: cap 1024, rows bound 1000000, memory \
+                 bound"
+            ),
+            "{}",
+            render_geometry_line("logs", &g)
+        );
+        // An explicit depth is kept above the cap.
+        let g = resolve_geometry(None, Some(4_096), 4, 1, 1, 100, None);
+        assert_eq!(g.pipeline_depth, 4_096);
+    }
+
+    #[test]
+    fn the_printed_per_row_figure_times_the_rows_is_the_target() {
+        // 3 rows estimated at 1,000 bytes: 333.333... per row, target
+        // floor(250,000 x 1,000 / 3) = 83,333,333.
+        let g = resolve_geometry(None, None, 1, 3, 3, 1_000, None);
+        assert_eq!(g.target_bytes, 83_333_333);
+        let line = render_geometry_line("logs", &g);
+        assert!(
+            line.contains(
+                "flush target 83333333 bytes (derived: 250000 rows x 333.333332 \
+                 estimated bytes per row)"
+            ),
+            "{line}"
+        );
+        let g = resolve_geometry(None, None, 1, 10_000, 10_000, 1_230_000, None);
+        assert!(
+            render_geometry_line("logs", &g).contains("250000 rows x 123 estimated"),
+            "{}",
+            render_geometry_line("logs", &g)
+        );
     }
 
     #[test]

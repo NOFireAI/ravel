@@ -962,6 +962,7 @@ pub async fn load_spans(
         batch_rows,
         skip_rows,
         GeometryRequest::explicit(target_bytes, pipeline_depth),
+        None,
         max_inflight_flushes,
         max_flush_delay,
         now_ns,
@@ -979,7 +980,8 @@ pub async fn load_spans(
 ///
 /// `request` leaves the target and depth to [`resolve_geometry`] where they
 /// are `None`; the router is built once the first non-empty batch is decoded,
-/// since a derived target is read off that batch's estimate.
+/// since a derived target is read off that batch's estimate. `on_geometry`
+/// is called with the resolved geometry before the first write is submitted.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_spans_into(
     report: &mut SpansLoadReport,
@@ -991,6 +993,7 @@ pub(super) async fn load_spans_into(
     batch_rows: usize,
     skip_rows: u64,
     request: GeometryRequest,
+    on_geometry: Option<GeometryHook>,
     max_inflight_flushes: u32,
     max_flush_delay: Option<Duration>,
     now_ns: i64,
@@ -1113,8 +1116,14 @@ pub(super) async fn load_spans_into(
 
         let (spans, rows, done) = match decoded {
             SpansDecoded::Failed(reason) => {
-                let (durable, reason) =
-                    drain_sequential_before_refusal(&mut inflight, report, reason).await;
+                let (durable, reason) = drain_sequential_before_refusal(
+                    &mut inflight,
+                    report,
+                    reason,
+                    lazy.as_ref().map(|(r, _, _)| r.as_ref()),
+                    &mut enqueue,
+                )
+                .await;
                 return Err(LoadError::BatchFailed {
                     reason,
                     durable,
@@ -1127,8 +1136,14 @@ pub(super) async fn load_spans_into(
                 attrs_dropped,
             } => {
                 report.attributes_dropped += attrs_dropped;
-                let (durable, reason) =
-                    drain_sequential_before_refusal(&mut inflight, report, reason).await;
+                let (durable, reason) = drain_sequential_before_refusal(
+                    &mut inflight,
+                    report,
+                    reason,
+                    lazy.as_ref().map(|(r, _, _)| r.as_ref()),
+                    &mut enqueue,
+                )
+                .await;
                 return Err(LoadError::RowRejected {
                     row,
                     reason,
@@ -1154,6 +1169,7 @@ pub(super) async fn load_spans_into(
             continue;
         }
 
+        let announce = lazy.is_none() && on_geometry.is_some();
         let (router, geometry, window) = lazy.get_or_insert_with(|| {
             let resolved = resolve_geometry(
                 request.target_bytes,
@@ -1164,12 +1180,20 @@ pub(super) async fn load_spans_into(
                 ravel_ingest::est_spans_object_bytes(&spans),
                 memory_budget,
             );
+            if let Some(on_geometry) = &on_geometry {
+                on_geometry(&resolved);
+            }
             (
                 build_router(resolved.target_bytes),
                 resolved,
                 DepthWindow::new(&resolved),
             )
         });
+        if announce {
+            // Lets a caller driving this future print the line before the
+            // first submit.
+            tokio::task::yield_now().await;
+        }
         let pipeline_depth = geometry.pipeline_depth;
 
         let handle = {
@@ -1188,11 +1212,19 @@ pub(super) async fn load_spans_into(
 
         // The depth flush runs before the window is resolved, so the oldest
         // write the loop waits on below has always been flushed already.
-        if window.submitted() {
+        if window.enabled() {
             enqueue.wait_enqueued().await;
-            let before = router.metrics_snapshot().flushes_manual;
-            router.flush_all().await;
-            depth_flushes += router.metrics_snapshot().flushes_manual - before;
+            let observed = settle_shards(|| router.metrics().shard_skew_by_shard())
+                .await
+                .map(|enqueued| ShardObservation {
+                    enqueued,
+                    size_flushes: SizeFlushes::Total(router.metrics_snapshot().flushes_by_size),
+                });
+            if window.submitted(observed) {
+                let before = router.metrics_snapshot().flushes_manual;
+                router.flush_all().await;
+                depth_flushes += router.metrics_snapshot().flushes_manual - before;
+            }
         }
 
         // Bound true concurrency to `pipeline_depth`, resolving strictly
@@ -1203,7 +1235,13 @@ pub(super) async fn load_spans_into(
                 break;
             };
             if let Err(mut e) = resolve_sequential_write(entry, report).await {
-                harvest_sequential_after_failure(&mut inflight, &mut e).await;
+                harvest_sequential_after_failure(
+                    &mut inflight,
+                    &mut e,
+                    Some(router.as_ref()),
+                    &mut enqueue,
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -1238,7 +1276,9 @@ pub(super) async fn load_spans_into(
                 }
             }
         });
-        let result = drain_sequential_inflight(&mut inflight, report).await;
+        let result =
+            drain_sequential_inflight(&mut inflight, report, Some(router.as_ref()), &mut enqueue)
+                .await;
         let _ = stop_tx.send(());
         let _ = ticker.await;
         result

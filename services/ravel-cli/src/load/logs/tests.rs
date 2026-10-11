@@ -4,71 +4,6 @@ use arrow::datatypes::Int32Type;
 use super::*;
 use crate::load::test_support::*;
 
-/// A deterministic clock the test advances by hand, whose `sleep` the shard
-/// actor's flush tick waits on (mirrors `ravel-ingest`'s own unit-test
-/// `TestClock`, restated here because that clock is private to that crate's
-/// test module). Advancing it past `max_flush_delay` is what drives an age
-/// flush with no real-time sleep, so the age trigger can be exercised
-/// through the loader deterministically.
-struct TestClock {
-    now_ns: std::sync::atomic::AtomicI64,
-    /// Clock reads and sleep registrations since construction. Every shard
-    /// actor loop iteration, every write the actor handles, and every flush
-    /// task reads this clock, so the counter standing still means no task
-    /// in the router is runnable: the progress signal
-    /// [`yield_until_router_is_quiet`] samples.
-    reads: std::sync::atomic::AtomicU64,
-    wake_tx: tokio::sync::watch::Sender<()>,
-}
-
-impl TestClock {
-    fn new(start_ns: i64) -> std::sync::Arc<Self> {
-        let (wake_tx, _rx) = tokio::sync::watch::channel(());
-        std::sync::Arc::new(TestClock {
-            now_ns: std::sync::atomic::AtomicI64::new(start_ns),
-            reads: std::sync::atomic::AtomicU64::new(0),
-            wake_tx,
-        })
-    }
-
-    fn advance_ns(&self, delta_ns: i64) {
-        self.now_ns
-            .fetch_add(delta_ns, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.wake_tx.send(());
-    }
-
-    fn reads(&self) -> u64 {
-        self.reads.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl Clock for TestClock {
-    fn now_ns(&self) -> i64 {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.now_ns.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn sleep(
-        &self,
-        dur: Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        let deadline = self
-            .now_ns()
-            .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
-        let mut rx = self.wake_tx.subscribe();
-        Box::pin(async move {
-            loop {
-                if self.now_ns() >= deadline {
-                    return;
-                }
-                if rx.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-    }
-}
-
 /// Consecutive scheduler rounds [`yield_until_router_is_quiet`] needs to see
 /// the clock unread before it calls the router quiet. A routed write reaches
 /// its shard buffer within a handful of rounds, so this is generous rather
@@ -1520,7 +1455,7 @@ async fn stride_reading_spreads_a_sorted_batch_across_all_shards() {
 /// every group and therefore touching all 4 shards -- 16 (batch, shard)
 /// writes over 16 rows.
 ///
-/// At the default `--target-bytes 1` each of those 16 writes flushes inside
+/// At `--target-bytes 1` each of those 16 writes flushes inside
 /// its own `handle_write`: 16 objects. At 8 MiB none of them can, because a
 /// shard's whole share of the file is 4 one-row writes, so each shard
 /// flushes exactly once (released by [`load_with_released_tail`], which
@@ -3402,21 +3337,22 @@ async fn both_write_windows_are_needed_to_overlap_put_round_trips() {
     // of the code. The end-to-end wall figure that justifies the default
     // lives in ADR-0807, measured on a real corpus.
 
-    // The shipped defaults, run through the same fixture: what an operator
-    // gets with neither flag given must be the overlapped arm, not the
-    // serial one. This is the assertion the default change is accountable
-    // to; against the pre-change defaults of 1 and 1 it reads a peak of 1.
+    // The measured depth (`MEASURED_PIPELINE_DEPTH`, what
+    // `--pipeline-depth 4` restores now that the depth is derived) with the
+    // default `--max-inflight-flushes`, run through the same fixture: it
+    // must be the overlapped arm, not the serial one. Against flush and
+    // depth windows of 1 and 1 it reads a peak of 1.
     let a_default = arm(MEASURED_PIPELINE_DEPTH, DEFAULT_MAX_INFLIGHT_FLUSHES).await;
     let (wall_default, peak_default) = (a_default.wall, a_default.peak);
     println!(
-        "  shipped defaults:    wall {wall_default:?} peak {peak_default} \
+        "  measured depth:      wall {wall_default:?} peak {peak_default} \
              (submit loop: write_wait {:?}, decode_wait {:?})",
         a_default.write_wait, a_default.decode_wait
     );
     assert_eq!(
         peak_default, 4,
-        "the shipped defaults must overlap four object PUTs; a peak of 1 means \
-             the loader ships serial"
+        "the measured depth with the default flush window must overlap four \
+             object PUTs; a peak of 1 means the loader runs serial"
     );
 }
 

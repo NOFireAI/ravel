@@ -243,6 +243,7 @@ pub async fn run(
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         now_ns,
+        Arc::new(SystemClock),
         &mut std::io::stderr(),
     )
     .await
@@ -343,6 +344,7 @@ pub(crate) async fn run_memory_warning_to(
         load_memory,
         false,
         now_ns,
+        Arc::new(SystemClock),
         warnings,
     )
     .await
@@ -371,6 +373,7 @@ pub(crate) async fn run_fold_warning_to(
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
     now_ns: i64,
+    clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     let refused = match signal {
@@ -424,6 +427,7 @@ pub(crate) async fn run_fold_warning_to(
                 max_flush_delay,
                 load_memory,
                 now_ns,
+                Arc::clone(&clock),
                 warnings,
             )
             .await;
@@ -445,6 +449,7 @@ pub(crate) async fn run_fold_warning_to(
                 max_flush_delay,
                 load_memory,
                 now_ns,
+                Arc::clone(&clock),
                 warnings,
             )
             .await;
@@ -452,37 +457,40 @@ pub(crate) async fn run_fold_warning_to(
         MappingSection::Logs(logs) => logs,
     };
 
-    let memory_options = LoadMemoryOptions::new(load_memory);
+    let mut memory_options = LoadMemoryOptions::new(load_memory);
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
 
     // The production entry point drives the columnar fast path (ADR-0109) with
     // the operator-configured decode-queue depth; `load` keeps a stable
     // signature for tests and callers that want the default depth.
-    match load_instrumented_at(
-        store,
-        parquet_path,
-        tenant,
-        &mapping,
-        shards,
-        batch_rows,
-        skip_rows,
-        read_cursors,
-        pipeline_depth,
-        max_inflight_flushes,
-        decode_queue_batches,
-        target_bytes,
-        max_flush_delay,
-        now_ns,
-        Arc::new(SystemClock),
-        LoadPath::Columnar,
-        None,
-        None,
-        zstd_level,
-        Some(memory_options),
-        fold_after_load,
-    )
-    .await
-    {
+    let loaded = printing_geometry("logs", warnings, |on_geometry| {
+        memory_options.on_geometry = Some(on_geometry);
+        load_instrumented_at(
+            store,
+            parquet_path,
+            tenant,
+            &mapping,
+            shards,
+            batch_rows,
+            skip_rows,
+            read_cursors,
+            pipeline_depth,
+            max_inflight_flushes,
+            decode_queue_batches,
+            target_bytes,
+            max_flush_delay,
+            now_ns,
+            clock,
+            LoadPath::Columnar,
+            None,
+            None,
+            zstd_level,
+            Some(memory_options),
+            fold_after_load,
+        )
+    })
+    .await;
+    match loaded {
         Ok(report) => {
             print_summary(&report, true);
             write_report_warnings(warnings, &report);
@@ -510,6 +518,36 @@ pub(crate) async fn run_fold_warning_to(
                 let _ = writeln!(warnings, "{hint}");
             }
             Err(anyhow::Error::new(err))
+        }
+    }
+}
+
+/// Drive one load while writing its resolved geometry line to `warnings`. The
+/// loader yields right after calling the hook, and the channel is polled ahead
+/// of the load, so the line is written before the first batch is submitted.
+async fn printing_geometry<F: std::future::Future>(
+    signal: &'static str,
+    warnings: &mut dyn std::io::Write,
+    load: impl FnOnce(GeometryHook) -> F,
+) -> F::Output {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let hook: GeometryHook = Arc::new(move |geometry: &LoadGeometry| {
+        let _ = tx.send(render_geometry_line(signal, geometry));
+    });
+    let load = load(hook);
+    tokio::pin!(load);
+    loop {
+        tokio::select! {
+            biased;
+            Some(line) = rx.recv() => {
+                let _ = writeln!(warnings, "{line}");
+            }
+            output = &mut load => {
+                while let Ok(line) = rx.try_recv() {
+                    let _ = writeln!(warnings, "{line}");
+                }
+                return output;
+            }
         }
     }
 }
@@ -586,6 +624,7 @@ async fn run_metrics(
     max_flush_delay: Option<Duration>,
     load_memory: LoadMemoryRequest,
     now_ns: i64,
+    clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -595,26 +634,29 @@ async fn run_metrics(
         warnings,
     )?;
 
-    match load_metrics_with(
-        store,
-        parquet_path,
-        tenant,
-        mapping,
-        shards,
-        batch_rows,
-        skip_rows,
-        GeometryRequest {
-            target_bytes,
-            pipeline_depth,
-            load_memory,
-        },
-        max_inflight_flushes,
-        max_flush_delay,
-        now_ns,
-        Arc::new(SystemClock),
-    )
-    .await
-    {
+    let loaded = printing_geometry("metrics", warnings, |on_geometry| {
+        load_metrics_with(
+            store,
+            parquet_path,
+            tenant,
+            mapping,
+            shards,
+            batch_rows,
+            skip_rows,
+            GeometryRequest {
+                target_bytes,
+                pipeline_depth,
+                load_memory,
+            },
+            Some(on_geometry),
+            max_inflight_flushes,
+            max_flush_delay,
+            now_ns,
+            clock,
+        )
+    })
+    .await;
+    match loaded {
         Ok(report) => {
             print_metrics_summary(&report);
             if let Some(warning) =
@@ -674,6 +716,7 @@ async fn run_spans(
     max_flush_delay: Option<Duration>,
     load_memory: LoadMemoryRequest,
     now_ns: i64,
+    clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -688,27 +731,30 @@ async fn run_spans(
     // carries, and a failure does not undo the approximation in the batches
     // that did land.
     let mut report = SpansLoadReport::default();
-    match load_spans_into(
-        &mut report,
-        store,
-        parquet_path,
-        tenant,
-        mapping,
-        shards,
-        batch_rows,
-        skip_rows,
-        GeometryRequest {
-            target_bytes,
-            pipeline_depth,
-            load_memory,
-        },
-        max_inflight_flushes,
-        max_flush_delay,
-        now_ns,
-        Arc::new(SystemClock),
-    )
-    .await
-    {
+    let loaded = printing_geometry("spans", warnings, |on_geometry| {
+        load_spans_into(
+            &mut report,
+            store,
+            parquet_path,
+            tenant,
+            mapping,
+            shards,
+            batch_rows,
+            skip_rows,
+            GeometryRequest {
+                target_bytes,
+                pipeline_depth,
+                load_memory,
+            },
+            Some(on_geometry),
+            max_inflight_flushes,
+            max_flush_delay,
+            now_ns,
+            clock,
+        )
+    })
+    .await;
+    match loaded {
         Ok(()) => {
             print_spans_summary(&report);
             if let Some(warning) =

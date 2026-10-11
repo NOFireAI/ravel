@@ -546,23 +546,24 @@ enum Command {
         /// Number of Strict writes allowed in flight at once. Each batch's
         /// write is one S3 PUT round trip per involved shard; at depth `1` the
         /// loader submits one write and waits for its ack before building or
-        /// submitting the next, so that round-trip latency is serial and the
-        /// machine has nothing to run in between. Raising the depth lets up to
-        /// this many writes overlap, hiding the PUT latency behind later
-        /// batches' encode and I/O.
+        /// submitting the next, so that round-trip latency is serial. Raising
+        /// the depth lets up to this many writes overlap. Unset, the depth is
+        /// derived once the first batch is decoded (issue #2753): the rows
+        /// bound `ceil(250,000 x --shards / --batch-rows)`, lowered to the
+        /// memory bound `--load-memory-bytes` divided by the estimated object
+        /// bytes of one batch when that is smaller, never below 1, and capped
+        /// at 1,024. With `--target-bytes` unset the loader also flushes every
+        /// shard each this many submitted batches (a size flush on a shard
+        /// restarts that shard's count); an explicit `--target-bytes` turns
+        /// that depth flush off. The durable-token list a failed load reports
+        /// is exactly what landed at any depth. `0` is rejected.
         ///
-        /// Unset, the depth is derived once the first batch is decoded (issue
-        /// #2753): the rows bound `ceil(250,000 x --shards / --batch-rows)`,
-        /// enough batches in flight for every shard to fill one
-        /// 250,000-row object, lowered to the memory bound `--load-memory-bytes
-        /// / (--batch-rows x estimated bytes per row)` when that is smaller,
-        /// and never below 1. At the defaults (4 shards, 10,000-row batches)
-        /// the rows bound is 100. The summary and the JSON load report name
-        /// the depth and which bound decided it. Whenever the flush target is
-        /// above `1`, every time this many batches have been submitted since
-        /// the last time, the loader flushes every shard buffer, so a buffer
-        /// the size trigger has not closed is closed then rather than by the
-        /// age trigger; the load report counts those flushes under `depth`.
+        /// At the defaults (4 shards, 10,000-row batches) the rows bound is
+        /// 100, enough batches in flight for every shard to fill one
+        /// 250,000-row object. The summary, the stderr geometry line printed
+        /// before the first write, and the JSON load report name the depth
+        /// and which bound decided it (`rows`, `memory`, `cap` or `flag`). The
+        /// load report counts the depth flush's flushes under `depth`.
         /// `4` (`MEASURED_PIPELINE_DEPTH`) is the depth measured at 2.94x on
         /// the 100M-row ClickBench corpus at one object per batch (ADR-0807),
         /// and `1` is one batch at a time.
@@ -583,12 +584,11 @@ enum Command {
         /// committed: on a failure the loader resolves every outstanding write
         /// before returning rather than abandoning it, so the report equals what
         /// landed at any depth, and a resume from it does not re-ingest rows
-        /// that already committed. `0` is rejected.
+        /// that already committed.
         ///
         /// With a flush target above `1` the depth also bounds object size:
-        /// each Strict write waits for the flush of its own batch, and the
-        /// depth flush closes every buffer each this many batches, so one
-        /// object merges at most this many batches' slices. An explicit depth
+        /// each Strict write waits for the flush of its own batch inside the
+        /// window, so one object merges at most this many batches' slices. An explicit depth
         /// below the batches one object needs on a shard gives objects of
         /// about `depth x --batch-rows / --shards` rows. On ClickBench at
         /// `--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay
@@ -639,23 +639,24 @@ enum Command {
         decode_queue_batches: usize,
         /// The object-size setting: the estimated UNCOMPRESSED content a
         /// shard's buffer accumulates before it flushes as one object (issue
-        /// #801). Stored objects come out much smaller than the target: on
-        /// the ClickBench corpus the logs estimate counts about 7.4 KB per row
-        /// and a stored object holds about 102 bytes per row, so stored
+        /// #801). Unset, the target is derived once the first batch is
+        /// decoded (issue #2753): `DEFAULT_OBJECT_ROWS` (250,000) times that
+        /// batch's estimated bytes per row, so the size trigger fires at
+        /// about 250,000 rows on every signal, and the depth flush closes a
+        /// shard whose rows came out narrower at the `--pipeline-depth` row
+        /// bound. An explicit value is used as given and turns the depth
+        /// flush off. Stored objects come out much smaller than the target.
+        /// `0` is rejected.
+        ///
+        /// On the ClickBench corpus the logs estimate counts about 7.4 KB per
+        /// row and a stored object holds about 102 bytes per row, so stored
         /// objects are about 65 to 75 times below the target (375,000,000
         /// gave 5.7 MB objects, 66x; 1,650,000,000 about 22 MB, 75x;
         /// 1,850,000,000 25.1 MB mean, 74x). That ratio is a property of that
-        /// corpus, not of the format.
-        ///
-        /// Unset, the target is derived once the first batch is decoded
-        /// (issue #2753): `DEFAULT_OBJECT_ROWS` (250,000) times that batch's
-        /// estimated bytes per row, so a shard object holds about 250,000
-        /// rows on every signal. It is an estimate in the same uncompressed
-        /// units the size trigger checks, not a stored size, so the size
-        /// trigger fires at about 250,000 rows. Rows wider or narrower than
-        /// the first batch's move the object's row count accordingly. The
-        /// summary and the JSON load report print the derived target and the
-        /// bytes per row it came from.
+        /// corpus, not of the format. The summary, the stderr geometry line
+        /// and the JSON load report print the derived target and the bytes
+        /// per row it came from. Rows wider than the first batch's reach the
+        /// target sooner, so only they move the size trigger.
         ///
         /// `--target-bytes 1 --batch-rows N` restores the layout every load
         /// had before issue #2753, when `1` was the default: every batch
@@ -696,8 +697,8 @@ enum Command {
         /// still sent only after its records' object and commit record are
         /// published, so an ack always means durable. But above `1` the flush
         /// that answers a batch's ack may be triggered by a LATER batch, so
-        /// that ack waits for one: the size trigger, the depth flush every
-        /// `--pipeline-depth` batches, the wall-clock age trigger
+        /// that ack waits for one: the size trigger, the depth flush (derived
+        /// target only), the wall-clock age trigger
         /// (`--max-flush-delay`, 60s by default) or, at the end of the input,
         /// the loader's own force-flush. `0` is rejected.
         #[arg(long, value_name = "BYTES")]
@@ -712,8 +713,8 @@ enum Command {
         /// This is the THIRD binding constraint on object size, beside
         /// `--target-bytes` and one batch's per-shard slice footprint. A shard
         /// flushes on the first of: its buffer reaches `--target-bytes`, its
-        /// oldest buffered point ages past this delay, the depth flush every
-        /// `--pipeline-depth` batches, or the final drain at load close. A
+        /// oldest buffered point ages past this delay, the depth flush (with
+        /// `--target-bytes` unset), or the final drain at load close. A
         /// buffer that fills slower than one target's worth per delay ages out
         /// before it ever reaches the target, so the size trigger never fires
         /// no matter how large the target is: at the router's own 2s delay the
@@ -725,8 +726,9 @@ enum Command {
         /// flush mix counts those under `manual`) before waiting on the last
         /// batches' acks, so a tail buffer left under `--target-bytes` is
         /// published there and never waits out this delay. Mid-load, a buffer
-        /// that misses `--target-bytes` waits for the depth flush or up to
-        /// this delay for the age trigger, and every write's ack deadline is
+        /// that misses `--target-bytes` waits for the depth flush (derived
+        /// target only), another batch's flush, or up to this delay for the
+        /// age trigger, and every write's ack deadline is
         /// raised to this delay plus one minute so that wait completes instead
         /// of failing the load. An ack still means durable whenever it arrives.
         ///
