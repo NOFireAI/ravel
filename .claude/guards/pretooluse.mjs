@@ -57,7 +57,7 @@ function readStdin() {
 // a refused push, so the chain after it requested a review on a head that
 // never moved.
 const GATE_HEAD =
-  /^(cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+(clippy|test|nextest|fmt|build|check)|git(\s+(-[A-Za-z]|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?|-c\s+\S+))*\s+push|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
+  /^(cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+(clippy|test|nextest|fmt|build|check)|git(\s+(-[Cc]\s+\S+|--(git-dir|work-tree)\s+\S+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+push|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
 // Things that may legitimately precede a gate on the same command line.
 // A bare assignment may precede a gate (`FOO=1 cargo test`). One plain
 // alternative for it: an earlier version added a separate `NAME=$(`

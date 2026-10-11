@@ -24,7 +24,8 @@
 #   0   nothing overlapping; dispatch
 #   64  usage
 #   65  an existing pull request already addresses the issue; skip and log
-#   66  an OPEN pull request is already touching the predicted files
+#   66  an OPEN, non-draft pull request is already touching the predicted
+#       files (drafts, merged and closed ones are listed as context only)
 #   69  the question could not be asked (gh failed after its retries, or a
 #       pull request list came back as long as its limit and may be
 #       truncated); not the same as a clean answer, and never report it as one

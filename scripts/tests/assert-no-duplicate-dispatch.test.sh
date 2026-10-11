@@ -268,6 +268,28 @@ out="$(run_in "${d}" "${GUARD}" --issue 42 --paths src/mine.rs,src/new.rs)"; rc=
 check_eq "an open PR on a predicted file collides (66)" "66" "${rc}"
 check_contains "and names the shared file" "src/mine.rs" "${out}"
 
+# --- a held draft is context, not a collision ---------------------------
+# Mutation: drop `and .isDraft` from the state mapping, or test the state
+# before the mapping. A held draft once blocked two epics' tickets for a day.
+d="$(new_case draft_only)"
+printf '[{"number":15,"title":"held draft","state":"OPEN","isDraft":true,"body":"","headRefName":"f","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+printf 'src/mine.rs\n' >"${d}/files-15.txt"
+out="$(run_in "${d}" "${GUARD}" --issue 42 --paths src/mine.rs)"; rc=$?
+check_eq "a draft PR on a predicted file is not a collision (0)" "0" "${rc}"
+check_contains "and is listed as a draft" "[DRAFT]" "${out}"
+check_contains "under the context heading" "NOTE" "${out}"
+
+# An open non-draft beside a draft still refuses, and the draft is listed
+# under the context heading rather than as the reason.
+d="$(new_case draft_and_open)"
+printf '[{"number":16,"title":"held draft","state":"OPEN","isDraft":true,"body":"","headRefName":"g","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null},{"number":17,"title":"in flight","state":"OPEN","isDraft":false,"body":"","headRefName":"h","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+printf 'src/mine.rs\n' >"${d}/files-16.txt"
+printf 'src/mine.rs\n' >"${d}/files-17.txt"
+out="$(run_in "${d}" "${GUARD}" --issue 42 --paths src/mine.rs)"; rc=$?
+check_eq "an open non-draft beside a draft still collides (66)" "66" "${rc}"
+check_contains "the open one is the reason" "#17 [OPEN]" "${out}"
+check_contains "the draft is context" "not a collision" "${out}"
+
 # The 150th file of a wide pull request counts the same as the first.
 # Mutation: read files from `gh pr list --json files`, which caps at 100.
 d="$(new_case wide)"

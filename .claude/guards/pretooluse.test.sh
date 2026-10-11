@@ -53,6 +53,8 @@ check allow "guard output read from a file"    "$(bash_payload 'scripts/guards/a
 # read as 0 and the chain after it requested a review on a head that never moved.
 check deny  "git push piped through tail"      "$(bash_payload 'git push -q origin land/x:refs/heads/fix/x 2>&1 | tail -3')"
 check deny  "git -c push piped through grep"   "$(bash_payload 'git -c push.default=simple push origin HEAD 2>&1 | grep -v remote')"
+check deny  "git -C dir push piped through tail" "$(bash_payload 'git -C ../wt push origin HEAD 2>&1 | tail -3')"
+check deny  "git --work-tree push piped"         "$(bash_payload 'git --work-tree /tmp/x push origin HEAD | tail')"
 check allow "git push alone"                   "$(bash_payload 'git push -q origin land/x:refs/heads/fix/x')"
 check allow "git push output to a file"        "$(bash_payload 'git push -q -f origin land/x:refs/heads/fix/x > /tmp/push.txt 2>&1')"
 # An allow case only has teeth when something could deny it. This one carried

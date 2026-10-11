@@ -74,7 +74,8 @@ costs a redispatch; carrying on costs the whole task, and 2h50m and
 
 COMMIT EARLY, COMMIT OFTEN: `git commit -s` the first state that compiles,
 before you go on to the rest, and commit again after every gate that
-passes (a fixup commit is fine; the merge script folds them). An executor
+passes (prefix each of those `wip:` so the merge script folds it; it folds
+no other spelling). An executor
 restart or the 4 h ceiling keeps only what is committed: a task that held
 two hours of green work in its working tree lost all of it that way. Never
 put any command in the background (no `run_in_background`, no trailing
@@ -190,7 +191,7 @@ Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 40 && df -h /tmp . "$HOME"
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 54 && df -h /tmp . "$HOME"
 
 Every step is joined with `&&` so a failure anywhere fails the command:
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
@@ -200,11 +201,14 @@ each tool call is its own shell and a variable set in one call is empty
 in the next.
 
 If the guard exits non-zero, say so in your report and stop rather than
-picking another directory: a cold workspace gate writes 40 to 70 GB of
-target, so a host without 40 GB free cannot finish it, and the run would
-die mid-link with a fake compiler error (two gate runs died at link on a
+picking another directory: a cold workspace gate writes 54 to 70 GB of
+target (CLAUDE.md's measured band; the largest lane completed in 56 GB),
+so a host without 54 GB free cannot finish it, and the run would die
+mid-link with a fake compiler error (two gate runs died at link on a
 shared executor volume another task filled mid-run; 5 GB was the old
-floor and it measured nothing the gate needed). Then run every long gate in the LONG COMMANDS form, into
+floor and it measured nothing the gate needed). The floor is the band's
+low end because a crate-scoped gate writes less; a spec that runs the
+full workspace gate asks for 70. Then run every long gate in the LONG COMMANDS form, into
 `.gate-logs/<step>.log` with its `EXIT=` marker.
 
 HOME on the amd64 executor class is a 1 GB tmpfs: pointing the log

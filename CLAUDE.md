@@ -389,7 +389,9 @@ merged, local last, so nothing is lost by splitting them.
 
 Several of these no longer depend on being remembered.
 `.claude/guards/pretooluse.mjs` runs as a PreToolUse hook and refuses the
-tool call outright: a gate or guard piped into `tail`/`head`/`grep`/`rg`/
+tool call outright: a gate, a guard or a `git push` (whose pre-push hook
+is a guard: its refusal is the push's exit code, and `git push | tail -3`
+once reported 0 on a refused push) piped into `tail`/`head`/`grep`/`rg`/
 `sed` or followed by `&& echo`, in the command itself or inside any
 command substitution (`out="$(guard | tail -1)"` and its backtick
 spelling run the same gate and read the same pipe's status), an
@@ -432,8 +434,11 @@ than passing for "no pull request open".
 - `scripts/guards/assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b]`:
   refuse to dispatch work someone is already doing. Exits 65 when an open or
   recently-merged pull request already references the issue (skip and log,
-  never open a second one), 66 when an OPEN pull request is already touching
-  a predicted file, and 69 when the question could not be asked. It reads
+  never open a second one), 66 when an OPEN, non-draft pull request is
+  already touching a predicted file (a draft, or a merged or closed pull
+  request on the same file, is printed under its own heading as context,
+  not a refusal: a held draft once blocked two epics' tickets for a day,
+  #2749), and 69 when the question could not be asked. It reads
   each candidate's files from the paginated endpoint, because
   `gh pr list --json files` caps at 100 and would report a wide pull request
   as touching nothing. It is the pre-dispatch half of the problem;
