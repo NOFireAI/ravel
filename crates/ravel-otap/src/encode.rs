@@ -59,7 +59,9 @@
 //! so on the wire, matching the spec's own vocabulary for the encodings it
 //! allows (otap-spec.md section 6.4). The resource columns carry no metadata
 //! and take the spec defaults a real exporter relies on: DELTA for the root's
-//! `resource.id` and QUASI-DELTA for `RESOURCE_ATTRS.parent_id`.
+//! `resource.id` and QUASI-DELTA for `RESOURCE_ATTRS.parent_id`, with the
+//! `RESOURCE_ATTRS` rows sorted by (type, key, value) as section 6.4.3 requires
+//! for that encoding to round-trip.
 //!
 //! `NUMBER_DATA_POINTS` and `NUMBER_DP_ATTRS` payloads are omitted from a
 //! batch entirely when they would have zero rows, per otap-spec.md section
@@ -102,6 +104,7 @@ use crate::proto::experimental::arrow::v1::{ArrowPayload, ArrowPayloadType, Batc
 /// encoder gives a real value column: it exists only to produce a non-scalar
 /// `type` discriminant (5=map, 6=slice, or 7=bytes per otap-spec.md section
 /// 5.5.1) the normalizer must reject as `ComplexAttributeValue`.
+#[derive(Clone, Debug)]
 pub enum AttrValue {
     Str(String),
     Bool(bool),
@@ -111,6 +114,7 @@ pub enum AttrValue {
 }
 
 /// A single data-point attribute.
+#[derive(Clone, Debug)]
 pub struct AttrRow {
     pub key: String,
     pub value: AttrValue,
@@ -532,11 +536,40 @@ fn quasi_delta_value(value: &AttrValue) -> Option<QuasiDeltaValue<'_>> {
     }
 }
 
+/// The `type` discriminant an attribute row is written with.
+fn attr_type(value: &AttrValue) -> u8 {
+    match value {
+        AttrValue::Str(_) => ANY_VALUE_TYPE_STRING,
+        AttrValue::Bool(_) => ANY_VALUE_TYPE_BOOL,
+        AttrValue::Int(_) => ANY_VALUE_TYPE_INT,
+        AttrValue::Double(_) => ANY_VALUE_TYPE_DOUBLE,
+        AttrValue::Complex(ty) => *ty,
+    }
+}
+
+/// The order otap-spec.md section 6.4.3 sorts an `*Attrs` batch in: by `type`,
+/// then `key`, then the Active Field value. Doubles compare by
+/// [`f64::total_cmp`]; a complex value has no Active Field and ties.
+fn attr_spec_cmp(a: &AttrRow, b: &AttrRow) -> std::cmp::Ordering {
+    let value = match (&a.value, &b.value) {
+        (AttrValue::Str(x), AttrValue::Str(y)) => x.cmp(y),
+        (AttrValue::Bool(x), AttrValue::Bool(y)) => x.cmp(y),
+        (AttrValue::Int(x), AttrValue::Int(y)) => x.cmp(y),
+        (AttrValue::Double(x), AttrValue::Double(y)) => x.total_cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    };
+    attr_type(&a.value)
+        .cmp(&attr_type(&b.value))
+        .then_with(|| a.key.cmp(&b.key))
+        .then(value)
+}
+
 /// Build the `RESOURCE_ATTRS` batch for `resources`, resource `i` taking
-/// batch-scoped id `i`. Rows go out grouped by resource and in each resource's
-/// attribute order; a row equal on (type, key, value) to the row before it
-/// carries its `parent_id` as a delta from that row's, every other row as an
-/// absolute id, which is what a quasi-delta decoder reconstructs.
+/// batch-scoped id `i`. Rows are sorted as otap-spec.md section 6.4.3 sorts
+/// them ([`attr_spec_cmp`], then resource id, then each resource's attribute
+/// order); a row equal on (type, key, value) to the row before it carries its
+/// `parent_id` as a delta from that row's, every other row as an absolute id,
+/// which is what a quasi-delta decoder reconstructs.
 fn resource_attrs_batch(resources: &[Vec<AttrRow>]) -> Result<RecordBatch, EncodeError> {
     let mut parent_ids = Vec::new();
     let mut keys = StringDictionaryBuilder::<UInt16Type>::new();
@@ -545,38 +578,44 @@ fn resource_attrs_batch(resources: &[Vec<AttrRow>]) -> Result<RecordBatch, Encod
     let mut bools = Vec::new();
     let mut ints = Vec::new();
     let mut doubles = Vec::new();
+    let mut rows: Vec<(u16, &AttrRow)> = resources
+        .iter()
+        .enumerate()
+        .flat_map(|(index, attrs)| {
+            let resource_id = u16::try_from(index).unwrap_or(u16::MAX);
+            attrs.iter().map(move |attr| (resource_id, attr))
+        })
+        .collect();
+    rows.sort_by(|(a_id, a), (b_id, b)| attr_spec_cmp(a, b).then(a_id.cmp(b_id)));
     let mut previous: Option<(&str, u8, QuasiDeltaValue<'_>, u16)> = None;
-    for (index, attrs) in resources.iter().enumerate() {
-        let resource_id = u16::try_from(index).unwrap_or(u16::MAX);
-        for attr in attrs {
-            let (ty, str_v, bool_v, int_v, double_v) = match &attr.value {
-                AttrValue::Str(s) => (ANY_VALUE_TYPE_STRING, Some(s.as_str()), None, None, None),
-                AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
-                AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
-                AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
-                AttrValue::Complex(ty) => (*ty, None, None, None, None),
-            };
-            let current = quasi_delta_value(&attr.value);
-            let encoded = match (&previous, &current) {
-                (Some((key, prev_ty, prev_value, prev_id)), Some(value))
-                    if *key == attr.key && *prev_ty == ty && prev_value == value =>
-                {
-                    resource_id.wrapping_sub(*prev_id)
-                }
-                _ => resource_id,
-            };
-            previous = current.map(|value| (attr.key.as_str(), ty, value, resource_id));
-            parent_ids.push(encoded);
-            keys.append(&attr.key)?;
-            match str_v {
-                Some(s) => strs.append(s).map(|_| ())?,
-                None => strs.append_null(),
+    for (resource_id, attr) in rows {
+        let (ty, str_v, bool_v, int_v, double_v) = match &attr.value {
+            AttrValue::Str(s) => (ANY_VALUE_TYPE_STRING, Some(s.as_str()), None, None, None),
+            AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
+            AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
+            AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
+            AttrValue::Complex(ty) => (*ty, None, None, None, None),
+        };
+        let current = quasi_delta_value(&attr.value);
+        let encoded = match (&previous, &current) {
+            (Some((key, prev_ty, prev_value, prev_id)), Some(value))
+                if *key == attr.key && *prev_ty == ty && prev_value == value =>
+            {
+                resource_id.wrapping_sub(*prev_id)
             }
-            types.push(ty);
-            bools.push(bool_v);
-            ints.push(int_v);
-            doubles.push(double_v);
+            _ => resource_id,
+        };
+        previous = current.map(|value| (attr.key.as_str(), ty, value, resource_id));
+        parent_ids.push(encoded);
+        keys.append(&attr.key)?;
+        match str_v {
+            Some(s) => strs.append(s).map(|_| ())?,
+            None => strs.append_null(),
         }
+        types.push(ty);
+        bools.push(bool_v);
+        ints.push(int_v);
+        doubles.push(double_v);
     }
     Ok(RecordBatch::try_new(
         Arc::new(resource_attrs_schema()),
@@ -1254,5 +1293,84 @@ impl MetricsStreamEncoder {
             arrow_payloads,
             headers: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use arrow::array::{Array, AsArray};
+
+    use super::*;
+
+    fn str_attr(key: &str, value: &str) -> AttrRow {
+        AttrRow {
+            key: key.to_string(),
+            value: AttrValue::Str(value.to_string()),
+        }
+    }
+
+    fn strings(column: &dyn Array) -> Vec<Option<String>> {
+        let column = arrow::compute::cast(column, &DataType::Utf8).expect("cast");
+        column
+            .as_string::<i32>()
+            .iter()
+            .map(|s| s.map(str::to_string))
+            .collect()
+    }
+
+    /// Rows go out sorted by (type, key, value), then resource id, and a
+    /// `parent_id` is a delta only when all three match the row before it.
+    #[test]
+    fn resource_attrs_are_sorted_with_quasi_delta_parents() {
+        let resources = vec![
+            vec![
+                str_attr("service.name", "x"),
+                AttrRow {
+                    key: "pid".to_string(),
+                    value: AttrValue::Int(3),
+                },
+                str_attr("host.name", "b"),
+            ],
+            vec![str_attr("service.name", "x"), str_attr("host.name", "a")],
+        ];
+        let batch = resource_attrs_batch(&resources).expect("build");
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            strings(batch.column(1)),
+            [
+                s("host.name"),
+                s("host.name"),
+                s("service.name"),
+                s("service.name"),
+                s("pid")
+            ]
+        );
+        assert_eq!(
+            strings(batch.column(3)),
+            [s("a"), s("b"), s("x"), s("x"), None]
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_primitive::<UInt8Type>()
+                .values()
+                .to_vec(),
+            [
+                ANY_VALUE_TYPE_STRING,
+                ANY_VALUE_TYPE_STRING,
+                ANY_VALUE_TYPE_STRING,
+                ANY_VALUE_TYPE_STRING,
+                ANY_VALUE_TYPE_INT
+            ]
+        );
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<UInt16Type>()
+                .values()
+                .to_vec(),
+            [1, 0, 0, 1, 0]
+        );
     }
 }

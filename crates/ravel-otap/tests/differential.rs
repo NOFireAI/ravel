@@ -956,7 +956,13 @@ fn build_otap_histogram_batch(
     encoder: &mut MetricsStreamEncoder,
     batch_id: i64,
 ) -> BatchArrowRecords {
-    let histograms: Vec<HistogramMetricRow> = workload
+    encoder
+        .encode_batch_ext(batch_id, &[], &histogram_rows(workload), &[])
+        .expect("encode histogram workload")
+}
+
+fn histogram_rows(workload: &[WorkloadHistogramMetric]) -> Vec<HistogramMetricRow> {
+    workload
         .iter()
         .map(|m| {
             let data_points: Vec<HistogramPointRow> = m
@@ -989,10 +995,7 @@ fn build_otap_histogram_batch(
                 data_points,
             }
         })
-        .collect();
-    encoder
-        .encode_batch_ext(batch_id, &[], &histograms, &[])
-        .expect("encode histogram workload")
+        .collect()
 }
 
 fn build_otap_summary_batch(
@@ -2619,6 +2622,7 @@ enum WorkloadResourceValue {
 struct WorkloadResource {
     attrs: Option<Vec<(String, WorkloadResourceValue)>>,
     metrics: Vec<WorkloadMetric>,
+    histograms: Vec<WorkloadHistogramMetric>,
     summaries: Vec<WorkloadSummaryMetric>,
 }
 
@@ -2634,9 +2638,8 @@ fn resource_limits() -> IngestLimits {
 }
 
 fn resource_attr_strategy() -> impl Strategy<Value = (String, WorkloadResourceValue)> {
-    // A small key pool, so a resource repeats a key often: the builder takes
-    // the first occurrence, which a reimplementation reading in arrival order
-    // gets wrong.
+    // A small key pool, so resources share keys and values and the encoder's
+    // quasi-delta `parent_id`s chain across them.
     let key = prop_oneof![
         Just("service.name".to_string()),
         Just("service.namespace".to_string()),
@@ -2683,17 +2686,65 @@ fn quantile_ladder(n: usize) -> Vec<WorkloadQuantile> {
         .collect()
 }
 
+/// Resource attributes with unique keys. A resource repeating a key is the
+/// one shape where the paths may differ: OTLP keeps the first in request
+/// order, OTAP the first row in table order, which the spec sorts by value.
+fn unique_resource_attrs_strategy() -> impl Strategy<Value = Vec<(String, WorkloadResourceValue)>> {
+    prop::collection::vec(resource_attr_strategy(), 0..=5).prop_map(|attrs| {
+        let mut seen = BTreeSet::new();
+        attrs
+            .into_iter()
+            .filter(|(key, _)| seen.insert(key.clone()))
+            .collect()
+    })
+}
+
+/// Renames point attribute `i` to `job` when bits `3i..3i+3` of `mask` are 0
+/// and to `instance` when they are 1, so a point label collides with the
+/// resource-derived one about a quarter of the time.
+fn collide_with_resource_labels(attrs: &mut [WorkloadAttr], mask: u64) {
+    for (i, attr) in attrs.iter_mut().enumerate() {
+        match mask.checked_shr(3 * i as u32).unwrap_or(0) & 7 {
+            0 => attr.key = "job".to_string(),
+            1 => attr.key = "instance".to_string(),
+            _ => {}
+        }
+    }
+}
+
 fn resource_workload_strategy() -> impl Strategy<Value = Vec<WorkloadResource>> {
     let resource = (
-        prop::option::weighted(0.8, prop::collection::vec(resource_attr_strategy(), 0..=5)),
+        prop::option::weighted(0.8, unique_resource_attrs_strategy()),
         prop::collection::vec(metric_strategy(), 0..=3),
+        prop::collection::vec(histogram_metric_strategy(), 0..=1),
         prop::collection::vec(wide_summary_metric_strategy(), 0..=1),
+        any::<u64>(),
     )
-        .prop_map(|(attrs, metrics, summaries)| WorkloadResource {
-            attrs,
-            metrics,
-            summaries,
-        });
+        .prop_map(
+            |(attrs, mut metrics, mut histograms, mut summaries, mask)| {
+                for m in &mut metrics {
+                    for p in &mut m.points {
+                        collide_with_resource_labels(&mut p.attrs, mask);
+                    }
+                }
+                for m in &mut histograms {
+                    for p in &mut m.points {
+                        collide_with_resource_labels(&mut p.attrs, mask.rotate_left(17));
+                    }
+                }
+                for m in &mut summaries {
+                    for p in &mut m.points {
+                        collide_with_resource_labels(&mut p.attrs, mask.rotate_left(41));
+                    }
+                }
+                WorkloadResource {
+                    attrs,
+                    metrics,
+                    histograms,
+                    summaries,
+                }
+            },
+        );
     prop::collection::vec(resource, 1..=3)
 }
 
@@ -2720,6 +2771,11 @@ fn build_otlp_resource_request(workload: &[WorkloadResource]) -> ExportMetricsSe
             let mut metrics = build_otlp_request(&r.metrics).resource_metrics[0].scope_metrics[0]
                 .metrics
                 .clone();
+            metrics.extend(
+                build_otlp_histogram_request(&r.histograms).resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .clone(),
+            );
             metrics.extend(
                 build_otlp_summary_request(&r.summaries).resource_metrics[0].scope_metrics[0]
                     .metrics
@@ -2760,8 +2816,10 @@ fn build_otap_resource_batch(
 ) -> BatchArrowRecords {
     let mut resources: Vec<Vec<AttrRow>> = Vec::new();
     let mut flat_metrics: Vec<WorkloadMetric> = Vec::new();
+    let mut flat_histograms: Vec<WorkloadHistogramMetric> = Vec::new();
     let mut flat_summaries: Vec<WorkloadSummaryMetric> = Vec::new();
     let mut metric_slots = Vec::new();
+    let mut histogram_slots = Vec::new();
     let mut summary_slots = Vec::new();
     for r in workload {
         let slot = r.attrs.as_ref().map(|attrs| {
@@ -2775,6 +2833,8 @@ fn build_otap_resource_batch(
         });
         flat_metrics.extend(r.metrics.iter().cloned());
         metric_slots.extend(r.metrics.iter().map(|_| slot));
+        flat_histograms.extend(r.histograms.iter().cloned());
+        histogram_slots.extend(r.histograms.iter().map(|_| slot));
         flat_summaries.extend(r.summaries.iter().cloned());
         summary_slots.extend(r.summaries.iter().map(|_| slot));
     }
@@ -2782,6 +2842,7 @@ fn build_otap_resource_batch(
     // Reuse the per-kind builders' row construction, then re-encode the rows
     // under their resources.
     let metrics = metric_rows(&flat_metrics);
+    let histograms = histogram_rows(&flat_histograms);
     let summaries = summary_rows(&flat_summaries);
     let units: Vec<&str> = flat_metrics.iter().map(|m| m.unit.as_str()).collect();
     encoder
@@ -2789,14 +2850,14 @@ fn build_otap_resource_batch(
             0,
             &metrics,
             &units,
-            &[],
+            &histograms,
             &[],
             &summaries,
             &[],
             &ResourceAssignment {
                 resources: &resources,
                 metrics: &metric_slots,
-                histograms: &[],
+                histograms: &histogram_slots,
                 summaries: &summary_slots,
             },
         )
@@ -2955,11 +3016,13 @@ fn two_resources_same_point_attrs_split_series() {
         WorkloadResource {
             attrs: str_resource(&[("service.name", "a")]),
             metrics: vec![gauge_metric("up", 1)],
+            histograms: vec![],
             summaries: vec![],
         },
         WorkloadResource {
             attrs: str_resource(&[("service.name", "b")]),
             metrics: vec![gauge_metric("up", 1)],
+            histograms: vec![],
             summaries: vec![],
         },
     ];
@@ -2986,11 +3049,13 @@ fn complex_resource_attribute_rejects_whole_resource_on_both_paths() {
                 WorkloadResourceValue::Complex,
             )]),
             metrics: vec![gauge_metric("up", 2), gauge_metric("down", 1)],
+            histograms: vec![],
             summaries: vec![],
         },
         WorkloadResource {
             attrs: str_resource(&[("service.name", "b")]),
             metrics: vec![gauge_metric("up", 1)],
+            histograms: vec![],
             summaries: vec![],
         },
     ];
@@ -3008,8 +3073,10 @@ fn complex_resource_attribute_rejects_whole_resource_on_both_paths() {
     );
 }
 
-/// The allowlist picks `host.name` and `cloud.region` (first occurrence of a
-/// repeated key wins), `service.namespace`/`service.name` join into `job`,
+/// The allowlist picks `host.name` and `cloud.region` (the repeated `host.name`
+/// resolves to `h-first` on both paths: first in request order on OTLP, and
+/// first row in table order on OTAP, where it also sorts first),
+/// `service.namespace`/`service.name` join into `job`,
 /// and the two attributes nothing reads are one `ResourceAttributesDropped`.
 #[test]
 fn resource_allowlist_and_dropped_count_agree() {
@@ -3049,6 +3116,7 @@ fn resource_allowlist_and_dropped_count_agree() {
             ),
         ]),
         metrics: vec![gauge_metric("up", 1)],
+        histograms: vec![],
         summaries: vec![],
     }];
     let otap_out = assert_resource_paths_agree(&workload, &limits);
@@ -3083,6 +3151,7 @@ fn summary_over_quantile_cap_rejected_on_both_paths() {
     let workload = vec![WorkloadResource {
         attrs: str_resource(&[("service.name", "svc")]),
         metrics: vec![],
+        histograms: vec![],
         summaries: vec![WorkloadSummaryMetric {
             name: "latency".to_string(),
             points: vec![point(65, 0), point(64, 1)],

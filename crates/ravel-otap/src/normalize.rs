@@ -27,7 +27,20 @@
 //! id per batch. A metric whose `resource` is null gets an empty prefix, as
 //! OTLP's `resource: None` does; `RESOURCE_ATTRS` rows no metric references
 //! are ignored, and `SCOPE_ATTRS` is not read (OTLP builds no label from
-//! scope attributes either).
+//! scope attributes either). A resource that cannot be read is rejected,
+//! never read as no resource. A METRICS `resource` column of the wrong type
+//! rejects every point; a `RESOURCE_ATTRS` table whose `parent_id`, `key` or
+//! `type` cannot be read, or that has a null dictionary `parent_id` slot,
+//! rejects every point under a resource. Both count as `malformed_resource`;
+//! an unrecognized `RESOURCE_ATTRS.parent_id` encoding counts as
+//! `unrecognized_id_encoding`.
+//!
+//! One count differs from OTLP's: a resource's point count, which its
+//! rejections carry and which decides whether it is admitted at all, covers
+//! number, histogram and summary points only. Exponential-histogram points
+//! are rejected on their own as an unsupported type, where OTLP counts them
+//! under their resource too; so a resource whose only points are exponential
+//! histograms is not admitted and its dropped attributes are not counted.
 //!
 //! Performance shape (docs/otap-ingest.md): data points join their attrs
 //! table by `parent_id` via a sort-and-binary-search over "sorted runs"
@@ -176,6 +189,13 @@ enum IdEncoding {
 /// those columns. Rejected outright via the same counted mechanism as
 /// [`MALFORMED_NUMBER_DATA_POINTS_BATCH`], never guessed.
 const UNRECOGNIZED_ID_ENCODING: &str = "unrecognized_id_encoding";
+
+/// Tag for the points of metrics whose resource cannot be read: a METRICS
+/// `resource` column or `id` child of the wrong type, or a `RESOURCE_ATTRS`
+/// batch missing its `parent_id`, `key` or `type` column or holding a null
+/// dictionary `parent_id` slot. Such points are rejected, never written
+/// without their resource labels.
+const MALFORMED_RESOURCE: &str = "malformed_resource";
 
 /// Resolve the declared encoding of a core `id`/`parent_id` column (the
 /// metric/data-point chain) from its Arrow field metadata
@@ -448,6 +468,17 @@ impl<'b> ParentIds<'b> {
         (0..self.len()).map(|i| self.plain(i)).collect()
     }
 
+    /// Whether a dictionary-encoded column has a null or out-of-range slot,
+    /// which [`Self::plain`] would read as parent 0.
+    fn has_null_dictionary_slot(&self) -> bool {
+        match self {
+            Self::U16(_) | Self::U32(_) => false,
+            Self::U32Dict8(..) | Self::U32Dict16(..) => {
+                (0..self.len()).any(|i| self.get(i).is_none())
+            }
+        }
+    }
+
     /// DELTA decode (otap-spec.md section 6.4.2), as [`decode_delta_u32`].
     fn decode_delta(&self) -> Vec<u32> {
         let mut acc: u32 = 0;
@@ -657,12 +688,11 @@ pub fn normalize_decoded_with_exemplars(
 ) -> MetricsNormalizeResult {
     normalize_impl(
         tenant,
-        batch,
+        prepare_batch(batch, limits),
         limits,
         ingest_ts_ns,
         exemplar_cap,
         false,
-        None,
     )
     .0
 }
@@ -702,85 +732,93 @@ pub fn normalize_decoded_with_metadata(
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     normalize_impl(
         tenant,
-        batch,
+        prepare_batch(batch, limits),
         limits,
         ingest_ts_ns,
         exemplar_cap,
         true,
-        None,
     )
 }
 
-/// [`normalize_decoded_with_metadata`] with the batch's
-/// [`project_resolved_label_bytes`] already computed, for a caller that charged
-/// it to a budget before normalizing (ADR-2708 D2) and must not walk the batch
-/// twice for the same figure.
-pub fn normalize_decoded_with_metadata_projected(
+/// [`normalize_decoded_with_metadata`] for a batch already prepared by
+/// [`prepare_batch`], for a caller that charged its
+/// [`PreparedBatch::projected_label_bytes`] to a budget before normalizing
+/// (ADR-2708 D2): the batch is flattened and resolved once for both.
+pub fn normalize_prepared_with_metadata(
     tenant: &TenantId,
-    batch: &DecodedBatch,
+    prepared: PreparedBatch<'_>,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
-    projected: ProjectedLabelBytes,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    normalize_impl(
-        tenant,
-        batch,
-        limits,
-        ingest_ts_ns,
-        exemplar_cap,
-        true,
-        Some(projected),
-    )
+    normalize_impl(tenant, prepared, limits, ingest_ts_ns, exemplar_cap, true)
 }
 
-/// Shared body of the exemplar-carrying entry points. `collect_metadata` is
-/// true only for the metadata entry points; the points, exemplars, and
-/// rejections it produces do not depend on it, so the older entry points are
-/// behaviorally unchanged. `projected` is the batch's label-byte projection
-/// when the caller already has it, computed here otherwise.
-fn normalize_impl(
-    tenant: &TenantId,
-    batch: &DecodedBatch,
-    limits: &IngestLimits,
-    ingest_ts_ns: i64,
-    exemplar_cap: &mut ExemplarCap,
-    collect_metadata: bool,
-    projected: Option<ProjectedLabelBytes>,
-) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+/// One batch flattened, resolved and projected, with no label built yet.
+///
+/// The point bounds and the resolved-label projection (ADR-2708 D2) need the
+/// batch flattened and every metric resolved, so [`prepare_batch`] does that
+/// once and the normalize reuses it. Resource prefixes are planned here from
+/// value lengths and built only after the label-byte bound passes, so a batch
+/// over the bound is rejected before any label exists.
+pub struct PreparedBatch<'b> {
+    batch: &'b DecodedBatch,
+    stage: Stage<'b>,
+}
+
+enum Stage<'b> {
+    /// A point bound rejects the whole request; nothing was resolved.
+    Rejected(Rejection),
+    Resolved(Box<Resolved<'b>>),
+}
+
+struct Resolved<'b> {
+    total_points: usize,
+    rejected: Vec<Rejection>,
+    flat: FlatPoints<'b>,
+    tables: MetricTables<'b>,
+    orders: AttrOrders,
+    projected: usize,
+}
+
+/// Each data-point attribute table's row indices sorted by `parent_id`.
+struct AttrOrders {
+    number: Vec<u32>,
+    hist: Vec<u32>,
+    summary: Vec<u32>,
+}
+
+impl PreparedBatch<'_> {
+    /// The resolved-label bytes normalizing this batch would build; zero when
+    /// a point bound already rejects it whole, since then nothing is built.
+    pub fn projected_label_bytes(&self) -> ProjectedLabelBytes {
+        match &self.stage {
+            Stage::Rejected(_) => ProjectedLabelBytes::from_walk(0),
+            Stage::Resolved(r) => ProjectedLabelBytes::from_walk(r.projected),
+        }
+    }
+}
+
+/// Flatten `batch`, check its two point bounds, resolve every metric and its
+/// resource, and project the label bytes the normalize would build. Allocates
+/// no label: resource prefixes are only planned here.
+pub fn prepare_batch<'b>(batch: &'b DecodedBatch, limits: &IngestLimits) -> PreparedBatch<'b> {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
-        return whole_request_rejection(
-            Rejection::TooManyDataPoints {
+        return PreparedBatch {
+            batch,
+            stage: Stage::Rejected(Rejection::TooManyDataPoints {
                 count: total_points,
                 max: limits.max_data_points_per_request,
-            },
-            dropped_exemplar_rows(batch),
-        );
+            }),
+        };
     }
 
     let mut rejected = Vec::new();
     push_unsupported_type_rejections(batch, &mut rejected);
     push_exp_histogram_exemplar_drops(batch, &mut rejected);
 
-    let hist_exemplar_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::HistogramDpExemplars);
-    let hist_exemplar_attr_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::HistogramDpExemplarAttrs);
-    let number_exemplar_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::NumberDpExemplars);
-    let number_exemplar_attr_batches: Vec<&RecordBatch> =
-        payloads_of(batch, ArrowPayloadType::NumberDpExemplarAttrs);
-
     let flat = flatten_points(batch, &mut rejected);
-    let FlatPoints {
-        dp: flat_dp,
-        attrs: flat_attrs,
-        hist_dp: flat_hist_dp,
-        hist_attrs: flat_hist_attrs,
-        summary_dp: flat_summary_dp,
-        summary_attrs: flat_summary_attrs,
-    } = &flat;
 
     // Second bound, on what the request expands to rather than on what it
     // carries on the wire, mirroring `ravel_otlp::normalize_impl`. One classic
@@ -802,28 +840,70 @@ fn normalize_impl(
     // `dropped_exemplar_rows` restores the count from the columnar row counts,
     // which is metadata rather than a decode. Parity with OTLP is a property
     // here, not a documented divergence.
-    let exploded_points = count_exploded_points(flat_dp, flat_hist_dp, flat_summary_dp);
+    let exploded_points = count_exploded_points(&flat.dp, &flat.hist_dp, &flat.summary_dp);
     if exploded_points > limits.max_data_points_per_request {
-        return whole_request_rejection(
-            Rejection::TooManyExplodedPoints {
+        return PreparedBatch {
+            batch,
+            stage: Stage::Rejected(Rejection::TooManyExplodedPoints {
                 exploded: exploded_points,
                 count: total_points,
                 max: limits.max_data_points_per_request,
-            },
-            dropped_exemplar_rows(batch),
-        );
+            }),
+        };
     }
 
     let tables = resolve_metrics(batch, &flat, limits, &mut rejected);
+    let orders = AttrOrders {
+        number: sort_attrs_by_parent(&flat.attrs),
+        hist: sort_attrs_by_parent(&flat.hist_attrs),
+        summary: sort_attrs_by_parent(&flat.summary_attrs),
+    };
+    let projected = project_flat(&flat, &tables, &orders, limits);
+    PreparedBatch {
+        batch,
+        stage: Stage::Resolved(Box::new(Resolved {
+            total_points,
+            rejected,
+            flat,
+            tables,
+            orders,
+            projected,
+        })),
+    }
+}
+
+/// Shared body of the exemplar-carrying entry points. `collect_metadata` is
+/// true only for the metadata entry points; the points, exemplars, and
+/// rejections it produces do not depend on it, so the older entry points are
+/// behaviorally unchanged.
+fn normalize_impl(
+    tenant: &TenantId,
+    prepared: PreparedBatch<'_>,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+    collect_metadata: bool,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    let PreparedBatch { batch, stage } = prepared;
+    let resolved = match stage {
+        Stage::Rejected(reason) => {
+            return whole_request_rejection(reason, dropped_exemplar_rows(batch));
+        }
+        Stage::Resolved(resolved) => *resolved,
+    };
+    let Resolved {
+        total_points,
+        mut rejected,
+        flat,
+        mut tables,
+        orders,
+        projected,
+    } = resolved;
 
     // Third bound, on the label bytes the points would carry (ADR-2708 D2),
-    // mirroring `ravel_otlp::normalize_impl`: checked before any label set
-    // exists, and before the exemplar payloads are decoded, for the reason
-    // the exploded check above gives.
-    let projected = match projected {
-        Some(p) => p.get(),
-        None => project_flat(&flat, &tables, limits),
-    };
+    // mirroring `ravel_otlp::normalize_impl`: checked before any label exists,
+    // resource prefixes included, and before the exemplar payloads are
+    // decoded, for the reason the exploded check in [`prepare_batch`] gives.
     if projected > limits.max_resolved_label_bytes_per_request {
         return whole_request_rejection(
             Rejection::ResolvedLabelBytesExceeded {
@@ -834,6 +914,24 @@ fn normalize_impl(
             dropped_exemplar_rows(batch),
         );
     }
+    tables.resources.build(limits, &mut rejected);
+
+    let FlatPoints {
+        dp: flat_dp,
+        attrs: flat_attrs,
+        hist_dp: flat_hist_dp,
+        hist_attrs: flat_hist_attrs,
+        summary_dp: flat_summary_dp,
+        summary_attrs: flat_summary_attrs,
+    } = &flat;
+    let hist_exemplar_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::HistogramDpExemplars);
+    let hist_exemplar_attr_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::HistogramDpExemplarAttrs);
+    let number_exemplar_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::NumberDpExemplars);
+    let number_exemplar_attr_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::NumberDpExemplarAttrs);
 
     let hist_exemplar_rows = group_exemplars_by_parent_id(&hist_exemplar_batches, &mut rejected);
     let flat_hist_exemplar_attrs = flatten_attrs(&hist_exemplar_attr_batches, &mut rejected);
@@ -855,9 +953,8 @@ fn normalize_impl(
     // entry points pay nothing measurable for it.
     let mut produced = vec![false; root.len()];
 
-    let attr_order = sort_attrs_by_parent(flat_attrs);
     let mut points = Vec::with_capacity(flat_dp.len());
-    let mut group_cache: GroupCache = HashMap::new();
+    let mut group_cache = GroupCache::default();
     let mut exemplars = Vec::new();
     let number_exemplar_attr_order = sort_attrs_by_parent(&flat_number_exemplar_attrs);
     let mut number_exemplar_admission = ExemplarAdmission {
@@ -875,8 +972,13 @@ fn normalize_impl(
         else {
             continue;
         };
+        // `None` only when the resource's build was rejected after planning,
+        // which counted these points already.
+        let Some(prefix) = resources.prefix_for(root, dp.parent_id) else {
+            continue;
+        };
 
-        let range = attr_range_for(flat_attrs, &attr_order, dp.id);
+        let range = attr_range_for(flat_attrs, &orders.number, dp.id);
         if range.len() > limits.max_attributes_per_point {
             rejected.push(Rejection::TooManyAttributes {
                 attribute_count: range.len(),
@@ -884,6 +986,7 @@ fn normalize_impl(
             });
             continue;
         }
+        group_cache.enter_run(dp.parent_id, range, flat_attrs);
 
         if dp.ts_ns == 0 {
             rejected.push(Rejection::ZeroTimestamp);
@@ -921,14 +1024,6 @@ fn normalize_impl(
             }
         };
 
-        let raw: Vec<(String, RawCell)> = range
-            .iter()
-            .map(|&i| {
-                let a = &flat_attrs[i as usize];
-                (a.key.to_string(), raw_cell(a))
-            })
-            .collect();
-
         // Per-label admission (complex value, then sanitized-name length,
         // then value length) runs in the attributes' input order with the
         // first violation winning, exactly as ravel_otlp::build_point checks a
@@ -937,21 +1032,15 @@ fn normalize_impl(
         // this pre-check is the only place attribute order is observable, and
         // it must line up with the OTLP oracle or the two paths class the same
         // input differently (ADR-0011).
-        if let Err(rejection) = check_attrs_in_input_order(&raw, limits) {
+        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits) {
             rejected.push(rejection);
             continue;
         }
 
-        let mut group_key = raw;
-        group_key.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let metric_name = &decision.name;
         // One metric id belongs to exactly one resource (its root row's
         // `resource.id`), so a per-metric cache is already per resource.
-        let prefix = resources.prefix_for(root, dp.parent_id);
-        let metric_cache = group_cache.entry(dp.parent_id as u32).or_default();
-        let outcome = metric_cache.entry(group_key).or_insert_with_key(|raw_key| {
-            build_group(raw_key, metric_name, prefix, tenant, limits)
+        let outcome = group_cache.resolve(dp.parent_id, range, flat_attrs, |key| {
+            build_group(key, &decision.name, prefix, tenant, limits)
         });
 
         match outcome {
@@ -986,8 +1075,10 @@ fn normalize_impl(
     // series to attach to and no point rejection accounting for them, so
     // without this they would vanish uncounted.
     number_exemplar_admission.count_orphans(flat_dp.iter().map(|dp| dp.id), &mut rejected);
+    #[cfg(test)]
+    held::record(group_cache.held_bytes() + resources.held_bytes());
+    drop(group_cache);
 
-    let hist_attr_order = sort_attrs_by_parent(flat_hist_attrs);
     let hist_exemplar_attr_order = sort_attrs_by_parent(&flat_hist_exemplar_attrs);
     let mut exemplar_admission = ExemplarAdmission {
         rows: &hist_exemplar_rows,
@@ -1004,14 +1095,17 @@ fn normalize_impl(
         else {
             continue;
         };
-        let range = attr_range_for(flat_hist_attrs, &hist_attr_order, dp.id);
+        let Some(prefix) = resources.prefix_for(root, dp.parent_id) else {
+            continue;
+        };
+        let range = attr_range_for(flat_hist_attrs, &orders.hist, dp.id);
         let memo = hist_memos
             .entry(dp.parent_id)
             .or_insert_with(SeriesIdMemo::new);
         match explode_histogram_point(
             tenant,
             &decision.name,
-            resources.prefix_for(root, dp.parent_id),
+            prefix,
             dp,
             range,
             flat_hist_attrs,
@@ -1034,7 +1128,6 @@ fn normalize_impl(
     }
     exemplar_admission.count_orphans(flat_hist_dp.iter().map(|dp| dp.id), &mut rejected);
 
-    let summary_attr_order = sort_attrs_by_parent(flat_summary_attrs);
     let mut summary_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
     for dp in flat_summary_dp {
         let Some(decision) = summary_decision
@@ -1043,14 +1136,17 @@ fn normalize_impl(
         else {
             continue;
         };
-        let range = attr_range_for(flat_summary_attrs, &summary_attr_order, dp.id);
+        let Some(prefix) = resources.prefix_for(root, dp.parent_id) else {
+            continue;
+        };
+        let range = attr_range_for(flat_summary_attrs, &orders.summary, dp.id);
         let memo = summary_memos
             .entry(dp.parent_id)
             .or_insert_with(SeriesIdMemo::new);
         match explode_summary_point(
             tenant,
             &decision.name,
-            resources.prefix_for(root, dp.parent_id),
+            prefix,
             dp,
             range,
             flat_summary_attrs,
@@ -1106,16 +1202,15 @@ fn normalize_impl(
 /// summary point, every exploded series. Built from the same per-label helpers,
 /// so the charge per label cannot drift between the formats.
 ///
-/// Builds no point label set. It does decode the batch's payloads and build
-/// each resource's prefix, which is bounded by `max_resource_attributes`.
+/// Builds no label: it decodes the batch's payloads and reads value lengths.
+/// Zero when a point bound already rejects the batch whole. A caller that
+/// normalizes afterwards should use [`prepare_batch`] instead, which keeps the
+/// decode for the normalize.
 pub fn project_resolved_label_bytes(
     batch: &DecodedBatch,
     limits: &IngestLimits,
 ) -> ProjectedLabelBytes {
-    let mut scratch = Vec::new();
-    let flat = flatten_points(batch, &mut scratch);
-    let tables = resolve_metrics(batch, &flat, limits, &mut scratch);
-    ProjectedLabelBytes::from_walk(project_flat(&flat, &tables, limits))
+    prepare_batch(batch, limits).projected_label_bytes()
 }
 
 /// The flattened data-point and attribute rows of one batch, decoded once and
@@ -1159,21 +1254,21 @@ fn flatten_points<'b>(batch: &'b DecodedBatch, rejected: &mut Vec<Rejection>) ->
 }
 
 /// Everything resolved per metric id before any point is built: the root
-/// table, the admitted resource prefixes, and the three decision tables.
-struct MetricTables {
+/// table, the planned resource prefixes, and the three decision tables.
+struct MetricTables<'b> {
     root: Vec<Option<RootEntry>>,
-    resources: ResourcePrefixes,
+    resources: ResourcePrefixes<'b>,
     metric_decision: Vec<Option<MetricDecision>>,
     hist_decision: Vec<Option<HistogramDecision>>,
     summary_decision: Vec<Option<SummaryDecision>>,
 }
 
-fn resolve_metrics(
-    batch: &DecodedBatch,
+fn resolve_metrics<'b>(
+    batch: &'b DecodedBatch,
     flat: &FlatPoints<'_>,
     limits: &IngestLimits,
     rejected: &mut Vec<Rejection>,
-) -> MetricTables {
+) -> MetricTables<'b> {
     let root_batches = payloads_of(batch, ArrowPayloadType::UnivariateMetrics);
     let root_ids = decode_root_ids(&root_batches, rejected);
     let dense_size = dense_size_for(
@@ -1186,11 +1281,9 @@ fn resolve_metrics(
     );
     let root = build_root_table(&root_batches, &root_ids, dense_size);
 
-    let resource_attrs = flatten_attrs(
-        &payloads_of(batch, ArrowPayloadType::ResourceAttrs),
-        rejected,
-    );
-    let resources = admit_resources(&root, &resource_attrs, flat, limits, rejected);
+    let resource_attrs =
+        flatten_resource_attrs(&payloads_of(batch, ArrowPayloadType::ResourceAttrs));
+    let resources = plan_resources(&root, resource_attrs, flat, limits, rejected);
     let blocked = &resources.blocked;
 
     let (metric_decision, unknown_number_count) =
@@ -1224,51 +1317,201 @@ fn resolve_metrics(
 
 /// The resource label prefixes of one batch, keyed by the batch-scoped
 /// `resource.id` (ADR-2708 D4), and which metric ids sit under a rejected
-/// resource.
-struct ResourcePrefixes {
-    /// Admitted resources: the prefix and its projected bytes.
-    prefixes: HashMap<u16, (Vec<Label>, usize)>,
+/// resource. [`plan_resources`] admits each resource from value lengths;
+/// [`ResourcePrefixes::build`] builds the labels once the label-byte bound
+/// has passed.
+struct ResourcePrefixes<'b> {
+    /// The `RESOURCE_ATTRS` rows, and their indices sorted by `parent_id`.
+    attrs: Vec<FlatAttr<'b>>,
+    order: Vec<u32>,
+    /// Resources admitted by the plan, in id order.
+    planned: BTreeMap<u16, PlannedResource>,
+    /// Built prefixes, empty until [`Self::build`].
+    prefixes: HashMap<u16, Vec<Label>>,
     /// Indexed by metric id: true when the metric's resource was rejected, so
     /// its points are already accounted for and must not be built or counted
     /// again.
     blocked: Vec<bool>,
 }
 
-impl ResourcePrefixes {
-    fn admitted(&self, root: &[Option<RootEntry>], metric_id: u16) -> Option<&(Vec<Label>, usize)> {
-        let resource_id = root
-            .get(metric_id as usize)
-            .and_then(|e| e.as_ref())
-            .and_then(|e| e.resource_id)?;
-        self.prefixes.get(&resource_id)
-    }
+struct PlannedResource {
+    /// Number, histogram, and summary points under the resource.
+    points: usize,
+    /// The prefix's projected bytes.
+    bytes: usize,
+    /// Where in the rejection list the build's rejections belong: where an
+    /// admission at plan time would have pushed them.
+    rejection_at: usize,
+}
 
+impl<'b> ResourcePrefixes<'b> {
     /// The label prefix every point of `metric_id` starts with: empty for a
-    /// metric with no resource.
-    fn prefix_for(&self, root: &[Option<RootEntry>], metric_id: u16) -> &[Label] {
-        self.admitted(root, metric_id)
-            .map_or(&[], |(labels, _)| labels.as_slice())
+    /// metric with no resource, `None` when its resource has no built prefix.
+    fn prefix_for(&self, root: &[Option<RootEntry>], metric_id: u16) -> Option<&[Label]> {
+        match resource_of(root, metric_id) {
+            ResourceRef::Absent => Some(&[]),
+            ResourceRef::Id(id) => self.prefixes.get(&id).map(Vec::as_slice),
+            ResourceRef::Malformed => None,
+        }
     }
 
     fn prefix_bytes_for(&self, root: &[Option<RootEntry>], metric_id: u16) -> usize {
-        self.admitted(root, metric_id)
-            .map_or(0, |(_, bytes)| *bytes)
+        match resource_of(root, metric_id) {
+            ResourceRef::Id(id) => self.planned.get(&id).map_or(0, |p| p.bytes),
+            ResourceRef::Absent | ResourceRef::Malformed => 0,
+        }
+    }
+
+    /// Build every planned prefix with [`admit_resource_labels`], the function
+    /// OTLP calls per `ResourceMetrics`, placing its rejections where the plan
+    /// recorded them so the rejection order is the eager build's.
+    fn build(&mut self, limits: &IngestLimits, rejected: &mut Vec<Rejection>) {
+        let mut prefixes = HashMap::with_capacity(self.planned.len());
+        let mut inserts: Vec<(usize, Vec<Rejection>)> = Vec::new();
+        for (&resource_id, plan) in &self.planned {
+            let pairs = resource_pairs(&self.attrs, &self.order, resource_id);
+            let mut scratch = Vec::new();
+            if let Some(labels) = admit_resource_labels(&pairs, plan.points, limits, &mut scratch) {
+                prefixes.insert(resource_id, labels);
+            }
+            if !scratch.is_empty() {
+                inserts.push((plan.rejection_at, scratch));
+            }
+        }
+        self.prefixes = prefixes;
+        // `rejection_at` never decreases in id order, so inserting from the
+        // last one leaves every earlier index valid.
+        for (at, rejections) in inserts.into_iter().rev() {
+            let at = at.min(rejected.len());
+            rejected.splice(at..at, rejections);
+        }
+    }
+
+    /// Heap bytes the built prefixes hold.
+    #[cfg(test)]
+    fn held_bytes(&self) -> usize {
+        self.prefixes
+            .values()
+            .map(|labels| held::labels(labels.capacity(), labels.iter()))
+            .sum()
     }
 }
 
-/// Admit every resource a metric with points refers to, through the same
-/// [`admit_resource_labels`] OTLP calls per `ResourceMetrics`, so one resource
-/// yields the same prefix, the same dropped count, and the same rejection on
-/// both paths. A resource's point count is the number, histogram, and summary
-/// points of every metric under it. Its attributes are its `RESOURCE_ATTRS`
-/// rows in row order; rows whose `parent_id` no metric refers to are ignored.
-fn admit_resources(
+fn resource_of(root: &[Option<RootEntry>], metric_id: u16) -> ResourceRef {
+    root.get(metric_id as usize)
+        .and_then(|e| e.as_ref())
+        .map_or(ResourceRef::Absent, |e| e.resource)
+}
+
+/// One resource's attributes as the resource-label builder reads them: its
+/// `RESOURCE_ATTRS` rows in table order.
+fn resource_pairs<'b>(
+    attrs: &[FlatAttr<'b>],
+    order: &[u32],
+    resource_id: u16,
+) -> Vec<(&'b str, ResourceAttrValue<'b>)> {
+    attr_range_for(attrs, order, u32::from(resource_id))
+        .iter()
+        .map(|&i| {
+            let a = &attrs[i as usize];
+            (a.key, resource_attr_value(a))
+        })
+        .collect()
+}
+
+/// The rejection [`ravel_otlp::build_resource_labels_from`] returns for
+/// `attrs`, decided from value lengths without building a label: the same
+/// reads in the same order (`service.name`, `service.namespace`, the joined
+/// `job`, `service.instance.id`, then the allowlist), each checked as its
+/// `push_checked` checks it.
+fn check_resource_labels(
+    attrs: &[(&str, ResourceAttrValue<'_>)],
+    limits: &IngestLimits,
+) -> Result<(), Rejection> {
+    let first_len = |key: &str| -> Result<Option<usize>, Rejection> {
+        match attrs.iter().find(|(k, _)| *k == key) {
+            None => Ok(None),
+            Some((_, value)) => resource_value_label_len(*value)
+                .map(Some)
+                .ok_or(Rejection::ComplexAttributeValue),
+        }
+    };
+    let name = first_len("service.name")?;
+    let namespace = first_len("service.namespace")?;
+    if let Some(name) = name {
+        let job = match namespace {
+            Some(ns) if ns > 0 => ns.saturating_add(1).saturating_add(name),
+            _ => name,
+        };
+        check_label_len("job".len(), job, limits)?;
+    }
+    if let Some(instance) = first_len("service.instance.id")? {
+        check_label_len("instance".len(), instance, limits)?;
+    }
+    for key in &limits.resource_attribute_allowlist {
+        if matches!(
+            key.as_str(),
+            "service.name" | "service.namespace" | "service.instance.id"
+        ) {
+            continue;
+        }
+        if let Some(len) = first_len(key)? {
+            check_label_len(sanitized_label_name_len(key), len, limits)?;
+        }
+    }
+    Ok(())
+}
+
+/// The length checks [`push_checked`] applies to a label of these lengths.
+fn check_label_len(
+    name_len: usize,
+    value_len: usize,
+    limits: &IngestLimits,
+) -> Result<(), Rejection> {
+    if value_len == 0 {
+        return Ok(());
+    }
+    if name_len > limits.max_label_name_len {
+        return Err(Rejection::LabelNameTooLong {
+            len: name_len,
+            max: limits.max_label_name_len,
+        });
+    }
+    if value_len > limits.max_label_value_len {
+        return Err(Rejection::LabelValueTooLong {
+            len: value_len,
+            max: limits.max_label_value_len,
+        });
+    }
+    Ok(())
+}
+
+/// Length of [`sanitize_label_name`]'s output: every character it keeps is
+/// ASCII and every one it replaces becomes `_`.
+fn sanitized_label_name_len(name: &str) -> usize {
+    name.chars().count()
+}
+
+/// Admit every resource a metric with points refers to with the checks
+/// [`admit_resource_labels`] applies, which OTLP calls per `ResourceMetrics`,
+/// decided from value lengths so no label is built before the label-byte
+/// bound. One resource yields the same prefix, the same dropped count, and the
+/// same rejection on both paths. A resource's point count is the number,
+/// histogram, and summary points of every metric under it. Its attributes are
+/// its `RESOURCE_ATTRS` rows in table order; rows whose `parent_id` no metric
+/// refers to are ignored.
+///
+/// A metric whose resource cannot be read is rejected, never read as having
+/// no resource: an unreadable `resource.id` rejects its metric's points, and
+/// an unreadable or unrecognized `RESOURCE_ATTRS` table rejects every point
+/// that refers to a resource.
+fn plan_resources<'b>(
     root: &[Option<RootEntry>],
-    resource_attrs: &[FlatAttr<'_>],
+    resource_attrs: Result<Vec<FlatAttr<'b>>, &'static str>,
     flat: &FlatPoints<'_>,
     limits: &IngestLimits,
     rejected: &mut Vec<Rejection>,
-) -> ResourcePrefixes {
+) -> ResourcePrefixes<'b> {
     let mut metric_points = vec![0usize; root.len()];
     let parents = flat
         .dp
@@ -1281,48 +1524,105 @@ fn admit_resources(
             *n += 1;
         }
     }
+    let resources: Vec<ResourceRef> = root
+        .iter()
+        .map(|e| e.as_ref().map_or(ResourceRef::Absent, |e| e.resource))
+        .collect();
+    let mut blocked = vec![false; root.len()];
+
+    let malformed: usize = resources
+        .iter()
+        .zip(&metric_points)
+        .filter(|(r, _)| matches!(r, ResourceRef::Malformed))
+        .map(|(_, &n)| n)
+        .sum();
+    for (b, r) in blocked.iter_mut().zip(&resources) {
+        *b |= matches!(r, ResourceRef::Malformed);
+    }
+    if malformed > 0 {
+        rejected.push(Rejection::UnsupportedMetricType {
+            metric_type: MALFORMED_RESOURCE,
+            count: malformed,
+        });
+    }
+
+    let attrs = match resource_attrs {
+        Ok(attrs) => attrs,
+        Err(tag) => {
+            let mut count = 0usize;
+            for ((b, r), &n) in blocked.iter_mut().zip(&resources).zip(&metric_points) {
+                if matches!(r, ResourceRef::Id(_)) {
+                    *b = true;
+                    count += n;
+                }
+            }
+            if count > 0 {
+                rejected.push(Rejection::UnsupportedMetricType {
+                    metric_type: tag,
+                    count,
+                });
+            }
+            return ResourcePrefixes {
+                attrs: Vec::new(),
+                order: Vec::new(),
+                planned: BTreeMap::new(),
+                prefixes: HashMap::new(),
+                blocked,
+            };
+        }
+    };
+
     let mut resource_points: BTreeMap<u16, usize> = BTreeMap::new();
-    for (entry, points) in root.iter().zip(&metric_points) {
-        if let Some(resource_id) = entry.as_ref().and_then(|e| e.resource_id) {
+    for (r, &points) in resources.iter().zip(&metric_points) {
+        if let ResourceRef::Id(resource_id) = *r {
             *resource_points.entry(resource_id).or_default() += points;
         }
     }
 
-    let order = sort_attrs_by_parent(resource_attrs);
-    let mut prefixes = HashMap::new();
+    let order = sort_attrs_by_parent(&attrs);
+    let mut planned = BTreeMap::new();
     let mut rejected_resources = HashSet::new();
     for (&resource_id, &points) in &resource_points {
         if points == 0 {
             continue;
         }
-        let pairs: Vec<(&str, ResourceAttrValue<'_>)> =
-            attr_range_for(resource_attrs, &order, u32::from(resource_id))
-                .iter()
-                .map(|&i| {
-                    let a = &resource_attrs[i as usize];
-                    (a.key, resource_attr_value(a))
-                })
-                .collect();
-        match admit_resource_labels(&pairs, points, limits, rejected) {
-            Some(labels) => {
-                let bytes = resource_prefix_bytes(&pairs, limits).unwrap_or(0);
-                prefixes.insert(resource_id, (labels, bytes));
-            }
-            None => {
-                rejected_resources.insert(resource_id);
-            }
+        let pairs = resource_pairs(&attrs, &order, resource_id);
+        if pairs.len() > limits.max_resource_attributes {
+            rejected.push(Rejection::TooManyResourceAttributes {
+                count: points,
+                max: limits.max_resource_attributes,
+            });
+            rejected_resources.insert(resource_id);
+        } else if let Err(reason) = check_resource_labels(&pairs, limits) {
+            rejected.push(Rejection::Grouped {
+                reason: Box::new(reason),
+                count: points,
+            });
+            rejected_resources.insert(resource_id);
+        } else {
+            planned.insert(
+                resource_id,
+                PlannedResource {
+                    points,
+                    bytes: resource_prefix_bytes(&pairs, limits).unwrap_or(0),
+                    rejection_at: rejected.len(),
+                },
+            );
         }
     }
 
-    let blocked = root
-        .iter()
-        .map(|e| {
-            e.as_ref()
-                .and_then(|e| e.resource_id)
-                .is_some_and(|r| rejected_resources.contains(&r))
-        })
-        .collect();
-    ResourcePrefixes { prefixes, blocked }
+    for (b, r) in blocked.iter_mut().zip(&resources) {
+        if let ResourceRef::Id(id) = r {
+            *b |= rejected_resources.contains(id);
+        }
+    }
+    ResourcePrefixes {
+        attrs,
+        order,
+        planned,
+        prefixes: HashMap::new(),
+        blocked,
+    }
 }
 
 /// One attribute row as the resource-label builder reads it. Agrees with
@@ -1375,11 +1675,67 @@ fn same_flat_attrs(a: &[u32], b: &[u32], attrs: &[FlatAttr<'_>]) -> bool {
         })
 }
 
+/// The bytes of one [`GroupCache`] key for these attribute rows: each
+/// attribute's key and string value copied, charged at the per-label rate,
+/// which covers the key's `(String, RawCell)` slot.
+fn group_key_bytes(range: &[u32], attrs: &[FlatAttr<'_>]) -> usize {
+    range
+        .iter()
+        .map(|&i| {
+            let a = &attrs[i as usize];
+            let str_len = match a.ty {
+                Some(ANY_VALUE_TYPE_STRING) => a.str_val.map_or(0, str::len),
+                _ => 0,
+            };
+            label_bytes(a.key.len(), str_len)
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Heap bytes held by label sets and group-cache keys during a normalize,
+/// recorded for the capacity test.
+#[cfg(test)]
+mod held {
+    use std::cell::Cell;
+
+    use ravel_types::Label;
+
+    thread_local! {
+        static HELD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record(bytes: usize) {
+        HELD.with(|h| h.set(bytes));
+    }
+
+    pub(super) fn take() -> usize {
+        HELD.with(|h| h.replace(0))
+    }
+
+    /// Bytes of `slots` label slots plus the strings of `labels`.
+    pub(super) fn labels<'a>(slots: usize, labels: impl Iterator<Item = &'a Label>) -> usize {
+        slots * std::mem::size_of::<Label>()
+            + labels
+                .map(|l| l.name.capacity() + l.value.capacity())
+                .sum::<usize>()
+    }
+}
+
 /// The projection walk behind [`project_resolved_label_bytes`], over rows
 /// already flattened and decisions already made. A point the build would reject
 /// before keeping a set (no decision, a blocked resource, over the attribute or
 /// bucket or quantile cap, an attribute with no label form) is not charged.
-fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLimits) -> usize {
+///
+/// A number point that starts a run (the first of consecutive points of its
+/// metric with equal attribute rows) is charged twice more: for the set the
+/// [`GroupCache`] keeps, and for the cache key, which copies each attribute's
+/// key and string value.
+fn project_flat(
+    flat: &FlatPoints<'_>,
+    tables: &MetricTables,
+    orders: &AttrOrders,
+    limits: &IngestLimits,
+) -> usize {
     let MetricTables {
         root,
         resources,
@@ -1389,12 +1745,12 @@ fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLim
     } = tables;
     let max_attrs = limits.max_attributes_per_point;
     let mut total = resources
-        .prefixes
+        .planned
         .values()
-        .map(|(_, bytes)| *bytes)
+        .map(|p| p.bytes)
         .fold(0usize, usize::saturating_add);
 
-    let order = sort_attrs_by_parent(&flat.attrs);
+    let order = &orders.number;
     let mut previous: HashMap<u16, &[u32]> = HashMap::new();
     for dp in &flat.dp {
         let Some(decision) = metric_decision
@@ -1403,7 +1759,7 @@ fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLim
         else {
             continue;
         };
-        let range = attr_range_for(&flat.attrs, &order, dp.id);
+        let range = attr_range_for(&flat.attrs, order, dp.id);
         if range.len() > max_attrs {
             continue;
         }
@@ -1420,11 +1776,12 @@ fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLim
             .insert(dp.parent_id, range)
             .is_some_and(|p| same_flat_attrs(p, range, &flat.attrs));
         if !repeat {
-            total = total.saturating_add(base.saturating_add(reserved));
+            total = total
+                .saturating_add(base.saturating_add(reserved))
+                .saturating_add(group_key_bytes(range, &flat.attrs));
         }
     }
 
-    let order = sort_attrs_by_parent(&flat.hist_attrs);
     for dp in &flat.hist_dp {
         let Some(decision) = hist_decision
             .get(dp.parent_id as usize)
@@ -1432,7 +1789,7 @@ fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLim
         else {
             continue;
         };
-        let range = attr_range_for(&flat.hist_attrs, &order, dp.id);
+        let range = attr_range_for(&flat.hist_attrs, &orders.hist, dp.id);
         if dp.explicit_bounds.len() > limits.max_histogram_buckets || range.len() > max_attrs {
             continue;
         }
@@ -1446,7 +1803,6 @@ fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLim
         total = total.saturating_add(histogram_point_bytes(per_series, &dp.explicit_bounds));
     }
 
-    let order = sort_attrs_by_parent(&flat.summary_attrs);
     for dp in &flat.summary_dp {
         let Some(decision) = summary_decision
             .get(dp.parent_id as usize)
@@ -1454,7 +1810,7 @@ fn project_flat(flat: &FlatPoints<'_>, tables: &MetricTables, limits: &IngestLim
         else {
             continue;
         };
-        let range = attr_range_for(&flat.summary_attrs, &order, dp.id);
+        let range = attr_range_for(&flat.summary_attrs, &orders.summary, dp.id);
         if dp.quantiles.len() > limits.max_summary_quantiles || range.len() > max_attrs {
             continue;
         }
@@ -1749,8 +2105,19 @@ struct RootEntry {
     /// the column normalizes exactly as before with an empty help.
     description: String,
     /// The batch-scoped `resource.id` this metric's resource label prefix is
-    /// built from, or `None` for a metric with no resource (an empty prefix).
-    resource_id: Option<u16>,
+    /// built from.
+    resource: ResourceRef,
+}
+
+/// A metric's `resource.id` as its METRICS row carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceRef {
+    /// No resource: an empty prefix.
+    Absent,
+    Id(u16),
+    /// A `resource` column or `id` child of the wrong type: the metric's
+    /// points are rejected as [`MALFORMED_RESOURCE`].
+    Malformed,
 }
 
 enum RootKind {
@@ -1877,12 +2244,120 @@ enum RawCell {
     Complex,
 }
 
+type GroupOutcome = Result<(LabelSet, SeriesId), Rejection>;
+
 /// Memoization cache for the series-grouping step: per metric id, maps a
 /// canonicalized (sorted-by-key) attribute set to its already-computed
 /// `(LabelSet, SeriesId)` or rejection, so BLAKE3 canonicalization runs
 /// once per distinct combination per batch instead of once per point.
-type GroupCache =
-    HashMap<u32, HashMap<Vec<(String, RawCell)>, Result<(LabelSet, SeriesId), Rejection>>>;
+///
+/// A key is built once per run: consecutive points of one metric with equal
+/// attribute rows, as [`project_flat`] counts them. A later point of the run
+/// reuses the run's outcome without copying its attributes again, so the keys
+/// and sets held never exceed what the projection charged.
+#[derive(Default)]
+struct GroupCache<'a> {
+    keys: HashMap<u16, HashMap<Vec<(String, RawCell)>, usize>>,
+    outcomes: Vec<GroupOutcome>,
+    /// Per metric id: the current run's attribute rows, and its outcome once
+    /// resolved.
+    runs: HashMap<u16, (&'a [u32], Option<usize>)>,
+}
+
+impl<'a> GroupCache<'a> {
+    /// Track `range` as the latest counted point of `metric_id`, starting a new
+    /// run unless its attributes equal the previous point's.
+    fn enter_run(&mut self, metric_id: u16, range: &'a [u32], attrs: &[FlatAttr<'_>]) {
+        if !has_label_form(range, attrs) {
+            return;
+        }
+        let outcome = match self.runs.get(&metric_id) {
+            Some(&(prev, outcome)) if same_flat_attrs(prev, range, attrs) => outcome,
+            _ => None,
+        };
+        self.runs.insert(metric_id, (range, outcome));
+    }
+
+    /// The outcome for this point's attributes: the run's, the cached one for
+    /// an equal key, or `build`'s result for a new key.
+    fn resolve(
+        &mut self,
+        metric_id: u16,
+        range: &'a [u32],
+        attrs: &[FlatAttr<'_>],
+        build: impl FnOnce(&[(String, RawCell)]) -> GroupOutcome,
+    ) -> &GroupOutcome {
+        let run = self.runs.get(&metric_id).and_then(|&(_, outcome)| outcome);
+        let idx = match run {
+            Some(idx) => idx,
+            None => {
+                let mut key: Vec<(String, RawCell)> = range
+                    .iter()
+                    .map(|&i| {
+                        let a = &attrs[i as usize];
+                        (a.key.to_string(), raw_cell(a))
+                    })
+                    .collect();
+                key.sort_by(|a, b| a.0.cmp(&b.0));
+                let keys = self.keys.entry(metric_id).or_default();
+                let idx = match keys.get(&key) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = self.outcomes.len();
+                        self.outcomes.push(build(&key));
+                        keys.insert(key, idx);
+                        idx
+                    }
+                };
+                if let Some(entry) = self.runs.get_mut(&metric_id) {
+                    entry.1 = Some(idx);
+                }
+                idx
+            }
+        };
+        &self.outcomes[idx]
+    }
+
+    /// Heap bytes the cached keys and label sets hold. A set's slots are its
+    /// labels plus the empty values [`build_group`] reserved and dropped.
+    #[cfg(test)]
+    fn held_bytes(&self) -> usize {
+        self.keys
+            .values()
+            .flat_map(|keys| keys.iter())
+            .map(|(key, &idx)| {
+                let strings: usize = key
+                    .iter()
+                    .map(|(k, v)| {
+                        k.capacity()
+                            + match v {
+                                RawCell::Str(s) => s.capacity(),
+                                _ => 0,
+                            }
+                    })
+                    .sum();
+                let key_bytes = key.capacity() * std::mem::size_of::<(String, RawCell)>() + strings;
+                let empties = key
+                    .iter()
+                    .filter(|(_, v)| matches!(v, RawCell::Str(s) if s.is_empty()))
+                    .count();
+                let set_bytes = match &self.outcomes[idx] {
+                    Ok((set, _)) => held::labels(set.len() + empties, set.iter()),
+                    Err(_) => 0,
+                };
+                key_bytes + set_bytes
+            })
+            .sum()
+    }
+}
+
+/// Whether every attribute in `range` has a label form, the condition under
+/// which [`project_flat`] counts a point.
+fn has_label_form(range: &[u32], attrs: &[FlatAttr<'_>]) -> bool {
+    range
+        .iter()
+        .all(|&i| resource_value_label_len(resource_attr_value(&attrs[i as usize])).is_some())
+}
 
 fn dense_size_for(root_ids: &[Option<RootIds>], parent_ids: impl Iterator<Item = u16>) -> usize {
     let mut max_id: u32 = 0;
@@ -1924,39 +2399,46 @@ fn decode_root_ids(
 /// joins to `RESOURCE_ATTRS` by.
 struct RootIds {
     ids: Vec<u16>,
-    resource_ids: Vec<Option<u16>>,
+    resource_ids: Vec<ResourceRef>,
 }
 
 /// Decode the METRICS `resource.id` column (otap-spec.md section 5.3.1: a
 /// `UInt16` child of the `resource` struct, DELTA by default, its encoding
-/// declared on the child field). `None` at a row means the metric carries no
-/// resource: the `resource` column, its `id` child, the struct slot or the id
-/// slot is absent or null. Null slots are left out of the delta running sum,
-/// as [`decode_delta_u16`] leaves them out. An unrecognized encoding rejects
-/// the batch as [`decode_id_column_u16`] does.
+/// declared on the child field). A row carries no resource when the `resource`
+/// column, its `id` child, the struct slot or the id slot is absent or null.
+/// Every row is [`ResourceRef::Malformed`] when the column or child is present
+/// with the wrong type. Null slots are left out of the delta running sum, as
+/// [`decode_delta_u16`] leaves them out. An unrecognized encoding rejects the
+/// batch as [`decode_id_column_u16`] does.
 fn decode_root_resource_ids(
     rb: &RecordBatch,
     rejected: &mut Vec<Rejection>,
-) -> Option<Vec<Option<u16>>> {
+) -> Option<Vec<ResourceRef>> {
     let rows = rb.num_rows();
-    let Some(resource) = column_as::<StructArray>(rb, "resource") else {
-        return Some(vec![None; rows]);
+    let Some(column) = rb.column_by_name("resource") else {
+        return Some(vec![ResourceRef::Absent; rows]);
     };
-    let child = resource.fields().iter().position(|f| f.name() == "id");
-    let Some((field, ids)) = child.and_then(|idx| {
-        let ids = resource
-            .column(idx)
-            .as_any()
-            .downcast_ref::<UInt16Array>()?;
-        Some((&resource.fields()[idx], ids))
-    }) else {
-        return Some(vec![None; rows]);
+    let Some(resource) = column.as_any().downcast_ref::<StructArray>() else {
+        return Some(vec![ResourceRef::Malformed; rows]);
+    };
+    let Some(idx) = resource.fields().iter().position(|f| f.name() == "id") else {
+        return Some(vec![ResourceRef::Absent; rows]);
+    };
+    let field = &resource.fields()[idx];
+    let Some(ids) = resource.column(idx).as_any().downcast_ref::<UInt16Array>() else {
+        return Some(vec![ResourceRef::Malformed; rows]);
     };
     let present = |i: usize| !resource.is_null(i) && !ids.is_null(i);
     match field_id_encoding(field) {
         Ok(IdEncoding::Plain) => Some(
             (0..rows)
-                .map(|i| present(i).then(|| ids.value(i)))
+                .map(|i| {
+                    if present(i) {
+                        ResourceRef::Id(ids.value(i))
+                    } else {
+                        ResourceRef::Absent
+                    }
+                })
                 .collect(),
         ),
         Ok(IdEncoding::Delta) => {
@@ -1964,10 +2446,12 @@ fn decode_root_resource_ids(
             Some(
                 (0..rows)
                     .map(|i| {
-                        present(i).then(|| {
+                        if present(i) {
                             acc = acc.wrapping_add(ids.value(i));
-                            acc
-                        })
+                            ResourceRef::Id(acc)
+                        } else {
+                            ResourceRef::Absent
+                        }
                     })
                     .collect(),
             )
@@ -2067,7 +2551,7 @@ fn build_root_table(
                     kind,
                     unit,
                     description,
-                    resource_id: resource_ids.get(i).copied().flatten(),
+                    resource: resource_ids.get(i).copied().unwrap_or(ResourceRef::Absent),
                 });
             }
         }
@@ -2120,53 +2604,102 @@ fn flatten_dp(dp_batches: &[&RecordBatch], rejected: &mut Vec<Rejection>) -> Vec
     out
 }
 
+/// Flatten a data-point or exemplar `*Attrs` table. A batch missing its
+/// `parent_id`, `key` or `type` column is skipped; one with an unrecognized
+/// `parent_id` encoding is skipped and counted as [`UNRECOGNIZED_ID_ENCODING`].
 fn flatten_attrs<'b>(
     attr_batches: &[&'b RecordBatch],
     rejected: &mut Vec<Rejection>,
 ) -> Vec<FlatAttr<'b>> {
     let mut out = Vec::new();
     for rb in attr_batches {
-        let Some(parents) = ParentIds::from_column(rb, "parent_id") else {
-            continue;
-        };
-        let Some(keys) = StrCol::from_column(rb, "key") else {
-            continue;
-        };
-        let Some(types) = column_as::<UInt8Array>(rb, "type") else {
-            continue;
-        };
-        let strs = StrCol::from_column(rb, "str");
-        let bools = column_as::<BooleanArray>(rb, "bool");
-        let ints = IntCol::from_column(rb, "int");
-        let doubles = column_as::<Float64Array>(rb, "double");
-        // otap-spec.md section 6.4.3: `*Attrs.parent_id` defaults to
-        // QUASI-DELTA (equality columns `type`, `key`, and the type's Active
-        // Field value), not the DELTA default of the core id chain.
-        let Some(decoded_parents) =
-            decode_quasi_delta_column(rb, &parents, rejected, decode_quasi_delta_attrs)
-        else {
-            continue;
-        };
-        for (i, &parent_id) in decoded_parents.iter().enumerate() {
-            out.push(FlatAttr {
-                parent_id,
-                // A null key reads as the empty string, as the plain column's
-                // empty slot always did.
-                key: keys.get(i).unwrap_or(""),
-                // Read the discriminant through the null-checking `opt_u8`, like
-                // the sibling value columns: a null `type` (validity bit unset,
-                // even with a scalar byte still in the buffer) is out of
-                // contract and must reach `raw_cell`'s rejection fallback, not
-                // be read as that stale byte.
-                ty: opt_u8(Some(types), i),
-                str_val: strs.as_ref().and_then(|c| c.get(i)),
-                bool_val: opt_bool(bools, i),
-                int_val: ints.as_ref().and_then(|c| c.get(i)),
-                double_val: opt_f64(doubles, i),
-            });
+        match flatten_attr_batch(rb, false, &mut out) {
+            Ok(()) | Err(AttrBatchError::Unreadable) => {}
+            Err(AttrBatchError::UnrecognizedEncoding) => {
+                rejected.push(Rejection::UnsupportedMetricType {
+                    metric_type: UNRECOGNIZED_ID_ENCODING,
+                    count: rb.num_rows(),
+                });
+            }
         }
     }
     out
+}
+
+/// Flatten the `RESOURCE_ATTRS` table, or name why it cannot be read: a
+/// non-empty batch missing its `parent_id`, `key` or `type` column, or with a
+/// null dictionary `parent_id` slot, is [`MALFORMED_RESOURCE`]; an
+/// unrecognized `parent_id` encoding is [`UNRECOGNIZED_ID_ENCODING`]. Either
+/// leaves no resource readable, so [`plan_resources`] rejects every point that
+/// refers to one.
+fn flatten_resource_attrs<'b>(
+    attr_batches: &[&'b RecordBatch],
+) -> Result<Vec<FlatAttr<'b>>, &'static str> {
+    let mut out = Vec::new();
+    for rb in attr_batches {
+        if rb.num_rows() == 0 {
+            continue;
+        }
+        match flatten_attr_batch(rb, true, &mut out) {
+            Ok(()) => {}
+            Err(AttrBatchError::Unreadable) => return Err(MALFORMED_RESOURCE),
+            Err(AttrBatchError::UnrecognizedEncoding) => return Err(UNRECOGNIZED_ID_ENCODING),
+        }
+    }
+    Ok(out)
+}
+
+enum AttrBatchError {
+    Unreadable,
+    UnrecognizedEncoding,
+}
+
+/// Append one `*Attrs` batch's rows to `out`. With `strict_parents`, a null
+/// dictionary `parent_id` slot makes the batch unreadable rather than parent 0.
+fn flatten_attr_batch<'b>(
+    rb: &'b RecordBatch,
+    strict_parents: bool,
+    out: &mut Vec<FlatAttr<'b>>,
+) -> Result<(), AttrBatchError> {
+    let parents = ParentIds::from_column(rb, "parent_id").ok_or(AttrBatchError::Unreadable)?;
+    let keys = StrCol::from_column(rb, "key").ok_or(AttrBatchError::Unreadable)?;
+    let types = column_as::<UInt8Array>(rb, "type").ok_or(AttrBatchError::Unreadable)?;
+    if strict_parents && parents.has_null_dictionary_slot() {
+        return Err(AttrBatchError::Unreadable);
+    }
+    let strs = StrCol::from_column(rb, "str");
+    let bools = column_as::<BooleanArray>(rb, "bool");
+    let ints = IntCol::from_column(rb, "int");
+    let doubles = column_as::<Float64Array>(rb, "double");
+    // otap-spec.md section 6.4.3: `*Attrs.parent_id` defaults to
+    // QUASI-DELTA (equality columns `type`, `key`, and the type's Active
+    // Field value), not the DELTA default of the core id chain.
+    let decoded_parents = match quasi_delta_default_encoding(rb, "parent_id") {
+        Ok(IdEncoding::Plain) => parents.decode_plain(),
+        Ok(IdEncoding::Delta) => parents.decode_delta(),
+        Ok(IdEncoding::QuasiDelta) => decode_quasi_delta_attrs(rb, &parents),
+        Err(()) => return Err(AttrBatchError::UnrecognizedEncoding),
+    };
+    out.reserve(decoded_parents.len());
+    for (i, &parent_id) in decoded_parents.iter().enumerate() {
+        out.push(FlatAttr {
+            parent_id,
+            // A null key reads as the empty string, as the plain column's
+            // empty slot always did.
+            key: keys.get(i).unwrap_or(""),
+            // Read the discriminant through the null-checking `opt_u8`, like
+            // the sibling value columns: a null `type` (validity bit unset,
+            // even with a scalar byte still in the buffer) is out of
+            // contract and must reach `raw_cell`'s rejection fallback, not
+            // be read as that stale byte.
+            ty: opt_u8(Some(types), i),
+            str_val: strs.as_ref().and_then(|c| c.get(i)),
+            bool_val: opt_bool(bools, i),
+            int_val: ints.as_ref().and_then(|c| c.get(i)),
+            double_val: opt_f64(doubles, i),
+        });
+    }
+    Ok(())
 }
 
 fn raw_cell(a: &FlatAttr) -> RawCell {
@@ -2312,10 +2845,9 @@ fn attr_range_for<'a>(attrs: &[FlatAttr], order: &'a [u32], parent_id: u32) -> &
 }
 
 /// Render a decoded attribute cell to its label-value string, rejecting a
-/// complex (array/map/bytes) value. Shared by [`check_attrs_in_input_order`]
-/// and [`build_group`] so value formatting and the `ComplexAttributeValue`
-/// rejection never drift between the ordered admission pass and the canonical
-/// group build.
+/// complex (array/map/bytes) value. Its output length is
+/// [`resource_value_label_len`], which [`check_flat_attrs_in_input_order`]
+/// checks before this builds anything.
 fn raw_cell_value(cell: &RawCell) -> Result<String, Rejection> {
     Ok(match cell {
         RawCell::Str(s) => s.clone(),
@@ -2338,33 +2870,23 @@ fn raw_cell_value(cell: &RawCell) -> Result<String, Rejection> {
 /// the sorted set; because a set that passes in input order also passes in any
 /// order, the sorted build only ever surfaces the order-independent
 /// `DuplicateLabelName` / `OversizedSeriesComponent` rejections.
-fn check_attrs_in_input_order(
-    raw: &[(String, RawCell)],
+///
+/// Decided from lengths, so a point it rejects allocates nothing.
+fn check_flat_attrs_in_input_order(
+    range: &[u32],
+    attrs: &[FlatAttr<'_>],
     limits: &IngestLimits,
 ) -> Result<(), Rejection> {
-    for (raw_key, cell) in raw {
-        let name = sanitize_label_name(raw_key);
-        let value = raw_cell_value(cell)?;
+    for &i in range {
+        let a = &attrs[i as usize];
+        let value_len = resource_value_label_len(resource_attr_value(a))
+            .ok_or(Rejection::ComplexAttributeValue)?;
         // ADR-0038: an empty-valued label is dropped as absent by
         // `push_checked` before any length check, so this ordered validation
         // pass must skip it too, or an empty-valued label with an over-long
         // name would reject here while the canonical build silently drops it,
         // breaking the ADR-0011 identical-rejection-class contract.
-        if value.is_empty() {
-            continue;
-        }
-        if name.len() > limits.max_label_name_len {
-            return Err(Rejection::LabelNameTooLong {
-                len: name.len(),
-                max: limits.max_label_name_len,
-            });
-        }
-        if value.len() > limits.max_label_value_len {
-            return Err(Rejection::LabelValueTooLong {
-                len: value.len(),
-                max: limits.max_label_value_len,
-            });
-        }
+        check_label_len(sanitized_label_name_len(a.key), value_len, limits)?;
     }
     Ok(())
 }
@@ -3413,7 +3935,7 @@ mod tests {
             kind: RootKind::Gauge,
             unit: unit.to_string(),
             description: String::new(),
-            resource_id: None,
+            resource: ResourceRef::Absent,
         })];
         let decisions = vec![Some(MetricDecision {
             name: "m".to_string(),
@@ -3507,7 +4029,7 @@ mod tests {
                 },
                 unit: "By".to_string(),
                 description: "first help".to_string(),
-                resource_id: None,
+                resource: ResourceRef::Absent,
             }),
             Some(RootEntry {
                 name: "requests".to_string(),
@@ -3517,14 +4039,14 @@ mod tests {
                 },
                 unit: "By".to_string(),
                 description: "second help".to_string(),
-                resource_id: None,
+                resource: ResourceRef::Absent,
             }),
             Some(RootEntry {
                 name: "silent".to_string(),
                 kind: RootKind::Gauge,
                 unit: String::new(),
                 description: "never stored".to_string(),
-                resource_id: None,
+                resource: ResourceRef::Absent,
             }),
         ];
         let decisions = vec![
@@ -3575,6 +4097,7 @@ mod tests {
     use crate::stream::{StreamConfig, StreamState};
     use arrow::array::{ArrayRef, Int64Builder, StringDictionaryBuilder};
     use arrow::datatypes::{DataType, Field, Schema};
+    use proptest::prelude::*;
 
     const TS: i64 = 1_700_000_000_000_000_000;
 
@@ -3911,7 +4434,8 @@ mod tests {
     /// A request whose projected resolved-label bytes exceed the bound is
     /// rejected whole, with one `ResolvedLabelBytesExceeded` carrying every
     /// point; one byte more of budget admits all of it. The projection covers
-    /// at least the bytes of the labels the admitted points keep.
+    /// the bytes of the labels the admitted points keep, plus the label sets,
+    /// cache keys and resource prefixes held while they were built.
     #[test]
     fn otap_request_over_label_byte_bound_is_rejected_whole() {
         let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
@@ -3948,7 +4472,9 @@ mod tests {
             max_resolved_label_bytes_per_request: projected,
             ..IngestLimits::default()
         };
+        held::take();
         let out = run(&batch, &exact);
+        let held = held::take();
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 2);
         let kept: usize = out
@@ -3958,5 +4484,416 @@ mod tests {
             .map(|l| label_bytes(l.name.len(), l.value.len()))
             .sum();
         assert!(projected >= kept, "projected {projected} < kept {kept}");
+        let output = output_label_bytes(&out);
+        assert!(held > 0, "the build held its sets, keys and prefix");
+        assert!(
+            projected >= held + output,
+            "projected {projected} < held {held} + output {output}"
+        );
+    }
+
+    /// Heap bytes of every admitted point's own label set.
+    fn output_label_bytes(out: &NormalizeOutput) -> usize {
+        out.points
+            .iter()
+            .map(|p| held::labels(p.labels.len(), p.labels.iter()))
+            .sum()
+    }
+
+    /// `rb` with column `name` replaced by `column`, keeping the field's
+    /// metadata.
+    fn with_column(rb: &RecordBatch, name: &str, column: ArrayRef) -> RecordBatch {
+        let schema = rb.schema();
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        for (field, existing) in schema.fields().iter().zip(rb.columns()) {
+            if field.name() == name {
+                fields.push(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(column.data_type().clone())
+                        .with_nullable(true),
+                );
+                columns.push(column.clone());
+            } else {
+                fields.push(field.as_ref().clone());
+                columns.push(existing.clone());
+            }
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("rebuilt batch")
+    }
+
+    fn map_payload(
+        batch: &mut DecodedBatch,
+        payload: ArrowPayloadType,
+        f: impl Fn(&RecordBatch) -> RecordBatch,
+    ) {
+        let mut seen = false;
+        for (ty, rb) in &mut batch.payloads {
+            if *ty == payload {
+                *rb = f(rb);
+                seen = true;
+            }
+        }
+        assert!(seen, "batch carries a {payload:?} payload");
+    }
+
+    /// `m0` under a resource with `service.name=a` and `m1` under none, one
+    /// point each.
+    fn resource_and_bare() -> DecodedBatch {
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        StreamState::new(StreamConfig::default())
+            .decode(encode(
+                &mut encoder,
+                &[
+                    gauge("m0", vec![]),
+                    gauge("m1", vec![str_attr("host", "h")]),
+                ],
+                &[vec![
+                    str_attr("service.name", "a"),
+                    str_attr("service.instance.id", "i"),
+                ]],
+                &[Some(0), None],
+            ))
+            .expect("decode")
+    }
+
+    fn malformed(metric_type: &'static str, count: usize) -> Vec<Rejection> {
+        vec![Rejection::UnsupportedMetricType { metric_type, count }]
+    }
+
+    /// Exponential-histogram points are rejected on their own and are not in
+    /// a resource's point count: two of them under `m0`'s over-cap resource
+    /// leave that rejection at `m0`'s one gauge point, where OTLP counts 3.
+    #[test]
+    fn exp_histogram_points_are_not_in_the_resource_count() {
+        let limits = IngestLimits {
+            max_resource_attributes: 1,
+            ..IngestLimits::default()
+        };
+        let mut batch = resource_and_bare();
+        let exp_points = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "parent_id",
+                DataType::UInt16,
+                false,
+            )])),
+            vec![Arc::new(UInt16Array::from(vec![0u16, 0]))],
+        )
+        .expect("exp histogram points");
+        batch
+            .payloads
+            .push((ArrowPayloadType::ExpHistogramDataPoints, exp_points));
+        let out = run(&batch, &limits);
+        assert_eq!(
+            labels_by_name(&out).keys().collect::<Vec<_>>(),
+            ["m1"],
+            "{:?}",
+            out.rejected
+        );
+        let mut rejected = out.rejected.clone();
+        rejected.sort_by_key(|r| format!("{r:?}"));
+        assert_eq!(
+            rejected,
+            vec![
+                Rejection::TooManyResourceAttributes { count: 1, max: 1 },
+                Rejection::UnsupportedMetricType {
+                    metric_type: "exponential_histogram",
+                    count: 2,
+                },
+            ]
+        );
+    }
+
+    /// A METRICS `resource` column, or its `id` child, of the wrong type
+    /// leaves no row's resource readable, so every point is rejected as
+    /// `malformed_resource` rather than written without resource labels.
+    #[test]
+    fn wrong_typed_resource_column_rejects_every_point() {
+        let limits = IngestLimits::default();
+        let not_a_struct: ArrayRef = Arc::new(Int32Array::from(vec![0, 0]));
+        let string_id: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["0", "1"])) as ArrayRef,
+        )]));
+        for column in [not_a_struct, string_id] {
+            let mut batch = resource_and_bare();
+            map_payload(&mut batch, ArrowPayloadType::UnivariateMetrics, |rb| {
+                with_column(rb, "resource", column.clone())
+            });
+            let out = run(&batch, &limits);
+            assert!(out.points.is_empty(), "{:?}", labels_by_name(&out));
+            assert_eq!(out.rejected, malformed(MALFORMED_RESOURCE, 2));
+        }
+    }
+
+    /// A `RESOURCE_ATTRS` batch whose `parent_id`, `key` or `type` column
+    /// cannot be read rejects every point under a resource as
+    /// `malformed_resource`; a point under no resource is unaffected.
+    #[test]
+    fn unreadable_resource_attrs_reject_points_under_a_resource() {
+        let limits = IngestLimits::default();
+        let unreadable: [(&str, ArrayRef); 3] = [
+            ("parent_id", Arc::new(StringArray::from(vec!["0", "0"]))),
+            ("key", Arc::new(Int64Array::from(vec![0, 0]))),
+            ("type", Arc::new(StringArray::from(vec!["1", "1"]))),
+        ];
+        for (name, column) in unreadable {
+            let mut batch = resource_and_bare();
+            map_payload(&mut batch, ArrowPayloadType::ResourceAttrs, |rb| {
+                with_column(rb, name, column.clone())
+            });
+            let out = run(&batch, &limits);
+            assert_eq!(out.rejected, malformed(MALFORMED_RESOURCE, 1), "{name}");
+            let got = labels_by_name(&out);
+            assert_eq!(got.len(), 1, "{name}: {got:?}");
+            assert_eq!(got["m1"], pairs(&[("__name__", "m1"), ("host", "h")]));
+        }
+    }
+
+    /// A `RESOURCE_ATTRS` `parent_id` declaring an encoding this pass does not
+    /// recognize rejects every point under a resource as
+    /// `unrecognized_id_encoding`, never guessed as plain or as no resource.
+    #[test]
+    fn unrecognized_resource_attrs_encoding_rejects_points_under_a_resource() {
+        let limits = IngestLimits::default();
+        let mut batch = resource_and_bare();
+        map_payload(&mut batch, ArrowPayloadType::ResourceAttrs, |rb| {
+            let schema = rb.schema();
+            let fields: Vec<Field> = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    let mut f = f.as_ref().clone();
+                    if f.name() == "parent_id" {
+                        let mut metadata = f.metadata().clone();
+                        metadata.insert("encoding".to_string(), "bogus".to_string());
+                        f = f.with_metadata(metadata);
+                    }
+                    f
+                })
+                .collect();
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), rb.columns().to_vec())
+                .expect("rebuilt batch")
+        });
+        let out = run(&batch, &limits);
+        assert_eq!(out.rejected, malformed(UNRECOGNIZED_ID_ENCODING, 1));
+        let got = labels_by_name(&out);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got["m1"], pairs(&[("__name__", "m1"), ("host", "h")]));
+    }
+
+    /// A dictionary-encoded `RESOURCE_ATTRS` `parent_id` reads like the plain
+    /// column, and one with a null slot is `malformed_resource` instead of
+    /// parent 0.
+    #[test]
+    fn null_dictionary_resource_parent_is_rejected() {
+        let limits = IngestLimits::default();
+        let dictionary = |null_slot: bool| {
+            move |rb: &RecordBatch| {
+                let plain = rb
+                    .column_by_name("parent_id")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt16Array>())
+                    .expect("plain u16 parent_id");
+                let values: Vec<u32> = plain.values().iter().map(|&v| u32::from(v)).collect();
+                let keys: Vec<Option<u8>> = (0..values.len())
+                    .map(|i| (!(null_slot && i == 1)).then_some(i as u8))
+                    .collect();
+                let column: ArrayRef = Arc::new(
+                    DictionaryArray::<UInt8Type>::try_new(
+                        UInt8Array::from(keys),
+                        Arc::new(UInt32Array::from(values)),
+                    )
+                    .expect("parent dict"),
+                );
+                with_column(rb, "parent_id", column)
+            }
+        };
+
+        let mut batch = resource_and_bare();
+        map_payload(
+            &mut batch,
+            ArrowPayloadType::ResourceAttrs,
+            dictionary(false),
+        );
+        let out = run(&batch, &limits);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(
+            labels_by_name(&out)["m0"],
+            pairs(&[("__name__", "m0"), ("instance", "i"), ("job", "a")])
+        );
+
+        let mut batch = resource_and_bare();
+        map_payload(
+            &mut batch,
+            ArrowPayloadType::ResourceAttrs,
+            dictionary(true),
+        );
+        let out = run(&batch, &limits);
+        assert_eq!(out.rejected, malformed(MALFORMED_RESOURCE, 1));
+        assert_eq!(labels_by_name(&out).len(), 1);
+    }
+
+    fn short_str() -> impl Strategy<Value = String> {
+        prop_oneof![Just(String::new()), "[a-z]{1,3}", "[a-z]{20,40}"]
+    }
+
+    fn attr_row() -> impl Strategy<Value = AttrRow> {
+        let key = prop_oneof![
+            Just("a"),
+            Just("b"),
+            Just("c"),
+            Just("job"),
+            Just("host.name")
+        ];
+        let value = prop_oneof![
+            3 => short_str().prop_map(AttrValue::Str),
+            1 => (0i64..3).prop_map(AttrValue::Int),
+            1 => any::<bool>().prop_map(AttrValue::Bool),
+        ];
+        (key, value).prop_map(|(key, value)| AttrRow {
+            key: key.to_string(),
+            value,
+        })
+    }
+
+    fn resource_rows() -> impl Strategy<Value = Vec<AttrRow>> {
+        let key = prop_oneof![
+            Just("service.name"),
+            Just("service.namespace"),
+            Just("service.instance.id"),
+            Just("host.name"),
+            Just("other"),
+        ];
+        proptest::collection::vec(
+            (key, short_str()).prop_map(|(key, v)| str_attr(key, &v)),
+            0..5,
+        )
+    }
+
+    /// Per metric: its points' attribute rows, and its resource slot.
+    type MetricShape = (Vec<Vec<AttrRow>>, Option<usize>);
+
+    fn metric_shapes() -> impl Strategy<Value = (Vec<Vec<AttrRow>>, Vec<MetricShape>)> {
+        let point = proptest::collection::vec(attr_row(), 0..4);
+        let metric = (
+            proptest::collection::vec(point, 1..6),
+            proptest::option::of(0usize..3),
+        );
+        (
+            proptest::collection::vec(resource_rows(), 3),
+            proptest::collection::vec(metric, 1..4),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The projection covers every byte the build holds at once: the
+        /// admitted points' label sets, plus the group cache's keys and sets
+        /// and the resource prefixes, measured from their real capacities.
+        #[test]
+        fn projection_covers_held_and_output_label_bytes(
+            (resources, shapes) in metric_shapes(),
+        ) {
+            let limits = IngestLimits {
+                resource_attribute_allowlist: vec!["host.name".to_string()],
+                ..IngestLimits::default()
+            };
+            let metrics: Vec<MetricRow> = shapes
+                .iter()
+                .enumerate()
+                .map(|(m, (points, _))| MetricRow {
+                    name: format!("m{m}"),
+                    kind: MetricKind::Gauge,
+                    data_points: points
+                        .iter()
+                        .map(|attrs| DataPointRow {
+                            time_unix_nano: TS,
+                            value: 1.0,
+                            flags: 0,
+                            attrs: attrs.clone(),
+                            exemplars: vec![],
+                        })
+                        .collect(),
+                })
+                .collect();
+            let assigned: Vec<Option<usize>> = shapes.iter().map(|(_, r)| *r).collect();
+            let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+            let batch = StreamState::new(StreamConfig::default())
+                .decode(encode(&mut encoder, &metrics, &resources, &assigned))
+                .expect("decode");
+
+            let projected = project_resolved_label_bytes(&batch, &limits).get();
+            held::take();
+            let out = run(&batch, &limits);
+            let held = held::take();
+            let output = output_label_bytes(&out);
+            prop_assert!(
+                projected >= held + output,
+                "projected {} < held {} + output {}",
+                projected,
+                held,
+                output
+            );
+        }
+
+        /// The length-only plan rejects a resource exactly when the builder
+        /// does, with the same reason, and its byte figure covers the prefix
+        /// the builder returns.
+        #[test]
+        fn resource_plan_agrees_with_the_builder(
+            rows in proptest::collection::vec(
+                (
+                    prop_oneof![
+                        Just("service.name"),
+                        Just("service.namespace"),
+                        Just("service.instance.id"),
+                        Just("host.name"),
+                        Just("h\u{e9}st"),
+                    ],
+                    prop_oneof![
+                        3 => "[a-z]{0,12}".prop_map(Some),
+                        1 => Just(None),
+                    ],
+                ),
+                0..6,
+            ),
+        ) {
+            let limits = IngestLimits {
+                resource_attribute_allowlist: vec!["host.name".to_string(), "h\u{e9}st".to_string()],
+                max_label_value_len: 8,
+                max_label_name_len: 4,
+                ..IngestLimits::default()
+            };
+            let pairs: Vec<(&str, ResourceAttrValue<'_>)> = rows
+                .iter()
+                .map(|(k, v)| {
+                    let value = v.as_deref().map_or(ResourceAttrValue::Complex, ResourceAttrValue::Str);
+                    (*k, value)
+                })
+                .collect();
+            let mut built = Vec::new();
+            let labels = admit_resource_labels(&pairs, 3, &limits, &mut built);
+            match check_resource_labels(&pairs, &limits) {
+                Err(reason) => {
+                    prop_assert!(labels.is_none());
+                    prop_assert_eq!(
+                        built,
+                        vec![Rejection::Grouped { reason: Box::new(reason), count: 3 }]
+                    );
+                }
+                Ok(()) => {
+                    let labels = labels.expect("the plan admitted it, so must the builder");
+                    let actual: usize = labels
+                        .iter()
+                        .map(|l| label_bytes(l.name.len(), l.value.len()))
+                        .sum();
+                    let planned = resource_prefix_bytes(&pairs, &limits).unwrap_or(0);
+                    prop_assert!(planned >= actual, "planned {} < built {}", planned, actual);
+                }
+            }
+        }
     }
 }

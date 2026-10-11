@@ -1382,11 +1382,17 @@ the whole-request rejection above, never a 429. That leaves no 429 a retry
 cannot clear only while `--max-ingest-buffer-bytes` is at least
 `max_resolved_label_bytes_per_request` (256 MiB), as its 512 MiB default is: with a smaller budget, a projection between
 the budget and the bound is shed with 429 on every retry.
-OTAP metrics take the same bound and charge: `ravel-otap`'s
-`project_resolved_label_bytes` applies the metrics rule above to a decoded
-batch with the same per-label helpers, the gateway's OTAP write path charges
-it before normalizing, and a shed is `RESOURCE_EXHAUSTED` on that batch's
-`BatchStatus` (see [otap-ingest.md](otap-ingest.md#resource-labels)).
+OTAP metrics take the same bound and charge. `ravel-otap`'s `prepare_batch`
+resolves a decoded batch once and applies the metrics rule above to it from
+value lengths, with the same per-label helpers, so no label exists until the
+batch is inside the bound. On top of the output labels, each run of points
+with identical raw attributes is charged again for the label set and the key
+the batch-wide group cache keeps for it, and each resource once for its
+prefix, since normalization holds all three while it runs. The gateway's
+OTAP write path charges the projection before normalizing and releases it
+just before the router takes its charge, and a shed is `RESOURCE_EXHAUSTED`
+on that batch's `BatchStatus` (see
+[otap-ingest.md](otap-ingest.md#resource-labels)).
 Remote Write does not take this charge.
 
 ### Worst-case resident memory

@@ -25,9 +25,7 @@ use std::sync::Arc;
 
 use futures::Stream;
 use ravel_ingest::{IngestByteShed, IngestPoint, WriteError, WriteMode, plausible_ingest_clock};
-use ravel_otap::normalize::{
-    normalize_decoded_with_metadata_projected, project_resolved_label_bytes,
-};
+use ravel_otap::normalize::{normalize_prepared_with_metadata, prepare_batch};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamError, StreamState};
@@ -222,54 +220,62 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     }
 
     match ctx.decoder.decode_gated(batch).await {
-        Ok(decoded) => {
-            match write_batch(&ctx.state.ingest, &ctx.tenant, ctx.mode, &decoded, now_ns()).await {
-                Ok(outcome) => (
-                    ack(batch_id, &outcome.tokens, outcome.dropped_points),
-                    false,
-                ),
-                Err(IngestRequestError::Admission(rejection)) => (
-                    nack(
-                        batch_id,
-                        StatusCode::ResourceExhausted,
-                        rejection.reason.to_string(),
-                    ),
-                    false,
-                ),
-                // Receiver-clock floor (ADR-0051 amendment): UNAVAILABLE,
-                // the replica's fault. The batch already decoded cleanly, so the
-                // decoder is unharmed and the stream stays open (false).
-                Err(IngestRequestError::ClockImplausible(msg)) => {
-                    (nack(batch_id, StatusCode::Unavailable, msg), false)
-                }
-                // A hard shard_count provisioning failure (ADR-0050 section 5):
-                // the configured value would resolve over a subset of shards, or
-                // the record is unreadable so the true shard_count is unknown.
-                // Not retryable and not the client's fault; nack this batch as an
-                // internal fault, matching the OTLP gRPC path (otlp_grpc.rs), and
-                // keep the stream open so unrelated batches still flow.
-                Err(IngestRequestError::Provisioning(msg)) => {
-                    (nack(batch_id, StatusCode::Internal, msg), false)
-                }
-                Err(IngestRequestError::Write(err)) => {
-                    // Same retry classification the OTLP gRPC path applies: a
-                    // retryable write is RESOURCE_EXHAUSTED/UNAVAILABLE-shaped
-                    // backpressure, anything else is an internal fault. The
-                    // buffer-budget shed (ADR-0069) is specifically
-                    // RESOURCE_EXHAUSTED, matching the byte-rate rejection.
-                    let code = match err {
-                        ravel_ingest::WriteError::BufferBudgetExceeded
-                        | ravel_ingest::WriteError::DeferralCapReached => {
-                            StatusCode::ResourceExhausted
-                        }
-                        _ if err.is_retryable() => StatusCode::Unavailable,
-                        _ => StatusCode::Internal,
-                    };
-                    (nack(batch_id, code, err.to_string()), false)
-                }
-            }
-        }
+        Ok(decoded) => write_reply(
+            batch_id,
+            write_batch(&ctx.state.ingest, &ctx.tenant, ctx.mode, &decoded, now_ns()).await,
+        ),
         Err(err) => decode_error_reply(batch_id, err),
+    }
+}
+
+/// The reply to a decoded batch's write. The batch already decoded cleanly,
+/// so every arm keeps the stream open.
+fn write_reply(
+    batch_id: i64,
+    written: Result<WriteOutcome, IngestRequestError>,
+) -> (BatchStatus, bool) {
+    match written {
+        Ok(outcome) => (
+            ack(batch_id, &outcome.tokens, outcome.dropped_points),
+            false,
+        ),
+        Err(IngestRequestError::Admission(rejection)) => (
+            nack(
+                batch_id,
+                StatusCode::ResourceExhausted,
+                rejection.reason.to_string(),
+            ),
+            false,
+        ),
+        // Receiver-clock floor (ADR-0051 amendment): UNAVAILABLE, the
+        // replica's fault.
+        Err(IngestRequestError::ClockImplausible(msg)) => {
+            (nack(batch_id, StatusCode::Unavailable, msg), false)
+        }
+        // A hard shard_count provisioning failure (ADR-0050 section 5): the
+        // configured value would resolve over a subset of shards, or the
+        // record is unreadable so the true shard_count is unknown. Not
+        // retryable and not the client's fault; nack this batch as an internal
+        // fault, matching the OTLP gRPC path (otlp_grpc.rs), and keep the
+        // stream open so unrelated batches still flow.
+        Err(IngestRequestError::Provisioning(msg)) => {
+            (nack(batch_id, StatusCode::Internal, msg), false)
+        }
+        Err(IngestRequestError::Write(err)) => {
+            // Same retry classification the OTLP gRPC path applies: a
+            // retryable write is RESOURCE_EXHAUSTED/UNAVAILABLE-shaped
+            // backpressure, anything else is an internal fault. The
+            // buffer-budget shed (ADR-0069), including the label-projection
+            // charge (ADR-2708 D2), is specifically RESOURCE_EXHAUSTED,
+            // matching the byte-rate rejection.
+            let code = match err {
+                ravel_ingest::WriteError::BufferBudgetExceeded
+                | ravel_ingest::WriteError::DeferralCapReached => StatusCode::ResourceExhausted,
+                _ if err.is_retryable() => StatusCode::Unavailable,
+                _ => StatusCode::Internal,
+            };
+            (nack(batch_id, code, err.to_string()), false)
+        }
     }
 }
 
@@ -380,23 +386,19 @@ async fn write_batch(
     // read either. So points, series, and the ack are byte-for-byte what they
     // were; the metadata tuple is the only addition.
     // The same resolved-label-byte bound and budget charge as the OTLP path
-    // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`.
-    let projected = project_resolved_label_bytes(decoded, &ingest.limits);
+    // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`. The batch
+    // is flattened and resolved once; no label exists until the normalize
+    // below has passed the bound.
+    let prepared = prepare_batch(decoded, &ingest.limits);
     let label_charge = crate::ingest::charge_projected_labels(
         &ingest.budget,
-        projected.get(),
+        prepared.projected_label_bytes().get(),
         ingest.limits.max_resolved_label_bytes_per_request,
     )
     .map_err(|IngestByteShed| IngestRequestError::Write(WriteError::BufferBudgetExceeded))?;
     let mut cap = ExemplarCap::new(ingest.limits.exemplar_cap_window_ns);
-    let (result, metadata) = normalize_decoded_with_metadata_projected(
-        tenant,
-        decoded,
-        &ingest.limits,
-        ingest_ts_ns,
-        &mut cap,
-        projected,
-    );
+    let (result, metadata) =
+        normalize_prepared_with_metadata(tenant, prepared, &ingest.limits, ingest_ts_ns, &mut cap);
     let normalized = result.output;
     // Layer 3's rejections, counted exactly as the OTLP path counts them
     // (ADR-0051 section 3). OTAP has no partial-success field to carry them,
@@ -521,8 +523,8 @@ fn nack(batch_id: i64, code: StatusCode, message: String) -> BatchStatus {
 mod tests {
     use super::*;
     use ravel_ingest::{
-        AdmissionController, AdmissionLimits, IngestConfig, IngestRouter,
-        MIN_PLAUSIBLE_INGEST_CLOCK_NS, PendingAckBudget, SystemClock,
+        AdmissionController, AdmissionLimits, IngestByteBudget, IngestByteBudgetLimit,
+        IngestConfig, IngestRouter, MIN_PLAUSIBLE_INGEST_CLOCK_NS, PendingAckBudget, SystemClock,
     };
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
@@ -687,6 +689,163 @@ mod tests {
             .fold((0, 0), |acc, row| {
                 (acc.0 + row.skew_total, acc.1 + row.structural_total)
             })
+    }
+
+    /// A state whose router charges `router_budget` and whose label projection
+    /// charges `label_budget`, which may be the same `Arc`.
+    fn state_with_budgets(
+        router_budget: Arc<IngestByteBudget>,
+        label_budget: Arc<IngestByteBudget>,
+    ) -> IngestState {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = Arc::new(
+            IngestRouter::new(
+                IngestConfig::default(),
+                store,
+                Signal::Metrics,
+                Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
+            )
+            .with_budget(router_budget),
+        );
+        IngestState {
+            budget: label_budget,
+            router,
+            ..ingest_state()
+        }
+    }
+
+    /// Four gauge points at `ts_ns`, each with its own attribute value, so the
+    /// projection is several hundred bytes.
+    fn labelled_gauge_batch(ts_ns: i64) -> DecodedBatch {
+        use ravel_otap::encode::{
+            AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
+        };
+        use ravel_otap::stream::{StreamConfig, StreamState};
+
+        let mut encoder = MetricsStreamEncoder::new("a9").expect("encoder");
+        let batch = encoder
+            .encode_batch(
+                0,
+                &[MetricRow {
+                    name: "temperature".to_string(),
+                    kind: MetricKind::Gauge,
+                    data_points: (0..4)
+                        .map(|i| DataPointRow {
+                            time_unix_nano: ts_ns,
+                            value: i as f64,
+                            flags: 0,
+                            exemplars: vec![],
+                            attrs: vec![AttrRow {
+                                key: "room".to_string(),
+                                value: AttrValue::Str(format!("room-{i}")),
+                            }],
+                        })
+                        .collect(),
+                }],
+            )
+            .expect("encode a labelled gauge batch");
+        StreamState::new(StreamConfig::default())
+            .decode(batch)
+            .expect("decode the batch back")
+    }
+
+    fn unlimited() -> Arc<IngestByteBudget> {
+        IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)
+    }
+
+    /// ADR-2708 D2 on the OTAP path: a budget one byte short of the projected
+    /// label bytes sheds the batch RESOURCE_EXHAUSTED before normalization, so
+    /// the stale points it carries move no counter and the router is never
+    /// charged.
+    #[tokio::test]
+    async fn a_budget_short_of_the_label_projection_sheds_the_batch() {
+        let too_old = BASE_TS_NS - ravel_otlp::IngestLimits::default().max_ingest_lag_ns - 1;
+        let decoded = labelled_gauge_batch(too_old);
+        let projected = prepare_batch(&decoded, &ravel_otlp::IngestLimits::default())
+            .projected_label_bytes()
+            .get();
+        assert!(projected > 0, "the fixture projects some label bytes");
+        let tenant = TenantId::new("acme");
+
+        let label_budget =
+            IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(projected as u64 - 1));
+        let router_budget = unlimited();
+        let ingest = state_with_budgets(router_budget.clone(), label_budget.clone());
+        let written =
+            write_batch(&ingest, &tenant, WriteMode::Buffered, &decoded, BASE_TS_NS).await;
+        assert!(
+            matches!(
+                written,
+                Err(IngestRequestError::Write(WriteError::BufferBudgetExceeded))
+            ),
+            "expected the buffer-budget shed"
+        );
+        let (status, teardown) = write_reply(9, written);
+        assert_eq!(
+            (status.batch_id, status.status_code, teardown),
+            (9, StatusCode::ResourceExhausted as i32, false)
+        );
+        assert_eq!(label_budget.shed_total(), 1);
+        assert_eq!(label_budget.in_flight_bytes(), 0);
+        assert_eq!(router_budget.peak_bytes(), 0, "nothing reached the router");
+        assert_eq!(
+            normalize_totals(&ingest, &tenant),
+            (0, 0),
+            "normalization must not run for a shed batch"
+        );
+
+        // The same batch under a budget that fits reaches normalization.
+        let ingest = state_with_budgets(
+            unlimited(),
+            IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(projected as u64)),
+        );
+        let written =
+            write_batch(&ingest, &tenant, WriteMode::Buffered, &decoded, BASE_TS_NS).await;
+        assert!(written.is_ok(), "a projection that fits is admitted");
+        assert_eq!(normalize_totals(&ingest, &tenant), (4, 0));
+    }
+
+    /// The projection charge is released before the router charges the
+    /// normalized batch, so on one shared budget the peak is the larger of the
+    /// two charges, never their sum.
+    #[tokio::test]
+    async fn label_charge_is_released_before_the_router_charge() {
+        let decoded = labelled_gauge_batch(BASE_TS_NS);
+        let tenant = TenantId::new("acme");
+
+        let label_only = unlimited();
+        let router_only = unlimited();
+        let ingest = state_with_budgets(router_only.clone(), label_only.clone());
+        let written =
+            write_batch(&ingest, &tenant, WriteMode::Buffered, &decoded, BASE_TS_NS).await;
+        assert!(written.is_ok(), "the gauge write succeeds");
+        let label_bytes = label_only.peak_bytes();
+        let router_bytes = router_only.peak_bytes();
+        assert_eq!(
+            label_bytes as usize,
+            prepare_batch(&decoded, &ravel_otlp::IngestLimits::default())
+                .projected_label_bytes()
+                .get(),
+            "the label charge is exactly the projection"
+        );
+        assert!(router_bytes > 0, "the router charged the batch");
+        assert_eq!(
+            label_only.in_flight_bytes(),
+            0,
+            "the label charge is refunded"
+        );
+
+        let shared = unlimited();
+        let ingest = state_with_budgets(shared.clone(), shared.clone());
+        let written =
+            write_batch(&ingest, &tenant, WriteMode::Buffered, &decoded, BASE_TS_NS).await;
+        assert!(written.is_ok(), "the gauge write succeeds");
+        assert_eq!(
+            shared.peak_bytes(),
+            label_bytes.max(router_bytes),
+            "the two charges must not coexist (label {label_bytes}, router {router_bytes})"
+        );
     }
 
     /// A payload decompression the write gate returned no result for nacks

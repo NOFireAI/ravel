@@ -6521,7 +6521,9 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         "Metric resource attributes outside the configured allowlist, dropped rather than turned \
          into labels, by tenant, for the metrics signal only. Not a rejection: counted before the \
          series cap and the write, so not a count of stored points. Covers OTLP HTTP, OTLP \
-         gRPC and OTAP ingest. The allowlist is not configurable today. This counter only makes an existing silent drop \
+         gRPC and OTAP ingest. OTAP counts no drops for a resource whose only points are \
+         exponential histograms, which it rejects as unsupported; OTLP counts them. The \
+         allowlist is not configurable today. This counter only makes an existing silent drop \
          visible, including the case where two resources differing only in a dropped attribute \
          collapse into one series.",
         "counter",

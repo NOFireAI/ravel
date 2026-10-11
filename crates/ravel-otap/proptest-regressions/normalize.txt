@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc aaaebe7616140dd130c9d297f7f1a86986eb33a12a470ea41ff3418563ce217c # shrinks to (resources, shapes) = ([[], [], []], [([[AttrRow { key: "a", value: Str("") }]], None)])

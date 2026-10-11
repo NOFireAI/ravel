@@ -2056,7 +2056,7 @@ operational depth.
 | `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
 | `ravel_ingest_body_conversions_total` | Log records whose structured (array or map) body was converted to canonical JSON text at normalization, by tenant and signal. Not a rejection, and not a count of stored records: see "Neither rule alerts on" below. |
-| `ravel_ingest_resource_attrs_dropped_total` | Metric resource attributes outside the configured allowlist, dropped rather than turned into labels, by tenant, for the metrics signal only. Not a rejection: counted before the series cap and the write, so not a count of stored points. Covers OTLP HTTP, OTLP gRPC and OTAP ingest. See "Resource attributes outside the allowlist" below. |
+| `ravel_ingest_resource_attrs_dropped_total` | Metric resource attributes outside the configured allowlist, dropped rather than turned into labels, by tenant, for the metrics signal only. Not a rejection: counted before the series cap and the write, so not a count of stored points. Covers OTLP HTTP, OTLP gRPC and OTAP ingest. OTAP counts no drops for a resource whose only points are exponential histograms, which it rejects as unsupported; OTLP counts them. See "Resource attributes outside the allowlist" below. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal. The last-known soft threshold stays in force. |
 
 Four more series report the reconciliation cycle. They carry `mode` alone,
@@ -2240,6 +2240,9 @@ such an attribute flatten to the same label set and merge into one series.
 - It covers OTLP HTTP, OTLP gRPC and OTAP ingest, for the metrics signal
   only. OTAP builds resource labels with the same builder as OTLP. Logs and
   traces never build them.
+- OTAP counts nothing for a resource whose only points are exponential
+  histograms: OTAP rejects those points as an unsupported type and never
+  admits their resource, where OTLP admits it and counts its drops.
 - The key names of the dropped attributes are not reported anywhere, on this
   counter or in the OTLP partial-success `error_message`. A resource
   attribute's key is caller-supplied and unbounded. A label or a per-key
@@ -2250,7 +2253,9 @@ such an attribute flatten to the same label set and merge into one series.
   attributes directly.
 - The count is a lower bound when a resource repeats a job/instance-source
   or allowlisted key, or gives one an empty value. Only the first occurrence
-  of a repeated key is consulted. An empty-value label is dropped after this
+  of a repeated key is consulted: the first in request order on OTLP, the
+  first row in table order on OTAP, where the spec sorts `RESOURCE_ATTRS` rows
+  by type, key and value. An empty-value label is dropped after this
   count already excluded that attribute by key. Neither case is added back as
   dropped.
 
