@@ -515,8 +515,7 @@ calls it on its own run. The reader splits the intersection into maximal
 contiguous runs, calls `block_run_span` per run, issues one ranged GET per
 returned span, and decodes each run's candidate blocks with the shared
 per-block decode (the same one the whole-object path uses; its row filter
-applies the full 16-byte `trace_id` equality and the time window, which
-`decode_trace` alone would not). The spans fetcher
+applies the time window, which `decode_trace` does not). The spans fetcher
 (`ravel_query::SpanSegmentFetcher`) already reads a trace through
 `block_run_span`: a `trace_id` lookup reads the object's tail (64 KiB, or
 the whole object in one ranged GET when the object is no larger than

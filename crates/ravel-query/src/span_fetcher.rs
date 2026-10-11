@@ -576,7 +576,11 @@ impl SpanSegmentFetcher {
     /// otherwise, from one [`RspanRangeReader::block_run_span`] per
     /// contiguous run of the intersection of `blocks` with this object's
     /// skip-index candidates, and each run is one ranged GET (served from the
-    /// probe when the probe already holds it). Only the run's blocks that
+    /// probe when the probe already holds it). The `None` run is read whole,
+    /// pruned blocks inside it included, because it is bounded by one trace's
+    /// blocks and one GET beats two for the common adjacent case; a caller's
+    /// set may span the object, so it is split on the intersection instead.
+    /// Only the run's blocks that
     /// pass the same skip-index and bloom prune the whole-object path applies
     /// are decoded, through the same per-block decode that accumulates page
     /// bytes. With `blocks` `None` the decoded set, the rows and `stats` equal
@@ -2927,10 +2931,11 @@ mod tests {
     }
 
     /// Records the `(key, range)` of every GET and forwards it to a
-    /// `MemoryStore`.
+    /// `MemoryStore`, optionally truncating one chosen GET's answer.
     struct GetLog {
         inner: MemoryStore,
         gets: std::sync::Mutex<Vec<(String, GetRange)>>,
+        truncate: std::sync::Mutex<Option<GetRange>>,
     }
 
     impl GetLog {
@@ -2938,7 +2943,13 @@ mod tests {
             GetLog {
                 inner,
                 gets: std::sync::Mutex::new(Vec::new()),
+                truncate: std::sync::Mutex::new(None),
             }
+        }
+
+        /// The next GET of exactly `range` returns one byte short.
+        fn truncate_next(&self, range: GetRange) {
+            *self.truncate.lock().expect("truncate") = Some(range);
         }
 
         /// The ranges GET'd on `key`, in issue order, clearing the log for
@@ -2974,7 +2985,13 @@ mod tests {
                 .lock()
                 .expect("get log")
                 .push((key.to_string(), range));
-            self.inner.get(key, range).await
+            let mut got = self.inner.get(key, range).await?;
+            let mut truncate = self.truncate.lock().expect("truncate");
+            if *truncate == Some(range) {
+                *truncate = None;
+                got.data = got.data.slice(..got.data.len().saturating_sub(1));
+            }
+            Ok(got)
         }
         async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
             self.inner.head(key).await
@@ -3279,6 +3296,154 @@ mod tests {
             .expect_err("a block set without a trace_id");
         assert!(matches!(err, SpanFetchError::Corrupt { .. }), "{err:?}");
         assert_eq!(log.total(), 0, "refused before any GET");
+    }
+
+    /// A caller's set over three adjacent blocks whose middle block the query
+    /// prunes is read as two ranged GETs of exactly the outer blocks, so the
+    /// pruned block's bytes are never transferred. The object's blocks are
+    /// `[t1] [t11] [t11] [t11] [t12]`, and trace 11's middle block holds its
+    /// only long spans, which a `duration_ns` bound prunes.
+    ///
+    /// FLIP: reading the caller's set unintersected (the `Some(set)` arm's
+    /// filter replaced by `.filter(|_b| true)`) yields one run over blocks
+    /// 1..=3 and one GET spanning all three, which fails the range list.
+    #[tokio::test]
+    async fn a_block_set_with_a_pruned_middle_block_reads_two_runs() {
+        let memory = MemoryStore::new();
+        let mut records = Vec::new();
+        for t in [1u8, 12] {
+            for s in 0..2u8 {
+                let at = 100 + i64::from(s);
+                records.push(bare_span(trace(t), [t * 16 + s; 8], at, at + 50));
+            }
+        }
+        for s in 0..6u8 {
+            let at = 100 + i64::from(s);
+            let duration = if s == 2 || s == 3 { 5_000 } else { 50 };
+            records.push(bare_span(trace(11), [176 + s; 8], at, at + duration));
+        }
+        let seg = write_object(&memory, 3, &records).await;
+        let whole = memory
+            .get(&seg.data_object_key, GetRange::Full)
+            .await
+            .expect("whole object")
+            .data;
+        let (blocks_end, blocks, _) = layout(&whole);
+        let duration_ns = Some((0, 100));
+        let reader = RspanReader::new(&whole, &RspanConfig::default()).expect("reader");
+        let skip = reader.skip_index();
+        assert_eq!(blocks.len(), 5, "fixture geometry: five blocks");
+        assert_eq!(
+            skip.candidate_blocks(Some(&trace(11)), i64::MIN, i64::MAX, None, None),
+            vec![1, 2, 3],
+            "fixture geometry: trace 11 is blocks 1..=3"
+        );
+        assert_eq!(
+            skip.candidate_blocks(Some(&trace(11)), i64::MIN, i64::MAX, duration_ns, None),
+            vec![1, 3],
+            "fixture geometry: the duration bound prunes block 2 alone"
+        );
+        let probe = seg.object_size - blocks_end;
+        assert!(
+            blocks[3].1 <= seg.object_size - probe,
+            "fixture geometry: trace 11's blocks lie outside the probe"
+        );
+
+        let log = Arc::new(GetLog::new(memory));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(probe);
+        let query = SpanQuery::trace(trace(11), i64::MIN, i64::MAX);
+        let acct = QueryAccounting::new();
+        let out = fetcher
+            .fetch_accounted_in_blocks(
+                &seg,
+                TENANT,
+                &query,
+                duration_ns,
+                None,
+                &[],
+                Some(&[1, 2, 3]),
+                &acct,
+            )
+            .await
+            .expect("fetch")
+            .expect("relevant");
+
+        let block = |b: usize| GetRange::Range(blocks[b].0, blocks[b].1);
+        assert_eq!(
+            log.take(&seg.data_object_key),
+            vec![
+                GetRange::Range(seg.object_size - probe, seg.object_size),
+                block(1),
+                block(3),
+            ],
+            "the probe, then one GET of exactly block 1 and one of exactly block 3"
+        );
+        assert_eq!(log.total(), 0, "no other GET was issued");
+        let snap = acct.snapshot();
+        assert_eq!(snap.s3_requests(AccountedOp::Get), 3);
+        assert_eq!(
+            snap.s3_bytes(AccountedOp::Get),
+            probe + (blocks[1].1 - blocks[1].0) + (blocks[3].1 - blocks[3].0),
+            "block 2's bytes were never transferred"
+        );
+        assert_eq!(out.records.len(), 4, "the four short trace-11 spans");
+        assert!(out.records.iter().all(|r| r.record.trace_id == trace(11)));
+        assert_eq!(out.stats.blocks_after_skip, 2);
+        assert_eq!(out.stats.blocks_scanned, 2);
+    }
+
+    /// A ranged GET that returns one byte short is `Corrupt` and never
+    /// admitted to the read cache: the next identical lookup goes back to the
+    /// store for that extent and returns the trace's rows.
+    ///
+    /// FLIP: deleting the length check inside `read_extent`'s `get_or_fetch`
+    /// closure admits the short bytes; the first lookup is still `Corrupt`
+    /// (`ranged_read`'s own check), but the second is a cache hit on the short
+    /// entry, issues no GET for the run, and is `Corrupt` again.
+    #[tokio::test]
+    async fn a_short_ranged_read_is_corrupt_and_never_admitted() {
+        use ravel_cache::{Cache, CacheLimits};
+
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
+            Arc::new(Cache::new(CacheLimits::new(1 << 20, 100, 1 << 20)));
+        let fetcher = SpanSegmentFetcher::new(log.clone())
+            .with_trace_probe_bytes(fx.probe)
+            .with_cache(cache);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let key = fx.a.data_object_key.clone();
+        let lookup = || {
+            let fetcher = fetcher.clone();
+            let seg = fx.a.clone();
+            async move {
+                let acct = QueryAccounting::new();
+                let out = fetcher
+                    .fetch_accounted(&seg, TENANT, &query, None, None, &[], &acct)
+                    .await;
+                (out, acct.snapshot())
+            }
+        };
+
+        log.truncate_next(fx.run());
+        let (first, _) = lookup().await;
+        let err = first.expect_err("a short run read");
+        assert!(matches!(err, SpanFetchError::Corrupt { .. }), "{err:?}");
+        assert_eq!(log.take(&key), vec![fx.probe_of(&fx.a), fx.run()]);
+
+        let (second, snap) = lookup().await;
+        let out = second
+            .expect("the run is read again from the store")
+            .expect("relevant");
+        assert_eq!(
+            log.take(&key),
+            vec![fx.run()],
+            "the probe is a hit and the run goes back to the store"
+        );
+        assert_eq!(snap.cache_hits, 1, "the probe");
+        assert_eq!(snap.cache_misses, 1, "the run");
+        assert_eq!(out.records.len(), 4, "every trace-3 span");
+        assert!(out.records.iter().all(|r| r.record.trace_id == trace(3)));
     }
 
     /// A repeated trace lookup through the read cache issues no GET: the probe
