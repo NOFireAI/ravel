@@ -725,6 +725,17 @@ ravel-sql, ravel-query, ravel-catalog, ravel-server)
 - Acceptance: `scripts/guards/check-amendment-integrity.sh` passes with the
   new markers, and `python3 scripts/check_docs.py` passes.
 
+Task 5 (#2733) landed the ADR-1170 amendment on 2026-10-11, with section 6's
+markers and an inline pointer in each named section and beside each of the
+four retired 503 sentences. Its heading carries the date, as the
+decision-record index's other amendments do. Its text differs from section
+6's block in three places, each to match the tree it landed on: the
+admission wait and the `grow` breach are stated as pending, since task 3
+(#2731) had not landed; it names the refusal counters; and it records that a
+DDL `LOCATION` footer-read refusal that fits the budget's limit still answers
+503 (#2840), outside section 5. The metrics reference in the observability
+guide lists every gate family as `metrics.rs` renders them.
+
 **Task 6: the acceptance runs** (no crate)
 
 - The scaled and M1-shaped runs above, pre-registered on the issue before the

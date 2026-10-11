@@ -125,7 +125,8 @@ by the code above:
 4. The ceiling cannot be RSS. MemTotal and `memory.max` are kill boundaries;
    DataFusion's `grow` allocates before a breach is detectable. The honest
    claim is "tracked allocations are bounded, with a measured overhead
-   reserve".
+   reserve". A gate on host available memory now refuses reservations under
+   that ceiling: see the host-memory gate amendment below.
 
 And the standing rule from ADR-0954: exact result via bounded spill, or a typed
 failure, never a partial answer.
@@ -597,7 +598,8 @@ everything, and for RSEG a lower width retains the same total (constraint 3).
 **Use RSS or `memory.max` as the ceiling.** Kill boundaries, not budgets;
 `grow` has already allocated by the time a breach is visible (constraint 4).
 The budget bounds tracked allocations and the acceptance test measures the
-residual against a stated reserve.
+residual against a stated reserve. (The rejection stands; the acceptance
+moved: see the host-memory gate amendment below.)
 
 **Land #1007 first.** It bounds the whole-object path's resident size by
 decoding per sub-range. The configuration that was killed at 31.1 GB routes
@@ -628,7 +630,8 @@ is guaranteed for tracked allocations and bounded, not guaranteed, for that
 path, by the overhead reserve exceeding `partitions x max batch bytes`. A
 budget that made that path fallible would need a DataFusion change or a
 pool that lies to `resize`, which desynchronises the reservation; neither is
-taken here.
+taken here. A host-memory gate that trips the breach on that path while it is
+closed is planned: see the host-memory gate amendment below.
 
 Report only, found while verifying: ADR-0107's 2026-09-05 amendment said the
 RLOG whole-object funnel issues GETs without a permit; `fad582c7` closed
@@ -736,8 +739,9 @@ path and the coordinator's local path) and on the cache warm pass, the same
 reserve against it: `component="fetch"` and
 `ravel_memory_handoff_overlap_bytes` read real values while a fetch is held,
 and a fetch that needs more than the remaining budget fails with
-`FetchMemoryExhausted`, returned as 503. A refused warm fetch is skipped and
-logged, not a startup failure.
+`FetchMemoryExhausted`, returned as 503 (422 now: see the host-memory gate
+amendment below). A refused warm fetch is skipped and logged, not a startup
+failure.
 
 Still unreserved against this budget: the RSPAN fetcher and every fetcher
 `build_sql_state` constructs, which keep their private
@@ -824,7 +828,8 @@ That RSPAN fetcher is the only one `ravel-server` builds, so no server fetcher
 outside tests still reserves against a private unlimited budget. A SQL fetch
 the budget cannot admit fails with `FetchMemoryExhausted` and answers 503
 (`unavailable`) over HTTP, distinct from the SQL memory pool's own refusal,
-which answers 422. The tests
+which answers 422 (both answer 422 now: see the host-memory gate amendment
+below). The tests
 `a_sql_{metrics,logs,spans}_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving`
 and `sql_logs_query_reserves_a_nonzero_fetch_gauge_while_the_get_is_held` in
 `services/ravel-server/src/tests.rs` pin each fetcher's wiring through the
@@ -954,13 +959,14 @@ server were alone on the host, and on that host it was not.
    budget's shared remainder after the cache carve. The fetch ledger draws
    from the same remainder, including the SQL path's own fetchers, and a
    fetch the remainder cannot admit answers 503 (the SQL fetcher amendment
-   above). A cap at the whole remainder would let one tenant at its ceiling
+   above; 422 now, see the host-memory gate amendment below). A cap at the whole remainder would let one tenant at its ceiling
    leave the fetch side nothing, so 10% stays outside the SQL ceiling. The
    10% is a minimum headroom, not a figure sized to peak fetch demand. In
    the #2367 run, fetch reservations reached 16.98 GB on their own, and SQL
    reservations 14.19 GB, and no 5 s sample showed both high at once. A fetch that arrives while
    a tenant sits at its ceiling and the remaining 10% is already reserved
-   still answers 503. The cap removes the case where the fetch side has no
+   still answers 503 (422 now: see the host-memory gate amendment below).
+   The cap removes the case where the fetch side has no
    headroom at all; it does not size fetch concurrency. An explicit flag is
    not capped. The derivation logs whether the cap applied,
    as `clamped` does today.
@@ -1137,3 +1143,68 @@ read lower than what is live; they can read higher, by at most the
 aggregate's own peak reservation, from its first shrink until its stream is
 dropped. ADR-0102's aggregate hold amendment records why `can_spill`
 selects it.
+
+## Amendment (2026-10-11, ADR-2633): a host-memory gate in front of the budget
+
+<!-- amendment-applies: sections="Constraints a governor has to satisfy|Rejected alternatives|Consequences|Amendment 2026-09-26 (issue #1255): decision 2 reaches the server|Amendment (2026-09-29, issue #2086): the SQL path's fetchers reserve against the budget|Amendment (2026-10-03, issue #2367): the budget starts from available memory" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="returned as 503" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="answers 503 (`unavailable`) over HTTP" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="a fetch the remainder cannot admit answers 503" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="still answers 503" pointer="host-memory gate amendment" -->
+
+ADR-2633 (as amended 2026-10-11, #2806 and #2838) adds a gate that samples
+the host's available memory (`MemAvailable`, and under a finite cgroup memory
+limit the smaller of that and the cgroup's headroom) every 100 ms
+(`--memory-gate-interval-ms`), forces a jemalloc purge while the reading is
+below a purge floor (`--memory-gate-purge-available-bytes`, default the
+smaller of twice the close floor and a quarter of host memory, at most once
+per 5 s, `--memory-gate-purge-min-interval-ms`), and closes once
+`--memory-gate-close-after-samples` consecutive readings (default 3) are
+below a close floor (`--memory-gate-min-available-bytes`, default
+`min(max(512 MiB, 2 % of host memory), host memory / 8)`), until one reading
+is back at or above it. The gate decides on host available memory, not on
+the process's resident size: `stats.resident` is still read, exported and
+acted on by the purge, and decides nothing. The mark at 70 % of
+`--memory-budget-bytes` that ADR-2633 first accepted, and its
+`--memory-gate-high-water-percent` flag, were superseded by its #2806
+amendment before any release carried them. The gate is off in `gateway`
+mode, with a fallback-sized budget, in a build whose allocator is not
+jemalloc, when `MemAvailable` or `MemTotal` cannot be read, and under
+`--disable-memory-gate`.
+
+A closed gate refuses every `MemoryBudget::try_reserve` of more than zero
+bytes with the budget's typed error and the `HostMemory` cause, counted on
+`ravel_memory_gate_refusals_total{site="reserve"}` apart from the ledger's
+own refusals on `ravel_memory_budget_refusals_total`. That covers decision
+2's fetch reservations, the SQL pool's fallible `try_grow` and the catalog
+decode charge. ADR-2633 task 3 (#2731) is pending: it adds a bounded
+admission wait on a closed gate (`--memory-gate-wait-ms` is resolved and
+stamped, not yet read) and has the infallible `grow` path trip its breach
+while the gate is closed, which is what would narrow the residual the
+Consequences name. Until it lands a closed gate refuses a reservation at
+once, `grow` still reserves unchecked, and the `admission` and `grow` sites
+of both refusal counters read 0.
+
+Constraint 4 and the rejected "RSS as the ceiling" alternative stand for the
+ceiling itself: the gate is a bound under the kill boundary, not a ceiling.
+The acceptance is ADR-2633's criteria (a) to (d) of its #2806 amendment: the
+ClickBench concurrent error ratio at most 0.10 on a stock c6a.4xlarge (re-run
+under the #2838 amendment's own bars), q33 to q35 answering on a warm server,
+no process killed at a 27 GB budget on a 32 GB host with the gate's refusals
+carrying the host-memory cause, and purges bounded by the minimum interval;
+peak VmRSS is a reported figure beside them, not a band. The available-memory
+amendment's "What this does not fix" is partly superseded: the purge returns
+retained memory the ledgers never see, and the gate refuses reservations while
+host available memory is low whatever holds it. Attributing and charging the
+live part stays open (#2367).
+
+Every `FetchMemoryExhausted` and every `CatalogError::MemoryExhausted`,
+accounted or gate, answers 422, not 503 (ADR-2633 section 5, landed by task 4,
+#2732): over the SQL and PromQL HTTP APIs as 422 `execution`, and on Flight
+SQL as `FailedPrecondition`, the status the SQL pool's own refusal takes, with
+the budget's own message. This retires the 503 in decision 2's server
+amendment, the SQL fetcher amendment, and both 503 sentences in the
+available-memory amendment's decision 3. Out of scope and unchanged: a DDL
+`LOCATION` snapshot whose footer read the budget refuses still answers 503
+when that read alone fits the budget's limit, and 422 when it does not
+(`DdlExecuteError::Snapshot` in `crates/ravel-sql/src/ddl.rs`, #2840).
