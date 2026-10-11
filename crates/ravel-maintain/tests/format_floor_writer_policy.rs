@@ -13,22 +13,24 @@ use std::time::Duration;
 
 use common::*;
 use ravel_catalog::{
-    AbsentPolicy, FloorBasis, FloorEvidence, FloorObservation, classify_floor, raise_format_floor,
-    read_floors_from_store, validate_or_adopt,
+    AbsentPolicy, FloorBasis, FloorEvidence, FloorObservation, classify_floor, provisioning_key,
+    raise_format_floor, read_floors_from_store, validate_or_adopt,
 };
-use ravel_commit::{keys, signal};
+use ravel_commit::{erasure, keys, record, signal};
 use ravel_ingest::{
     BelowFormatFloor, FormatFamily, FormatFloorMetrics, FormatFloorPolicy, IngestConfig,
     IngestRouter, PendingAckBudget, SystemClock, WriteError, WriteMode,
 };
+use ravel_maintain::rewrite::reencode_compaction_parts;
 use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FixedClock, MaintainError, MaintainMemo, MigrateBudget,
-    NoLeases, PendingErasureRequest, RequestLedger, RetentionConfig, RetentionOutcome,
-    census_family, compact_bucket, erasure_rewrite_bucket, maintain_bucket, migrate_bucket_format,
-    migrate_family,
+    NoLeases, RequestLedger, RetentionConfig, RetentionOutcome, RsegCodec,
+    bucket_erasure_completion, census_family, compact_bucket, conserve_exact,
+    erasure_rewrite_bucket, maintain_bucket, migrate_bucket_format, migrate_family,
+    pending_erasure_requests, read, rewrite_and_publish,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{InstrumentedStore, ObjectStoreBackend};
+use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
 use ravel_otlp::NormalizedPoint;
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId};
@@ -340,36 +342,50 @@ async fn the_override_lets_a_compaction_write_below_the_floor() {
     assert_eq!(metrics.refused(FormatFamily::Rseg), 0);
 }
 
-/// An erasure rewrite is refused before its claim, its build and every PUT;
-/// the request stays pending.
+/// An erasure rewrite is refused before its claim, its build and every PUT,
+/// and the request stays pending: its `.dreq` is still listed as pending, no
+/// `.done` exists, and the completion gate the maintenance loop consults
+/// before it writes a `.done` (`bucket_erasure_completion`) still finds the
+/// bucket serving the subject. Without the check the rewrite publishes, the
+/// subject is dropped, and that gate no longer blocks the request.
 #[tokio::test]
 async fn an_erasure_rewrite_below_the_floor_is_refused_before_any_put() {
     let store = floored_bucket().await;
     let (metrics, config) = refusing();
     let clock = FixedClock::new(sealed_now_ns());
     let request_id = Uuid::from_u128(0x1746);
-    let pending = vec![PendingErasureRequest {
-        request_key: keys::erasure_request_key(&tenant_hash(), Signal::Metrics, request_id)
-            .expect("dreq key"),
-        request: ErasureRequest {
-            format_version: 1,
-            tenant_hash: tenant_hash().0.to_vec(),
-            signal: signal::to_proto(Signal::Metrics) as i32,
-            request_id: request_id.to_string(),
-            created_unix_ns: 0,
-            predicate: vec![ErasurePredicateMatcher {
-                key: "__name__".to_string(),
-                value: "victim".to_string(),
-            }],
-            window_start_ns: 0,
-            window_end_ns: 0,
-            reason: String::new(),
-        },
-    }];
+    let request = ErasureRequest {
+        format_version: 1,
+        tenant_hash: tenant_hash().0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics) as i32,
+        request_id: request_id.to_string(),
+        created_unix_ns: 0,
+        predicate: vec![ErasurePredicateMatcher {
+            key: "__name__".to_string(),
+            value: "victim".to_string(),
+        }],
+        window_start_ns: 0,
+        window_end_ns: 0,
+        reason: String::new(),
+    };
+    let request_key =
+        keys::erasure_request_key(&tenant_hash(), Signal::Metrics, request_id).expect("dreq key");
+    store
+        .put(
+            &request_key,
+            erasure::encode_request(&request),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put the request");
+    let pending = pending_erasure_requests(&store, &tenant_hash(), Signal::Metrics)
+        .await
+        .expect("list pending");
+    assert_eq!(pending.len(), 1);
     let mut memo = MaintainMemo::with_default_interval();
     let before = puts(&store);
 
-    let err = erasure_rewrite_bucket(
+    let outcome = erasure_rewrite_bucket(
         &store,
         &clock,
         &config,
@@ -378,15 +394,33 @@ async fn an_erasure_rewrite_below_the_floor_is_refused_before_any_put() {
         &pending,
         &mut memo,
     )
-    .await
-    .expect_err("refused below the floor");
+    .await;
 
     assert!(
-        matches!(err, MaintainError::BelowFormatFloor(r) if r == refused()),
-        "{err:?}"
+        matches!(outcome, Err(MaintainError::BelowFormatFloor(r)) if r == refused()),
+        "{outcome:?}"
     );
     assert_eq!(puts(&store), before, "nothing is PUT");
     assert_eq!(metrics.refused(FormatFamily::Rseg), 1);
+    let still = pending_erasure_requests(&store, &tenant_hash(), Signal::Metrics)
+        .await
+        .expect("list pending");
+    assert_eq!(still.len(), 1, "the request is still pending");
+    assert_eq!(still[0].request_key, request_key);
+    let done_key = keys::erasure_completion_key(&tenant_hash(), Signal::Metrics, request_id)
+        .expect("done key");
+    assert!(
+        store.head(&done_key).await.is_err(),
+        "no .done is written for the request"
+    );
+    let completion =
+        bucket_erasure_completion(&store, &clock, &config, &NoLeases, &bucket(), &pending)
+            .await
+            .expect("completion gate");
+    assert!(
+        completion.blocked.contains(&request_id.to_string()),
+        "the bucket still serves the subject, so the gate withholds the .done"
+    );
 }
 
 /// A bucket migration is refused before its claim and every PUT.
@@ -439,4 +473,117 @@ async fn a_family_migration_checks_the_floor_with_no_policy_installed() {
         "{err:?}"
     );
     assert_eq!(puts(&store), before, "nothing is PUT");
+}
+
+/// A maintenance pass keeps going past a compaction refused below the floor,
+/// and only past that: a compaction that fails for another reason still stops
+/// the pass. A provisioning record that does not decode fails the floor read
+/// with `FormatFloorRead`, which `maintain_bucket` returns. An arm that
+/// swallowed every compaction error returns `Ok` here.
+#[tokio::test]
+async fn a_compaction_error_other_than_the_floor_still_stops_the_maintenance_pass() {
+    let store = floored_bucket().await;
+    store
+        .put(
+            &provisioning_key(&tenant_hash(), Signal::Metrics),
+            bytes::Bytes::from_static(b"\xff\xff not a provisioning record"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("corrupt the record");
+    let (metrics, config) = refusing();
+    let clock = FixedClock::new(sealed_now_ns());
+
+    let result = maintain_bucket(
+        &store,
+        &clock,
+        &config,
+        &RetentionConfig::default(),
+        &NoLeases,
+        &bucket(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(MaintainError::FormatFloorRead(_))),
+        "{result:?}"
+    );
+    assert_eq!(metrics.refused(FormatFamily::Rseg), 0);
+}
+
+/// A rewrite driven directly through `rewrite_and_publish` checks the floor
+/// before it reads its inputs and PUTs anything.
+#[tokio::test]
+async fn a_direct_rewrite_below_the_floor_is_refused_before_any_put() {
+    let store = floored_bucket().await;
+    let (metrics, config) = refusing();
+    let clock = FixedClock::new(sealed_now_ns());
+    let listing = read::list_bucket(&store, &bucket()).await.expect("list");
+    assert_eq!(listing.commit_keys.len(), 2);
+    let before = puts(&store);
+
+    let outcome = rewrite_and_publish::<RsegCodec>(
+        &store,
+        &clock,
+        &config,
+        &bucket(),
+        &listing.commit_keys,
+        conserve_exact(),
+        sealed_now_ns(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Err(MaintainError::BelowFormatFloor(r)) if r == refused()),
+        "{outcome:?}"
+    );
+    assert_eq!(puts(&store), before, "nothing is PUT");
+    assert_eq!(metrics.refused(FormatFamily::Rseg), 1);
+}
+
+/// A force-2 re-encode of a compaction record whose parts are recorded below
+/// the current version is refused before its claim and every PUT. The bucket
+/// is compacted with no policy installed, then its one record is stamped one
+/// version below, which only a fixture may do.
+#[tokio::test]
+async fn a_reencode_below_the_floor_is_refused_before_any_put() {
+    let store = floored_bucket().await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let compacted = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+        .await
+        .expect("compact without a policy");
+    assert!(
+        matches!(compacted, CompactionOutcome::Compacted { .. }),
+        "{compacted:?}"
+    );
+    let listing = read::list_bucket(&store, &bucket()).await.expect("list");
+    assert_eq!(listing.compaction_record_keys.len(), 1);
+    let key = &listing.compaction_record_keys[0];
+    let got = store
+        .get(key, ravel_object_store::GetRange::Full)
+        .await
+        .expect("get record");
+    let mut rec = record::decode_compaction(&got.data).expect("decode record");
+    for part in &mut rec.parts {
+        part.segment_format_version = ravel_maintain::build::OUTPUT_FORMAT_VERSION - 1;
+    }
+    store
+        .put(key, record::encode_compaction(&rec), PutOptions::default())
+        .await
+        .expect("stamp the record below target");
+    let (metrics, config) = refusing();
+    let config = CompactorConfig {
+        reencode_writer_enabled: true,
+        ..config
+    };
+    let before = puts(&store);
+
+    let outcome = reencode_compaction_parts(&store, &clock, &config, &bucket()).await;
+
+    assert!(
+        matches!(outcome, Err(MaintainError::BelowFormatFloor(r)) if r == refused()),
+        "{outcome:?}"
+    );
+    assert_eq!(puts(&store), before, "nothing is PUT");
+    assert_eq!(metrics.refused(FormatFamily::Rseg), 1);
 }
