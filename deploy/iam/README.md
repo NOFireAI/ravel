@@ -858,7 +858,7 @@ would admit nothing.
 | `t/<tenant_hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch` at startup under `--tenant-kms-config`; absent means no epoch is recorded yet, and the process records the first ones |
 | `t/<tenant_hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache (serves nothing) |
 | `t/<tenant_hash>/<signal>/prov` | `m`, `l`, `s` | `m`, `l`, `s`, `p`, `a`, `u` | `m`, `l`, `s` | `validate_or_adopt` and the shard-generation reads; absent means a tenant with no write yet. The query catalog reads it for whichever signal a query resolves, including signals that never get a record, so Query names one pattern per signal letter rather than a `?` that would admit any one-character segment |
-| `t/<tenant_hash>/catalog/<signal>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent means the first fold |
+| `t/<tenant_hash>/catalog/<signal>/HEAD` | | | `m`, `l`, `s`, `a`, `u` | the scheduled fold's `get_head` (`m`, `l`, `s`); absent means the first fold. The startup format-window check (`format_window::check`) reads all five; absent means nothing folded, so nothing to check |
 | `t/<tenant_hash>/a/state/latest` | | yes | yes | the alert evaluator (folds the full history) and alert retention (checks the commit prefix) |
 | `t/<tenant_hash>/pq/grants` | | yes | | `grants::list`; absent is an empty grant list |
 | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` | `l`, `s` | | | `read_marker` on every keyed log or span write, once per hour of the dedup window; absent means no marker at that hour. The keyhash and the hour are spelled one `?` per character, as the tenant hash is |
@@ -866,6 +866,23 @@ would admit nothing.
 The catalog `HEAD` that Gateway and Query read was already covered by their
 `t/*/catalog/*/*` list prefix, and Maintain's scrub cursor and other keys
 under `t/*/*/maint/*` by `MaintainList`, so those need no new grant.
+
+The startup format-window check (`--format-window-check`,
+`services/ravel-server/src/format_window.rs`) runs in every mode, before any
+listener binds, for each statically known tenant. It reads the catalog `HEAD`
+of metrics, logs, spans, alerts and audit, then each snapshot part a `HEAD`
+names. A part can be absent too, when a fold's sweep removes it between the
+`HEAD` read and the part read; the check then re-reads the `HEAD` once.
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| `read_catalog` GETs `t/<tenant_hash>/catalog/<signal>/HEAD`, signal `m`, `l`, `s`, `a` or `u` | every mode | `s3:GetObject`; the 404 for an absent `HEAD` needs `s3:ListBucket` | Gateway: `GatewayRead` `t/*/catalog/*/*`, `GatewayList` `t/*/catalog/*/*`. Query: `QueryRead` `t/*/catalog/*/*`, `QueryList` `t/*/catalog/*/*`. Maintain: `MaintainRead` `t/*/catalog/*/HEAD`, `MaintainListTenantBootstrapKeys` `t/????????????????????????????????/catalog/<signal>/HEAD` for each of the five letters |
+| `read_catalog` GETs each part `t/<tenant_hash>/catalog/<signal>/snap/<ingest_hour>.<hash16>.csnap` the `HEAD` names | every mode | `s3:GetObject`; the 404 for a swept part needs `s3:ListBucket` | Gateway and Query: as above. Maintain: `MaintainRead` and `MaintainList` `t/*/catalog/*/snap/*` |
+
+A role without the list grant on a `HEAD` key gets `AccessDenied` for an
+absent `HEAD`, and cannot tell it from a denied one. The check reports that
+(tenant, signal) as not run, with a message naming the grant, and
+`--format-window-check refuse` exits on it.
 
 These statements list nothing else. A list request whose prefix is one of
 these keys can return only that key, since no key the system writes begins

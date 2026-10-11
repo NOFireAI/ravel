@@ -2564,6 +2564,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             BOOTSTRAP_HEAD_M_PATTERN,
             BOOTSTRAP_HEAD_L_PATTERN,
             BOOTSTRAP_HEAD_S_PATTERN,
+            BOOTSTRAP_HEAD_A_PATTERN,
+            BOOTSTRAP_HEAD_U_PATTERN,
             BOOTSTRAP_ALERT_STATE_PATTERN,
         ],
         list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
@@ -11343,6 +11345,8 @@ const BOOTSTRAP_PQ_GRANTS_PATTERN: &str = "t/????????????????????????????????/pq
 const BOOTSTRAP_HEAD_M_PATTERN: &str = "t/????????????????????????????????/catalog/m/HEAD";
 const BOOTSTRAP_HEAD_L_PATTERN: &str = "t/????????????????????????????????/catalog/l/HEAD";
 const BOOTSTRAP_HEAD_S_PATTERN: &str = "t/????????????????????????????????/catalog/s/HEAD";
+const BOOTSTRAP_HEAD_A_PATTERN: &str = "t/????????????????????????????????/catalog/a/HEAD";
+const BOOTSTRAP_HEAD_U_PATTERN: &str = "t/????????????????????????????????/catalog/u/HEAD";
 
 /// One server role's two bootstrap-key list statements. IAM ANDs the operators
 /// of one Condition block, so the fixed keys (`StringEquals`) and the
@@ -11405,6 +11409,8 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
             BOOTSTRAP_HEAD_M_PATTERN,
             BOOTSTRAP_HEAD_L_PATTERN,
             BOOTSTRAP_HEAD_S_PATTERN,
+            BOOTSTRAP_HEAD_A_PATTERN,
+            BOOTSTRAP_HEAD_U_PATTERN,
             BOOTSTRAP_ALERT_STATE_PATTERN,
         ],
     },
@@ -11592,6 +11598,43 @@ fn bootstrap_reads() -> Vec<BootstrapRead> {
         "read_alert_state_memo in alert_keep_set (services/ravel-server/src/maintain.rs)",
         "MaintainListTenantBootstrapKeys",
     );
+    // The startup format-window check (services/ravel-server/src/format_window.rs)
+    // runs in every mode and GETs each checked signal's HEAD, absent for every
+    // signal a tenant never folded, and then each part the HEAD names, which a
+    // concurrent sweep can remove before the GET.
+    for (role, head_sid, part_sid) in [
+        ("gateway", "GatewayList", "GatewayList"),
+        ("query", "QueryList", "QueryList"),
+        (
+            "maintain",
+            "MaintainListTenantBootstrapKeys",
+            "MaintainList",
+        ),
+    ] {
+        for signal in [
+            Signal::Metrics,
+            Signal::Logs,
+            Signal::Spans,
+            Signal::Alerts,
+            Signal::Audit,
+        ] {
+            let prefix = signal.key_prefix();
+            add(
+                role,
+                format!("t/{hex}/catalog/{prefix}/HEAD"),
+                "read_catalog in format_window::check \
+                 (services/ravel-server/src/format_window.rs), startup",
+                head_sid,
+            );
+            add(
+                role,
+                format!("t/{hex}/catalog/{prefix}/snap/20260101T00.0123456789abcdef.csnap"),
+                "read_catalog in format_window::check \
+                 (services/ravel-server/src/format_window.rs), startup",
+                part_sid,
+            );
+        }
+    }
     // `cursor_key` in services/ravel-server/src/scrub.rs.
     add(
         "maintain",

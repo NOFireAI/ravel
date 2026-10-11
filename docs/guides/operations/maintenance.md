@@ -1592,7 +1592,7 @@ migration target:
 | Format | Supported version | Anomalies |
 |---|---|---|
 | Metric segments | v7 | Every other version, including v6. |
-| Log segments | v4 | v1, v2 and v3. |
+| Log segments | v5 | Every other version, including v4. |
 | Span segments | v4 | Every other version. |
 
 ### Rolling a format bump
@@ -1695,6 +1695,98 @@ What to do. Pick one of two ways out:
    again, so after the rewrite that floor reads `stale` rather than
    `current`. It reads `current` again only after a later version raise
    appends a new floor for the family.
+
+### Format crossings at startup
+
+A build whose reader window no longer covers a stored version refuses those
+objects at query and compaction time. `ravel-server` can report such entries
+when it starts, before any listener binds:
+
+```sh
+ravel-server ... --format-window-check off      # the default: no check
+ravel-server ... --format-window-check warn
+ravel-server ... --format-window-check refuse
+```
+
+The check is off by default because it is not free: `warn` and `refuse`
+download every statically known tenant's folded catalog before any listener
+binds, which can take up to `--format-window-check-timeout` (default `20s`),
+close to a liveness probe's budget. Turn on `warn` (or `refuse`) for the first
+starts of a new release, when a format crossing is possible, and back off once
+those starts have reported clean. Under `off` startup makes no request for the
+check and logs nothing about it at info level.
+
+For each statically known tenant and each of metrics, logs, spans, alerts and
+audit, the check reads the catalog HEAD and every snapshot part that HEAD
+names. It counts the entries whose recorded `segment_format_version` is
+outside the reader window of that signal's format: RSEG for metrics, RLOG for
+logs, alerts and audit, RSPAN for spans. The window comes from each reader's
+own constant, the same source `audit-versions` reads.
+
+The statically known tenants are those named by `--tenant-token`,
+`--tenant-token-file`, `--maintain-tenant` and the rules in
+`--alert-rules-file`. A deployment that authenticates every tenant through
+OIDC or mTLS and names none of these checks nothing, and startup logs that
+no tenant was checked.
+
+- `warn` logs one `WARN` line per (signal, version) with the entry count, the
+  number of tenants and the reader window, then starts.
+- `refuse` exits non-zero before any listener binds. The error names each
+  signal and version, for example
+  `signal alerts version 4 (1 entries in 1 tenants; reader window RLOG 5..=5)`.
+- A store error, a corrupt HEAD, or a snapshot part that does not match the
+  blake3 its HEAD names is a check that could not run, not a clean result.
+  `warn` logs it with the tenant and signal; `refuse` exits non-zero and says
+  the check could not run.
+- A HEAD or snapshot part whose format version is above the one this build
+  reads was written by a newer build, and the message says so rather than
+  calling it corrupt. It is still a check that could not run. The remedy is to
+  upgrade this process to the build that wrote it, not to re-ingest.
+- A snapshot part that is not found may have been swept by a fold that
+  replaced the HEAD after the check read it. The check re-reads that HEAD and
+  its parts once; a second not-found is a check that could not run.
+- A HEAD GET denied with `AccessDenied` is a check that could not run, and
+  its message names the cause: on S3, a role without an `s3:ListBucket` grant
+  naming the HEAD key gets 403 for an absent HEAD, so it cannot tell absent
+  from denied. The shipped roles in `deploy/iam/` carry that grant for all
+  five signals; see "Bootstrap keys" in `deploy/iam/README.md`.
+
+The check reads up to 8 (tenant, signal) pairs at once and stops at
+`--format-window-check-timeout` (default `20s`), so startup stays inside a
+liveness probe's budget. The pairs not finished by then are reported as not
+checked: `warn` logs each tenant and signal not checked and starts, and
+`refuse` exits non-zero saying the check could not run to completion. Raise
+the timeout for a deployment with many statically known tenants or large
+catalogs.
+
+Request cost, per tenant and per signal: one logical read (GET) of the HEAD,
+plus one per snapshot part when a HEAD exists; the store may split a large
+part into ranged requests, and retries add more. A (tenant, signal) never
+folded costs the one read that finds no HEAD, so five reads per tenant is the
+floor. The check issues no LIST, no HEAD request and no write. Byte cost: it
+downloads every statically known tenant's folded catalog, each HEAD and every
+part it names, on every start that runs the check.
+
+Limits:
+
+- Commit records above the HEAD watermark, the hours not yet folded, are not
+  read. Finding them needs a LIST of the commit prefix. For metrics, logs
+  and spans, `ravel-cli maintain audit-versions` lists the live records and
+  covers them.
+- Only metrics, logs and spans are ever folded: the server's fold loop and
+  `ravel-cli catalog fold --signal` cover those three. No component folds
+  alerts or audit, so those two signals have no catalog HEAD and the check
+  reports nothing for them. An alert object at a version this build cannot
+  read is skipped and counted by the alert evaluator itself
+  (`ravel_alert_history_records_skipped_total`); no startup check covers
+  audit objects.
+- The version checked is the one the writer recorded in the catalog entry.
+  The reader still checks each object's own trailer when it opens it.
+
+On a pre-v1.0 build a crossing found here has one remedy, as described
+above: re-ingest or discard the objects at the retired version. Start with
+`warn` to see the counts, and use `refuse` on a deployment that must not
+serve with part of its catalog unreadable.
 
 ## Legal hold
 

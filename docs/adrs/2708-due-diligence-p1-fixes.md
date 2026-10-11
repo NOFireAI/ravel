@@ -287,7 +287,9 @@ c. **Startup check.** `--format-window-check {warn|refuse}`, default `warn`,
    version) outside the reader window; `refuse` exits non-zero naming the
    signal and version. No bucket listing. Advisory: the version field is a
    writer stamp, so the check is a report, not a proof. Default `warn`
-   because a false refusal is an outage.
+   because a false refusal is an outage. (The startup-check amendment below
+   records what the shipped check reads, and replaces this default with
+   `off`.)
 d. **Release notes.** A guard script fails a change to a reader `VERSION`
    constant unless a changelog fragment names every signal that format
    carries (RLOG: logs, alerts, audit). The format-change skill points at it.
@@ -459,3 +461,42 @@ already expected to lose readability, and the skip still keeps the tenant's
 other rules evaluating. The skip also applies only to an object whose bytes match its
 commit record's content hash, since the RLOG reader checks the trailer
 version before the footer CRC.
+
+## Amendment (2026-10-11): what the startup check reads (#2724)
+
+<!-- amendment-applies: sections="D5. A format crossing is loud and contained, not reversible (#2712)" pointer="startup-check amendment" -->
+
+D5c asks the startup check to read the commit records of unsealed hours and
+also forbids a bucket listing. Both cannot hold: a commit record's key carries
+the writer's id, so finding the records of an unsealed hour needs a LIST. The
+shipped check keeps the no-listing rule. It reads each statically known
+tenant's catalog HEAD and snapshot parts, for metrics, logs, spans, alerts and
+audit, and nothing else. Two limits follow:
+
+- **Hours not yet folded are not checked.** An object written by an older or
+  newer writer into the unsealed tail is invisible to the check until the fold
+  seals that hour. This is the window a rolling deploy most often crosses, so
+  the check is a report on folded history, not on the tail.
+  `ravel-cli maintain audit-versions` covers the stored objects of metrics,
+  logs and spans directly.
+- **Only statically known tenants are checked:** those named by
+  `--tenant-token`, `--tenant-token-file`, `--maintain-tenant` and
+  `--alert-rules-file`. Tenant discovery would need a LIST too, so a tenant
+  known only through a dynamic resolver (OIDC, an mTLS header, durable
+  `sys/auth` tokens) is not checked, and a deployment with no static tenant
+  logs that it checked nothing.
+
+Only metrics, logs and spans are ever folded (the server's fold loop and
+`ravel-cli catalog fold --signal` cover those three), so the alerts and audit
+catalogs have no HEAD and the check reports nothing for them. Out-of-window
+alert objects are handled by D6's skip in the alert evaluator; no startup check
+covers audit objects. The check still reads those two HEADs, and the maintain
+IAM role's bootstrap list grant names them, so their absence reads as absent
+rather than denied (#2724).
+
+Owner decision (2026-10-11): D5c's default of `warn` is replaced by `off`, a
+third value under which startup does not run the check and reads nothing.
+`warn` and `refuse` download every statically known tenant's folded catalog
+before any listener binds and can take up to `--format-window-check-timeout`
+(20 s by default), close to an operator's liveness window, so the check runs
+only when an operator asks for it. `warn` and `refuse` are unchanged.

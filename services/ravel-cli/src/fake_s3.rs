@@ -6,6 +6,10 @@
 //! store contract for the conformance suite to pass against it, and records
 //! what each PUT carried, each LIST asked for, which keys were read and
 //! deleted and which subresources were asked for, so a test can pin them.
+//!
+//! A second crate includes this file by `#[path]`:
+//! services/ravel-server/tests/format_window_refusal_binary.rs, so an edit
+//! here must keep that test compiling and passing too.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

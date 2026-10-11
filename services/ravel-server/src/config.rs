@@ -352,6 +352,30 @@ impl AuditModeArg {
     }
 }
 
+/// The `--format-window-check` values (ADR-2708 decision D5c): what startup
+/// does when a known tenant's catalog names an entry whose format version is
+/// outside this build's reader window. See [`crate::format_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum FormatWindowCheck {
+    /// Do not run the check: no catalog reads at startup.
+    #[default]
+    Off,
+    /// Log one warning per (signal, version) with its count, and start.
+    Warn,
+    /// Exit non-zero before any listener binds, naming each signal and
+    /// version, or saying the check could not run.
+    Refuse,
+}
+
+/// Parses `--format-window-check-timeout`: a non-zero humantime duration.
+fn parse_format_window_check_timeout(value: &str) -> Result<Duration, String> {
+    let duration = humantime::parse_duration(value).map_err(|err| err.to_string())?;
+    if duration.is_zero() {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(duration)
+}
+
 /// The `--audit-text` values (ADR-0062 decision 2e). Selects how a query's
 /// text is recorded on its audit record's `query.text` attribute;
 /// [`resolve_audit_text_policy`] turns it into the policy `start` installs.
@@ -641,6 +665,49 @@ pub struct Cli {
     /// production deployment impossible to start.
     #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
     pub require_bucket_protection: bool,
+
+    /// Startup check of stored format versions against this build's reader
+    /// window (ADR-2708 decision D5c). Before any listener binds, reads the
+    /// catalog HEAD and its snapshot parts for each statically known tenant
+    /// (`--tenant-token`, `--tenant-token-file`, `--maintain-tenant`, and the
+    /// tenants in `--alert-rules-file`) and each of metrics, logs, spans,
+    /// alerts and audit, and counts the entries whose
+    /// `segment_format_version` is outside the window, with up to 8 pairs
+    /// in flight and within `--format-window-check-timeout`. Each part is one
+    /// logical read (GET); the store may split a large part into ranged
+    /// requests. It issues no LIST, so commit records not yet folded into a
+    /// HEAD are not checked. `off` (default) skips the check and reads
+    /// nothing. `warn` logs one line per (signal, version) with the count and
+    /// starts; `refuse` exits non-zero naming the signal and version. Both
+    /// download every checked catalog before any listener binds, which can
+    /// take up to `--format-window-check-timeout`; enable one for the first
+    /// starts of a new release. A store or decode error is reported as a
+    /// check that could not run, and `refuse` exits non-zero on it too.
+    /// Advisory: the version is the writer's stamp, not the object's own
+    /// trailer.
+    #[arg(
+        long = "format-window-check",
+        value_enum,
+        default_value = "off",
+        env = "RAVEL_FORMAT_WINDOW_CHECK"
+    )]
+    pub format_window_check: FormatWindowCheck,
+
+    /// Deadline for the whole `--format-window-check` run, as a humantime
+    /// duration (e.g. `20s`). The check runs before any listener binds, so it
+    /// is bounded to stay inside a liveness probe's budget. The (tenant,
+    /// signal) pairs not finished when it elapses are reported as not
+    /// checked: `warn` logs each of them and starts, `refuse` exits non-zero
+    /// saying the check could not run. Unused under `off`. Zero is refused at
+    /// startup.
+    #[arg(
+        long = "format-window-check-timeout",
+        value_name = "DURATION",
+        default_value = "20s",
+        value_parser = parse_format_window_check_timeout,
+        env = "RAVEL_FORMAT_WINDOW_CHECK_TIMEOUT"
+    )]
+    pub format_window_check_timeout: Duration,
 
     /// Whether the query-audit pipeline runs, and its failure posture
     /// (ADR-0062 decision 2b and its opt-in amendment): `off` (default)
@@ -18399,5 +18466,61 @@ mod tests {
         let large = HostProfile::new(4, Some(8 * GIB), Some(8 * GIB), None, None, None);
         let resolved = all.resolve_performance(large).expect("8 GiB starts");
         assert_eq!(resolved.memory_overhead_reserve_ingest_limit, None);
+    }
+
+    #[test]
+    fn the_default_mode_is_off() {
+        let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
+        assert_eq!(cli.format_window_check, FormatWindowCheck::Off);
+    }
+
+    #[test]
+    fn a_timeout_with_the_check_off_validates() {
+        let cli = Cli::parse_validated_from([
+            "ravel-server",
+            "--format-window-check",
+            "off",
+            "--format-window-check-timeout",
+            "5s",
+        ])
+        .expect("a timeout under off is not an error");
+        assert_eq!(cli.format_window_check, FormatWindowCheck::Off);
+        assert_eq!(cli.format_window_check_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn format_window_check_parses_every_value() {
+        for (value, expected) in [
+            ("off", FormatWindowCheck::Off),
+            ("warn", FormatWindowCheck::Warn),
+            ("refuse", FormatWindowCheck::Refuse),
+        ] {
+            let cli = Cli::parse_validated_from(["ravel-server", "--format-window-check", value])
+                .expect("a known value validates");
+            assert_eq!(cli.format_window_check, expected, "{value}");
+        }
+        let err = Cli::parse_validated_from(["ravel-server", "--format-window-check", "ignore"])
+            .expect_err("an unknown value is rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn format_window_check_timeout_defaults_to_20s_and_refuses_zero() {
+        let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
+        assert_eq!(cli.format_window_check_timeout, Duration::from_secs(20));
+        let cli =
+            Cli::parse_validated_from(["ravel-server", "--format-window-check-timeout", "5s"])
+                .expect("a non-zero duration validates");
+        assert_eq!(cli.format_window_check_timeout, Duration::from_secs(5));
+        for value in ["0s", "soon"] {
+            let err =
+                Cli::parse_validated_from(["ravel-server", "--format-window-check-timeout", value])
+                    .expect_err("zero and unparseable durations are rejected");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
     }
 }
