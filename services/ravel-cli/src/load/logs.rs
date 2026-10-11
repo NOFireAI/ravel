@@ -822,19 +822,21 @@ pub(super) async fn load_with_drain_reflush_period(
         // write the loop waits on below has always been flushed already.
         if window.enabled() {
             enqueue.wait_enqueued().await;
-            let observed = settle_shards(|| router.metrics().shard_skew_by_shard())
-                .await
-                .map(|enqueued| ShardObservation {
-                    enqueued,
-                    size_flushes: SizeFlushes::PerShard(
-                        router
+            let observed = if window.realigning() {
+                settle_shards(clock.as_ref(), || router.metrics().shard_skew_by_shard())
+                    .await
+                    .map(|enqueued| ShardObservation {
+                        enqueued,
+                        size_flushes: router
                             .metrics()
                             .flush_trigger_mix_by_shard()
                             .into_iter()
                             .map(|(shard, mix)| (shard, mix.size))
                             .collect(),
-                    ),
-                });
+                    })
+            } else {
+                None
+            };
             if window.submitted(observed) {
                 let _flushing = flush_lock.lock().await;
                 let before = router.metrics().flush_trigger_mix_by_shard();
@@ -991,6 +993,7 @@ pub(super) async fn load_with_drain_reflush_period(
         shards,
     );
     report.geometry = geometry_resolved.then_some(geometry);
+    report.realign_gave_up = window.realign_gave_up();
     #[cfg(feature = "stage-timing")]
     {
         report.stage_timings = router.stage_timings().snapshot();

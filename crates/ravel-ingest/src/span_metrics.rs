@@ -221,6 +221,10 @@ pub struct SpanIngestMetrics {
     /// a gauge with a per-shard dimension, unlike everything else here; read it
     /// via [`SpanIngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// `flushes_by_size` split by shard, incremented at the same site. Keyed
+    /// by shard index; a shard that never size-flushed has no entry. Read via
+    /// [`SpanIngestMetrics::size_flushes_by_shard`].
+    size_flushes_by_shard: Mutex<HashMap<u32, u64>>,
     /// Per-shard ingest-skew accounting (issue #865), the span-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own and
     /// [`crate::LogIngestMetrics`]'s own. All three spans (on-actor,
@@ -463,6 +467,28 @@ impl SpanIngestMetrics {
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one size flush against `shard`, beside the router-wide
+    /// `flushes_by_size` that [`SpanIngestMetrics::record_flush`] keeps.
+    pub(crate) fn record_shard_size_flush(&self, shard: u32) {
+        let mut map = self
+            .size_flushes_by_shard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(shard).or_insert(0) += 1;
+    }
+
+    /// Per-shard size-flush counts, sorted by shard index. A shard that never
+    /// size-flushed is absent, equivalent to 0.
+    pub fn size_flushes_by_shard(&self) -> Vec<(u32, u64)> {
+        let map = self
+            .size_flushes_by_shard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counts: Vec<(u32, u64)> = map.iter().map(|(&s, &c)| (s, c)).collect();
+        counts.sort_unstable_by_key(|&(shard, _)| shard);
+        counts
     }
 
     pub(crate) fn record_arrival_coalesced(&self) {

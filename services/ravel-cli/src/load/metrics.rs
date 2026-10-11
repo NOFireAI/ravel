@@ -51,6 +51,10 @@ pub struct MetricsLoadReport {
     pub flush_mix: FlushMixReport,
     /// [`layout_no_effect_warning`] over this load's tokens.
     pub target_bytes_no_effect_warning: Option<String>,
+    /// How many times the depth window gave up realigning on size flushes
+    /// (`DepthWindow::realign_gave_up`): 0, or 1 when the shards had not
+    /// handled a batch within the 30 s settle timeout.
+    pub realign_gave_up: u64,
 }
 
 impl MetricsLoadReport {
@@ -72,6 +76,7 @@ impl MetricsLoadReport {
             geometry: self.geometry,
             flush_mix: self.flush_mix.clone(),
             target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
+            realign_gave_up: self.realign_gave_up,
         }
     }
 }
@@ -1335,12 +1340,20 @@ pub(super) async fn load_metrics_with(
         // write the loop waits on below has always been flushed already.
         if window.enabled() {
             enqueue.wait_enqueued().await;
-            let observed = settle_shards(|| router.metrics().shard_skew_by_shard())
-                .await
-                .map(|enqueued| ShardObservation {
-                    enqueued,
-                    size_flushes: SizeFlushes::Total(router.metrics_snapshot().flushes_by_size),
-                });
+            let observed = if window.realigning() {
+                settle_shards(clock.as_ref(), || router.metrics().shard_skew_by_shard())
+                    .await
+                    .map(|enqueued| ShardObservation {
+                        enqueued,
+                        size_flushes: router
+                            .metrics()
+                            .size_flushes_by_shard()
+                            .into_iter()
+                            .collect(),
+                    })
+            } else {
+                None
+            };
             if window.submitted(observed) {
                 let before = router.metrics_snapshot().flushes_manual;
                 router.flush_all().await;
@@ -1377,7 +1390,7 @@ pub(super) async fn load_metrics_with(
     // `--target-bytes`, so its writes' acks would otherwise wait out the age
     // trigger. Every submit is enqueued first, so the flush drains every
     // buffered write; the ticker is a backstop that should find nothing.
-    let Some((router, geometry, _)) = lazy else {
+    let Some((router, geometry, window)) = lazy else {
         // No batch carried a point, so nothing was submitted.
         report.histogram_points_exploded = state.grouper.as_ref().map_or(0, |g| g.exploded);
         report.elapsed = started.elapsed();
@@ -1433,6 +1446,7 @@ pub(super) async fn load_metrics_with(
         shards,
     );
     report.geometry = Some(geometry);
+    report.realign_gave_up = window.realign_gave_up();
     report.histogram_points_exploded = state.grouper.as_ref().map_or(0, |g| g.exploded);
     report.elapsed = started.elapsed();
     Ok(report)

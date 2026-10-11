@@ -256,25 +256,51 @@ impl EnqueueTracker {
     }
 }
 
-/// How long [`settle_shards`] waits for the shard actors to handle every
-/// enqueued write before the depth window stops trusting size flushes.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long, on the loader's clock, [`settle_shards`] waits for the shard
+/// actors to handle every enqueued write before the depth window gives up
+/// realigning on size flushes.
+pub(super) const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The shard skew figures [`settle_shards`] reads, after the test override
+/// when one is in scope.
+#[cfg(test)]
+pub(super) type SkewOverride = Arc<
+    dyn Fn(Vec<(u32, ravel_ingest::ShardSkewStats)>) -> Vec<(u32, ravel_ingest::ShardSkewStats)>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Rewrites the figures [`settle_shards`] reads, so a test can hold a
+    /// shard short of handling its writes.
+    pub(super) static SKEW_OVERRIDE: SkewOverride;
+}
 
 /// Wait until every shard actor has handled every write enqueued so far, and
 /// return each shard's enqueued count. `None` when that has not happened
-/// within [`SETTLE_TIMEOUT`].
+/// within [`SETTLE_TIMEOUT`] on `clock`.
 ///
 /// A shard actor counts a write processed only after `handle_write` returns,
-/// and a size flush is opened (and counted) inside `handle_write`, so once
-/// processed has caught up with enqueued the router's size-flush counters
-/// cover every write submitted so far.
+/// and a write's size flush is opened (and counted) inside `handle_write`, so
+/// once processed has caught up with enqueued the router's size-flush
+/// counters cover every write submitted so far ([`DepthWindow`] covers the
+/// hand-back flushes this does not wait for). The wait is one batch's merge on the
+/// shard actors, not a flush: the flush runs in a task of its own.
 pub(super) async fn settle_shards(
+    clock: &dyn Clock,
     skew: impl Fn() -> Vec<(u32, ravel_ingest::ShardSkewStats)>,
 ) -> Option<BTreeMap<u32, u64>> {
-    let started = Instant::now();
+    let timeout_ns = i64::try_from(SETTLE_TIMEOUT.as_nanos()).unwrap_or(i64::MAX);
+    let deadline_ns = clock.now_ns().saturating_add(timeout_ns);
     let mut round = 0u32;
     loop {
         let stats = skew();
+        #[cfg(test)]
+        let stats = match SKEW_OVERRIDE.try_with(Arc::clone) {
+            Ok(rewrite) => rewrite(stats),
+            Err(_) => stats,
+        };
         if stats
             .iter()
             .all(|(_, s)| s.messages_processed >= s.messages_enqueued)
@@ -286,30 +312,24 @@ pub(super) async fn settle_shards(
                     .collect(),
             );
         }
-        if started.elapsed() >= SETTLE_TIMEOUT {
+        if clock.now_ns() >= deadline_ns {
             return None;
         }
         round = round.saturating_add(1);
         if round < 64 {
             tokio::task::yield_now().await;
         } else {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            clock.sleep(Duration::from_millis(1)).await;
         }
     }
 }
 
-/// The size flushes a router has opened so far: per shard where the router
-/// counts per shard (logs), a router-wide total otherwise.
-pub(super) enum SizeFlushes {
-    PerShard(BTreeMap<u32, u64>),
-    Total(u64),
-}
-
 /// The router state the depth window reads after each submit, once
-/// [`settle_shards`] returned.
+/// [`settle_shards`] returned: each shard's enqueued writes and the size
+/// flushes it has opened so far.
 pub(super) struct ShardObservation {
     pub(super) enqueued: BTreeMap<u32, u64>,
-    pub(super) size_flushes: SizeFlushes,
+    pub(super) size_flushes: BTreeMap<u32, u64>,
 }
 
 /// Decides when the loader flushes every shard. A shard's buffer is pending
@@ -322,14 +342,22 @@ pub(super) struct ShardObservation {
 /// in-flight write, which is `pipeline_depth` batches back, so that wait never
 /// sits on a buffer nothing will flush.
 ///
-/// A size flush clears its shard, so the next window starts at the shard's
-/// next batch: the depth flush never closes a buffer the size trigger has
-/// just emptied. Per-shard counts attribute a size flush exactly. A
-/// router-wide count attributes it only when it equals the number of shards
-/// the batch reached (a write opens at most one size flush per shard);
-/// otherwise nothing is cleared and the depth flush may come early, never
-/// late. Only a write opens a size flush, so a flush counted after a batch
-/// was handled covers that batch.
+/// A size flush clears its own shard only, so that shard's next window starts
+/// at its next batch while every other shard keeps its oldest pending batch:
+/// the depth flush never closes a buffer the size trigger has just emptied.
+/// A write's size flush is counted before the write is, so one counted after
+/// a batch was handled covers that batch. A hand-back from another shard
+/// generation (`handle_hand_back`) also opens size flushes, and is not
+/// counted as enqueued, so settling does not wait for it; that arises only
+/// when the tenant's shard generation changes during the load, and a
+/// hand-back flush observed one batch late starts its shard's next window
+/// one batch late. Age and stall flushes clear nothing.
+///
+/// When the shards have not handled a batch within [`SETTLE_TIMEOUT`] the
+/// window gives up realigning for the rest of the load: it stops observing
+/// the router, size flushes no longer clear anything, and the depth flush
+/// may come early, never late. The load reports that it gave up
+/// ([`DepthWindow::realign_gave_up`]).
 pub(super) struct DepthWindow {
     depth: u64,
     enabled: bool,
@@ -337,10 +365,10 @@ pub(super) struct DepthWindow {
     oldest_pending: BTreeMap<u32, u64>,
     enqueued: BTreeMap<u32, u64>,
     size_per_shard: BTreeMap<u32, u64>,
-    size_total: u64,
     /// Cleared once an observation is missing, after which size flushes no
     /// longer clear anything.
     realign: bool,
+    realign_gave_up: u64,
 }
 
 /// The `oldest_pending` key for batches whose shards are unknown.
@@ -355,19 +383,31 @@ impl DepthWindow {
             oldest_pending: BTreeMap::new(),
             enqueued: BTreeMap::new(),
             size_per_shard: BTreeMap::new(),
-            size_total: 0,
             realign: true,
+            realign_gave_up: 0,
         }
     }
 
-    /// Whether the loader observes the router after each submit at all.
+    /// Whether the depth flush runs at all.
     pub(super) fn enabled(&self) -> bool {
         self.enabled
     }
 
+    /// Whether the loader still settles the shards and observes the router
+    /// after each submit. `false` once the window gave up realigning.
+    pub(super) fn realigning(&self) -> bool {
+        self.enabled && self.realign
+    }
+
+    /// How many times the window gave up realigning on size flushes: 0, or 1
+    /// once [`settle_shards`] timed out, since the loader stops settling then.
+    pub(super) fn realign_gave_up(&self) -> u64 {
+        self.realign_gave_up
+    }
+
     /// Record one submitted batch and the router state once it was handled
-    /// (`None` when [`settle_shards`] timed out); `true` when the depth flush
-    /// is due now.
+    /// (`None` when [`settle_shards`] timed out or was not run); `true` when
+    /// the depth flush is due now.
     pub(super) fn submitted(&mut self, observed: Option<ShardObservation>) -> bool {
         if !self.enabled {
             return false;
@@ -377,7 +417,9 @@ impl DepthWindow {
         match observed {
             Some(observed) if self.realign => self.realign_to(batch, observed),
             _ => {
-                self.realign = false;
+                if std::mem::replace(&mut self.realign, false) {
+                    self.realign_gave_up += 1;
+                }
                 self.oldest_pending.entry(ANY_SHARD).or_insert(batch);
             }
         }
@@ -393,33 +435,18 @@ impl DepthWindow {
     }
 
     fn realign_to(&mut self, batch: u64, observed: ShardObservation) {
-        let mut reached = Vec::new();
         for (&shard, &count) in &observed.enqueued {
             if count > self.enqueued.get(&shard).copied().unwrap_or(0) {
-                reached.push(shard);
                 self.oldest_pending.entry(shard).or_insert(batch);
             }
         }
         self.enqueued = observed.enqueued;
-        match observed.size_flushes {
-            SizeFlushes::PerShard(counts) => {
-                for (&shard, &count) in &counts {
-                    if count > self.size_per_shard.get(&shard).copied().unwrap_or(0) {
-                        self.oldest_pending.remove(&shard);
-                    }
-                }
-                self.size_per_shard = counts;
-            }
-            SizeFlushes::Total(total) => {
-                let opened = total.saturating_sub(self.size_total);
-                if opened > 0 && opened == reached.len() as u64 {
-                    for shard in &reached {
-                        self.oldest_pending.remove(shard);
-                    }
-                }
-                self.size_total = total;
+        for (&shard, &count) in &observed.size_flushes {
+            if count > self.size_per_shard.get(&shard).copied().unwrap_or(0) {
+                self.oldest_pending.remove(&shard);
             }
         }
+        self.size_per_shard = observed.size_flushes;
     }
 }
 
@@ -431,8 +458,8 @@ pub struct FlushMixCounts {
     pub size: u64,
     /// Flushes opened because a shard buffer aged past `--max-flush-delay`.
     pub age: u64,
-    /// Flushes the loader opened because `pipeline_depth` batches had been
-    /// submitted since its last such flush.
+    /// Flushes the loader opened because the oldest batch pending on some
+    /// shard was `pipeline_depth` batches old ([`DepthWindow`]).
     pub depth: u64,
     /// Every other loader-requested flush: the final drain at load close and
     /// the logs loader's budget-stall flushes.
@@ -497,6 +524,11 @@ pub struct LoadLayoutReport {
     pub geometry: Option<LoadGeometry>,
     pub flush_mix: FlushMixReport,
     pub target_bytes_no_effect_warning: Option<String>,
+    /// 1 when the depth window gave up realigning on size flushes because the
+    /// shards had not handled a batch within the settle timeout (30 s on the
+    /// loader's clock), 0 otherwise.
+    #[serde(default)]
+    pub realign_gave_up: u64,
 }
 
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.
@@ -549,6 +581,21 @@ fn depth_bound_text(g: &LoadGeometry) -> String {
     }
 }
 
+/// Whether the depth window kept realigning on size flushes, as the summary
+/// prints it.
+fn realign_text(gave_up: u64) -> String {
+    if gave_up == 0 {
+        "per shard on size flushes".to_string()
+    } else {
+        format!(
+            "gave up {gave_up} time(s): the shards had not handled a batch within {} s, so \
+             later depth flushes counted batches without size flushes and may have closed \
+             objects early",
+            SETTLE_TIMEOUT.as_secs()
+        )
+    }
+}
+
 /// The prefix of the line a load prints on stderr once its geometry is
 /// resolved, before its first write.
 pub const GEOMETRY_LINE_PREFIX: &str = "load geometry: ";
@@ -585,6 +632,13 @@ pub fn render_layout_summary(report: &LoadLayoutReport) -> String {
             g.pipeline_depth,
             depth_bound_text(g)
         );
+        if g.depth_flush_enabled() {
+            let _ = writeln!(
+                out,
+                "  depth realign    : {}",
+                realign_text(report.realign_gave_up)
+            );
+        }
     }
     let t = &report.flush_mix.totals;
     let _ = writeln!(
@@ -678,7 +732,7 @@ mod tests {
     fn one_shard(enqueued: u64, size: u64) -> Option<ShardObservation> {
         Some(ShardObservation {
             enqueued: BTreeMap::from([(0, enqueued)]),
-            size_flushes: SizeFlushes::PerShard(BTreeMap::from([(0, size)])),
+            size_flushes: BTreeMap::from([(0, size)]),
         })
     }
 
@@ -716,25 +770,22 @@ mod tests {
     }
 
     #[test]
-    fn a_router_wide_count_clears_only_what_it_can_attribute() {
-        let g = resolve_geometry(None, Some(2), 2, 10, 10, 10, None);
-        let both = |enqueued: u64, size: u64| {
+    fn a_size_flush_restarts_only_its_own_shard() {
+        let g = resolve_geometry(None, Some(3), 2, 10, 10, 10, None);
+        let both = |enqueued: u64, size0: u64| {
             Some(ShardObservation {
                 enqueued: BTreeMap::from([(0, enqueued), (1, enqueued)]),
-                size_flushes: SizeFlushes::Total(size),
+                size_flushes: BTreeMap::from([(0, size0)]),
             })
         };
-        // One size flush for a batch that reached two shards cannot be
-        // placed, so the window still fires on batch 2.
+        // Shard 0 size-flushes on batch 2; shard 1 is still pending from
+        // batch 1, so the window fires on batch 3, not on batch 4.
         let mut w = DepthWindow::new(&g);
-        assert!(!w.submitted(both(1, 0)));
-        assert!(w.submitted(both(2, 1)));
-        // Two size flushes on batch 2 close both shards.
-        let mut w = DepthWindow::new(&g);
-        assert!(!w.submitted(both(1, 0)));
-        assert!(!w.submitted(both(2, 2)));
-        assert!(!w.submitted(both(3, 2)));
-        assert!(w.submitted(both(4, 2)));
+        let fired: Vec<bool> = [(1, 0), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+            .into_iter()
+            .map(|(n, size)| w.submitted(both(n, size)))
+            .collect();
+        assert_eq!(fired, [false, false, true, false, false, true]);
     }
 
     #[test]
@@ -742,9 +793,39 @@ mod tests {
         let g = resolve_geometry(None, Some(3), 1, 10, 10, 10, None);
         let mut w = DepthWindow::new(&g);
         assert!(!w.submitted(one_shard(1, 0)));
+        assert!(w.realigning());
         assert!(!w.submitted(None));
-        // Size flushes no longer clear anything once one was missed.
+        assert!(!w.realigning());
+        assert_eq!(w.realign_gave_up(), 1);
+        // Size flushes no longer clear anything once one was missed, and the
+        // give-up is counted once.
         assert!(w.submitted(one_shard(3, 1)));
+        assert!(!w.submitted(None));
+        assert_eq!(w.realign_gave_up(), 1);
+    }
+
+    #[tokio::test]
+    async fn settle_gives_up_on_the_injected_clock() {
+        use super::super::test_support::{NOW_NS, TestClock, yield_until_router_is_quiet};
+        let clock = TestClock::new(NOW_NS);
+        let stuck = || {
+            vec![(
+                0,
+                ravel_ingest::ShardSkewStats {
+                    messages_enqueued: 1,
+                    ..Default::default()
+                },
+            )]
+        };
+        let settle = settle_shards(clock.as_ref(), stuck);
+        tokio::pin!(settle);
+        tokio::select! {
+            biased;
+            _ = &mut settle => panic!("a shard that never handles its write cannot settle"),
+            () = yield_until_router_is_quiet(&clock) => {}
+        }
+        clock.advance_ns(i64::try_from(SETTLE_TIMEOUT.as_nanos()).unwrap());
+        assert_eq!(settle.await, None);
     }
 
     #[test]

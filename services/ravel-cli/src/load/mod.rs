@@ -332,6 +332,10 @@ pub struct LoadReport {
     /// The target-no-effect warning ([`target_bytes_no_effect_warning`]),
     /// computed once the load finished.
     pub target_bytes_no_effect_warning: Option<String>,
+    /// How many times the depth window gave up realigning on size flushes
+    /// (`DepthWindow::realign_gave_up`): 0, or 1 when the shards had not
+    /// handled a batch within the 30 s settle timeout.
+    pub realign_gave_up: u64,
     /// The early shard-skew warning (issue #560), set at most once, the first
     /// time the check at [`SKEW_CHECK_AFTER_BATCHES`](logs::SKEW_CHECK_AFTER_BATCHES) data batches finds the
     /// spread at or below the [`SKEW_WARN_DENOMINATOR`](logs::SKEW_WARN_DENOMINATOR) threshold. `None` when
@@ -435,6 +439,7 @@ impl LoadReport {
             geometry: self.geometry,
             flush_mix: self.flush_mix_report(),
             target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
+            realign_gave_up: self.realign_gave_up,
         }
     }
 }
