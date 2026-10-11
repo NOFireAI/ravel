@@ -262,10 +262,8 @@ fn fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
 }
 
 /// The same cache and read gate as [`fetcher`] with the fetcher's default
-/// thresholds, so these small objects are read whole: the plan phase decodes
-/// the directories from their ranged reads and each partition's open takes the
-/// whole object's bytes with those directories carried, through
-/// `open_scan_on_gate_from_decoded`.
+/// thresholds, so these small objects are under the plan bound and each is
+/// read whole by the one partition that opens it, with no plan read.
 fn whole_object_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
     let cache_bytes = 64u64 << 20;
     let cache: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(CacheLimits::new(
@@ -527,15 +525,15 @@ async fn striped_projection_decompresses_once_per_segment() {
     );
 }
 
-/// The same decode-once pin on the route that reads whole objects: the plan
-/// phase charges each segment's directories once, the scan phase charges the
-/// projected pages only, and together they equal one whole-object decode.
+/// The same decode-once pin on the route that reads whole objects. These
+/// objects are under the fetcher's plan bound, so none is planned (ADR-2677
+/// decision 2): the plan phase reads and decodes nothing, and each segment's
+/// one open reads it whole and decodes its directories and projected pages
+/// once, plus the read gate's PAGE_DIR.
 ///
-/// Fails against a reader built from carried directories that still seeds its
-/// open-time total (each partition's open charges the directories again, so the
-/// scan phase exceeds the pages by one directory decode per open), and against a
-/// read gate that decodes PAGE_DIR again to size its job (the scan phase exceeds
-/// the pages by `page_dir`). Both are asserted by the exact scan-phase figure.
+/// Fails against a scan that still plans these objects (the plan phase then
+/// reads every object whole and decodes its directories), and against one
+/// that opens a segment more than once (the scan-phase GET count and bytes).
 #[tokio::test]
 async fn whole_object_route_decompresses_once_per_segment() {
     let fx = fixture().await;
@@ -555,31 +553,36 @@ async fn whole_object_route_decompresses_once_per_segment() {
         "the run under test must be the striped route, one refusal per partition"
     );
     assert_eq!(run.rows, SEGMENTS * BLOCKS_PER_SEG);
-    // The route under test: the plan phase read each whole object once (the
-    // suffix probe covers these small objects), and the opens took those bytes
-    // with the directories carried, so the scan phase issued no GET.
     assert_eq!(
-        run.phases.plan.s3_bytes[ravel_types::accounting::AccountedOp::Get.index()],
-        fx.object_bytes,
-        "the plan phase holds each whole object"
+        sum_metric(&run.plan, "segments_unplanned"),
+        SEGMENTS,
+        "every object is under the plan bound"
+    );
+    // The route under test: no segment is planned (ADR-2677 decision 2), and
+    // each partition's open reads its segment whole, once.
+    let get = ravel_types::accounting::AccountedOp::Get.index();
+    assert_eq!(
+        (
+            run.phases.plan.s3_requests[get],
+            run.phases.plan.s3_bytes[get]
+        ),
+        (0, 0),
+        "no plan read"
     );
     assert_eq!(
-        run.phases.scan.s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
-        0,
-        "the opens read the carried whole objects, not the store"
+        (
+            run.phases.scan.s3_requests[get],
+            run.phases.scan.s3_bytes[get]
+        ),
+        (SEGMENTS as u64, fx.object_bytes),
+        "one whole-object GET per segment"
     );
+    assert_eq!(run.phases.plan.decompressed_bytes, 0);
     assert_eq!(
-        run.phases.plan.decompressed_bytes, fx.directories,
-        "the plan phase decodes each segment's four directories exactly once"
-    );
-    assert_eq!(
-        run.phases.scan.decompressed_bytes, fx.pages,
-        "the whole-object opens decode only their blocks' pages, no directory"
-    );
-    assert_eq!(
-        run.phases.plan.decompressed_bytes + run.phases.scan.decompressed_bytes,
-        fx.directories + fx.pages,
-        "the total is one whole-object decode of the projection"
+        run.phases.scan.decompressed_bytes,
+        fx.directories + fx.pages + fx.page_dir,
+        "each open decodes its directories and projected pages once, plus the \
+         read gate's PAGE_DIR"
     );
 }
 

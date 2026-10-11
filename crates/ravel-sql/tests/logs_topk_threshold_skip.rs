@@ -309,6 +309,7 @@ struct Setup {
     partitions: usize,
     group_blocks: Option<usize>,
     cached: bool,
+    planned: bool,
 }
 
 impl Setup {
@@ -319,7 +320,16 @@ impl Setup {
             partitions: 1,
             group_blocks: None,
             cached: false,
+            planned: true,
         }
+    }
+    /// A fetcher with its default whole-object bound, which every fixture
+    /// object is under, so the scan opens each segment once without planning
+    /// it (ADR-2677 decision 2). The default `Setup` sets the bound to zero so
+    /// every segment takes the planned route.
+    fn unplanned(mut self) -> Self {
+        self.planned = false;
+        self
     }
     fn spill(mut self) -> Self {
         self.fixture = Fixture::Spill;
@@ -358,6 +368,8 @@ struct Run {
     segments_skipped: usize,
     /// Segment keys in the order the run first issued a GET for each.
     first_gets: Vec<String>,
+    /// Every GET the run issued, repeats included.
+    gets: usize,
     plan: Arc<dyn ExecutionPlan>,
 }
 
@@ -487,6 +499,9 @@ async fn run(sql: &str, setup: Setup) -> Run {
     let snapshot = build_snapshot(store.as_ref(), setup.fixture, setup.group_blocks).await;
     let accounting = QueryAccounting::new();
     let mut fetcher = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+    if setup.planned {
+        fetcher = fetcher.with_block_range_threshold(0);
+    }
     if setup.cached {
         fetcher = fetcher.with_cache(read_cache());
     }
@@ -516,6 +531,7 @@ async fn run(sql: &str, setup: Setup) -> Run {
         blocks_skipped: metric(&plan, "LogsScanExec", "blocks_skipped_by_threshold"),
         segments_skipped: metric(&plan, "LogsScanExec", "segments_skipped_by_threshold"),
         first_gets: store.first_gets(),
+        gets: store.gets.lock().unwrap().len(),
         plan: Arc::clone(&plan),
     };
     eprintln!(
@@ -920,5 +936,62 @@ async fn attrs_raw_fallback_after_a_skip_matches() {
         (run.blocks_total, run.blocks_scanned),
         (3, 5),
         "the drain re-decodes the skipped block"
+    );
+}
+
+/// ADR-2677 decision 2 under the skip: every fixture object is under the
+/// default plan bound, so a block predicate that keeps the scan off the fast
+/// path sends each segment through one unplanned whole-object read. The skip
+/// fires on both levels there too, and a segment it passes over is never read
+/// at all: no plan read reached it first, which the planned run's GETs show.
+#[tokio::test]
+async fn unplanned_sub_break_even_segments_match_and_skip() {
+    let sql = "SELECT ts, body FROM logs WHERE has_word(severity_text, 'INFO') \
+               ORDER BY ts LIMIT 10";
+    let planned = same_rows(sql, Setup::new()).await;
+    let run = same_rows(sql, Setup::new().unplanned()).await;
+    assert_eq!(run.rows, planned.rows, "both routes return the same rows");
+    assert_bodies_in_order(&run.rows, &smallest_bodies(10, true));
+    assert_eq!(planned.scan_metric("segments_unplanned"), 0);
+    assert_eq!(
+        planned.first_gets.len(),
+        SEGMENTS,
+        "the plan reads every segment"
+    );
+
+    let opened = run.scan_metric("segments_opened");
+    assert_eq!(run.scan_metric("segments_unplanned"), opened);
+    assert_eq!(
+        (opened, run.segments_skipped, run.blocks_skipped),
+        (2, 6, 4),
+        "opened, skipped segments, skipped blocks"
+    );
+    assert_eq!(
+        run.first_gets,
+        ["logs/seg7.rlog", "logs/seg0.rlog"],
+        "only the two opened segments are read"
+    );
+    assert_eq!(run.gets, 2, "one GET per opened segment");
+    assert_eq!(
+        (run.blocks_scanned, run.blocks_total),
+        (8, 2 * BLOCKS_PER_SEGMENT),
+        "a skipped unplanned segment's blocks are not counted"
+    );
+
+    // Late materialization reopens a segment by row ref: a row ref's block
+    // position must index the same block on the unplanned reopen.
+    let sql = "SELECT * FROM logs WHERE has_word(severity_text, 'INFO') \
+               ORDER BY ts LIMIT 10";
+    let run = same_rows(sql, Setup::new().unplanned()).await;
+    assert!(
+        run.has_fetch_node(),
+        "the rewrite must fire:\n{}",
+        run.explain
+    );
+    assert_bodies_in_order(&run.rows, &smallest_bodies(10, true));
+    assert!(run.segments_skipped > 0 && run.blocks_skipped > 0);
+    assert_eq!(
+        run.scan_metric("segments_unplanned"),
+        run.scan_metric("segments_opened")
     );
 }
