@@ -1759,10 +1759,21 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    summed charge is inside the budget. At the shipped defaults the derivation
    returns the 25,000-entry cap, so the budget is 22.5 MB per
    actively-queried tenant; at the 10,000-entry floor (which is also what
-   `--disable-cache` holds) it is 9 MB. `0` disables the cache. Each commit
-   record is read at most once per resolve: the cache cap bounds memory, not
-   the GET count, so a resolve over N uncached records issues N record GETs
-   whatever the cap.
+   `--disable-cache` holds) it is 9 MB. `0` disables the cache. On the
+   listing path each L0 commit record is read at most once per resolve: the
+   prewarm looks every listed record up in the cache first, fetches the
+   misses once, and hands the decoded records to the include pass, so a
+   resolve over N uncached records issues N record GETs whatever the cap.
+   The cap bounds the cache's memory, not the GET count, and not the memory
+   a resolve holds while it runs: the decoded records of the window stay
+   referenced until the include pass finishes, so a resolve over more
+   records than the cap holds more than the cache budget for its lifetime
+   (about 69 MB for 80,000 records against the 22.5 MB budget). Two paths
+   stay outside the once-per-resolve rule: a `min_token` lookup reads its
+   record through the cache after the listing and re-fetches it when a
+   later miss evicted it, and compaction and rewrite records keep their own
+   prewarm plus a cache re-read, so at a cap below their count each is
+   read twice.
 3. Tombstone present: the bucket contributes nothing to the snapshot.
    Otherwise, build ONE unified exclusion mechanism over the bucket
    (ADR-0064 unifies rewrite supersession with compaction's, rather than

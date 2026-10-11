@@ -44,7 +44,8 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 ///   on cost, not a promise about hit rate.
 ///
 /// Past the bound the tenant pays one GET per record the cache could not
-/// hold, on every resolve (a resolve still reads each record at most once),
+/// hold, on every resolve (a resolve still reads each listed L0 record at
+/// most once; a `min_token` lookup after an eviction re-reads its own),
 /// which is what `a_bound_below_the_hot_region_loses_the_saving` in
 /// tests/hot_record_cache.rs pins. The byte bound never over-allocates, but
 /// it is not free of a hit-rate cost the old flat entry count did not have:
@@ -166,7 +167,9 @@ pub const MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;
 /// one GET per uncached record on every resolve (docs/catalog-and-mvcc.md,
 /// and `a_bound_below_the_hot_region_loses_the_saving` in
 /// tests/hot_record_cache.rs). The cap bounds the cache's memory, not how
-/// often one resolve reads a record: each is read at most once. The levers for it are a coarser `max_flush_delay` or fewer shards,
+/// often one resolve reads a listed record (once) and not what the resolve
+/// holds while it runs (every decoded record of the window until the
+/// include pass ends). The levers for it are a coarser `max_flush_delay` or fewer shards,
 /// both of which shrink the tail itself; raising the ceiling is a code change
 /// today, since no flag exposes it.
 pub const MAX_CACHE_CAPACITY_PER_TENANT: usize = (MAX_RECORD_CACHE_BYTES_PER_TENANT

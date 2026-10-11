@@ -10521,9 +10521,14 @@ mod tests {
     /// cached).
     ///
     /// FLIP (raised cap): in `fetch_commit_record`, pass
-    /// `MAX_CACHE_CAPACITY_PER_TENANT` instead of
-    /// `self.config.cache_capacity_per_tenant`; the warm resolve then fetches
-    /// no record and the `warm record GETs` assertion fails.
+    /// `MAX_CACHE_CAPACITY_PER_TENANT` and `MAX_RECORD_CACHE_BYTES_PER_TENANT`
+    /// instead of the configured entry cap and byte budget. Both bounds have
+    /// to move: raising the entry cap alone leaves the byte budget at
+    /// `cap x 900` and the fixture's 864-byte records still fit exactly
+    /// `cap` of them at caps 8 and 13, so only cap 39 (40 x 864 under
+    /// 39 x 900) catches an entry-only raise. With both raised the warm
+    /// resolve fetches no record at every cap and the `warm record GETs`
+    /// assertion fails.
     /// FLIP (re-read warm): make `cached_commit_records` return an empty map;
     /// the warm resolve fetches all 40 and the same assertion fails.
     /// Against the pre-#2752 tree the cold assertion fails (2N + 3).
