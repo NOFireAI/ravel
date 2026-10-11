@@ -113,8 +113,9 @@ checkable. The committed `tier-b.json` was recorded through it at
 at the given commit, installs the toolchain from `rust-toolchain.toml`, runs
 `scripts/bench-tier-b.sh record` with the five stamps above in the label, copies
 the baseline back, and terminates the instance. Every input is a flag (or a
-`FRESH_BOX_*` environment variable) with no default; `--help` lists them, and a
-missing one exits 64 naming it before anything is launched.
+`FRESH_BOX_*` environment variable) with no default, except `--max-minutes`,
+which defaults to 600; `--help` lists them, and a missing one exits 64 naming
+it before anything is launched.
 
 ```sh
 scripts/bench/fresh-box.sh --dry-run \
@@ -148,10 +149,12 @@ The trap cannot run when the launcher is killed with SIGKILL or the operator's
 machine goes away. For that the instance's user-data runs
 `shutdown -h +MAX_MINUTES` at boot, and the instance is launched with
 `--instance-initiated-shutdown-behavior terminate`, so it terminates itself
-`--max-minutes` after boot. That input is required: pick a value that covers
-the cold build and the bench run, since the instance ends at that point
-whether or not the run finished. It relies on the AMI's cloud-init running
-user-data scripts.
+`--max-minutes` after boot. The default is 600, the ten hours every
+measurement box carries; a run that needs more raises it and says so on its
+issue, since the instance ends at that point whether or not the run
+finished. It relies on the AMI's cloud-init running user-data scripts, and
+cloud-init runs them once per instance, so the timer covers the first boot
+only.
 
 The script avoids bash 4 features so that it runs under bash 3.2, the
 `/bin/bash` of macOS.

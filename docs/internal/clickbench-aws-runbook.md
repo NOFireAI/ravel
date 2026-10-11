@@ -187,14 +187,23 @@ shutdown -h +600' \
   --query 'Instances[0].InstanceId' --output text
 ```
 
-Every measurement box self-terminates ten hours after boot: the user-data
-arms `shutdown -h +600` and the shutdown behaviour is `terminate`, so a box
-whose driver session died is gone by the next morning instead of billing
-until someone notices. Ten hours covers the longest run in this runbook
-(bootstrap, load, fold and a full concurrent pass) with margin; a run
-pre-registered to need more raises the figure in its own launch, and says
-so on its issue. `scripts/bench/fresh-box.sh` carries the same figure as
-the default of `--max-minutes`.
+Every measurement box self-terminates ten hours after its first boot: the
+user-data arms `shutdown -h +600` and the shutdown behaviour is `terminate`,
+so a box whose driver session died is gone by the next morning instead of
+billing until someone notices. Ten hours covers the longest run in this
+runbook (bootstrap, load, fold and a full concurrent pass) with margin; a
+run pre-registered to need more raises the figure in its own launch, and
+says so on its issue. `scripts/bench/fresh-box.sh` carries the same figure
+as the default of `--max-minutes`.
+
+The timer covers the first boot only. cloud-init runs a user-data script
+once per instance, not once per boot, so a box that was stopped and started
+again (section 11) comes up with no shutdown scheduled; re-arm it by hand
+right after the start:
+
+```sh
+sudo shutdown -h +600 "ravel-clickbench safety shutdown"
+```
 
 An IMDSv2 token is required to read instance metadata from on the box:
 
@@ -998,9 +1007,13 @@ identical. Before concluding a path is gone, check the symbol is present
 
 ## 11. Teardown
 
-Stopping preserves the EBS volume, so the corpus and pinned binaries survive
-and the box restarts ready to run. Terminating discards them; the load must be
-repeated.
+Stopping through the API preserves the EBS volume, so the corpus and pinned
+binaries survive and the box restarts ready to run. Terminating discards
+them; the load must be repeated. Only `aws ec2 stop-instances` preserves the
+volume: the box is launched with `--instance-initiated-shutdown-behavior
+terminate` (section 5), so an in-guest `shutdown`, `poweroff` or `halt`
+terminates the instance and discards the volume with it. A started box has
+no safety timer until it is re-armed (section 5).
 
 ```sh
 aws ec2 stop-instances      --instance-ids <id>   # keeps the volume, keeps billing for it
