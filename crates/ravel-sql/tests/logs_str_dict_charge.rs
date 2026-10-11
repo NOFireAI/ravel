@@ -11,6 +11,8 @@
 //! values of its own, so the group dictionary holds `COMMON + BLOCKS * UNIQUE`
 //! entries and a block's narrowed dictionary `COMMON + UNIQUE`.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,7 +91,7 @@ fn unique(block: usize, i: usize) -> String {
 /// the block.
 fn value_at(row: usize) -> String {
     let (block, r) = (row / BLOCK_ROWS, row % BLOCK_ROWS);
-    if r % 2 == 0 {
+    if r.is_multiple_of(2) {
         common((r / 2) % COMMON)
     } else {
         unique(block, (r / 2) % UNIQUE)
@@ -247,7 +249,7 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
     let mut charged = Vec::new();
     while let Some(batch) = stream.next().await {
         let batch = batch.expect("batch");
-        if batches.len() % 2 == 0 {
+        if batches.len().is_multiple_of(2) {
             let block = batches.len() / 2;
             charged.push(pool.reserved() - decoded[block]);
         }
