@@ -1764,16 +1764,21 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    prewarm looks every listed record up in the cache first, fetches the
    misses once, and hands the decoded records to the include pass, so a
    resolve over N uncached records issues N record GETs whatever the cap.
-   The cap bounds the cache's memory, not the GET count, and not the memory
-   a resolve holds while it runs: the decoded records of the window stay
-   referenced until the include pass finishes, so a resolve over more
-   records than the cap holds more than the cache budget for its lifetime
-   (about 69 MB for 80,000 records, three times the budget above). Two paths
-   stay outside the once-per-resolve rule: a `min_token` lookup reads its
-   record through the cache after the listing and re-fetches it when a
-   later miss evicted it, and compaction and rewrite records keep their own
-   prewarm plus a cache re-read, so at a cap below their count each is
-   read twice.
+   The cap bounds the cache's memory, not the GET count, and not what a
+   resolve holds while it runs: the records it found resident stay
+   referenced for the resolve's lifetime (at most the cache budget, since
+   they were resident when it started), and each in-flight bucket holds its
+   own fetched records until that bucket's include pass ends, with
+   `resolve_get_concurrency` (default 128) buckets in flight at once. So
+   one resolve peaks at about the cache budget plus `resolve_get_concurrency`
+   times the largest bucket's decoded records, and that figure is per
+   concurrent resolve, which is the number to hold next to the host-memory
+   gate. Two paths stay outside the once-per-resolve rule: a `min_token`
+   lookup reads its record through the cache after the listing and
+   re-fetches it when a later miss evicted it, and compaction records keep
+   their own prewarm plus a cache re-read, so at a cap below their count
+   each is read twice. Rewrite records are not cached at all: one GET per
+   record per resolve, whatever the cap.
 3. Tombstone present: the bucket contributes nothing to the snapshot.
    Otherwise, build ONE unified exclusion mechanism over the bucket
    (ADR-0064 unifies rewrite supersession with compaction's, rather than

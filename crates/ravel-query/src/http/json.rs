@@ -391,7 +391,7 @@ pub struct IoShapeJson {
     #[serde(rename = "unfoldedSegmentsResolved")]
     pub unfolded_segments_resolved: u64,
     /// EXACT count of COMMIT RECORDS this query's resolve found already
-    /// resident during its listing prewarm pass
+    /// resident in its resolve-wide cache lookup before any record GET
     /// (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
     /// from accounting; a record served afterwards through
     /// `resolve_min_token` is outside it, as are the records an attempt

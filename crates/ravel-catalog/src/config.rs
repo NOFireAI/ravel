@@ -168,10 +168,13 @@ pub const MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;
 /// and `a_bound_below_the_hot_region_loses_the_saving` in
 /// tests/hot_record_cache.rs). The cap bounds the cache's memory, not how
 /// often one resolve reads a listed record (once) and not what the resolve
-/// holds while it runs (every decoded record of the window until the
-/// include pass ends). The levers for it are a coarser `max_flush_delay` or fewer shards,
-/// both of which shrink the tail itself; raising the ceiling is a code change
-/// today, since no flag exposes it.
+/// holds while it runs: the records found resident stay referenced for the
+/// resolve's lifetime (at most this budget) and each in-flight bucket holds
+/// its fetched records until its include pass ends, `resolve_get_concurrency`
+/// buckets at a time, per concurrent resolve. The levers for it are a
+/// coarser `max_flush_delay` or fewer shards, both of which shrink the tail
+/// itself; raising the ceiling is a code change today, since no flag
+/// exposes it.
 pub const MAX_CACHE_CAPACITY_PER_TENANT: usize = (MAX_RECORD_CACHE_BYTES_PER_TENANT
     / (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT))
     as usize;

@@ -154,10 +154,10 @@
 //!   opened, from the query's shape and the resolve's own pruning outcome.
 //! - [`unfolded_records_served_from_cache`](QueryIoShape::unfolded_records_served_from_cache):
 //!   the EXACT count of COMMIT RECORDS this query's resolve found already
-//!   resident during its listing prewarm pass
+//!   resident in its resolve-wide cache lookup before any record GET
 //!   (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
 //!   from accounting, never inferred from the pooled cache counters. That
-//!   prewarm pass is the whole of it: a record served afterwards through
+//!   lookup is the whole of it: a record served afterwards through
 //!   `resolve_min_token`'s own cache lookup is not counted, nor are the
 //!   records an attempt abandoned to `SnapshotInvalidated` had warmed. The
 //!   counter's contract in `ravel-types` states both exclusions and is the
@@ -233,7 +233,7 @@ pub struct QueryIoShape {
     pub service_batches: u32,
     pub unfolded_segments_resolved: u64,
     /// EXACT count of commit records this query's resolve found already
-    /// resident during its listing prewarm pass
+    /// resident in its resolve-wide cache lookup before any record GET
     /// (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
     /// from accounting for the resolve(s) this query ran. A RECORD count,
     /// not a segment count -- see the module docs' entry of the same name

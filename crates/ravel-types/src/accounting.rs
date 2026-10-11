@@ -224,12 +224,13 @@ impl QueryAccounting {
     /// catalog's local decoded commit-record cache on the resolve path.
     ///
     /// Counted **once per commit record per resolve**, at the single site that
-    /// warms the cache before the include passes run (the prewarm pass). The
-    /// resolve path touches each commit-record key twice (a concurrent prewarm,
-    /// then a sequential include); crediting only the first, warming touch means
-    /// the double touch of one key counts once, and a record the resolve itself
-    /// fetched (not yet resident when prewarm reached it) counts zero, because
-    /// only a record already resident when the resolve began is a serve.
+    /// looks every listed record up in the cache before any record GET (the
+    /// resolve-wide lookup, `cached_commit_records`). The include pass reads
+    /// the decoded records that lookup and the prewarm fetch hand it and
+    /// touches the cache no further, so a record the resolve itself fetched
+    /// (not resident when the lookup reached it) counts zero: only a record
+    /// already resident when the resolve began is a serve. A later
+    /// `resolve_min_token` cache lookup on the same resolve credits nothing.
     ///
     /// This is a **commit-record-only** count, deliberately narrower than the
     /// pooled [`record_cache_hit`](Self::record_cache_hit): unlike that counter,

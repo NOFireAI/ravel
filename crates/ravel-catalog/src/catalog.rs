@@ -3760,10 +3760,13 @@ impl Catalog {
     /// bucket, a resolve over more records than the cache holds would evict
     /// each cached record before reaching it.
     ///
-    /// The single per-resolve site that decides "served from cache" for a
-    /// commit record: nothing later in the resolve touches the record cache
-    /// for an L0 record, so each is credited exactly once and a record this
-    /// resolve fetched itself is never credited.
+    /// The only `record_commit_record_cache_hit` site an L0 record reaches:
+    /// the include pass reads the decoded records it is handed and never
+    /// touches the cache, so each record is credited at most once and a
+    /// record this resolve fetched itself is never credited.
+    /// `resolve_min_token` looks an L0 key up in the cache after the listing
+    /// pass, but it credits nothing; a credit added there would double-count
+    /// a record this lookup already served.
     fn cached_commit_records(
         &self,
         tenant: &TenantHash,
