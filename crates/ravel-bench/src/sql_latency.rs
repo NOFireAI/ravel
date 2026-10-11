@@ -4269,7 +4269,7 @@ mod tests {
         let objects = write_matching_objects(&store, &tenant, 0, OBJECTS).await;
         let object_len = objects[0].len() as u64;
         assert!(
-            derive_suffix_len(object_len) >= object_len,
+            ravel_query::derive_suffix_len(object_len) >= object_len,
             "fixture: the derived probe must cover the whole {object_len}-byte object, \
              so every read of it shares one cache key"
         );
