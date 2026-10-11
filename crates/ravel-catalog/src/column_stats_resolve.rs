@@ -278,7 +278,7 @@ pub enum LoadColumnStatsError {
     },
     /// The process memory budget refused the reservation for a stats object's
     /// declared uncompressed body (ADR-1702 decision 6). Carries only the
-    /// budget's three figures.
+    /// budget's figures and the class that refused.
     #[error("column-stats decode refused: {0}")]
     MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
 }

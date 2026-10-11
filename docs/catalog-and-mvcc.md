@@ -1990,7 +1990,8 @@ pinning are unchanged:
    as a memory refusal with the breach and its counter lost. The
    column-statistics load reserves each object's declared body the same
    way and fails with `LoadColumnStatsError::MemoryExhausted`, which a SQL
-   client sees as the transient 503, never as corrupt data. Its header
+   client sees as 422 with the budget's own message (ADR-2633 section 5),
+   never as corrupt data. Its header
    checks (tenant_hash, format version and part binding) also read the
    peeked header and run before that reservation, so under memory pressure
    a foreign-tenant object still fails with

@@ -255,7 +255,7 @@ pub enum MetricsMetaError {
     DecompressedTooLarge { key: String, cap: usize },
     /// The process memory budget refused the reservation for the record's
     /// declared decompressed size (ADR-1702 decision 6). Carries only the
-    /// budget's three figures.
+    /// budget's figures and the class that refused.
     #[error("metadata record decode refused: {0}")]
     MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
     /// The read CPU gate produced no result for the body decode (ADR-1702

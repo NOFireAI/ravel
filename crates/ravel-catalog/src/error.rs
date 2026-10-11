@@ -182,7 +182,8 @@ pub enum CatalogError {
     /// or postings object's declared uncompressed length (ADR-1702 decision
     /// 6). The resolve fails rather than decoding uncharged or falling back
     /// to a listing pass that would hold more memory, not less. Carries only
-    /// the budget's three figures, never a key or tenant value.
+    /// the budget's figures and the class that refused, never a key or
+    /// tenant value.
     #[error("catalog decode refused: {0}")]
     MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
 }

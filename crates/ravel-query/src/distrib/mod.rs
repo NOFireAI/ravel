@@ -1055,7 +1055,10 @@ fn parse_worker_cap_refusal(msg: &str) -> Option<QueryError> {
 /// proto change is out of scope here. Until then, changing the budget's
 /// `Display` or the `fetch` prefix without updating this parser makes that
 /// test fail rather than silently degrading the coordinator to a generic
-/// error.
+/// error. During a rolling upgrade a worker on the previous build still
+/// sends the retired "byte budget" wording; it parses to `None` here and
+/// answers 503 as before, which is the pre-change behaviour and accepted
+/// until the proto field exists.
 fn parse_fetch_memory_exhausted(msg: &str) -> Option<ravel_memory::MemoryExhausted> {
     let rest = msg.strip_prefix("fetch memory exhausted: ")?;
     if let Some(rest) = rest.strip_prefix("requested ") {
