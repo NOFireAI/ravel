@@ -6354,4 +6354,483 @@ mod tests {
             "both low blocks, the one after the skip included, decode whole"
         );
     }
+
+    /// Per-block content evaluation (ADR-2773 decision D2) against the
+    /// row-by-row [`eval`] it replaced.
+    mod block_predicate {
+        use super::*;
+        use proptest::prelude::*;
+
+        const BODIES: [&str; 5] = ["alpha beta", "beta gamma", "gamma", "", "alpha delta"];
+        const LO: [&str; 3] = ["x", "y", "x y"];
+        const ZZ: [&str; 3] = ["p q", "q", "p"];
+        const F: [f64; 3] = [0.0, -0.0, 1.5];
+
+        /// One generated record: indexes into the pools above, `None` for an
+        /// attribute the record does not carry.
+        #[derive(Clone, Debug)]
+        struct Row {
+            stream: u8,
+            ts: i64,
+            body: usize,
+            lo: Option<usize>,
+            hi: bool,
+            n: Option<i64>,
+            flag: Option<bool>,
+            blob: Option<u8>,
+            f: Option<usize>,
+            zz: Option<usize>,
+        }
+
+        fn row() -> impl Strategy<Value = Row> {
+            (
+                (0u8..6, 0i64..40, 0usize..BODIES.len()),
+                (
+                    proptest::option::of(0usize..LO.len()),
+                    any::<bool>(),
+                    proptest::option::of(-2i64..3),
+                    proptest::option::of(any::<bool>()),
+                ),
+                (
+                    proptest::option::of(0u8..3),
+                    proptest::option::of(0usize..F.len()),
+                    proptest::option::of(0usize..ZZ.len()),
+                ),
+            )
+                .prop_map(|((stream, ts, body), (lo, hi, n, flag), (blob, f, zz))| Row {
+                    stream,
+                    ts,
+                    body,
+                    lo,
+                    hi,
+                    n,
+                    flag,
+                    blob,
+                    f,
+                    zz,
+                })
+        }
+
+        fn blob(b: u8) -> Vec<u8> {
+            [vec![], vec![1], vec![2, 3]][b as usize].clone()
+        }
+
+        /// The records, and the dynamic column cap that gives every attribute
+        /// but `zz` (last in the writer's `(name, type)` order) a column, so
+        /// `zz` always overflows into `attrs_raw`.
+        fn corpus(rows: &[Row]) -> (Vec<LogRecord>, usize) {
+            let mut pairs = std::collections::BTreeSet::new();
+            let recs = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let mut attrs = Vec::new();
+                    if let Some(v) = r.lo {
+                        attrs.push(attr("lo", AttrValue::Str(LO[v].into())));
+                    }
+                    if r.hi {
+                        attrs.push(attr("hi", AttrValue::Str(format!("u{i}"))));
+                    }
+                    if let Some(v) = r.n {
+                        attrs.push(attr("n", AttrValue::I64(v)));
+                    }
+                    if let Some(v) = r.flag {
+                        attrs.push(attr("flag", AttrValue::Bool(v)));
+                    }
+                    if let Some(v) = r.blob {
+                        attrs.push(attr("blob", AttrValue::Bytes(blob(v))));
+                    }
+                    if let Some(v) = r.f {
+                        attrs.push(attr("f", AttrValue::F64(F[v])));
+                    }
+                    for (k, _) in &attrs {
+                        pairs.insert(k.clone());
+                    }
+                    if let Some(v) = r.zz {
+                        attrs.push(attr("zz", AttrValue::Str(ZZ[v].into())));
+                    }
+                    rec_attrs(r.stream, r.ts, BODIES[r.body], attrs)
+                })
+                .collect();
+            (recs, pairs.len())
+        }
+
+        /// The attribute equality arms: every column type, a dictionary and a
+        /// plain string column, values present and absent, and arms whose
+        /// value type has no column (`n` as a string, `zz` as an integer) or
+        /// whose field overflows (`zz`), which take the per-row path.
+        fn attr_equals() -> Vec<(&'static str, AttrValue)> {
+            vec![
+                ("lo", AttrValue::Str("x".into())),
+                ("lo", AttrValue::Str("x y".into())),
+                ("lo", AttrValue::Str("nope".into())),
+                ("hi", AttrValue::Str("u3".into())),
+                ("hi", AttrValue::Str("u0".into())),
+                ("n", AttrValue::I64(0)),
+                ("n", AttrValue::I64(2)),
+                ("n", AttrValue::Str("1".into())),
+                ("flag", AttrValue::Bool(true)),
+                ("flag", AttrValue::Bool(false)),
+                ("blob", AttrValue::Bytes(vec![2, 3])),
+                ("blob", AttrValue::Bytes(vec![])),
+                ("f", AttrValue::F64(0.0)),
+                ("f", AttrValue::F64(-0.0)),
+                ("zz", AttrValue::Str("q".into())),
+                ("zz", AttrValue::Str("p q".into())),
+                ("zz", AttrValue::I64(1)),
+                ("missing", AttrValue::Str("x".into())),
+            ]
+        }
+
+        fn ts_arm() -> impl Strategy<Value = Predicate> {
+            (-2i64..42, 0i64..24).prop_map(|(min_ns, len)| Predicate::TsRange {
+                min_ns,
+                max_ns: min_ns + len,
+            })
+        }
+
+        fn stream_arm() -> impl Strategy<Value = Predicate> {
+            proptest::collection::vec(0u8..8, 1..6)
+                .prop_map(|s| Predicate::StreamIn(s.into_iter().map(sid).collect()))
+        }
+
+        fn arm() -> impl Strategy<Value = Predicate> {
+            let words = ["alpha", "beta", "gamma delta", "x", "u1", "p", "q", "1"];
+            prop_oneof![
+                3 => ts_arm(),
+                3 => stream_arm(),
+                1 => (0usize..BODIES.len()).prop_map(|b| Predicate::Equals {
+                    field: FieldSel::Body,
+                    value: AttrValue::Str(BODIES[b].into()),
+                }),
+                1 => Just(Predicate::Equals {
+                    field: FieldSel::Body,
+                    value: AttrValue::I64(1),
+                }),
+                1 => prop_oneof![Just("INFO"), Just("WARN")].prop_map(|s| Predicate::Equals {
+                    field: FieldSel::SeverityText,
+                    value: AttrValue::Str(s.into()),
+                }),
+                1 => (0usize..words.len()).prop_map(move |w| Predicate::HasWord {
+                    field: FieldSel::Body,
+                    word: words[w].into(),
+                }),
+                3 => (0usize..attr_equals().len()).prop_map(|i| {
+                    let (name, value) = attr_equals().swap_remove(i);
+                    Predicate::Equals {
+                        field: FieldSel::Attr(name.into()),
+                        value,
+                    }
+                }),
+                2 => (0usize..4, 0usize..words.len()).prop_map(move |(f, w)| {
+                    Predicate::HasWord {
+                        field: FieldSel::Attr(["lo", "hi", "zz", "n"][f].into()),
+                        word: words[w].into(),
+                    }
+                }),
+                1 => Just(Predicate::NumRange {
+                    field: FieldSel::Attr("n".into()),
+                    ty: FieldType::I64,
+                    min: Some(1),
+                    max: Some(1),
+                }),
+            ]
+        }
+
+        /// What [`eval`] gives row by row over the whole predicate: the
+        /// matching rows ascending, or an error if any row errors.
+        fn oracle(
+            sd: &StreamDir,
+            fd: &FieldDir,
+            pred: &Predicate,
+            block: &DecodedBlock,
+        ) -> Result<Vec<usize>, LogSegError> {
+            let mut out = Vec::new();
+            for row in 0..block.record_count() {
+                if eval(sd, fd, pred, block, row)? {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        }
+
+        fn kernel(
+            sd: &StreamDir,
+            fd: &FieldDir,
+            pred: &Predicate,
+            loc: &BlockLoc,
+            block: &DecodedBlock,
+        ) -> Result<Vec<usize>, LogSegError> {
+            let mut flat = Vec::new();
+            flatten(pred, &mut flat);
+            let arms = compile_arms(sd, fd, &flat);
+            let mut out = Vec::new();
+            block_survivors(
+                sd,
+                fd,
+                &arms,
+                loc,
+                block,
+                &mut ScanStats::default(),
+                &mut out,
+            )?;
+            Ok(out)
+        }
+
+        /// An integer column cell: absent, or a value.
+        fn cell(range: std::ops::Range<i64>) -> impl Strategy<Value = Option<i64>> {
+            proptest::option::weighted(0.9, range)
+        }
+
+        /// A block's honest skip-index bounds over its present cells. A
+        /// negative ref has no `u32` bound, so a block holding one reads as
+        /// bounds no ref satisfies.
+        fn loc_for(ts: &[Option<i64>], refs: &[Option<i64>]) -> BlockLoc {
+            let ts: Vec<i64> = ts.iter().flatten().copied().collect();
+            let present: Vec<i64> = refs.iter().flatten().copied().collect();
+            let (min_stream_ref, max_stream_ref) = match (
+                present.iter().min().map(|&v| u32::try_from(v)),
+                present.iter().max().map(|&v| u32::try_from(v)),
+            ) {
+                (Some(Ok(lo)), Some(Ok(hi))) => (lo, hi),
+                _ => (1, 0),
+            };
+            BlockLoc {
+                record_count: refs.len(),
+                crc32c: 0,
+                block_index: 0,
+                min_ts: ts.iter().min().copied().unwrap_or(0),
+                max_ts: ts.iter().max().copied().unwrap_or(0),
+                min_stream_ref,
+                max_stream_ref,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The block kernels keep exactly the rows the old per-row
+            /// [`eval`] kept, over writer-built objects (dictionary and plain
+            /// string pages, NULL attribute cells, an overflowing attribute in
+            /// `attrs_raw`) and over hand-built blocks with absent and
+            /// out-of-range `ts`/`stream_ref` cells.
+            #[test]
+            fn block_predicate_kernel_matches_row_by_row_eval(
+                rows in proptest::collection::vec(row(), 1..60),
+                block_target_records in 2usize..12,
+                group_target_blocks in 1usize..4,
+                arms in proptest::collection::vec(arm(), 1..=4),
+                cells in (1usize..140).prop_flat_map(|n| (
+                    proptest::collection::vec(cell(0..30), n),
+                    proptest::collection::vec(cell(-1..8), n),
+                    proptest::collection::vec(cell(-1..3), n),
+                )),
+                synthetic_arms in proptest::collection::vec(
+                    prop_oneof![
+                        ts_arm(),
+                        stream_arm(),
+                        (-1i64..3).prop_map(|v| Predicate::Equals {
+                            field: FieldSel::Attr("n".into()),
+                            value: AttrValue::I64(v),
+                        }),
+                    ],
+                    1..=4,
+                ),
+            ) {
+                let (recs, columns) = corpus(&rows);
+                let cfg = RlogConfig {
+                    block_target_records,
+                    group_target_blocks,
+                    max_dynamic_columns: columns,
+                    ..RlogConfig::default()
+                };
+                let obj = build(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                let pred = Predicate::And(arms);
+
+                // Every block, decoded whole: the kernel sees windows and
+                // stream sets that cover, cut, and miss it, which pruning
+                // would otherwise keep it from seeing.
+                let mut all = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while all.next_block_columnar(&obj).expect("decode").is_some() {
+                    let loc = all.blocks[all.next - 1];
+                    let block = all.current.as_ref().expect("decoded");
+                    let want = oracle(sd, fd, &pred, block).expect("oracle");
+                    let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
+                    prop_assert_eq!(got, want, "block {}", loc.block_index);
+                }
+
+                // The scan itself, pruning included.
+                let mut scan = reader
+                    .scan_blocks(&pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    let want = oracle(sd, fd, &pred, block).expect("oracle");
+                    prop_assert_eq!(&scan.surviving, &want);
+                }
+
+                // Hand-built blocks with absent cells, a negative ref, and
+                // refs past the directory. Only the outcome is compared on an
+                // error: the kernels visit arm by arm, so which row's error
+                // surfaces first may differ.
+                let (ts, refs, n) = cells;
+                let mut cols = vec![
+                    (COL_TS, I64Column::from_options(&ts)),
+                    (COL_STREAM_REF, I64Column::from_options(&refs)),
+                ];
+                if let Some(e) = fd.column("n", FieldType::I64) {
+                    cols.push((e.column_id, I64Column::from_options(&n)));
+                }
+                let loc = loc_for(&ts, &refs);
+                let block = DecodedBlock::with_i64_columns(refs.len(), cols);
+                let pred = Predicate::And(synthetic_arms);
+                let want = oracle(sd, fd, &pred, &block);
+                let got = kernel(sd, fd, &pred, &loc, &block);
+                match (&got, &want) {
+                    (Ok(g), Ok(w)) => prop_assert_eq!(g, w),
+                    (Err(_), Err(_)) => {}
+                    _ => prop_assert!(false, "kernel {got:?}, row-by-row {want:?}"),
+                }
+            }
+        }
+
+        /// The generator's corpus reaches the page shapes the property claims
+        /// to cover: `lo` stored on dictionary pages, the per-row-unique `hi`
+        /// on plain pages, and `zz` in `attrs_raw`.
+        #[test]
+        fn kernel_corpus_reaches_dict_plain_and_overflow_pages() {
+            let rows: Vec<Row> = (0..24)
+                .map(|i| Row {
+                    stream: (i % 3) as u8,
+                    ts: i,
+                    body: i as usize % BODIES.len(),
+                    lo: Some(i as usize % 2),
+                    hi: true,
+                    n: (i % 4 != 0).then_some(i % 3),
+                    flag: Some(i % 2 == 0),
+                    blob: Some((i % 3) as u8),
+                    f: Some(i as usize % F.len()),
+                    zz: Some(i as usize % ZZ.len()),
+                })
+                .collect();
+            let (recs, columns) = corpus(&rows);
+            let cfg = RlogConfig {
+                block_target_records: 8,
+                max_dynamic_columns: columns,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let fd = &*reader.field_dir;
+            let lo = fd.column("lo", FieldType::Str).expect("lo column").column_id;
+            let hi = fd.column("hi", FieldType::Str).expect("hi column").column_id;
+            assert!(fd.column("zz", FieldType::Str).is_none(), "zz overflows");
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut blocks = 0;
+            while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                let block = scan.current.as_ref().expect("decoded");
+                assert!(matches!(block.str_column(lo), Some(StrColumn::Dict(_))));
+                assert!(matches!(block.str_column(hi), Some(StrColumn::Plain(_))));
+                assert!(block.str_column(COL_ATTRS_RAW).is_some());
+                blocks += 1;
+            }
+            assert_eq!(blocks, 3);
+        }
+
+        fn eval_calls() -> u64 {
+            EVAL_CALLS.with(std::cell::Cell::get)
+        }
+
+        fn kernel_arms() -> u64 {
+            KERNEL_ARMS.with(std::cell::Cell::get)
+        }
+
+        /// A block the window and the stream set both cover keeps every row
+        /// without evaluating any; an overflow attribute arm on top of them
+        /// costs exactly one [`eval`] per row and no kernel.
+        #[test]
+        fn block_wholly_inside_the_window_makes_no_per_row_eval() {
+            let recs: Vec<LogRecord> = (0..24)
+                .map(|i| {
+                    rec_attrs(
+                        1 + (i % 2) as u8,
+                        100 + i,
+                        "b",
+                        vec![
+                            attr("a", AttrValue::I64(i)),
+                            attr("zz", AttrValue::Str(ZZ[(i % 3) as usize].into())),
+                        ],
+                    )
+                })
+                .collect();
+            let cfg = RlogConfig {
+                block_target_records: 6,
+                max_dynamic_columns: 1,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            assert!(
+                reader.field_dir.column("zz", FieldType::Str).is_none(),
+                "zz overflows into attrs_raw"
+            );
+            let covering = vec![
+                Predicate::TsRange {
+                    min_ns: 100,
+                    max_ns: 123,
+                },
+                Predicate::StreamIn(vec![sid(1), sid(2), sid(9)]),
+            ];
+
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(
+                    &Predicate::And(covering.clone()),
+                    &[],
+                    &ColumnSelection::all(),
+                )
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 24, "every row survives");
+            assert_eq!(stats.blocks_scanned, 4);
+            assert_eq!(eval_calls() - evals, 0, "no per-row eval");
+            assert_eq!(kernel_arms() - kernels, 0, "no block kernel");
+            assert_eq!(stats.blocks_predicate_dropped, 4, "every block drops every arm");
+            assert_eq!(stats.rows_predicate_evaluated, 0);
+
+            let mut with_overflow = covering;
+            with_overflow.push(Predicate::Equals {
+                field: FieldSel::Attr("zz".into()),
+                value: AttrValue::Str("q".into()),
+            });
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(
+                    &Predicate::And(with_overflow),
+                    &[],
+                    &ColumnSelection::all(),
+                )
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 8, "the rows whose zz is \"q\"");
+            assert_eq!(eval_calls() - evals, 24, "one eval per row the bounds kept");
+            assert_eq!(kernel_arms() - kernels, 0, "the ts and stream arms dropped");
+            assert_eq!(stats.blocks_predicate_dropped, 0);
+            assert_eq!(stats.rows_predicate_evaluated, 24);
+        }
+    }
 }
