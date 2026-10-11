@@ -5269,6 +5269,7 @@ mod tests {
                     store,
                     Signal::Metrics,
                     clock.clone(),
+                    Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
                 )
                 .with_budget(Arc::clone(&budget)),
             );
@@ -5557,8 +5558,14 @@ mod tests {
         };
         assert_eq!(config.flush_share_per_tenant(), 1);
         let router = Arc::new(
-            IngestRouter::new(config, store, Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                store,
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let tenant = TenantId::new("histograms");
         let gate = fault.hold(

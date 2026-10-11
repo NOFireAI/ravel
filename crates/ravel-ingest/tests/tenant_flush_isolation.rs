@@ -410,6 +410,7 @@ async fn buffered_flush_queued_past_its_hours_bound_is_abandoned_and_counted() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let a_points: Vec<_> = (0..400u32)
@@ -1030,7 +1031,13 @@ fn new_metrics_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> IngestRouter {
-    IngestRouter::new(config, store, Signal::Metrics, clock)
+    IngestRouter::new(
+        config,
+        store,
+        Signal::Metrics,
+        clock,
+        Arc::new(PendingAckBudget::new(0)),
+    )
 }
 
 fn new_log_router(
@@ -1038,7 +1045,7 @@ fn new_log_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> LogIngestRouter {
-    LogIngestRouter::new(config, store, clock)
+    LogIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
 }
 
 fn new_span_router(
@@ -1046,7 +1053,7 @@ fn new_span_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> SpanIngestRouter {
-    SpanIngestRouter::new(config, store, clock)
+    SpanIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
 }
 
 /// The three share tests, once per pipeline. `$new` builds the router,
