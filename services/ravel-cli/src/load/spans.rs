@@ -41,6 +41,14 @@ pub struct SpansLoadReport {
     /// reconciled against the stored records.
     pub attributes_dropped: u64,
     pub elapsed: Duration,
+    /// The flush target and pipeline depth the load ran with. `None` when no
+    /// batch was decoded.
+    pub geometry: Option<LoadGeometry>,
+    /// The router's flush counts split by trigger cause. The span router
+    /// counts per router, so this carries totals only.
+    pub flush_mix: FlushMixReport,
+    /// [`layout_no_effect_warning`] over this load's tokens.
+    pub target_bytes_no_effect_warning: Option<String>,
 }
 
 impl SpansLoadReport {
@@ -52,6 +60,17 @@ impl SpansLoadReport {
             .iter()
             .filter(|t| seen.insert(t.encode()))
             .count()
+    }
+
+    /// The layout report the summary renders and prints as JSON.
+    pub fn layout_report(&self) -> LoadLayoutReport {
+        LoadLayoutReport {
+            signal: "spans".to_string(),
+            objects_written: self.objects_written(),
+            geometry: self.geometry,
+            flush_mix: self.flush_mix.clone(),
+            target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
+        }
     }
 }
 
@@ -942,9 +961,8 @@ pub async fn load_spans(
         shards,
         batch_rows,
         skip_rows,
-        pipeline_depth,
+        GeometryRequest::explicit(target_bytes, pipeline_depth),
         max_inflight_flushes,
-        target_bytes,
         max_flush_delay,
         now_ns,
         clock,
@@ -958,6 +976,10 @@ pub async fn load_spans(
 /// them. Today that is [`SpansLoadReport::attributes_dropped`]: an
 /// approximation the operator has to be told about, and one a failure does not
 /// undo for the batches that did land.
+///
+/// `request` leaves the target and depth to [`resolve_geometry`] where they
+/// are `None`; the router is built once the first non-empty batch is decoded,
+/// since a derived target is read off that batch's estimate.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_spans_into(
     report: &mut SpansLoadReport,
@@ -968,9 +990,8 @@ pub(super) async fn load_spans_into(
     shards: u32,
     batch_rows: usize,
     skip_rows: u64,
-    pipeline_depth: usize,
+    request: GeometryRequest,
     max_inflight_flushes: u32,
-    target_bytes: usize,
     max_flush_delay: Option<Duration>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
@@ -984,13 +1005,7 @@ pub(super) async fn load_spans_into(
                 .to_string(),
         ));
     }
-    if pipeline_depth == 0 {
-        return Err(LoadError::Setup(
-            "--pipeline-depth must be at least 1 (the number of concurrent in-flight writes); 0 \
-             was given"
-                .to_string(),
-        ));
-    }
+    request.validate()?;
     if max_inflight_flushes == 0 {
         return Err(LoadError::Setup(
             "--max-inflight-flushes must be at least 1 (the number of flushes one shard may have \
@@ -999,13 +1014,8 @@ pub(super) async fn load_spans_into(
                 .to_string(),
         ));
     }
-    if target_bytes == 0 {
-        return Err(LoadError::Setup(
-            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
-             given"
-                .to_string(),
-        ));
-    }
+    let memory_budget =
+        request.sequential_memory_budget(u64::from(shards) * u64::from(max_inflight_flushes))?;
     // Both attribute-count caps live in `validate`, which also runs at mapping
     // parse: they are properties of the mapping alone.
     mapping.validate()?;
@@ -1031,12 +1041,17 @@ pub(super) async fn load_spans_into(
         ))
     })?;
 
-    let router = Arc::new(SpanIngestRouter::new(
-        build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
-        Arc::clone(&store),
-        clock,
-        Arc::new(PendingAckBudget::new(0)),
-    ));
+    let build_router = |target_bytes: usize| {
+        Arc::new(SpanIngestRouter::new(
+            build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Arc::new(PendingAckBudget::new(0)),
+        ))
+    };
+    let mut lazy: Option<(Arc<SpanIngestRouter>, LoadGeometry, DepthWindow)> = None;
+    let mut enqueue = EnqueueTracker::new();
+    let mut depth_flushes: u64 = 0;
     let ack_deadline = write_ack_deadline(max_flush_delay);
 
     let input = FileInput { path: parquet_path };
@@ -1070,7 +1085,7 @@ pub(super) async fn load_spans_into(
     let mapped_keys = Arc::new(mapping.mapped_keys());
 
     let mut inflight: std::collections::VecDeque<Inflight<SpanWriteReceipt, SpanWriteError>> =
-        std::collections::VecDeque::with_capacity(pipeline_depth);
+        std::collections::VecDeque::new();
 
     loop {
         let mapping_for_decode = Arc::clone(&mapping);
@@ -1139,16 +1154,46 @@ pub(super) async fn load_spans_into(
             continue;
         }
 
+        let (router, geometry, window) = lazy.get_or_insert_with(|| {
+            let resolved = resolve_geometry(
+                request.target_bytes,
+                request.pipeline_depth,
+                shards,
+                batch_rows,
+                spans.len(),
+                ravel_ingest::est_spans_object_bytes(&spans),
+                memory_budget,
+            );
+            (
+                build_router(resolved.target_bytes),
+                resolved,
+                DepthWindow::new(&resolved),
+            )
+        });
+        let pipeline_depth = geometry.pipeline_depth;
+
         let handle = {
-            let router = Arc::clone(&router);
+            let router = Arc::clone(router);
             let tenant = tenant_id.clone();
+            let enqueued = enqueue.guard();
             tokio::spawn(async move {
-                router
-                    .write(tenant, spans, WriteMode::Strict, ack_deadline)
-                    .await
+                let submitted = router
+                    .submit(tenant, spans, WriteMode::Strict, ack_deadline)
+                    .await;
+                drop(enqueued);
+                submitted?.acks().await
             })
         };
         inflight.push_back((rows, rows, handle));
+
+        // The depth flush runs before the window is resolved, so the oldest
+        // write the loop waits on below has always been flushed already.
+        if window.submitted() {
+            enqueue.wait_enqueued().await;
+            let before = router.metrics_snapshot().flushes_manual;
+            router.flush_all().await;
+            depth_flushes += router.metrics_snapshot().flushes_manual - before;
+        }
 
         // Bound true concurrency to `pipeline_depth`, resolving strictly
         // oldest-first so the token list and the first error stay in
@@ -1171,8 +1216,14 @@ pub(super) async fn load_spans_into(
     // Publish the tail buffers before draining, for the same reason the other
     // paths do: no later batch is coming to push a buffer past
     // `--target-bytes`, so its writes' acks would otherwise wait out the age
-    // trigger. The ticker sweeps a straggler whose send landed after this
-    // flush.
+    // trigger. Every submit is enqueued first, so the flush drains every
+    // buffered write; the ticker is a backstop that should find nothing.
+    let Some((router, geometry, _)) = lazy else {
+        // Nothing was decoded, so nothing was submitted.
+        report.elapsed = started.elapsed();
+        return Ok(());
+    };
+    enqueue.wait_enqueued().await;
     router.flush_all().await;
     let drain_result = {
         let ticker_router = Arc::clone(&router);
@@ -1194,6 +1245,25 @@ pub(super) async fn load_spans_into(
     };
     drain_result?;
 
+    let m = router.metrics_snapshot();
+    let totals = FlushMixCounts {
+        size: m.flushes_by_size,
+        age: m.flushes_by_age + m.flushes_by_age_floor + m.flushes_by_arrival,
+        depth: depth_flushes,
+        manual: m.flushes_manual.saturating_sub(depth_flushes),
+    };
+    report.flush_mix = FlushMixReport {
+        shards: Vec::new(),
+        totals,
+    };
+    report.target_bytes_no_effect_warning = layout_no_effect_warning(
+        geometry.target_bytes,
+        geometry.target_source,
+        &report.tokens,
+        batch_rows,
+        shards,
+    );
+    report.geometry = Some(geometry);
     report.elapsed = started.elapsed();
     Ok(())
 }

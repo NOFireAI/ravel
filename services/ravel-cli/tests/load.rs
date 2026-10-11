@@ -571,7 +571,7 @@ async fn load_budgeted(
         shards,
         batch_rows,
         None,
-        load::DEFAULT_PIPELINE_DEPTH,
+        load::MEASURED_PIPELINE_DEPTH,
         target_bytes,
         max_flush_delay,
         memory,
@@ -669,7 +669,7 @@ async fn load_memory_budget_bounds_the_load_and_keeps_bytes() {
         &pq,
         2,
         BATCH_ROWS,
-        load::DEFAULT_TARGET_BYTES,
+        load::PER_BATCH_TARGET_BYTES,
         None,
         flag(u64::MAX),
     )
@@ -698,7 +698,7 @@ async fn load_memory_budget_bounds_the_load_and_keeps_bytes() {
                 &pq,
                 2,
                 BATCH_ROWS,
-                load::DEFAULT_TARGET_BYTES,
+                load::PER_BATCH_TARGET_BYTES,
                 None,
                 options,
             )
@@ -762,7 +762,7 @@ async fn load_memory_budget_bounds_the_load_and_keeps_bytes() {
         &pq,
         2,
         BATCH_ROWS,
-        load::DEFAULT_TARGET_BYTES,
+        load::PER_BATCH_TARGET_BYTES,
         None,
         flag(batch - 1),
     )
@@ -1024,7 +1024,7 @@ async fn small_batches_with_a_large_target_merge_without_deadlock() {
         &pq,
         1,
         BATCH_ROWS,
-        load::DEFAULT_TARGET_BYTES,
+        load::PER_BATCH_TARGET_BYTES,
         None,
         flag(u64::MAX),
     )
@@ -1098,7 +1098,7 @@ async fn a_derived_budget_below_one_batch_runs_one_batch_at_a_time() {
         &pq,
         2,
         BATCH_ROWS,
-        load::DEFAULT_TARGET_BYTES,
+        load::PER_BATCH_TARGET_BYTES,
         None,
         flag(u64::MAX),
     )
@@ -1113,7 +1113,7 @@ async fn a_derived_budget_below_one_batch_runs_one_batch_at_a_time() {
         &pq,
         2,
         BATCH_ROWS,
-        load::DEFAULT_TARGET_BYTES,
+        load::PER_BATCH_TARGET_BYTES,
         None,
         load::LoadMemoryOptions::new(load::LoadMemoryRequest::Derived {
             host_total_bytes: Some(HOST),
@@ -1166,7 +1166,7 @@ async fn a_derived_budget_below_one_batch_runs_one_batch_at_a_time() {
         &pq,
         2,
         BATCH_ROWS,
-        load::DEFAULT_TARGET_BYTES,
+        load::PER_BATCH_TARGET_BYTES,
         None,
         flag(batch - 1),
     )
@@ -1200,7 +1200,7 @@ async fn a_budget_that_never_binds_lays_out_the_unbudgeted_objects() {
             &pq,
             1,
             BATCH_ROWS,
-            load::DEFAULT_TARGET_BYTES,
+            load::PER_BATCH_TARGET_BYTES,
             None,
             memory,
         )

@@ -102,10 +102,10 @@ async fn the_entry_point_emits_the_overflow_warning() {
         10_000,
         0,
         None,
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         None,
@@ -216,10 +216,10 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
                 16,
                 0,
                 Some(shards as usize),
-                4,
+                Some(4),
                 DEFAULT_MAX_INFLIGHT_FLUSHES,
                 DEFAULT_DECODE_QUEUE_BATCHES,
-                target_bytes,
+                Some(target_bytes),
                 None,
                 RlogZstdLevel::DEFAULT,
                 None,
@@ -260,7 +260,7 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
 /// accumulating case starts warning (its `is_none` assertion fails at
 /// "a repeated token is a flush that answered two batches"); delete the
 /// `< 2` writes-per-shard guard and the one-write-per-shard case starts
-/// warning; change the `target_bytes <= DEFAULT_TARGET_BYTES` guard to `<`
+/// warning; change the `target_bytes <= PER_BATCH_TARGET_BYTES` guard to `<`
 /// and the default-target case starts warning.
 #[test]
 fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
@@ -290,7 +290,7 @@ fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
     );
 
     assert!(
-        target_bytes_no_effect_warning(DEFAULT_TARGET_BYTES, &inert, 16, 4).is_none(),
+        target_bytes_no_effect_warning(PER_BATCH_TARGET_BYTES, &inert, 16, 4).is_none(),
         "the default target is not a no-op, it is the documented per-batch layout"
     );
 
@@ -357,10 +357,10 @@ async fn a_failed_load_still_prints_the_one_batch_warning() {
         2,
         0,
         Some(1),
-        1,
+        Some(1),
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
-        DEFAULT_TARGET_BYTES,
+        Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::DEFAULT,
         LoadMemoryRequest::Derived {

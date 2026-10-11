@@ -979,7 +979,7 @@ mod empty_dictionary_chunk_file {
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
-            DEFAULT_TARGET_BYTES,
+            PER_BATCH_TARGET_BYTES,
             None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),

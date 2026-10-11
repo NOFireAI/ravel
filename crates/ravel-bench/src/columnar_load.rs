@@ -380,7 +380,8 @@ enum Built {
 fn config(shards: u32) -> IngestConfig {
     // `target_bytes: 1` flushes each write as one RLOG object inside the size
     // trigger, so every batch is one object with no lingering buffer, and flush
-    // timing stays off the wall clock. Same config the CLI loader uses.
+    // timing stays off the wall clock. The CLI loader's `--target-bytes 1`
+    // layout; its default derives a larger target (issue #2753).
     IngestConfig {
         shard_count: shards,
         target_bytes: 1,
