@@ -926,11 +926,8 @@ impl LogFlushCtx {
         let encoded = match self.bound_to_deadline(deadline_ns, encode).await {
             Some(Ok(encoded)) => encoded,
             Some(Err(err)) => {
-                // Nothing was written, and the job's charges dropped with its
-                // result. A gate failure is the server's, not the input's: the
-                // waiters get the retryable answer an encode panic gave when it
-                // took the actor down, and the flush counts in no abandoned_*
-                // counter.
+                // Gate fault: see `GATE_DEADLINE_MESSAGE`.
+                self.metrics.record_flush_gate_fault();
                 tracing::error!(
                     shard = self.shard,
                     error = %err,
@@ -940,8 +937,7 @@ impl LogFlushCtx {
                 return;
             }
             None => {
-                // The job's charges drop with it: now if it never started,
-                // when it returns if it did.
+                // Deadline: see `GATE_DEADLINE_MESSAGE`.
                 self.metrics.record_abandoned_queue_deadline();
                 self.ack_waiters(
                     waiters,

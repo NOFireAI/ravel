@@ -454,6 +454,9 @@ pub async fn load_catalog_from_object(
     // An absent EXEMPLARS section is legal and the common case: this costs two
     // extra ranged GETs (the LABEL_DICT the attributes intern into, and the
     // section itself) only for an object that actually carries exemplars.
+    // The fetch happens here, before the catalog decode below rather than
+    // beside the exemplar decode, so the gated job can own the bytes; a
+    // corrupt catalog section therefore pays these two GETs before it fails.
     let exemplar_sections = if footer.sections.iter().any(|s| s.kind == EXEMPLARS) {
         Some((
             get_section(store, &object_key, &footer, LABEL_DICT, ledger).await?,

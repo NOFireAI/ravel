@@ -176,6 +176,11 @@ Acked buffered rows can be lost in these cases:
   abandoned without a PUT rather than published into an hour the catalog has
   already sealed. `ravel_ingest_abandoned_hour_bound_total` counts these
   flushes.
+- **A flush whose encode fails on the write gate.** If the encode job panics,
+  or the runtime cancels it while shutting down, nothing is stored and the
+  buffered rows are dropped. Strict waiters get a retryable 503.
+  `ravel_ingest_flush_gate_faults_total` counts these flushes; any increase
+  is a server defect.
 
 One stalled tenant holds at most `--max-inflight-flushes-per-tenant` of its
 shard's permits (default 3 of 4), so a co-resident tenant's flush normally

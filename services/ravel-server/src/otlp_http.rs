@@ -458,7 +458,6 @@ async fn admit_and_decode_body(
             // not just by --max-inflight-ingest-requests. A body whose inflate
             // would cross the ceiling is shed mid-inflate (429), before the
             // process grows by the full expansion.
-            //
             let inflated = match inflate_gzip_gated(
                 state.write_gate.as_deref(),
                 body,

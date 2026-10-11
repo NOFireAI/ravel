@@ -26,8 +26,8 @@
 //!   are the six trigger counters (`flushes_by_size`, `flushes_by_age`,
 //!   `flushes_by_age_adaptive`, `flushes_by_age_floor`, `flushes_by_arrival`,
 //!   and `flushes_manual`) summed, minus `abandoned_retry_exhausted`,
-//!   `abandoned_input_rejected`, `abandoned_queue_deadline`, and
-//!   `abandoned_hour_bound`; the bare
+//!   `abandoned_input_rejected`, `abandoned_queue_deadline`,
+//!   `abandoned_hour_bound`, and `flush_gate_faults`; the bare
 //!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
 //!   waiters are acked, i.e. at the flush's terminal outcome. They count
@@ -168,6 +168,12 @@ pub struct IngestMetrics {
     /// `abandoned_retry_exhausted` because `error.rs` already treats the two
     /// causes differently.
     abandoned_input_rejected: AtomicU64,
+    /// Flushes whose ADR-1702 write gate encode returned no result, because
+    /// the job panicked or the runtime cancelled it
+    /// (`WriteError::ShardUnavailable`). Nothing was stored and the buffered
+    /// rows are dropped. A server fault, kept out of the `abandoned_*` family;
+    /// the shard keeps running, so `shard_deaths` does not move either.
+    flush_gate_faults: AtomicU64,
     /// Cumulative bytes admitted into shard buffers at enqueue time.
     buffered_bytes_total: AtomicU64,
     /// Cumulative sample count admitted into shard buffers at enqueue time.
@@ -785,6 +791,9 @@ pub struct IngestMetricsSnapshot {
     /// their pinned hour's end plus `max_flush_lifetime` (ADR-2708 D3).
     pub abandoned_hour_bound: u64,
     pub abandoned_input_rejected: u64,
+    /// Flushes whose write gate encode returned no result (the job panicked
+    /// or was cancelled). Not an `abandoned_*` cause.
+    pub flush_gate_faults: u64,
     pub buffered_bytes_total: u64,
     pub buffered_points_total: u64,
     pub acks_ok: u64,
@@ -1113,6 +1122,12 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A flush whose write gate encode returned no result
+    /// (`WriteError::ShardUnavailable`): a server fault, retryable.
+    pub(crate) fn record_flush_gate_fault(&self) {
+        self.flush_gate_faults.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_buffered(&self, bytes: u64, points: u64) {
         self.buffered_bytes_total
             .fetch_add(bytes, Ordering::Relaxed);
@@ -1303,6 +1318,7 @@ impl IngestMetrics {
             abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_hour_bound: self.abandoned_hour_bound.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
+            flush_gate_faults: self.flush_gate_faults.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_points_total: self.buffered_points_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
@@ -1800,12 +1816,16 @@ mod tests {
         metrics.record_abandoned_hour_bound();
         metrics.record_abandoned_hour_bound();
         metrics.record_abandoned_hour_bound();
+        for _ in 0..4 {
+            metrics.record_flush_gate_fault();
+        }
 
         let snap = metrics.snapshot();
         assert_eq!(snap.abandoned_retry_exhausted, 2);
         assert_eq!(snap.abandoned_input_rejected, 1);
         assert_eq!(snap.abandoned_queue_deadline, 1);
         assert_eq!(snap.abandoned_hour_bound, 3);
+        assert_eq!(snap.flush_gate_faults, 4);
     }
 
     /// Each hand-back counts on the total and on exactly one per-reason
