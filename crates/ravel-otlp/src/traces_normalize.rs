@@ -52,7 +52,7 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use ravel_rspan::{StatusCode, merge_attrs};
 
-use crate::label_projection::exact_capacity;
+use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
 use crate::promcompat::format_float;
 use crate::traces_limits::{SpanIngestLimits, SpanRejection};
 
@@ -135,6 +135,21 @@ pub fn normalize_traces(
     limits: &SpanIngestLimits,
     ingest_ts_ns: i64,
 ) -> SpanNormalizeOutput {
+    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits);
+    normalize_traces_projected(req, limits, ingest_ts_ns, projected)
+}
+
+/// [`normalize_traces`] for a caller that already projected `req` with
+/// [`crate::project_span_resolved_label_bytes`] under the same `limits`, so
+/// the request is walked once. `projected` is checked against
+/// `max_resolved_label_bytes_per_request` exactly as the plain entry point
+/// checks its own projection.
+pub fn normalize_traces_projected(
+    req: ExportTraceServiceRequest,
+    limits: &SpanIngestLimits,
+    ingest_ts_ns: i64,
+    projected: ProjectedLabelBytes,
+) -> SpanNormalizeOutput {
     let total_spans: usize = req.resource_spans.iter().map(resource_span_count).sum();
     if total_spans > limits.max_spans_per_request {
         return SpanNormalizeOutput {
@@ -148,8 +163,8 @@ pub fn normalize_traces(
 
     // Every span merges its resource and scope attributes into its own, so
     // attribute bytes grow with spans times resource width, which no per-span
-    // limit bounds (ADR-2708 D2). Read-only, before any span is built.
-    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits);
+    // limit bounds (ADR-2708 D2). Checked before any span is built.
+    let projected = projected.get();
     if projected > limits.max_resolved_label_bytes_per_request {
         return SpanNormalizeOutput {
             spans: Vec::new(),
@@ -1556,7 +1571,7 @@ mod tests {
         // `otel.scope.version="1"` 83. Each span inherits 1232.
         let req = wide_resource_request(N, 1_000);
         let projected =
-            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default());
+            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default()).get();
         assert_eq!(projected, 1_067 + 165 + 1_232 * N);
 
         let limits = SpanIngestLimits {
@@ -1579,6 +1594,44 @@ mod tests {
         let out = normalize(wide_resource_request(N, 1_000));
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), N);
+    }
+
+    #[test]
+    fn a_passed_projection_under_the_bound_is_admitted_without_a_second_walk() {
+        const N: usize = 50;
+        let limits = SpanIngestLimits {
+            max_resolved_label_bytes_per_request: 10_000,
+            ..SpanIngestLimits::default()
+        };
+        let req = wide_resource_request(N, 1_000);
+        assert!(crate::project_span_resolved_label_bytes(&req, &limits).get() > 10_000);
+
+        let out = normalize_traces_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(0));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), N);
+    }
+
+    #[test]
+    fn a_passed_projection_over_the_bound_is_rejected_with_that_value() {
+        const MAX: usize = 10_000;
+        let limits = SpanIngestLimits {
+            max_resolved_label_bytes_per_request: MAX,
+            ..SpanIngestLimits::default()
+        };
+        let req = wide_resource_request(1, 1);
+        assert!(crate::project_span_resolved_label_bytes(&req, &limits).get() <= MAX);
+
+        let out =
+            normalize_traces_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+        assert!(out.spans.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![SpanRejection::ResolvedLabelBytesExceeded {
+                projected: MAX + 1,
+                max: MAX,
+                count: 1,
+            }]
+        );
     }
 
     #[test]
@@ -1644,7 +1697,7 @@ mod tests {
             resource_spans(vec![], vec![scope_spans("other", "", spans(3_000))]),
         ]);
         let limits = SpanIngestLimits::default();
-        let projected = crate::project_span_resolved_label_bytes(&req, &limits);
+        let projected = crate::project_span_resolved_label_bytes(&req, &limits).get();
         let out = normalize_traces(req, &limits, 5_000);
         // Array and kvlist values are dropped with a notice, not the span.
         assert!(
@@ -1694,8 +1747,8 @@ mod tests {
                 )],
             )])
         };
-        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits)
-            - crate::project_span_resolved_label_bytes(&req(1), &limits);
+        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits).get()
+            - crate::project_span_resolved_label_bytes(&req(1), &limits).get();
         let out = normalize_traces(req(1), &limits, 5_000);
         for s in &out.spans {
             for (k, v) in &s.attrs {

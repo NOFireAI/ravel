@@ -13,7 +13,7 @@ use ravel_ingest::{
     IngestPoint, IngestRouter, MetadataSink, RequestRejection, WriteError, WriteMode,
     plausible_ingest_clock,
 };
-use ravel_otlp::normalize::normalize_metrics_with_metadata;
+use ravel_otlp::normalize::normalize_metrics_with_metadata_projected;
 use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
@@ -196,15 +196,22 @@ pub async fn handle_export(
     // tenant x lifetime series cardinality (the same growth vector
     // `shard.rs`'s per-flush cap comment already rejected building one layer
     // lower).
+    let projected = ravel_otlp::project_resolved_label_bytes(&request, &state.limits);
     let label_charge = charge_projected_labels(
         &state.budget,
-        ravel_otlp::project_resolved_label_bytes(&request, &state.limits),
+        projected.get(),
         state.limits.max_resolved_label_bytes_per_request,
     )
     .map_err(|IngestByteShed| IngestRequestError::Write(WriteError::BufferBudgetExceeded))?;
     let mut cap = ExemplarCap::new(state.limits.exemplar_cap_window_ns);
-    let (result, metadata) =
-        normalize_metrics_with_metadata(&tenant, request, &state.limits, ingest_ts_ns, &mut cap);
+    let (result, metadata) = normalize_metrics_with_metadata_projected(
+        &tenant,
+        request,
+        &state.limits,
+        ingest_ts_ns,
+        &mut cap,
+        projected,
+    );
     // Capture this request's `(family, type, help, unit)` tuples (ADR-0085
     // decision 1). Synchronous, no I/O, infallible: it only compares
     // fingerprints and stores the changed ones for the background flush window,
@@ -1612,7 +1619,7 @@ mod tests {
             }
         }
         let projected =
-            ravel_otlp::project_resolved_label_bytes(&request, &IngestLimits::default());
+            ravel_otlp::project_resolved_label_bytes(&request, &IngestLimits::default()).get();
         assert!(projected > 0, "the fixture projects some label bytes");
         let budget = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Bounded(
             projected as u64 - 1,
@@ -1693,7 +1700,8 @@ mod tests {
             ravel_otlp::project_resolved_label_bytes(
                 &labelled_gauge_request(),
                 &IngestLimits::default()
-            ),
+            )
+            .get(),
             "the label charge is exactly the projection"
         );
         assert!(router_bytes > 0, "the router charged the batch");

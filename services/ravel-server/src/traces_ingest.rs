@@ -12,7 +12,9 @@ use ravel_ingest::{
     WriteMode, plausible_ingest_clock, write_marker,
 };
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::{NormalizeRejectCounts, SpanIngestLimits, SpanRejection, normalize_traces};
+use ravel_otlp::{
+    NormalizeRejectCounts, SpanIngestLimits, SpanRejection, normalize_traces_projected,
+};
 use ravel_types::{CommitToken, Signal, TenantId};
 
 use crate::otlp_http::{
@@ -219,15 +221,16 @@ pub async fn handle_export_traces(
         }
     }
 
+    let projected = ravel_otlp::project_span_resolved_label_bytes(&request, &state.limits);
     let label_charge = crate::ingest::charge_projected_labels(
         &state.budget,
-        ravel_otlp::project_span_resolved_label_bytes(&request, &state.limits),
+        projected.get(),
         state.limits.max_resolved_label_bytes_per_request,
     )
     .map_err(|ravel_ingest::IngestByteShed| {
         SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)
     })?;
-    let normalized = normalize_traces(request, &state.limits, ingest_ts_ns);
+    let normalized = normalize_traces_projected(request, &state.limits, ingest_ts_ns, projected);
     // `rejected_spans` counts only spans that never reached storage. An
     // attribute-level rejection (one oversized/malformed attribute, an
     // over-long events/links blob, a bad parent_span_id) drops a single field
@@ -694,7 +697,7 @@ mod tests {
             request(vec![stale.clone(), stale])
         };
         let projected =
-            ravel_otlp::project_span_resolved_label_bytes(&stale_request(), &state().limits);
+            ravel_otlp::project_span_resolved_label_bytes(&stale_request(), &state().limits).get();
         assert!(projected > 0, "the fixture projects some label bytes");
 
         let mut state = state();

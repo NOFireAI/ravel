@@ -76,7 +76,7 @@ use ravel_types::{
     TypeError,
 };
 
-use crate::label_projection::exact_capacity;
+use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
 use crate::limits::{IngestLimits, Rejection};
 use crate::metadata::{MetricKind, MetricMetadata};
 use crate::promcompat::format_float;
@@ -220,7 +220,16 @@ pub fn normalize_metrics_with_exemplars(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
-    normalize_impl(tenant, req, limits, ingest_ts_ns, exemplar_cap, None)
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    normalize_impl(
+        tenant,
+        req,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        projected,
+        None,
+    )
 }
 
 /// Decode and normalize gauge and sum data points exactly like
@@ -244,6 +253,30 @@ pub fn normalize_metrics_with_metadata(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    normalize_metrics_with_metadata_projected(
+        tenant,
+        req,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        projected,
+    )
+}
+
+/// [`normalize_metrics_with_metadata`] for a caller that already projected
+/// `req` with [`crate::project_resolved_label_bytes`] under the same `limits`,
+/// so the request is walked once. `projected` is checked against
+/// `max_resolved_label_bytes_per_request` exactly as the plain entry point
+/// checks its own projection.
+pub fn normalize_metrics_with_metadata_projected(
+    tenant: &TenantId,
+    req: ExportMetricsServiceRequest,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+    projected: ProjectedLabelBytes,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     let mut collector = MetadataCollector::default();
     let result = normalize_impl(
         tenant,
@@ -251,21 +284,24 @@ pub fn normalize_metrics_with_metadata(
         limits,
         ingest_ts_ns,
         exemplar_cap,
+        projected,
         Some(&mut collector),
     );
     (result, collector.entries)
 }
 
-/// Shared body of the two exemplar-carrying entry points. `metadata_out` is
-/// `Some` only for [`normalize_metrics_with_metadata`]; when `None`, the suffix
-/// pass still runs (names are unconditional) but no metadata is collected, so
-/// the older entry points stay behaviorally identical apart from the names.
+/// Shared body of the two exemplar-carrying entry points. `projected` is the
+/// caller's projection of `req`. `metadata_out` is `Some` only for
+/// [`normalize_metrics_with_metadata`]; when `None`, the suffix pass still
+/// runs (names are unconditional) but no metadata is collected, so the older
+/// entry points stay behaviorally identical apart from the names.
 fn normalize_impl(
     tenant: &TenantId,
     mut req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
+    projected: ProjectedLabelBytes,
     mut metadata_out: Option<&mut MetadataCollector>,
 ) -> MetricsNormalizeResult {
     let total_points = count_data_points(&req);
@@ -302,9 +338,9 @@ fn normalize_impl(
 
     // Third bound, on the label bytes the points would carry (ADR-2708 D2):
     // neither count above sees attribute width, so a request under both can
-    // still build an unbounded label volume. Read-only, before any label set
+    // still build an unbounded label volume. Checked before any label set
     // exists.
-    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    let projected = projected.get();
     if projected > limits.max_resolved_label_bytes_per_request {
         return whole_request_rejection(
             &req,
@@ -6049,7 +6085,7 @@ mod tests {
         const P: usize = 100;
         let req = wide_gauge_request(P, 1_000, true);
         // `__name__="g"` is 73 bytes, `k=<1000 bytes>` 1065, per point.
-        let projected = crate::project_resolved_label_bytes(&req, &IngestLimits::default());
+        let projected = crate::project_resolved_label_bytes(&req, &IngestLimits::default()).get();
         assert_eq!(projected, P * (73 + 1_065));
 
         memo_stats::reset();
@@ -6079,6 +6115,57 @@ mod tests {
     }
 
     #[test]
+    fn a_passed_projection_under_the_bound_is_admitted_without_a_second_walk() {
+        const P: usize = 100;
+        let limits = limits_with_label_bytes(10_000);
+        let req = wide_gauge_request(P, 1_000, true);
+        assert!(crate::project_resolved_label_bytes(&req, &limits).get() > 10_000);
+
+        let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+        let (result, _) = normalize_metrics_with_metadata_projected(
+            &tenant(),
+            req,
+            &limits,
+            1_000_000,
+            &mut cap,
+            ProjectedLabelBytes::for_test(0),
+        );
+        assert!(
+            result.output.rejected.is_empty(),
+            "{:?}",
+            result.output.rejected
+        );
+        assert_eq!(result.output.points.len(), P);
+    }
+
+    #[test]
+    fn a_passed_projection_over_the_bound_is_rejected_with_that_value() {
+        const MAX: usize = 10_000;
+        let limits = limits_with_label_bytes(MAX);
+        let req = wide_gauge_request(1, 1, false);
+        assert!(crate::project_resolved_label_bytes(&req, &limits).get() <= MAX);
+
+        let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+        let (result, _) = normalize_metrics_with_metadata_projected(
+            &tenant(),
+            req,
+            &limits,
+            1_000_000,
+            &mut cap,
+            ProjectedLabelBytes::for_test(MAX + 1),
+        );
+        assert!(result.output.points.is_empty());
+        assert_eq!(
+            result.output.rejected,
+            vec![Rejection::ResolvedLabelBytesExceeded {
+                projected: MAX + 1,
+                max: MAX,
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
     fn identical_attribute_run_counts_once() {
         let limits = IngestLimits::default();
         // One `{__name__="g", k="a"}` set: 73 + 66 bytes, whatever the run
@@ -6086,18 +6173,18 @@ mod tests {
         for n in [1, 2, 100] {
             let req = wide_gauge_request(n, 1, false);
             assert_eq!(
-                crate::project_resolved_label_bytes(&req, &limits),
+                crate::project_resolved_label_bytes(&req, &limits).get(),
                 139,
                 "{n}"
             );
         }
         // Two alternating values never share a set: every point counts.
         assert_eq!(
-            crate::project_resolved_label_bytes(&wide_gauge_request(2, 1, true), &limits),
+            crate::project_resolved_label_bytes(&wide_gauge_request(2, 1, true), &limits).get(),
             278
         );
         assert_eq!(
-            crate::project_resolved_label_bytes(&wide_gauge_request(100, 1, true), &limits),
+            crate::project_resolved_label_bytes(&wide_gauge_request(100, 1, true), &limits).get(),
             100 * 139
         );
 
@@ -6145,7 +6232,10 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         )]);
-        assert_eq!(crate::project_resolved_label_bytes(&small, &limits), 1_064);
+        assert_eq!(
+            crate::project_resolved_label_bytes(&small, &limits).get(),
+            1_064
+        );
 
         // One point at the bucket cap with one 4000-byte attribute: 163
         // series copy that attribute, about 670 KB, so a 100 KB bound refuses
@@ -6160,7 +6250,7 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         )]);
-        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
         assert!(projected >= 163 * 4_065, "{projected}");
 
         let bounded = limits_with_label_bytes(100_000);
@@ -6384,7 +6474,7 @@ mod tests {
                     resource.clone(),
                     vec![metric.clone()],
                 )]);
-                let projected = crate::project_resolved_label_bytes(&req, &limits);
+                let projected = crate::project_resolved_label_bytes(&req, &limits).get();
                 label_capacity_stats::reset();
                 let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
                 assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6403,7 +6493,7 @@ mod tests {
                 .map(|(resource, metrics)| resource_metrics(resource, metrics))
                 .collect(),
         );
-        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
         label_capacity_stats::reset();
         let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6439,7 +6529,7 @@ mod tests {
                 summary_metric("s", vec![summary_point(vec![], 1_000, 1, 1.0, vec![])]),
             ],
         )]);
-        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
         label_capacity_stats::reset();
         let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6520,7 +6610,7 @@ mod tests {
         for metric in every_metric_path(attributes, bounds, quantiles) {
             let name = metric.name.clone();
             let req = request(vec![resource_metrics(resource.to_vec(), vec![metric])]);
-            let projected = crate::project_resolved_label_bytes(&req, limits);
+            let projected = crate::project_resolved_label_bytes(&req, limits).get();
             label_capacity_stats::reset();
             let out = normalize_metrics(&tenant(), req, limits, 1_000_000);
             let sets = out
@@ -6694,7 +6784,7 @@ mod tests {
             + allowlist.iter().map(|key| label(key.len())).sum::<usize>();
         // Every point builds its own set: the prefix, `__name__="g"` (73) and
         // `k` (66), with nothing shared between alternating neighbours.
-        let projected = crate::project_resolved_label_bytes(&req, &limits);
+        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
         assert_eq!(projected, prefix + POINTS * (prefix + 73 + 66));
         assert!(projected > limits.max_resolved_label_bytes_per_request);
 

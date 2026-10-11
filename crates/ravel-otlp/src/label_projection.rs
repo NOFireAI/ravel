@@ -56,6 +56,26 @@ use crate::traces_normalize::{
 /// log attribute's `(String, AttrValue)` pair (56).
 pub const RESOLVED_LABEL_OVERHEAD_BYTES: usize = 64;
 
+/// The result of one `project_*` walk over a request. Only the projection
+/// functions construct one, so a value handed to a `_projected` normalizer
+/// entry point is a real projection rather than an arbitrary number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectedLabelBytes(usize);
+
+impl ProjectedLabelBytes {
+    /// The projected byte count.
+    pub fn get(self) -> usize {
+        self.0
+    }
+
+    /// A projection of `n` bytes that no walk produced, for tests of the
+    /// `_projected` entry points.
+    #[cfg(test)]
+    pub(crate) fn for_test(n: usize) -> Self {
+        Self(n)
+    }
+}
+
 /// Longest suffix the classic histogram and summary explosion appends to a
 /// family name (`_bucket`, `_count`, `_sum`).
 const EXPLODE_SUFFIX_MAX_LEN: usize = "_bucket".len();
@@ -130,11 +150,13 @@ pub(crate) fn exact_capacity(mut s: String) -> String {
 pub fn project_resolved_label_bytes(
     req: &ExportMetricsServiceRequest,
     limits: &IngestLimits,
-) -> usize {
-    req.resource_metrics
-        .iter()
-        .map(|rm| project_resource_metrics(rm, limits))
-        .fold(0usize, usize::saturating_add)
+) -> ProjectedLabelBytes {
+    ProjectedLabelBytes(
+        req.resource_metrics
+            .iter()
+            .map(|rm| project_resource_metrics(rm, limits))
+            .fold(0usize, usize::saturating_add),
+    )
 }
 
 fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usize {
@@ -404,7 +426,7 @@ fn project_memo_run<'a>(
 pub fn project_log_resolved_label_bytes(
     req: &ExportLogsServiceRequest,
     limits: &LogIngestLimits,
-) -> usize {
+) -> ProjectedLabelBytes {
     let mut total = 0usize;
     for rl in &req.resource_logs {
         let resource_attributes = rl
@@ -442,7 +464,7 @@ pub fn project_log_resolved_label_bytes(
             }
         }
     }
-    total
+    ProjectedLabelBytes(total)
 }
 
 /// Bytes of the LEB128 encoding of `value`.
@@ -562,7 +584,7 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
 pub fn project_span_resolved_label_bytes(
     req: &ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
-) -> usize {
+) -> ProjectedLabelBytes {
     let mut total = 0usize;
     for rs in &req.resource_spans {
         let resource_attributes = rs
@@ -607,7 +629,7 @@ pub fn project_span_resolved_label_bytes(
             }
         }
     }
-    total
+    ProjectedLabelBytes(total)
 }
 
 fn span_attrs_bytes(attributes: &[KeyValue]) -> usize {

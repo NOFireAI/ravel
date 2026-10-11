@@ -419,7 +419,8 @@ async fn stored_data_keys(store: &Arc<dyn ObjectStoreBackend>) -> Vec<String> {
 async fn metrics_over_the_bound_are_rejected_whole_and_counted() {
     let request = exploding_histogram_request();
     let projected =
-        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default());
+        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default())
+            .get();
     assert!(
         projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         "fixture must project past the default bound: {projected}"
@@ -457,7 +458,8 @@ async fn logs_over_the_bound_are_rejected_whole_and_counted() {
     let projected = ravel_otlp::project_log_resolved_label_bytes(
         &request,
         &ravel_otlp::LogIngestLimits::default(),
-    );
+    )
+    .get();
     assert!(
         projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         "fixture must project past the default bound: {projected}"
@@ -489,7 +491,8 @@ async fn traces_over_the_bound_are_rejected_whole_and_counted() {
     let projected = ravel_otlp::project_span_resolved_label_bytes(
         &request,
         &ravel_otlp::SpanIngestLimits::default(),
-    );
+    )
+    .get();
     assert!(
         projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         "fixture must project past the default bound: {projected}"
@@ -522,7 +525,8 @@ async fn traces_over_the_bound_are_rejected_whole_and_counted() {
 async fn the_measured_gauge_shape_is_rejected_at_default_limits() {
     let request = measured_gauge_request();
     let projected =
-        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default());
+        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default())
+            .get();
     assert!(
         projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         "fixture must project past the default bound: {projected}"
@@ -658,7 +662,8 @@ async fn a_projection_over_the_byte_budget_is_shed_with_429() {
     let projected = ravel_otlp::project_resolved_label_bytes(
         &stale_gauge_request(),
         &ravel_otlp::IngestLimits::default(),
-    );
+    )
+    .get();
     assert!(
         projected as u64 > BUDGET
             && projected <= ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,

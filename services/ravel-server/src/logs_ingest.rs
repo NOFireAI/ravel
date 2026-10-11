@@ -16,7 +16,7 @@ use ravel_ingest::{
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs};
+use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs_projected};
 use ravel_types::logstream::LogStreamId;
 use ravel_types::{CommitToken, Signal, TenantId};
 
@@ -362,15 +362,16 @@ pub async fn handle_export_logs(
         }
     }
 
+    let projected = ravel_otlp::project_log_resolved_label_bytes(&request, &state.limits);
     let label_charge = crate::ingest::charge_projected_labels(
         &state.budget,
-        ravel_otlp::project_log_resolved_label_bytes(&request, &state.limits),
+        projected.get(),
         state.limits.max_resolved_label_bytes_per_request,
     )
     .map_err(|ravel_ingest::IngestByteShed| {
         LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)
     })?;
-    let normalized = normalize_logs(request, &state.limits, ingest_ts_ns);
+    let normalized = normalize_logs_projected(request, &state.limits, ingest_ts_ns, projected);
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
     // Layer 3's rejections, counted where they are observed. The body
     // conversions alongside them are not rejections: those records passed
@@ -1020,7 +1021,7 @@ mod tests {
             request(vec![rec.clone(), rec])
         };
         let projected =
-            ravel_otlp::project_log_resolved_label_bytes(&stale_request(), &state().limits);
+            ravel_otlp::project_log_resolved_label_bytes(&stale_request(), &state().limits).get();
         assert!(projected > 0, "the fixture projects some label bytes");
 
         let mut state = state();

@@ -44,7 +44,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use ravel_logseg::{MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
-use crate::label_projection::exact_capacity;
+use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
 use crate::logs_limits::{LogIngestLimits, LogRejection};
 use crate::promcompat::format_float;
 
@@ -100,6 +100,21 @@ pub fn normalize_logs(
     limits: &LogIngestLimits,
     ingest_ts_ns: i64,
 ) -> LogNormalizeOutput {
+    let projected = crate::label_projection::project_log_resolved_label_bytes(&req, limits);
+    normalize_logs_projected(req, limits, ingest_ts_ns, projected)
+}
+
+/// [`normalize_logs`] for a caller that already projected `req` with
+/// [`crate::project_log_resolved_label_bytes`] under the same `limits`, so the
+/// request is walked once. `projected` is checked against
+/// `max_resolved_label_bytes_per_request` exactly as the plain entry point
+/// checks its own projection.
+pub fn normalize_logs_projected(
+    req: ExportLogsServiceRequest,
+    limits: &LogIngestLimits,
+    ingest_ts_ns: i64,
+    projected: ProjectedLabelBytes,
+) -> LogNormalizeOutput {
     let total_records: usize = req.resource_logs.iter().map(resource_record_count).sum();
     if total_records > limits.max_records_per_request {
         return LogNormalizeOutput {
@@ -114,8 +129,8 @@ pub fn normalize_logs(
 
     // Every record copies its stream attributes, so attribute bytes grow
     // with records times stream width, which no per-record limit bounds
-    // (ADR-2708 D2). Read-only, before any record is built.
-    let projected = crate::label_projection::project_log_resolved_label_bytes(&req, limits);
+    // (ADR-2708 D2). Checked before any record is built.
+    let projected = projected.get();
     if projected > limits.max_resolved_label_bytes_per_request {
         return LogNormalizeOutput {
             records: Vec::new(),
@@ -3154,7 +3169,8 @@ mod tests {
         // 1+3, version 1+1, empty scope set 1), built once per scope and
         // copied once per record.
         let req = wide_stream_request(N, 1_000);
-        let projected = crate::project_log_resolved_label_bytes(&req, &LogIngestLimits::default());
+        let projected =
+            crate::project_log_resolved_label_bytes(&req, &LogIngestLimits::default()).get();
         assert_eq!(projected, 1_067 + 1_015 * (N + 1));
 
         let limits = LogIngestLimits {
@@ -3180,6 +3196,44 @@ mod tests {
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), N);
         assert!(out.records.iter().all(|r| r.stream_attrs.len() == 1_015));
+    }
+
+    #[test]
+    fn a_passed_projection_under_the_bound_is_admitted_without_a_second_walk() {
+        const N: usize = 50;
+        let limits = LogIngestLimits {
+            max_resolved_label_bytes_per_request: 10_000,
+            ..LogIngestLimits::default()
+        };
+        let req = wide_stream_request(N, 1_000);
+        assert!(crate::project_log_resolved_label_bytes(&req, &limits).get() > 10_000);
+
+        let out = normalize_logs_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(0));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), N);
+    }
+
+    #[test]
+    fn a_passed_projection_over_the_bound_is_rejected_with_that_value() {
+        const MAX: usize = 10_000;
+        let limits = LogIngestLimits {
+            max_resolved_label_bytes_per_request: MAX,
+            ..LogIngestLimits::default()
+        };
+        let req = wide_stream_request(1, 1);
+        assert!(crate::project_log_resolved_label_bytes(&req, &limits).get() <= MAX);
+
+        let out =
+            normalize_logs_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+        assert!(out.records.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::ResolvedLabelBytesExceeded {
+                projected: MAX + 1,
+                max: MAX,
+                count: 1,
+            }]
+        );
     }
 
     /// Heap bytes a converted value actually allocated: string and byte
@@ -3254,7 +3308,7 @@ mod tests {
             resource_logs(vec![], vec![scope_logs("other", "", records(3_000))]),
         ]);
         let limits = LogIngestLimits::default();
-        let projected = crate::project_log_resolved_label_bytes(&req, &limits);
+        let projected = crate::project_log_resolved_label_bytes(&req, &limits).get();
         let out = normalize_logs(req, &limits, 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 15);
@@ -3318,8 +3372,8 @@ mod tests {
                 )],
             )])
         };
-        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits)
-            - crate::project_log_resolved_label_bytes(&req(1), &limits);
+        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits).get()
+            - crate::project_log_resolved_label_bytes(&req(1), &limits).get();
         let out = normalize_logs(req(1), &limits, 5_000);
         for r in &out.records {
             for (k, v) in &r.attrs {

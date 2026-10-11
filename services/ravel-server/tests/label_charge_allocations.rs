@@ -254,7 +254,7 @@ async fn a_shed_projection_allocates_nothing_near_the_label_bytes() {
 
     // Metrics.
     let limits = IngestLimits::default();
-    let projected = ravel_otlp::project_resolved_label_bytes(&wide_gauge_request(), &limits);
+    let projected = ravel_otlp::project_resolved_label_bytes(&wide_gauge_request(), &limits).get();
     let request = wide_gauge_request();
     let region = Region::new(&INSTRUMENTED_SYSTEM);
     let output = ravel_otlp::normalize_metrics(&tenant, request, &limits, INGEST_TS_NS);
@@ -284,7 +284,7 @@ async fn a_shed_projection_allocates_nothing_near_the_label_bytes() {
     // Logs.
     let limits = LogIngestLimits::default();
     let projected =
-        ravel_otlp::project_log_resolved_label_bytes(&wide_stream_log_request(), &limits);
+        ravel_otlp::project_log_resolved_label_bytes(&wide_stream_log_request(), &limits).get();
     let request = wide_stream_log_request();
     let region = Region::new(&INSTRUMENTED_SYSTEM);
     let output = ravel_otlp::normalize_logs(request, &limits, INGEST_TS_NS);
@@ -317,7 +317,7 @@ async fn a_shed_projection_allocates_nothing_near_the_label_bytes() {
     // Traces.
     let limits = SpanIngestLimits::default();
     let projected =
-        ravel_otlp::project_span_resolved_label_bytes(&wide_resource_span_request(), &limits);
+        ravel_otlp::project_span_resolved_label_bytes(&wide_resource_span_request(), &limits).get();
     let request = wide_resource_span_request();
     let region = Region::new(&INSTRUMENTED_SYSTEM);
     let output = ravel_otlp::normalize_traces(request, &limits, INGEST_TS_NS);
