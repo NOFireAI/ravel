@@ -1660,13 +1660,18 @@ async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
 /// instead of a suffix probe in the plan phase followed by the scan's own
 /// reads. The planned route over the same corpus is measured beside it, both
 /// to pin what the bound saves and to compare rows.
+///
+/// The scan skips the plan only when it holds at least as many sub-bound
+/// segments as partitions, so the fixture asks for fewer partitions than its
+/// segments, as on any corpus larger than the plan fan-out. Three partitions
+/// over eight segments give unequal round-robin shares (3, 3 and 2), so a
+/// routing decision taken per partition would disagree across partitions and
+/// read an object twice.
 #[tokio::test]
 async fn sub_break_even_segments_are_read_once() {
     const BREAK_EVEN: u64 = 1 << 20;
-    // Below the segment count, as on any corpus larger than the plan fan-out:
-    // a plan-phase whole read is carried for at most this many segments, so
-    // planning these objects would show as a second GET of the rest.
-    const PLAN_CONCURRENCY: usize = 2;
+    const PLAN_CONCURRENCY: usize = 3;
+    const _: () = assert!(SEGMENTS >= PLAN_CONCURRENCY);
     let filters = [code_eq(2)];
 
     let base = Arc::new(MemoryStore::new());
@@ -1782,6 +1787,88 @@ async fn sub_break_even_segments_are_read_once() {
         (64, 16, 16, 32, 197_690),
         "planned route cost on the same corpus"
     );
+}
+
+/// The mirror of [`sub_break_even_segments_are_read_once`]: a scan with fewer
+/// sub-bound segments than partitions keeps planning them, the route that
+/// stripes their blocks across partitions when a read cache is wired
+/// (ADR-0102). The same corpus and fetcher run at exactly `SEGMENTS`
+/// partitions, the largest count that still skips the plan, and at one more,
+/// which plans every object. A
+/// read cache is wired because an un-cached scan caps its partitions at the
+/// segment count, so it never has more partitions than sub-bound segments
+/// when every segment is sub-bound.
+#[tokio::test]
+async fn fewer_sub_break_even_segments_than_partitions_keep_the_plan() {
+    const BREAK_EVEN: u64 = 1 << 20;
+    const CACHE_BYTES: u64 = 64 << 20;
+    let filters = [code_eq(2)];
+    let run = |label: &'static str, partitions: usize| {
+        let filters = filters.clone();
+        async move {
+            let base = Arc::new(MemoryStore::new());
+            let snapshot = build_snapshot(base.as_ref()).await;
+            assert!(
+                snapshot
+                    .segments
+                    .iter()
+                    .all(|seg| seg.object_size <= BREAK_EVEN),
+                "fixture precondition: every object is under the break-even"
+            );
+            measure_with_fetcher(label, &filters, partitions, base, snapshot, |store| {
+                fetcher(store, CACHE_BYTES).with_projection_break_even_bytes(Some(BREAK_EVEN))
+            })
+            .await
+        }
+    };
+    let at_count = run("q20 equality (partitions == sub-bound segments)", SEGMENTS).await;
+    let above = run(
+        "q20 equality (partitions > sub-bound segments)",
+        SEGMENTS + 1,
+    )
+    .await;
+    report(&at_count);
+    report(&above);
+
+    assert_eq!(
+        at_count.unplanned, SEGMENTS,
+        "as many sub-bound segments as partitions: none is planned"
+    );
+    assert_eq!(
+        (at_count.plan_phase_gets, at_count.plan_full_reads),
+        (0, 0),
+        "no plan read at the partition count"
+    );
+    assert_eq!(
+        (at_count.gets, at_count.full_gets, at_count.bytes),
+        (SEGMENTS as u64, SEGMENTS as u64, 630_401),
+        "one whole-object GET per object, the corpus exactly once"
+    );
+
+    assert_eq!(
+        above.unplanned, 0,
+        "fewer sub-bound segments than partitions: every one is planned"
+    );
+    // The planned route here: the plan reads each object whole, once, and
+    // carries it, since the carry budget (the partition count) exceeds the
+    // segment count, so the scan issues no GET of its own.
+    assert_eq!(
+        (
+            above.gets,
+            above.plan_phase_gets,
+            above.scan_phase_gets,
+            above.plan_full_reads,
+            above.bytes,
+            above.acc_bytes_reused
+        ),
+        (8, 8, 0, SEGMENTS, 630_401, 630_401),
+        "planned route cost with more partitions than sub-bound segments"
+    );
+    assert_eq!(
+        above.row_lines, at_count.row_lines,
+        "both routes return the same rows"
+    );
+    assert_eq!(above.rows, SEGMENTS, "one matching record per segment");
 }
 
 /// Issue #835 follow-up (finding 3): the carry budget must not be spent on a

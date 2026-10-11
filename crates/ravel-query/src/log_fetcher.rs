@@ -1433,10 +1433,13 @@ impl LogSegmentFetcher {
     /// Whether a scan should plan `seg_ref` before opening it (ADR-2677
     /// decision 2): true only above [`Self::plan_whole_object_bound`]. At or
     /// under the bound [`plan_segment`](Self::plan_segment) would read the
-    /// whole object only to count survivors, so the scan skips it and opens
+    /// whole object only to count survivors, so a scan may skip it and open
     /// the object once through
     /// [`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant),
-    /// which prunes blocks from the directories that one read holds.
+    /// which prunes blocks from the directories that one read holds. This is
+    /// the per-segment size test only: the SQL logs scan skips the plan for
+    /// these segments only when it holds at least as many of them as target
+    /// partitions, and plans them otherwise.
     #[must_use]
     pub fn plans_segment(&self, seg_ref: &SegmentRef) -> bool {
         seg_ref.object_size > self.plan_whole_object_bound()

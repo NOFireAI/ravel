@@ -526,18 +526,29 @@ async fn striped_projection_decompresses_once_per_segment() {
 }
 
 /// The same decode-once pin on the route that reads whole objects. These
-/// objects are under the fetcher's plan bound, so none is planned (ADR-2677
-/// decision 2): the plan phase reads and decodes nothing, and each segment's
-/// one open reads it whole and decodes its directories and projected pages
-/// once, plus the read gate's PAGE_DIR.
+/// objects are under the fetcher's plan bound, and both routes that can serve
+/// them are measured.
 ///
-/// Fails against a scan that still plans these objects (the plan phase then
-/// reads every object whole and decodes its directories), and against one
-/// that opens a segment more than once (the scan-phase GET count and bytes).
+/// With more partitions than these segments the scan plans them (ADR-2677
+/// decision 2 skips the plan only when the scan holds at least as many
+/// sub-bound segments as partitions): the plan phase reads each object whole
+/// once and decodes its directories once, and the striped opens reuse both.
+///
+/// With as many partitions as segments, and a predicate every block passes
+/// so the whole-segment fast path refuses, none is planned: the plan phase
+/// reads and decodes nothing, and each segment's one open reads it whole and
+/// decodes its directories and projected pages once, plus the read gate's
+/// PAGE_DIR.
+///
+/// Fails against a scan that routes either run the other way (the plan-phase
+/// figures and `segments_unplanned`), and against one that reads or decodes
+/// a segment more than once (the GET counts, bytes and decoded bytes).
 #[tokio::test]
 async fn whole_object_route_decompresses_once_per_segment() {
     let fx = fixture().await;
-    let run = run_with(
+    let get = ravel_types::accounting::AccountedOp::Get.index();
+
+    let planned = run_with(
         &fx.store,
         &fx.snapshot,
         STRIPED_PARTS,
@@ -546,43 +557,85 @@ async fn whole_object_route_decompresses_once_per_segment() {
     .await;
     assert_eq!(
         sum_metric(
-            &run.plan,
+            &planned.plan,
             "fast_path_rejected_fewer_segments_than_partitions"
         ),
         STRIPED_PARTS,
-        "the run under test must be the striped route, one refusal per partition"
+        "the planned run must be the striped route, one refusal per partition"
     );
-    assert_eq!(run.rows, SEGMENTS * BLOCKS_PER_SEG);
+    assert_eq!(planned.rows, SEGMENTS * BLOCKS_PER_SEG);
     assert_eq!(
-        sum_metric(&run.plan, "segments_unplanned"),
-        SEGMENTS,
-        "every object is under the plan bound"
-    );
-    // The route under test: no segment is planned (ADR-2677 decision 2), and
-    // each partition's open reads its segment whole, once.
-    let get = ravel_types::accounting::AccountedOp::Get.index();
-    assert_eq!(
-        (
-            run.phases.plan.s3_requests[get],
-            run.phases.plan.s3_bytes[get]
-        ),
-        (0, 0),
-        "no plan read"
+        sum_metric(&planned.plan, "segments_unplanned"),
+        0,
+        "fewer sub-bound segments than partitions: every one is planned"
     );
     assert_eq!(
         (
-            run.phases.scan.s3_requests[get],
-            run.phases.scan.s3_bytes[get]
+            planned.phases.plan.s3_requests[get],
+            planned.phases.plan.s3_bytes[get]
         ),
         (SEGMENTS as u64, fx.object_bytes),
-        "one whole-object GET per segment"
+        "planned: one whole-object plan read per segment"
     );
-    assert_eq!(run.phases.plan.decompressed_bytes, 0);
     assert_eq!(
-        run.phases.scan.decompressed_bytes,
+        (
+            planned.phases.scan.s3_requests[get],
+            planned.phases.scan.s3_bytes[get]
+        ),
+        (0, 0),
+        "planned: the striped opens reuse the plan read"
+    );
+    assert_eq!(
+        (
+            planned.phases.plan.decompressed_bytes,
+            planned.phases.scan.decompressed_bytes
+        ),
+        (fx.directories, fx.pages),
+        "planned: directories decoded once by the plan, pages once by the opens"
+    );
+
+    let keep_all = vec![col(attr_name(0)).lt(lit(1_000i64))];
+    let unplanned = run_scan(
+        &fx.snapshot,
+        SEGMENTS,
+        whole_object_fetcher(Arc::clone(&fx.store)),
+        Some(vec![LOG_COL_BODY]),
+        &keep_all,
+    )
+    .await;
+    assert_eq!(
+        sum_metric(&unplanned.plan, "fast_path_rejected_block_predicate"),
+        SEGMENTS,
+        "the unplanned run must refuse the fast path, one refusal per partition"
+    );
+    assert_eq!(unplanned.rows, SEGMENTS * BLOCKS_PER_SEG);
+    assert_eq!(
+        sum_metric(&unplanned.plan, "segments_unplanned"),
+        SEGMENTS,
+        "as many sub-bound segments as partitions: none is planned"
+    );
+    assert_eq!(
+        (
+            unplanned.phases.plan.s3_requests[get],
+            unplanned.phases.plan.s3_bytes[get]
+        ),
+        (0, 0),
+        "unplanned: no plan read"
+    );
+    assert_eq!(
+        (
+            unplanned.phases.scan.s3_requests[get],
+            unplanned.phases.scan.s3_bytes[get]
+        ),
+        (SEGMENTS as u64, fx.object_bytes),
+        "unplanned: one whole-object GET per segment"
+    );
+    assert_eq!(unplanned.phases.plan.decompressed_bytes, 0);
+    assert_eq!(
+        unplanned.phases.scan.decompressed_bytes,
         fx.directories + fx.pages + fx.page_dir,
-        "each open decodes its directories and projected pages once, plus the \
-         read gate's PAGE_DIR"
+        "unplanned: each open decodes its directories and projected pages \
+         once, plus the read gate's PAGE_DIR"
     );
 }
 
