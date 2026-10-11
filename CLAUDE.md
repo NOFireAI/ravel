@@ -106,7 +106,13 @@ cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets --
 cargo test   -p ravel-server -p ravel-sql --features flight-sql
 ```
 
-`scripts/gates.sh` runs these when the crates are in scope. It also runs a
+`scripts/gates.sh` runs these when the crates are in scope. In scoped mode
+(`-p CRATE`) scope is the reverse-dependency closure of the named crates:
+the `sql` lane runs when ravel-server is in it and the `flight-sql` lane
+when ravel-sql or ravel-server is, so `-p ravel-query` runs both. A fleet
+executor's gate is `scripts/gates.sh -p <crate> [-p <crate2>]`, not a
+hand-listed workspace clippy, and the PreToolUse hook refuses `cargo
+clippy --workspace` in a fleet clone. gates.sh also runs a
 ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
 tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
 ravel-query, or ravel-ingest is in scope, and a `-p ravel-logseg -p
@@ -215,11 +221,17 @@ Use these instead of retyping the same shell each time; they exist
 because the ad-hoc version of each has broken in practice (a stale SSE
 connection, a pushed-but-broken main).
 
-- `scripts/gates.sh [-p CRATE ...]`: the Gates list above. No args runs
-  the full workspace gate; `-p CRATE` (repeatable) scopes clippy/test/doc
-  to specific crates for fast iteration. It also runs the `sql` and
-  `flight-sql` feature lanes, always in workspace mode and in scoped mode
-  when `ravel-server` or `ravel-sql` is named.
+- `scripts/gates.sh [-p CRATE ...] [--dry-run]`: the Gates list above. No
+  args runs the full workspace gate; `-p CRATE` (repeatable) scopes
+  clippy/test/doc to the named crates and every workspace crate that
+  depends on them, transitively (the closure `affected-tests.sh -n`
+  prints). It also runs the `sql` and `flight-sql` feature lanes, always
+  in workspace mode, and in scoped mode `sql` when `ravel-server` is in
+  the closure and `flight-sql` when `ravel-sql` or `ravel-server` is.
+  This is the executor's gate in fleet specs. A scoped run writes no
+  gates-pass receipt. `--dry-run` prints the closure and every cargo
+  command the same arguments would run, then exits 0 without building;
+  `scripts/gates.test.sh` pins that selection.
 - `scripts/disk-reap.sh [-y]`: reclaims disk from merged clean worktrees
   and orphaned cargo target dirs (dry run by default; `-y` applies). Run
   it when free space drops below ~20 GB, and after a land worktree's PR
@@ -366,11 +378,14 @@ connection, a pushed-but-broken main).
 - `scripts/affected-tests.sh [-n] -p CRATE [-p CRATE ...]`: runs tests
   for the named crates plus every workspace crate that depends on them
   (transitively), with the `ci` cargo profile; `-n` prints the affected
-  set without running. This is the executor-side test gate in fleet
-  specs: full-workspace tests still run at merge time
+  set without running. When ravel-server is in the closure it also runs
+  `-p ravel-server --features sql`, and when ravel-sql or ravel-server
+  is, `-p ravel-server -p ravel-sql --features flight-sql`, on the same
+  profile. Full-workspace tests still run at merge time
   (verify-dispatch-gates.sh and PR CI), so executors only pay for the
-  blast radius of their change. Doctests included (nextest skips them,
-  the script runs them separately).
+  blast radius of their change; fleet specs gate with `scripts/gates.sh
+  -p`, which reads its closure from this script's `-n`. Doctests included
+  (nextest skips them, the script runs them separately).
 
 ### Guard scripts (mechanical preconditions)
 

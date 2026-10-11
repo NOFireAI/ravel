@@ -503,7 +503,10 @@ jobs:
         run: bash scripts/reproduce-figure.test.sh
       - name: Flag-doc guard cases (issue #1297)
         run: bash scripts/tests/flag-doc-guard.test.sh
-      - name: Fleet-result-merge squash cases
+      # A stub cargo serves the workspace graph, so this needs no toolchain.
+      - name: Scoped gate selection cases (issue #2877)
+        run: bash scripts/gates.test.sh
+      - name: Fleet-result-merge squash and shape-guard cases
         run: bash scripts/tests/fleet-result-merge-squash.test.sh
       - name: Fresh-box launcher cases
         run: bash scripts/bench/fresh-box.test.sh

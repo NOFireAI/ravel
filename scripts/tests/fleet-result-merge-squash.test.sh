@@ -4,7 +4,9 @@
 #
 # The merge script is sourced, not executed, so only its rewrite helpers run:
 # every case builds a throwaway repo under $TMPDIR and rewrites it there.
-# Nothing is fetched, pushed, or merged.
+# The one exception is case (j), which runs the whole script against a scratch
+# origin under the same temp dir, with gates.sh, the guards and gh stubbed; it
+# pushes only to that scratch origin, and its gh creates nothing.
 set -uo pipefail
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/fleet-result-merge.sh"
@@ -287,6 +289,87 @@ if grep -q "${orphan_sha:0:12}" "${dir}/fold.log" \
 else
   fail=$((fail + 1)); printf 'FAIL  orphan fixup: error does not name the commit\n'
   cat "${dir}/fold.log"
+fi
+
+# (j) The post-fork shape guard (assert-struct-literals-current.sh) runs on the
+# cleaned history after the gates and before anything is pushed or a PR is
+# opened (issue #2877). Unlike the cases above, this runs the whole script as a
+# command, against a scratch origin, from a copy whose sibling gates.sh and
+# guards are stubs and with a stub gh first on PATH, so nothing leaves the
+# temp dir. Each run gets a fresh fixture.
+e2e_tools="${tmproot}/e2e-tools"
+mkdir -p "${e2e_tools}/scripts/guards" "${e2e_tools}/bin"
+cp "${SCRIPT}" "${e2e_tools}/scripts/fleet-result-merge.sh"
+# The stub bodies are single-quoted on purpose: they expand when the stub runs.
+# shellcheck disable=SC2016
+{
+  printf '#!/usr/bin/env bash\necho "gates $*" >>"${E2E_LOG}"\n' >"${e2e_tools}/scripts/gates.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"${e2e_tools}/scripts/guards/assert-gh-auth.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"${e2e_tools}/scripts/guards/assert-clean-authorship.sh"
+  printf '#!/usr/bin/env bash\necho "shape-guard $*" >>"${E2E_LOG}"\necho "stub shape guard report"\nexit "${SHAPE_STUB_RC}"\n' \
+    >"${e2e_tools}/scripts/guards/assert-struct-literals-current.sh"
+  printf '#!/usr/bin/env bash\necho "gh $*" >>"${E2E_LOG}"\nif [[ "$1 $2" == "pr create" ]]; then echo https://github.com/example/ravel/pull/4242; fi\n' \
+    >"${e2e_tools}/bin/gh"
+}
+chmod +x "${e2e_tools}"/scripts/*.sh "${e2e_tools}"/scripts/guards/*.sh "${e2e_tools}/bin/gh"
+printf 'feat(scratch): land the result\n\nThe body.\n' >"${e2e_tools}/message.txt"
+
+# merge_run <name> <stub guard exit> [ALLOW_STALE_SHAPE_SITES value]: build a
+# scratch origin with main and task/t1/result, run the merge script from a
+# clone on main, and leave its exit code in e2e_rc, its output in
+# <dir>/run.log and the stubs' call log in <dir>/calls.log.
+merge_run() {
+  local dir="${tmproot}/e2e-$1"
+  e2e_dir="${dir}"
+  git init -q --bare "${dir}/origin.git"
+  new_repo "${dir}/work"
+  git -C "${dir}/work" remote add origin "${dir}/origin.git"
+  git -C "${dir}/work" push -q origin main
+  git -C "${dir}/work" checkout -q -b result
+  commit_in "${dir}/work" deliverable.txt "feat(scratch): add the deliverable" "" "${DELIVERABLE_AUTHOR}"
+  git -C "${dir}/work" push -q origin result:refs/heads/task/t1/result
+  git -C "${dir}/work" checkout -q main
+  git -C "${dir}/work" branch -q -D result
+  : >"${dir}/calls.log"
+  e2e_rc=0
+  (
+    cd "${dir}/work" || exit 1
+    PATH="${e2e_tools}/bin:${PATH}" E2E_LOG="${dir}/calls.log" \
+      SHAPE_STUB_RC="$2" ALLOW_STALE_SHAPE_SITES="${3:-}" \
+      bash "${e2e_tools}/scripts/fleet-result-merge.sh" t1 "${e2e_tools}/message.txt"
+  ) >"${dir}/run.log" 2>&1 || e2e_rc=$?
+}
+
+# called <dir> <prefix>: how many stub calls in <dir>/calls.log start with it.
+called() { grep -c "^$2" "$1/calls.log"; }
+merge_ref() { git -C "$1/origin.git" rev-parse -q --verify refs/heads/task/t1/merge; }
+
+merge_run guard-refuses 1
+check_eq "shape guard exit 1: script exits 1" "1" "${e2e_rc}"
+check_eq "shape guard exit 1: the gates ran first" "1" "$(called "${e2e_dir}" "gates")"
+check_eq "shape guard exit 1: the guard ran" "1" "$(called "${e2e_dir}" "shape-guard")"
+check_eq "shape guard exit 1: no PR created" "0" "$(called "${e2e_dir}" "gh pr create")"
+check_eq "shape guard exit 1: nothing pushed" "" "$(merge_ref "${e2e_dir}")"
+check_eq "shape guard exit 1: the guard's output is shown" "1" \
+  "$(grep -c 'stub shape guard report' "${e2e_dir}/run.log")"
+
+merge_run guard-cannot-answer 2
+check_eq "shape guard exit 2: script exits 2" "2" "${e2e_rc}"
+check_eq "shape guard exit 2: no PR created" "0" "$(called "${e2e_dir}" "gh pr create")"
+
+merge_run guard-overridden 1 1
+check_eq "shape guard exit 1 with ALLOW_STALE_SHAPE_SITES=1: script exits 0" "0" "${e2e_rc}"
+check_eq "shape guard exit 1 with ALLOW_STALE_SHAPE_SITES=1: PR created" "1" \
+  "$(called "${e2e_dir}" "gh pr create")"
+
+merge_run guard-passes 0
+check_eq "shape guard exit 0: script exits 0" "0" "${e2e_rc}"
+check_eq "shape guard exit 0: PR created" "1" "$(called "${e2e_dir}" "gh pr create")"
+check_eq "shape guard exit 0: the guard checked the pushed head against origin/main" \
+  "shape-guard $(merge_ref "${e2e_dir}") origin/main" \
+  "$(grep '^shape-guard' "${e2e_dir}/calls.log")"
+if [[ ${e2e_rc} -ne 0 ]]; then
+  cat "${e2e_dir}/run.log"
 fi
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"

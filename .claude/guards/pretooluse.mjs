@@ -73,6 +73,16 @@ const HARMLESS_PREFIX =
 const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 
+// Workspace clippy in a fleet clone. It is not the executor's gate:
+// `scripts/gates.sh -p` runs clippy and tests over the changed crates'
+// reverse-dependency closure plus the `sql` and `flight-sql` lanes, and a
+// hand-run workspace clippy compiles neither lane. cargo's global flags may
+// precede the subcommand, as in GATE_HEAD; `--all` is clippy's older spelling
+// of `--workspace`. Only the arguments before a bare `--` are cargo's.
+const CLIPPY_HEAD =
+  /^cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+clippy(\s|$)/;
+const WORKSPACE_FLAG = /\s--(workspace|all)(\s|$)/;
+
 // zsh marks these read-only; assigning to one kills the enclosing loop with
 // no output that looks like a failure.
 const RESERVED_ASSIGN = /(^|[;&|(]|\bdo\b|\bthen\b|\blocal\b|\bexport\b)\s*(status|path|argv|PWD)=/;
@@ -509,10 +519,31 @@ function scanTexts(command) {
   return texts;
 }
 
-function checkBash(rawCommand) {
+// Each `&&`, `||` or `|` part of a statement is its own command here, so a
+// workspace clippy chained after `cargo fmt --all &&` is still seen.
+function checkWorkspaceClippy(stmt) {
+  for (const part of blankSubstitutions(stmt).split(/&&|\|\|?/)) {
+    const stripped = part.replace(HARMLESS_PREFIX, "").trim();
+    if (!CLIPPY_HEAD.test(stripped)) continue;
+    const cargoArgs = ` ${stripped}`.split(/\s--(?=\s|$)/)[0];
+    if (!WORKSPACE_FLAG.test(cargoArgs)) continue;
+    deny(
+      "`cargo clippy --workspace` is not a fleet executor's gate. Run " +
+        "`scripts/gates.sh -p <crate> [-p <crate2>]` instead: it runs clippy " +
+        "and tests over the named crates and every crate that depends on " +
+        "them, plus the `sql` lane when ravel-server is in that closure and " +
+        "the `flight-sql` lane when ravel-sql or ravel-server is. A hand-run " +
+        "workspace clippy compiles neither lane, which is how a sql-gated " +
+        "break reached CI on #2833.",
+    );
+  }
+}
+
+function checkBash(rawCommand, cwd) {
   if (typeof rawCommand !== "string" || rawCommand === "") return;
   const command = stripHeredocBodies(rawCommand);
   const shaAllowed = shaLiteralAllowed(command);
+  const fleetClone = cwdIsFleetClone(cwd);
 
   for (const raw of scanTexts(command).flatMap(splitStatements)) {
     const stmt = raw.trim();
@@ -551,6 +582,7 @@ function checkBash(rawCommand) {
 
     checkDestructiveGit(stmt);
     checkBareSha(stmt, shaAllowed);
+    if (fleetClone) checkWorkspaceClippy(stmt);
   }
 }
 
@@ -574,13 +606,27 @@ function gitDirFor(startPath) {
 // it. Two independent signals, because a false block there loses a task:
 // the clone lives under the fleet work root, and it hosts no linked
 // worktrees of its own.
-function isExemptCheckout(repoRoot, gitPath) {
-  if (process.env.RAVEL_GUARD_ALLOW_PRIMARY === "1") return true;
+function isFleetClone(repoRoot, gitPath) {
   const normalized = repoRoot.split(sep).join("/");
   if (normalized.includes("/fleet/work/") || normalized.includes("/var/lib/fleet")) {
     return true;
   }
   return !existsSync(resolve(gitPath, "worktrees"));
+}
+
+function isExemptCheckout(repoRoot, gitPath) {
+  if (process.env.RAVEL_GUARD_ALLOW_PRIMARY === "1") return true;
+  return isFleetClone(repoRoot, gitPath);
+}
+
+// The checkout `cwd` sits in, judged the way checkFileWrite judges a file: a
+// linked worktree records .git as a file and is never a fleet clone.
+function cwdIsFleetClone(cwd) {
+  if (typeof cwd !== "string" || cwd === "") return false;
+  const found = gitDirFor(resolve(cwd));
+  if (!found) return false;
+  if (!statSync(found.gitPath).isDirectory()) return false;
+  return isFleetClone(found.repoRoot, found.gitPath);
 }
 
 function checkFileWrite(filePath) {
@@ -627,7 +673,7 @@ try {
   const tool = payload.tool_name;
   const input = payload.tool_input ?? {};
 
-  if (tool === "Bash") checkBash(input.command);
+  if (tool === "Bash") checkBash(input.command, payload.cwd);
   else if (tool === "Write" || tool === "Edit" || tool === "MultiEdit") {
     checkFileWrite(input.file_path);
   } else if (tool === "ScheduleWakeup") checkWakeup(input);

@@ -125,15 +125,21 @@ Tests: <the specific behaviors to prove, including failure paths>.
 Gates: format and lint IN PLACE before the commit you will gate -- run
 `cargo fmt --all` (not just --check) and, where it applies, scoped
 `cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
---check`; cargo clippy --workspace --all-targets -- -D warnings;
-scripts/affected-tests.sh -p <crate> [-p <crate2>]. Cap cargo's build
+--check`; scripts/gates.sh -p <crate> [-p <crate2>]. That one script is
+the gate: it runs clippy, tests and doctests over the named crates and
+every workspace crate that depends on them, plus the `sql` lane when
+ravel-server is in that closure and the `flight-sql` lane when ravel-sql
+or ravel-server is. Do not hand-run `cargo clippy --workspace` in its
+place: in a fleet clone the PreToolUse hook refuses it. A doc-only or
+test-only round runs the same gate: `cargo check -p <crate>` while
+iterating, then scripts/gates.sh -p <crate>. Cap cargo's build
 parallelism through the environment, not a flag, because
-`scripts/affected-tests.sh` accepts no `--jobs` and runs cargo at the
-default otherwise: read `nproc` and DERIVE the cap from it rather than
+`scripts/gates.sh` accepts no `--jobs`: read `nproc` and DERIVE the cap
+from it rather than
 matching a known machine shape, then prefix every cargo command and every
 script that runs cargo with `CARGO_BUILD_JOBS=<that number>`. Use
 `min(4, max(2, nproc / 4))`, and report the `uname -m`, the `nproc` and the
-value you used. `scripts/gates.sh` also caps jobs by itself, but by MEMORY rather than
+value you used. `scripts/gates.sh` caps jobs by itself only by MEMORY, not
 cores (`mem_gb -le 11` gives 2), and its own comment says an explicit
 `CARGO_BUILD_JOBS` in the environment WINS. So the value you export
 overrides that cap for every gate run through it. On the 8-core box this
@@ -175,15 +181,17 @@ burns four hours and produces nothing. A healthy Pi is slow, not broken,
 and that is the distinction the tripwire exists to draw. Do NOT run
 `cargo test --workspace`: full-workspace tests are verified at merge
 time (verify-dispatch cold gate and PR CI); your job is the blast
-radius of your own change, and affected-tests.sh computes it (the
-named crates plus every crate that depends on them). The commit that
+radius of your own change, and scripts/gates.sh -p computes it (the
+named crates plus every crate that depends on them, and the feature
+lanes that closure reaches; `scripts/gates.sh -p <crate> --dry-run`
+prints the list without building). The commit that
 gets gated must already be formatted; never append a formatting-only
 fixup commit after a failed --check. Run every gate command UNPIPED and
 read its own real exit code (the `EXIT=` marker from LONG COMMANDS, which
 survives into a later tool call where a `code` variable would not), never
 `| tail` / `| head` / `| grep` to keep the output small -- the pipeline's
 exit code is the last stage's, not the gate's, so a real failure buried in
-a `tail`-truncated tool-result can report a false "affected-tests passed"
+a `tail`-truncated tool-result can report a false "All gates passed."
 while a test actually failed. The LONG COMMANDS form solves both at once:
 the redirect keeps the output out of the tool result, and the marker at the
 end of the same log carries the gate's own exit code.
@@ -204,11 +212,15 @@ If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a cold workspace gate writes 54 to 70 GB of
 target (CLAUDE.md's measured band; the largest lane completed in 56 GB),
 so a host without 70 GB free cannot be trusted to finish the template's
-workspace clippy, and the run would die mid-link with a fake compiler
+scripts/gates.sh -p run, and the run would die mid-link with a fake compiler
 error (two gate runs died at link on a shared executor volume another
 task filled mid-run; 5 GB was the old floor and it measured nothing the
-gate needed). A spec whose gates are all crate-scoped may ask for 54, the
-band's low end, and must say so. Then run every long gate in the LONG COMMANDS form, into
+gate needed). Scoped does not mean small: the closure of a crate low in
+the dependency graph is most of the workspace plus every feature lane
+(`-p ravel-types` reaches 27 of the 38 workspace crates). A spec whose
+`scripts/gates.sh -p <crate> --dry-run` lists a short closure and no
+feature lane may ask for 54, the band's low end, and must say so. Then
+run every long gate in the LONG COMMANDS form, into
 `.gate-logs/<step>.log` with its `EXIT=` marker.
 
 HOME on the amd64 executor class is a 1 GB tmpfs: pointing the log
@@ -236,10 +248,11 @@ commit needs a fragment under changelog.d/ (or a `Changelog: none`
 trailer); verify with `scripts/guards/check-changelog-touched.sh
 origin/main HEAD`, which is the check CI runs (`changelog-assemble.sh
 --check` only validates the fragments that exist and never says one is
-missing). When the task touches crates/ravel-server, crates/ravel-sql or
-crates/ravel-query, add the `sql` and `flight-sql` lanes from CLAUDE.md's
-Gates section. Each of these has failed a pull request's first CI run after
-an executor reported every gate it was given green.
+missing). The `sql` and `flight-sql` lanes need no line of their own:
+scripts/gates.sh -p runs them whenever the closure reaches ravel-server
+or ravel-sql, which it does from crates/ravel-query too. Each of these has
+failed a pull request's first CI run after an executor reported every gate
+it was given green.
 
 CLAIMS AUDIT, before the commit you gate, reported afterwards: list every
 sentence you wrote or edited in docs, HELP text, doc comments or an ADR
@@ -373,8 +386,8 @@ were lost.
 
 ## Executor test scope
 
-The Gates template scopes executor tests with affected-tests.sh on
-purpose. A fleet task used to end with `cargo test --workspace` on an
+The Gates template scopes the executor's gate with `scripts/gates.sh -p`
+on purpose. A fleet task used to end with `cargo test --workspace` on an
 8 GB 4-core host (the arm64 Pi class; the 16 vCPU amd64 class is roughly
 four times faster, so size by the slower class): 1-2 hours of cold
 compile and test time per task,
@@ -383,9 +396,23 @@ of it re-verified anyway at merge (the orchestrator's cold
 verify-dispatch run and the PR's required CI checks are the trust
 boundary; the executor's own green is never trusted). The executor-side
 run exists for fast self-feedback, so it covers exactly the changed
-crates and their reverse dependencies. Workspace clippy stays: it is
-check-mode (no codegen or link) and is the cheap whole-workspace
-compile-break detector.
+crates and their reverse dependencies.
+
+It is one script rather than a hand-listed workspace clippy plus
+affected-tests.sh because the hand-listed pair misses what CI compiles.
+`scripts/gates.sh -p` runs clippy and tests over the named crates and
+their reverse-dependency closure, then the `sql` lane when ravel-server is
+in that closure and the `flight-sql` lane when ravel-sql or ravel-server
+is: the same package and feature selections CI's `lint`, `sql` and
+`flight-sql` jobs build. Both surfaces
+compile only under their features. On #2833 the executor ran `cargo clippy
+-p ravel-server --all-targets` without `sql`, so a `redundant_closure` and
+then an E0282 in a sql-gated test each reached CI, two extra 40-minute
+cycles. A workspace clippy is no substitute: it builds ravel-server with
+`sql` only through ravel-cli's dev-dependency, alongside the other
+features the workspace adds (CLAUDE.md, Gates), and never builds
+`flight-sql` at all. The hook refuses `cargo clippy --workspace` in a
+fleet clone so that the template's older wording cannot creep back.
 
 ## Format before you commit, not after
 
