@@ -50,10 +50,11 @@ pub const MIN_PURGE_MIN_INTERVAL_MS: u64 = 100;
 pub const MAX_PURGE_MIN_INTERVAL_MS: u64 = 600_000;
 /// Default `--memory-gate-interval-ms`.
 pub const DEFAULT_INTERVAL_MS: u64 = 100;
-/// Default `--memory-gate-close-after-samples`: at the default interval a
-/// dip must last at least 300 ms to close the gate, where a dip shorter
-/// than the acceptance run's own 2 s host sampler period used to close it
-/// for a whole phase (issue #2838).
+/// Default `--memory-gate-close-after-samples`: three samples at the default
+/// interval span about 200 ms, so a dip shorter than that never closes the
+/// gate and one of 300 ms or more always does, where a single sub-floor
+/// sample used to close it (issue #2838: dips shorter than the acceptance
+/// run's 2 s host sampler period refused a concurrent phase's fetches).
 pub const DEFAULT_CLOSE_AFTER_SAMPLES: u32 = 3;
 /// The accepted range of `--memory-gate-close-after-samples`; 1 closes on
 /// the first reading below the floor.

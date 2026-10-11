@@ -2229,8 +2229,9 @@ pub struct Cli {
     /// A sample at or above the close floor resets the run and reopens a
     /// closed gate at once, so reopening never waits. With 1 the gate
     /// closes on the first sample below the floor. At the default 3 and the
-    /// default 100 ms interval a dip must last at least 300 ms to close the
-    /// gate; a shorter one is still counted on
+    /// default 100 ms interval three samples span about 200 ms: a dip
+    /// shorter than that never closes the gate, one of 300 ms or more
+    /// always does; a dip that does not close it is still counted on
     /// `ravel_memory_gate_samples_below_floor_total` and shown on
     /// `ravel_memory_gate_available_bytes`. The purge decision is not
     /// affected (ADR-2633, as amended for issue #2838).
