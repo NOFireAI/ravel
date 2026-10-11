@@ -50,8 +50,9 @@ const COLD_GROUPS: i64 = 20_000;
 /// Groups `0..HOT_GROUPS` get extra samples: group `j` ends with `j + 2`.
 const HOT_GROUPS: i64 = 10;
 
-/// Cold groups of the labels test: 2,570 groups with the hot ones, 11
-/// slices. At [`COLD_GROUPS`] the final aggregate's `first_value(labels)`
+/// Cold groups of the labels test: [`corpus_of`] gives hot group `j` the
+/// same key as cold group `j`, so the query has 2,560 groups, 10 slices of
+/// [`BATCH_SIZE`]. At [`COLD_GROUPS`] the final aggregate's `first_value(labels)`
 /// alone exhausts the 1 GiB measuring pool (measured: 44,234,496 bytes asked
 /// on top of 1,032,085,576 reserved), before any slice reaches the exec.
 const LABELS_COLD_GROUPS: i64 = 2_560;
@@ -489,6 +490,13 @@ async fn the_executor_plans_the_exec_under_the_round_robin_repartition() {
 /// `Dictionary(Int32, Map(Utf8, Utf8))` column, is copied by the exec and the
 /// query answers with the rule on, the same rows and columns as with it off.
 ///
+/// Measured: the aggregate emits 2,560 groups in 10 slices of
+/// [`BATCH_SIZE`], and the exec copies all 10 and passes none through. The
+/// measurement counts the labels column's Map values in full (no per-value
+/// size for a Map), so a slice whose bytes were mostly labels values could
+/// pass through over-charged; on this corpus every slice is still charged
+/// more than 2x what it references, values counted in full.
+///
 /// FLIP: drop the fallback to `concat` in the module's `compact_dictionary`
 /// (return the cast's error) and the rule-on run fails with "Unsupported
 /// output type for dictionary packing" at the `expect` in `run`.
@@ -511,9 +519,16 @@ async fn an_aggregate_output_carrying_the_labels_dictionary_answers_with_the_rul
             .clone(),
         "the output carries the labels dictionary"
     );
-    assert!(
-        compact_metric(&on.physical, "compacted_batches") > 0,
-        "the exec copied the aggregate's slices, the labels column included:\n{}",
+    assert_eq!(
+        compact_metric(&on.physical, "compacted_batches"),
+        10,
+        "the exec copied every one of the aggregate's 10 slices, the labels column included:\n{}",
+        on.plan
+    );
+    assert_eq!(
+        compact_metric(&on.physical, "passed_through_batches"),
+        0,
+        "no slice passed through with the whole output's charge:\n{}",
         on.plan
     );
     assert_eq!(compact_metric(&off.physical, "compacted_batches"), 0);
