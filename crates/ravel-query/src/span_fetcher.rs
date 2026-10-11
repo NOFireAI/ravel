@@ -583,12 +583,18 @@ impl SpanSegmentFetcher {
     /// Only the run's blocks that
     /// pass the same skip-index and bloom prune the whole-object path applies
     /// are decoded, through the same per-block decode that accumulates page
-    /// bytes. With `blocks` `None` the decoded set, the rows and `stats` equal
-    /// the whole-object path's; with a block set the decoded set is the
-    /// intersection, so rows and `blocks_after_skip` are those of the set.
-    /// The wire bytes and request count are what differ from the whole-object
-    /// path. A failed ranged GET is a typed [`SpanFetchError::Store`], never a
-    /// fallback to a whole-object read.
+    /// bytes. On a well-formed object, with `blocks` `None` the decoded set,
+    /// the rows and `stats` equal the whole-object path's; with a block set
+    /// the decoded set is the intersection, so rows and `blocks_after_skip`
+    /// are those of the set. The wire bytes and request count are what
+    /// differ from the whole-object path. One check differs too: a lookup
+    /// with no pushed predicate does not read BLOOM, so a missing or corrupt
+    /// BLOOM section that the whole-object path refuses at open (its
+    /// `RspanReader::new` reads BLOOM unconditionally) goes unnoticed here;
+    /// the bloom only ever widens a candidate set, so no row is wrong, and
+    /// any other query on the object still reports the corruption. A failed
+    /// ranged GET is a typed [`SpanFetchError::Store`], never a fallback to a
+    /// whole-object read.
     ///
     /// With a read cache, every ranged read is keyed
     /// `(tenant_hash, content_hash, offset, len)`, so a repeated lookup is

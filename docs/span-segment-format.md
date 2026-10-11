@@ -519,11 +519,18 @@ applies the time window, which `decode_trace` does not). The spans fetcher
 (`ravel_query::SpanSegmentFetcher`) already reads a trace through
 `block_run_span`: a `trace_id` lookup reads the object's tail (64 KiB, or
 the whole object in one ranged GET when the object is no larger than
-that), then one ranged GET per contiguous candidate run, never a
-`GetRange::Full` read, and the process read cache fronts those reads,
-keyed `(tenant_hash, content_hash, offset, len)`, so a repeated lookup
-issues no GET. Under this format's sort order the intersection is always
-one run:
+that), then one ranged GET of the trace's whole SKIP_IDX run (pruned
+blocks inside it included; the run is bounded by one trace's blocks and
+one GET beats two for the common adjacent case), or, when a caller
+supplies a block set, one ranged GET per contiguous run of that set's
+intersection with the candidates; never a `GetRange::Full` read. The
+process read cache fronts those reads, keyed
+`(tenant_hash, content_hash, offset, len)`, so a repeated lookup issues
+no GET. A lookup with no pushed predicate does not read BLOOM, so it
+does not detect a missing or corrupt BLOOM section that a whole-object
+open refuses; the bloom only widens a candidate set, so the rows are
+unaffected and any other query on the object still reports it. Under this
+format's sort order the intersection is always one run:
 the object sorts by `(trace_id, start_ts)`, every trace id that sorts
 between two ids sharing an 8-byte prefix shares that prefix too, so the
 records carrying one `key8` are one contiguous range and the blocks holding
