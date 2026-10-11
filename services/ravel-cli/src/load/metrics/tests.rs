@@ -1061,6 +1061,25 @@ mod default_geometry {
         shards: u32,
         batch_rows: usize,
     ) -> Result<MetricsLoadReport, LoadError> {
+        try_load_clocked(
+            store,
+            pq,
+            request,
+            shards,
+            batch_rows,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+    }
+
+    async fn try_load_clocked(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        request: GeometryRequest,
+        shards: u32,
+        batch_rows: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Result<MetricsLoadReport, LoadError> {
         load_metrics_with(
             store,
             pq,
@@ -1074,7 +1093,7 @@ mod default_geometry {
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             Some(DEFAULT_MAX_FLUSH_DELAY),
             NOW_NS,
-            Arc::new(FixedClock(NOW_NS)),
+            clock,
         )
         .await
     }
@@ -1412,6 +1431,119 @@ mod default_geometry {
         assert_eq!(shard_keys(store.as_ref(), shard_b).await.len(), 1);
         assert_eq!(report.objects_written() as u64, mix.total());
         assert_eq!(report.realign_gave_up, 0);
+    }
+
+    /// Issue #2753: a shard that never handles its writes makes the load give
+    /// up realigning once, on the injected clock, and say so in the report,
+    /// the summary line and the JSON line. The skew override holds every
+    /// shard one write short of its enqueued count, so the first submit's
+    /// settle waits until the test advances the clock by the settle timeout;
+    /// no wall-clock time passes. Once given up, the later submits never
+    /// settle again (the override is read exactly once more, by the round
+    /// that sees the deadline), and the load still writes every point.
+    #[tokio::test]
+    async fn a_shard_that_never_merges_gives_up_realigning_on_the_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::load::geometry::{SETTLE_TIMEOUT, SKEW_OVERRIDE};
+
+        const BATCHES: usize = 3;
+        let (_dir, pq) = fixture(BATCH_ROWS, BATCHES);
+        let reads = Arc::new(AtomicU64::new(0));
+        let override_reads = Arc::clone(&reads);
+        let stall: crate::load::geometry::SkewOverride = Arc::new(move |stats| {
+            override_reads.fetch_add(1, Ordering::SeqCst);
+            stats
+                .into_iter()
+                .map(|(shard, mut s)| {
+                    s.messages_enqueued = s.messages_processed + 1;
+                    (shard, s)
+                })
+                .collect()
+        });
+        let clock = TestClock::new(NOW_NS);
+        let run = SKEW_OVERRIDE.scope(
+            stall,
+            try_load_clocked(
+                Arc::new(MemoryStore::new()),
+                &pq,
+                GeometryRequest {
+                    target_bytes: None,
+                    pipeline_depth: None,
+                    load_memory: host_derived(),
+                },
+                1,
+                BATCH_ROWS,
+                clock.clone(),
+            ),
+        );
+        tokio::pin!(run);
+        // The settle loop yields 64 rounds before it sleeps on the clock, so
+        // more reads than that mean its deadline is set and it is parked.
+        while reads.load(Ordering::SeqCst) < 64 {
+            tokio::select! {
+                biased;
+                _ = &mut run => panic!("the load finished while a shard held its writes"),
+                () = yield_until_router_is_quiet(&clock) => {}
+            }
+        }
+        let parked = reads.load(Ordering::SeqCst);
+        clock.advance_ns(i64::try_from(SETTLE_TIMEOUT.as_nanos()).expect("fits"));
+        let report = loop {
+            tokio::select! {
+                biased;
+                done = &mut run => break done.expect("load succeeds"),
+                () = yield_until_router_is_quiet(&clock) => assert!(
+                    reads.load(Ordering::SeqCst) <= parked + 1,
+                    "a later submit settled again after the window gave up"
+                ),
+            }
+        };
+        assert_eq!(reads.load(Ordering::SeqCst), parked + 1);
+
+        assert_eq!(report.realign_gave_up, 1);
+        assert_eq!(report.points_written, (BATCHES * BATCH_ROWS) as u64);
+        let layout = report.layout_report();
+        let summary = render_layout_summary(&layout);
+        assert!(
+            summary.contains(
+                "  depth realign    : gave up 1 time(s): the shards had not handled a batch \
+                 within 30 s, so later depth flushes counted batches without size flushes and \
+                 may have closed objects early"
+            ),
+            "{summary}"
+        );
+        let json = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(LOAD_REPORT_JSON_PREFIX))
+            .expect("the summary ends with the JSON report");
+        let value: serde_json::Value = serde_json::from_str(json).expect("the line is JSON");
+        assert_eq!(value["realign_gave_up"], 1);
+        let parsed: LoadLayoutReport = serde_json::from_str(json).expect("parses back");
+        assert_eq!(parsed.realign_gave_up, 1);
+
+        let settled = load(
+            Arc::new(MemoryStore::new()),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+        )
+        .await;
+        assert_eq!(settled.realign_gave_up, 0);
+        let summary = render_layout_summary(&settled.layout_report());
+        assert!(
+            summary.contains("  depth realign    : per shard on size flushes\n"),
+            "{summary}"
+        );
+        let json = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(LOAD_REPORT_JSON_PREFIX))
+            .expect("the summary ends with the JSON report");
+        let value: serde_json::Value = serde_json::from_str(json).expect("the line is JSON");
+        assert_eq!(value["realign_gave_up"], 0);
     }
 
     /// Issue #2753: a decode refusal at the default geometry reports at once.
