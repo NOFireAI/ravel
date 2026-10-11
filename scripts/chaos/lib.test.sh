@@ -45,6 +45,10 @@ REPO_ROOT="$(cd "${CHAOS_DIR}/../.." && pwd)"
 source "${CHAOS_DIR}/lib.sh"
 # The cases below pin the default; an operator's exported value must not flip them.
 unset CHAOS_KEEP_LOGS
+# The conservation oracle waits up to the takeover bound for a survivor
+# publish; every case reads the log once unless it sets its own wait.
+CHAOS_CONSERVATION_WAIT_SECONDS=0
+CHAOS_CONSERVATION_POLL_SECONDS=0.1
 
 PASSED=0
 FAILED=0
@@ -172,6 +176,7 @@ curl() {
     serve-metrics) printf '%s\n' "${METRICS_SAMPLE}" ;;
     unreachable) return 7 ;;
     slow-metrics) sleep 2; printf '%s\n' "${METRICS_SAMPLE}" ;;
+    metrics-file) cat "${METRICS_FILE}" ;;
     export)
       local dump="" prev=""
       local arg
@@ -395,6 +400,28 @@ check "unfinished: already_done=1 is not compacted=1" "0" \
 check "unfinished: pass line read through ANSI colouring" "1" \
   "$(unfinished "${PUB_LINE}"$'\n\e[32m INFO\e[0m maintenance: retention + compaction pass complete \e[3mcompacted\e[0m\e[2m=\e[0m2')"
 
+# The scenario-2 trigger reads ravel_maintain_compactions_in_flight, as
+# render_maintain_ownership_family renders it.
+inflight_body() {
+  printf '%s\n# TYPE ravel_maintain_compactions_in_flight gauge\nravel_maintain_compactions_in_flight{mode="maintain"} %s\n' \
+    "${METRICS_SAMPLE}" "$1"
+}
+inflight_wait() { METRICS_SAMPLE="$1" rc_of wait_for_compaction_in_flight http://stub 1; }
+check "in-flight trigger fires on the gauge at 1" "0" "$(inflight_wait "$(inflight_body 1)")"
+check "in-flight trigger does not fire on the gauge at 0" "1" "$(inflight_wait "$(inflight_body 0)")"
+check "in-flight trigger does not fire with the gauge absent" "1" "$(inflight_wait "${METRICS_SAMPLE}")"
+check "in-flight trigger does not fire on an unreachable worker" "1" \
+  "$(CURL_MODE=unreachable rc_of wait_for_compaction_in_flight http://stub 1)"
+inflight_polls() {
+  CHAOS_COMPACTION_POLL_SECONDS=0.1 METRICS_SAMPLE="$(inflight_body 0)" \
+    wait_for_compaction_in_flight http://stub 2 >/dev/null 2>&1
+  echo "${CHAOS_COMPACTION_POLLS}"
+}
+check "in-flight trigger scrapes more than once a second at the poll interval" "yes" \
+  "$([[ "$(inflight_polls)" -gt 4 ]] && echo yes || echo no)"
+check "in-flight trigger records the units owned it read" "4" \
+  "$(METRICS_SAMPLE="$(inflight_body 1)" wait_for_compaction_in_flight http://stub 1 >/dev/null 2>&1; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
+
 # Args: A's log, B's log, aborts baseline.
 cons() { rc_of oracle_conservation_or_unmeasured "$1" http://stub "${3:-1}" "$2"; }
 check "classifier: A finished its pass, B silent is could-not-measure (3)" "3" \
@@ -516,11 +543,62 @@ check "scenario 2 checks the universe before the wait, and kills right after it"
   "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_a_kill_line:-0}" -gt "${inflight_wait_line:-0}" && "$(only_bookkeeping_between "${CHAOS_DIR}/kill-maintain-worker.sh" "${inflight_wait_line}" "${first_a_kill_line}")" == 0 ]] && echo yes || echo no)"
 b_count_line="$(scenario2_line 'B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"')"
 last_a_kill_line="$(grep -n -F 'sigkill_pid "$WORKER_A_PID"' "${CHAOS_DIR}/kill-maintain-worker.sh" | tail -1 | cut -d: -f1)"
-cons_call_line="$(scenario2_line '"$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" || true')"
+cons_call_line="$(scenario2_line '"$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true')"
 check "scenario 2 counts B's log after the last kill and passes it to the conservation oracle" "yes" \
   "$([[ -n "${b_count_line}" && -n "${cons_call_line}" && "${b_count_line}" -gt "${last_a_kill_line:-999999}" && "${b_count_line}" -lt "${cons_call_line}" ]] && echo yes || echo no)"
 check "scenario 2 headers make no 'provably' claim" "no" \
   "$([[ "${scenario2_body}" == *provabl* ]] && echo yes || echo no)"
+check "scenario 2 triggers on the gauge, not on worker A's log" "yes" \
+  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
+
+# The conservation oracle waits, from the kill, for a survivor publish that
+# lands after the kill line. Args: A's log, B's log, wait seconds. B's log
+# starts as one pre-kill line, so the kill line count is 1.
+LOG_B_WAIT="${SCRATCH}/b-wait.log"
+cons_wait() {
+  CHAOS_CONSERVATION_WAIT_SECONDS="$3" \
+    rc_of oracle_conservation_or_unmeasured "$1" http://stub 1 "$2" 1 "$(date +%s)"
+}
+printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n' >"${LOG_B_WAIT}"
+( sleep 1; printf '%s\n' "${PUB_LINE}" >>"${LOG_B_WAIT}" ) &
+check "conservation wait: a publish landing during the wait passes" "0" \
+  "$(cons_wait "${LOG_A_UNIT2}" "${LOG_B_WAIT}" 5)"
+wait
+cons_wait_timed() {
+  local t0 rc
+  t0="$(date +%s)"
+  rc="$(cons_wait "$1" "$2" "$3")"
+  printf 'rc=%s waited=%s\n' "${rc}" "$([[ $(( $(date +%s) - t0 )) -ge "$3" ]] && echo yes || echo no)"
+}
+printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n' >"${LOG_B_WAIT}"
+check "conservation wait: no publish by the bound, A unfinished, fails after waiting" "rc=1 waited=yes" \
+  "$(cons_wait_timed "${LOG_A_UNIT2}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: no publish by the bound, A finished, could-not-measure after waiting" \
+  "rc=3 waited=yes" "$(cons_wait_timed "${LOG_A_FINISHED}" "${LOG_B_WAIT}" 2)"
+check "conservation wait: a pre-kill publish does not end the wait" "rc=1 waited=yes" \
+  "$(cons_wait_timed "${LOG_A_UNIT2}" "${LOG_B_PRE_KILL}" 2)"
+aborts_first() {
+  local t0 rc
+  t0="$(date +%s)"
+  rc="$(CHAOS_CONSERVATION_WAIT_SECONDS=3 rc_of oracle_conservation_or_unmeasured \
+    "${LOG_A_UNIT2}" http://stub 0 "${LOG_B_WAIT}" 1 "$(date +%s)")"
+  printf 'rc=%s waited=%s\n' "${rc}" "$([[ $(( $(date +%s) - t0 )) -ge 3 ]] && echo yes || echo no)"
+}
+check "conservation wait: aborts that rose before the wait fail without waiting" "rc=1 waited=no" \
+  "$(aborts_first)"
+METRICS_FILE="${SCRATCH}/metrics-file"
+printf '%s\n' "${METRICS_SAMPLE}" >"${METRICS_FILE}"
+printf '2026-10-10T05:29:00Z  INFO ravel_server: other work\n' >"${LOG_B_WAIT}"
+(
+  sleep 1
+  sed 's/^\(ravel_maintain_conservation_aborts_total{mode="maintain",signal="metrics"}\) 1$/\1 2/' \
+    "${METRICS_FILE}" >"${METRICS_FILE}.new"
+  command mv "${METRICS_FILE}.new" "${METRICS_FILE}"
+  printf '%s\n' "${PUB_LINE}" >>"${LOG_B_WAIT}"
+) &
+check "conservation wait: an abort during the wait fails even with a publish" "1" \
+  "$(CURL_MODE=metrics-file cons_wait "${LOG_A_UNIT2}" "${LOG_B_WAIT}" 5)"
+wait
 
 # ---------------------------------------------------------------------------
 # Fixture arguments reach gen_otlp_fixture, and none are added by default.

@@ -842,16 +842,16 @@ load, or issuing a real kill:
 | Script | Scenario | Pinned oracle |
 |---|---|---|
 | `scripts/chaos/kill-ingest-flush.sh` | Drive strict-acknowledged load, then send one more export in the background and `SIGKILL` the server mid-flush, restart. The kill fires the moment the sum of the `ravel_ingest_flushes_by_*_total` and `ravel_ingest_flushes_manual_total` families rises past its value read after the acknowledged exports, which is flush-attempt time whatever triggered the flush. A baseline that cannot be read exits 3. The run prints `KILL-TIMING: mid-flush=yes` or `mid-flush=no`, the latter when no flush was observed or the server answered the in-flight export before the kill. | Every write acknowledged under strict acknowledgement before the kill is durable and queryable after restart; no partial flush becomes visible; custody and catalog verification clean. |
-| `scripts/chaos/kill-maintain-worker.sh` | Two `maintain` mode workers under leased maintenance, `SIGKILL` one mid-compaction with the sibling running. The script first stops the ingest server and waits until every hour it wrote is past the compactor's seal: it waits for the end of the hour plus the server's logged `seal_margin_secs` (the catalog fold's margin, which exceeds the compactor's while `--gc-max-flush-lifetime` is at its default), plus 120 s, so there is something to compact. The kill fires while the victim owns units and its log shows unfinished compaction work, within one maintenance tick plus 120 s. | The sibling takes over the dead worker's units within the liveness bound plus one maintenance tick; no unit stays orphaned; the interrupted compaction completes under the conservation gate; the dead worker's partial outputs age out with no leak past the horizon; custody and catalog verification clean. |
+| `scripts/chaos/kill-maintain-worker.sh` | Two `maintain` mode workers under leased maintenance, `SIGKILL` one mid-compaction with the sibling running. The script first stops the ingest server and waits until every hour it wrote is past the compactor's seal: it waits for the end of the hour plus the server's logged `seal_margin_secs` (the catalog fold's margin, which exceeds the compactor's while `--gc-max-flush-lifetime` is at its default), plus 120 s, so there is something to compact. The kill fires on the first scrape of the victim's `/metrics` that reads `ravel_maintain_compactions_in_flight` at 1 or more, which means a bucket merge has started and not finished. The script scrapes every 0.05 s plus the time the scrape takes (`CHAOS_COMPACTION_POLL_SECONDS`). If the gauge never reads 1 within one maintenance tick plus 120 s, the kill still fires and the run prints a warning. The default load, 1350 exports of 1000 series by 300 points paced at one per 0.75 s, is sized for a merge of about 1 s. That figure scales the 15 ms that 60 inputs took in a real nightly and has not been measured itself; the `CHAOS_MAINTAIN_*` variables in `scripts/chaos/lib.sh` tune it. After the kill, the conservation oracle reads the sibling's log every 5 s for a compaction record published after the kill, for up to the liveness bound plus one maintenance tick from the kill, since the sibling takes over a dead worker's unit only once its lease expires. It then decides. | The sibling takes over the dead worker's units within the liveness bound plus one maintenance tick; no unit stays orphaned; the interrupted compaction completes under the conservation gate; the dead worker's partial outputs age out with no leak past the horizon; custody and catalog verification clean. |
 
 A failure of the second scenario is release-blocking. The exit codes are:
 
 - The second script names the failed assertions and exits 2 on any oracle
   failure.
 - The second script exits 3 when the conservation oracle could not measure:
-  the survivor published nothing after the kill and the victim's log shows no
-  interrupted unit, because it published nothing before the kill or had
-  finished its last pass. Its summary names the reason in a
+  the survivor published nothing between the kill and the end of the
+  oracle's wait, and the victim's log shows no interrupted unit, because it
+  published nothing before the kill or had finished its last pass. Its summary names the reason in a
   `RESULT: COULD NOT MEASURE` line. An oracle failure elsewhere still exits 2.
 - The first script exits 1 on an oracle failure.
 - For both scripts, 3 is otherwise, and anything above 3 always, a setup or
@@ -864,7 +864,8 @@ scenario returned.
 
 `scripts/chaos/lib.test.sh` covers the helpers that the scripts rest on,
 without a store: the label-aware `/metrics` parser, commit-token extraction,
-and the read-your-write check. It runs on every pull request in the
+the read-your-write check, the mid-compaction trigger against a stubbed
+`/metrics`, and the conservation oracle's wait with a shortened bound. It runs on every pull request in the
 `doc-scripts` job of ci.yml.
 
 Record each real run here, under the same rule as the table above. Only a
