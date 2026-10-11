@@ -1885,4 +1885,87 @@ mod tests {
         assert!(lens.contains(&4), "the default generation set is present");
         assert!(lens.contains(&8), "the activated generation set is present");
     }
+
+    /// A clock a test sets by hand.
+    struct SetClock(std::sync::atomic::AtomicI64);
+
+    impl Clock for SetClock {
+        fn now_ns(&self) -> i64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The flush-open background re-read ([`GenerationSwitch::reread`]) merges
+    /// a floor it reads into the cached view, so the next flush's
+    /// [`GenerationSwitch::floor_check`] refuses. Both arms of
+    /// `install_if_newer` are reached: tenant 1's cached view was refreshed at
+    /// the instant the re-read is issued, so its generations are kept and only
+    /// the floor merges; tenant 2's view is older than the re-read, so the
+    /// re-read replaces it. Deleting either arm's floor merge leaves that
+    /// tenant's check at `Write`.
+    #[tokio::test]
+    async fn a_background_reread_raising_the_floor_is_seen_by_the_next_flush_check() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let t0 = 10 * NS_PER_HOUR;
+        let family = FormatFamily::Rseg;
+        let writing = family.writable_version();
+        let floor = writing + 1;
+        let (kept, replaced) = (tenant(1), tenant(2));
+        for t in [kept, replaced] {
+            ravel_catalog::validate_or_adopt(
+                store.as_ref(),
+                &t,
+                Signal::Metrics,
+                1,
+                1,
+                ravel_catalog::AbsentPolicy::CreateFromConfig,
+            )
+            .await
+            .expect("provision");
+        }
+        let clock = Arc::new(SetClock(std::sync::atomic::AtomicI64::new(t0)));
+        let sw = Arc::new(index_switch(1, DEFAULT_REFRESH_INTERVAL_NS).with_refresh_source(
+            store.clone(),
+            Signal::Metrics,
+            clock.clone(),
+        ));
+        let metrics = Arc::new(crate::format_floor::FormatFloorMetrics::default());
+        sw.set_floor_policy(FormatFloorPolicy::new(false, Arc::clone(&metrics)));
+        sw.refresh(kept, vec![gen0(1)], t0);
+        sw.refresh(replaced, vec![gen0(1)], t0);
+        assert_eq!(sw.floor_check(kept, family, writing), FloorCheck::Write);
+        for t in [kept, replaced] {
+            ravel_catalog::raise_format_floor(
+                store.as_ref(),
+                &t,
+                Signal::Metrics,
+                family.as_str(),
+                floor,
+                ravel_catalog::FloorBasis {
+                    observed_entries: 0,
+                    observed_newest_created_unix_ns: 0,
+                    observed_shards: 1,
+                },
+                "test",
+                2,
+            )
+            .await
+            .expect("raise floor");
+        }
+        let refused = FloorCheck::Refuse(BelowFormatFloor {
+            family,
+            floor,
+            writing,
+        });
+
+        assert!(sw.reread(kept).await, "the re-read installs");
+        assert_eq!(sw.floor_check(kept, family, writing), refused);
+
+        clock.0.store(t0 + 1, std::sync::atomic::Ordering::SeqCst);
+        assert!(sw.reread(replaced).await, "the re-read installs");
+        assert_eq!(sw.floor_check(replaced, family, writing), refused);
+        assert_eq!(metrics.refused(family), 2);
+    }
 }
