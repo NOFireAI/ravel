@@ -481,12 +481,101 @@ fn ts_only_fixture(ts: Vec<i64>) -> (tempfile::TempDir, std::path::PathBuf, std:
     (dir, pq, mapping_path)
 }
 
+/// Router-quiet periods on the injected clock [`yield_until_geometry_printed`]
+/// sits through before it calls the line missing. Decoding the first batch
+/// runs on a blocking thread that reads no clock, so the router reads as quiet
+/// while it runs; this many quiet periods is far longer than that decode and
+/// still fails a load that never prints in well under a second.
+const GEOMETRY_QUIET_PERIODS: usize = 10_000;
+
 /// Yields until `sink` holds the load's geometry line. The loader prints it
 /// once the first batch is decoded, which happens on a blocking thread this
-/// task cannot otherwise wait on.
-async fn yield_until_geometry_printed(sink: &SharedSink) {
-    while !sink.text().contains(GEOMETRY_LINE_PREFIX) {
-        tokio::task::yield_now().await;
+/// task cannot otherwise wait on. Panics once the router has been quiet on
+/// `clock` [`GEOMETRY_QUIET_PERIODS`] times with no line, so a load that never
+/// calls the geometry hook fails the test instead of hanging it.
+async fn yield_until_geometry_printed(sink: &SharedSink, clock: &TestClock) {
+    for _ in 0..GEOMETRY_QUIET_PERIODS {
+        if sink.text().contains(GEOMETRY_LINE_PREFIX) {
+            return;
+        }
+        yield_until_router_is_quiet(clock).await;
+    }
+    panic!(
+        "no geometry line after {GEOMETRY_QUIET_PERIODS} quiet periods on the injected clock: {}",
+        sink.text()
+    );
+}
+
+/// A store that records, at its first data-object PUT, whether `sink` already
+/// held the geometry line.
+struct GeometryBeforePutStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    sink: SharedSink,
+    printed_at_first_put: std::sync::Mutex<Option<bool>>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for GeometryBeforePutStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: ravel_object_store::PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        if key.contains("/l0/") {
+            let printed = self.sink.text().contains(GEOMETRY_LINE_PREFIX);
+            self.printed_at_first_put
+                .lock()
+                .expect("first-put lock")
+                .get_or_insert(printed);
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+    {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
     }
 }
 
@@ -543,7 +632,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
             "the load must not finish before 60 s on the injected clock: {result:?}"
         ),
         () = async {
-            yield_until_geometry_printed(&sink).await;
+            yield_until_geometry_printed(&sink, &clock).await;
             yield_until_router_is_quiet(&clock).await;
             clock.advance_ns(59 * SECOND_NS);
             yield_until_router_is_quiet(&clock).await;
@@ -575,12 +664,15 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
 /// size nor the age trigger can answer their acks: only the failure path's
 /// own `flush_all` (`drain_inflight`) can. The load returns the row
 /// rejection with the first two batches durable as one object, and the
-/// geometry line was printed before anything was written.
+/// geometry line was already in the warnings sink at the first data-object
+/// PUT.
 ///
 /// Prove-the-test: delete the `router.flush_all()` in `drain_inflight` and
 /// the buffered acks are answered by nothing, so the load fails only once
 /// the Strict ack deadline (120 s of wall time at the 60 s default delay)
-/// expires, with a write error instead of the row rejection.
+/// expires, with a write error instead of the row rejection. Drop the
+/// `rx.recv()` arm in `printing_geometry` and the line is written only once
+/// the load returns, after that PUT.
 #[tokio::test]
 async fn a_failed_default_load_flushes_before_it_reports() {
     use ravel_object_store::memory::MemoryStore;
@@ -590,9 +682,14 @@ async fn a_failed_default_load_flushes_before_it_reports() {
     // Row 4 is the first row of the third 2-row batch.
     ts[4] = NOW_NS + limits.max_future_skew_ns + 1;
     let (_dir, pq, mapping_path) = ts_only_fixture(ts);
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(NOW_NS);
     let sink = SharedSink::default();
+    let probe = Arc::new(GeometryBeforePutStore {
+        inner: Arc::new(MemoryStore::new()),
+        sink: sink.clone(),
+        printed_at_first_put: std::sync::Mutex::new(None),
+    });
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&probe) as Arc<dyn ObjectStoreBackend>;
     let mut warnings = sink.clone();
     let err = run_fold_warning_to(
         Arc::clone(&store),
@@ -637,5 +734,10 @@ async fn a_failed_default_load_flushes_before_it_reports() {
     assert!(
         emitted.contains("load geometry: logs: flush target "),
         "{emitted}"
+    );
+    assert_eq!(
+        *probe.printed_at_first_put.lock().expect("first-put lock"),
+        Some(true),
+        "the geometry line was in the sink at the first data-object PUT"
     );
 }

@@ -2434,6 +2434,90 @@ async fn a_derived_depth_above_the_cap_is_capped() {
     );
 }
 
+/// Issue #2753: a memory bound between the cap and the rows bound still
+/// leaves the cap deciding, and the summary names all three. `--batch-rows 1`
+/// on 4 shards has a rows bound of 1,000,000; a `--load-memory` of 2,000
+/// batches puts the memory bound at 2,000, above the 1,024 cap.
+#[tokio::test]
+async fn a_memory_bound_above_the_cap_leaves_the_cap_deciding() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(1, 4);
+    let probe = load_with_default_geometry_on(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        4,
+        1,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    let per_row = probe.geometry.expect("geometry resolved").est_bytes_per_row;
+    let report = load_with_default_geometry_on(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        4,
+        1,
+        None,
+        None,
+        LoadMemoryRequest::Flag(2_000 * per_row),
+    )
+    .await;
+    let layout = report.layout_report();
+    let geometry = layout.geometry.expect("geometry resolved");
+    assert_eq!(geometry.rows_depth, 1_000_000);
+    assert_eq!(geometry.memory_depth, Some(2_000));
+    assert_eq!(geometry.pipeline_depth, MAX_DERIVED_PIPELINE_DEPTH);
+    assert_eq!(geometry.depth_bound, DepthBound::Cap);
+    let summary = render_layout_summary(&layout);
+    assert!(
+        summary.contains(
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000, memory bound \
+             2000)"
+        ),
+        "{summary}"
+    );
+}
+
+/// Issue #2753: a logs input with no rows resolves no geometry, so the
+/// report carries none and the summary prints no geometry lines, as on the
+/// metrics and spans paths.
+#[tokio::test]
+async fn an_empty_input_reports_no_geometry() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(0, 2);
+    let report = load_with_default_geometry(
+        Arc::new(MemoryStore::new()),
+        &pq,
+        &m,
+        2,
+        None,
+        None,
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(GEOMETRY_HOST_BYTES),
+        },
+    )
+    .await;
+    assert_eq!(report.rows_processed, 0);
+    assert!(
+        report.tokens.is_empty(),
+        "nothing was written: {:?}",
+        report.tokens
+    );
+    assert_eq!(report.geometry, None);
+    let layout = report.layout_report();
+    assert_eq!(layout.geometry, None);
+    let summary = render_layout_summary(&layout);
+    assert!(!summary.contains("flush target"), "{summary}");
+    assert!(!summary.contains("pipeline depth"), "{summary}");
+}
+
 /// The ack semantics a larger `--target-bytes` changes (issue #801,
 /// deliverable 3). A Strict write's ack is answered from `ack_waiters` in
 /// `crates/ravel-ingest/src/log_shard.rs`, which only runs once that
