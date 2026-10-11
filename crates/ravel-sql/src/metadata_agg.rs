@@ -1,7 +1,7 @@
 //! Answer two more ClickBench aggregate shapes straight from ADR-0850's
 //! per-object column statistics, with zero data-block GETs (issue #850, item
 //! 2 of epic #849; the first shape, predicate-free/ts-contained `COUNT(*)`
-//! and `MIN`/`MAX`, is [`crate::logs_scan::LogsScanExec::partition_statistics`]
+//! and `MIN`/`MAX`, is [`crate::logs_scan::LogsScanExec::statistics_from_inputs`]
 //! feeding DataFusion's own built-in `AggregateStatistics` physical optimizer
 //! rule -- that rule requires zero `GROUP BY` and zero residual filter, so it
 //! can never fire for either shape here and this rule is additive, not
@@ -59,6 +59,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -66,6 +67,7 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -619,6 +621,13 @@ impl ExecutionPlan for MetadataOnlyExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -648,7 +657,11 @@ impl ExecutionPlan for MetadataOnlyExec {
         )?))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
         Ok(Arc::new(
             physical_plan::common::compute_record_batch_statistics(
                 &[vec![self.batch.clone()]],

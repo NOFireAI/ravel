@@ -35,9 +35,9 @@
 //! `AggregateExec`, summed across its partitions:
 //!
 //! * `output_rows` (the `BaselineMetrics` counter every operator publishes),
-//! * `skipped_aggregation_rows` (the counter `GroupedHashAggregateStream`
-//!   increments for each row it forwards without aggregating, which is zero
-//!   exactly when no partition's probe ever fired),
+//! * `skipped_aggregation_rows` (the counter DataFusion 55's
+//!   `PartialHashAggregateStream` increments for each row it forwards without
+//!   aggregating, which is zero exactly when no partition's probe ever fired),
 //! * `output_rows - skipped_aggregation_rows`, the rows the partial stage
 //!   emitted out of its hash tables, which is the number of group entries those
 //!   tables held. That last figure is the quantity issue #680 is about: what

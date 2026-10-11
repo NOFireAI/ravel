@@ -727,7 +727,7 @@ pub struct SpillCounts {
     /// rows.
     pub rows_written: u64,
     /// Bytes streamed back from spill files, or `None` when unmeasured.
-    /// Always `None` on DataFusion 54, which exposes no read-side spill
+    /// Always `None` on DataFusion 55, which exposes no read-side spill
     /// counter (module doc). `None` rather than `0` so a reader cannot mistake
     /// "not measured" for "nothing was read".
     pub bytes_read: Option<u64>,
@@ -778,7 +778,7 @@ pub(crate) fn accumulate_spill_counts(
 ) {
     if let Some(metrics) = plan.metrics() {
         // Spill figures are typed `MetricValue::SpillCount`/`SpilledBytes`/
-        // `SpilledRows` variants, not named `Count`s. DataFusion 54.1.0's
+        // `SpilledRows` variants, not named `Count`s. DataFusion 55.2.0's
         // `MetricsSet::sum_by_name` matches only named metrics and returns
         // `false` for every spill variant, so reading them by name always
         // yields zero even for a query that spilled; the typed accessors are

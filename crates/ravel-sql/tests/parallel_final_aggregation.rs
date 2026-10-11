@@ -77,8 +77,8 @@ fn nan_b() -> f64 {
 /// group's aggregate. Includes:
 ///
 /// - `big`: three `4e15` samples, one per segment, for the 2^53-crossing sum.
-/// - `floats`: `-0.0`/`0.0` and mixed-payload NaNs split across partitions, for
-///   `count(DISTINCT float_col)`.
+/// - `floats`: `-0.0`/`0.0` (one group key since DataFusion 55) and
+///   mixed-payload NaNs split across partitions, for `count(DISTINCT float_col)`.
 fn dataset() -> Vec<SegSpec> {
     let seg1 = SegSpec::new(
         10,
@@ -317,16 +317,17 @@ async fn count_distinct_float_is_bit_identical_across_partition_counts() {
 
     let baseline = sorted_rows(&fixture_with(1, false).await, sql).await;
 
-    // The `floats` group's four distinct bit patterns (-0.0, 0.0, NAN_A, NAN_B),
-    // with the second NAN_A collapsing back into the first.
+    // The `floats` group holds -0.0, 0.0, NAN_A, NAN_B and a second NAN_A.
+    // DataFusion 55's group values fold -0.0 into 0.0 (SQL equality) and keep
+    // NaN payloads apart, so three distinct values remain: zero and two NaNs.
     let floats_row = baseline
         .iter()
         .find(|row| group_key(row) == "floats")
         .expect("the floats group is present");
     assert_eq!(
         floats_row[1],
-        Cell::Int(4),
-        "-0.0, 0.0, and two NaN payloads are four distinct values; a repeated \
+        Cell::Int(3),
+        "-0.0 and 0.0 are one group key, two NaN payloads are two; a repeated \
          payload collapses"
     );
 

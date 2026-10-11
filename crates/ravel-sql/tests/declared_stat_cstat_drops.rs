@@ -1,5 +1,5 @@
 //! The `.cstat` half of the ADR-0873 decision 2 defect metric: the `.cstat`
-//! entry is read in `ravel_sql` (by `partition_statistics` too, although there
+//! entry is read in `ravel_sql` (by `statistics_from_inputs` too, although there
 //! it never answers, since it describes record-level cells rather than the
 //! merged value SQL returns), so its refusals are reported to
 //! `ravel_commit::declared_stats::declared_stat_drops_observed` under the
@@ -8,7 +8,7 @@
 //!
 //! The metric has observation semantics (one increment per READ of a defective
 //! entry, no per-entry dedup), which is why every assertion here is a delta
-//! across exactly one `partition_statistics` call.
+//! across exactly one `statistics_from_inputs` call.
 //!
 //! Own integration binary, all tests synchronous, all tests holding one lock:
 //! the tally is process-wide and monotonic, so an exact-delta assertion means
@@ -19,6 +19,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -161,9 +162,9 @@ fn resolve(
     .with_column_stats(Some(stats));
     let plan = provider.plan_filters(4, &[]).expect("plan_filters");
     let before = observed_all();
-    let resolved = plan
-        .partition_statistics(None)
-        .expect("partition_statistics");
+    let resolved = StatisticsContext::new()
+        .compute(plan.as_ref(), &StatisticsArgs::new())
+        .expect("statistics");
     let after = observed_all();
     drop(guard);
 

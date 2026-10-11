@@ -60,7 +60,7 @@ pub const DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS: usize = 8;
 /// magnitude below it.
 pub const DEFAULT_BOUNDED_TOPK_MAX_LIMIT: usize = 1024;
 
-/// Under-count of DataFusion 54's `GroupValues::size()` against the real
+/// Under-count of DataFusion 55's `GroupValues::size()` against the real
 /// hashbrown allocation of the group-key table (issue #740, finding 2).
 /// `size()` charges `capacity() * entry_size`, where `capacity()` is the
 /// table's usable slot count at the 7/8 load factor, and it counts no control
@@ -84,7 +84,7 @@ pub const GROUP_VALUES_RESIZE_TRANSIENT_FACTOR: f64 = 1.5;
 
 /// Combined compensation applied to a reported `GroupValues::size()` figure to
 /// bound the real peak the pool must survive: the under-count times the resize
-/// transient, `1.22 * 1.5 = 1.83`. Both defects are upstream in DataFusion 54
+/// transient, `1.22 * 1.5 = 1.83`. Both defects are upstream in DataFusion 55
 /// (documented in the ADR-0102 amendment for #740); this crate cannot fix
 /// either from outside DataFusion, so it compensates its own ceiling math by
 /// this factor rather than trusting the reported figure. See

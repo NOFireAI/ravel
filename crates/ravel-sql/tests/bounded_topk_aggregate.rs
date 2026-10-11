@@ -693,12 +693,12 @@ const PEAK_ON_SMALL: u64 = 1_050_112;
 const PEAK_ON_LARGE: u64 = 1_509_688;
 
 /// The 20,000-key fixture with the rule uninstalled.
-const PEAK_OFF_SMALL: u64 = 1_143_552;
+const PEAK_OFF_SMALL: u64 = 1_143_040;
 
 /// The 200,000-key fixture with the rule uninstalled: ten times the groups for
-/// 9.4 times the bytes. This is the figure issue #1402 exists to remove, at
+/// 8.26 times the bytes. This is the figure issue #1402 exists to remove, at
 /// fixture scale.
-const PEAK_OFF_LARGE: u64 = 10_748_928;
+const PEAK_OFF_LARGE: u64 = 9_438_720;
 
 /// The claim, as a ratio between two measured pairs.
 ///

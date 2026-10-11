@@ -13,7 +13,7 @@
 //!
 //! # What can and cannot be bounded exactly
 //!
-//! The pinned DataFusion (54.1) already ships the operator: an `AggregateExec`
+//! The pinned DataFusion (55.2) already ships the operator: an `AggregateExec`
 //! carrying `LimitOptions` executes as `GroupedTopKAggregateStream`, a bounded
 //! priority map of `k` groups instead of an unbounded group table. This rule
 //! decides *when* ravel lets that happen; it does not reimplement it.
@@ -267,7 +267,7 @@ fn is_pass_through(plan: &Arc<dyn ExecutionPlan>) -> bool {
         return false;
     }
     // `CoalescePartitionsExec` collapses the partial stages under the final
-    // one; `CooperativeExec` is DataFusion 54's yield wrapper. A
+    // one; `CooperativeExec` is DataFusion 55's yield wrapper. A
     // `RepartitionExec` of any partitioning preserves every row: it moves rows
     // between partitions, and the sort above it still takes the global top `k`
     // from whatever each partition kept.

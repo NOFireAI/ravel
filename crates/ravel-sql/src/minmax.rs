@@ -1,6 +1,6 @@
 //! Total-order MIN/MAX (ADR-0023).
 //!
-//! DataFusion 54.1.0 ships two disagreeing MIN/MAX implementations for
+//! DataFusion 55.2.0 ships two disagreeing MIN/MAX implementations for
 //! floating point. The ungrouped path (`MinAccumulator`/`MaxAccumulator` over
 //! arrow's min/max kernels) compares with `f64::total_cmp`, a true total
 //! order. The grouped path (`PrimitiveGroupsAccumulator`) folds `partial_cmp`

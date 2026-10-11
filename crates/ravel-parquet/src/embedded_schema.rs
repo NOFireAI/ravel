@@ -2,7 +2,7 @@
 //! `ARROW:schema` key-value, run by the footer walk before anything decodes
 //! it.
 //!
-//! parquet 58.4.0's Arrow schema conversion, which the reader runs at every
+//! parquet 59.3.0's Arrow schema conversion, which the reader runs at every
 //! scan open and the snapshot runs to describe a file, base64-decodes that
 //! value, drops the 8-byte IPC prefix it starts with, and verifies the
 //! flatbuffer with the verifier's default options: an apparent size of
