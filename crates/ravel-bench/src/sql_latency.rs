@@ -4204,17 +4204,21 @@ mod tests {
     /// The `--cache-bytes` cache is not inert: attaching it to the log fetcher
     /// cuts object-store GETs and adds fetch-cache hits.
     ///
-    /// Only the planned route re-reads an object within a run, so only it gives
-    /// the fetcher cache a second read to absorb. A segment at or under
-    /// `LogSegmentFetcher::plan_whole_object_bound` is no longer that route
-    /// here (ADR-2677 decision 2, as amended 2026-10-11): a scan holding at
-    /// least as many such segments as partitions opens each one once,
-    /// unplanned, and without a cache this lane's scan has one partition per
-    /// segment at most, so its sub-bound segments always take the read-once
-    /// route and leave the cache nothing within a run. The fixture therefore
-    /// routes its objects ABOVE the bound: `logs_block_range_threshold: 0`
-    /// with no projection break-even makes the bound 0, which every object
-    /// exceeds (asserted below), so every segment is planned
+    /// Within a run the cache saves a GET only where the run reads the same
+    /// bytes twice. A segment at or under
+    /// `LogSegmentFetcher::plan_whole_object_bound` no longer does here
+    /// (ADR-2677 decision 2, partition-count amendment): a scan holding at
+    /// least as many such segments, relevant to the window, as partitions opens
+    /// each one once, unplanned (`sub_break_even_segments_are_read_once` in
+    /// ravel-sql's `logs_selective_scan_amplification` tests). Without a cache
+    /// a scan declares at most one
+    /// partition per segment, so a scan made only of sub-bound segments always
+    /// takes that route there, and at this fixture's one partition the cached
+    /// arm takes it too: neither arm re-reads, so the cache has nothing to
+    /// absorb. The fixture therefore routes its objects ABOVE the bound, where
+    /// the planned route still re-reads: `logs_block_range_threshold: 0` with
+    /// no projection break-even makes the bound 0, which every object exceeds
+    /// (asserted below), so every segment is planned
     /// (`LogSegmentFetcher::plans_segment`).
     ///
     /// On that route, with the derived suffix probe (`derive_suffix_len`, which
@@ -4244,7 +4248,11 @@ mod tests {
     /// cached arm without `with_cache` collapses the delta to zero
     /// (`get_on=14 get_off=14`). Making `plans_segment` answer false sends all
     /// three segments down the read-once route in both arms
-    /// (`get_on=7 get_off=7`).
+    /// (`get_on=7 get_off=7`). Dropping the `carried_seen < budget` bound from
+    /// `compute_plan_counts` in `ravel_sql::logs_scan` carries every segment,
+    /// so no scan re-open is left (`get_on=7 get_off=10`): the uncached phase
+    /// split fails first, and of the three totals checks only the exact
+    /// difference would, since the cache still cuts GETs and adds hits.
     ///
     /// The `has_word` predicate keeps the query off `LogsScanExec`'s
     /// predicate-free whole-segment fast path (issue #739), which reads each
