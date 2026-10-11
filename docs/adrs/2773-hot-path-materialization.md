@@ -405,7 +405,7 @@ on the ratio new / main.
 |---|---|---|
 | Set I (q2, q3, q4, q8, q30), warm CPU sum | at most 0.70 | above 0.78 |
 | Set S (q11, q12, q13, q25, q26, q27), warm CPU sum | at most 0.85 | above 0.92 |
-| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 | above 0.92 |
+| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 (missed at 0.99; see the Set L amendment below) | above 0.92 |
 | Set N (11), warm wall sum | at most 0.80 | above 0.88 |
 | Suite (43), warm CPU sum | at most 0.90 | above 0.95 |
 | Suite (43), warm wall sum | at most 0.92 | above 0.97 |
@@ -589,41 +589,55 @@ gets can differ from main's; no well-formed object changes result.
 The Set L band (q21 to q24, the `LIKE` statements over `URL` and `Title`,
 warm CPU at most 0.85) did not hold, and the model it was derived from
 was wrong. Measured by the T5 sweep on #2790 (two arms interleaved on one
-c6a.4xlarge, 3 repetitions): 0.998 for main `aaebcc008` against main
-`bb171e615`, and 0.993 for `bb171e615` against the same tree with the
-three epic commits reverted. The measured 0.99 is the outcome of record;
-no new band is claimed for these statements by this ADR.
+c6a.4xlarge, 3 repetitions), as new / base like every band here: 0.998
+with new = main `bb171e615` and base = main `aaebcc008` (the parent of
+the three epic commits, the pre-registered comparison), and 0.993 with
+the same new arm against base = `bb171e615` with 011d5fe11, 7e5ffb59a
+and bb171e615 reverted (the control that isolates the epic). The measured
+0.99 is the outcome of record; no new band is claimed for these
+statements by this ADR.
 
 What the derivation got wrong. "Targets and bars" took the `Declared Str
-build` column of the profile table less the `UTF-8 validation` column it
-contains (22.7% pooled) as the part D3 removes. The validation column only
-counted the frames under the builder's own `from_utf8` (5.0% on q23); the
-other 15 points of validation on q23 sat under the columnar view's lazy
-cell accessor (`entry > get_or_try_init`), inside the same build frame,
-and were counted as removable. Read by leaf, the build on q23 was 37.9%:
-validation 19.4, the winner selection 5.1, the per-cell `append_value`
-2.9, the second keys vector 1.8, the builder itself 1.5, and the copy of
-the cell bytes. D3 could remove the winner, the append and the keys vector
-(about 15 points on q23, 12 to 16 on the others) and did; the validation
-and the copy are the cost of the column.
+build` column of the profile table less the `UTF-8 validation` column
+(45.7 less 20.6 on q23, 22.7% pooled) as the part D3 removes. The
+subtraction itself was right: the validation column already held all of
+the validation. The error was in what remained. Of the 25.1 points left
+on q23, D3 could only remove the per-cell overhead of the builder: read
+by leaf in the #2864 profile's control arm (the same tree minus the epic,
+2 repetitions pooled, where the build frame is 37.9% inclusive), that is
+the multi-occurrence winner selection (`winner_at`, 5.1), the per-cell
+`append_value` (2.9), the second keys vector (1.8) and the builder's own
+frame (1.5), about 10 points, and 10 to 12 on q21, q22 and q24. The rest
+of the column was the read and copy of each cell's bytes through the
+cursor (`crates/ravel-logseg/src/columnar.rs`, `text_at`, which is also
+where the validation ran, once per cell, `std::str::from_utf8` at line
+312 of the pre-D3 tree), and that is the cost of the column, not an
+overhead. The control arm reproduces the P1 table's groups within 1 to 4
+points; the #2864 run's zstd share (18 to 20 points) is 2 to 3 above the
+table's 15.0 to 18.1 for the same statements, so figures from the two
+runs are compared by group, not to the decimal.
 
-What landed. The profile on #2864 (`bb171e615` against the same tree minus
-the epic, frame pointers, same box, interleaved, 2 repetitions) shows the
-build frame at 13 to 17% in the new tree with `winner_at`, `append_value`
-and the keys vector at 0.0%, the per-row predicate at 0.2 to 0.4% (D2),
-the UTF-8 validation unchanged at 8 to 20% but now reached through
-`decode_columns` when a block's `DictValues` is built, with the entry copy
-moved with it, and the shared values array and cache (D3) at 4 to 5%.
-Net per statement: q21 1.00, q22 1.00, q23 0.97, q24 0.95. The dominant
-phase on these statements is the decode of the long cells and their
-once-per-cell validation (zstd 18 to 20 points, validation 8 to 20, copy),
-which D1 to D3 do not touch and which this ADR's Rejected alternatives
-leave to a format-level validated flag.
+What landed. In the new tree the build frame is 13 to 17%: `winner_at`
+is not reached on these statements (their columns take the single
+matching branch of `build_str_block`), the per-cell append and the second
+keys vector are gone, and the per-row predicate is 0.2 to 0.4% (D2). The
+validation is unchanged at 8 to 20% of each statement but runs once per
+dictionary entry when the block's `DictValues` is built from
+`decode_columns` (`crates/ravel-logseg/src/dict_values.rs`,
+`validate_entry`), with the entry copy moved there with it; the shared
+values array and its cache (D3) add 4 to 5%. Net per statement in that
+run: q21 1.00, q22 1.00, q23 0.97, q24 0.95, a Set L sum of 0.98 for
+that run's own two repetitions; the T5 sweep's 0.993 above is the ratio
+of record. The dominant phase on these statements is the decode of the
+long cells and their once-per-entry validation (zstd 15 to 20 points,
+validation 8 to 20, the copy), which D1 to D3 do not touch and which this
+ADR's Rejected alternatives leave to a format-level validated flag.
 
 What moves Set L. A `LIKE '%literal%'` arm evaluated on the raw page bytes
 before the block's values are validated and built, so that only the
 surviving rows (15,911 of 99,997,497 on q21) pay the validation, the
 copy, the build and the `LIKE` kernel. That changes the pushed predicate
-language D2 holds fixed, so it is its own decision: issue #2865, which
-sizes it at about 0.5 to 0.6 for Set L ahead of `DictValues` and about
-0.8 behind it.
+language D2 holds fixed and makes D3's per-block values build lazy on
+that path, so it is its own decision: issue #2865, which sizes it at
+about 0.5 to 0.6 for Set L ahead of `DictValues` and about 0.8 behind
+it.
