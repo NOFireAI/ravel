@@ -1130,8 +1130,8 @@ pub(super) async fn load_metrics_with(
                 .to_string(),
         ));
     }
-    let memory_budget = request
-        .sequential_memory_budget(u64::from(shards) * u64::from(max_inflight_flushes))?;
+    let memory_budget =
+        request.sequential_memory_budget(u64::from(shards) * u64::from(max_inflight_flushes))?;
     mapping.validate()?;
 
     let limits = IngestLimits::default();

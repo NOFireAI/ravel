@@ -66,10 +66,10 @@ pub use lifecycle::{
 };
 pub use log_error::LogWriteError;
 pub use log_metrics::{FlushTriggerMix, LogIngestMetrics, LogIngestMetricsSnapshot};
-pub use log_shard::{est_columnar_log_batch_object_bytes, est_log_records_object_bytes};
 pub use log_router::{
     LogIndexedFields, LogIngestRouter, LogSubmitted, LogWriteReceipt, NoIndexedFields,
 };
+pub use log_shard::{est_columnar_log_batch_object_bytes, est_log_records_object_bytes};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot, ShardSkewStats};
 pub use metrics_meta_sink::{
     DEFAULT_MAX_CAS_RETRIES, DEFAULT_METADATA_FLUSH_WINDOW, FlushSummary, MetadataSink,

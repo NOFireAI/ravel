@@ -138,7 +138,12 @@ fn loader_flush_window_default_diverges_from_the_serving_default() {
         None,
         "the serving path leaves the share at max(1, N-1)"
     );
-    let cfg = build_ingest_config(4, PER_BATCH_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    let cfg = build_ingest_config(
+        4,
+        PER_BATCH_TARGET_BYTES,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        None,
+    );
     assert_eq!(
         cfg.max_inflight_flushes_per_tenant,
         Some(DEFAULT_MAX_INFLIGHT_FLUSHES as usize),
@@ -159,7 +164,12 @@ fn loader_flush_window_default_diverges_from_the_serving_default() {
 /// `left: 1s, right: 2s`.
 #[test]
 fn max_flush_delay_unset_keeps_the_default_age_trigger() {
-    let cfg = build_ingest_config(4, PER_BATCH_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    let cfg = build_ingest_config(
+        4,
+        PER_BATCH_TARGET_BYTES,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        None,
+    );
     assert_eq!(
         cfg.max_flush_delay,
         IngestConfig::default().max_flush_delay,
@@ -250,7 +260,12 @@ fn strict_visibility_budget_follows_the_configured_flush_delay() {
         "the budget must exceed the delay, not equal it: equal collapses the corridor"
     );
 
-    let unset = build_ingest_config(4, PER_BATCH_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+    let unset = build_ingest_config(
+        4,
+        PER_BATCH_TARGET_BYTES,
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        None,
+    );
     assert_eq!(
         unset.strict_visibility_budget_ns,
         IngestConfig::default().strict_visibility_budget_ns,

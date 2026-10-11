@@ -1911,7 +1911,9 @@ async fn default_load_merges_batches_into_target_sized_objects() {
     assert_eq!(report.objects_written(), expected_objects);
 
     let layout = report.layout_report();
-    let geometry = layout.geometry.expect("a load that decoded rows resolves its geometry");
+    let geometry = layout
+        .geometry
+        .expect("a load that decoded rows resolves its geometry");
     assert_eq!(geometry.target_source, TargetSource::Derived);
     // `est_bytes_per_row` is the first batch's estimate per row rounded up;
     // the target is 250,000 rows of the unrounded figure.
@@ -2025,7 +2027,9 @@ async fn a_small_memory_budget_decides_the_derived_depth() {
     assert_eq!(geometry.depth_bound, DepthBound::Memory);
     let summary = render_layout_summary(&layout);
     assert!(
-        summary.contains("pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"),
+        summary.contains(
+            "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+        ),
         "{summary}"
     );
 }

@@ -1014,8 +1014,8 @@ pub(super) async fn load_spans_into(
                 .to_string(),
         ));
     }
-    let memory_budget = request
-        .sequential_memory_budget(u64::from(shards) * u64::from(max_inflight_flushes))?;
+    let memory_budget =
+        request.sequential_memory_budget(u64::from(shards) * u64::from(max_inflight_flushes))?;
     // Both attribute-count caps live in `validate`, which also runs at mapping
     // parse: they are properties of the mapping alone.
     mapping.validate()?;

@@ -2039,7 +2039,9 @@ mod default_geometry {
         let dir = tempfile::tempdir().expect("tempdir");
         let pq = dir.path().join("spans.parquet");
         let group = |g: usize| {
-            let ids: Vec<u64> = (0..batch_rows).map(|r| (g * batch_rows + r) as u64).collect();
+            let ids: Vec<u64> = (0..batch_rows)
+                .map(|r| (g * batch_rows + r) as u64)
+                .collect();
             batch(vec![
                 (
                     "trace_id",
@@ -2061,8 +2063,8 @@ mod default_geometry {
         };
         let first = group(0);
         let file = std::fs::File::create(&pq).expect("create parquet");
-        let mut writer = parquet::arrow::ArrowWriter::try_new(file, first.schema(), None)
-            .expect("arrow writer");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
         writer.write(&first).expect("write row group");
         writer.flush().expect("flush row group");
         for g in 1..batches {
@@ -2161,7 +2163,9 @@ mod default_geometry {
         assert_eq!(report.objects_written(), expected_objects);
 
         let layout = report.layout_report();
-        let geometry = layout.geometry.expect("a load that decoded rows resolves its geometry");
+        let geometry = layout
+            .geometry
+            .expect("a load that decoded rows resolves its geometry");
         assert_eq!(geometry.target_source, TargetSource::Derived);
         // `est_bytes_per_row` is the first batch's estimate per span rounded
         // up; the target is 250,000 spans of the unrounded figure.
@@ -2244,7 +2248,7 @@ mod default_geometry {
             },
         )
         .await;
-        let geometry = report.geometry.clone().expect("geometry resolved");
+        let geometry = report.geometry.expect("geometry resolved");
         assert_eq!(geometry.memory_depth, Some(3));
         assert_eq!(geometry.pipeline_depth, 3);
         assert_eq!(geometry.depth_bound, DepthBound::Memory);

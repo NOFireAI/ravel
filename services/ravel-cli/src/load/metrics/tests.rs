@@ -1094,7 +1094,9 @@ mod default_geometry {
         assert_eq!(report.objects_written(), expected_objects);
 
         let layout = report.layout_report();
-        let geometry = layout.geometry.expect("a load that decoded rows resolves its geometry");
+        let geometry = layout
+            .geometry
+            .expect("a load that decoded rows resolves its geometry");
         assert_eq!(geometry.target_source, TargetSource::Derived);
         // `est_bytes_per_row` is the first batch's estimate per row rounded
         // up; the target is 250,000 rows of the unrounded figure.
@@ -1176,7 +1178,7 @@ mod default_geometry {
             },
         )
         .await;
-        let geometry = report.geometry.clone().expect("geometry resolved");
+        let geometry = report.geometry.expect("geometry resolved");
         assert_eq!(geometry.memory_depth, Some(3));
         assert_eq!(geometry.pipeline_depth, 3);
         assert_eq!(geometry.depth_bound, DepthBound::Memory);
