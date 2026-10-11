@@ -9057,7 +9057,10 @@ mod tests {
     fn max_pending_strict_acks_above_the_semaphore_maximum_is_refused() {
         let max = tokio::sync::Semaphore::MAX_PERMITS as u64;
         assert_eq!(check_max_pending_strict_acks(0).expect("unlimited"), 0);
-        assert_eq!(check_max_pending_strict_acks(max).expect("the maximum"), max);
+        assert_eq!(
+            check_max_pending_strict_acks(max).expect("the maximum"),
+            max
+        );
         let err = check_max_pending_strict_acks(max + 1)
             .expect_err("one past the maximum is refused")
             .to_string();

@@ -334,8 +334,7 @@ async fn in_flight_permit_is_released_before_the_strict_ack() {
             let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
                 .await
                 .expect("gRPC client connects");
-            let mut request =
-                tonic::Request::new(export_request(metric, "demo", 1.0, now_ns()));
+            let mut request = tonic::Request::new(export_request(metric, "demo", 1.0, now_ns()));
             request.metadata_mut().insert(
                 "authorization",
                 format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
@@ -353,7 +352,10 @@ async fn in_flight_permit_is_released_before_the_strict_ack() {
         "both strict acks wait for the held data PUTs"
     );
     assert_eq!(
-        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_concurrency_shed_total"),
+        strict_flush::process_sample(
+            &server.scrape().await,
+            "ravel_ingest_concurrency_shed_total"
+        ),
         0,
         "the second export was admitted, not shed"
     );

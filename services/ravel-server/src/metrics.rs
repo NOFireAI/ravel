@@ -3049,7 +3049,11 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
 /// cumulative refusals at `--max-pending-strict-acks`. Mode-only labeled like
 /// `render_ingest_concurrency_family` above: one budget is shared across
 /// metrics, logs and traces with no per-signal breakdown.
-fn render_pending_strict_ack_family(out: &mut String, mode: Mode, snapshot: PendingStrictAckSnapshot) {
+fn render_pending_strict_ack_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: PendingStrictAckSnapshot,
+) {
     write_header(
         out,
         "ravel_ingest_pending_strict_acks",

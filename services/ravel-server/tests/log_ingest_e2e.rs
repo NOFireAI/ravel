@@ -699,7 +699,10 @@ async fn in_flight_permit_is_released_before_the_strict_ack() {
         "both strict acks wait for the held data PUTs"
     );
     assert_eq!(
-        process_sample(&server.scrape().await, "ravel_ingest_concurrency_shed_total"),
+        process_sample(
+            &server.scrape().await,
+            "ravel_ingest_concurrency_shed_total"
+        ),
         0,
         "the second export was admitted, not shed"
     );
@@ -772,7 +775,10 @@ async fn pending_strict_ack_limit_refuses_with_429() {
         200,
         "a buffered write never takes a pending-ack slot"
     );
-    assert!(!pending.is_finished(), "the first strict ack is still pending");
+    assert!(
+        !pending.is_finished(),
+        "the first strict ack is still pending"
+    );
 
     let pending = release_until(&server.gate, pending)
         .await
@@ -820,7 +826,10 @@ async fn grpc_pending_strict_ack_limit_refuses_resource_exhausted() {
         "process pending strict-acknowledgement limit reached"
     );
     assert_eq!(
-        process_sample(&server.scrape().await, "ravel_ingest_pending_ack_shed_total"),
+        process_sample(
+            &server.scrape().await,
+            "ravel_ingest_pending_ack_shed_total"
+        ),
         1
     );
 
