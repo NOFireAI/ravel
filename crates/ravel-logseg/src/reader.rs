@@ -6883,7 +6883,10 @@ mod tests {
                 rows += view.surviving_count();
             }
             let stats = scan.stats();
-            assert_eq!(rows, 1, "ts 101, the one row in the window whose zz is \"q\"");
+            assert_eq!(
+                rows, 1,
+                "ts 101, the one row in the window whose zz is \"q\""
+            );
             assert_eq!(stats.blocks_scanned, 2);
             assert_eq!(kernel_arms() - kernels, 2, "one ts kernel per block");
             assert_eq!(eval_calls() - evals, 3, "one eval per row the ts arm kept");
