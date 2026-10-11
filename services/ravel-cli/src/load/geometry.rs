@@ -349,9 +349,13 @@ pub(super) struct ShardObservation {
 /// a batch was handled covers that batch. A hand-back from another shard
 /// generation (`handle_hand_back`) also opens size flushes, and is not
 /// counted as enqueued, so settling does not wait for it; that arises only
-/// when the tenant's shard generation changes during the load, and a
-/// hand-back flush observed one batch late starts its shard's next window
-/// one batch late. Age and stall flushes clear nothing.
+/// when the tenant's shard generation changes during the load. A hand-back
+/// flush observed after a later batch merged restarts that shard's window
+/// one batch late, and because the depth flush and the loop's oldest-ack
+/// wait are in lockstep (one batch of slack is the whole margin), the loop
+/// then waits on an ack that only the age trigger answers: the load stalls
+/// once for up to `--max-flush-delay`, and nothing in the summary says so.
+/// Age and stall flushes clear nothing.
 ///
 /// When the shards have not handled a batch within [`SETTLE_TIMEOUT`] the
 /// window gives up realigning for the rest of the load: it stops observing
