@@ -54,7 +54,8 @@ Five facts about that driver decide the shape of this design:
 4. `now()` and every other clock function are deregistered in every session
    (`session.rs:394-404`), because the SQL differential gate cannot attest
    a nondeterministic function.
-5. A session registers exactly one table (`session.rs:895-929`), and a
+5. A session registers exactly one signal table (`session.rs:895-929`;
+   only the Parquet arm registers several), and a
    statement naming two signal tables is refused as `CrossSignalQuery`.
 
 Outside the driver:
@@ -157,11 +158,11 @@ either way; the strength of the claim is not.
 ```mermaid
 flowchart TD
     C[Client] -->|POST /api/v1/esql| H[esql handler<br/>ravel-server, feature esql]
-    H -->|authenticate| Q[QueryService::esql_execute<br/>admit, clamp, usage guard, audit]
-    Q --> G[structural guard<br/>ravel-esql]
+    H -->|authenticate| G[structural guard<br/>ravel-esql]
     G --> P[lexer, command parsers, Pratt expressions<br/>ravel-esql]
     P --> A[AST with source spans]
-    A --> B[binder: sources, fields, types<br/>ravel-sql::esql]
+    A --> Q[QueryService::esql_execute<br/>admit, clamp, usage guard, audit]
+    Q --> B[binder: sources, fields, types<br/>ravel-sql::esql]
     B --> K[CheckedProgram<br/>tenant, source, dialect policy, query clock]
     K --> X[SqlExecutor<br/>resolve snapshot, admit, budgets, retry]
     X --> L[lower against the session<br/>ravel-sql::esql]
@@ -174,8 +175,8 @@ flowchart TD
 
 `crates/ravel-esql` is a new pure Rust crate: lexer, parser, syntax tree,
 language types, function signatures and the typed program a binder
-produces. It depends on no Arrow, no DataFusion and no object store, in
-the way `ravel-promql` and `ravel-analytics` do not. It adds no external
+produces. It depends on no Arrow, no DataFusion and no object store,
+as `ravel-promql` and `ravel-analytics` do not. It adds no external
 dependency: the lexer and parser are hand-written (D5).
 
 `crates/ravel-sql/src/esql/` holds everything that needs the engine:
@@ -223,8 +224,18 @@ the driver works on:
 Context fact 2 is why the input is a lowering, not a `LogicalPlan`: a
 table scan binds to the provider of the session it was built in, and one
 query has up to three sessions. The ES|QL path hands the driver a
-`CheckedProgram` and the driver calls `esql::lower(&program, &session)` at
-each of the sites where it calls `ctx.sql(text)` today. Admission, the
+`CheckedProgram` and the driver calls `esql::lower(&program, &session)`
+wherever it turns SQL text into a plan today. There are two such sites on
+this path, and both must be routed:
+
+- the classification plan, built in the throwaway session by
+  `analyzed_classification_plan` (`executor.rs:2975`,
+  `state.create_logical_plan(sql)`), which decides spill and exactness;
+- the executed plan (`executor.rs:2222`, `ctx.sql(sql)`), which runs again
+  on the snapshot retry and on the spill fallback rebuild.
+
+Wiring only the second leaves every ES|QL query without a classification
+plan. Admission, the
 request-budget check, the spill decision, the retry contract, accounting
 and the deadline are the same code for both forms. `build_session`, the
 providers and `PinnedStream::start` are already public; the ES|QL path
@@ -371,9 +382,10 @@ and no data.
 [[...]]}, "warnings"?, "stats"}`, with ES|QL type names in `type`. The
 Elasticsearch response shape belongs to the later `POST /_query` adapter.
 The route is attached to both the primary and the mTLS service. Errors use the
-existing status table: 400 for a parse or verification error with its
-line and column, 422 for a valid program that needs an unimplemented
-capability, 503, 504 and 500 as for SQL.
+existing status table. A parse error, a verification error and a valid
+program that needs an unimplemented capability are all 400 `bad_data`,
+as every SQL validation refusal is, the first two with line and column.
+422, 503, 504 and 500 keep the meaning they have for SQL.
 
 Audit records the language as `esql` with its own redaction arm, built on
 the ES|QL lexer so that string and number literals are tokenized and
