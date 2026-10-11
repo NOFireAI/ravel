@@ -943,15 +943,19 @@ impl<H> GenerationSwitch<H> {
         Some(self.ensure_set(&mut inner, count))
     }
 
-    /// Install a freshly-read generation history for a tenant, stamp the refresh
-    /// time to `now_ns`, and return the active shard-actor set for the write.
-    /// Called by the router after a successful re-read, and by the server's
-    /// background refresher. An empty history is ignored (the caller passes the
-    /// normalized, never-empty history [`ravel_catalog::read_generations`]
-    /// returns) and falls back to the default view.
+    /// Install a generation history for a tenant, stamp the refresh time to
+    /// `now_ns`, and return the active shard-actor set. An empty history is
+    /// ignored (the caller passes the normalized, never-empty history
+    /// [`ravel_catalog::read_generations`] returns) and falls back to the
+    /// default view.
     ///
-    /// A history carries no format floor, so the tenant's cached floor is kept
-    /// ([`Self::refresh_view`] installs one read with the record).
+    /// A history carries no format floor (ADR-1746 decision 4). A tenant with
+    /// a cached view keeps its cached floor; a tenant with none gets a fresh
+    /// view with NO floor, which routes and admits writes without re-reading
+    /// the record until the refresh interval passes. So this is a test seam,
+    /// not a production path: the routers' own re-read installs the floor with
+    /// the generations ([`Self::refresh_view`]), and nothing in the shipped
+    /// server calls this.
     pub fn refresh(
         &self,
         tenant: TenantHash,

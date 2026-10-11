@@ -461,6 +461,8 @@ impl LogIngestRouter {
     }
 
     /// Update a tenant's cached shard-generation view (ADR-0052 section 2).
+    /// Installs no format floor: see [`GenerationSwitch::refresh`], which
+    /// makes this a test seam that must not be used on a production path.
     pub fn refresh_generations(
         &self,
         tenant: ravel_types::TenantHash,
