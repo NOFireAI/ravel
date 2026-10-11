@@ -84,9 +84,12 @@ rather than following it. A refusal keeps its status and message:
 `RESOURCE_EXHAUSTED` for a shed, and `UNAUTHENTICATED` with "invalid or
 missing tenant credentials" for bad credentials on gRPC.
 
-Because the permit is taken before the body arrives, the ceiling counts
-concurrent uploads plus concurrent decodes and writes: a request holds its
-slot while its body is still being received. That wait is bounded by
+The permit covers decode through enqueue. It is returned as soon as the
+request's points are enqueued on their shards, before a strict write's
+durability acknowledgement, so a request does not hold its slot while it waits
+for a flush. Because the permit is taken before the body arrives, the ceiling
+counts concurrent uploads plus concurrent decodes and enqueues: a request holds
+its slot while its body is still being received. That wait is bounded by
 `INGEST_BODY_READ_TIMEOUT`, 30 seconds from admission (a fixed constant in
 `ingest_admission.rs`, not a flag). A body that has not fully arrived by then
 is refused with HTTP 503 and `Retry-After` (a status Prometheus remote write
@@ -101,6 +104,19 @@ inside its own deadline is not cut off; a 16 MiB body fits in it at about
 4.5 Mbit/s. The OTAP stream is not bounded this way: it holds no permit while
 it waits for a frame.
 
+The strict acknowledgement wait has its own process-wide bound,
+`--max-pending-strict-acks` (default 8,192, 0 disables it): one budget shared
+by the metrics, logs and traces routers counts the strict and strict-arrival
+writes that are enqueued and still waiting for their ack. A strict write takes
+its slot after decode, as its points are submitted, and returns it when the
+ack resolves or the request deadline elapses; a buffered write never takes
+one. Over the bound the write is refused before anything is buffered, with
+HTTP 429 and `Retry-After: 1` (body "process pending
+strict-acknowledgement limit reached") or gRPC `RESOURCE_EXHAUSTED`. This shed
+comes after decode, so it does not replace the head shed above as the memory
+bound, and the slot holds no ingest byte charge of its own: the points a
+pending write enqueued are already charged to the ADR-0069 byte budget.
+
 The OTAP `ArrowMetricsService` stream differs. The same tower layer checks its
 tenant credential on the stream's request head, before any frame is read, but
 takes no permit there: OTAP takes one permit per `BatchArrowRecords`, after
@@ -108,7 +124,9 @@ tonic has read and decoded that batch's protobuf frame (up to the 16 MiB
 message cap) and before its Arrow payloads are decompressed or decoded. An
 authenticated OTAP client over the ceiling therefore still costs one decoded
 frame per shed batch, which is answered with a `RESOURCE_EXHAUSTED` batch
-status and ends the stream.
+status and ends the stream. The batch's permit is returned once its points are
+enqueued, after the decoded batch has been dropped, so a batch waiting for its
+strict ack holds neither.
 
 No HTTP/2 stream cap is derived from this ceiling:
 `SETTINGS_MAX_CONCURRENT_STREAMS` applies to a whole connection, and the gRPC
@@ -116,7 +134,10 @@ listener also serves Flight SQL and fragment fetches, which keep their
 previous stream limits.
 
 Worst-case memory bound at the default: each in-flight request holds at most
-one decoded request body. The largest such body on any covered route is not
+one decoded request body, and only between admission and enqueue; once its
+points are enqueued the body is gone, the permit is back, and what the points
+occupy is counted by the ADR-0069 byte budget instead. The largest such body
+on any covered route is not
 Remote Write's 64 MiB post-decompression cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`)
 but the resolved label bytes the RW2 decoder retains after expanding symbol
 references, bounded at `RESOLVED_LABEL_BUDGET_MULTIPLIER` (16) times that cap,
@@ -1461,7 +1482,12 @@ terms:
    accepts.
 2. **In-flight decode overhead**: each admitted in-flight request transiently
    holds one decoded/normalized request body during normalization, before its
-   points reach a buffer. This is bounded by
+   points reach a buffer. The term counts the window from admission to
+   enqueue and nothing after it: the permit is returned once the points are
+   enqueued, by which time the body has been consumed, so a strict write
+   waiting for its ack is outside this term. Its enqueued points are term 1,
+   and the `--max-pending-strict-acks` slot it holds carries no byte charge,
+   so that bound adds no memory term of its own. This is bounded by
    `--max-inflight-ingest-requests` (default 1024) times the largest
    per-request decoded body, which on the Remote Write RW2 path is the resolved
    label bytes the decoder owns after it expands symbol references (up to 16
@@ -1629,15 +1655,23 @@ ten strict requests per second on one shard, 32x at saturation.
 `PendingAckBudget` bounds how many strict-mode `submit`s may have an
 outstanding ack wait at once (0 = unlimited). Each router takes an
 `Arc<PendingAckBudget>` at construction; the bound is process-wide across
-all three pipelines only when every router is built from one shared `Arc`,
-which ravel-server does from `IngestConfig::max_pending_strict_acks` once it
-adopts the two phases. A strict `submit` takes the permit before it charges the byte budget
+all three pipelines only when every router is built from one shared `Arc`.
+ravel-server builds exactly one, sized by `--max-pending-strict-acks`
+(`RAVEL_MAX_PENDING_STRICT_ACKS`, default 8,192), and hands it to the
+metrics, logs and traces routers; a value above the tokio semaphore maximum
+is refused at startup rather than clamped. A strict `submit` takes the permit before it charges the byte budget
 and before it sends to any shard, so a refusal here holds no byte charge
 and touches no shard; it is a refusal after decode, not a head shed like
-the in-flight request ceiling above. The permit is released when the
+the in-flight request ceiling above. ravel-server answers it with HTTP 429,
+`Retry-After: 1` and the body "process pending strict-acknowledgement limit
+reached" on OTLP/HTTP and Remote Write, and `RESOURCE_EXHAUSTED` on OTLP
+gRPC and as an OTAP batch status. The permit is released when the
 returned `Submitted`'s `acks()` resolves, when its deadline elapses after
 `acks()` is first polled, or when the `Submitted` is dropped. A
 `Submitted` that is never polled holds its permit until it is dropped.
+ravel-server returns the request's in-flight ingest permit between `submit`
+and `acks()`, so this budget, not `--max-inflight-ingest-requests`, is what
+bounds the number of strict requests waiting for their ack.
 
 ## Sizing defaults (config, all overridable)
 
@@ -1654,7 +1688,7 @@ returned `Submitted`'s `acks()` resolves, when its deadline elapses after
 | idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
-| max_pending_strict_acks (process-wide once one budget is shared across the three routers) | 8,192 (`IngestConfig::max_pending_strict_acks`: the in-flight ingest ceiling times eight, 0 = unlimited; ravel-server wires it once it adopts the two phases, and every in-tree router constructor passes 0, unlimited, until then) |
+| max pending strict acks (process-wide, one budget shared by the three routers) | 8,192 (`--max-pending-strict-acks`, `RAVEL_MAX_PENDING_STRICT_ACKS`: the in-flight ingest ceiling times eight, 0 = unlimited, refused above the tokio semaphore maximum) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
 | max_inflight_flushes (per shard, all three pipelines) | 4 on `ravel-server` and on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
 | max_inflight_flushes_per_tenant (per shard and tenant, all three pipelines) | `max(1, N - 1)` on `ravel-server`, so 3 (`--max-inflight-flushes-per-tenant`, rejects 0 and values above `--max-inflight-flushes`); N on `ravel-cli load` |
@@ -1957,9 +1991,11 @@ Counters recorded today:
   `SpanIngestRouter` counterparts) reports them; a bare
   `IngestMetrics::snapshot()` reports 0 for both. They are process-wide,
   the same figure from all three routers, only when every router is built
-  from one shared `Arc<PendingAckBudget>`; ravel-server does that once it
-  adopts the two phases.
-  Until then each router reports the budget it was given.
+  from one shared `Arc<PendingAckBudget>`, which ravel-server does. Its
+  `/metrics` endpoint therefore reads them once, from one router, rather than
+  summing three copies of the same budget: the gauge
+  `ravel_ingest_pending_strict_acks` and the counter
+  `ravel_ingest_pending_ack_shed_total`, both carrying no `signal` label.
 
 ### Per-shard skew
 

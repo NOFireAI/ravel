@@ -34,7 +34,8 @@ use ravel_types::logstream::AttrValue;
 mod strict_flush;
 
 use ravel_server::config::StrictFlushPolicy;
-use strict_flush::{PolicyServer, Signal, release_until};
+use ravel_server::ingest_concurrency::IngestConcurrencyLimit;
+use strict_flush::{PolicyServer, Signal, process_sample, release_until};
 
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
@@ -141,6 +142,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -593,9 +595,7 @@ async fn strict_header_follows_the_process_default() {
 
     let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Logs).await;
     let strict = spawn_export(&server, Some("strict"), "aged log line");
-    server.assert_no_flush_yet(1).await;
     let absent = spawn_export(&server, None, "aged log line");
-    server.assert_no_flush_yet(2).await;
     let unknown = spawn_export(&server, Some("not-a-mode"), "aged log line");
     server.assert_no_flush_yet(3).await;
 
@@ -675,6 +675,168 @@ async fn grpc_strict_arrival_metadata_selects_the_policy() {
             .is_some_and(|value| !value.is_empty()),
         "a strict export acks with commit-token metadata"
     );
+
+    server.shutdown().await;
+}
+
+/// With the in-flight ceiling at one, a strict export returns its permit
+/// once its record is enqueued, so a second strict export is admitted while
+/// the first still waits on its held data PUT. Both reach the shard buffer,
+/// neither is shed, and both ack with a token once the gate releases.
+#[tokio::test]
+async fn in_flight_permit_is_released_before_the_strict_ack() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Logs, |config| {
+        config.ingest_concurrency_limit = IngestConcurrencyLimit::Bounded(1);
+    })
+    .await;
+
+    let mut first = spawn_export(&server, Some("strict"), "first strict log line");
+    server.wait_for_buffered_while_pending(1, &mut first).await;
+    let mut second = spawn_export(&server, Some("strict"), "second strict log line");
+    server.wait_for_buffered_while_pending(2, &mut second).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "both strict acks wait for the held data PUTs"
+    );
+    assert_eq!(
+        process_sample(
+            &server.scrape().await,
+            "ravel_ingest_concurrency_shed_total"
+        ),
+        0,
+        "the second export was admitted, not shed"
+    );
+
+    let (first, second) = release_until(&server.gate, async {
+        (
+            first.await.expect("export task"),
+            second.await.expect("export task"),
+        )
+    })
+    .await;
+    assert_strict_ack(&first);
+    assert_strict_ack(&second);
+
+    server.shutdown().await;
+}
+
+/// With `--max-pending-strict-acks 1` and one strict export waiting on its
+/// held data PUT, a second strict export is refused 429 with `Retry-After`
+/// and the shed body, the refusal and the pending count both show on the
+/// real `/metrics`, and a buffered export in the same state is still
+/// accepted.
+#[tokio::test]
+async fn pending_strict_ack_limit_refuses_with_429() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Logs, |config| {
+        config.max_pending_strict_acks = 1;
+    })
+    .await;
+
+    let pending = spawn_export(&server, Some("strict"), "pending strict log line");
+    server.wait_for_data_put().await;
+
+    let refused = spawn_export(&server, Some("strict"), "refused strict log line")
+        .await
+        .expect("export task");
+    assert_eq!(refused.status(), 429, "the second strict export is shed");
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    assert!(
+        refused.headers().get("x-ravel-commit-token").is_none(),
+        "a refused write carries no commit token"
+    );
+    assert_eq!(
+        refused.text().await.expect("refusal body"),
+        "process pending strict-acknowledgement limit reached"
+    );
+
+    let exposition = server.scrape().await;
+    assert_eq!(
+        process_sample(&exposition, "ravel_ingest_pending_ack_shed_total"),
+        1,
+        "the refusal is counted once"
+    );
+    assert_eq!(
+        process_sample(&exposition, "ravel_ingest_pending_strict_acks"),
+        1,
+        "the first export still holds the only pending-ack slot"
+    );
+
+    let buffered = spawn_export(&server, Some("buffered"), "buffered log line")
+        .await
+        .expect("export task");
+    assert_eq!(
+        buffered.status(),
+        200,
+        "a buffered write never takes a pending-ack slot"
+    );
+    assert!(
+        !pending.is_finished(),
+        "the first strict ack is still pending"
+    );
+
+    let pending = release_until(&server.gate, pending)
+        .await
+        .expect("export task");
+    assert_strict_ack(&pending);
+    assert_eq!(
+        process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        0,
+        "the ack returned the slot"
+    );
+
+    server.shutdown().await;
+}
+
+/// The gRPC twin of `pending_strict_ack_limit_refuses_with_429`: the same
+/// refusal over gRPC is `RESOURCE_EXHAUSTED` with the shared shed message.
+#[tokio::test]
+async fn grpc_pending_strict_ack_limit_refuses_resource_exhausted() {
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Logs, |config| {
+        config.max_pending_strict_acks = 1;
+    })
+    .await;
+    let grpc_addr = server.running.grpc_addr.expect("gateway mode binds gRPC");
+
+    let pending = spawn_export(&server, Some("strict"), "pending strict log line");
+    server.wait_for_data_put().await;
+
+    let mut client = LogsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    let mut request = tonic::Request::new(export_request("refused grpc log line", now_ns()));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+    let status = client
+        .export(request)
+        .await
+        .expect_err("a strict export over the pending-ack ceiling is refused");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+    assert_eq!(
+        status.message(),
+        "process pending strict-acknowledgement limit reached"
+    );
+    assert_eq!(
+        process_sample(
+            &server.scrape().await,
+            "ravel_ingest_pending_ack_shed_total"
+        ),
+        1
+    );
+
+    let pending = release_until(&server.gate, pending)
+        .await
+        .expect("export task");
+    assert_strict_ack(&pending);
 
     server.shutdown().await;
 }

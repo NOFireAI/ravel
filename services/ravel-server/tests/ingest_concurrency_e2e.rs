@@ -1,11 +1,14 @@
 //! End-to-end coverage for the process-wide in-flight ingest-request ceiling:
-//! a real HTTP or gRPC export blocked mid-flush, over
-//! `--max-inflight-ingest-requests`, is shed immediately rather than queued.
+//! a real HTTP or gRPC export over `--max-inflight-ingest-requests` is shed
+//! immediately rather than queued.
 //!
-//! Every test here holds the shard's data-object PUT open with a
-//! `FaultStore` hold gate (ADR-0059 decision 5) so an admitted request stays
-//! genuinely in-flight -- awaiting its flush's ack -- for the whole window in
-//! which the test proves the next request is shed.
+//! The permit is returned once a request's write is enqueued, so a request
+//! waiting for its strict ack no longer holds one. To keep admitted requests
+//! genuinely in flight, every test here holds the tenant's first-write
+//! provisioning-record read with a `FaultStore` hold gate (ADR-0059 decision
+//! 5): the handler issues that read after admission and before it enqueues,
+//! so a request parked on it holds its permit for the whole window in which
+//! the test proves the next request is shed.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -136,6 +139,7 @@ async fn start_test_server(
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -155,11 +159,32 @@ async fn start_test_server(
     .expect("server starts")
 }
 
+/// Holds every read of the tenant's metrics provisioning record. The first
+/// write of a (tenant, signal) in a process reads that record after the
+/// request was admitted and before its points are enqueued, so a request
+/// parked on this gate holds its in-flight permit.
+fn hold_provisioning_reads(fault: &FaultStore<MemoryStore>) -> GateHandle {
+    let key = format!("t/{}/m/prov", TenantId::new(TENANT).hash().to_hex());
+    fault.hold(Op::Get, Some(key), Occurrence::Always)
+}
+
+/// Waits until `want` admitted requests are parked on `gate`, which is the
+/// precondition the shedding tests need: each holds one of the permits.
+async fn wait_for_parked(gate: &GateHandle, want: usize) {
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(want))
+        .await
+        .expect("the admitted requests reach the provisioning read");
+    assert_eq!(
+        gate.held_count(),
+        want,
+        "exactly the admitted requests are parked: {:?}",
+        gate.held_details()
+    );
+}
+
 /// Releases every currently held call on `gate`, repeatedly, until every
-/// spawned task in `tasks` has completed. A held flush's data-object PUT is
-/// only armed once the flush actually fires (the shard's own
-/// `max_flush_delay`), so a single release pass can race a later flush; this
-/// keeps draining until nothing is left in flight.
+/// spawned task in `tasks` has completed, since a single release pass can
+/// race a call that arrives after it.
 async fn drain_until_done<T>(gate: &GateHandle, tasks: &[tokio::task::JoinHandle<T>]) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -176,40 +201,6 @@ async fn drain_until_done<T>(gate: &GateHandle, tasks: &[tokio::task::JoinHandle
     .expect("held requests drain within 10s");
 }
 
-/// Poll `/metrics` until `want` metric points have been admitted into shard
-/// buffers, which is the precondition the shedding tests need: a request whose
-/// point is buffered has already passed the in-flight ingest ceiling and is
-/// parked awaiting its flush's ack, so it is holding one of the permits. The
-/// counter is monotonic, so this cannot see a transient. Returns the last
-/// value read, for the assertion's message.
-async fn wait_for_buffered_items(client: &reqwest::Client, base: &str, want: u64) -> u64 {
-    let mut seen = 0;
-    for _ in 0..1_000 {
-        let body = client
-            .get(format!("{base}/metrics"))
-            .send()
-            .await
-            .expect("metrics scrape completes")
-            .text()
-            .await
-            .expect("metrics body is text");
-        seen = body
-            .lines()
-            .find(|line| {
-                line.starts_with("ravel_ingest_buffered_items_total")
-                    && line.contains("signal=\"metrics\"")
-            })
-            .and_then(|line| line.rsplit(' ').next())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        if seen >= want {
-            return seen;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    seen
-}
-
 async fn durable_metric_object_count(store: &dyn ObjectStoreBackend) -> usize {
     let prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
     list_all(store, &prefix)
@@ -219,7 +210,7 @@ async fn durable_metric_object_count(store: &dyn ObjectStoreBackend) -> usize {
 }
 
 /// (a) HTTP: with the ceiling at 2, two concurrent exports are admitted and
-/// held mid-flush; a third is shed with 429 and `Retry-After`.
+/// parked before enqueue; a third is shed with 429 and `Retry-After`.
 /// (b) the shed request buffers nothing and returns no commit token.
 /// (d) the shed counter increments, observable on `/metrics`.
 #[tokio::test]
@@ -230,8 +221,7 @@ async fn http_third_concurrent_request_over_limit_is_shed() {
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
-    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
-    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let gate = hold_provisioning_reads(&fault);
 
     let ts_ns = now_ns();
     let held_tasks: Vec<_> = ["held_a", "held_b"]
@@ -254,20 +244,13 @@ async fn http_third_concurrent_request_over_limit_is_shed() {
         .collect();
 
     // Both admitted requests must have passed the ceiling and be parked
-    // awaiting their flush before the third is sent: the ceiling has to be
-    // saturated for the third to be shed at all. Waiting for both points to
-    // reach a shard buffer proves it. The 300 ms sleep this replaces only made
-    // it likely, and on a host slow enough to miss the window the third
-    // request is admitted and the 429 assertion below fails for a scheduling
-    // reason rather than a product one.
-    let buffered = wait_for_buffered_items(&client, &base, 2).await;
-    assert_eq!(
-        buffered, 2,
-        "both admitted requests must have buffered their point, so both hold a permit"
-    );
+    // before the third is sent: the ceiling has to be saturated for the third
+    // to be shed at all. Waiting for both reads on the gate proves it, where a
+    // sleep would only make it likely.
+    wait_for_parked(&gate, 2).await;
     assert!(
         held_tasks.iter().all(|t| !t.is_finished()),
-        "both admitted requests must still be in flight, blocked on the held flush"
+        "both admitted requests must still be in flight, parked before enqueue"
     );
 
     let third_request = metrics_export_request("shed", ts_ns);
@@ -345,10 +328,8 @@ async fn grpc_third_concurrent_request_over_limit_is_shed() {
     let store: Arc<dyn ObjectStoreBackend> = fault.clone();
     let running = start_test_server(store.clone(), IngestConcurrencyLimit::Bounded(2)).await;
     let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
-    let http_base = format!("http://{}", running.http_addr);
 
-    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
-    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let gate = hold_provisioning_reads(&fault);
 
     let ts_ns = now_ns();
     let held_tasks: Vec<_> = ["held_a", "held_b"]
@@ -372,16 +353,11 @@ async fn grpc_third_concurrent_request_over_limit_is_shed() {
         })
         .collect();
 
-    // Same saturation precondition as the HTTP case above, waited for rather
-    // than slept through.
-    let buffered = wait_for_buffered_items(&reqwest::Client::new(), &http_base, 2).await;
-    assert_eq!(
-        buffered, 2,
-        "both admitted gRPC requests must have buffered their point, so both hold a permit"
-    );
+    // Same saturation precondition as the HTTP case above.
+    wait_for_parked(&gate, 2).await;
     assert!(
         held_tasks.iter().all(|t| !t.is_finished()),
-        "both admitted gRPC requests must still be in flight, blocked on the held flush"
+        "both admitted gRPC requests must still be in flight, parked before enqueue"
     );
 
     let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))

@@ -101,6 +101,7 @@ async fn start_test_server() -> ravel_server::Running {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -185,6 +186,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -267,6 +269,7 @@ async fn start_test_server_fault(
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -899,8 +902,9 @@ async fn durable_metric_object_count(store: &dyn ObjectStoreBackend) -> usize {
 /// the OTAP gRPC ingest path is gated by the same process-wide
 /// in-flight ingest ceiling OTLP is, so a burst of OTAP exports
 /// cannot bypass the admission-shed backpressure. With the ceiling at 1, one
-/// admitted batch held mid-flush occupies the only slot; a second batch on a
-/// fresh stream is shed with `RESOURCE_EXHAUSTED` (OTLP's shed status),
+/// admitted batch parked before enqueue on a held provisioning read occupies
+/// the only slot; a second batch on a fresh stream is shed with
+/// `RESOURCE_EXHAUSTED` (OTLP's shed status),
 /// ingests nothing, and -- like the byte-rate rejection -- tears its stream
 /// down so a batch queued behind it never gets a status. Once the held batch
 /// releases its permit, the next export succeeds.
@@ -917,28 +921,27 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
     let running = start_test_server_fault(store.clone(), IngestConcurrencyLimit::Bounded(1)).await;
     let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
 
-    // Hold only the first metrics data-object PUT open, so the admitted batch's
-    // strict write blocks awaiting its flush's durable ack and keeps holding
-    // the one permit. `Nth(1)` (not `Always`) leaves the "after" batch's later
-    // PUT free to complete once the permit is released: a hold gate has no
-    // disarm, so an `Always` gate would re-hold every subsequent flush.
-    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new("acme").hash().to_hex());
-    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Nth(1));
+    // The permit is returned at enqueue, so a held flush would not keep it.
+    // The first write of a tenant reads its provisioning record after
+    // admission and before enqueue; holding that one read parks the admitted
+    // batch with the permit. `Nth(1)` leaves later reads free, since a hold
+    // gate has no disarm.
+    let prov_key = format!("t/{}/m/prov", TenantId::new("acme").hash().to_hex());
+    let gate = fault.hold(Op::Get, Some(prov_key), Occurrence::Nth(1));
 
     let ts = now_ns();
 
-    // The single admitted batch: its strict write blocks on the held PUT, so it
-    // stays in flight -- holding the only permit -- for the whole window below.
+    // The single admitted batch: parked before enqueue, it holds the only
+    // permit for the whole window below.
     let held =
         tokio::spawn(async move { send_one_batch(grpc_addr, otap_gauge_batch("held", ts)).await });
 
-    // Wait until the held batch actually reaches (and is blocked on) its PUT:
-    // at that point it has passed admission, holds the permit, and is genuinely
-    // in flight. Deterministic, no sleep race.
-    gate.wait_until_held(1).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+        .await
+        .expect("the admitted batch reaches the provisioning read");
     assert!(
         !held.is_finished(),
-        "the admitted batch must still be in flight, blocked on the held flush"
+        "the admitted batch must still be in flight, parked before enqueue"
     );
 
     // A second stream with two batches: the first is shed over the ceiling and
@@ -968,7 +971,7 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
         shed_statuses[0].status_message
     );
 
-    // Release the held PUT and let the admitted batch finish, freeing the slot.
+    // Release the held read and let the admitted batch finish, freeing the slot.
     for id in gate.held() {
         gate.release(id);
     }
@@ -979,7 +982,7 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
     assert_eq!(
         held_status.status_code,
         StatusCode::Ok as i32,
-        "the admitted batch must ack OK once its flush is released: {}",
+        "the admitted batch must ack OK once its read is released: {}",
         held_status.status_message
     );
 
@@ -1002,6 +1005,93 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// With the ceiling at 1 and every data PUT held, an OTAP stream's first
+/// batch is enqueued and waits for its strict ack, and an OTLP export is
+/// still admitted in that state: the batch returned its permit at enqueue,
+/// not at its ack. `otap_grpc`'s unit tests pin that the decoded batch drops
+/// before the permit does.
+#[tokio::test]
+async fn otap_batch_is_dropped_before_the_permit() {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server_fault(store.clone(), IngestConcurrencyLimit::Bounded(1)).await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+    let base = format!("http://{}", running.http_addr);
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new("acme").hash().to_hex());
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+
+    let ts = now_ns();
+    let pending =
+        tokio::spawn(
+            async move { send_one_batch(grpc_addr, otap_gauge_batch("pending", ts)).await },
+        );
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+        .await
+        .expect("the batch's flush issues its data PUT");
+    assert!(
+        !pending.is_finished(),
+        "the batch's strict ack waits for the held data PUT"
+    );
+
+    let admitted = reqwest::Client::new()
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(otlp_gauge_request("admitted", ts).encode_to_vec())
+        .send()
+        .await
+        .expect("OTLP export completes");
+    assert_eq!(
+        admitted.status(),
+        200,
+        "the OTLP export is admitted while the batch's ack is pending"
+    );
+    assert!(
+        !pending.is_finished(),
+        "the batch's ack is still pending after the OTLP export was admitted"
+    );
+
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            if pending.is_finished() {
+                return pending.await.expect("batch task joins");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the batch acks once its PUT is released");
+    assert_eq!(
+        status.status_code,
+        StatusCode::Ok as i32,
+        "the batch acks OK once its flush is released: {}",
+        status.status_message
+    );
+
+    let shutdown = running.shutdown();
+    tokio::pin!(shutdown);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            tokio::select! {
+                out = &mut shutdown => return out,
+                () = gate.wait_until_held(1) => {
+                    for id in gate.held() {
+                        gate.release(id);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("shutdown drains once its held PUTs are released")
+    .expect("graceful shutdown");
 }
 
 /// Not a `BatchArrowRecords`: field 1 there is the varint `batch_id`, and this

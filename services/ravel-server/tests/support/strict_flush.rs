@@ -91,13 +91,22 @@ pub struct PolicyServer {
 
 /// Starts a server under `policy` with every `signal` data PUT held.
 pub async fn start(policy: StrictFlushPolicy, signal: Signal) -> PolicyServer {
+    start_with(policy, signal, |_| {}).await
+}
+
+/// [`start`], with `configure` applied to the configuration last.
+pub async fn start_with(
+    policy: StrictFlushPolicy,
+    signal: Signal,
+    configure: impl FnOnce(&mut ServerConfig),
+) -> PolicyServer {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
     let gate = faults.hold(Op::Put, Some(signal.data_prefix()), Occurrence::Always);
     let store: Arc<dyn ObjectStoreBackend> = faults;
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         strict_flush_policy: policy,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
@@ -147,6 +156,7 @@ pub async fn start(policy: StrictFlushPolicy, signal: Signal) -> PolicyServer {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),
         distrib: None,
@@ -157,6 +167,7 @@ pub async fn start(policy: StrictFlushPolicy, signal: Signal) -> PolicyServer {
             1024,
         ),
     };
+    configure(&mut config);
     let running = ravel_server::start(
         config,
         store.clone(),
@@ -221,6 +232,30 @@ pub fn sample(exposition: &str, family: &str, signal: &str) -> u64 {
     values[0]
 }
 
+/// The value of the one sample of a process-wide `family` (labelled by
+/// `mode` only) in a `/metrics` body. Panics unless exactly one is present.
+pub fn process_sample(exposition: &str, family: &str) -> u64 {
+    let values: Vec<u64> = exposition
+        .lines()
+        .filter(|line| {
+            line.strip_prefix(family)
+                .is_some_and(|rest| rest.starts_with('{'))
+        })
+        .map(|line| {
+            line.rsplit(' ')
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("unparsable sample: {line}"))
+        })
+        .collect();
+    assert_eq!(
+        values.len(),
+        1,
+        "expected exactly one {family} sample in:\n{exposition}"
+    );
+    values[0]
+}
+
 impl PolicyServer {
     pub async fn scrape(&self) -> String {
         self.client
@@ -255,9 +290,39 @@ impl PolicyServer {
         assert_eq!(held.len(), 1, "exactly one data PUT is held: {held:?}");
     }
 
+    /// Waits until `task` has buffered its item, so the pipeline holds at
+    /// least `items`, while `task` is still waiting for its response. A task
+    /// that finishes first was answered without being enqueued, and its
+    /// response is in the panic message.
+    pub async fn wait_for_buffered_while_pending<T: std::fmt::Debug>(
+        &self,
+        items: u64,
+        task: &mut tokio::task::JoinHandle<T>,
+    ) {
+        let buffered = tokio::time::timeout(WAIT, async {
+            loop {
+                if self.counter("ravel_ingest_buffered_items_total").await >= items {
+                    return true;
+                }
+                if task.is_finished() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the write reaches its buffer or is answered");
+        if !buffered {
+            let response = task.await.expect("export task");
+            panic!("the write was answered before it was enqueued: {response:?}");
+        }
+    }
+
     /// Waits until the pipeline has buffered at least `items` items, then
-    /// asserts that no flush has opened: no data PUT held, and neither the
-    /// arrival nor the age counter moved.
+    /// settles once and asserts from one scrape that no flush has opened: no
+    /// data PUT held, and neither the arrival nor the age counter moved.
+    /// Callers send every write first and check once, so all of them share
+    /// one window inside `MAX_FLUSH_DELAY`.
     pub async fn assert_no_flush_yet(&self, items: u64) {
         tokio::time::timeout(WAIT, async {
             while self.counter("ravel_ingest_buffered_items_total").await < items {
@@ -265,16 +330,18 @@ impl PolicyServer {
             }
         })
         .await
-        .expect("the write reaches its buffer");
+        .expect("the writes reach their buffer");
         tokio::time::sleep(SETTLE).await;
         assert_eq!(self.gate.held_count(), 0, "no data PUT was issued");
+        let exposition = self.scrape().await;
+        let label = self.signal.label();
         assert_eq!(
-            self.flushes_by_arrival().await,
+            sample(&exposition, "ravel_ingest_flushes_by_arrival_total", label),
             0,
             "no arrival flush opened"
         );
         assert_eq!(
-            self.flushes_by_age().await,
+            sample(&exposition, "ravel_ingest_flushes_by_age_total", label),
             0,
             "no age flush opened inside the window either, or this check proves nothing"
         );

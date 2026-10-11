@@ -153,6 +153,7 @@ async fn start_test_server(
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),
         distrib: None,
@@ -293,24 +294,32 @@ async fn scrape_counter(client: &reqwest::Client, base: &str, prefix: &str) -> u
         .unwrap_or(0)
 }
 
-/// Polls `/metrics` until `want` metric points have been admitted into shard
-/// buffers: a request whose point is buffered has passed the in-flight
-/// ceiling and is parked awaiting its flush's ack, so it holds a permit.
-async fn wait_for_buffered_items(client: &reqwest::Client, base: &str, want: u64) -> u64 {
-    let mut seen = 0;
-    for _ in 0..2_000 {
-        seen = scrape_counter(client, base, "ravel_ingest_buffered_items_total").await;
-        if seen >= want {
-            return seen;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    seen
+/// Holds every read of the tenant's metrics provisioning record. The first
+/// write of a (tenant, signal) in a process reads that record after the
+/// request was admitted and before its points are enqueued, so a request
+/// parked on this gate holds its in-flight permit.
+fn hold_provisioning_reads(fault: &FaultStore<MemoryStore>) -> GateHandle {
+    let key = format!("t/{}/m/prov", TenantId::new(TENANT).hash().to_hex());
+    fault.hold(Op::Get, Some(key), Occurrence::Always)
+}
+
+/// Waits until `want` admitted requests are parked on `gate`, each holding
+/// one of the in-flight permits.
+async fn wait_for_parked(gate: &GateHandle, want: usize) {
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(want))
+        .await
+        .expect("the admitted requests reach the provisioning read");
+    assert_eq!(
+        gate.held_count(),
+        want,
+        "exactly the admitted requests are parked: {:?}",
+        gate.held_details()
+    );
 }
 
 /// Issue #1705, the named acceptance case. With the process-wide ceiling at
 /// `LIMIT`, `LIMIT` concurrent authenticated exports are admitted and parked
-/// mid-flush, saturating it. The `LIMIT + 1`th request is unauthenticated and
+/// before enqueue on a held provisioning read, saturating it. The `LIMIT + 1`th request is unauthenticated and
 /// declares a 15 MiB body it never sends: it is refused 429 by the in-flight
 /// ceiling on its head alone.
 ///
@@ -323,9 +332,9 @@ async fn wait_for_buffered_items(client: &reqwest::Client, base: &str, want: u64
 ///      authentication, so an unauthenticated request over the ceiling is
 ///      shed rather than rejected, and no credential check is reached.
 ///   3. `ravel_ingest_concurrency_shed_total` reads exactly 1 and
-///      `ravel_ingest_buffered_items_total` is still exactly `LIMIT`: the
-///      refused request was counted by the existing shed counter, and nothing
-///      of its body was decoded into a shard buffer.
+///      `ravel_ingest_buffered_items_total` is still 0: the refused request
+///      was counted by the existing shed counter, and nothing of its body was
+///      decoded into a shard buffer.
 #[tokio::test]
 async fn ingest_refuses_overflow_before_reading_the_body() {
     const LIMIT: u64 = 2;
@@ -336,8 +345,7 @@ async fn ingest_refuses_overflow_before_reading_the_body() {
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
-    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
-    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let gate = hold_provisioning_reads(&fault);
 
     let ts_ns = now_ns();
     let held_tasks: Vec<_> = (0..LIMIT)
@@ -358,14 +366,10 @@ async fn ingest_refuses_overflow_before_reading_the_body() {
         })
         .collect();
 
-    let buffered = wait_for_buffered_items(&client, &base, LIMIT).await;
-    assert_eq!(
-        buffered, LIMIT,
-        "every admitted request must have buffered its point, so all {LIMIT} permits are held"
-    );
+    wait_for_parked(&gate, LIMIT as usize).await;
     assert!(
         held_tasks.iter().all(|t| !t.is_finished()),
-        "the admitted requests must still be in flight, blocked on the held flush"
+        "the admitted requests must still be in flight, parked before enqueue"
     );
 
     let exchange = post_head_only(running.http_addr, None).await;
@@ -396,8 +400,9 @@ async fn ingest_refuses_overflow_before_reading_the_body() {
     );
     assert_eq!(
         scrape_counter(&client, &base, "ravel_ingest_buffered_items_total").await,
-        LIMIT,
-        "no part of the refused request's body was decoded into a shard buffer"
+        0,
+        "the admitted requests are parked before enqueue, and no part of the refused \
+         request's body was decoded into a shard buffer"
     );
 
     drain_until_done(&gate, &held_tasks).await;
@@ -519,8 +524,7 @@ async fn grpc_refuses_overflow_before_decoding_the_message() {
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
-    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
-    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let gate = hold_provisioning_reads(&fault);
 
     let ts_ns = now_ns();
     let held_tasks: Vec<_> = (0..LIMIT)
@@ -541,11 +545,7 @@ async fn grpc_refuses_overflow_before_decoding_the_message() {
         })
         .collect();
 
-    let buffered = wait_for_buffered_items(&client, &base, LIMIT).await;
-    assert_eq!(
-        buffered, LIMIT,
-        "every admitted request must have buffered its point, so all {LIMIT} permits are held"
-    );
+    wait_for_parked(&gate, LIMIT as usize).await;
 
     let status = grpc_send_undecodable(grpc_addr, GRPC_METRICS_EXPORT, Some(TOKEN)).await;
 

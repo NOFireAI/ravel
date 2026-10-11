@@ -17,6 +17,8 @@ use ravel_otlp::normalize::normalize_metrics_with_metadata_projected;
 use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
+use crate::ingest_concurrency::IngestPermitHandle;
+
 pub struct IngestState {
     pub router: Arc<IngestRouter>,
     pub limits: IngestLimits,
@@ -152,6 +154,29 @@ pub async fn handle_export(
     mode: WriteMode,
     request: ExportMetricsServiceRequest,
     ingest_ts_ns: i64,
+) -> Result<IngestOutcome, IngestRequestError> {
+    handle_export_releasing(
+        state,
+        tenant,
+        mode,
+        request,
+        ingest_ts_ns,
+        &IngestPermitHandle::default(),
+    )
+    .await
+}
+
+/// [`handle_export`] for a transport that holds the request's in-flight
+/// permit: `permit` is released once the write is enqueued, before the
+/// strict ack is awaited (ADR-2793 decision 4), so the ack wait holds no slot
+/// of the in-flight ceiling.
+pub async fn handle_export_releasing(
+    state: &IngestState,
+    tenant: TenantId,
+    mode: WriteMode,
+    request: ExportMetricsServiceRequest,
+    ingest_ts_ns: i64,
+    permit: &IngestPermitHandle,
 ) -> Result<IngestOutcome, IngestRequestError> {
     // Receiver-clock plausibility (ADR-0051 amendment): the admission
     // clock must sit above the 2020 floor and yield a representable hour bucket
@@ -290,29 +315,32 @@ pub async fn handle_export(
     // the projection and the batch estimate describe the same labels.
     drop(label_charge);
     let tenant_hash = tenant.hash();
-    let receipt = state
+    let classify = |err: WriteError| {
+        // A PartialWrite's durable siblings are real, durably committed
+        // data (docs/consistency-model.md). OTLP has no error-response
+        // channel to hand their tokens back to the client, so logging the
+        // count is the only recovery this path offers. The metrics pipeline
+        // has no idempotency marker at all: dedup is by `(series_id, ts)` at
+        // read time, so a retry of these siblings is harmless rather than
+        // duplicating.
+        let durable_shard_count = err.durable_tokens().len();
+        if durable_shard_count > 0 {
+            tracing::warn!(
+                tenant_hash = %tenant_hash.to_hex(),
+                durable_shard_count,
+                "metric write partially committed before a sibling shard \
+                 failed"
+            );
+        }
+        IngestRequestError::Write(err)
+    };
+    let submitted = state
         .router
-        .write_values_with_exemplars(tenant, points, exemplars, mode, state.ack_deadline)
+        .submit_values_with_exemplars(tenant, points, exemplars, mode, state.ack_deadline)
         .await
-        .map_err(|err| {
-            // A PartialWrite's durable siblings are real, durably committed
-            // data (docs/consistency-model.md). OTLP has no error-response
-            // channel to hand their tokens back to the client, so logging the
-            // count is the only recovery this path offers. The metrics pipeline
-            // has no idempotency marker at all: dedup is by `(series_id, ts)` at
-            // read time, so a retry of these siblings is harmless rather than
-            // duplicating.
-            let durable_shard_count = err.durable_tokens().len();
-            if durable_shard_count > 0 {
-                tracing::warn!(
-                    tenant_hash = %tenant_hash.to_hex(),
-                    durable_shard_count,
-                    "metric write partially committed before a sibling shard \
-                     failed"
-                );
-            }
-            IngestRequestError::Write(err)
-        })?;
+        .map_err(classify)?;
+    permit.release();
+    let receipt = submitted.acks().await.map_err(classify)?;
 
     // Gate on whether anything was rejected at all, never on the unit count: a
     // zero-count rejection still has to reach the sender. The rule and the

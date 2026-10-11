@@ -16,8 +16,8 @@
 //! ... reject before buffering"), so the caller's own retry/backoff decides
 //! where the request lands next.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -51,6 +51,41 @@ pub struct IngestConcurrencyController {
 #[derive(Debug)]
 pub struct IngestPermit {
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+/// The release handle for one request's [`IngestPermit`] (ADR-2793 decision
+/// 4). Every clone shares one slot: the admission layer keeps a clone for the
+/// request's lifetime and the handler takes another, so the permit is
+/// returned either when the handler calls [`Self::release`] once its write is
+/// enqueued, or when the last clone drops, whichever comes first. Dropping a
+/// clone while another is alive never releases it, which is what lets a clone
+/// sit in request extensions that tonic drops mid-handler.
+#[derive(Debug, Clone, Default)]
+pub struct IngestPermitHandle(Arc<Mutex<Option<IngestPermit>>>);
+
+impl IngestPermitHandle {
+    pub fn new(permit: IngestPermit) -> Self {
+        IngestPermitHandle(Arc::new(Mutex::new(Some(permit))))
+    }
+
+    /// Empties the slot, returning the permit to the controller. Idempotent.
+    pub fn release(&self) {
+        let permit = self.slot().take();
+        drop(permit);
+    }
+
+    /// Whether the slot still holds the permit.
+    pub fn is_held(&self) -> bool {
+        self.slot().is_some()
+    }
+
+    fn slot(&self) -> MutexGuard<'_, Option<IngestPermit>> {
+        // The guarded value is an `Option` with no invariant a panicking
+        // holder could have broken, so a poisoned lock is still usable.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// The process-wide in-flight ceiling is reached. Never carries a reason
@@ -150,6 +185,32 @@ mod tests {
             .collect();
         assert_eq!(controller.shed_total(), 0);
         drop(permits);
+    }
+
+    #[test]
+    fn handle_release_frees_the_slot_while_clones_are_alive() {
+        let controller = IngestConcurrencyController::new(IngestConcurrencyLimit::Bounded(1));
+        let handle = IngestPermitHandle::new(controller.try_admit().expect("admit under bound"));
+        let layer_clone = handle.clone();
+        assert!(controller.try_admit().is_err());
+        handle.release();
+        assert!(!layer_clone.is_held());
+        let next = controller.try_admit().expect("released slot is free");
+        drop(next);
+        layer_clone.release();
+        assert!(controller.try_admit().is_ok());
+    }
+
+    #[test]
+    fn dropping_one_handle_clone_keeps_the_permit() {
+        let controller = IngestConcurrencyController::new(IngestConcurrencyLimit::Bounded(1));
+        let handle = IngestPermitHandle::new(controller.try_admit().expect("admit under bound"));
+        let extension_clone = handle.clone();
+        drop(extension_clone);
+        assert!(handle.is_held());
+        assert!(controller.try_admit().is_err());
+        drop(handle);
+        assert!(controller.try_admit().is_ok());
     }
 
     #[test]
