@@ -1052,6 +1052,20 @@ sound (ADR-0013): a block is dropped only when its bounds prove no record in it
 can match. Precision is not guaranteed; survivors are scanned and re-evaluated
 exactly.
 
+The same bounds also shorten that re-evaluation (ADR-2773 decision D2). A
+`TsRange` arm whose range contains the block's `[min_ts, max_ts]`, or a
+`StreamIn` arm whose set holds every ref in `[min_stream_ref,
+max_stream_ref]`, is true for every record of the block, so the scan leaves it
+out of that block's evaluation; a block with no arm left keeps every record and
+evaluates none. An arm is left out only when the block's decoded `ts` or
+`stream_ref` column has a value on every row, so an absent cell on a row an
+arm reaches is still reported as `Corrupted`. The arms that remain are
+evaluated a block at a time
+over the decoded column buffers, and only an attribute arm with no FIELD_DIR
+column of its value's type is evaluated per record, against `attrs_raw`, on the
+records the other arms kept. `ScanStats` counts both outcomes:
+`blocks_predicate_dropped` and `rows_predicate_evaluated`.
+
 ## BLOOM
 
 One blocked bloom filter per row block. The BLOOM section (version 5) is a

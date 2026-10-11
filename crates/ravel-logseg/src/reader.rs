@@ -14,7 +14,8 @@ use std::sync::Arc;
 use ravel_types::logstream::AttrValue;
 
 use crate::block::{
-    ColumnIdSet, ColumnPlan, DecodedBlock, PageCounters, read_block_pages_with_shared_dicts,
+    ColumnIdSet, ColumnPlan, DecodedBlock, I64Column, PageCounters, StrColumn,
+    read_block_pages_with_shared_dicts,
 };
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
@@ -26,8 +27,9 @@ use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
 use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
 use crate::record::{
-    COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
-    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
+    COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
+    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate,
+    resolve_value,
 };
 use crate::rlog_bloom::RlogBloomSection;
 use crate::rlog_codec::decode_dict_page;
@@ -97,6 +99,18 @@ pub struct ScanStats {
     /// `pages_decoded`: the figure is the decompressed bytes each block
     /// consumed, which bounds the bytes actually inflated from above.
     pub decompressed_bytes: u64,
+    /// Decoded blocks whose rows were all kept without evaluating the exact
+    /// predicate on any of them: every arm was proven true for the whole block
+    /// by its skip-index bounds (a `TsRange` containing the block's ts bounds,
+    /// a `StreamIn` holding every stream ref in its ref bounds), or the
+    /// predicate had no exact arm to begin with. Grows as blocks are decoded,
+    /// like [`Self::pages_decoded`] (ADR-2773 decision D2).
+    pub blocks_predicate_dropped: u64,
+    /// Rows of the decoded blocks that kept at least one exact predicate arm,
+    /// i.e. the rows the predicate was evaluated over. Zero when every decoded
+    /// block was counted in [`Self::blocks_predicate_dropped`]. Grows as blocks
+    /// are decoded, like [`Self::pages_decoded`].
+    pub rows_predicate_evaluated: u64,
 }
 
 /// An opened RLOG object ready to scan.
@@ -713,6 +727,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                 block_index,
                 min_ts: entry.min_ts,
                 max_ts: entry.max_ts,
+                min_stream_ref: entry.min_stream_ref,
+                max_stream_ref: entry.max_stream_ref,
             });
         }
 
@@ -723,7 +739,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             columns: columns
                 .resolve(&self.field_dir)
                 .map(|s| s.into_iter().collect()),
-            content: content.clone(),
+            arms: compile_arms(&self.stream_dir, &self.field_dir, &arms),
             blocks,
             page_dir: self.page_dir.clone(),
             blocks_offset: self.blocks_offset,
@@ -732,6 +748,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             current: None,
             surviving: Vec::new(),
             dicts: DictCache::default(),
+            dict_memo: DictArmMemo::default(),
         })
     }
 
@@ -848,7 +865,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             field_dir: self.field_dir.clone(),
             plans: Vec::new(),
             columns: None,
-            content: Predicate::And(Vec::new()),
+            arms: Vec::new(),
             blocks: Vec::new(),
             page_dir: Arc::new(PageDir::default()),
             blocks_offset: 0,
@@ -857,6 +874,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             current: None,
             surviving: Vec::new(),
             dicts: DictCache::default(),
+            dict_memo: DictArmMemo::default(),
         }
     }
 
@@ -1099,6 +1117,9 @@ struct BlockLoc {
     /// for both, and nothing here checks `min_ts <= max_ts`.
     min_ts: i64,
     max_ts: i64,
+    /// The block's skip-index stream ref bounds, as stored.
+    min_stream_ref: u32,
+    max_stream_ref: u32,
 }
 
 /// A pruned scan that has not decoded anything yet: the surviving block list,
@@ -1122,8 +1143,9 @@ pub struct BlockScan {
     /// re-collects `resolve`'s std `HashSet<u32>` into the crate's faster set
     /// rather than paying SipHash on every page of every block decoded.
     columns: Option<ColumnIdSet>,
-    /// The exact per-row filter, re-evaluated against every decoded row.
-    content: Predicate,
+    /// The exact content filter, its arms resolved against the directories
+    /// once per scan and evaluated per decoded block ([`block_survivors`]).
+    arms: Vec<Arm>,
     blocks: Vec<BlockLoc>,
     /// The object's shared decoded PAGE_DIR. One [`Arc`] copy per scan, cloned
     /// from the reader, through which [`Self::decode_block`] resolves each
@@ -1146,6 +1168,9 @@ pub struct BlockScan {
     surviving: Vec<usize>,
     /// The current row group's decoded dictionaries, shared by its blocks.
     dicts: DictCache,
+    /// Per-arm work over a shared dictionary, reused by the blocks of its row
+    /// group.
+    dict_memo: DictArmMemo,
 }
 
 impl BlockScan {
@@ -1369,17 +1394,16 @@ impl BlockScan {
             .decompressed_bytes
             .saturating_add(decoded.decompressed_bytes());
 
-        for row in 0..decoded.record_count() {
-            if eval(
-                &self.stream_dir,
-                &self.field_dir,
-                &self.content,
-                &decoded,
-                row,
-            )? {
-                self.surviving.push(row);
-            }
-        }
+        block_survivors(
+            &self.stream_dir,
+            &self.field_dir,
+            &self.arms,
+            &loc,
+            &decoded,
+            &mut self.dict_memo,
+            &mut self.stats,
+            &mut self.surviving,
+        )?;
         self.current = Some(decoded);
         Ok(true)
     }
@@ -1631,12 +1655,539 @@ fn verify_and_read(
     Ok(produced)
 }
 
+// --- per-block evaluation (ADR-2773 decision D2) ----------------------------
+
+/// One arm of the exact content predicate, resolved against the object's
+/// STREAM_DIR and FIELD_DIR once per scan.
+#[derive(Clone, Debug)]
+enum Arm {
+    /// `TsRange`, inclusive at both ends.
+    Ts {
+        min: i64,
+        max: i64,
+    },
+    /// `StreamIn`, as the sorted, deduplicated stream refs its ids resolve to.
+    /// An id this object has no stream for matches no row, so it has no ref.
+    Stream {
+        refs: Vec<u32>,
+    },
+    /// Equality on a string or bytes column (plain or dictionary pages).
+    BytesEq {
+        col: u32,
+        target: Vec<u8>,
+    },
+    I64Eq {
+        col: u32,
+        target: i64,
+    },
+    /// Equality on an f64 column by bit pattern.
+    F64Eq {
+        col: u32,
+        bits: u64,
+    },
+    BoolEq {
+        col: u32,
+        target: bool,
+    },
+    /// `HasWord` on a string column.
+    Word {
+        col: u32,
+        word: String,
+    },
+    /// An `Equals` that no row can satisfy (`body` against a non-string).
+    Never,
+    /// An attribute arm whose field has no FIELD_DIR column of the type the
+    /// value resolves to: evaluated per row against `attrs_raw`.
+    Overflow(Predicate),
+}
+
+/// Resolves the flattened exact arms. `NumRange` is prune-only and matches
+/// every row (see [`eval`]), so it contributes no arm.
+fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate]) -> Vec<Arm> {
+    let mut out = Vec::with_capacity(arms.len());
+    for &p in arms {
+        let arm = match p {
+            // `flatten` leaves no `And`; an empty one matches every row.
+            Predicate::And(_) | Predicate::NumRange { .. } => continue,
+            Predicate::TsRange { min_ns, max_ns } => Arm::Ts {
+                min: *min_ns,
+                max: *max_ns,
+            },
+            Predicate::StreamIn(ids) => {
+                let mut refs: Vec<u32> = ids
+                    .iter()
+                    .filter_map(|id| stream_dir.stream_ref(id))
+                    .collect();
+                refs.sort_unstable();
+                refs.dedup();
+                Arm::Stream { refs }
+            }
+            Predicate::HasWord { field, word } => match field {
+                FieldSel::Body => Arm::Word {
+                    col: COL_BODY,
+                    word: word.clone(),
+                },
+                FieldSel::SeverityText => Arm::Word {
+                    col: COL_SEVERITY_TEXT,
+                    word: word.clone(),
+                },
+                FieldSel::Attr(name) => match field_dir.column(name, FieldType::Str) {
+                    Some(e) => Arm::Word {
+                        col: e.column_id,
+                        word: word.clone(),
+                    },
+                    None => Arm::Overflow(p.clone()),
+                },
+            },
+            Predicate::Equals { field, value } => match field {
+                FieldSel::Body | FieldSel::SeverityText => {
+                    let col = if matches!(field, FieldSel::Body) {
+                        COL_BODY
+                    } else {
+                        COL_SEVERITY_TEXT
+                    };
+                    match value {
+                        AttrValue::Str(s) => Arm::BytesEq {
+                            col,
+                            target: s.as_bytes().to_vec(),
+                        },
+                        _ => Arm::Never,
+                    }
+                }
+                FieldSel::Attr(name) => {
+                    let (ty, _) = resolve_value(value);
+                    match field_dir.column(name, ty) {
+                        Some(e) => column_eq_arm(e.column_id, value),
+                        None => Arm::Overflow(p.clone()),
+                    }
+                }
+            },
+        };
+        out.push(arm);
+    }
+    out
+}
+
+/// The equality arm for a FIELD_DIR column of the type `value` resolves to,
+/// matching exactly the rows [`attr_equals`] does.
+fn column_eq_arm(col: u32, value: &AttrValue) -> Arm {
+    match value {
+        // A string column cell reads as `Str` only when it is UTF-8, and the
+        // query string is UTF-8, so equal bytes are the whole condition.
+        AttrValue::Str(s) => Arm::BytesEq {
+            col,
+            target: s.as_bytes().to_vec(),
+        },
+        AttrValue::Bytes(b) => Arm::BytesEq {
+            col,
+            target: b.clone(),
+        },
+        AttrValue::I64(v) => Arm::I64Eq { col, target: *v },
+        AttrValue::F64(f) => Arm::F64Eq {
+            col,
+            bits: f.to_bits(),
+        },
+        AttrValue::Bool(b) => Arm::BoolEq { col, target: *b },
+        // A list or map is stored in a bytes column as its canonical bytes.
+        other => Arm::BytesEq {
+            col,
+            target: crate::record::canonical_value_bytes(other),
+        },
+    }
+}
+
+impl Arm {
+    /// Whether the block's skip-index bounds prove this arm true for every
+    /// row, so it can be left out of the block's evaluation. A block whose
+    /// `ts` or `stream_ref` column has an absent cell keeps the arm, so the
+    /// kernel still reports that cell as corrupt.
+    fn holds_for_block(&self, loc: &BlockLoc, block: &DecodedBlock) -> bool {
+        let n = block.record_count();
+        let complete = |col: u32| {
+            block
+                .i64_column(col)
+                .is_some_and(|c| c.len() == n && c.null_count() == 0)
+        };
+        match self {
+            Arm::Ts { min, max } => {
+                loc.min_ts <= loc.max_ts
+                    && *min <= loc.min_ts
+                    && loc.max_ts <= *max
+                    && complete(COL_TS)
+            }
+            Arm::Stream { refs } => {
+                let (lo, hi) = (loc.min_stream_ref, loc.max_stream_ref);
+                if lo > hi {
+                    return false;
+                }
+                // Every ref in `lo..=hi` is in the set: the set's refs inside
+                // the bounds number as many as the bounds span.
+                let inside = refs.partition_point(|&r| r <= hi) - refs.partition_point(|&r| r < lo);
+                inside as u64 == u64::from(hi - lo) + 1 && complete(COL_STREAM_REF)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`eval`] on this thread.
+    static EVAL_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Arms [`block_survivors`] ran as a block kernel on this thread.
+    static KERNEL_ARMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Dictionary entries a `BytesEq` arm compared with its target.
+    static DICT_ENTRY_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `phrase_match` memos a `Word` arm allocated over a dictionary.
+    static DICT_WORD_MEMOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// What each dictionary arm learned about the dictionary it last ran over,
+/// so the blocks of a row group, which share one dictionary, pay for it once:
+/// the keys a `BytesEq` target equals, and a `Word` arm's `phrase_match`
+/// result per entry so far. Indexed by the arm's position in the scan.
+#[derive(Default)]
+struct DictArmMemo {
+    hits: Vec<DictSlot<Vec<i32>>>,
+    words: Vec<DictSlot<Vec<Option<bool>>>>,
+}
+
+/// Work keyed by the identity of the shared [`DictValues`] it was done over.
+/// The [`Weak`](std::sync::Weak) keeps that allocation from being reused for
+/// another dictionary while the slot names it, without keeping a past row
+/// group's entries resident.
+type DictSlot<T> = Option<(std::sync::Weak<DictValues>, T)>;
+
+/// Slot `arm` of `slots`, rebuilt by `init` unless it holds `dict`'s work.
+fn dict_slot<'m, T>(
+    slots: &'m mut Vec<DictSlot<T>>,
+    arm: usize,
+    dict: &Arc<DictValues>,
+    init: impl FnOnce(&DictValues) -> T,
+) -> &'m mut T {
+    if slots.len() <= arm {
+        slots.resize_with(arm + 1, || None);
+    }
+    let slot = &mut slots[arm];
+    if !matches!(slot, Some((w, _)) if std::ptr::eq(w.as_ptr(), Arc::as_ptr(dict))) {
+        *slot = None;
+    }
+    &mut slot
+        .get_or_insert_with(|| (Arc::downgrade(dict), init(dict)))
+        .1
+}
+
+/// The rows of `block` matching `arms`, ascending, appended to `out`: the
+/// rows [`eval`] accepts one by one over the whole content predicate.
+///
+/// Arms the block's skip-index bounds prove true are dropped first; a block
+/// left with no arm keeps every row and evaluates nothing. The remaining
+/// column arms run as kernels over the decoded column buffers, each clearing
+/// rows from one selection bitmap in arm order. Overflow arms run last, per
+/// row, on the rows the column arms kept. `memo` carries dictionary work
+/// between the blocks of one scan.
+#[allow(clippy::too_many_arguments)]
+fn block_survivors(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    arms: &[Arm],
+    loc: &BlockLoc,
+    block: &DecodedBlock,
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+    out: &mut Vec<usize>,
+) -> Result<(), LogSegError> {
+    let n = block.record_count();
+    let live: Vec<(usize, &Arm)> = arms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.holds_for_block(loc, block))
+        .collect();
+    if live.is_empty() {
+        stats.blocks_predicate_dropped += 1;
+        out.extend(0..n);
+        return Ok(());
+    }
+    stats.rows_predicate_evaluated += n as u64;
+    let mut sel = RowSelection::all(n);
+    // Without a decoded `attrs_raw` column an overflow arm matches no row
+    // (`overflow_attr` reads `None`), so it clears the selection in place.
+    let attrs_raw = live.iter().any(|(_, a)| matches!(a, Arm::Overflow(_)))
+        && block.str_column(COL_ATTRS_RAW).is_some();
+    let mut deferred: Vec<&Predicate> = Vec::new();
+    for (i, arm) in live {
+        match arm {
+            Arm::Overflow(p) if attrs_raw => deferred.push(p),
+            _ => {
+                if sel.is_empty() {
+                    break;
+                }
+                #[cfg(test)]
+                KERNEL_ARMS.with(|c| c.set(c.get() + 1));
+                apply_arm(arm, i, block, memo, &mut sel)?;
+            }
+        }
+    }
+    for p in deferred {
+        if sel.is_empty() {
+            break;
+        }
+        sel.retain(|row| eval(stream_dir, field_dir, p, block, row))?;
+    }
+    sel.extend_rows(out);
+    Ok(())
+}
+
+/// Clears from `sel` the rows `arm` rejects. An absent `ts` or `stream_ref`
+/// cell on a selected row is the same `Corrupted` error [`i64_at`] gives.
+/// `index` is the arm's position in the scan's arms, its slot in `memo`.
+fn apply_arm(
+    arm: &Arm,
+    index: usize,
+    block: &DecodedBlock,
+    memo: &mut DictArmMemo,
+    sel: &mut RowSelection,
+) -> Result<(), LogSegError> {
+    match arm {
+        Arm::Ts { min, max } => {
+            let (min, max) = (*min, *max);
+            i64_kernel(block.i64_column(COL_TS), Some(COL_TS), sel, |v| {
+                (min..=max).contains(&v)
+            })
+        }
+        Arm::Stream { refs } => {
+            let Some(col) = block.i64_column(COL_STREAM_REF) else {
+                return sel.reject_all_or(missing_i64(COL_STREAM_REF));
+            };
+            sel.retain(|row| {
+                let raw = col.get(row).ok_or_else(|| missing_i64(COL_STREAM_REF))?;
+                let r = u32::try_from(raw)
+                    .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+                Ok(refs.binary_search(&r).is_ok())
+            })
+        }
+        Arm::I64Eq { col, target } => {
+            let target = *target;
+            i64_kernel(block.i64_column(*col), None, sel, |v| v == target)
+        }
+        Arm::F64Eq { col, bits } => match block.f64_col(*col) {
+            Some(cells) => sel.retain(|row| Ok(cells.get(row).copied().flatten() == Some(*bits))),
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::BoolEq { col, target } => match block.bool_col(*col) {
+            Some(cells) => sel.retain(|row| Ok(cells.get(row).copied().flatten() == Some(*target))),
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::BytesEq { col, target } => match block.str_column(*col) {
+            Some(StrColumn::Plain(cells)) => {
+                sel.retain(|row| Ok(cells.get(row).and_then(Option::as_deref) == Some(target)))
+            }
+            Some(StrColumn::Dict(d)) => {
+                // The entries equal to the target, found once per dictionary;
+                // each row then compares its key.
+                let hits = dict_slot(&mut memo.hits, index, d.values(), |values| {
+                    (0..values.len())
+                        .filter(|&k| {
+                            #[cfg(test)]
+                            DICT_ENTRY_VISITS.with(|c| c.set(c.get() + 1));
+                            values.entry(k) == Some(target.as_slice())
+                        })
+                        .filter_map(|k| i32::try_from(k).ok())
+                        .collect()
+                });
+                if hits.is_empty() {
+                    sel.clear();
+                    return Ok(());
+                }
+                sel.retain(|row| Ok(d.key(row).is_some_and(|k| hits.contains(&k))))
+            }
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::Word { col, word } => match block.str_column(*col) {
+            Some(StrColumn::Plain(cells)) => sel.retain(|row| {
+                Ok(cells
+                    .get(row)
+                    .and_then(Option::as_deref)
+                    .is_some_and(|c| phrase_match(c, word)))
+            }),
+            Some(StrColumn::Dict(d)) => {
+                // One `phrase_match` per dictionary entry a selected row uses,
+                // over every block sharing the dictionary.
+                let values = d.values();
+                let memo = dict_slot(&mut memo.words, index, values, |values| {
+                    #[cfg(test)]
+                    DICT_WORD_MEMOS.with(|c| c.set(c.get() + 1));
+                    vec![None; values.len()]
+                });
+                sel.retain(|row| {
+                    let Some(k) = d.key(row) else {
+                        return Ok(false);
+                    };
+                    let k = k as usize;
+                    Ok(match memo.get(k).copied().flatten() {
+                        Some(hit) => hit,
+                        None => {
+                            let hit = values.entry(k).is_some_and(|c| phrase_match(c, word));
+                            if let Some(slot) = memo.get_mut(k) {
+                                *slot = Some(hit);
+                            }
+                            hit
+                        }
+                    })
+                })
+            }
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::Never | Arm::Overflow(_) => {
+            sel.clear();
+            Ok(())
+        }
+    }
+}
+
+fn missing_i64(col: u32) -> LogSegError {
+    LogSegError::Corrupted(format!("missing i64 col {col}"))
+}
+
+/// Clears from `sel` the rows of an integer column whose value fails `keep`,
+/// 64 rows to a word. An absent cell never matches; with `strict` naming the
+/// column, an absent cell on a selected row is an error instead.
+fn i64_kernel(
+    col: Option<&I64Column>,
+    strict: Option<u32>,
+    sel: &mut RowSelection,
+    keep: impl Fn(i64) -> bool,
+) -> Result<(), LogSegError> {
+    let Some(col) = col else {
+        return match strict {
+            Some(id) => sel.reject_all_or(missing_i64(id)),
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        };
+    };
+    let values = col.values();
+    let validity = col.validity();
+    for (wi, word) in sel.words.iter_mut().enumerate() {
+        if *word == 0 {
+            continue;
+        }
+        let start = wi * 64;
+        let chunk = values.get(start..).unwrap_or(&[]);
+        let chunk = &chunk[..chunk.len().min(64)];
+        let valid = validity_word(validity, wi) & low_bits(chunk.len());
+        if let Some(id) = strict
+            && *word & !valid != 0
+        {
+            return Err(missing_i64(id));
+        }
+        let mut hit = 0u64;
+        for (j, &v) in chunk.iter().enumerate() {
+            hit |= u64::from(keep(v)) << j;
+        }
+        *word &= hit & valid;
+    }
+    Ok(())
+}
+
+/// Bits `[64 * wi, 64 * wi + 64)` of an LSB-first validity bitmap; all set
+/// when there is no bitmap.
+fn validity_word(validity: Option<&[u8]>, wi: usize) -> u64 {
+    let Some(bits) = validity else {
+        return u64::MAX;
+    };
+    let mut word = [0u8; 8];
+    if let Some(src) = bits.get(wi * 8..) {
+        let n = src.len().min(8);
+        word[..n].copy_from_slice(&src[..n]);
+    }
+    u64::from_le_bytes(word)
+}
+
+/// A word with its low `n` bits set, `n <= 64`.
+fn low_bits(n: usize) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// The rows of one block still selected, one bit per row.
+struct RowSelection {
+    words: Vec<u64>,
+}
+
+impl RowSelection {
+    fn all(n: usize) -> Self {
+        let mut words = vec![u64::MAX; n.div_ceil(64)];
+        if let Some(last) = words.last_mut() {
+            *last = low_bits(n - (n.div_ceil(64) - 1) * 64);
+        }
+        RowSelection { words }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.words.iter().all(|&w| w == 0)
+    }
+
+    fn clear(&mut self) {
+        self.words.iter_mut().for_each(|w| *w = 0);
+    }
+
+    /// Clears every row, or returns `err` when any row is still selected:
+    /// for a column every selected row must have.
+    fn reject_all_or(&mut self, err: LogSegError) -> Result<(), LogSegError> {
+        if self.is_empty() { Ok(()) } else { Err(err) }
+    }
+
+    /// Keeps the selected rows `keep` accepts, visiting them in row order.
+    fn retain(
+        &mut self,
+        mut keep: impl FnMut(usize) -> Result<bool, LogSegError>,
+    ) -> Result<(), LogSegError> {
+        for (wi, word) in self.words.iter_mut().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                if !keep(wi * 64 + bit as usize)? {
+                    *word &= !(1u64 << bit);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extend_rows(&self, out: &mut Vec<usize>) {
+        for (wi, &word) in self.words.iter().enumerate() {
+            let mut rest = word;
+            while rest != 0 {
+                out.push(wi * 64 + rest.trailing_zeros() as usize);
+                rest &= rest - 1;
+            }
+        }
+    }
+}
+
 // --- exact evaluation -------------------------------------------------------
 
 /// Evaluate the exact filter against one decoded row.
 ///
 /// Free rather than a [`RlogReader`] method because [`BlockScan`] evaluates the
 /// same predicate without holding a reader: both need only the two directories.
+/// The scan reaches it only for an overflow arm ([`block_survivors`]); the
+/// whole-predicate form is the row-by-row oracle the block kernels are tested
+/// against.
 fn eval(
     stream_dir: &StreamDir,
     field_dir: &FieldDir,
@@ -1644,6 +2195,8 @@ fn eval(
     block: &DecodedBlock,
     row: usize,
 ) -> Result<bool, LogSegError> {
+    #[cfg(test)]
+    EVAL_CALLS.with(|c| c.set(c.get() + 1));
     Ok(match pred {
         Predicate::And(v) => {
             for p in v {
@@ -5888,5 +6441,738 @@ mod tests {
             8,
             "both low blocks, the one after the skip included, decode whole"
         );
+    }
+
+    /// Per-block content evaluation (ADR-2773 decision D2) against the
+    /// row-by-row [`eval`] it replaced.
+    mod block_predicate {
+        use super::*;
+        use proptest::prelude::*;
+
+        const BODIES: [&str; 5] = ["alpha beta", "beta gamma", "gamma", "", "alpha delta"];
+        const LO: [&str; 3] = ["x", "y", "x y"];
+        const ZZ: [&str; 3] = ["p q", "q", "p"];
+        const F: [f64; 3] = [0.0, -0.0, 1.5];
+
+        /// One generated record: indexes into the pools above, `None` for an
+        /// attribute the record does not carry.
+        #[derive(Clone, Debug)]
+        struct Row {
+            stream: u8,
+            ts: i64,
+            body: usize,
+            lo: Option<usize>,
+            hi: bool,
+            n: Option<i64>,
+            flag: Option<bool>,
+            blob: Option<u8>,
+            f: Option<usize>,
+            zz: Option<usize>,
+        }
+
+        fn row() -> impl Strategy<Value = Row> {
+            (
+                (0u8..6, 0i64..40, 0usize..BODIES.len()),
+                (
+                    proptest::option::of(0usize..LO.len()),
+                    any::<bool>(),
+                    proptest::option::of(-2i64..3),
+                    proptest::option::of(any::<bool>()),
+                ),
+                (
+                    proptest::option::of(0u8..3),
+                    proptest::option::of(0usize..F.len()),
+                    proptest::option::of(0usize..ZZ.len()),
+                ),
+            )
+                .prop_map(|((stream, ts, body), (lo, hi, n, flag), (blob, f, zz))| {
+                    Row {
+                        stream,
+                        ts,
+                        body,
+                        lo,
+                        hi,
+                        n,
+                        flag,
+                        blob,
+                        f,
+                        zz,
+                    }
+                })
+        }
+
+        fn blob(b: u8) -> Vec<u8> {
+            [vec![], vec![1], vec![2, 3]][b as usize].clone()
+        }
+
+        /// The records, and the dynamic column cap that gives every attribute
+        /// but `zz` (last in the writer's `(name, type)` order) a column, so
+        /// `zz` always overflows into `attrs_raw`.
+        fn corpus(rows: &[Row]) -> (Vec<LogRecord>, usize) {
+            let mut pairs = std::collections::BTreeSet::new();
+            let recs = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let mut attrs = Vec::new();
+                    if let Some(v) = r.lo {
+                        attrs.push(attr("lo", AttrValue::Str(LO[v].into())));
+                    }
+                    if r.hi {
+                        attrs.push(attr("hi", AttrValue::Str(format!("u{i}"))));
+                    }
+                    if let Some(v) = r.n {
+                        attrs.push(attr("n", AttrValue::I64(v)));
+                    }
+                    if let Some(v) = r.flag {
+                        attrs.push(attr("flag", AttrValue::Bool(v)));
+                    }
+                    if let Some(v) = r.blob {
+                        attrs.push(attr("blob", AttrValue::Bytes(blob(v))));
+                    }
+                    if let Some(v) = r.f {
+                        attrs.push(attr("f", AttrValue::F64(F[v])));
+                    }
+                    for (k, _) in &attrs {
+                        pairs.insert(k.clone());
+                    }
+                    if let Some(v) = r.zz {
+                        attrs.push(attr("zz", AttrValue::Str(ZZ[v].into())));
+                    }
+                    rec_attrs(r.stream, r.ts, BODIES[r.body], attrs)
+                })
+                .collect();
+            (recs, pairs.len())
+        }
+
+        /// The attribute equality arms: every column type, a dictionary and a
+        /// plain string column, values present and absent, and arms whose
+        /// value type has no column (`n` as a string, `zz` as an integer) or
+        /// whose field overflows (`zz`), which take the per-row path.
+        fn attr_equals() -> Vec<(&'static str, AttrValue)> {
+            vec![
+                ("lo", AttrValue::Str("x".into())),
+                ("lo", AttrValue::Str("x y".into())),
+                ("lo", AttrValue::Str("nope".into())),
+                ("hi", AttrValue::Str("u3".into())),
+                ("hi", AttrValue::Str("u0".into())),
+                ("n", AttrValue::I64(0)),
+                ("n", AttrValue::I64(2)),
+                ("n", AttrValue::Str("1".into())),
+                ("flag", AttrValue::Bool(true)),
+                ("flag", AttrValue::Bool(false)),
+                ("blob", AttrValue::Bytes(vec![2, 3])),
+                ("blob", AttrValue::Bytes(vec![])),
+                ("f", AttrValue::F64(0.0)),
+                ("f", AttrValue::F64(-0.0)),
+                ("zz", AttrValue::Str("q".into())),
+                ("zz", AttrValue::Str("p q".into())),
+                ("zz", AttrValue::I64(1)),
+                ("missing", AttrValue::Str("x".into())),
+            ]
+        }
+
+        fn ts_arm() -> impl Strategy<Value = Predicate> {
+            (-2i64..42, 0i64..24).prop_map(|(min_ns, len)| Predicate::TsRange {
+                min_ns,
+                max_ns: min_ns + len,
+            })
+        }
+
+        fn stream_arm() -> impl Strategy<Value = Predicate> {
+            proptest::collection::vec(0u8..8, 1..6)
+                .prop_map(|s| Predicate::StreamIn(s.into_iter().map(sid).collect()))
+        }
+
+        /// A window over every `ts` a hand-built block draws (`0..30`), so
+        /// the block's bounds always fall inside it.
+        fn covering_ts_arm() -> impl Strategy<Value = Predicate> {
+            (-2i64..1, 31i64..34).prop_map(|(min_ns, len)| Predicate::TsRange {
+                min_ns,
+                max_ns: min_ns + len,
+            })
+        }
+
+        /// Every stream the corpus can hold, so a hand-built block whose refs
+        /// all resolve has bounds the set covers.
+        fn covering_stream_arm() -> impl Strategy<Value = Predicate> {
+            Just(Predicate::StreamIn((0u8..8).map(sid).collect()))
+        }
+
+        fn arm() -> impl Strategy<Value = Predicate> {
+            let words = ["alpha", "beta", "gamma delta", "x", "u1", "p", "q", "1"];
+            prop_oneof![
+                3 => ts_arm(),
+                3 => stream_arm(),
+                1 => (0usize..BODIES.len()).prop_map(|b| Predicate::Equals {
+                    field: FieldSel::Body,
+                    value: AttrValue::Str(BODIES[b].into()),
+                }),
+                1 => Just(Predicate::Equals {
+                    field: FieldSel::Body,
+                    value: AttrValue::I64(1),
+                }),
+                1 => prop_oneof![Just("INFO"), Just("WARN")].prop_map(|s| Predicate::Equals {
+                    field: FieldSel::SeverityText,
+                    value: AttrValue::Str(s.into()),
+                }),
+                1 => (0usize..words.len()).prop_map(move |w| Predicate::HasWord {
+                    field: FieldSel::Body,
+                    word: words[w].into(),
+                }),
+                3 => (0usize..attr_equals().len()).prop_map(|i| {
+                    let (name, value) = attr_equals().swap_remove(i);
+                    Predicate::Equals {
+                        field: FieldSel::Attr(name.into()),
+                        value,
+                    }
+                }),
+                2 => (0usize..4, 0usize..words.len()).prop_map(move |(f, w)| {
+                    Predicate::HasWord {
+                        field: FieldSel::Attr(["lo", "hi", "zz", "n"][f].into()),
+                        word: words[w].into(),
+                    }
+                }),
+                1 => Just(Predicate::NumRange {
+                    field: FieldSel::Attr("n".into()),
+                    ty: FieldType::I64,
+                    min: Some(1),
+                    max: Some(1),
+                }),
+            ]
+        }
+
+        /// What [`eval`] gives row by row over the whole predicate: the
+        /// matching rows ascending, or an error if any row errors.
+        fn oracle(
+            sd: &StreamDir,
+            fd: &FieldDir,
+            pred: &Predicate,
+            block: &DecodedBlock,
+        ) -> Result<Vec<usize>, LogSegError> {
+            let mut out = Vec::new();
+            for row in 0..block.record_count() {
+                if eval(sd, fd, pred, block, row)? {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        }
+
+        fn kernel(
+            sd: &StreamDir,
+            fd: &FieldDir,
+            pred: &Predicate,
+            loc: &BlockLoc,
+            block: &DecodedBlock,
+        ) -> Result<Vec<usize>, LogSegError> {
+            let mut flat = Vec::new();
+            flatten(pred, &mut flat);
+            let arms = compile_arms(sd, fd, &flat);
+            let mut out = Vec::new();
+            block_survivors(
+                sd,
+                fd,
+                &arms,
+                loc,
+                block,
+                &mut DictArmMemo::default(),
+                &mut ScanStats::default(),
+                &mut out,
+            )?;
+            Ok(out)
+        }
+
+        /// An integer column cell: absent, or a value.
+        fn cell(range: std::ops::Range<i64>) -> impl Strategy<Value = Option<i64>> {
+            proptest::option::weighted(0.9, range)
+        }
+
+        /// A block's honest skip-index bounds over its present cells. A
+        /// negative ref has no `u32` bound, so a block holding one reads as
+        /// bounds no ref satisfies.
+        fn loc_for(ts: &[Option<i64>], refs: &[Option<i64>]) -> BlockLoc {
+            let ts: Vec<i64> = ts.iter().flatten().copied().collect();
+            let present: Vec<i64> = refs.iter().flatten().copied().collect();
+            let (min_stream_ref, max_stream_ref) = match (
+                present.iter().min().map(|&v| u32::try_from(v)),
+                present.iter().max().map(|&v| u32::try_from(v)),
+            ) {
+                (Some(Ok(lo)), Some(Ok(hi))) => (lo, hi),
+                _ => (1, 0),
+            };
+            BlockLoc {
+                record_count: refs.len(),
+                crc32c: 0,
+                block_index: 0,
+                min_ts: ts.iter().min().copied().unwrap_or(0),
+                max_ts: ts.iter().max().copied().unwrap_or(0),
+                min_stream_ref,
+                max_stream_ref,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The block kernels keep exactly the rows the old per-row
+            /// [`eval`] kept, over writer-built objects (dictionary and plain
+            /// string pages, NULL attribute cells, an overflowing attribute in
+            /// `attrs_raw`) and over hand-built blocks with absent and
+            /// out-of-range `ts`/`stream_ref` cells.
+            #[test]
+            fn block_predicate_kernel_matches_row_by_row_eval(
+                rows in proptest::collection::vec(row(), 1..60),
+                block_target_records in 2usize..12,
+                group_target_blocks in 1usize..4,
+                arms in proptest::collection::vec(arm(), 1..=4),
+                cells in (1usize..140).prop_flat_map(|n| (
+                    proptest::collection::vec(cell(0..30), n),
+                    proptest::collection::vec(cell(-1..8), n),
+                    proptest::collection::vec(cell(-1..3), n),
+                )),
+                synthetic_arms in proptest::collection::vec(
+                    prop_oneof![
+                        ts_arm(),
+                        stream_arm(),
+                        (-1i64..3).prop_map(|v| Predicate::Equals {
+                            field: FieldSel::Attr("n".into()),
+                            value: AttrValue::I64(v),
+                        }),
+                    ],
+                    1..=4,
+                ),
+                // Drawn after the parameters above so the committed seeds
+                // still replay the cases they recorded.
+                narrow in any::<bool>(),
+                covering_arms in proptest::collection::vec(
+                    prop_oneof![covering_ts_arm(), covering_stream_arm()],
+                    0..=2,
+                ),
+            ) {
+                let (recs, columns) = corpus(&rows);
+                let cfg = RlogConfig {
+                    block_target_records,
+                    group_target_blocks,
+                    max_dynamic_columns: columns,
+                    ..RlogConfig::default()
+                };
+                let obj = build(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                let pred = Predicate::And(arms);
+
+                // Every block, decoded whole: the kernel sees windows and
+                // stream sets that cover, cut, and miss it, which pruning
+                // would otherwise keep it from seeing.
+                let mut all = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while all.next_block_columnar(&obj).expect("decode").is_some() {
+                    let loc = all.blocks[all.next - 1];
+                    let block = all.current.as_ref().expect("decoded");
+                    let want = oracle(sd, fd, &pred, block).expect("oracle");
+                    let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
+                    prop_assert_eq!(got, want, "block {}", loc.block_index);
+                }
+
+                // The scan itself, pruning included.
+                let mut scan = reader
+                    .scan_blocks(&pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    let want = oracle(sd, fd, &pred, block).expect("oracle");
+                    prop_assert_eq!(&scan.surviving, &want);
+                }
+
+                // Hand-built blocks with absent cells, a negative ref, and
+                // refs past the directory, or (`narrow`) refs only within the
+                // first three streams; covering arms put such a block's bounds
+                // wholly inside a window or stream set while a cell is absent.
+                // Only the outcome is compared on an error: the kernels visit
+                // arm by arm, so which row's error surfaces first may differ.
+                let (ts, mut refs, n) = cells;
+                if narrow {
+                    for r in refs.iter_mut().flatten() {
+                        *r = r.rem_euclid(3);
+                    }
+                }
+                let synthetic_arms: Vec<Predicate> =
+                    synthetic_arms.into_iter().chain(covering_arms).collect();
+                let mut cols = vec![
+                    (COL_TS, I64Column::from_options(&ts)),
+                    (COL_STREAM_REF, I64Column::from_options(&refs)),
+                ];
+                if let Some(e) = fd.column("n", FieldType::I64) {
+                    cols.push((e.column_id, I64Column::from_options(&n)));
+                }
+                let loc = loc_for(&ts, &refs);
+                let block = DecodedBlock::with_i64_columns(refs.len(), cols);
+                let pred = Predicate::And(synthetic_arms);
+                let want = oracle(sd, fd, &pred, &block);
+                let got = kernel(sd, fd, &pred, &loc, &block);
+                match (&got, &want) {
+                    (Ok(g), Ok(w)) => prop_assert_eq!(g, w),
+                    (Err(_), Err(_)) => {}
+                    _ => prop_assert!(false, "kernel {got:?}, row-by-row {want:?}"),
+                }
+            }
+        }
+
+        /// The generator's corpus reaches the page shapes the property claims
+        /// to cover: `lo` stored on dictionary pages, the per-row-unique `hi`
+        /// on plain pages, and `zz` in `attrs_raw`.
+        #[test]
+        fn kernel_corpus_reaches_dict_plain_and_overflow_pages() {
+            let rows: Vec<Row> = (0..24)
+                .map(|i| Row {
+                    stream: (i % 3) as u8,
+                    ts: i,
+                    body: i as usize % BODIES.len(),
+                    lo: Some(i as usize % 2),
+                    hi: true,
+                    n: (i % 4 != 0).then_some(i % 3),
+                    flag: Some(i % 2 == 0),
+                    blob: Some((i % 3) as u8),
+                    f: Some(i as usize % F.len()),
+                    zz: Some(i as usize % ZZ.len()),
+                })
+                .collect();
+            let (recs, columns) = corpus(&rows);
+            let cfg = RlogConfig {
+                block_target_records: 8,
+                max_dynamic_columns: columns,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let fd = &*reader.field_dir;
+            let lo = fd
+                .column("lo", FieldType::Str)
+                .expect("lo column")
+                .column_id;
+            let hi = fd
+                .column("hi", FieldType::Str)
+                .expect("hi column")
+                .column_id;
+            assert!(fd.column("zz", FieldType::Str).is_none(), "zz overflows");
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut blocks = 0;
+            while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                let block = scan.current.as_ref().expect("decoded");
+                assert!(matches!(block.str_column(lo), Some(StrColumn::Dict(_))));
+                assert!(matches!(block.str_column(hi), Some(StrColumn::Plain(_))));
+                assert!(block.str_column(COL_ATTRS_RAW).is_some());
+                blocks += 1;
+            }
+            assert_eq!(blocks, 3);
+        }
+
+        fn eval_calls() -> u64 {
+            EVAL_CALLS.with(std::cell::Cell::get)
+        }
+
+        fn kernel_arms() -> u64 {
+            KERNEL_ARMS.with(std::cell::Cell::get)
+        }
+
+        /// A block the window and the stream set both cover keeps every row
+        /// without evaluating any; an overflow attribute arm on top of them
+        /// costs exactly one [`eval`] per row and no kernel.
+        #[test]
+        fn block_wholly_inside_the_window_makes_no_per_row_eval() {
+            let recs: Vec<LogRecord> = (0..24)
+                .map(|i| {
+                    rec_attrs(
+                        1 + (i % 2) as u8,
+                        100 + i,
+                        "b",
+                        vec![
+                            attr("a", AttrValue::I64(i)),
+                            attr("zz", AttrValue::Str(ZZ[(i % 3) as usize].into())),
+                        ],
+                    )
+                })
+                .collect();
+            let cfg = RlogConfig {
+                block_target_records: 6,
+                max_dynamic_columns: 1,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            assert!(
+                reader.field_dir.column("zz", FieldType::Str).is_none(),
+                "zz overflows into attrs_raw"
+            );
+            let covering = vec![
+                Predicate::TsRange {
+                    min_ns: 100,
+                    max_ns: 123,
+                },
+                Predicate::StreamIn(vec![sid(1), sid(2), sid(9)]),
+            ];
+
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(
+                    &Predicate::And(covering.clone()),
+                    &[],
+                    &ColumnSelection::all(),
+                )
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 24, "every row survives");
+            assert_eq!(stats.blocks_scanned, 4);
+            assert_eq!(eval_calls() - evals, 0, "no per-row eval");
+            assert_eq!(kernel_arms() - kernels, 0, "no block kernel");
+            assert_eq!(
+                stats.blocks_predicate_dropped, 4,
+                "every block drops every arm"
+            );
+            assert_eq!(stats.rows_predicate_evaluated, 0);
+
+            let mut with_overflow = covering;
+            with_overflow.push(Predicate::Equals {
+                field: FieldSel::Attr("zz".into()),
+                value: AttrValue::Str("q".into()),
+            });
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(with_overflow), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 8, "the rows whose zz is \"q\"");
+            assert_eq!(eval_calls() - evals, 24, "one eval per row the bounds kept");
+            assert_eq!(kernel_arms() - kernels, 0, "the ts and stream arms dropped");
+            assert_eq!(stats.blocks_predicate_dropped, 0);
+            assert_eq!(stats.rows_predicate_evaluated, 24);
+
+            // A window cutting the two blocks that hold ts 100..=102 runs the
+            // ts kernel on both, and the overflow arm only on the three rows
+            // it kept.
+            let cut = vec![
+                Predicate::TsRange {
+                    min_ns: 100,
+                    max_ns: 102,
+                },
+                Predicate::Equals {
+                    field: FieldSel::Attr("zz".into()),
+                    value: AttrValue::Str("q".into()),
+                },
+            ];
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(cut), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(
+                rows, 1,
+                "ts 101, the one row in the window whose zz is \"q\""
+            );
+            assert_eq!(stats.blocks_scanned, 2);
+            assert_eq!(kernel_arms() - kernels, 2, "one ts kernel per block");
+            assert_eq!(eval_calls() - evals, 3, "one eval per row the ts arm kept");
+            assert_eq!(stats.blocks_predicate_dropped, 0);
+            assert_eq!(stats.rows_predicate_evaluated, 12);
+        }
+
+        /// An object with streams 0, 1 and 2, for its directories.
+        fn three_stream_reader_object() -> Vec<u8> {
+            let recs = (0..6)
+                .map(|i| rec_attrs((i % 3) as u8, i, "b", Vec::new()))
+                .collect();
+            build(RlogConfig::default(), recs)
+        }
+
+        /// A hand-built block of three rows whose middle row has no cell in
+        /// `absent` (`COL_TS` or `COL_STREAM_REF`), the other column complete.
+        fn block_with_absent_cell(sd: &StreamDir, absent: u32) -> (BlockLoc, DecodedBlock) {
+            let r0 = i64::from(sd.stream_ref(&sid(0)).expect("stream 0"));
+            let r1 = i64::from(sd.stream_ref(&sid(1)).expect("stream 1"));
+            let (ts, refs) = if absent == COL_TS {
+                (
+                    vec![Some(5), None, Some(7)],
+                    vec![Some(r0), Some(r1), Some(r0)],
+                )
+            } else {
+                (
+                    vec![Some(5), Some(6), Some(7)],
+                    vec![Some(r0), None, Some(r1)],
+                )
+            };
+            let loc = loc_for(&ts, &refs);
+            let block = DecodedBlock::with_i64_columns(
+                3,
+                vec![
+                    (COL_TS, I64Column::from_options(&ts)),
+                    (COL_STREAM_REF, I64Column::from_options(&refs)),
+                ],
+            );
+            (loc, block)
+        }
+
+        /// A block whose `ts` bounds lie wholly inside the window still runs
+        /// the `ts` arm when a row has no `ts` cell, and reports it corrupt,
+        /// as the row-by-row evaluation does, rather than keeping every row.
+        #[test]
+        fn absent_ts_cell_in_a_covered_block_is_corrupted() {
+            let obj = three_stream_reader_object();
+            let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open object");
+            let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+            let (loc, block) = block_with_absent_cell(sd, COL_TS);
+            let pred = Predicate::TsRange {
+                min_ns: 0,
+                max_ns: 10,
+            };
+            assert_eq!((loc.min_ts, loc.max_ts), (5, 7), "bounds inside the window");
+            let want = oracle(sd, fd, &pred, &block);
+            let got = kernel(sd, fd, &pred, &loc, &block);
+            assert!(
+                matches!(want, Err(LogSegError::Corrupted(_))),
+                "row-by-row: {want:?}"
+            );
+            assert!(
+                matches!(got, Err(LogSegError::Corrupted(_))),
+                "kernel: {got:?}"
+            );
+        }
+
+        /// A block whose `stream_ref` bounds the stream set covers still runs
+        /// the stream arm when a row has no `stream_ref` cell, and reports it
+        /// corrupt, as the row-by-row evaluation does.
+        #[test]
+        fn absent_stream_ref_cell_in_a_covered_block_is_corrupted() {
+            let obj = three_stream_reader_object();
+            let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open object");
+            let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+            let (loc, block) = block_with_absent_cell(sd, COL_STREAM_REF);
+            let pred = Predicate::StreamIn(vec![sid(0), sid(1)]);
+            let covered: Vec<u32> = [sid(0), sid(1)]
+                .iter()
+                .filter_map(|id| sd.stream_ref(id))
+                .collect();
+            assert!(
+                (loc.min_stream_ref..=loc.max_stream_ref).all(|r| covered.contains(&r)),
+                "bounds {}..={} inside the set {covered:?}",
+                loc.min_stream_ref,
+                loc.max_stream_ref
+            );
+            let want = oracle(sd, fd, &pred, &block);
+            let got = kernel(sd, fd, &pred, &loc, &block);
+            assert!(
+                matches!(want, Err(LogSegError::Corrupted(_))),
+                "row-by-row: {want:?}"
+            );
+            assert!(
+                matches!(got, Err(LogSegError::Corrupted(_))),
+                "kernel: {got:?}"
+            );
+        }
+
+        fn dict_entry_visits() -> u64 {
+            DICT_ENTRY_VISITS.with(std::cell::Cell::get)
+        }
+
+        fn dict_word_memos() -> u64 {
+            DICT_WORD_MEMOS.with(std::cell::Cell::get)
+        }
+
+        /// The blocks of a row group share its dictionary, and a scan does a
+        /// dictionary arm's per-entry work once per dictionary: an `Equals`
+        /// compares each entry with its target once, and a `HasWord`
+        /// allocates one memo, however many blocks read the dictionary.
+        #[test]
+        fn dictionary_arm_work_is_done_once_per_dictionary() {
+            let recs: Vec<LogRecord> = (0..24)
+                .map(|i| {
+                    rec_attrs(
+                        0,
+                        i,
+                        "b",
+                        vec![attr("lo", AttrValue::Str(LO[(i % 3) as usize].into()))],
+                    )
+                })
+                .collect();
+            let cfg = RlogConfig {
+                block_target_records: 6,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let lo = reader
+                .field_dir
+                .column("lo", FieldType::Str)
+                .expect("lo column")
+                .column_id;
+
+            let mut dicts: Vec<Arc<DictValues>> = Vec::new();
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("scan");
+            while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                let block = scan.current.as_ref().expect("decoded");
+                let Some(StrColumn::Dict(d)) = block.str_column(lo) else {
+                    panic!("lo is on dictionary pages");
+                };
+                dicts.push(d.values().clone());
+            }
+            assert_eq!(dicts.len(), 4, "four blocks");
+            assert!(
+                dicts.iter().all(|d| Arc::ptr_eq(d, &dicts[0])),
+                "one row group dictionary shared by every block"
+            );
+            let entries = dicts[0].len() as u64;
+            assert_eq!(entries, 3);
+            drop(dicts);
+
+            let run = |pred: Predicate| {
+                let mut scan = reader
+                    .scan_blocks(&pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                let mut rows = 0;
+                while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                    rows += view.surviving_count();
+                }
+                assert_eq!(scan.stats().blocks_scanned, 4);
+                assert_eq!(scan.stats().rows_predicate_evaluated, 24);
+                rows
+            };
+
+            let visits = dict_entry_visits();
+            let rows = run(Predicate::Equals {
+                field: FieldSel::Attr("lo".into()),
+                value: AttrValue::Str("x".into()),
+            });
+            assert_eq!(rows, 8, "the rows whose lo is \"x\"");
+            assert_eq!(
+                dict_entry_visits() - visits,
+                entries,
+                "each entry compared once for the scan's four blocks"
+            );
+
+            let memos = dict_word_memos();
+            let rows = run(Predicate::HasWord {
+                field: FieldSel::Attr("lo".into()),
+                word: "x".into(),
+            });
+            assert_eq!(rows, 16, "the rows whose lo is \"x\" or \"x y\"");
+            assert_eq!(dict_word_memos() - memos, 1, "one memo for the dictionary");
+        }
     }
 }

@@ -2065,6 +2065,8 @@ impl LogSegmentFetcher {
                     decompressed_bytes: 0,
                     bloom_degraded: false,
                     postings_degraded: false,
+                    blocks_predicate_dropped: 0,
+                    rows_predicate_evaluated: 0,
                 };
                 // Footer-carrying branch: only the probe and the four
                 // directories were read, no BLOCKS byte, so the touch is the
@@ -2341,6 +2343,8 @@ impl LogSegmentFetcher {
             decompressed_bytes: 0,
             bloom_degraded: false,
             postings_degraded: false,
+            blocks_predicate_dropped: 0,
+            rows_predicate_evaluated: 0,
         };
         // Every block survives (the fast path's containment check proved it),
         // so the raw whole-object block index equals the ordinal position.

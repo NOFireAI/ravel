@@ -1489,6 +1489,14 @@ struct BlockMetrics {
     /// per integer column decoded from its own value page per block
     /// ([`ScanStats::int_values_buffers`], ADR-2773 decision 1).
     int_values_buffers: Count,
+    /// Blocks this partition decoded whose rows were all kept without
+    /// evaluating the pushed exact predicate, every arm proven by the block's
+    /// skip-index bounds ([`ScanStats::blocks_predicate_dropped`], ADR-2773
+    /// decision D2).
+    blocks_predicate_dropped: Count,
+    /// Rows of this partition's decoded blocks the pushed exact predicate was
+    /// evaluated over ([`ScanStats::rows_predicate_evaluated`]).
+    rows_predicate_evaluated: Count,
     /// String dictionary values arrays this partition's declared `Str` columns
     /// built: one per row group dictionary per scan opening, one per per-block
     /// dictionary page, one per plain-page block, and one per extended copy
@@ -1637,6 +1645,10 @@ impl BlockMetrics {
             pages_skipped: MetricBuilder::new(metrics).counter("pages_skipped", partition),
             int_values_buffers: MetricBuilder::new(metrics)
                 .counter("int_values_buffers", partition),
+            blocks_predicate_dropped: MetricBuilder::new(metrics)
+                .counter("blocks_predicate_dropped", partition),
+            rows_predicate_evaluated: MetricBuilder::new(metrics)
+                .counter("rows_predicate_evaluated", partition),
             str_dict_values_built: MetricBuilder::new(metrics)
                 .counter("str_dict_values_built", partition),
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
@@ -1724,6 +1736,10 @@ impl BlockMetrics {
         self.pages_skipped.add(stats.pages_skipped as usize);
         self.int_values_buffers
             .add(stats.int_values_buffers as usize);
+        self.blocks_predicate_dropped
+            .add(stats.blocks_predicate_dropped as usize);
+        self.rows_predicate_evaluated
+            .add(stats.rows_predicate_evaluated as usize);
     }
 }
 

@@ -265,10 +265,13 @@ The exact content predicate the SQL scan pushes into `scan_blocks`
   stream-ref columns, `Equals` over the field's column, `HasWord` over the
   field's cells), producing one selection bitmap per block instead of one
   `Result<bool>` per row through `i64_at` and an `Option` chain.
-- The predicate language and its semantics do not change: an absent cell
-  does not match, exactly as `i64_at` and `field_text` treat it today, and
-  the resource/scope fallback stays untouched because the block predicate
-  never consulted it. `NumRange` stays prune-only (ADR-0095 decision 6).
+- The predicate language and its semantics do not change: this section
+  first said an absent cell "does not match, exactly as `i64_at` and
+  `field_text` treat it today" (see the absent-cell correction below:
+  right for attribute, body and severity-text columns, wrong for `ts`
+  and `stream_ref`). The resource/scope fallback stays untouched because
+  the block predicate never consulted it. `NumRange` stays prune-only
+  (ADR-0095 decision 6).
 - An arm on an attribute that has no FIELD_DIR column of the resolved
   type reads the row's `attrs_raw` cell today (`field_text` and `equals`
   fall through to `overflow_attr`, which decodes the cell and scans it for
@@ -550,3 +553,27 @@ on the ClickBench statements the bands are over: every ClickBench column
 is declared and no block carries an `attrs_raw` page, so the row path is
 never taken there. The owner took this decision on 2026-10-11 to close
 #2773 on the decisions that move its measured figures.
+
+## Correction (2026-10-11): what an absent cell does under a block predicate
+
+<!-- amendment-applies: sections="D2. A pushed-down block predicate is evaluated as a vector kernel" pointer="the absent-cell correction below" -->
+<!-- amendment-supersedes: phrase="does not match, exactly as `i64_at` and `field_text` treat it today" pointer="the absent-cell correction below" -->
+
+D2 as accepted said an absent cell "does not match, exactly as `i64_at`
+and `field_text` treat it today". Main's two paths differ, and the
+per-block evaluation (#2788) follows each one. For `ts` and
+`stream_ref`, `i64_at` reports an absent cell, a NULL in a present column
+or a missing column alike, as `Corrupted` on any row an arm reaches; the
+kernel does the same, and an arm the skip index drops never reaches a
+row, so a block the window wholly contains is not read for this at all.
+For attribute, body and severity-text columns, an absent cell or a
+missing column does not match, as `get_attr_value`, `str_at` and
+`field_text` treat it, and the kernel does the same. The property test
+in `crates/ravel-logseg/src/reader.rs` compares the kernel's survivors
+with the unchanged row-by-row `eval` over both kinds of column. Found by
+the #2788 executor's claims audit and confirmed by the checkpoint review.
+One further difference, on corrupt input only: the per-block evaluation
+runs overflow-attribute arms after the column arms, where `eval` ran the
+`And` in written order, so on a block with an absent `ts` or `stream_ref`
+cell or an undecodable `attrs_raw` cell, which error or exclusion a row
+gets can differ from main's; no well-formed object changes result.

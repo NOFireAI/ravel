@@ -1388,6 +1388,40 @@ impl DecodedBlock {
             .map(|v| BytesColRef::Fixed(v.as_slice()))
     }
 
+    /// String column `column_id` in the shape its page carried, resolved once
+    /// for a kernel that walks the whole block. `None` when the column is
+    /// absent or projected away.
+    pub(crate) fn str_column(&self, column_id: u32) -> Option<&StrColumn> {
+        self.bump_lookup();
+        self.str_cols.get(column_id)
+    }
+
+    /// A block holding only the given integer columns, for tests that need
+    /// cells no writer produces (an absent `ts` or `stream_ref`).
+    #[cfg(test)]
+    pub(crate) fn with_i64_columns(record_count: usize, cols: Vec<(u32, I64Column)>) -> Self {
+        let mut i64_cols = ColMap::new();
+        for (id, col) in cols {
+            i64_cols.insert(id, col);
+        }
+        DecodedBlock {
+            record_count,
+            i64_cols,
+            f64_cols: ColMap::new(),
+            bool_cols: ColMap::new(),
+            str_cols: ColMap::new(),
+            fixed_cols: ColMap::new(),
+            col_lookups: Cell::new(0),
+            attrs_raw_page: false,
+            pages_decoded: 0,
+            pages_skipped: 0,
+            page_bytes_fetched: 0,
+            page_bytes_decoded: 0,
+            decompressed_bytes: 0,
+            int_values_buffers: 0,
+        }
+    }
+
     /// The dictionary form of string column `column_id`: its shared dictionary
     /// and one key per block row. `None` when the column is absent, projected
     /// away, or stored in plain form -- a plain page is read through
