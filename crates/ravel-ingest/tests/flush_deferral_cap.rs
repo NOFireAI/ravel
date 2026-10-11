@@ -806,6 +806,14 @@ macro_rules! strict_arrival_at_cap_test {
             let router = Arc::new($new_router(config, store, clock.clone()));
             let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
             let buffered = || router.metrics().snapshot().$buffered;
+            let queued = || -> u64 {
+                router
+                    .metrics()
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flushes_queued)
+                    .sum()
+            };
             let deferred_triggers = || -> u64 {
                 router
                     .metrics()
@@ -858,6 +866,10 @@ macro_rules! strict_arrival_at_cap_test {
                 .await
                 .expect("parked write task")
                 .expect("parked write acks once the gate is released");
+            // The ack lands before the parked flush is reaped, and the gauge is
+            // written after the reap's arrival scan, so it reading zero means
+            // the scan has run.
+            until(|| queued() == 0).await;
             assert_eq!(
                 router.metrics().snapshot().flushes_by_arrival,
                 0,

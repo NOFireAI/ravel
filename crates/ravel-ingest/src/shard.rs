@@ -236,7 +236,9 @@ struct TenantBuf {
     mismatch_held_since_ns: Option<i64>,
     /// Set when a strict-arrival write merged while this tenant already had a
     /// flush in flight, so the reap that brings it to zero opens this buffer's
-    /// flush (ADR-2793 decision 2).
+    /// flush (ADR-2793 decision 2). Cleared whenever the buffer leaves the map
+    /// for a flush ([`ShardActor::take_for_flush`]), so a buffer the flush puts
+    /// back never carries it.
     arrival_pending: bool,
 }
 
@@ -1435,7 +1437,7 @@ impl ShardActor {
             })
             .unwrap_or(false);
         if should_flush {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                     .await;
             }
@@ -1444,13 +1446,23 @@ impl ShardActor {
         }
     }
 
+    /// Removes `tenant`'s buffer to hand it to [`Self::flush_tenant`], clearing
+    /// `arrival_pending`: a buffer `flush_tenant` puts back waits for its next
+    /// trigger like any other, rather than being reopened by the reap as an
+    /// arrival flush.
+    fn take_for_flush(&mut self, tenant: &TenantId) -> Option<TenantBuf> {
+        let mut buf = self.tenants.remove(tenant)?;
+        buf.arrival_pending = false;
+        Some(buf)
+    }
+
     /// Opens `tenant`'s flush for a strict-arrival write when the tenant has
     /// none in flight, or marks the buffer for the reap that brings it to zero.
     /// Opening only at zero in flight keeps the queued-flush cap and the
     /// tenant share from ever refusing it (ADR-2793 decision 2).
     async fn open_arrival_flush(&mut self, tenant: TenantId) {
         if self.shares.in_flight(tenant.hash()) == 0 {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
                     .await;
             }
@@ -1486,7 +1498,7 @@ impl ShardActor {
         }
         due.sort_unstable_by_key(|(since, oldest, _)| (*since, *oldest));
         for (_, _, tenant) in due {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
                     .await;
             }
@@ -1519,7 +1531,7 @@ impl ShardActor {
                 self.backstop_ceiling.get(),
             )
         });
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+        if should_flush && let Some(buf) = self.take_for_flush(&tenant) {
             self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                 .await;
         }
@@ -1777,7 +1789,7 @@ impl ShardActor {
             .collect();
         due.sort_unstable_by_key(|(since, oldest, ..)| (*since, *oldest));
         for (_, _, tenant, trigger) in due {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                     .await;
             }
@@ -1901,7 +1913,7 @@ impl ShardActor {
                 .map(|(tenant, _)| tenant.clone())
                 .collect();
             for tenant in held {
-                if let Some(buf) = self.tenants.remove(&tenant) {
+                if let Some(buf) = self.take_for_flush(&tenant) {
                     self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                         .await;
                 }
@@ -1965,7 +1977,7 @@ impl ShardActor {
     async fn flush_all_pass(&mut self, trigger: FlushTrigger, lag_check: LagCheck) {
         let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
         for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, lag_check).await;
             }
         }

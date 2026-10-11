@@ -917,7 +917,7 @@ impl SpanShardActor {
             })
             .unwrap_or(false);
         if should_flush {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                     .await;
             }
@@ -945,7 +945,7 @@ impl SpanShardActor {
             &self.config,
             self.backstop_ceiling.get(),
         );
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+        if should_flush && let Some(buf) = self.take_for_flush(&tenant) {
             self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                 .await;
         }
@@ -1154,7 +1154,7 @@ impl SpanShardActor {
             .collect();
         due.sort_unstable_by_key(|(since, oldest, ..)| (*since, *oldest));
         for (_, _, tenant, trigger) in due {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                     .await;
             }
@@ -1162,10 +1162,17 @@ impl SpanShardActor {
         self.refresh_oldest_deferral();
     }
 
+    /// The span counterpart of `crate::shard::ShardActor::take_for_flush`.
+    fn take_for_flush(&mut self, tenant: &TenantId) -> Option<SpanTenantBuf> {
+        let mut buf = self.tenants.remove(tenant)?;
+        buf.arrival_pending = false;
+        Some(buf)
+    }
+
     /// The span counterpart of `crate::shard::ShardActor::open_arrival_flush`.
     async fn open_arrival_flush(&mut self, tenant: TenantId) {
         if self.shares.in_flight(tenant.hash()) == 0 {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
                     .await;
             }
@@ -1201,7 +1208,7 @@ impl SpanShardActor {
         }
         due.sort_unstable_by_key(|(since, oldest, _)| (*since, *oldest));
         for (_, _, tenant) in due {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, FlushTrigger::Arrival, LagCheck::Enforced)
                     .await;
             }
@@ -1310,7 +1317,7 @@ impl SpanShardActor {
                 .map(|(tenant, _)| tenant.clone())
                 .collect();
             for tenant in held {
-                if let Some(buf) = self.tenants.remove(&tenant) {
+                if let Some(buf) = self.take_for_flush(&tenant) {
                     self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                         .await;
                 }
@@ -1374,7 +1381,7 @@ impl SpanShardActor {
     async fn flush_all_pass(&mut self, trigger: FlushTrigger, lag_check: LagCheck) {
         let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
         for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
+            if let Some(buf) = self.take_for_flush(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, lag_check).await;
             }
         }

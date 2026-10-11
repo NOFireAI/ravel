@@ -117,7 +117,7 @@ async fn releasing_within_yields(gate: &GateHandle, mut probe: impl FnMut() -> b
     probe()
 }
 
-/// The four tests, generated once per pipeline: `$new` builds the router,
+/// The five tests, generated once per pipeline: `$new` builds the router,
 /// `$spawn` is a single-item writer taking a write mode, and `$buffered` the
 /// cumulative buffered-item counter on its metrics snapshot.
 macro_rules! strict_arrival_tests {
@@ -126,6 +126,7 @@ macro_rules! strict_arrival_tests {
         $coalesces:ident,
         $age_floor:ident,
         $never_refused:ident,
+        $deferred_by_age:ident,
         $new:ident,
         $spawn:ident,
         $buffered:ident
@@ -239,6 +240,14 @@ macro_rules! strict_arrival_tests {
             let router = Arc::new($new(config(), Arc::clone(&store), clock.clone()));
             let acme = tenant("acme");
             let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+            let queued = || -> u64 {
+                router
+                    .metrics()
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flushes_queued)
+                    .sum()
+            };
 
             let first = $spawn(&router, &acme, 0, WriteMode::StrictArrival);
             gate.wait_until_held(1).await;
@@ -264,6 +273,9 @@ macro_rules! strict_arrival_tests {
 
             assert!(releasing_within_yields(&gate, || first.is_finished()).await);
             first.await.expect("write task").expect("first write acks");
+            // The ack lands before the first flush is reaped; the queued-flushes
+            // gauge is written after the reap's arrival scan.
+            assert!(within_yields(|| queued() == 0).await);
             assert_eq!(
                 router.metrics().snapshot().flushes_by_arrival,
                 1,
@@ -300,7 +312,7 @@ macro_rules! strict_arrival_tests {
                     .map(|(_, s)| s.flush_trigger_deferred)
                     .sum()
             };
-            let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+            let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
             let acme = tenant("acme");
             let globex = tenant("globex");
 
@@ -326,6 +338,24 @@ macro_rules! strict_arrival_tests {
             assert_eq!(snapshot.flushes_by_arrival, 2);
             assert_eq!(deferred_triggers(), 0);
 
+            // Release A alone and hold B1's data PUT until A is reaped, so the
+            // reap scan always runs with globex's flush still in flight: a scan
+            // that opened globex's pending buffer then would be refused at the
+            // share and deferred.
+            let a_put = gate.held();
+            assert_eq!(a_put.len(), 1);
+            assert!(gate.release(a_put[0]));
+            assert!(
+                within_yields(|| gate.held_count() == 1).await,
+                "B1's PUT is held"
+            );
+            assert!(
+                within_yields(|| a.is_finished() && queued() == 1).await,
+                "A is reaped while B1 is held"
+            );
+            assert_eq!(deferred_triggers(), 0);
+            assert_eq!(router.metrics().snapshot().flushes_by_arrival, 2);
+
             assert!(
                 releasing_within_yields(&gate, || {
                     a.is_finished() && b1.is_finished() && b2.is_finished()
@@ -340,6 +370,77 @@ macro_rules! strict_arrival_tests {
             assert_eq!(deferred_triggers(), 0);
             assert_eq!(clock.now(), BASE_NS);
         }
+
+        /// An arrival-pending buffer whose age flush the queued-flush cap
+        /// deferred loses its pending mark when it is put back: the reap after
+        /// the in-flight flush opens nothing, and the next age tick flushes it
+        /// as an age flush.
+        #[tokio::test]
+        async fn $deferred_by_age() {
+            let (fault_store, store) = fault_store();
+            let clock = TestClock::new(BASE_NS);
+            let config = IngestConfig {
+                max_queued_flushes: 1,
+                ..config()
+            };
+            let router = Arc::new($new(config, Arc::clone(&store), clock.clone()));
+            let queued = || -> u64 {
+                router
+                    .metrics()
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flushes_queued)
+                    .sum()
+            };
+            let deferred_triggers = || -> u64 {
+                router
+                    .metrics()
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum()
+            };
+            let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
+            let acme = tenant("acme");
+
+            let first = $spawn(&router, &acme, 0, WriteMode::StrictArrival);
+            gate.wait_until_held(1).await;
+            let pending = $spawn(&router, &acme, 1, WriteMode::StrictArrival);
+            assert!(within_yields(|| router.metrics().snapshot().$buffered >= 2).await);
+            let snapshot = router.metrics().snapshot();
+            assert_eq!(snapshot.arrival_coalesced, 1);
+            assert_eq!(snapshot.flushes_by_arrival, 1);
+
+            clock.advance_ns(PAST_DELAY_NS);
+            assert!(
+                within_yields(|| deferred_triggers() == 1).await,
+                "the age tick's flush is deferred at the full queue"
+            );
+            assert!(!pending.is_finished());
+            assert_eq!(router.metrics().snapshot().flushes_by_age, 0);
+
+            assert!(
+                releasing_within_yields(&gate, || first.is_finished() && queued() == 0).await,
+                "the first flush is reaped"
+            );
+            first.await.expect("write task").expect("first write acks");
+
+            clock.advance_ns(PAST_DELAY_NS);
+            assert!(
+                releasing_within_yields(&gate, || pending.is_finished()).await,
+                "the next age tick flushes the deferred buffer"
+            );
+            let receipt = pending
+                .await
+                .expect("write task")
+                .expect("deferred write acks on age");
+            assert_eq!(receipt.tokens.len(), 1);
+            let snapshot = router.metrics().snapshot();
+            assert_eq!(snapshot.flushes_by_age, 1);
+            assert_eq!(snapshot.flushes_by_arrival, 1);
+            assert_eq!(snapshot.arrival_coalesced, 1);
+            assert_eq!(deferred_triggers(), 1);
+        }
     };
 }
 
@@ -348,6 +449,7 @@ strict_arrival_tests!(
     strict_arrival_coalesces_behind_an_in_flight_flush,
     arrival_pending_buffer_keeps_the_age_floor,
     strict_arrival_at_the_share_or_cap_is_never_refused,
+    deferred_pending_buffer_flushes_by_age_not_arrival,
     new_metrics_router,
     spawn_metric_write,
     buffered_points_total
@@ -361,6 +463,7 @@ mod logs {
         strict_arrival_coalesces_behind_an_in_flight_flush,
         arrival_pending_buffer_keeps_the_age_floor,
         strict_arrival_at_the_share_or_cap_is_never_refused,
+        deferred_pending_buffer_flushes_by_age_not_arrival,
         new_log_router,
         spawn_log_write,
         buffered_records_total
@@ -375,6 +478,7 @@ mod spans {
         strict_arrival_coalesces_behind_an_in_flight_flush,
         arrival_pending_buffer_keeps_the_age_floor,
         strict_arrival_at_the_share_or_cap_is_never_refused,
+        deferred_pending_buffer_flushes_by_age_not_arrival,
         new_span_router,
         spawn_span_write,
         buffered_spans_total
