@@ -360,7 +360,10 @@ fn expected_top_k() -> Vec<(i64, i64)> {
 /// the two group keys and the accumulating ordering aggregate are both visible
 /// in the chain below, and both are conjuncts the gate refuses. This test is
 /// the record of the shape, so a DataFusion upgrade that reshapes it fails here
-/// rather than silently moving the rule's target.
+/// rather than silently moving the rule's target. The `CompactSlicesExec`
+/// between the projection and the final aggregate is the session's
+/// always-on `CompactSlices` rule (issue #2720), which decorates every
+/// aggregate feeding a sort and runs after this rule.
 #[tokio::test]
 async fn q33_shape_plans_to_a_sort_over_a_two_stage_aggregate() {
     let executor = executor(SMALL_KEYS, None).await;
@@ -385,6 +388,7 @@ async fn q33_shape_plans_to_a_sort_over_a_two_stage_aggregate() {
             "SortExec",
             "CoalescePartitionsExec",
             "ProjectionExec",
+            "CompactSlicesExec",
             "AggregateExec",
             "RepartitionExec",
             "AggregateExec",
