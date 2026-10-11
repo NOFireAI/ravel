@@ -245,6 +245,9 @@ proptest = { workspace = true }
 # Corpus-loader tests write malformed and well-formed corpus files to a temp
 # directory that cleans itself up; workspace pin, no new external crate.
 tempfile = { workspace = true }
+# The `logs_scan_gate_runs` bench builds a read gate with the reference box's
+# default permits. Workspace pin, already an optional dependency above.
+ravel-cpu-gate = { workspace = true }
 
 [lib]
 # Only the criterion `[[bench]]` targets below understand `cargo bench`'s
@@ -578,6 +581,15 @@ harness = false
 [[bench]]
 name = "series_id_hash"
 harness = false
+
+# Issue #2795: the read CPU gate's per-job cost on the SQL logs scan's columnar
+# path, one job per block against one job per run of blocks. Not in the
+# ADR-0070 tier B set (scripts/bench-tier-b.sh): it runs whole SQL statements
+# through the executor, so it needs the `sql-latency` feature.
+[[bench]]
+name = "logs_scan_gate_runs"
+harness = false
+required-features = ["sql-latency"]
 
 [[bin]]
 name = "page_codec_bakeoff"

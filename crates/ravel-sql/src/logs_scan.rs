@@ -289,11 +289,12 @@
 //!
 //! A block decode at or above the read gate's inline floor runs on the read
 //! CPU gate rather than on a tokio worker (ADR-1702 decision 1): with a gate on
-//! the fetcher, each block is one `log_block` job, the columnar decode and its
-//! Arrow build together, the row path's through
-//! [`LogSegmentScan::next_block_on_gate`], and the stream returns `Pending`
+//! the fetcher, a run of consecutive blocks of one part, bounded by the
+//! fetcher's [`BlockRun`], is one `log_block` job, on the columnar path each
+//! block's decode and Arrow build together, and the stream returns `Pending`
 //! from [`LogScanState::DecodingColumnar`] or [`LogScanState::DecodingRows`]
-//! while it runs. With no gate the decode runs inline.
+//! while it runs. The stream hands on the run's batches before it submits the
+//! next job. With no gate the decode runs inline, one block at a time.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -356,7 +357,7 @@ use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
-    CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
+    BlockRun, CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
     LogSegmentScan, PhaseAccounting,
 };
 use ravel_types::TenantHash;
@@ -3148,6 +3149,7 @@ impl ExecutionPlan for LogsScanExec {
             segments: Arc::clone(&self.segments),
             work,
             resident: reservation.new_empty(),
+            run_charge: reservation.new_empty(),
             reservation,
             held: 0,
             emitted: 0,
@@ -3164,7 +3166,7 @@ impl ExecutionPlan for LogsScanExec {
             current_whole_object: None,
             current_dirs: None,
             state,
-            decoded: None,
+            decoded: VecDeque::new(),
             fetch: self.fetch,
             rows_emitted: 0,
         }))
@@ -4245,20 +4247,19 @@ enum LogScanState {
         scan: Box<LogSegmentScan>,
         skip: usize,
     },
-    /// One columnar block's decode and Arrow build, running as a read-gate
-    /// job that owns the scan (ADR-1702 decision 7). Resolved, the scan goes
-    /// back to [`LogScanState::Columnar`] with the block's outcome in
-    /// [`LogScanStream::decoded`].
+    /// A run of columnar blocks' decodes and Arrow builds, running as one
+    /// read-gate job that owns the scan (ADR-1702 decision 7). Resolved, the
+    /// scan goes back to [`LogScanState::Columnar`] with one outcome per block
+    /// in [`LogScanStream::decoded`].
     DecodingColumnar {
         job: ColumnarJobFuture,
         /// When the job was submitted, so `decode_build_elapsed` includes the
         /// wait for a gate permit.
         started: Instant,
     },
-    /// One row-path block decoding on the read gate through
-    /// [`LogSegmentScan::next_block_on_gate`]. Resolved, the scan goes back
-    /// to the state `resume` names with the block in
-    /// [`LogScanStream::decoded`].
+    /// A run of row-path blocks decoding as one read-gate job that owns the
+    /// scan. Resolved, the scan goes back to the state `resume` names with
+    /// the blocks in [`LogScanStream::decoded`].
     DecodingRows {
         job: RowJobFuture,
         resume: RowResume,
@@ -4267,28 +4268,23 @@ enum LogScanState {
     Done,
 }
 
-type ColumnarJobFuture = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    (Box<LogSegmentScan>, MemoryReservation, ColumnarStep),
-                    CpuGateError,
-                >,
-            > + Send,
-    >,
->;
+/// What a columnar run job hands back: the scan, the charge for the decoded
+/// block its reader still holds, the charge for the run's built batches, and
+/// one step per block it decoded, in scan order.
+type ColumnarRun = (
+    Box<LogSegmentScan>,
+    MemoryReservation,
+    MemoryReservation,
+    VecDeque<ColumnarStep>,
+);
 
-type RowJobFuture = Pin<
-    Box<
-        dyn Future<
-                Output = (
-                    Box<LogSegmentScan>,
-                    Option<usize>,
-                    Result<Option<Vec<LogRecord>>, LogFetchError>,
-                ),
-            > + Send,
-    >,
->;
+type ColumnarJobFuture = Pin<Box<dyn Future<Output = Result<ColumnarRun, CpuGateError>> + Send>>;
+
+/// What a row-path run job hands back: the scan, the charge for the run's
+/// decoded records, and one entry per block it decoded, in scan order.
+type RowRun = (Box<LogSegmentScan>, MemoryReservation, VecDeque<Decoded>);
+
+type RowJobFuture = Pin<Box<dyn Future<Output = Result<RowRun, CpuGateError>> + Send>>;
 
 /// The row-path state a [`LogScanState::DecodingRows`] job returns its scan
 /// to.
@@ -4304,14 +4300,18 @@ enum Decoded {
     Rows {
         /// The block's whole-object index, read before the decode.
         block: Option<usize>,
-        next: Result<Option<Vec<LogRecord>>, LogFetchError>,
+        next: DFResult<Option<Vec<LogRecord>>>,
+        /// The bytes of [`LogScanStream::run_charge`] covering `next`'s
+        /// records until the stream takes them.
+        charged: usize,
     },
 }
 
 /// What [`LogScanStream::next_row_block`] did.
 enum RowNext {
-    /// The block's whole-object index, read before the decode, and the block.
-    Ready(Option<usize>, Result<Option<Vec<LogRecord>>, LogFetchError>),
+    /// The block's whole-object index, read before the decode, the block, and
+    /// the bytes of [`LogScanStream::run_charge`] covering its records.
+    Ready(Option<usize>, DFResult<Option<Vec<LogRecord>>>, usize),
     /// The decode went to the read gate; the state is now
     /// [`LogScanState::DecodingRows`].
     Submitted,
@@ -4327,42 +4327,167 @@ enum ColumnarStep {
     /// the row path.
     Fallback,
     /// A clean block's built batches (possibly empty for a block with no
-    /// surviving row). The decoded block itself, which stays resident behind
-    /// the reader while those batches drain, is charged by
-    /// [`ColumnarBlockJob::run`].
+    /// surviving row), with the bytes of the run charge covering them. The
+    /// decoded block itself, which stays resident behind the reader while
+    /// those batches drain, is charged by [`ColumnarBlockJob::block`].
     Held {
         batches: Vec<RecordBatch>,
+        charged: usize,
     },
     /// A decode or build error, carried out of the view's borrow.
     Failed(DataFusionError),
 }
 
-/// Everything one columnar block's decode and build read besides the scan,
-/// owned so the two can run together as one read-gate job.
+/// Everything a columnar run's decode and build read besides the scan, owned
+/// so they can run together as one read-gate job.
 struct ColumnarBlockJob {
     schema: SchemaRef,
     projection: Arc<Vec<usize>>,
     declared: Arc<Vec<DeclaredColumn>>,
     attr_keys: Arc<Vec<String>>,
     full_len: usize,
-    /// The segment field of the block's row refs.
+    /// The segment field of the blocks' row refs.
     segment: usize,
-    /// The block's surviving-block position for its row refs, from
-    /// [`block_index`]; consulted only when a block is decoded.
-    block: DFResult<Option<usize>>,
-    /// Panic inside the gate job instead of running it.
+    /// Whether the blocks' row refs are built, and what [`block_index`]
+    /// resolves them from: the segment's surviving blocks, the drain position
+    /// of the run's first block, and the object key.
+    row_refs: bool,
+    survivors: Option<Arc<Vec<usize>>>,
+    cursor: usize,
+    key: String,
+    /// Blocks this job decodes at most, and the cap on the batches it holds.
+    run: BlockRun,
+    /// Set when the stream stops waiting for the job; read before each block.
+    stop: Arc<AtomicBool>,
+    /// The run position whose block decode panics instead of running.
     #[cfg(test)]
-    panic_for_test: bool,
+    panic_at: Option<usize>,
+    /// Observes the run's blocks and can hold it after its first.
+    #[cfg(test)]
+    hook: Option<Arc<RunHook>>,
+}
+
+/// A test's view into one columnar run job: how many blocks it decoded, a
+/// signal once its first block is done, after which the job waits for
+/// `release`, and the block count once it returns.
+#[cfg(test)]
+struct RunHook {
+    decoded: std::sync::atomic::AtomicUsize,
+    paused: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    finished: std::sync::Mutex<std::sync::mpsc::Sender<usize>>,
+}
+
+#[cfg(test)]
+impl RunHook {
+    fn after_block(&self, position: usize) {
+        self.decoded.fetch_add(1, Ordering::AcqRel);
+        if position == 0 {
+            let _ = self.paused.lock().map(|tx| tx.send(()));
+            let _ = self.release.lock().map(|rx| rx.recv());
+        }
+    }
+
+    fn finish(&self) {
+        let decoded = self.decoded.load(Ordering::Acquire);
+        let _ = self.finished.lock().map(|tx| tx.send(decoded));
+    }
+}
+
+/// Object keys whose next columnar run job reports to a [`RunHook`].
+#[cfg(test)]
+static RUN_HOOKS: std::sync::Mutex<Vec<(String, Arc<RunHook>)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn take_run_hook(key: &str) -> Option<Arc<RunHook>> {
+    let mut hooks = RUN_HOOKS.lock().ok()?;
+    let i = hooks.iter().position(|(k, _)| k == key)?;
+    Some(hooks.swap_remove(i).1)
 }
 
 impl ColumnarBlockJob {
-    /// Decodes `scan`'s next block and builds its batches.
+    /// Decodes and builds up to [`Self::run`]'s blocks of `scan`, stopping
+    /// after the first block that is not a clean one, once the scan has no
+    /// block left, or once [`Self::stop`] is set. `resident` is resized as in
+    /// [`Self::block`], and each clean block's batches are charged to `charge`
+    /// before the next block is decoded.
+    fn run(
+        &self,
+        scan: &mut LogSegmentScan,
+        resident: &MemoryReservation,
+        charge: &MemoryReservation,
+    ) -> VecDeque<ColumnarStep> {
+        let mut steps = VecDeque::new();
+        let mut held = 0u64;
+        while self.run.takes_another(steps.len(), held)
+            && scan.remaining_blocks() > 0
+            && !self.stop.load(Ordering::Acquire)
+        {
+            let position = steps.len();
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                assert!(
+                    self.panic_at != Some(position),
+                    "injected columnar block job panic"
+                );
+                self.block(scan, resident, charge, position)
+            }))
+            .unwrap_or_else(|_| {
+                ColumnarStep::Failed(log_block_gate_failed(&self.key, CpuGateError::Panicked))
+            });
+            let clean = match &step {
+                ColumnarStep::Held { charged, .. } => {
+                    held = held.saturating_add(*charged as u64);
+                    true
+                }
+                _ => false,
+            };
+            steps.push_back(step);
+            #[cfg(test)]
+            if let Some(hook) = &self.hook {
+                hook.after_block(position);
+            }
+            if !clean {
+                break;
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook.finish();
+        }
+        steps
+    }
+
+    /// Decodes `scan`'s next block and builds its batches, charging them to
+    /// `charge`. `position` is the block's place in the run, which with
+    /// [`Self::cursor`] is its drain position.
     ///
     /// `resident` is the charge for the block the reader held before this
     /// call. The decode frees that block, so the charge is resized to the
     /// block it decoded as soon as the decode returns, and freed when it
     /// decoded none.
-    fn run(self, scan: &mut LogSegmentScan, resident: &MemoryReservation) -> ColumnarStep {
+    fn block(
+        &self,
+        scan: &mut LogSegmentScan,
+        resident: &MemoryReservation,
+        charge: &MemoryReservation,
+        position: usize,
+    ) -> ColumnarStep {
+        // The row-ref address of the block this call decodes, resolved from
+        // the scan's own next block (issue #2417), not from the cursor's
+        // position in `current_indices`. Read before the decode, since the
+        // view it returns holds the scan borrowed; only a decoded block
+        // consumes it, and with no next block none is decoded.
+        let block = match scan.next_block_index() {
+            Some(next) => block_index(
+                self.row_refs,
+                self.survivors.as_deref().map(Vec::as_slice),
+                Some(next),
+                self.cursor + position,
+                &self.key,
+            ),
+            None => Ok(None),
+        };
         match scan.next_block_columnar() {
             Ok(ColumnarBlockOutcome::Exhausted) => {
                 resident.free();
@@ -4382,7 +4507,7 @@ impl ColumnarBlockJob {
                 if view.has_attrs_raw_page() {
                     return ColumnarStep::Fallback;
                 }
-                let built = self.block.and_then(|block| {
+                let built = block.and_then(|block| {
                     build_columnar_batches(
                         &view,
                         &self.schema,
@@ -4397,8 +4522,13 @@ impl ColumnarBlockJob {
                         }),
                     )
                 });
-                match built {
-                    Ok(batches) => ColumnarStep::Held { batches },
+                let batches = match built {
+                    Ok(batches) => batches,
+                    Err(e) => return ColumnarStep::Failed(e),
+                };
+                let charged: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+                match charge.try_grow(charged) {
+                    Ok(()) => ColumnarStep::Held { batches, charged },
                     Err(e) => ColumnarStep::Failed(e),
                 }
             }
@@ -4410,56 +4540,133 @@ impl ColumnarBlockJob {
     }
 }
 
-/// `job` on `gate` as one [`ReadSite::LogBlock`] job: the block's decode and
-/// its Arrow build both leave the runtime worker, and the scan comes back
-/// with the outcome. `resident`, the charge for the block the scan's reader
-/// holds, goes with it, so a job waiting for a permit keeps that block
+/// Sets its flag when dropped. Held by a run job's future, so a stream that
+/// stops waiting for the job (dropped on a satisfied limit above it or on
+/// cancellation) tells the job to decode no further block.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// `job` on `gate` as one [`ReadSite::LogBlock`] job: the run's decodes and
+/// their Arrow builds all leave the runtime worker, and the scan comes back
+/// with one step per block. `resident`, the charge for the block the scan's
+/// reader holds, goes with it, so a job waiting for a permit keeps that block
 /// charged until its decode frees it, and a job that never hands the scan
-/// back drops the charge with the scan.
+/// back drops the charge with the scan. `charge` takes each built block's
+/// batches as the job builds them and comes back holding them.
 fn columnar_block_on_gate(
     gate: Arc<ReadGate>,
     size: JobSize,
     mut scan: Box<LogSegmentScan>,
     job: ColumnarBlockJob,
     resident: MemoryReservation,
+    charge: MemoryReservation,
 ) -> ColumnarJobFuture {
     Box::pin(async move {
+        let _stop = StopOnDrop(Arc::clone(&job.stop));
         gate.run(ReadSite::LogBlock, size, move || {
-            #[cfg(test)]
-            assert!(!job.panic_for_test, "injected columnar block job panic");
-            let step = job.run(&mut scan, &resident);
-            (scan, resident, step)
+            let steps = job.run(&mut scan, &resident, &charge);
+            (scan, resident, charge, steps)
         })
         .await
     })
 }
 
-/// Object keys whose next columnar block job panics on the gate. Keyed by
-/// object so a test arming it leaves every other test's scan alone.
-#[cfg(test)]
-static PANIC_NEXT_COLUMNAR_JOB: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// Whether the next columnar block job over `key` panics, consuming the
-/// arming.
-#[cfg(test)]
-fn take_columnar_job_panic(key: &str) -> bool {
-    PANIC_NEXT_COLUMNAR_JOB
-        .lock()
-        .is_ok_and(|mut keys| match keys.iter().position(|k| k == key) {
-            Some(i) => {
-                keys.swap_remove(i);
-                true
-            }
-            None => false,
-        })
+/// [`LogScanStream::run_for`] over the stream's fields.
+fn scan_run(
+    run: BlockRun,
+    fetch: Option<usize>,
+    topk: bool,
+    fallback_skip: Option<usize>,
+) -> BlockRun {
+    match fallback_skip {
+        Some(skip) => run.capped(skip + 1),
+        None if fetch.is_some() || topk => BlockRun::SINGLE,
+        None => run,
+    }
 }
 
-/// The row path's next block on the read gate, the scan returned with it.
-fn row_block_on_gate(mut scan: Box<LogSegmentScan>) -> RowJobFuture {
+/// A job of `blocks` blocks of a scan whose single-block job is `size`.
+fn run_job_size(size: JobSize, blocks: usize) -> JobSize {
+    match size {
+        JobSize::Bytes(bytes) => JobSize::Bytes(bytes.saturating_mul(blocks as u64)),
+        other => other,
+    }
+}
+
+/// Object keys whose next columnar run job panics on the gate, each with the
+/// run position of the block whose decode panics. Keyed by object so a test
+/// arming it leaves every other test's scan alone.
+#[cfg(test)]
+static PANIC_NEXT_COLUMNAR_JOB: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The run position at which the next columnar run job over `key` panics,
+/// consuming the arming.
+#[cfg(test)]
+fn take_columnar_job_panic(key: &str) -> Option<usize> {
+    let mut keys = PANIC_NEXT_COLUMNAR_JOB.lock().ok()?;
+    let i = keys.iter().position(|(k, _)| k == key)?;
+    Some(keys.swap_remove(i).1)
+}
+
+/// Up to `run`'s blocks of the row path in one [`ReadSite::LogBlock`] job on
+/// `gate`, the scan returned with them. Each block's records are charged to
+/// `charge` before the next block is decoded, and the job stops after a
+/// block that ends the scan or fails, or once the stream has stopped waiting.
+fn row_run_on_gate(
+    gate: Arc<ReadGate>,
+    size: JobSize,
+    mut scan: Box<LogSegmentScan>,
+    run: BlockRun,
+    charge: MemoryReservation,
+    key: String,
+) -> RowJobFuture {
+    let stop = Arc::new(AtomicBool::new(false));
     Box::pin(async move {
-        let block = scan.next_block_index();
-        let next = scan.next_block_on_gate().await;
-        (scan, block, next)
+        let _stop = StopOnDrop(Arc::clone(&stop));
+        gate.run(ReadSite::LogBlock, size, move || {
+            let mut blocks = VecDeque::new();
+            let mut held = 0u64;
+            while run.takes_another(blocks.len(), held)
+                && scan.remaining_blocks() > 0
+                && !stop.load(Ordering::Acquire)
+            {
+                let block = scan.next_block_index();
+                let next =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan.next_block()))
+                        .unwrap_or_else(|_| {
+                            Err(log_block_gate_fetch_error(&key, CpuGateError::Panicked))
+                        })
+                        .map_err(|e| DataFusionError::from(SqlError::from(e)));
+                let (next, charged) = match next {
+                    Ok(Some(records)) => {
+                        let charged = records_memory(&records);
+                        match charge.try_grow(charged) {
+                            Ok(()) => (Ok(Some(records)), charged),
+                            Err(e) => (Err(e), 0),
+                        }
+                    }
+                    other => (other, 0),
+                };
+                let more = matches!(next, Ok(Some(_)));
+                held = held.saturating_add(charged as u64);
+                blocks.push_back(Decoded::Rows {
+                    block,
+                    next,
+                    charged,
+                });
+                if !more {
+                    break;
+                }
+            }
+            (scan, charge, blocks)
+        })
+        .await
     })
 }
 
@@ -4467,7 +4674,13 @@ fn row_block_on_gate(mut scan: Box<LogSegmentScan>) -> RowJobFuture {
 /// fetcher classifies its own gated block decodes: a panic is the decode's
 /// failure, a job that never ran is transient.
 fn log_block_gate_failed(key: &str, err: CpuGateError) -> DataFusionError {
-    let fetch = match err {
+    SqlError::from(log_block_gate_fetch_error(key, err)).into()
+}
+
+/// [`log_block_gate_failed`]'s fetch error, before it becomes a DataFusion
+/// error.
+fn log_block_gate_fetch_error(key: &str, err: CpuGateError) -> LogFetchError {
+    match err {
         CpuGateError::Panicked => LogFetchError::Corrupt {
             key: key.to_string(),
             source: LogSegError::Corrupted(format!("read CPU gate: {err}")),
@@ -4476,8 +4689,7 @@ fn log_block_gate_failed(key: &str, err: CpuGateError) -> DataFusionError {
             key: key.to_string(),
             source: StoreError::Transient(format!("read CPU gate: {err}")),
         },
-    };
-    SqlError::from(fetch).into()
+    }
 }
 
 /// The block currently being drained into output batches, and the form it is
@@ -4773,10 +4985,17 @@ struct LogScanStream {
     /// phase).
     current_dirs: Option<Arc<CarriedDirs>>,
     state: LogScanState,
-    /// The block a [`LogScanState::DecodingColumnar`] or
-    /// [`LogScanState::DecodingRows`] job decoded, taken by the state the job
-    /// returned its scan to on the next turn of the poll loop.
-    decoded: Option<Decoded>,
+    /// The blocks a [`LogScanState::DecodingColumnar`] or
+    /// [`LogScanState::DecodingRows`] job decoded, in scan order, taken one
+    /// per turn of the poll loop by the state the job returned its scan to.
+    /// The next job is submitted only once this is empty.
+    decoded: VecDeque<Decoded>,
+    /// The charge for what `decoded` holds: each columnar block's built
+    /// batches and each row block's records, taken by the job as it builds
+    /// or decodes them. A block's bytes move from here to `held` when the
+    /// stream takes the block, so each is charged from the moment it exists
+    /// until its last batch has been handed on.
+    run_charge: MemoryReservation,
     /// The `fetch` pushed into the exec (issue #362), carried unchanged from
     /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
     /// it owns, exactly the pre-#362 behavior.
@@ -5124,28 +5343,41 @@ impl LogScanStream {
     }
 
     /// Take ownership of one decoded block's records (row path), charging the
-    /// pool for `records_memory` before it is held. An empty block (every row
-    /// filtered out) charges nothing and leaves the stream to ask for the next.
-    fn hold_block(&mut self, records: Vec<LogRecord>) -> DFResult<()> {
+    /// pool for `records_memory` before it is held. `charged` is what
+    /// [`Self::run_charge`] already holds for the block, which moves to
+    /// `held`. An empty block (every row filtered out) charges nothing and
+    /// leaves the stream to ask for the next.
+    fn hold_block(&mut self, records: Vec<LogRecord>, charged: usize) -> DFResult<()> {
         let bytes = records_memory(&records);
-        self.reservation.try_grow(bytes)?;
+        self.take_run_charge(charged, bytes)?;
         self.held = bytes;
         self.pending = Pending::Rows { records, pos: 0 };
         Ok(())
     }
 
     /// Take ownership of one block's pre-built columnar batches, charging the
-    /// pool for their total Arrow footprint. The decoded block they were built
-    /// from is charged separately, in [`Self::resident`].
+    /// pool for their total Arrow footprint. `charged` is what
+    /// [`Self::run_charge`] already holds for them, which moves to `held`.
+    /// The decoded block they were built from is charged separately, in
+    /// [`Self::resident`].
     ///
     /// [`Self::emit_next_columnar_batch`] moves each emitted batch's bytes
     /// from `held` to `emitted`.
-    fn hold_batches(&mut self, batches: Vec<RecordBatch>) -> DFResult<()> {
+    fn hold_batches(&mut self, batches: Vec<RecordBatch>, charged: usize) -> DFResult<()> {
         let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-        self.reservation.try_grow(bytes)?;
+        self.take_run_charge(charged, bytes)?;
         self.held = bytes;
         self.pending = Pending::Batches(batches.into());
         Ok(())
+    }
+
+    /// Moves a block's charge from [`Self::run_charge`], where it is
+    /// `charged` bytes, to `reservation`, where it is `bytes`. The release and
+    /// the new charge are one step of the stream with nothing of it running
+    /// between them, and the pool never counts the block twice.
+    fn take_run_charge(&mut self, charged: usize, bytes: usize) -> DFResult<()> {
+        self.run_charge.shrink(charged.min(self.run_charge.size()));
+        self.reservation.try_grow(bytes)
     }
 
     /// True when the current block still has a batch to emit.
@@ -5182,15 +5414,25 @@ impl LogScanStream {
         self.finish_segment();
     }
 
-    /// The next block of the row-path scan the state holds: the one a
-    /// [`LogScanState::DecodingRows`] job just decoded, or, with none waiting,
-    /// a new decode. That decode goes to the read gate as a job when the
+    /// The next block of the row-path scan the state holds: the next one a
+    /// [`LogScanState::DecodingRows`] job decoded, or, with none waiting, a
+    /// new decode. That decode goes to the read gate as a run job when the
     /// scan's fetcher carries one, leaving the state at
     /// [`LogScanState::DecodingRows`] to return to `resume`, and runs inline
     /// otherwise. Exhaustion decodes nothing and always runs inline.
+    ///
+    /// A run on [`RowResume::FallbackBlock`] ends at the block that fell back,
+    /// since the columnar cursor takes the scan back after it. Under a pushed
+    /// `fetch` or a confirmed TopK threshold a run is one block, so the scan
+    /// decodes no block past the one the limit is reached in and reads the
+    /// threshold before each block, as with one job per block.
     fn next_row_block(&mut self, resume: RowResume) -> RowNext {
-        match self.decoded.take() {
-            Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, next),
+        match self.decoded.pop_front() {
+            Some(Decoded::Rows {
+                block,
+                next,
+                charged,
+            }) => return RowNext::Ready(block, next, charged),
             Some(Decoded::Columnar(_)) => {
                 return RowNext::Failed(DataFusionError::Internal(
                     "a columnar block resumed on the row path".into(),
@@ -5198,6 +5440,10 @@ impl LogScanStream {
             }
             None => {}
         }
+        let run = self.run_for(match resume {
+            RowResume::FallbackBlock { skip } => Some(skip),
+            RowResume::Rows => None,
+        });
         let (LogScanState::Rows(scan) | LogScanState::RowFallbackBlock { scan, .. }) =
             &mut self.state
         else {
@@ -5209,7 +5455,10 @@ impl LogScanStream {
         // returning the records (`BlockScan::next_block`), so no previous
         // block is resident behind the reader while this job waits for a
         // permit, and there is no block charge to carry into it.
-        if scan.remaining_blocks() > 0 && scan.block_gate().is_some() {
+        let remaining = scan.remaining_blocks();
+        if remaining > 0
+            && let Some((gate, size)) = scan.block_gate()
+        {
             let (LogScanState::Rows(scan) | LogScanState::RowFallbackBlock { scan, .. }) =
                 std::mem::replace(&mut self.state, LogScanState::Done)
             else {
@@ -5217,8 +5466,20 @@ impl LogScanStream {
                     "row block requested off a row-path state".into(),
                 ));
             };
+            let run = run.capped(remaining);
+            let key = self
+                .current_seg
+                .as_ref()
+                .map_or_else(String::new, |s| s.data_object_key.clone());
             self.state = LogScanState::DecodingRows {
-                job: row_block_on_gate(scan),
+                job: row_run_on_gate(
+                    gate,
+                    run_job_size(size, run.blocks()),
+                    scan,
+                    run,
+                    self.run_charge.take(),
+                    key,
+                ),
                 resume,
                 started: Instant::now(),
             };
@@ -5226,9 +5487,25 @@ impl LogScanStream {
         }
         let decode_started = Instant::now();
         let block = scan.next_block_index();
-        let next = scan.next_block();
+        let next = scan
+            .next_block()
+            .map_err(|e| DataFusionError::from(SqlError::from(e)));
         self.blocks.decode_build_elapsed.add_elapsed(decode_started);
-        RowNext::Ready(block, next)
+        RowNext::Ready(block, next, 0)
+    }
+
+    /// The run the next gate job decodes, from the fetcher's [`BlockRun`]: on
+    /// the `attrs_raw` fallback that drains `fallback_skip` blocks, at most
+    /// the blocks up to and including the one that fell back; otherwise one
+    /// block under a pushed `fetch` or a confirmed TopK threshold.
+    fn run_for(&self, fallback_skip: Option<usize>) -> BlockRun {
+        let run = match &self.state {
+            LogScanState::Columnar(scan)
+            | LogScanState::Rows(scan)
+            | LogScanState::RowFallbackBlock { scan, .. } => scan.block_run(),
+            _ => BlockRun::SINGLE,
+        };
+        scan_run(run, self.fetch, self.topk.is_some(), fallback_skip)
     }
 
     /// This partition is done with the current segment: drop its handle on the
@@ -5257,7 +5534,7 @@ impl LogScanStream {
                     self.blocks.record_segment_totals(&stats);
                 }
             }
-            // A block job runs only once the previous block's batches or
+            // A block job runs only once the previous run's batches or
             // records are all emitted, so no row has been emitted since the
             // last check and `fetch` cannot be reached with one in flight. Dropping it abandons the job; the scan folds its
             // accounting when it drops, with the future or with the job's
@@ -5274,6 +5551,7 @@ impl LogScanStream {
         self.work.clear();
         self.prefetch_pool.clear(self.partition);
         self.release_block();
+        self.release_run();
         self.resident.free();
     }
 
@@ -5284,9 +5562,17 @@ impl LogScanStream {
         self.work.clear();
         self.prefetch_pool.clear(self.partition);
         self.release_block();
+        self.release_run();
         self.resident.free();
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         Poll::Ready(Some(Err(e)))
+    }
+
+    /// Drop the blocks a run decoded that the stream has not taken, and their
+    /// charge.
+    fn release_run(&mut self) {
+        self.decoded.clear();
+        self.run_charge.free();
     }
 
     /// Take one decoded block's surviving records through the row path: apply
@@ -5298,9 +5584,9 @@ impl LogScanStream {
     /// fetcher-level filter matches per-record attributes alone and cannot see
     /// it. An empty `records` is normal, not end-of-segment: a block can survive
     /// pruning and hold no matching row, or have every matching row erased.
-    fn take_row_block(&mut self, mut records: Vec<LogRecord>) -> DFResult<()> {
+    fn take_row_block(&mut self, mut records: Vec<LogRecord>, charged: usize) -> DFResult<()> {
         retain_unerased(&mut records, &self.erasure)?;
-        self.hold_block(records)
+        self.hold_block(records, charged)
     }
 }
 
@@ -5636,7 +5922,7 @@ impl LogScanStream {
                     Poll::Pending => return Poll::Pending,
                 },
                 LogScanState::Columnar(scan) => {
-                    let step = match this.decoded.take() {
+                    let step = match this.decoded.pop_front() {
                         Some(Decoded::Columnar(step)) => step,
                         Some(Decoded::Rows { .. }) => {
                             return this.fail(DataFusionError::Internal(
@@ -5649,25 +5935,14 @@ impl LogScanStream {
                                 this.block_cursor += skipped;
                                 this.blocks.blocks_skipped_by_threshold.add(skipped);
                             }
-                            // The row-ref address of the block this call
-                            // decodes, resolved from the scan's own next block
-                            // (issue #2417), not from the cursor's position in
-                            // `current_indices`. Read before the decode, since
-                            // the view it returns holds the scan borrowed; only
-                            // a decoded block consumes it, and with no next
-                            // block none is decoded.
-                            let block = match scan.next_block_index() {
-                                Some(next) => block_index(
-                                    this.row_refs,
-                                    this.current_survivors.as_deref().map(Vec::as_slice),
-                                    Some(next),
-                                    this.block_cursor,
-                                    this.current_seg
-                                        .as_ref()
-                                        .map_or("", |s| s.data_object_key.as_str()),
-                                ),
-                                None => Ok(None),
-                            };
+                            let key = this
+                                .current_seg
+                                .as_ref()
+                                .map_or_else(String::new, |s| s.data_object_key.clone());
+                            let remaining = scan.remaining_blocks();
+                            let run =
+                                scan_run(scan.block_run(), this.fetch, this.topk.is_some(), None)
+                                    .capped(remaining);
                             let job = ColumnarBlockJob {
                                 schema: Arc::clone(&this.schema),
                                 projection: Arc::clone(&this.projection),
@@ -5675,18 +5950,21 @@ impl LogScanStream {
                                 attr_keys: Arc::clone(&this.attr_keys),
                                 full_len: this.full_len,
                                 segment: this.current_seg_ordinal,
-                                block,
+                                row_refs: this.row_refs,
+                                survivors: this.current_survivors.clone(),
+                                cursor: this.block_cursor,
                                 #[cfg(test)]
-                                panic_for_test: take_columnar_job_panic(
-                                    this.current_seg
-                                        .as_ref()
-                                        .map_or("", |s| s.data_object_key.as_str()),
-                                ),
+                                panic_at: take_columnar_job_panic(&key),
+                                #[cfg(test)]
+                                hook: take_run_hook(&key),
+                                key,
+                                run,
+                                stop: Arc::new(AtomicBool::new(false)),
                             };
                             match scan.block_gate() {
                                 // Exhaustion decodes nothing, so it submits no
                                 // job.
-                                Some((gate, size)) if scan.remaining_blocks() > 0 => {
+                                Some((gate, size)) if remaining > 0 => {
                                     let LogScanState::Columnar(scan) =
                                         std::mem::replace(&mut this.state, LogScanState::Done)
                                     else {
@@ -5701,7 +5979,12 @@ impl LogScanStream {
                                     let resident = this.resident.take();
                                     this.state = LogScanState::DecodingColumnar {
                                         job: columnar_block_on_gate(
-                                            gate, size, scan, job, resident,
+                                            gate,
+                                            run_job_size(size, run.blocks()),
+                                            scan,
+                                            job,
+                                            resident,
+                                            this.run_charge.take(),
                                         ),
                                         started: Instant::now(),
                                     };
@@ -5709,7 +5992,7 @@ impl LogScanStream {
                                 }
                                 _ => {
                                     let decode_started = Instant::now();
-                                    let step = job.run(scan, &this.resident);
+                                    let step = job.block(scan, &this.resident, &this.run_charge, 0);
                                     this.blocks.decode_build_elapsed.add_elapsed(decode_started);
                                     step
                                 }
@@ -5782,7 +6065,7 @@ impl LogScanStream {
                             // held, went with the state it was in.
                             this.resident.free();
                         }
-                        ColumnarStep::Held { batches } => {
+                        ColumnarStep::Held { batches, charged } => {
                             // A clean columnar block: the streak of consecutive
                             // fallbacks that would otherwise escalate to a
                             // full row-path commit is broken.
@@ -5801,21 +6084,22 @@ impl LogScanStream {
                             // freed this block. Outside the decode calls
                             // themselves there is no interval during which it
                             // is resident and uncharged, a wait for a gate
-                            // permit included.
-                            if !batches.is_empty()
-                                && let Err(e) = this.hold_batches(batches)
-                            {
+                            // permit included. Its batches were charged to
+                            // `run_charge` as the job built them, and that
+                            // charge moves to `held` here.
+                            if let Err(e) = this.hold_batches(batches, charged) {
                                 return this.fail(e);
                             }
                         }
                     }
                 }
                 LogScanState::Rows(_) => {
-                    if this.decoded.is_none() {
+                    if this.decoded.is_empty() {
                         this.skip_threshold_blocks();
                     }
-                    let (decoded_block, next) = match this.next_row_block(RowResume::Rows) {
-                        RowNext::Ready(block, next) => (block, next),
+                    let (decoded_block, next, charged) = match this.next_row_block(RowResume::Rows)
+                    {
+                        RowNext::Ready(block, next, charged) => (block, next, charged),
                         RowNext::Submitted => continue,
                         RowNext::Failed(e) => return this.fail(e),
                     };
@@ -5831,14 +6115,14 @@ impl LogScanStream {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
-                            if let Err(e) = this.take_row_block(records) {
+                            if let Err(e) = this.take_row_block(records, charged) {
                                 return this.fail(e);
                             }
                         }
                         // Only `None` ends the segment. Its counters are final
                         // now, so publish them before moving on.
                         Ok(None) => this.end_scanned_segment(),
-                        Err(e) => return this.fail(SqlError::from(e).into()),
+                        Err(e) => return this.fail(e),
                     }
                 }
                 LogScanState::RowFallbackBlock { skip, .. } => {
@@ -5848,13 +6132,16 @@ impl LogScanStream {
                     // that carried the `attrs_raw` overflow page -- through the
                     // row path.
                     let skip = *skip;
-                    let (decoded_block, next) =
+                    let (decoded_block, next, charged) =
                         match this.next_row_block(RowResume::FallbackBlock { skip }) {
-                            RowNext::Ready(block, next) => (block, next),
+                            RowNext::Ready(block, next, charged) => (block, next, charged),
                             RowNext::Submitted => continue,
                             RowNext::Failed(e) => return this.fail(e),
                         };
                     if skip > 0 {
+                        // A discarded block's records go now, and their charge
+                        // with them.
+                        this.run_charge.shrink(charged.min(this.run_charge.size()));
                         match next {
                             Ok(Some(_)) => {
                                 if let LogScanState::RowFallbackBlock { skip, .. } = &mut this.state
@@ -5863,7 +6150,7 @@ impl LogScanStream {
                                 }
                             }
                             Ok(None) => this.end_scanned_segment(),
-                            Err(e) => return this.fail(SqlError::from(e).into()),
+                            Err(e) => return this.fail(e),
                         }
                         continue;
                     }
@@ -5879,7 +6166,7 @@ impl LogScanStream {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
-                            if let Err(e) = this.take_row_block(records) {
+                            if let Err(e) = this.take_row_block(records, charged) {
                                 return this.fail(e);
                             }
                             // Exactly one block goes through the row path per
@@ -5921,7 +6208,7 @@ impl LogScanStream {
                         // as end-of-segment rather than panicking, matching
                         // `ReopenRows`'s own `Ok(None)` handling above.
                         Ok(None) => this.end_scanned_segment(),
-                        Err(e) => return this.fail(SqlError::from(e).into()),
+                        Err(e) => return this.fail(e),
                     }
                 }
                 LogScanState::DecodingColumnar { job, started } => {
@@ -5932,9 +6219,10 @@ impl LogScanStream {
                     };
                     this.blocks.decode_build_elapsed.add_elapsed(started);
                     match ran {
-                        Ok((scan, resident, step)) => {
+                        Ok((scan, resident, run_charge, steps)) => {
                             this.resident = resident;
-                            this.decoded = Some(Decoded::Columnar(step));
+                            this.run_charge = run_charge;
+                            this.decoded = steps.into_iter().map(Decoded::Columnar).collect();
                             this.state = LogScanState::Columnar(scan);
                         }
                         Err(err) => {
@@ -5953,12 +6241,24 @@ impl LogScanStream {
                     started,
                 } => {
                     let (resume, started) = (*resume, *started);
-                    let (scan, block, next) = match job.as_mut().poll(cx) {
+                    let ran = match job.as_mut().poll(cx) {
                         Poll::Ready(ran) => ran,
                         Poll::Pending => return Poll::Pending,
                     };
                     this.blocks.decode_build_elapsed.add_elapsed(started);
-                    this.decoded = Some(Decoded::Rows { block, next });
+                    let (scan, run_charge, blocks) = match ran {
+                        Ok(ran) => ran,
+                        Err(err) => {
+                            let key = this
+                                .current_seg
+                                .as_ref()
+                                .map_or("", |s| s.data_object_key.as_str());
+                            let e = log_block_gate_failed(key, err);
+                            return this.fail(e);
+                        }
+                    };
+                    this.run_charge = run_charge;
+                    this.decoded = blocks;
                     this.state = match resume {
                         RowResume::Rows => LogScanState::Rows(scan),
                         RowResume::FallbackBlock { skip } => {
@@ -11332,8 +11632,16 @@ mod read_gate_tests {
     /// attribute, so no block has an `attrs_raw` page and the columnar
     /// drain never falls back.
     fn object() -> Vec<u8> {
+        object_with(None)
+    }
+
+    /// [`object`], with block `overflow` (if any) carrying a second
+    /// attribute past a one-column dynamic budget, so it alone has an
+    /// `attrs_raw` page and the columnar drain falls back on it.
+    fn object_with(overflow: Option<i64>) -> Vec<u8> {
         let cfg = RlogConfig {
             block_target_records: 1,
+            max_dynamic_columns: 1,
             ..RlogConfig::default()
         };
         let identity = ObjectIdentity {
@@ -11346,6 +11654,10 @@ mod read_gate_tests {
         let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
         let mut writer = RlogWriter::new(cfg, identity);
         for ts in 0..BLOCKS as i64 {
+            let mut attrs = vec![("a".to_string(), AttrValue::Str(format!("a{ts}")))];
+            if overflow == Some(ts) {
+                attrs.push(("b".to_string(), AttrValue::Str(format!("b{ts}"))));
+            }
             writer
                 .push(ravel_logseg::LogRecord {
                     stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
@@ -11358,11 +11670,43 @@ mod read_gate_tests {
                     trace_id: None,
                     span_id: None,
                     flags: 0,
-                    attrs: vec![("a".to_string(), AttrValue::Str(format!("a{ts}")))],
+                    attrs,
                 })
                 .expect("push");
         }
         writer.finish().expect("finish")
+    }
+
+    /// `obj` with one byte flipped in every page of block `block`, so that
+    /// block's decode fails its page crc and every other block decodes. The
+    /// BLOCKS section's crc in the footer is recomputed over the flipped
+    /// bytes, so opening the object still succeeds.
+    fn corrupt_block(mut obj: Vec<u8>, block: u32) -> Vec<u8> {
+        use ravel_logseg::footer::{TRAILER_LEN, kind, write_footer_and_trailer};
+        let cfg = RlogConfig::default();
+        let mut footer = ravel_logseg::footer::open(&obj).expect("footer");
+        let desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR");
+        let raw = ravel_logseg::read_section(&obj, &desc, &cfg).expect("read PAGE_DIR");
+        let page_dir = ravel_logseg::page_dir::PageDir::decode(&raw).expect("decode PAGE_DIR");
+        let pages = page_dir.block_pages(block).expect("block pages");
+        assert!(!pages.is_empty());
+        let blocks = footer
+            .sections
+            .iter_mut()
+            .find(|s| s.kind == kind::BLOCKS)
+            .expect("BLOCKS");
+        // Page offsets are relative to the BLOCKS section.
+        let start = blocks.offset as usize;
+        for page in pages {
+            obj[start + page.offset as usize] ^= 0xFF;
+        }
+        blocks.crc32c = crc32c::crc32c(&obj[start..start + blocks.len as usize]);
+        let trailer = obj.len() - TRAILER_LEN;
+        let footer_len =
+            u32::from_le_bytes(obj[trailer..trailer + 4].try_into().expect("len")) as usize;
+        obj.truncate(trailer - footer_len);
+        write_footer_and_trailer(&mut obj, &footer);
+        obj
     }
 
     async fn fixture() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
@@ -11371,8 +11715,12 @@ mod read_gate_tests {
 
     /// The fixture stored under `key`.
     async fn fixture_at(key: &str) -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
+        fixture_of(key, object()).await
+    }
+
+    /// `obj` stored under `key`, as the one segment of a snapshot.
+    async fn fixture_of(key: &str, obj: Vec<u8>) -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let obj = object();
         store
             .put(key, bytes::Bytes::from(obj.clone()), PutOptions::default())
             .await
@@ -11440,11 +11788,27 @@ mod read_gate_tests {
         gate: Option<Arc<ReadGate>>,
         rows: bool,
     ) -> LogsScanExec {
-        let fetcher = LogSegmentFetcher::new(Arc::clone(store));
+        exec_run(store, segments, gate, BlockRun::default(), rows)
+    }
+
+    /// [`exec`] with the fetcher's block run set to `run`.
+    fn exec_run(
+        store: &Arc<dyn ObjectStoreBackend>,
+        segments: &[SegmentRef],
+        gate: Option<Arc<ReadGate>>,
+        run: BlockRun,
+        rows: bool,
+    ) -> LogsScanExec {
+        let fetcher = LogSegmentFetcher::new(Arc::clone(store)).with_block_run(run);
         let fetcher = match gate {
             Some(gate) => fetcher.with_read_gate(gate),
             None => fetcher,
         };
+        exec_on(fetcher, segments, rows)
+    }
+
+    /// A one-partition scan over the whole fixture window through `fetcher`.
+    fn exec_on(fetcher: LogSegmentFetcher, segments: &[SegmentRef], rows: bool) -> LogsScanExec {
         LogsScanExec::new(
             TENANT,
             fetcher,
@@ -11557,7 +11921,7 @@ mod read_gate_tests {
         PANIC_NEXT_COLUMNAR_JOB
             .lock()
             .expect("panic hook")
-            .push(PANIC_KEY.to_string());
+            .push((PANIC_KEY.to_string(), 0));
         let gated = exec(&store, &segments, Some(Arc::clone(&gate)), false);
         let items: Vec<DFResult<RecordBatch>> = gated
             .execute(0, Arc::new(TaskContext::default()))
@@ -11615,6 +11979,268 @@ mod read_gate_tests {
                 other => panic!("expected a transient store error, got {other:?}"),
             }
         }
+    }
+
+    /// A run of at most `n` blocks with no byte cap.
+    fn run_of(n: usize) -> BlockRun {
+        BlockRun {
+            max_blocks: n,
+            max_decoded_bytes: u64::MAX,
+        }
+    }
+
+    /// Every item `plan` yields at partition 0, errors included.
+    async fn items(plan: &LogsScanExec) -> Vec<DFResult<RecordBatch>> {
+        plan.execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .collect()
+            .await
+    }
+
+    /// The `LogFetchError::Corrupt` an item carries, with its object key and
+    /// message.
+    fn corrupt_of(item: &DFResult<RecordBatch>) -> Option<(String, String)> {
+        let Err(DataFusionError::External(err)) = item else {
+            return None;
+        };
+        match err.downcast_ref::<SqlError>() {
+            Some(SqlError::LogFetch(LogFetchError::Corrupt { key, source })) => {
+                Some((key.clone(), source.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// One `log_block` job decodes a run of blocks: the job count is the
+    /// number of runs the fixture's four blocks make, on the columnar and the
+    /// row path, and the batches are those of no gate, in the same order.
+    /// Four blocks make four runs of one block, two runs at three blocks a
+    /// run (3 + 1), and one run at eight. A byte cap of 1 stops every run
+    /// after its first block, whose batches or records are larger than that,
+    /// so that is one job per block again.
+    ///
+    /// Fails with the run loop in `ColumnarBlockJob::run` or
+    /// `row_run_on_gate` stopping after one block whatever the run (the
+    /// three- and eight-block counts read 4), and with `takes_another`
+    /// ignoring the byte cap (the capped count reads 1).
+    #[tokio::test]
+    async fn a_gate_job_decodes_a_run_of_blocks() {
+        let (store, segments) = fixture().await;
+        let capped = BlockRun {
+            max_blocks: 8,
+            max_decoded_bytes: 1,
+        };
+        for rows in [false, true] {
+            let want = collect(&exec(&store, &segments, None, rows)).await;
+            assert_eq!(
+                want.len(),
+                BLOCKS as usize,
+                "a batch a block (rows: {rows})"
+            );
+            for (run, jobs) in [
+                (BlockRun::SINGLE, 4),
+                (run_of(3), 2),
+                (run_of(8), 1),
+                (capped, 4),
+            ] {
+                let gate = floor_zero_gate();
+                let plan = exec_run(&store, &segments, Some(Arc::clone(&gate)), run, rows);
+                let got = collect(&plan).await;
+                assert_eq!(
+                    site_counts(&gate, ReadSite::LogBlock),
+                    (jobs, 0),
+                    "{run:?} (rows: {rows})"
+                );
+                assert_eq!(got, want, "{run:?} (rows: {rows})");
+            }
+        }
+    }
+
+    /// Every block a run decodes is charged from when the job builds its
+    /// batches until the stream has handed the last of them on. After the
+    /// first batch of a four-block run the pool holds that batch, the three
+    /// still to come and the decoded block behind the reader (the same block
+    /// until the scan ends), so each later batch lowers the pool by exactly
+    /// the size of the batch handed on before it, and nothing is held once
+    /// the stream is dropped.
+    ///
+    /// Fails with the batches left off the run charge in
+    /// `ColumnarBlockJob::block`: the pool then holds only the emitted batch
+    /// and the decoded block, the same after each batch and less than the
+    /// four batches together.
+    #[tokio::test]
+    async fn a_run_keeps_each_decoded_block_charged_until_handed_on() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+        let (store, segments) = fixture().await;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime");
+        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+        let plan = exec_run(&store, &segments, Some(floor_zero_gate()), run_of(8), false);
+        let mut stream = plan.execute(0, ctx).expect("execute");
+        let (mut sizes, mut reserved) = (Vec::new(), Vec::new());
+        while let Some(batch) = stream.next().await {
+            sizes.push(batch.expect("batch").get_array_memory_size());
+            reserved.push(pool.reserved());
+        }
+        assert_eq!(sizes.len(), BLOCKS as usize);
+        let all: usize = sizes.iter().sum();
+        assert!(
+            reserved[0] >= all,
+            "the whole run is charged once its first batch is out: {reserved:?} vs {all}"
+        );
+        for k in 1..sizes.len() {
+            assert_eq!(
+                reserved[k - 1] - reserved[k],
+                sizes[k - 1],
+                "batch {k}: {reserved:?} {sizes:?}"
+            );
+        }
+        drop(stream);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A stream dropped while its run job is decoding stops the job after
+    /// the block it is on. The job holds after its first block, the stream is
+    /// dropped, and once released the job decodes no further block, where it
+    /// would otherwise decode the other three for nobody.
+    ///
+    /// Fails with no `StopOnDrop` in `columnar_block_on_gate`'s future: the
+    /// job then decodes all four blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_stream_stops_its_run_after_the_current_block() {
+        const STOP_KEY: &str = "t/gate-stop.rlog";
+        let (store, segments) = fixture_at(STOP_KEY).await;
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        RUN_HOOKS.lock().expect("hooks").push((
+            STOP_KEY.to_string(),
+            Arc::new(RunHook {
+                decoded: std::sync::atomic::AtomicUsize::new(0),
+                paused: std::sync::Mutex::new(paused_tx),
+                release: std::sync::Mutex::new(release_rx),
+                finished: std::sync::Mutex::new(finished_tx),
+            }),
+        ));
+        let plan = exec_run(&store, &segments, Some(floor_zero_gate()), run_of(8), false);
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let polling = tokio::spawn(async move { stream.next().await.map(|b| b.is_ok()) });
+        tokio::task::spawn_blocking(move || paused_rx.recv())
+            .await
+            .expect("join")
+            .expect("the job paused after its first block");
+        polling.abort();
+        assert!(polling.await.expect_err("aborted").is_cancelled());
+        release_tx.send(()).expect("release");
+        let decoded = tokio::task::spawn_blocking(move || finished_rx.recv())
+            .await
+            .expect("join")
+            .expect("the job returned");
+        assert_eq!(decoded, 1, "the job stopped after the block it was on");
+    }
+
+    /// A decode error in block 2 of a run surfaces as it does with one job
+    /// per block and with no gate: blocks 0 and 1 are handed on first, then
+    /// the error ends the stream. Block 2's pages each have a byte flipped,
+    /// which fails their page crc.
+    ///
+    /// Fails with the run's steps before a failed block dropped (the run's
+    /// first item is then the error).
+    #[tokio::test]
+    async fn a_decode_error_mid_run_follows_the_blocks_before_it() {
+        let (store, segments) = fixture_of(KEY, corrupt_block(object(), 2)).await;
+        for rows in [false, true] {
+            for run in [None, Some(BlockRun::SINGLE), Some(run_of(8))] {
+                let plan = match run {
+                    None => exec(&store, &segments, None, rows),
+                    Some(run) => exec_run(&store, &segments, Some(floor_zero_gate()), run, rows),
+                };
+                let items = items(&plan).await;
+                assert_eq!(items.len(), 3, "{run:?} (rows: {rows}): {items:?}");
+                assert!(
+                    items[0].is_ok() && items[1].is_ok(),
+                    "{run:?} (rows: {rows}): {items:?}"
+                );
+                let (key, _) = corrupt_of(&items[2]).expect("a corrupt block error");
+                assert_eq!(key, KEY);
+            }
+        }
+    }
+
+    /// A panic in the decode of block 2 of a run is the corrupt error a
+    /// panicked gate job reports, after blocks 0 and 1, as it is with one job
+    /// per block: the job catches it per block.
+    ///
+    /// Fails with the per-block `catch_unwind` in `ColumnarBlockJob::run`
+    /// removed: the panic then fails the whole job and the stream's only item
+    /// is the error.
+    #[tokio::test]
+    async fn a_panic_mid_run_follows_the_blocks_before_it() {
+        const PANIC_KEY: &str = "t/gate-panic-mid.rlog";
+        let (store, segments) = fixture_at(PANIC_KEY).await;
+        PANIC_NEXT_COLUMNAR_JOB
+            .lock()
+            .expect("panic hook")
+            .push((PANIC_KEY.to_string(), 2));
+        let plan = exec_run(&store, &segments, Some(floor_zero_gate()), run_of(8), false);
+        let items = items(&plan).await;
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(items[0].is_ok() && items[1].is_ok(), "{items:?}");
+        let (key, message) = corrupt_of(&items[2]).expect("a corrupt error");
+        assert_eq!(key, PANIC_KEY);
+        assert!(
+            message.contains(&format!("read CPU gate: {}", CpuGateError::Panicked)),
+            "{message}"
+        );
+    }
+
+    /// Under a pushed `fetch` a run is one block, so a `LIMIT 1` scan decodes
+    /// the one block it needs rather than a whole run.
+    ///
+    /// Fails with `scan_run` ignoring `fetch`: `blocks_scanned` reads 4.
+    #[tokio::test]
+    async fn a_pushed_fetch_decodes_one_block_per_job() {
+        let (store, segments) = fixture().await;
+        let gate = floor_zero_gate();
+        let plan = exec_run(&store, &segments, Some(Arc::clone(&gate)), run_of(8), false)
+            .with_fetch_pushed(Some(1));
+        let got = collect(&plan).await;
+        assert_eq!(got.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(metric_total(&plan, "blocks_scanned"), 1);
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (1, 0));
+    }
+
+    /// The `attrs_raw` fallback under runs returns what it returns with no
+    /// gate. Block 2 overflows: the first columnar run decodes blocks 0 and 1
+    /// and falls back on block 2 (one job); the reopened row scan's run, capped
+    /// at `skip + 1` = 3 blocks, drains blocks 0 and 1 and takes block 2 (one
+    /// job); the columnar run after it decodes block 3 (one job). Three
+    /// `log_block` jobs in all.
+    ///
+    /// Fails with the fallback's row run left uncapped: it then also decodes
+    /// block 3 on the row path, and the columnar state that takes the scan
+    /// back fails on it ("a row-path block resumed on the columnar path").
+    #[tokio::test]
+    async fn the_attrs_raw_fallback_run_ends_at_the_block_that_fell_back() {
+        let (store, segments) = fixture_of(KEY, object_with(Some(2))).await;
+        let want = collect(&exec(&store, &segments, None, false)).await;
+        assert_eq!(
+            want.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            BLOCKS as usize
+        );
+        let gate = floor_zero_gate();
+        let plan = exec_run(&store, &segments, Some(Arc::clone(&gate)), run_of(8), false);
+        let got = collect(&plan).await;
+        assert_eq!(got, want);
+        assert_eq!(metric_total(&plan, "reopens"), 1, "one fallback");
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (3, 0));
     }
 }
 
