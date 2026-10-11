@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
+use ravel_cpu_gate::ReadSite;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::Signal;
 
@@ -172,8 +173,10 @@ pub(crate) fn note_skipped_input(
 /// Counter seam for `ravel_maintain_buckets_held_out_of_window_total`
 /// (ADR-2708 D5b): compactions that ended in
 /// [`CompactionOutcome::HeldOutOfWindow`]. Process-wide and monotonic, counted
-/// once per bucket per pass, so a held bucket keeps the rate nonzero until the
-/// upgrade finishes or rolls back.
+/// once per bucket per pass, so a held bucket keeps the rate nonzero until a
+/// build that reads the object runs here, retention tombstones the bucket, or
+/// (on the query-audit shard, which is never tombstoned) the audit age sweep
+/// deletes the held record. Rolling the newer side back does not clear it.
 static BUCKETS_HELD_OUT_OF_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 /// Read [`BUCKETS_HELD_OUT_OF_WINDOW`]. Zero on a healthy deployment.
@@ -185,7 +188,9 @@ pub fn buckets_held_out_of_window_total() -> u64 {
 /// readers check the trailer version before the footer CRC, so a flipped
 /// version byte reads the same as an object a newer build wrote; only the
 /// commit record's content hash tells them apart. Intact bytes hold the
-/// bucket; anything else fails with the reader's own error, as corruption.
+/// bucket; anything else fails with the refusal, as corruption. The hash runs
+/// on the read gate under the `compaction` site (ADR-1702), sized by the
+/// object, as scrub's content-tier hash does.
 async fn hold_out_of_window_input(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -201,7 +206,15 @@ async fn hold_out_of_window_input(
         RequestPhase::CatalogRead,
         &whole,
     );
-    if blake3::hash(&whole?.data).as_bytes().as_slice() != content_hash {
+    let data = whole?.data;
+    let size = data.len() as u64;
+    let actual = config
+        .read_gate
+        .run(ReadSite::Compaction, size, move || {
+            *blake3::hash(data.as_ref()).as_bytes()
+        })
+        .await?;
+    if actual.as_slice() != content_hash {
         return Err(reader_error);
     }
     BUCKETS_HELD_OUT_OF_WINDOW.fetch_add(1, Ordering::Relaxed);

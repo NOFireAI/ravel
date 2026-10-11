@@ -7,6 +7,7 @@ mod common;
 
 use common::*;
 use ravel_commit::keys;
+use ravel_logseg::LogSegError;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::scan::{
     DEFAULT_MEMO_REVERIFY_INTERVAL_NS, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainMemo,
@@ -19,6 +20,7 @@ use ravel_maintain::{
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_rspan::SpanSegError;
 use ravel_segment::SegmentError;
 use ravel_types::Signal;
 use uuid::Uuid;
@@ -1149,63 +1151,199 @@ async fn invalidate_forces_reevaluation_and_survives_snapshot_round_trip() {
 /// so each one's before/after delta covers only its own scans.
 static HELD_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The RSEG version after this build's reader window.
-fn next_rseg_version() -> u16 {
-    ravel_segment::SUPPORTED_VERSIONS.newest() + 1
+/// The segment format a held-bucket test seeds.
+#[derive(Clone, Copy, Debug)]
+enum Format {
+    Rseg,
+    Rlog,
+    Rspan,
 }
 
-/// How [`seed_altered_input`] changes an input's bytes before storing them.
+impl Format {
+    fn signal(self) -> Signal {
+        match self {
+            Format::Rseg => Signal::Metrics,
+            Format::Rlog => Signal::Logs,
+            Format::Rspan => Signal::Spans,
+        }
+    }
+
+    /// The newest version this build reads and writes, which its own writer
+    /// stamps on the commit record.
+    fn current_version(self) -> u16 {
+        match self {
+            Format::Rseg => ravel_segment::SUPPORTED_VERSIONS.newest(),
+            Format::Rlog => ravel_logseg::footer::SUPPORTED_VERSIONS.newest(),
+            Format::Rspan => ravel_rspan::footer::SUPPORTED_VERSIONS.newest(),
+        }
+    }
+
+    /// The version after this build's reader window, which a newer writer
+    /// stamps on both the object's trailer and its commit record.
+    fn next_version(self) -> u16 {
+        self.current_version() + 1
+    }
+
+    /// Whether `err` is this format's reader refusing trailer version `v`.
+    fn is_version_refusal(self, err: &MaintainError, v: u16) -> bool {
+        match (self, err) {
+            (Format::Rseg, MaintainError::Segment(SegmentError::UnsupportedVersion(got)))
+            | (Format::Rlog, MaintainError::LogSeg(LogSegError::UnsupportedVersion(got)))
+            | (Format::Rspan, MaintainError::SpanSeg(SpanSegError::UnsupportedVersion(got))) => {
+                *got == v
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How [`seed_l0`] changes an input before storing it. Every variant but
+/// `CorruptVersionByte` hashes the commit record over the bytes as stored
+/// before any later damage, as a writer does.
 #[derive(Clone, Copy)]
 enum Alteration {
-    /// Trailer version set to [`next_rseg_version`] and the commit record
-    /// hashed over the stamped bytes: an intact object a newer build wrote.
+    /// Trailer version and commit record both stamped
+    /// [`Format::next_version`]: an intact object a newer build wrote.
     OutOfWindow,
-    /// The same version stamp, with the hash of the bytes as built: a flipped
-    /// version byte in an object this build wrote.
+    /// Trailer version stamped [`Format::next_version`] under a commit record
+    /// this build wrote, which carries the current version and the hash of the
+    /// bytes as built: a flipped version byte in this build's own object.
     CorruptVersionByte,
-    /// Trailer magic smashed and the record hashed over the smashed bytes, so
-    /// only the decoder can tell it is unreadable.
+    /// Trailer magic smashed after hashing, so only the decoder can tell the
+    /// object is unreadable.
     CorruptMagic,
+    /// [`Alteration::OutOfWindow`], with a byte at the front of the object
+    /// flipped after hashing: a newer object that no longer matches its hash.
+    OutOfWindowCorruptBody,
+    /// Commit record stamped [`Format::next_version`] over an object this
+    /// build reads.
+    NewerRecordOnly,
 }
 
-/// [`seed_input`], with the stored bytes altered as `alteration` says.
-async fn seed_altered_input(
+/// One L0 object as its writer built it, with the figures its commit record
+/// carries.
+struct BuiltL0 {
+    bytes: Vec<u8>,
+    count: u64,
+    series: u64,
+    min_ts: i64,
+    max_ts: i64,
+}
+
+fn build_l0(format: Format, hour: u32, writer_id: Uuid, seq: u64, created: i64) -> BuiltL0 {
+    let ts = 1_000 + seq as i64;
+    match format {
+        Format::Rseg => {
+            let series = [raw_series("m", &[("k", "a")], &[(ts, seq as f64)])];
+            let written = build_v5_l0(&series, hour, (created, 1, seq));
+            BuiltL0 {
+                bytes: written.bytes.to_vec(),
+                count: written.summary.sample_count,
+                series: written.summary.series_count,
+                min_ts: written.summary.min_event_ts_ns,
+                max_ts: written.summary.max_event_ts_ns,
+            }
+        }
+        Format::Rlog => {
+            let mut writer = ravel_logseg::RlogWriter::new(
+                ravel_logseg::RlogConfig::default(),
+                ravel_logseg::writer::ObjectIdentity {
+                    tenant_hash: tenant_hash().0,
+                    shard: SHARD,
+                    writer_id: writer_id.into_bytes(),
+                    writer_epoch: 1,
+                    writer_seq: seq,
+                },
+            );
+            writer
+                .push(log_record(0, ts, "body"))
+                .expect("push log record");
+            BuiltL0 {
+                bytes: writer.finish().expect("finish rlog L0"),
+                count: 1,
+                series: 1,
+                min_ts: ts,
+                max_ts: ts,
+            }
+        }
+        Format::Rspan => {
+            let mut writer = ravel_rspan::RspanWriter::new(
+                ravel_rspan::RspanConfig::default(),
+                ravel_rspan::writer::ObjectIdentity {
+                    tenant_hash: tenant_hash().0,
+                    shard: SHARD,
+                    writer_id: writer_id.into_bytes(),
+                    writer_epoch: 1,
+                    writer_seq: seq,
+                },
+            );
+            writer.push(span_record(seq as u8, 0, ts, ts + 10));
+            BuiltL0 {
+                bytes: writer.finish().expect("finish rspan L0"),
+                count: 1,
+                series: 1,
+                min_ts: ts,
+                max_ts: ts + 10,
+            }
+        }
+    }
+}
+
+/// Seed one L0 input of `format` at `hour` (data object and commit record),
+/// with its bytes and record altered as `alteration` says.
+async fn seed_l0(
     store: &dyn ObjectStoreBackend,
-    spec: &InputSpec,
-    alteration: Alteration,
+    format: Format,
+    hour: u32,
+    writer_n: u128,
+    seq: u64,
+    alteration: Option<Alteration>,
 ) {
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::PutOptions;
 
     let th = tenant_hash();
-    let written = build_v5_l0(
-        &spec.series,
-        spec.hour,
-        (spec.created_unix_ns, spec.epoch, spec.seq),
-    );
-    let mut bytes = written.bytes.to_vec();
-    let trailer = bytes.len() - ravel_segment::TRAILER_LEN as usize;
+    let writer_id = Uuid::from_u128(writer_n);
+    let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+    let built = build_l0(format, hour, writer_id, seq, created);
+    let mut bytes = built.bytes.clone();
+    // Every trailer is 16 bytes, its `version: u16` after footer_len and
+    // footer_crc32c.
+    let version_at = bytes.len() - 16 + 8;
+    let stamp = |bytes: &mut Vec<u8>| {
+        bytes[version_at..version_at + 2].copy_from_slice(&format.next_version().to_le_bytes());
+    };
+    let mut record_version = format.current_version();
+    let mut damage_after_hash: Option<usize> = None;
     match alteration {
-        Alteration::OutOfWindow | Alteration::CorruptVersionByte => {
-            // The trailer's `version: u16` follows footer_len and footer_crc32c.
-            bytes[trailer + 8..trailer + 10].copy_from_slice(&next_rseg_version().to_le_bytes());
+        None => {}
+        Some(Alteration::OutOfWindow) => {
+            stamp(&mut bytes);
+            record_version = format.next_version();
         }
-        Alteration::CorruptMagic => {
-            let last = bytes.len() - 1;
-            bytes[last] ^= 0xFF;
+        Some(Alteration::CorruptVersionByte) => stamp(&mut bytes),
+        Some(Alteration::CorruptMagic) => damage_after_hash = Some(bytes.len() - 1),
+        Some(Alteration::OutOfWindowCorruptBody) => {
+            stamp(&mut bytes);
+            record_version = format.next_version();
+            damage_after_hash = Some(0);
         }
+        Some(Alteration::NewerRecordOnly) => record_version = format.next_version(),
     }
     let content_hash = match alteration {
-        Alteration::CorruptVersionByte => written.summary.blake3,
-        Alteration::OutOfWindow | Alteration::CorruptMagic => *blake3::hash(&bytes).as_bytes(),
+        Some(Alteration::CorruptVersionByte) => *blake3::hash(&built.bytes).as_bytes(),
+        _ => *blake3::hash(&bytes).as_bytes(),
     };
+    if let Some(at) = damage_after_hash {
+        bytes[at] ^= 0xFF;
+    }
     let data_key = keys::data_key(
         &th,
-        Signal::Metrics,
+        format.signal(),
         SHARD,
-        spec.writer_id,
-        spec.epoch,
-        spec.seq,
+        writer_id,
+        1,
+        seq,
         &content_hash,
     )
     .expect("data key");
@@ -1216,22 +1354,22 @@ async fn seed_altered_input(
         .expect("put data object");
     let rec = record::build(NewCommitRecord {
         tenant_hash: th,
-        signal: Signal::Metrics,
+        signal: format.signal(),
         shard: SHARD,
-        writer_id: spec.writer_id,
-        writer_epoch: spec.epoch,
-        writer_seq: spec.seq,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: seq,
         object_size,
         content_hash,
-        sample_count: written.summary.sample_count,
-        series_count: written.summary.series_count,
-        min_event_ts_ns: written.summary.min_event_ts_ns,
-        max_event_ts_ns: written.summary.max_event_ts_ns,
-        min_ingest_ts_ns: spec.created_unix_ns,
-        max_ingest_ts_ns: spec.created_unix_ns,
-        segment_format_version: u32::from(ravel_segment::VERSION_V7),
-        created_unix_ns: spec.created_unix_ns,
-        ingest_hour_bucket: spec.hour,
+        sample_count: built.count,
+        series_count: built.series,
+        min_event_ts_ns: built.min_ts,
+        max_event_ts_ns: built.max_ts,
+        min_ingest_ts_ns: created,
+        max_ingest_ts_ns: created,
+        segment_format_version: u32::from(record_version),
+        created_unix_ns: created,
+        ingest_hour_bucket: hour,
     })
     .expect("build commit record");
     let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
@@ -1241,20 +1379,31 @@ async fn seed_altered_input(
         .expect("put commit record");
 }
 
-/// Seed two L0 inputs at `hour`, the second altered as `alteration` says.
+/// Seed two intact L0 inputs of `format` at `hour`.
+async fn seed_two(store: &dyn ObjectStoreBackend, format: Format, hour: u32, base: u128) {
+    seed_l0(store, format, hour, base, 1, None).await;
+    seed_l0(store, format, hour, base + 1, 2, None).await;
+}
+
+/// Seed two L0 inputs of `format` at `hour`, the second altered as
+/// `alteration` says.
 async fn seed_with_one_altered(
     store: &dyn ObjectStoreBackend,
+    format: Format,
     hour: u32,
     base: u128,
     alteration: Alteration,
 ) {
-    let specs = two_at(hour, base);
-    seed_input(store, &specs[0]).await;
-    seed_altered_input(store, &specs[1], alteration).await;
+    seed_l0(store, format, hour, base, 1, None).await;
+    seed_l0(store, format, hour, base + 1, 2, Some(alteration)).await;
 }
 
-async fn compaction_record_count(store: &dyn ObjectStoreBackend, hour: u32) -> usize {
-    let bucket = bucket_at(hour);
+async fn compaction_record_count(
+    store: &dyn ObjectStoreBackend,
+    format: Format,
+    hour: u32,
+) -> usize {
+    let bucket = Bucket::new(tenant_hash(), format.signal(), SHARD, hour);
     let prefix = keys::commit_shard_hour_prefix(
         &bucket.tenant_hash,
         bucket.signal,
@@ -1282,6 +1431,7 @@ fn sealed_through(hour: u32) -> FixedClock {
 
 async fn scan(
     store: &dyn ObjectStoreBackend,
+    format: Format,
     clock: &FixedClock,
 ) -> ravel_maintain::Result<ScanReport> {
     scan_and_compact(
@@ -1289,28 +1439,27 @@ async fn scan(
         clock,
         &CompactorConfig::default(),
         tenant_hash(),
-        Signal::Metrics,
+        format.signal(),
         SHARD,
     )
     .await
 }
 
-#[tokio::test]
-async fn an_out_of_window_l0_input_is_held_and_later_hours_still_compact() {
+/// An input a newer build wrote, stamped with its newer version on both its
+/// trailer and its commit record as that build's writer stamps them, holds
+/// its own bucket; the hours before and after it compact, and the cursor
+/// stops before the held hour.
+async fn an_out_of_window_input_is_held_and_later_hours_still_compact(format: Format) {
     let _counter = HELD_COUNTER_LOCK.lock().await;
     let store = MemoryStore::new();
-    for spec in two_at(HOUR - 1, 10) {
-        seed_input(&store, &spec).await;
-    }
-    seed_with_one_altered(&store, HOUR, 20, Alteration::OutOfWindow).await;
-    for spec in two_at(HOUR + 1, 30) {
-        seed_input(&store, &spec).await;
-    }
+    seed_two(&store, format, HOUR - 1, 10).await;
+    seed_with_one_altered(&store, format, HOUR, 20, Alteration::OutOfWindow).await;
+    seed_two(&store, format, HOUR + 1, 30).await;
 
     let before = buckets_held_out_of_window_total();
-    let report = scan(&store, &sealed_through(HOUR + 1))
+    let report = scan(&store, format, &sealed_through(HOUR + 1))
         .await
-        .expect("a held bucket does not fail the scan");
+        .unwrap_or_else(|err| panic!("{format:?}: a held bucket does not fail the scan: {err}"));
 
     assert_eq!(
         report,
@@ -1321,27 +1470,41 @@ async fn an_out_of_window_l0_input_is_held_and_later_hours_still_compact() {
             held_out_of_window: 1,
             cursor_advanced_to: Some(HOUR - 1),
         },
-        "both readable hours compact and the cursor stops before the held hour"
+        "{format:?}: both readable hours compact and the cursor stops before the held hour"
     );
-    assert_eq!(buckets_held_out_of_window_total() - before, 1);
-    assert_eq!(compaction_record_count(&store, HOUR - 1).await, 1);
-    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
-    assert_eq!(compaction_record_count(&store, HOUR + 1).await, 1);
+    assert_eq!(buckets_held_out_of_window_total() - before, 1, "{format:?}");
+    assert_eq!(compaction_record_count(&store, format, HOUR - 1).await, 1);
+    assert_eq!(compaction_record_count(&store, format, HOUR).await, 0);
+    assert_eq!(compaction_record_count(&store, format, HOUR + 1).await, 1);
+}
+
+#[tokio::test]
+async fn an_out_of_window_rseg_input_is_held_and_later_hours_still_compact() {
+    an_out_of_window_input_is_held_and_later_hours_still_compact(Format::Rseg).await;
+}
+
+#[tokio::test]
+async fn an_out_of_window_rlog_input_is_held_and_later_hours_still_compact() {
+    an_out_of_window_input_is_held_and_later_hours_still_compact(Format::Rlog).await;
+}
+
+#[tokio::test]
+async fn an_out_of_window_rspan_input_is_held_and_later_hours_still_compact() {
+    an_out_of_window_input_is_held_and_later_hours_still_compact(Format::Rspan).await;
 }
 
 #[tokio::test]
 async fn a_held_bucket_is_retried_on_the_next_pass() {
     let _counter = HELD_COUNTER_LOCK.lock().await;
     let store = MemoryStore::new();
-    seed_with_one_altered(&store, HOUR, 20, Alteration::OutOfWindow).await;
-    for spec in two_at(HOUR + 1, 30) {
-        seed_input(&store, &spec).await;
-    }
+    let format = Format::Rseg;
+    seed_with_one_altered(&store, format, HOUR, 20, Alteration::OutOfWindow).await;
+    seed_two(&store, format, HOUR + 1, 30).await;
     let clock = sealed_through(HOUR + 1);
 
     let before = buckets_held_out_of_window_total();
-    let first = scan(&store, &clock).await.expect("first pass");
-    let second = scan(&store, &clock).await.expect("second pass");
+    let first = scan(&store, format, &clock).await.expect("first pass");
+    let second = scan(&store, format, &clock).await.expect("second pass");
 
     assert_eq!(
         first,
@@ -1369,44 +1532,75 @@ async fn a_held_bucket_is_retried_on_the_next_pass() {
         2,
         "the held bucket is counted once per pass"
     );
-    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
+    assert_eq!(compaction_record_count(&store, format, HOUR).await, 0);
+}
+
+/// Seed one intact input and one altered as `alteration` says at [`HOUR`],
+/// scan, and return the error the scan fails with, after checking nothing
+/// was held or published.
+async fn scan_error_with_one_altered(format: Format, alteration: Alteration) -> MaintainError {
+    let _counter = HELD_COUNTER_LOCK.lock().await;
+    let store = MemoryStore::new();
+    seed_with_one_altered(&store, format, HOUR, 20, alteration).await;
+
+    let before = buckets_held_out_of_window_total();
+    let err = scan(&store, format, &sealed_through(HOUR))
+        .await
+        .expect_err("the scan fails");
+
+    assert_eq!(
+        buckets_held_out_of_window_total() - before,
+        0,
+        "{format:?}: nothing held: {err:?}"
+    );
+    assert_eq!(compaction_record_count(&store, format, HOUR).await, 0);
+    err
 }
 
 #[tokio::test]
 async fn a_corrupt_input_still_fails_the_scan() {
-    let _counter = HELD_COUNTER_LOCK.lock().await;
-    let store = MemoryStore::new();
-    seed_with_one_altered(&store, HOUR, 20, Alteration::CorruptMagic).await;
-
-    let before = buckets_held_out_of_window_total();
-    let err = scan(&store, &sealed_through(HOUR))
-        .await
-        .expect_err("an undecodable input fails the scan");
-
+    let err = scan_error_with_one_altered(Format::Rseg, Alteration::CorruptMagic).await;
     assert!(
         matches!(err, MaintainError::Segment(ref e) if !matches!(e, SegmentError::UnsupportedVersion(_))),
         "the decoder's own error, not a version refusal: {err:?}"
     );
-    assert_eq!(buckets_held_out_of_window_total() - before, 0);
-    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
 }
 
+/// A flipped version byte in an object this build wrote reads, to the
+/// reader, the same as an object a newer build wrote; the content hash fails,
+/// so it is corruption and the scan fails with the reader's own refusal.
 #[tokio::test]
 async fn a_corrupt_version_byte_is_not_held() {
-    let _counter = HELD_COUNTER_LOCK.lock().await;
-    let store = MemoryStore::new();
-    seed_with_one_altered(&store, HOUR, 20, Alteration::CorruptVersionByte).await;
+    for format in [Format::Rseg, Format::Rlog, Format::Rspan] {
+        let err = scan_error_with_one_altered(format, Alteration::CorruptVersionByte).await;
+        assert!(
+            format.is_version_refusal(&err, format.next_version()),
+            "{format:?}: the reader's own error, unwrapped: {err:?}"
+        );
+    }
+}
 
-    let before = buckets_held_out_of_window_total();
-    let err = scan(&store, &sealed_through(HOUR))
-        .await
-        .expect_err("a version byte that fails the content hash is corruption");
-
-    let version = next_rseg_version();
+/// A metrics input stamped with a newer version on its commit record, whose
+/// object a byte flip has left unmatched to its content hash, is refused by
+/// the newer-than-writable pre-check and the hash check confirms it is not
+/// intact, so the scan fails with the pre-check's refusal.
+#[tokio::test]
+async fn a_newer_metrics_input_that_fails_its_hash_is_not_held() {
+    let err = scan_error_with_one_altered(Format::Rseg, Alteration::OutOfWindowCorruptBody).await;
     assert!(
-        matches!(err, MaintainError::Segment(SegmentError::UnsupportedVersion(v)) if v == version),
-        "the reader's own error, unwrapped: {err:?}"
+        matches!(err, MaintainError::Invariant(ref msg) if msg.contains("newer than the current output version")),
+        "the newer-than-writable refusal: {err:?}"
     );
-    assert_eq!(buckets_held_out_of_window_total() - before, 0);
-    assert_eq!(compaction_record_count(&store, HOUR).await, 0);
+}
+
+/// A metrics commit record stamped newer than this build writes, over an
+/// object whose trailer this build reads, is not an out-of-window object:
+/// the pre-check's refusal stands.
+#[tokio::test]
+async fn a_newer_metrics_record_over_a_readable_object_is_not_held() {
+    let err = scan_error_with_one_altered(Format::Rseg, Alteration::NewerRecordOnly).await;
+    assert!(
+        matches!(err, MaintainError::Invariant(ref msg) if msg.contains("newer than the current output version")),
+        "the newer-than-writable refusal: {err:?}"
+    );
 }

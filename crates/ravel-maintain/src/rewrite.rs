@@ -285,6 +285,38 @@ async fn load_input_catalog_noting_version<C: SegmentCodec>(
     }
 }
 
+/// A [`SegmentCodec::validate_rewrite_inputs`] refusal, checked against the
+/// first input recorded newer than this build can write. A newer writer stamps
+/// its own version on the commit record, so that input's reader is asked too:
+/// when it refuses the object's trailer version as well, the refusal becomes
+/// [`MaintainError::InputOutOfWindow`] for compaction's content-hash check,
+/// still carrying the refusal as its source. An object this build reads, or
+/// one whose read fails any other way, keeps the refusal as it was.
+async fn refusal_noting_version<C: SegmentCodec>(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    inputs: &[crate::read::InputRecord],
+    refusal: MaintainError,
+) -> MaintainError {
+    let Some(input) = inputs.iter().find(|i| C::recorded_newer_than_writable(i)) else {
+        return refusal;
+    };
+    match load_input_catalog_noting_version::<C>(store, config, input).await {
+        Err(MaintainError::InputOutOfWindow {
+            object_key,
+            version,
+            content_hash,
+            source: _,
+        }) => MaintainError::InputOutOfWindow {
+            object_key,
+            version,
+            content_hash,
+            source: Box::new(refusal),
+        },
+        _ => refusal,
+    }
+}
+
 /// What [`rewrite_and_publish_loaded`] did.
 #[derive(Debug)]
 pub(crate) enum FencedRewrite {
@@ -456,7 +488,9 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     if let Some(t) = config.merge_memory_tracker.as_ref() {
         t.reset_for_run();
     }
-    C::validate_rewrite_inputs(&inputs)?;
+    if let Err(refusal) = C::validate_rewrite_inputs(&inputs) {
+        return Err(refusal_noting_version::<C>(store, config, &inputs, refusal).await);
+    }
     let mut inputs = inputs;
     let mut hash = input_set_hash(&inputs);
 

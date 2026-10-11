@@ -4336,7 +4336,9 @@ fn render_maintain_safety_family(
          this build's reader window and its bytes match its commit record's content hash, \
          counted once per bucket per pass, summed over every signal since process start \
          (ADR-2708 D5b). Later hours still compact and the bucket is retried every pass. A \
-         rising total means an upgrade is unfinished: finish it or roll back.",
+         rising total means an upgrade is unfinished: the bucket compacts once a build that \
+         reads the object runs here, or stops being retried once retention tombstones it. \
+         Rolling back does not clear it.",
         "counter",
     );
     write_sample(

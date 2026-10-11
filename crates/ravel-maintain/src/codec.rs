@@ -119,6 +119,13 @@ pub trait SegmentCodec {
         Ok(())
     }
 
+    /// Whether `input` is recorded at a format version newer than this
+    /// codec's output version, which is what [`Self::validate_rewrite_inputs`]
+    /// refuses. The default refuses nothing, so it names nothing.
+    fn recorded_newer_than_writable(_input: &InputRecord) -> bool {
+        false
+    }
+
     /// Why this codec's writer would refuse to rewrite the input `catalog`
     /// describes, with the decoder's error, or `None` when it can rewrite it.
     /// Compaction leaves such an input out of its merge instead of failing on
@@ -158,7 +165,7 @@ impl SegmentCodec for RsegCodec {
         // (older included), because RSEG could only copy pages verbatim.
         for input in inputs {
             let version = input.record.segment_format_version;
-            if version > OUTPUT_FORMAT_VERSION {
+            if Self::recorded_newer_than_writable(input) {
                 return Err(crate::error::MaintainError::Invariant(format!(
                     "RSEG rewrite input {:?} is recorded as format version {version}, newer than \
                      the current output version {OUTPUT_FORMAT_VERSION}: a rewrite migrates an \
@@ -169,6 +176,10 @@ impl SegmentCodec for RsegCodec {
             }
         }
         Ok(())
+    }
+
+    fn recorded_newer_than_writable(input: &InputRecord) -> bool {
+        input.record.segment_format_version > crate::build::OUTPUT_FORMAT_VERSION
     }
 
     async fn load_input_catalog(

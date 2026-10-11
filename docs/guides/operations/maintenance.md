@@ -793,8 +793,22 @@ Compaction then reads the whole object and compares its blake3 hash with the
   Only the content hash tells them apart. A mismatch is corruption, and the
   scan fails with the reader's own error, as for any other undecodable input.
 
-Any other decode error fails the scan as before. Only a version refusal is
-checked against the hash.
+For metrics, a newer writer also stamps its own version on the commit record,
+and compaction refuses a record stamped newer than this build writes before it
+loads any input. Compaction then asks that input's reader as well. If the
+reader refuses the object's version too, the hash decides as above. If the
+reader accepts the object, or the hash does not match, the scan fails with
+the refusal of the newer record.
+
+Only a version refusal is checked against the hash. Any other decode error
+fails the scan, but a held bucket can hide a corrupt input in the same
+bucket. For logs and spans, compaction loads a bucket's inputs in their
+listed order and stops at the first error, so an intact out-of-window input
+listed before a corrupt one holds the bucket and that pass does not report
+the corruption. For metrics, a newer commit record stops compaction before
+any other input is loaded, so a corrupt input anywhere in the bucket goes
+unread for as long as the hold lasts. Either way the corruption surfaces once
+the held input no longer stops the load.
 
 What an operator sees for a held bucket:
 
@@ -808,10 +822,38 @@ What an operator sees for a held bucket:
   failed one.
 
 A held bucket is retried on every pass. The scan's advisory cursor does not
-move past it, and the memo never records it as finished. It compacts on the
-first pass after a build that reads the object runs here, once the upgrade
-finishes. Rolling back the newer side does not clear the hold: the object
-stays in the bucket, and only a build that reads it can compact it.
+move past it, and the memo never records it as finished. The hold ends in one
+of two ways:
+
+- **A build that reads the object runs here.** The bucket compacts on that
+  build's first pass, once the upgrade finishes.
+- **Retention tombstones the bucket.** Compaction skips a tombstoned bucket
+  before it loads any input, so no later pass reads the held object for
+  compaction. The retention sweep still refuses to delete the out-of-window
+  object (see [The format-version hold](#the-format-version-hold)), so the
+  data stays in the bucket. With retention off, only the first way ends the
+  hold.
+
+Rolling back the newer side does not clear the hold: the object stays in the
+bucket, and only a build that reads it can compact it.
+
+Because the memo never records a held bucket as finished, each pass plans it
+again: the bucket listing and its commit-record GETs, the input loads up to
+the refusal (for metrics, a footer read of the refused object), and, when
+maintenance is coordinated, the claim's acquire, renewal and completion
+writes under `sys/maintain/claims/`. On top of that, each pass costs a
+whole-object GET and a blake3 hash of the held object. That GET is counted
+under the `catalog_read` request phase, and the hash runs on the CPU read gate
+under the `compaction` site. The data signals already visit every sealed
+bucket of a shard on each pass, skipping the ones the memo records as
+finished, so a hold adds no other bucket to that walk.
+The query-audit shard's compaction pass resumes from its advisory cursor
+instead, and the cursor stops before the first held hour. While a bucket is
+held, every pass therefore walks again every later hour of that shard, one
+bucket listing each, from the held hour to the newest sealed hour. Nothing
+bounds that span except the end of the hold: the query-audit shard is never
+tombstoned, so for it the hold ends when a build that reads the object runs
+here, or when the query-audit age sweep deletes the held record.
 
 `ravel-cli maintain compact-tenant` prints `outcome=HeldOutOfWindow
 version=<n>` for a held bucket, counts it on the summary's

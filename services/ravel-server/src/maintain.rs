@@ -6338,12 +6338,25 @@ mod tests {
             writer.push(r.clone()).expect("push log record");
         }
         let bytes = bytes::Bytes::from(writer.finish().expect("finish rlog L0"));
-        publish_log_bytes(store, tenant, writer_id, hour, records, bytes).await
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        publish_log_bytes(
+            store,
+            tenant,
+            writer_id,
+            hour,
+            records,
+            bytes,
+            content_hash,
+            ravel_logseg::footer::VERSION,
+        )
+        .await
     }
 
     /// Store `bytes` as the logs L0 object of `writer_id` holding `records`
-    /// in `hour` of shard 0, and publish a commit record hashed over them;
-    /// returns the data object's key.
+    /// in `hour` of shard 0, and publish a commit record carrying
+    /// `content_hash` and `segment_format_version`; returns the data object's
+    /// key.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_log_bytes(
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
@@ -6351,8 +6364,9 @@ mod tests {
         hour: u32,
         records: &[ravel_logseg::LogRecord],
         bytes: bytes::Bytes,
+        content_hash: [u8; 32],
+        segment_format_version: u16,
     ) -> String {
-        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let min_ts = records.iter().map(|r| r.ts_ns).min().expect("records");
         let max_ts = records.iter().map(|r| r.ts_ns).max().expect("records");
         let created = i64::from(hour) * TEST_NS_PER_HOUR + 1;
@@ -6371,7 +6385,7 @@ mod tests {
             max_event_ts_ns: max_ts,
             min_ingest_ts_ns: created,
             max_ingest_ts_ns: created,
-            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            segment_format_version: u32::from(segment_format_version),
             created_unix_ns: created,
             ingest_hour_bucket: hour,
         })
@@ -6447,24 +6461,34 @@ mod tests {
         samples[0]
     }
 
-    /// An RLOG input another build wrote at a version this build's reader
-    /// refuses holds its bucket (ADR-2708 D5b): the tick still compacts the
-    /// later hour, the scan does not fail, so the unit is not stalled even at
-    /// a threshold of one, and the rendered counter moves by exactly one.
-    #[tokio::test]
-    async fn maintain_tick_holds_an_out_of_window_bucket_and_reports_no_stall() {
-        const HELD_HOUR: u32 = 1;
-        const LATER_HOUR: u32 = 2;
-        let store = MemoryStore::new();
-        let tenant = TenantId::new("acme").hash();
-        let ts = |hour: u32, n: i64| i64::from(hour) * TEST_NS_PER_HOUR + 1_000 + n;
+    /// Serializes the tests that read the process-wide
+    /// `buckets_held_out_of_window_total` counter.
+    static HELD_OUT_OF_WINDOW_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-        let held_records = [subject_log_record(0, ts(HELD_HOUR, 0), "a")];
+    /// The ingest hour of the out-of-window bucket the D5b tests seed, and a
+    /// later hour of two ordinary inputs that compacts when the scan goes on.
+    const OUT_OF_WINDOW_HOUR: u32 = 1;
+    const AFTER_OUT_OF_WINDOW_HOUR: u32 = 2;
+
+    /// Seed [`OUT_OF_WINDOW_HOUR`] with an ordinary RLOG input and one whose
+    /// trailer is stamped one version past this build's reader window, and
+    /// [`AFTER_OUT_OF_WINDOW_HOUR`] with two ordinary inputs. The stamped
+    /// input's commit record carries the newer version and, when
+    /// `hash_matches`, the hash of the stamped bytes; otherwise the hash of
+    /// the bytes before stamping, which is what a flipped version byte on an
+    /// object this build wrote looks like.
+    async fn seed_out_of_window_rlog(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        hash_matches: bool,
+    ) {
+        let ts = |hour: u32, n: i64| i64::from(hour) * TEST_NS_PER_HOUR + 1_000 + n;
+        let held_records = [subject_log_record(0, ts(OUT_OF_WINDOW_HOUR, 0), "a")];
         publish_log_l0(
-            &store,
-            &tenant,
+            store,
+            tenant,
             Uuid::from_u128(0x2723_0000),
-            HELD_HOUR,
+            OUT_OF_WINDOW_HOUR,
             &held_records,
             false,
         )
@@ -6480,49 +6504,67 @@ mod tests {
                 writer_seq: 1,
             },
         );
-        let newer_records = [subject_log_record(0, ts(HELD_HOUR, 1), "b")];
+        let newer_records = [subject_log_record(0, ts(OUT_OF_WINDOW_HOUR, 1), "b")];
         writer
             .push(newer_records[0].clone())
             .expect("push log record");
         let mut bytes = writer.finish().expect("finish rlog L0");
+        let unstamped_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         // The trailer's `version: u16` follows footer_len and footer_crc32c.
         let at = bytes.len() - 16 + 8;
         let version = ravel_logseg::footer::SUPPORTED_VERSIONS.newest() + 1;
         bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+        let content_hash = if hash_matches {
+            *blake3::hash(&bytes).as_bytes()
+        } else {
+            unstamped_hash
+        };
         publish_log_bytes(
-            &store,
-            &tenant,
+            store,
+            tenant,
             newer_writer,
-            HELD_HOUR,
+            OUT_OF_WINDOW_HOUR,
             &newer_records,
             bytes::Bytes::from(bytes),
+            content_hash,
+            version,
         )
         .await;
         for n in 0..2u8 {
             publish_log_l0(
-                &store,
-                &tenant,
+                store,
+                tenant,
                 Uuid::from_u128(0x2723_0010 + u128::from(n)),
-                LATER_HOUR,
-                &[subject_log_record(0, ts(LATER_HOUR, i64::from(n)), "c")],
+                AFTER_OUT_OF_WINDOW_HOUR,
+                &[subject_log_record(
+                    0,
+                    ts(AFTER_OUT_OF_WINDOW_HOUR, i64::from(n)),
+                    "c",
+                )],
                 false,
             )
             .await;
         }
+    }
 
+    /// One maintain tick at a stall threshold of one over `store`, sealed
+    /// well past [`AFTER_OUT_OF_WINDOW_HOUR`]: the report, the change in the
+    /// rendered held counter, and the stalled-unit count.
+    async fn out_of_window_tick(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+    ) -> (MaintainReport, u64, u64) {
         let safety = MaintenanceSafetyMetrics::default();
         let ownership = MaintenanceOwnershipMetrics::new(1);
         let worker = solo_worker();
         let live_set = worker.solo_live_set();
         let mut memo = MaintainMemo::with_default_interval();
-        let clock = FixedClock::new(i64::from(LATER_HOUR + 3) * TEST_NS_PER_HOUR);
-        // The counter is process-wide; no other test in this binary holds a
-        // bucket, and the delta keeps this one exact regardless.
+        let clock = FixedClock::new(i64::from(AFTER_OUT_OF_WINDOW_HOUR + 3) * TEST_NS_PER_HOUR);
         let before = held_out_of_window_sample(&rendered_metrics(&safety));
         let report = run_tick_with_clock(
             &clock,
-            &store,
-            &tenant,
+            store,
+            tenant,
             &CompactorConfig::default(),
             &RetentionConfig::default(),
             1,
@@ -6534,15 +6576,45 @@ mod tests {
         )
         .await;
         let after = held_out_of_window_sample(&rendered_metrics(&safety));
+        (report, after - before, ownership.units_stalled())
+    }
+
+    /// An RLOG input another build wrote at a version this build's reader
+    /// refuses holds its bucket (ADR-2708 D5b): the tick still compacts the
+    /// later hour, the scan does not fail, so the unit is not stalled even at
+    /// a threshold of one, and the rendered counter moves by exactly one.
+    #[tokio::test]
+    async fn maintain_tick_holds_an_out_of_window_bucket_and_reports_no_stall() {
+        let _serial = HELD_OUT_OF_WINDOW_SERIAL.lock().await;
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        seed_out_of_window_rlog(&store, &tenant, true).await;
+
+        let (report, held_delta, stalled) = out_of_window_tick(&store, &tenant).await;
 
         assert_eq!(report.held_out_of_window, 1, "{report:?}");
         assert_eq!(report.compacted, 1, "the later hour compacts: {report:?}");
-        assert_eq!(after - before, 1, "one held bucket on the rendered counter");
-        assert_eq!(
-            ownership.units_stalled(),
-            0,
-            "a held bucket is not a failed scan"
-        );
+        assert_eq!(held_delta, 1, "one held bucket on the rendered counter");
+        assert_eq!(stalled, 0, "a held bucket is not a failed scan");
+    }
+
+    /// The same out-of-window trailer over bytes whose content hash does not
+    /// match the commit record is corruption, not a newer writer: nothing is
+    /// held, the scan fails before it reaches the later hour, and the unit
+    /// stalls at a threshold of one.
+    #[tokio::test]
+    async fn maintain_tick_stalls_on_an_out_of_window_input_that_fails_its_hash() {
+        let _serial = HELD_OUT_OF_WINDOW_SERIAL.lock().await;
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        seed_out_of_window_rlog(&store, &tenant, false).await;
+
+        let (report, held_delta, stalled) = out_of_window_tick(&store, &tenant).await;
+
+        assert_eq!(report.held_out_of_window, 0, "{report:?}");
+        assert_eq!(report.compacted, 0, "the scan stops: {report:?}");
+        assert_eq!(held_delta, 0, "nothing held on the rendered counter");
+        assert_eq!(stalled, 1, "a failed scan stalls the unit");
     }
 
     /// Submit a logs erasure request for [`TEST_ERASED_SUBJECT`] acknowledged

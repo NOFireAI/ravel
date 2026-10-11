@@ -154,7 +154,10 @@ pub enum MaintainError {
     /// ([`crate::compact::CompactionOutcome::HeldOutOfWindow`]) on a match, or
     /// fails with `source` on a mismatch, since the readers check the version
     /// before the footer CRC and a corrupted version field reads the same.
-    /// Every other rewrite gets `source` back unchanged. Displays as `source`.
+    /// `source` is the reader's refusal, or the codec's pre-check refusal of a
+    /// record stamped newer than this build writes when the reader refused
+    /// that record's object too. Every other rewrite gets `source` back
+    /// unchanged. Displays as `source`.
     #[error("{source}")]
     InputOutOfWindow {
         object_key: String,
