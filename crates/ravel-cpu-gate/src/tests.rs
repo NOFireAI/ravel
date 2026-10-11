@@ -423,8 +423,9 @@ impl MonotonicClock for StepClock {
     }
 }
 
-/// One uncontended job reads the clock four times in a fixed order: wait
-/// start, wait end, run start, run end.
+/// One uncontended job reads the clock six times in a fixed order: wait
+/// start, wait end, handoff, run start, run end, resume. Run start ends the
+/// handoff and run end starts the post-return time.
 #[test]
 fn wait_and_run_times_come_from_the_injected_clock() {
     run_with_watchdog(
@@ -447,6 +448,201 @@ fn wait_and_run_times_come_from_the_injected_clock() {
                 let snapshot = gate.snapshot();
                 assert_eq!((snapshot.wait_nanos_sum, snapshot.wait_count), (10, 1));
                 assert_eq!((snapshot.run_nanos_sum, snapshot.run_count), (10, 1));
+                let fold = snapshot.sites[ReadSite::Fold.index()];
+                assert_eq!((fold.handoff_nanos_sum, fold.handoff_count), (10, 1));
+                assert_eq!((fold.return_nanos_sum, fold.return_count), (10, 1));
+            });
+        },
+    );
+}
+
+/// Reads 0, 10, 20, ... like [`StepClock`], plus `JUMP` from read `jump_at`
+/// on, so exactly one interval of the gate's fixed read order grows by `JUMP`.
+struct JumpClock {
+    reads: AtomicU64,
+    jump_at: u64,
+}
+
+const JUMP: u64 = 1_000;
+/// Reads of one uncontended job, in order.
+const READ_RUN_START: u64 = 3;
+const READ_RESUME: u64 = 5;
+
+impl MonotonicClock for JumpClock {
+    fn now_nanos(&self) -> u64 {
+        let read = self.reads.fetch_add(1, Ordering::SeqCst);
+        read * 10 + if read >= self.jump_at { JUMP } else { 0 }
+    }
+}
+
+/// Runs one uncontended job on `site` under a [`JumpClock`] and returns the
+/// snapshot.
+fn one_job_with_jump(jump_at: u64, site: WriteSite) -> CpuGateSnapshot<WriteSite> {
+    current_thread_runtime().block_on(async {
+        let gate = CpuGate::<WriteSite>::new(
+            CpuGateConfig {
+                permits: 1,
+                inline_floor_bytes: 0,
+                eval_floor_samples: 0,
+            },
+            Arc::new(JumpClock {
+                reads: AtomicU64::new(0),
+                jump_at,
+            }),
+        );
+        assert_eq!(gate.run(site, JobSize::Bytes(0), || 1).await, Ok(1));
+        gate.snapshot()
+    })
+}
+
+/// A delay between handing the job to the blocking pool and its first
+/// instruction lands in the site's handoff sum and nowhere else.
+#[test]
+fn delay_before_the_job_starts_lands_in_handoff_only() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running one job"),
+        || {
+            let snapshot = one_job_with_jump(READ_RUN_START, WriteSite::OtapDecode);
+            let site = snapshot.sites[WriteSite::OtapDecode.index()];
+            assert_eq!(
+                (site.handoff_nanos_sum, site.handoff_count),
+                (10 + JUMP, 1),
+                "the handoff delay is the handoff"
+            );
+            assert_eq!(
+                (site.return_nanos_sum, site.return_count),
+                (10, 1),
+                "the handoff delay is not post-return"
+            );
+            assert_eq!(snapshot.wait_nanos_sum, 10, "nor permit wait");
+            assert_eq!(snapshot.run_nanos_sum, 10, "nor run time");
+            let other_sites: u64 = snapshot
+                .sites
+                .iter()
+                .filter(|entry| entry.site != WriteSite::OtapDecode)
+                .map(|entry| entry.handoff_count + entry.return_count)
+                .sum();
+            assert_eq!(other_sites, 0);
+        },
+    );
+}
+
+/// A delay between the job's last instruction and its caller resuming lands
+/// in the site's post-return sum and nowhere else.
+#[test]
+fn delay_before_the_caller_resumes_lands_in_post_return_only() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running one job"),
+        || {
+            let snapshot = one_job_with_jump(READ_RESUME, WriteSite::LogFlush);
+            let site = snapshot.sites[WriteSite::LogFlush.index()];
+            assert_eq!(
+                (site.return_nanos_sum, site.return_count),
+                (10 + JUMP, 1),
+                "the resume delay is post-return"
+            );
+            assert_eq!(
+                (site.handoff_nanos_sum, site.handoff_count),
+                (10, 1),
+                "the resume delay is not the handoff"
+            );
+            assert_eq!(snapshot.wait_nanos_sum, 10, "nor permit wait");
+            assert_eq!(snapshot.run_nanos_sum, 10, "nor run time");
+        },
+    );
+}
+
+/// An inline job records neither time. A gated job that panics records its
+/// handoff, since it started, and no post-return, since nothing returned.
+#[test]
+fn inline_records_neither_and_a_panic_records_only_handoff() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running an inline and a panicking job"),
+        || {
+            current_thread_runtime().block_on(async {
+                let gate = CpuGate::<ReadSite>::new(
+                    CpuGateConfig::with_permits(1),
+                    Arc::new(StepClock(AtomicU64::new(0))),
+                );
+                let inline = gate.run(ReadSite::LogBlock, JobSize::Bytes(0), || 1).await;
+                assert_eq!(inline, Ok(1));
+                let panicked = gate
+                    .run(
+                        ReadSite::LogPostings,
+                        JobSize::Bytes(DEFAULT_INLINE_FLOOR_BYTES),
+                        || -> u32 { panic!("decode panicked") },
+                    )
+                    .await;
+                assert_eq!(panicked, Err(CpuGateError::Panicked));
+
+                let snapshot = gate.snapshot();
+                let inline_site = snapshot.sites[ReadSite::LogBlock.index()];
+                assert_eq!(inline_site.inline, 1);
+                assert_eq!(
+                    (inline_site.handoff_count, inline_site.return_count),
+                    (0, 0),
+                    "an inline job records neither time"
+                );
+                let panicked_site = snapshot.sites[ReadSite::LogPostings.index()];
+                assert_eq!(
+                    (panicked_site.handoff_nanos_sum, panicked_site.handoff_count),
+                    (10, 1),
+                    "a started job that panics records its handoff"
+                );
+                assert_eq!(
+                    (panicked_site.return_nanos_sum, panicked_site.return_count),
+                    (0, 0),
+                    "a panicked job records no post-return"
+                );
+            });
+        },
+    );
+}
+
+/// A job whose caller stopped waiting records its handoff and no
+/// post-return: nobody resumed.
+#[test]
+fn abandoned_job_records_handoff_and_no_post_return() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} after dropping a running job's waiter"),
+        || {
+            current_thread_runtime().block_on(async {
+                let gate = floorless_gate::<ReadSite>(1);
+                let (began_tx, mut began_rx) = unbounded_channel();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+
+                let job_gate = Arc::clone(&gate);
+                let job = parked_job(1, began_tx, release_rx);
+                let first = tokio::spawn(async move {
+                    job_gate
+                        .run(ReadSite::Compaction, JobSize::Bytes(u64::MAX), job)
+                        .await
+                });
+                assert_eq!(began_rx.recv().await, Some(1));
+                first.abort();
+                assert!(first.await.unwrap_err().is_cancelled());
+
+                drop(release_tx);
+                let next = gate
+                    .run(ReadSite::Fold, JobSize::Bytes(u64::MAX), || 2)
+                    .await;
+                assert_eq!(
+                    next,
+                    Ok(2),
+                    "the next job runs once the abandoned one returns"
+                );
+                assert_eq!(gate.abandoned(), 1);
+
+                let site = gate.snapshot().sites[ReadSite::Compaction.index()];
+                assert_eq!(
+                    (site.handoff_count, site.return_count),
+                    (1, 0),
+                    "an abandoned job records its handoff and no post-return"
+                );
             });
         },
     );

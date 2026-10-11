@@ -403,8 +403,8 @@ pub enum Label {
     /// Which ADR-1702 CPU gate a `ravel_cpu_gate_*` sample belongs to:
     /// `read` or `write`. A closed enum owned by [`ravel_cpu_gate`].
     CpuGate(ravel_cpu_gate::GateKind),
-    /// Which read-gate call site a `ravel_cpu_gate_jobs_total` or
-    /// `ravel_cpu_gate_inline_total` sample counts. A closed enum owned by
+    /// Which read-gate call site a per-site CPU gate sample counts. A closed
+    /// enum owned by
     /// [`ravel_cpu_gate`]; shares the `site` key with [`Label::WriteGateSite`].
     ReadGateSite(ravel_cpu_gate::ReadSite),
     /// Which write-gate call site a per-site CPU gate sample counts. Shares the
@@ -3252,6 +3252,10 @@ struct CpuGateSiteRow {
     site: Label,
     jobs: u64,
     inline: u64,
+    handoff_nanos_sum: u64,
+    handoff_count: u64,
+    return_nanos_sum: u64,
+    return_count: u64,
 }
 
 /// Reads one whole-gate figure off a [`CpuGateRow`].
@@ -3260,6 +3264,9 @@ type GateFigure = fn(&CpuGateRow) -> u64;
 type GateSumCount = fn(&CpuGateRow) -> (u64, u64);
 /// Reads one per-site figure off a [`CpuGateSiteRow`].
 type SiteFigure = fn(&CpuGateSiteRow) -> u64;
+/// Reads one per-site summary's nanosecond sum and count off a
+/// [`CpuGateSiteRow`].
+type SiteSumCount = fn(&CpuGateSiteRow) -> (u64, u64);
 
 impl CpuGateRow {
     fn new<S: ravel_cpu_gate::GateSite>(
@@ -3283,6 +3290,10 @@ impl CpuGateRow {
                     site: site_label(site.site),
                     jobs: site.jobs,
                     inline: site.inline,
+                    handoff_nanos_sum: site.handoff_nanos_sum,
+                    handoff_count: site.handoff_count,
+                    return_nanos_sum: site.return_nanos_sum,
+                    return_count: site.return_count,
                 })
                 .collect(),
         }
@@ -3290,8 +3301,8 @@ impl CpuGateRow {
 }
 
 /// The ADR-1702 decision 11 CPU gate families. Every sample carries `{mode,
-/// gate}`; the two per-site counters add `site`, one sample for every site in
-/// that gate's closed set, zero included. A rising mean wait
+/// gate}`; the per-site counters and summaries add `site`, one sample for
+/// every site in that gate's closed set, zero included. A rising mean wait
 /// (`wait_seconds_sum / wait_seconds_count` over a window) with `running` at
 /// `permits` means the node is CPU-bound on decode.
 ///
@@ -3300,6 +3311,12 @@ impl CpuGateRow {
 /// from. A wait is counted when it ends with a permit, so a waiter dropped in
 /// the queue adds to neither. `abandoned_total` counts started jobs whose
 /// waiter was gone when they returned.
+///
+/// The per-site `handoff_seconds` and `return_seconds` summaries (the ADR-1702
+/// handoff and post-return amendment) time a gated job's trip onto the blocking
+/// pool and back: from `spawn_blocking` to the job's first instruction, and
+/// from its last instruction to the caller resuming. Inline jobs add to
+/// neither.
 fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot) {
     let rows = [
         CpuGateRow::new(&gates.read, Label::ReadGateSite),
@@ -3396,6 +3413,32 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
                     &[Label::Mode(mode), row.gate.clone(), site.site.clone()],
                     value(site),
                 );
+            }
+        }
+    }
+
+    let per_site_summaries: [(&str, &str, SiteSumCount); 2] = [
+        (
+            "ravel_cpu_gate_handoff_seconds",
+            "Time from handing a CPU gate job to the blocking pool to its first instruction there, per call site.",
+            |site| (site.handoff_nanos_sum, site.handoff_count),
+        ),
+        (
+            "ravel_cpu_gate_return_seconds",
+            "Time from a CPU gate job's last instruction to its waiting caller resuming, per call site.",
+            |site| (site.return_nanos_sum, site.return_count),
+        ),
+    ];
+    for (name, help, value) in per_site_summaries {
+        write_header(out, name, help, "summary");
+        let sum_name = format!("{name}_sum");
+        let count_name = format!("{name}_count");
+        for row in &rows {
+            for site in &row.sites {
+                let (nanos, count) = value(site);
+                let labels = [Label::Mode(mode), row.gate.clone(), site.site.clone()];
+                write_sample_f64(out, &sum_name, &labels, nanos_to_seconds(nanos));
+                write_sample(out, &count_name, &labels, count);
             }
         }
     }
@@ -9186,6 +9229,10 @@ mod tests {
         snapshot.write.run_nanos_sum = 250_000_000;
         snapshot.write.run_count = 2;
         snapshot.write.sites[5].jobs = 8;
+        snapshot.read.sites[0].handoff_nanos_sum = 3_000_000;
+        snapshot.read.sites[0].handoff_count = 3;
+        snapshot.write.sites[5].return_nanos_sum = 500_000;
+        snapshot.write.sites[5].return_count = 2;
         let runtime = RuntimeSnapshot {
             workers: 2,
             alive_tasks: 11,
@@ -9206,6 +9253,8 @@ mod tests {
             ("ravel_cpu_gate_abandoned_total", "counter"),
             ("ravel_cpu_gate_jobs_total", "counter"),
             ("ravel_cpu_gate_inline_total", "counter"),
+            ("ravel_cpu_gate_handoff_seconds", "summary"),
+            ("ravel_cpu_gate_return_seconds", "summary"),
             ("ravel_runtime_workers", "gauge"),
             ("ravel_runtime_alive_tasks", "gauge"),
             ("ravel_runtime_global_queue_depth", "gauge"),
@@ -9235,6 +9284,11 @@ mod tests {
             "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 6",
             "ravel_cpu_gate_jobs_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 8",
             "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 0",
+            "ravel_cpu_gate_handoff_seconds_sum{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 0.003",
+            "ravel_cpu_gate_handoff_seconds_count{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 3",
+            "ravel_cpu_gate_return_seconds_sum{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 0",
+            "ravel_cpu_gate_return_seconds_sum{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 0.0005",
+            "ravel_cpu_gate_return_seconds_count{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 2",
             "ravel_runtime_workers{mode=\"all\"} 2",
             "ravel_runtime_alive_tasks{mode=\"all\"} 11",
             "ravel_runtime_global_queue_depth{mode=\"all\"} 4",
@@ -9250,7 +9304,14 @@ mod tests {
 
         use ravel_cpu_gate::GateSite;
         let sites = ravel_cpu_gate::ReadSite::ALL.len() + ravel_cpu_gate::WriteSite::ALL.len();
-        for family in ["ravel_cpu_gate_jobs_total{", "ravel_cpu_gate_inline_total{"] {
+        for family in [
+            "ravel_cpu_gate_jobs_total{",
+            "ravel_cpu_gate_inline_total{",
+            "ravel_cpu_gate_handoff_seconds_sum{",
+            "ravel_cpu_gate_handoff_seconds_count{",
+            "ravel_cpu_gate_return_seconds_sum{",
+            "ravel_cpu_gate_return_seconds_count{",
+        ] {
             assert_eq!(
                 body.lines().filter(|line| line.starts_with(family)).count(),
                 sites,
