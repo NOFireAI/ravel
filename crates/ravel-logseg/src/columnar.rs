@@ -37,7 +37,10 @@
 //! cell whose column is absent from the block or was projected away by the
 //! scan's [`ColumnSelection`](crate::ColumnSelection).
 
-use crate::block::{BytesColRef, DecodedBlock, I64Column};
+use std::sync::Arc;
+
+use crate::block::{BytesColRef, DecodedBlock, DictColumn, I64Column};
+use crate::dict_values::DictValues;
 use crate::field_dir::FieldDir;
 use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
@@ -62,23 +65,39 @@ pub struct AttrColumn {
 /// rows (ADR-0099 decision 4).
 ///
 /// Handed out only for a column whose page was dictionary-encoded, by
-/// [`ColumnarBlockView::str_dict`]. It exposes the distinct values and one id
-/// per surviving row, indexed by surviving row position exactly as every other
-/// per-row accessor is -- never the block's storage vectors.
+/// [`ColumnarBlockView::str_dict`]. It exposes the shared dictionary and one
+/// key per surviving row ([`values`](Self::values), [`key_at`](Self::key_at)),
+/// indexed by surviving row position exactly as every other per-row accessor
+/// is -- never the block's storage vectors. [`dict`](Self::dict) and
+/// [`id_at`](Self::id_at) are the same column as owned entries and ids, built
+/// on first use.
 pub struct StrDictColumn<'a> {
-    dict: &'a [Vec<u8>],
-    /// One entry per block row, `Some(id)` indexing `dict`, `None` for an absent
-    /// row. Addressed through `rows` so callers see surviving-row indices only.
-    ids: &'a [Option<u32>],
+    col: &'a DictColumn,
     /// Block row positions of the surviving rows, ascending (the view's `rows`).
     rows: &'a [usize],
 }
 
 impl<'a> StrDictColumn<'a> {
-    /// The distinct values, in the page's dictionary order. Id `k` from
-    /// [`id_at`](Self::id_at) addresses `dict()[k as usize]`.
+    /// The dictionary every key indexes, shared with every other block that
+    /// reads it: a row group dictionary is one `Arc` for its whole row group
+    /// (ADR-2773 decision D3), so callers may key a cache on its address.
+    pub fn values(&self) -> &'a Arc<DictValues> {
+        self.col.values()
+    }
+
+    /// The key of surviving row `i` into [`values`](Self::values), or `None`
+    /// when that row has no value for the column or `i` is out of range.
+    /// `Some(k)` always indexes `values` in bounds.
+    pub fn key_at(&self, i: usize) -> Option<i32> {
+        self.col.key(*self.rows.get(i)?)
+    }
+
+    /// The distinct values the block uses, in the page's dictionary order: a
+    /// row group dictionary narrowed to the block's entries, a tag 7 page's
+    /// dictionary whole. Id `k` from [`id_at`](Self::id_at) addresses
+    /// `dict()[k as usize]`. Built (and cloned) on first use.
     pub fn dict(&self) -> &'a [Vec<u8>] {
-        self.dict
+        &self.col.legacy().dict
     }
 
     /// The number of surviving rows: the length [`id_at`](Self::id_at) and
@@ -92,12 +111,13 @@ impl<'a> StrDictColumn<'a> {
         self.rows.is_empty()
     }
 
-    /// The dictionary id of surviving row `i`, or `None` when that row has no
-    /// value for the column (absent per the presence bitmap) or `i` is out of
-    /// range. `Some(id)` always indexes [`dict`](Self::dict) in bounds.
+    /// The [`dict`](Self::dict) id of surviving row `i`, or `None` when that
+    /// row has no value for the column (absent per the presence bitmap) or `i`
+    /// is out of range. `Some(id)` always indexes [`dict`](Self::dict) in
+    /// bounds.
     pub fn id_at(&self, i: usize) -> Option<u32> {
         let row = *self.rows.get(i)?;
-        self.ids.get(row).copied().flatten()
+        self.col.legacy().ids.get(row).copied().flatten()
     }
 
     /// The dictionary ids of the surviving rows in order (see
@@ -111,8 +131,8 @@ impl<'a> StrDictColumn<'a> {
     /// surviving row; it exists so a test can prove the dictionary form fuses
     /// back to the per-row form.
     pub fn value_at(&self, i: usize) -> Option<&'a [u8]> {
-        let id = self.id_at(i)? as usize;
-        self.dict.get(id).map(Vec::as_slice)
+        let k = self.key_at(i)?;
+        self.col.values().entry(k as usize)
     }
 }
 
@@ -746,10 +766,9 @@ impl<'a> ColumnarBlockView<'a> {
     /// the distinct byte values and the ids address them, so the caller learns
     /// nothing of how the column is stored beyond that it deduplicates.
     pub fn str_dict(&self, column_id: u32) -> Option<StrDictColumn<'a>> {
-        let (dict, ids) = self.block.str_dict(column_id)?;
+        let col = self.block.str_dict(column_id)?;
         Some(StrDictColumn {
-            dict,
-            ids,
+            col,
             rows: self.rows,
         })
     }

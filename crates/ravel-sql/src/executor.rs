@@ -409,6 +409,13 @@ pub struct SqlStats {
     /// `int_values_buffers` counter and summed over every logs scan in the
     /// plan. Zero for a metrics query.
     pub int_values_buffers: u64,
+    /// String dictionary values arrays the successful attempt's logs scans
+    /// built for declared `Str` columns (ADR-2773 decision D3): one per row
+    /// group dictionary per scan opening, one per per-block dictionary page,
+    /// one per plain-page block. Read off the scans'
+    /// `str_dict_values_built` counter and summed over every logs scan in the
+    /// plan. Zero for a metrics query.
+    pub str_dict_values_built: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
     /// counters above are. All zero on the default configuration, where the
@@ -635,6 +642,7 @@ struct BlockCounts {
     blocks_skipped_by_threshold: u64,
     segments_skipped_by_threshold: u64,
     int_values_buffers: u64,
+    str_dict_values_built: u64,
     timing: ScanTiming,
     /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
     /// here rather than in a second walk because one traversal already reads
@@ -644,9 +652,10 @@ struct BlockCounts {
 
 /// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings` /
 /// `segments_pruned_by_stats` / `blocks_skipped_by_threshold` /
-/// `segments_skipped_by_threshold` / `int_values_buffers` DataFusion counters
-/// over `plan` and its descendants, plus the metrics scan's
-/// `histogram_series_skipped`. Only `LogsScanExec` publishes the first seven names (crate::logs_scan) and only `RsegScanExec` the last
+/// `segments_skipped_by_threshold` / `int_values_buffers` /
+/// `str_dict_values_built` DataFusion counters over `plan` and its
+/// descendants, plus the metrics scan's `histogram_series_skipped`. Only
+/// `LogsScanExec` publishes the first eight names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. Reads the
 /// counters the scans already maintain rather than counting a second time.
@@ -670,6 +679,7 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
         counts.segments_skipped_by_threshold += sum("segments_skipped_by_threshold");
         counts.int_values_buffers += sum("int_values_buffers");
+        counts.str_dict_values_built += sum("str_dict_values_built");
         counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
         accumulate_scan_timing(&metrics, &mut counts.timing);
     }
@@ -1618,6 +1628,7 @@ impl SqlExecutor {
                     stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
                     stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
                     stats.int_values_buffers = blocks.int_values_buffers;
+                    stats.str_dict_values_built = blocks.str_dict_values_built;
                     stats.scan_timing = blocks.timing;
                     stats.wall = PhaseWallTiming {
                         resolve_ns,
