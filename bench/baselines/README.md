@@ -122,7 +122,7 @@ scripts/bench/fresh-box.sh --dry-run \
   --instance-type c6a.4xlarge --ami ami-... --subnet subnet-... \
   --security-group sg-... --region us-east-1 \
   --access ssh --key-name KEY --identity-file ~/.ssh/KEY.pem --ssh-user ubuntu \
-  --volume-gb 120 --max-minutes 180 --repo-url https://github.com/OWNER/ravel.git \
+  --volume-gb 120 --repo-url https://github.com/OWNER/ravel.git \
   --commit <40-character sha> --out bench/baselines/tier-b.json \
   --sample-size 30 --warmup 2 --measure 5 --max-series 2000
 ```

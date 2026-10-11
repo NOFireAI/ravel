@@ -205,6 +205,10 @@ right after the start:
 sudo shutdown -h +600 "ravel-clickbench safety shutdown"
 ```
 
+The re-armed timer terminates the box and discards the corpus with it, the
+same as the first one: a box being kept for another session needs
+`aws ec2 stop-instances` before the timer runs out.
+
 An IMDSv2 token is required to read instance metadata from on the box:
 
 ```sh

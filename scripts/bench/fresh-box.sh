@@ -46,7 +46,7 @@ usage: scripts/bench/fresh-box.sh [--dry-run] --instance-type T --ami AMI
          --subnet SUBNET --security-group SG --region REGION
          --access ssh|ssm [--instance-profile NAME] --key-name NAME
          --identity-file PATH --ssh-user USER
-         --volume-gb N --max-minutes N --repo-url URL --commit SHA --out PATH
+         --volume-gb N [--max-minutes N] --repo-url URL --commit SHA --out PATH
          --sample-size N --warmup S --measure S --max-series N
 
 Launches one EC2 instance, records a tier B baseline on it with
