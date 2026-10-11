@@ -1117,6 +1117,7 @@ pub async fn load_metrics(
         Arc::clone(&store),
         Signal::Metrics,
         clock,
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let ack_deadline = write_ack_deadline(max_flush_delay);
 

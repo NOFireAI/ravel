@@ -42,7 +42,9 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use ravel_ingest::{Clock, IngestConfig, LogIngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{
+    Clock, IngestConfig, LogIngestRouter, PendingAckBudget, SystemClock, WriteMode,
+};
 use ravel_logseg::{ColumnarLogBatch, LogRecord, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -400,7 +402,12 @@ async fn measure_path(
 ) -> Result<PathReport, CompareError> {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let router = LogIngestRouter::new(config(shards), Arc::clone(&store), clock);
+    let router = LogIngestRouter::new(
+        config(shards),
+        Arc::clone(&store),
+        clock,
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let tenant = TenantId::new("clickbench-local");
 
     // Build every batch's input up front (outside the timed region). This is

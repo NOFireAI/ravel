@@ -445,7 +445,7 @@ fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> St
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-    use ravel_ingest::{AdmissionLimits, CountLimit, IngestConfig, SystemClock};
+    use ravel_ingest::{AdmissionLimits, CountLimit, IngestConfig, PendingAckBudget, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
@@ -472,6 +472,7 @@ mod tests {
             store,
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         IngestState {
             router,
@@ -496,6 +497,7 @@ mod tests {
             store.clone(),
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let sink = Arc::new(MetadataSink::new(
             store.clone(),
@@ -1423,6 +1425,7 @@ mod tests {
             store.clone(),
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let state = IngestState {
             router,
@@ -1536,6 +1539,7 @@ mod tests {
                 store,
                 Signal::Metrics,
                 Arc::new(SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
             )
             .with_budget(router_budget),
         );

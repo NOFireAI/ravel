@@ -34,7 +34,7 @@ use ravel_catalog::{
 use ravel_commit::{keys, record};
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, LogIngestRouter,
-    SpanIngestRouter, WriteMode, shard_for_span,
+    PendingAckBudget, SpanIngestRouter, WriteMode, shard_for_span,
 };
 use ravel_logseg::{Predicate, RlogConfig, RlogReader, stream_attrs_bytes};
 use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
@@ -159,7 +159,14 @@ impl Pipe for IngestRouter {
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
     ) -> Self {
-        IngestRouter::new(config, store, Signal::Metrics, clock).with_budget(budget)
+        IngestRouter::new(
+            config,
+            store,
+            Signal::Metrics,
+            clock,
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(budget)
     }
 
     fn send_row(
@@ -266,7 +273,8 @@ impl Pipe for LogIngestRouter {
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
     ) -> Self {
-        LogIngestRouter::new(config, store, clock).with_budget(budget)
+        LogIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
+            .with_budget(budget)
     }
 
     fn send_row(
@@ -342,7 +350,8 @@ impl Pipe for SpanIngestRouter {
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
     ) -> Self {
-        SpanIngestRouter::new(config, store, clock).with_budget(budget)
+        SpanIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
+            .with_budget(budget)
     }
 
     fn send_row(

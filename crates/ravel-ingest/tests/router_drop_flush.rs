@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_types::Signal;
@@ -55,7 +55,13 @@ async fn dropping_router_flushes_buffered_points() {
         flush_tick: Duration::from_millis(10),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     router

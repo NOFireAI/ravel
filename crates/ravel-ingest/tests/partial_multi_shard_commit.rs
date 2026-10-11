@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, span_on_shard, tenant};
 use ravel_commit::keys;
-use ravel_ingest::{IngestConfig, IngestRouter, SpanIngestRouter, WriteError, WriteMode};
+use ravel_ingest::{
+    IngestConfig, IngestRouter, PendingAckBudget, SpanIngestRouter, WriteError, WriteMode,
+};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
@@ -111,6 +113,7 @@ async fn metrics_partial_commit_reports_surviving_tokens_in_shard_order() {
         store.clone() as Arc<dyn ObjectStoreBackend>,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -175,6 +178,7 @@ async fn spans_partial_commit_reports_surviving_tokens_in_shard_order() {
         flush_on_first(shard_count),
         store.clone() as Arc<dyn ObjectStoreBackend>,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -253,6 +257,7 @@ async fn metrics_all_shards_fail_is_plain_error_not_partial() {
         store.clone() as Arc<dyn ObjectStoreBackend>,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -311,6 +316,7 @@ async fn spans_all_shards_fail_is_plain_error_not_partial() {
         flush_on_first(shard_count),
         store.clone() as Arc<dyn ObjectStoreBackend>,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -374,6 +380,7 @@ async fn ack_timeout_recovers_no_tokens_but_commit_lands_after_release() {
         store.clone() as Arc<dyn ObjectStoreBackend>,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

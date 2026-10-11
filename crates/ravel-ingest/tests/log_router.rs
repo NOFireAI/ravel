@@ -18,7 +18,7 @@ use bytes::Bytes;
 use common::{SplitBrainOnFirstCommit, TestClock, tenant};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, WriteMode};
+use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, PendingAckBudget, WriteMode};
 use ravel_logseg::{
     ColumnarLogBatch, LogRecord, Predicate, RlogConfig, RlogReader, stream_attrs_bytes,
 };
@@ -125,7 +125,12 @@ async fn read_back(
 async fn single_shard_write_round_trips_to_a_readable_rlog_object() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
-    let router = LogIngestRouter::new(flush_on_first(1), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(1),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let receipt = router
@@ -155,6 +160,7 @@ async fn multi_shard_write_produces_one_token_per_involved_shard() {
         flush_on_first(shard_count),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -202,7 +208,12 @@ async fn buffered_write_returns_immediately_with_no_tokens() {
         max_flush_delay: Duration::from_secs(3600),
         ..IngestConfig::default()
     };
-    let router = LogIngestRouter::new(config, Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        config,
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let receipt = router
@@ -235,6 +246,7 @@ async fn dead_shard_is_observable_and_counted_once() {
         flush_on_first(shard_count),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -346,6 +358,7 @@ async fn partial_failure_recovers_the_surviving_shards_token() {
         flush_on_first(shard_count),
         store.clone() as Arc<dyn ObjectStoreBackend>,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -445,6 +458,7 @@ async fn columnar_partial_failure_recovers_the_surviving_shards_token() {
         flush_on_first(shard_count),
         store.clone() as Arc<dyn ObjectStoreBackend>,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -509,7 +523,12 @@ async fn columnar_partial_failure_recovers_the_surviving_shards_token() {
 async fn write_columnar_rejects_a_stream_ref_past_stream_ids_end() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
-    let router = LogIngestRouter::new(flush_on_first(1), Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        flush_on_first(1),
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let rec = norm_record(&[("service.name", "api")], 1_000, "hello");
@@ -661,6 +680,7 @@ async fn an_unresolved_ack_contributes_no_token() {
         flush_on_first(shard_count),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

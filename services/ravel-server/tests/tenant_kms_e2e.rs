@@ -32,7 +32,8 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ravel_catalog::read_epochs_from_store;
 use ravel_ingest::{
-    AdmissionController, AdmissionLimits, IngestConfig, LogIngestRouter, SystemClock, WriteMode,
+    AdmissionController, AdmissionLimits, IngestConfig, LogIngestRouter, PendingAckBudget,
+    SystemClock, WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::LogIngestLimits;
@@ -101,6 +102,7 @@ fn log_state(
         },
         store.clone(),
         Arc::new(SystemClock),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     LogIngestState {
         router,

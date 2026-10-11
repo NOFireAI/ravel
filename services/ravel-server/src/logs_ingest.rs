@@ -584,7 +584,9 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
-    use ravel_ingest::{AdmissionController, AdmissionLimits, IngestConfig, SystemClock};
+    use ravel_ingest::{
+        AdmissionController, AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock,
+    };
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
@@ -612,6 +614,7 @@ mod tests {
             },
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         LogIngestState {
             router,
@@ -1275,6 +1278,7 @@ mod tests {
             },
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         LogIngestState {
             router,

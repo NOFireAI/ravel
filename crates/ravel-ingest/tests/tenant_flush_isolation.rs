@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use common::{StallingStore, TestClock, make_point, tenant};
 use ravel_ingest::{
-    Clock, IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, SpanIngestRouter,
-    SpanWriteError, WriteError, WriteMode,
+    Clock, IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget,
+    SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
@@ -104,6 +104,7 @@ async fn stalled_flush_does_not_stop_a_coresident_tenants_age_trigger() {
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     // Tenant A: a wide strict write that crosses target_bytes, so it opens a
@@ -269,6 +270,7 @@ async fn buffered_flush_queued_behind_a_stall_reaches_the_store_past_lifetime() 
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     // Tenant A: a wide strict write that crosses target_bytes, so it opens a
@@ -408,6 +410,7 @@ async fn buffered_flush_queued_past_its_hours_bound_is_abandoned_and_counted() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
 
     let a_points: Vec<_> = (0..400u32)
@@ -506,7 +509,13 @@ async fn expired_flush_is_abandoned_in_the_queue_without_a_permit() {
         max_inflight_flushes: 1,
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let t = tenant("acme");
     router
@@ -615,7 +624,12 @@ async fn stalled_log_flush_does_not_stop_a_coresident_tenants_age_trigger() {
         max_inflight_flushes: 1,
         ..IngestConfig::default()
     };
-    let router = Arc::new(LogIngestRouter::new(config, store, clock.clone()));
+    let router = Arc::new(LogIngestRouter::new(
+        config,
+        store,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    ));
 
     let a_records: Vec<_> = (0..400u32)
         .map(|i| norm_record(&format!("a{i}"), start_ns))
@@ -759,7 +773,12 @@ async fn stalled_span_flush_does_not_stop_a_coresident_tenants_age_trigger() {
         max_inflight_flushes: 1,
         ..IngestConfig::default()
     };
-    let router = Arc::new(SpanIngestRouter::new(config, store, clock.clone()));
+    let router = Arc::new(SpanIngestRouter::new(
+        config,
+        store,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    ));
 
     let a_spans: Vec<_> = (0..A_SPANS).map(|i| norm_span(i, start_ns)).collect();
     let router_a = Arc::clone(&router);
@@ -1012,7 +1031,13 @@ fn new_metrics_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> IngestRouter {
-    IngestRouter::new(config, store, Signal::Metrics, clock)
+    IngestRouter::new(
+        config,
+        store,
+        Signal::Metrics,
+        clock,
+        Arc::new(PendingAckBudget::new(0)),
+    )
 }
 
 fn new_log_router(
@@ -1020,7 +1045,7 @@ fn new_log_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> LogIngestRouter {
-    LogIngestRouter::new(config, store, clock)
+    LogIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
 }
 
 fn new_span_router(
@@ -1028,7 +1053,7 @@ fn new_span_router(
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<TestClock>,
 ) -> SpanIngestRouter {
-    SpanIngestRouter::new(config, store, clock)
+    SpanIngestRouter::new(config, store, clock, Arc::new(PendingAckBudget::new(0)))
 }
 
 /// The three share tests, once per pipeline. `$new` builds the router,

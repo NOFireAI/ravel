@@ -3205,6 +3205,7 @@ mod tests {
                 Arc::clone(&store),
                 Signal::Metrics,
                 clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
             )
             .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
@@ -3506,8 +3507,14 @@ mod tests {
         let cap_ns = config.flush_deferral_cap_ns();
         assert_eq!(cap_ns, 3_159_990_000_000);
         let router = Arc::new(
-            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let acme = TenantId::new("acme");
         let globex = TenantId::new("globex");
@@ -3636,8 +3643,14 @@ mod tests {
         let cap_ns = config.flush_deferral_cap_ns();
         let tick_ns = config.flush_tick.as_nanos() as i64;
         let router = Arc::new(
-            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
         let write = |tenant: &'static str| {
@@ -3746,8 +3759,14 @@ mod tests {
         };
         assert!(config.max_flush_delay_idle >= Duration::from_secs(40));
         let router = Arc::new(
-            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
         let parked = {
@@ -3806,8 +3825,14 @@ mod tests {
         let config = queue_order(2);
         let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
         let router = Arc::new(
-            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let write = |tenant: &'static str, host: &'static str, mode: WriteMode| {
             let router = Arc::clone(&router);
@@ -3901,6 +3926,7 @@ mod tests {
                 Arc::clone(&store),
                 Signal::Metrics,
                 clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
             )
             .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
@@ -5243,6 +5269,7 @@ mod tests {
                     store,
                     Signal::Metrics,
                     clock.clone(),
+                    Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
                 )
                 .with_budget(Arc::clone(&budget)),
             );
@@ -5531,8 +5558,14 @@ mod tests {
         };
         assert_eq!(config.flush_share_per_tenant(), 1);
         let router = Arc::new(
-            IngestRouter::new(config, store, Signal::Metrics, clock.clone())
-                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+            IngestRouter::new(
+                config,
+                store,
+                Signal::Metrics,
+                clock.clone(),
+                Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
         );
         let tenant = TenantId::new("histograms");
         let gate = fault.hold(

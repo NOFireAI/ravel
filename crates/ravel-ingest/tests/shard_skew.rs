@@ -26,7 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SlowStore, TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestMetrics, IngestRouter, ShardSkewStats, WriteMode};
+use ravel_ingest::{
+    IngestConfig, IngestMetrics, IngestRouter, PendingAckBudget, ShardSkewStats, WriteMode,
+};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_types::{METRIC_NAME_LABEL, SeriesId, Signal, TenantId, shard_for};
@@ -91,6 +93,7 @@ async fn skewed_load_shows_exact_per_shard_processed_counts() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -148,6 +151,7 @@ async fn even_load_shows_even_per_shard_processed_counts() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -200,7 +204,13 @@ async fn slow_flush_time_lands_off_actor_not_on_actor() {
         max_flush_lifetime: Duration::from_secs(60),
         ..base_config(1)
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     // Buffered write: acknowledged at enqueue, handled by the actor at the
@@ -351,6 +361,7 @@ async fn permit_wait_lands_in_its_own_counter_not_in_on_actor() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 
@@ -449,6 +460,7 @@ async fn the_three_spans_do_not_double_count_a_known_window() {
         Arc::clone(&store),
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
     let tenant = tenant("acme");
 

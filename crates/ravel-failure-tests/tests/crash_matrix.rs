@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use common::{GcWindow, TestClock, make_point, spec_model_sweep_orphans, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
@@ -58,7 +58,13 @@ async fn crash_before_data_put_leaves_nothing_stored_or_visible() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let points = vec![make_point(&tid, "cpu_usage", &[("host", "a")], 1_000, 1.0)];
@@ -138,7 +144,13 @@ async fn crash_after_data_put_before_commit_orphans_then_spec_model_gc_sweeps_af
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tid = tenant("acme");
     let points = vec![make_point(&tid, "cpu_usage", &[("host", "a")], 1_000, 1.0)];

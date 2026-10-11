@@ -1989,7 +1989,8 @@ mod tests {
             Metric, ResourceMetrics, ScopeMetrics,
         };
         use ravel_ingest::{
-            AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, WriteMode,
+            AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, PendingAckBudget,
+            WriteMode,
         };
 
         use crate::ingest::{IngestState, handle_export};
@@ -2011,6 +2012,7 @@ mod tests {
             backend.clone(),
             Signal::Metrics,
             Arc::new(FixedClock(NOW)),
+            Arc::new(PendingAckBudget::new(0)),
         ));
         let limits = ravel_otlp::IngestLimits::default();
         let ingest = IngestState {

@@ -455,7 +455,12 @@ mod tests {
     }
 
     fn test_router(store: Arc<dyn ObjectStoreBackend>) -> LogIngestRouter {
-        LogIngestRouter::new(flush_on_first(), store, Arc::new(SystemClock))
+        LogIngestRouter::new(
+            flush_on_first(),
+            store,
+            Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+        )
     }
 
     /// Drives a real logs write through the router to a flush and asserts the
@@ -613,6 +618,7 @@ mod tests {
             Arc::clone(&store),
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let timings = router.stage_timings();
 
@@ -680,6 +686,7 @@ mod tests {
             Arc::clone(&store),
             Signal::Metrics,
             Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
 
         let receipt = router

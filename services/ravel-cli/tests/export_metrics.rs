@@ -29,7 +29,8 @@ use ravel_cli::load::{self, MetricsMapping};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_ingest::{
-    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, SystemClock, WriteMode,
+    Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, PendingAckBudget, SystemClock,
+    WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
@@ -1274,6 +1275,7 @@ async fn a_native_histogram_series_in_the_window_is_refused() {
         Arc::clone(&store),
         Signal::Metrics,
         Arc::new(FixedClock(LOAD_NS)),
+        Arc::new(PendingAckBudget::new(0)),
     );
     router
         .write_values(

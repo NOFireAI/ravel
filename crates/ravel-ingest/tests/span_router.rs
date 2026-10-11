@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SplitBrainOnFirstCommit, TestClock, span_on_shard, tenant};
-use ravel_ingest::{IngestConfig, SpanIngestRouter, SpanWriteError, WriteMode};
+use ravel_ingest::{IngestConfig, PendingAckBudget, SpanIngestRouter, SpanWriteError, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
 
@@ -45,6 +45,7 @@ async fn dead_shard_is_observable_and_condemns_on_first_death() {
         flush_on_first(shard_count),
         Arc::clone(&store),
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

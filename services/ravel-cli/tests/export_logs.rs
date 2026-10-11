@@ -26,7 +26,7 @@ use ravel_cli::load::{self, Mapping};
 use ravel_cli::maintain::{SignalArg, compact_tenant};
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
-use ravel_ingest::{Clock, IngestConfig, LogIngestRouter, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, LogIngestRouter, PendingAckBudget, WriteMode};
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
@@ -1317,6 +1317,7 @@ async fn a_pending_erasure_on_a_scope_or_resource_attribute_excludes_its_subject
         },
         Arc::clone(&store),
         Arc::new(FixedClock(now_ns)),
+        Arc::new(PendingAckBudget::new(0)),
     );
     router
         .write(

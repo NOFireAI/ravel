@@ -17,8 +17,8 @@ use std::time::Duration;
 use common::{TestClock, make_point, tenant};
 use ravel_commit::keys;
 use ravel_ingest::{
-    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, SpanIngestRouter, WriteError,
-    WriteMode, shard_for_span,
+    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget, SpanIngestRouter,
+    WriteError, WriteMode, shard_for_span,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::ObjectStoreBackend;
@@ -165,6 +165,7 @@ async fn partial_multi_shard_commit_reports_durable_tokens_metrics() {
         store.clone() as Arc<dyn ObjectStoreBackend>,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -212,6 +213,7 @@ async fn partial_multi_shard_commit_reports_durable_tokens_logs() {
         flush_on_first(shard_count),
         store.clone() as Arc<dyn ObjectStoreBackend>,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");
@@ -259,6 +261,7 @@ async fn partial_multi_shard_commit_reports_durable_tokens_spans() {
         flush_on_first(shard_count),
         store.clone() as Arc<dyn ObjectStoreBackend>,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let tenant = tenant("acme");

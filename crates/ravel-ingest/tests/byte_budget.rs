@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_ingest::{
-    IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, WriteError, WriteMode,
+    IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, PendingAckBudget,
+    WriteError, WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
@@ -48,7 +49,16 @@ fn budgeted_router(
         max_inflight_flushes,
         ..IngestConfig::default()
     };
-    Arc::new(IngestRouter::new(config, store, Signal::Metrics, clock).with_budget(budget))
+    Arc::new(
+        IngestRouter::new(
+            config,
+            store,
+            Signal::Metrics,
+            clock,
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_budget(budget),
+    )
 }
 
 /// A request that would push the gauge past the ceiling is shed before any

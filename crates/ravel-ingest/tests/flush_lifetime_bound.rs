@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SlowStore, TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_types::Signal;
@@ -44,7 +44,13 @@ async fn slow_data_object_put_abandons_flush_at_deadline() {
         max_flush_lifetime: Duration::from_millis(50),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let tenant = tenant("acme");
     let points = vec![make_point(

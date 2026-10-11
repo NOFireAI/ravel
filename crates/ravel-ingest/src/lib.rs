@@ -24,6 +24,7 @@ mod log_router;
 mod log_shard;
 mod metrics;
 mod metrics_meta_sink;
+mod pending_ack;
 mod reconcile;
 mod router;
 mod shard;
@@ -64,19 +65,22 @@ pub use lifecycle::{
 };
 pub use log_error::LogWriteError;
 pub use log_metrics::{FlushTriggerMix, LogIngestMetrics, LogIngestMetricsSnapshot};
-pub use log_router::{LogIndexedFields, LogIngestRouter, LogWriteReceipt, NoIndexedFields};
+pub use log_router::{
+    LogIndexedFields, LogIngestRouter, LogSubmitted, LogWriteReceipt, NoIndexedFields,
+};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot, ShardSkewStats};
 pub use metrics_meta_sink::{
     DEFAULT_MAX_CAS_RETRIES, DEFAULT_METADATA_FLUSH_WINDOW, FlushSummary, MetadataSink,
     MetadataSinkConfig, catalog_metric_kind,
 };
+pub use pending_ack::{PendingAckBudget, PendingAckPermit};
 pub use reconcile::{
     DEFAULT_ADMISSION_RECONCILE_INTERVAL, ReconcileCycleStats, reconcile_once, snapshot_key,
 };
-pub use router::{IngestRouter, WriteMode, WriteReceipt};
+pub use router::{IngestRouter, Submitted, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
-pub use span_router::{SpanIngestRouter, SpanWriteReceipt, shard_for_span};
+pub use span_router::{SpanIngestRouter, SpanSubmitted, SpanWriteReceipt, shard_for_span};
 #[cfg(feature = "stage-timing")]
 pub use stage_timing::{
     LogStage, LogStageSnapshot, LogStageTimings, MetricStage, MetricStageSnapshot,

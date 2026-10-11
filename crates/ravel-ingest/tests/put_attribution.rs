@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_ingest::{
-    IngestConfig, IngestRouter, LogIngestRouter, PUTS_PER_FLUSH, SpanIngestRouter, WriteMode,
+    IngestConfig, IngestRouter, LogIngestRouter, PUTS_PER_FLUSH, PendingAckBudget,
+    SpanIngestRouter, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
@@ -74,7 +75,13 @@ async fn metrics_flush_attributes_puts_to_the_tenant() {
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let acme = tenant("acme");
     let points = vec![make_point(&acme, "cpu_usage", &[("host", "a")], 1_000, 1.0)];
@@ -119,7 +126,13 @@ async fn repeated_metrics_flushes_sum_for_one_tenant() {
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let acme = tenant("acme");
 
     for i in 0..3 {
@@ -162,7 +175,13 @@ async fn distinct_tenants_are_attributed_independently() {
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
     };
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
 
     let heavy = tenant("heavy");
     let light = tenant("light");
@@ -223,7 +242,12 @@ async fn log_flush_attributes_puts_to_the_tenant() {
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
     };
-    let router = LogIngestRouter::new(config, Arc::clone(&store), clock.clone());
+    let router = LogIngestRouter::new(
+        config,
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let acme = tenant("acme");
     let records = vec![norm_log_record(1_000), norm_log_record(2_000)];
     router
@@ -256,7 +280,12 @@ async fn span_flush_attributes_puts_to_the_tenant() {
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
     };
-    let router = SpanIngestRouter::new(config, Arc::clone(&store), clock.clone());
+    let router = SpanIngestRouter::new(
+        config,
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
     let acme = tenant("acme");
     let spans = vec![norm_span(1_000), norm_span(2_000)];
     router

@@ -26,9 +26,10 @@ use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_generations,
 };
+use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::router::WriteMode;
 use crate::span_error::SpanWriteError;
-use crate::span_metrics::SpanIngestMetrics;
+use crate::span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 use crate::span_shard::{SpanShardActor, SpanShardMsg, est_span_bytes};
 
 /// Routing v1 for spans (persistent contract, ADR-0041 decision 2): shard from
@@ -73,6 +74,121 @@ pub fn shard_for_span(trace_id: &[u8; 16], shard_count: u32) -> u32 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpanWriteReceipt {
     pub tokens: Vec<CommitToken>,
+}
+
+/// A span write enqueued to every involved shard but not yet acknowledged
+/// (ADR-2793 decision 4), returned by [`SpanIngestRouter::submit`].
+/// [`Self::acks`] is the other half of what [`SpanIngestRouter::write`] used
+/// to do in one step.
+///
+/// Holds the strict-mode pending-ack permit this submit took, and releases
+/// it when [`Self::acks`] resolves (either way), when its ack deadline
+/// elapses after [`Self::acks`] is first polled, or when `self` is dropped.
+/// A `SpanSubmitted` that is never polled holds its permit until it is
+/// dropped.
+pub struct SpanSubmitted<'a> {
+    router: &'a SpanIngestRouter,
+    state: SpanSubmittedState,
+}
+
+enum SpanSubmittedState {
+    /// Buffered mode, or a write with no spans: already resolved, nothing to
+    /// await.
+    Done(SpanWriteReceipt),
+    /// Strict mode with at least one shard's ack outstanding.
+    Pending {
+        set: Arc<Vec<SpanShardHandle>>,
+        ack_shards: Vec<u32>,
+        ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, SpanWriteError>>>,
+        ack_deadline: Duration,
+        /// Held until `acks()` resolves, its deadline elapses, or this value
+        /// is dropped; never read directly.
+        _permit: Option<PendingAckPermit>,
+    },
+}
+
+impl SpanSubmitted<'_> {
+    /// Awaits every involved shard's strict ack within the `ack_deadline`
+    /// duration captured at submit; the clock starts at the first poll of
+    /// this future, so [`SpanIngestRouter::write`], which polls it at once,
+    /// keeps the deadline it always had.
+    /// Returns a receipt with one token per shard that acked durable, maps a
+    /// deadline elapse to [`SpanWriteError::AckTimeout`], and otherwise
+    /// applies the same partial-write classification `write` always has
+    /// (issue #1130). A buffered submit's `acks()` returns the empty receipt
+    /// immediately: there was never anything to await.
+    pub async fn acks(self) -> Result<SpanWriteReceipt, SpanWriteError> {
+        let router = self.router;
+        let (set, ack_shards, ack_rxs, ack_deadline, _permit) = match self.state {
+            SpanSubmittedState::Done(receipt) => return Ok(receipt),
+            SpanSubmittedState::Pending {
+                set,
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                _permit,
+            } => (set, ack_shards, ack_rxs, ack_deadline, _permit),
+        };
+
+        // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
+        // On a deadline elapse the whole `join_all` future is dropped, so no
+        // per-shard ack is observed: `AckTimeout` carries no recovered tokens
+        // (a sibling that committed inside the elapsed window is unknowable
+        // here, and reporting an unresolved ack as durable would be wrong).
+        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
+            .await
+            .map_err(|_| SpanWriteError::AckTimeout)?;
+
+        // Every ack resolved. Scan them all: collect every shard that acked a
+        // durable commit (issue #1130), and record the first failure in shard
+        // order so the returned classification and `mark_shard_dead` side effect
+        // are exactly what the pre-fix early-return produced. A shard whose ack
+        // failed to resolve (`RecvError`: the actor panicked mid-flush) is NOT a
+        // durable write and contributes no token.
+        let mut durable = Vec::with_capacity(joined.len());
+        let mut first_error: Option<SpanWriteError> = None;
+        let mut dead_shard: Option<u32> = None;
+        for (shard, result) in ack_shards.into_iter().zip(joined) {
+            match result {
+                Ok(Ok(token)) => durable.push(token),
+                Ok(Err(shard_error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(shard_error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(SpanWriteError::ShardUnavailable);
+                        dead_shard = Some(shard);
+                    }
+                }
+            }
+        }
+
+        if let Some(inner) = first_error {
+            // Preserve the exact failure semantics: the death is counted once,
+            // only when the first failure in shard order is a dropped ack, and
+            // only then (a resolved shard-level error never marked a death).
+            if let Some(shard) = dead_shard {
+                router.mark_shard_dead(&set[shard as usize]);
+            }
+            // Carry the durably-acked sibling tokens only when there are any; a
+            // failure with no partial success surfaces as the bare variant,
+            // unchanged from before this fix.
+            let error = if durable.is_empty() {
+                inner
+            } else {
+                router.metrics.record_partial_write();
+                SpanWriteError::PartialWrite {
+                    inner: Box::new(inner),
+                    durable,
+                }
+            };
+            return Err(error);
+        }
+
+        Ok(SpanWriteReceipt { tokens: durable })
+    }
 }
 
 /// The span pipeline's counterpart of [`crate::log_router`]'s private
@@ -124,6 +240,12 @@ pub struct SpanIngestRouter {
     /// limit. Written by [`SpanIngestRouter::with_budget`], which runs after the
     /// actors exist.
     backstop_ceiling: BufferBudgetCeiling,
+    /// Ceiling on outstanding strict acks (ADR-2793 decision 4). Process-wide
+    /// when the caller hands the same `Arc` to the metrics and log routers;
+    /// otherwise it bounds this router alone. A strict [`Self::submit`] takes
+    /// a permit here before the byte budget is charged; the [`SpanSubmitted`]
+    /// it returns releases it.
+    pending_ack_budget: Arc<PendingAckBudget>,
 }
 
 impl SpanIngestRouter {
@@ -131,6 +253,7 @@ impl SpanIngestRouter {
         config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
+        pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
         // Production OS-entropy source for writer ids and PUT-retry jitter
@@ -193,6 +316,7 @@ impl SpanIngestRouter {
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             backstop_ceiling,
+            pending_ack_budget,
         }
     }
 
@@ -216,6 +340,19 @@ impl SpanIngestRouter {
     /// drain counts into it).
     pub fn metrics_handle(&self) -> Arc<SpanIngestMetrics> {
         self.metrics.clone()
+    }
+
+    /// Composes the counter registry's snapshot with this router's
+    /// pending-ack budget gauge and shed counter (ADR-2793 decision 4), since
+    /// [`SpanIngestMetrics::snapshot`] has no access to the budget this
+    /// router holds and so always reports both fields as 0. Prefer this over
+    /// `metrics().snapshot()` wherever the pending-ack figures matter.
+    pub fn metrics_snapshot(&self) -> SpanIngestMetricsSnapshot {
+        SpanIngestMetricsSnapshot {
+            pending_strict_acks: self.pending_ack_budget.held(),
+            pending_ack_shed: self.pending_ack_budget.shed_total(),
+            ..self.metrics.snapshot()
+        }
     }
 
     /// Whether every shard actor this router owns is live enough to serve:
@@ -292,10 +429,9 @@ impl SpanIngestRouter {
         self.switch.evict_idle(now_ns, ttl_ns)
     }
 
-    /// Groups `spans` by [`shard_for_span`], sends one `SpanShardMsg::Write`
-    /// per involved shard, and (in strict mode) awaits every involved shard's
-    /// ack within `ack_deadline`. Sending blocks on a full channel: that
-    /// backpressure is intentional (docs/ingest.md "Channel").
+    /// `submit(..).await?.acks().await`, kept as one call for every production
+    /// caller today (ravel-server's admission path, task #2797, is the only
+    /// caller that will split the two).
     pub async fn write(
         &self,
         tenant: ravel_types::TenantId,
@@ -303,9 +439,43 @@ impl SpanIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<SpanWriteReceipt, SpanWriteError> {
+        self.submit(tenant, spans, mode, ack_deadline)
+            .await?
+            .acks()
+            .await
+    }
+
+    /// Groups `spans` by [`shard_for_span`] and sends one `SpanShardMsg::Write`
+    /// per involved shard, returning once every message is enqueued rather
+    /// than awaiting any shard's ack (ADR-2793 decision 4). Sending blocks on
+    /// a full channel: that backpressure is intentional (docs/ingest.md
+    /// "Channel"). A strict submit takes a pending-ack permit before the byte
+    /// budget is charged, so a refused submit holds no charge; call
+    /// [`SpanSubmitted::acks`] to await the shard acks this returns.
+    pub async fn submit(
+        &self,
+        tenant: ravel_types::TenantId,
+        spans: Vec<NormalizedSpan>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<SpanSubmitted<'_>, SpanWriteError> {
         if spans.is_empty() {
-            return Ok(SpanWriteReceipt::default());
+            return Ok(SpanSubmitted {
+                router: self,
+                state: SpanSubmittedState::Done(SpanWriteReceipt::default()),
+            });
         }
+
+        // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
+        // before the byte budget below, so a refused submit holds no charge.
+        let permit = match mode {
+            WriteMode::Strict => Some(
+                self.pending_ack_budget
+                    .try_acquire()
+                    .ok_or(SpanWriteError::PendingAckLimitReached)?,
+            ),
+            WriteMode::Buffered => None,
+        };
 
         // Global ingest byte budget (ADR-0069 decision 1): charge the estimated
         // buffered bytes and shed at the ceiling before routing, so a shed
@@ -334,7 +504,10 @@ impl SpanIngestRouter {
             by_shard.entry(shard).or_default().push(span);
         }
         if by_shard.is_empty() {
-            return Ok(SpanWriteReceipt::default());
+            return Ok(SpanSubmitted {
+                router: self,
+                state: SpanSubmittedState::Done(SpanWriteReceipt::default()),
+            });
         }
 
         let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
@@ -402,67 +575,22 @@ impl SpanIngestRouter {
         }
 
         if mode == WriteMode::Buffered {
-            return Ok(SpanWriteReceipt::default());
+            return Ok(SpanSubmitted {
+                router: self,
+                state: SpanSubmittedState::Done(SpanWriteReceipt::default()),
+            });
         }
 
-        // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
-        // On a deadline elapse the whole `join_all` future is dropped, so no
-        // per-shard ack is observed: `AckTimeout` carries no recovered tokens
-        // (a sibling that committed inside the elapsed window is unknowable
-        // here, and reporting an unresolved ack as durable would be wrong).
-        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
-            .await
-            .map_err(|_| SpanWriteError::AckTimeout)?;
-
-        // Every ack resolved. Scan them all: collect every shard that acked a
-        // durable commit (issue #1130), and record the first failure in shard
-        // order so the returned classification and `mark_shard_dead` side effect
-        // are exactly what the pre-fix early-return produced. A shard whose ack
-        // failed to resolve (`RecvError`: the actor panicked mid-flush) is NOT a
-        // durable write and contributes no token.
-        let mut durable = Vec::with_capacity(joined.len());
-        let mut first_error: Option<SpanWriteError> = None;
-        let mut dead_shard: Option<u32> = None;
-        for (shard, result) in ack_shards.into_iter().zip(joined) {
-            match result {
-                Ok(Ok(token)) => durable.push(token),
-                Ok(Err(shard_error)) => {
-                    if first_error.is_none() {
-                        first_error = Some(shard_error);
-                    }
-                }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error = Some(SpanWriteError::ShardUnavailable);
-                        dead_shard = Some(shard);
-                    }
-                }
-            }
-        }
-
-        if let Some(inner) = first_error {
-            // Preserve the exact failure semantics: the death is counted once,
-            // only when the first failure in shard order is a dropped ack, and
-            // only then (a resolved shard-level error never marked a death).
-            if let Some(shard) = dead_shard {
-                self.mark_shard_dead(&set[shard as usize]);
-            }
-            // Carry the durably-acked sibling tokens only when there are any; a
-            // failure with no partial success surfaces as the bare variant,
-            // unchanged from before this fix.
-            let error = if durable.is_empty() {
-                inner
-            } else {
-                self.metrics.record_partial_write();
-                SpanWriteError::PartialWrite {
-                    inner: Box::new(inner),
-                    durable,
-                }
-            };
-            return Err(error);
-        }
-
-        Ok(SpanWriteReceipt { tokens: durable })
+        Ok(SpanSubmitted {
+            router: self,
+            state: SpanSubmittedState::Pending {
+                set,
+                ack_shards,
+                ack_rxs,
+                ack_deadline,
+                _permit: permit,
+            },
+        })
     }
 
     /// Records the first observation of a shard actor's death, deduped so a
@@ -620,6 +748,7 @@ mod tests {
             },
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let tenant = TenantId::new("acme");
         let id = trace_id(0xdead_beef);
@@ -667,6 +796,7 @@ mod tests {
             },
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         // Hashed routing does not guarantee a bijection over a handful of
         // sequential trace ids the way the old raw-leading-bytes math
@@ -708,6 +838,7 @@ mod tests {
             },
             Arc::new(MemoryStore::new()),
             Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let receipt = router
             .write(
@@ -735,6 +866,7 @@ mod tests {
             },
             store.clone(),
             Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let receipt = router
             .write(
@@ -822,6 +954,7 @@ mod tests {
             },
             store.clone(),
             clock.clone(),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let tenant = TenantId::new("acme");
         // reshard 4 -> 8 at hour 100 (relative to the plausibility-floor base).
@@ -900,6 +1033,7 @@ mod tests {
             },
             store.clone(),
             clock.clone(),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let tenant = TenantId::new("acme");
         router.refresh_generations(tenant.hash(), vec![sg(0, 1, 0)], clock.now_ns());
@@ -963,6 +1097,7 @@ mod tests {
             },
             store.clone(),
             clock.clone(),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
         );
         let tenant = TenantId::new("acme");
         router.refresh_generations(tenant.hash(), vec![sg(0, 4, BASE_HOUR)], t0);

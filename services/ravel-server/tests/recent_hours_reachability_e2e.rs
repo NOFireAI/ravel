@@ -29,7 +29,7 @@ use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_MAX_FLUSH_LIFETIME_NS,
 };
-use ravel_ingest::{Clock, IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_otlp::NormalizedPoint;
@@ -183,6 +183,7 @@ async fn ingest_hot_segments(
         Arc::clone(&store),
         Signal::Metrics,
         Arc::new(FixedClock(base_ns)),
+        Arc::new(PendingAckBudget::new(0)),
     );
 
     let series_id = SeriesId::compute(tenant_id, METRIC, &label_set()).expect("series id");

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SlowStore, TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_types::Signal;
@@ -88,6 +88,7 @@ async fn adaptive_flush_delay_true_uses_the_corridor_above_the_floor() {
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let acme = tenant("acme");
 
@@ -214,6 +215,7 @@ async fn adaptive_flush_delay_false_keeps_the_fixed_floor_under_the_same_pattern
         store,
         Signal::Metrics,
         clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
     ));
     let acme = tenant("acme");
 
