@@ -27,6 +27,12 @@ pub enum WriteError {
     /// and the router reports not-ready (`IngestRouter::ready`), which sheds
     /// traffic from this replica but does not replace it. Recovering the shard
     /// needs the process rolled.
+    ///
+    /// Also the strict waiter's answer when the ADR-1702 write gate returns
+    /// no result for a flush's encode (the job panicked, or the runtime
+    /// cancelled it while shutting down). That is the answer an encode panic
+    /// produced before the encode moved onto the gate, when it took the actor
+    /// down; now the actor survives, and no death is counted.
     #[error("shard actor unavailable")]
     ShardUnavailable,
     /// A strict-mode ack did not arrive within the caller's `ack_deadline`.
@@ -45,9 +51,7 @@ pub enum WriteError {
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RSEG segment failed (a deterministic input problem, e.g.
-    /// oversized batch); retrying identical input will fail again. Also the
-    /// answer when the ADR-1702 write gate returns no result for the encode:
-    /// the job panicked, or the runtime cancelled it while shutting down.
+    /// oversized batch); retrying identical input will fail again.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
     /// Two points in one shard buffer carried the same `series_id` but

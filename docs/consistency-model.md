@@ -105,6 +105,8 @@ Buffered mode (opt-in per request, named "buffered"):
   so a flush granted past `end(H) + max_flush_lifetime` is abandoned without a
   PUT, is not moved to a later hour, and is counted on `abandoned_hour_bound`.
   That keeps every publish inside the catalog's seal of `H`.
+  The same deadline also bounds the flush's wait for a write gate permit
+  for its encode (case six below).
 - A stalled prefix holds at most `max_inflight_flushes_per_tenant` of its
   shard's permits (default `max(1, N - 1)` of 4), so a co-resident tenant's
   flush normally takes a free permit and does not queue behind the stall at
@@ -138,7 +140,17 @@ Buffered mode (opt-in per request, named "buffered"):
   `abandoned_input_rejected` counts it. Four: the flush cannot be built at all
   -- the segment writer rejects the batch, the data object key cannot be
   derived, or the commit record fails to build. Those are fail-loud and
-  non-retryable on the same terms as case three, counted the same way. The
+  non-retryable on the same terms as case three, counted the same way. Five:
+  the ADR-1702 write gate returns no result for the flush's encode, because
+  the job panicked or the runtime cancelled it while shutting down. That is a
+  server fault, not bad input: no store call is made, any strict waiter is
+  acked with the retryable `ShardUnavailable` (503), the shard actor keeps
+  running, and the flush is logged at ERROR and counted in no `abandoned_*`
+  counter. Six: the flush's lifetime, re-derived when its permit is granted,
+  elapses before its encode on the write gate returns, most likely because
+  the encode is still queued for a gate permit. The flush is abandoned with
+  no store call, any strict waiter is acked with the retryable `Abandoned`
+  (503), and `abandoned_queue_deadline` counts it. The
   ADR-1685 store-clock lag check is not a case of its own: a teardown drain's
   bypass passes disable that check precisely so it cannot drop acknowledged
   rows, and what it costs instead is visibility until a HEAD rebuild (see
