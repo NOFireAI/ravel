@@ -258,14 +258,17 @@ raised a bucket's format floor to N+1, a build that writes N:
 - starts, and warns once per (tenant, signal, family) whose floor is above
   what it writes, for the tenants its flags name; it sets
   `ravel_format_floor_above_writer{family}` to the count;
-- refuses ingest flushes into that bucket at flush open, before any store
-  call, once it has read the bucket's provisioning record, and answers a
-  strict write with a retryable error; a refused flush's rows are dropped;
+- refuses ingest writes into that bucket, strict or buffered, at admission,
+  before they are buffered, once it has read the bucket's provisioning
+  record, with a retryable error; rows it buffered before that read are
+  dropped when their flush opens, before any PUT;
 - in a `maintain` process, refuses a compaction or erasure rewrite of that
   bucket before it claims or writes anything, and moves on; an erasure
   request whose rewrite is refused stays pending; `ravel-cli maintain
-  migrate` refuses to migrate the bucket;
-- counts every refusal under `ravel_format_floor_refused_total{family}`.
+  migrate` and the `ravel-cli` compaction commands refuse the bucket too;
+- counts every ingest and `maintain` refusal under
+  `ravel_format_floor_refused_total{family}`; a `ravel-cli` refusal is the
+  command's error and nonzero exit.
 
 Queries, the fold and retention run as before, so the stance on reading is
 unchanged. The way back is to roll forward. An operator who must keep

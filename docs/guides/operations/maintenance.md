@@ -1559,23 +1559,35 @@ What you see:
   count. The process starts either way. Queries, the fold and retention run
   as normal, and so does the retention version hold. A tenant that is not
   named by a flag is not checked at startup. Its writes are still checked.
-- On ingest, the check runs when a flush opens. It uses the provisioning
-  record the router already caches for routing, so it adds no store read. A
-  refused flush makes no store call, drops its rows, and answers a strict
-  write with a retryable error naming the family, the floor and the version
-  (HTTP 503). A floor raised while a writer runs takes effect once the writer
-  reads the record again. A write does that before it routes when the
-  router's copy is more than 60 seconds old.
+- On ingest, the check runs when a write is admitted, before it is
+  buffered. It uses the provisioning record the router already caches for
+  routing, so it adds no store read. A refused write, strict or buffered, is
+  answered with a retryable error naming the family, the floor and the
+  version (HTTP 503), and nothing of it is buffered. A floor raised while a
+  writer runs takes effect once the writer reads the record again. A write
+  does that before it routes when the router's copy is more than 60 seconds
+  old. Rows buffered before that re-read are checked again when their flush
+  opens: they are dropped and counted, the flush makes no PUT, and a strict
+  write waiting on them gets the same error. A buffered write among them was
+  already acknowledged, so those rows are lost.
+- A provisioning record whose floor history fails validation, in any family,
+  fails the ingest router's read of that record the way a corrupt generation
+  history does. Writes for that tenant and signal are then refused with
+  `StaleProvisioningView` (HTTP 503): at once for a tenant the router has no
+  cached view of, and once the cached view's grace window ends otherwise. A
+  `maintain` compaction or erasure rewrite of the tenant's buckets fails its
+  floor read and writes nothing.
 - In a `maintain` process, a compaction or erasure rewrite reads the bucket's
   provisioning record before it claims the bucket or writes anything. That is
   one GET per run. A refused run builds and publishes nothing, and the
   maintenance loop moves on to the next bucket. An erasure request whose
   rewrite is refused stays pending, so its deletion waits too.
-  `ravel-cli maintain migrate` checks each bucket the same way and stops at
-  the first refused one. The `ravel-cli` compaction commands do not check the
-  floor.
-- Every refusal logs a warning and counts under
-  `ravel_format_floor_refused_total{family}`.
+  `ravel-cli maintain migrate` and the `ravel-cli` compaction commands check
+  each bucket the same way; `migrate` stops at the first refused one.
+- Every refusal logs a warning. An ingest or `maintain` refusal counts under
+  `ravel_format_floor_refused_total{family}`. `ravel-cli` renders no
+  `/metrics`, so its refusal is the command's error, naming the family, the
+  floor and the version, and a nonzero exit.
 
 What to do. Pick one of two ways out:
 

@@ -142,8 +142,8 @@ struct LogShardHandle {
     /// per shard per generation.
     dead: AtomicBool,
     /// The shard's at-cap flag (ADR-1642 deferral cap amendment), set and
-    /// cleared by the actor and read here before enqueue, the only place a
-    /// buffered-mode write can be refused.
+    /// cleared by the actor and read here before enqueue, where every refusal
+    /// of a buffered-mode write happens.
     cap_flag: DeferralCapFlag,
 }
 
@@ -967,8 +967,9 @@ impl LogIngestRouter {
 
     /// Refuses the whole write, before any shard is sent anything, when one of
     /// `shards` is dead or has a flush deferred for the whole flush deferral
-    /// cap (ADR-1642 deferral cap amendment). The cap check is the only refusal
-    /// a buffered-mode write can get, since it is acknowledged at enqueue. A
+    /// cap (ADR-1642 deferral cap amendment). Like every refusal of a
+    /// buffered-mode write, the cap check comes before enqueue, where that
+    /// write is acknowledged. A
     /// dead shard is checked first, so a deferral its actor published before
     /// dying cannot hide the death from `ready`.
     fn refuse_dead_or_capped(

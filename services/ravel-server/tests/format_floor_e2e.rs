@@ -350,15 +350,27 @@ async fn floored_writes_are_refused_with_503_and_the_override_writes_them() {
     }
     let body = scrape(&client, &base).await;
     assert_eq!(
-        floor_sample(&body, "ravel_format_floor_writes_below_total", FormatFamily::Rseg),
+        floor_sample(
+            &body,
+            "ravel_format_floor_writes_below_total",
+            FormatFamily::Rseg
+        ),
         1
     );
     assert_eq!(
-        floor_sample(&body, "ravel_format_floor_writes_below_total", FormatFamily::Rlog),
+        floor_sample(
+            &body,
+            "ravel_format_floor_writes_below_total",
+            FormatFamily::Rlog
+        ),
         1
     );
     assert_eq!(
-        floor_sample(&body, "ravel_format_floor_refused_total", FormatFamily::Rseg),
+        floor_sample(
+            &body,
+            "ravel_format_floor_refused_total",
+            FormatFamily::Rseg
+        ),
         1,
         "the override refuses nothing more"
     );

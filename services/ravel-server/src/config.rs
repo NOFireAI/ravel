@@ -970,15 +970,17 @@ pub struct Cli {
     pub maintain_claims: MaintainClaimsArg,
 
     /// Write objects below a bucket's recorded format floor instead of
-    /// refusing them (ADR-1746 decision 5). Without it an ingest flush, a
-    /// compaction or an erasure rewrite that would publish an object below the
-    /// floor for its family is refused and counted under
+    /// refusing them (ADR-1746 decision 5). Without it an ingest write or
+    /// flush, a compaction or an erasure rewrite that would publish an object
+    /// below the floor for its family is refused and counted under
     /// `ravel_format_floor_refused_total`. With it the object is written, a
-    /// warning is logged per publish and counted under
+    /// warning is logged per flush or run and counted under
     /// `ravel_format_floor_writes_below_total`, and the floor no longer holds:
     /// the next `ravel-cli maintain audit-versions` classifies it
     /// `contradicted`. The floor itself is never lowered. Meant for keeping a
     /// rolled-back binary ingesting until a roll forward and a `migrate` run.
+    /// The flag does not reach `ravel-cli`: its compactions, `maintain
+    /// migrate` and the re-encodes `migrate` runs always refuse below a floor.
     #[arg(long = "write-below-format-floor")]
     pub write_below_format_floor: bool,
 

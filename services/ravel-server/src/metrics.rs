@@ -3645,7 +3645,7 @@ fn render_provisioning_family(
 /// The ADR-1746 writer-policy family, one sample per format family under
 /// `{mode, family}`: the startup gauge of buckets whose recorded floor is
 /// above what this build writes, publishes refused below a floor, and
-/// publishes written below one under `--write-below-format-floor`. Read from
+/// flushes and runs opened below one under `--write-below-format-floor`. Read from
 /// the process-wide [`ravel_ingest::format_floor_metrics`], which every
 /// writer role in the process counts into; zero in a mode that writes nothing.
 fn render_format_floor_family(
@@ -3670,7 +3670,7 @@ fn render_format_floor_family(
     write_header(
         out,
         "ravel_format_floor_refused_total",
-        "Publishes refused because the object's format version is below the bucket's recorded floor for its family: ingest flushes, and maintenance compactions and erasure rewrites (ADR-1746 decision 4).",
+        "Publishes refused because the object's format version would be below the bucket's recorded floor for its family: ingest writes refused at admission, ingest flushes refused at flush open, and maintenance compactions and erasure rewrites refused before their claim (ADR-1746 decision 4). Format migrations and re-encodes run only in ravel-cli, which renders no /metrics, and are not counted here.",
         "counter",
     );
     for f in families {
@@ -3684,7 +3684,7 @@ fn render_format_floor_family(
     write_header(
         out,
         "ravel_format_floor_writes_below_total",
-        "Publishes written below the bucket's recorded format floor under --write-below-format-floor, each one contradicting the floor (ADR-1746 decision 5).",
+        "Ingest flushes opened, and maintenance compactions and erasure rewrites started, below the bucket's recorded format floor under --write-below-format-floor (ADR-1746 decision 5). Counted when the flush opens or the run passes its floor check, so one that then fails before its PUT still counts; each one that publishes contradicts the floor.",
         "counter",
     );
     for f in families {

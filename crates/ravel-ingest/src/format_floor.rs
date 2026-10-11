@@ -114,7 +114,8 @@ pub struct FormatFloorFamilySnapshot {
     pub family: FormatFamily,
     /// Publishes refused below the floor.
     pub refused: u64,
-    /// Publishes written below the floor under the override.
+    /// Publishes admitted below the floor under the override, counted when
+    /// admitted: a flush or run that then fails before its PUT still counts.
     pub writes_below: u64,
     /// (tenant, signal) buckets whose floor the startup check found above the
     /// writable version.
@@ -127,7 +128,7 @@ impl FormatFloorMetrics {
         self.refused[family.index()].load(Ordering::Relaxed)
     }
 
-    /// Publishes of `family` written below the floor under the override.
+    /// Publishes of `family` admitted below the floor under the override.
     pub fn writes_below(&self, family: FormatFamily) -> u64 {
         self.writes_below[family.index()].load(Ordering::Relaxed)
     }

@@ -550,7 +550,12 @@ async fn a_buffered_span_write_below_the_floor_is_refused_and_nothing_is_buffere
     let before = puts(&store);
 
     let err = router
-        .write(acme.clone(), vec![span()], WriteMode::Buffered, ACK_DEADLINE)
+        .write(
+            acme.clone(),
+            vec![span()],
+            WriteMode::Buffered,
+            ACK_DEADLINE,
+        )
         .await
         .expect_err("a buffered write below the floor is refused, not acknowledged");
 
