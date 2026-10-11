@@ -707,18 +707,18 @@ const PEAK_OFF_LARGE: u64 = 9_438_720;
 /// The claim, as a ratio between two measured pairs.
 ///
 /// With the rule off, `peak_intermediate_bytes` for the admitted statement
-/// grows with the distinct-key count (9.4x for 10x the keys): the aggregate
+/// grows with the distinct-key count (8.26x for 10x the keys): the aggregate
 /// holds one accumulator per group. With the rule on it does not (1.44x, and
 /// that residue is scan batches), because the aggregate holds `k` groups
 /// whatever the key count is. At the large fixture the ratio between the two
-/// is 7.12x.
+/// is 6.25x.
 ///
 /// All four figures are pinned, and the three ratios are asserted separately so
 /// a change that moved every figure by the same factor still has to explain
 /// itself. Changing `Some(TOP_K)` to `None` on the `on_large` line below is the
 /// demonstration that the bound assertion is load-bearing: `on_large` becomes
 /// `PEAK_OFF_LARGE` and the first assertion, `assert_eq!(on_large,
-/// PEAK_ON_LARGE, ...)`, fails with `10748928` against `1509688`.
+/// PEAK_ON_LARGE, ...)`, fails with `9438720` against `1509688`.
 #[tokio::test]
 async fn peak_intermediate_bytes_stops_scaling_with_the_key_count() {
     let sql = topk_sql(TOP_K);
