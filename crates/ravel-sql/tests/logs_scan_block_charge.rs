@@ -30,7 +30,7 @@ use ravel_logseg::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, PhaseAccounting};
+use ravel_query::{BlockRun, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{LOG_COL_TS, LogsScanExec, logs_schema_with_declared};
 use ravel_test_support::{ParkOnFirstArmedCall, run_with_watchdog};
 use ravel_types::TenantHash;
@@ -160,13 +160,15 @@ fn log_block_jobs(gate: &ReadGate) -> u64 {
 }
 
 /// A one-partition `ts` scan (the columnar fast path) over the whole fixture
-/// window, with `gate` on the fetcher when given.
+/// window, with `gate` on the fetcher when given. One block per job, so the
+/// wait for a permit sits between two blocks; a job decoding a longer run
+/// takes the reader's block charge into its wait the same way.
 fn exec(
     store: &Arc<dyn ObjectStoreBackend>,
     segments: &[SegmentRef],
     gate: Option<Arc<ReadGate>>,
 ) -> LogsScanExec {
-    let fetcher = LogSegmentFetcher::new(Arc::clone(store));
+    let fetcher = LogSegmentFetcher::new(Arc::clone(store)).with_block_run(BlockRun::SINGLE);
     let fetcher = match gate {
         Some(gate) => fetcher.with_read_gate(gate),
         None => fetcher,

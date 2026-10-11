@@ -413,8 +413,9 @@ impl LogSegmentScan {
     }
 
     /// The run of blocks such a caller decodes per job, set by
-    /// [`LogSegmentFetcher::with_block_run`]. A job of `n` blocks is sized at
-    /// `n` times the [`block_gate`](Self::block_gate) size.
+    /// [`LogSegmentFetcher::with_block_run`]. This scan's own
+    /// [`next_block_on_gate`](Self::next_block_on_gate) still decodes one
+    /// block per job.
     pub fn block_run(&self) -> BlockRun {
         self.block_run
     }

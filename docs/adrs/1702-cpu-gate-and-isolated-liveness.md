@@ -184,6 +184,8 @@ rule on thread placement.
 7. **The logs and spans scans get a decode state.** Their decode runs
    inside `poll_next`, so a wrap in place is not possible. Each scan's state
    machine gains a state that holds the pending gate future for one block.
+   (Widened by the block-run amendment below: the future is one job that
+   decodes a run of consecutive blocks of one part.)
    `poll_next` returns `Pending` while the block decodes.
 
 8. **Liveness and readiness get their own listener on their own thread.**
@@ -656,3 +658,68 @@ documents. The alert evaluator's alert-state fold, which decodes each alert
 commit's RLOG object with `RlogReader::new` and `scan` in
 `services/ravel-server/src/alerting.rs`, runs inline too; it reads through
 the store directly, not through a fetcher.
+
+## Amendment (2026-10-10): the block-run amendment
+
+<!-- amendment-applies: sections="Decision" pointer="block-run amendment" -->
+<!-- amendment-supersedes: phrase="holds the pending gate future for one block" pointer="block-run amendment" -->
+
+Task 8 (#2715) gave the SQL logs and spans scans one `log_block` or
+`span_block` job per block, as decision 7 put it. On the reference box, a
+c6a.4xlarge with ClickBench loaded, that cost about 15% of hot time on the
+CPU-heavy logs aggregates: the hot sum of q19, q21, q22, q34 and q35 went
+from 14.35 s to 16.50 s, each statement 13% to 23% slower (issue #2795).
+
+A scan job now decodes a run of consecutive blocks of one part. A run is
+bounded by the fetcher's `BlockRun`, by default up to 8 blocks, and takes no
+further block once the blocks it holds have decoded 16 MiB, so it holds less
+than 16 MiB plus one block. It also ends at the end of the part, after a
+block whose decode fails, and after a logs block that falls back to the row
+path for its `attrs_raw` page. The stream hands on the run's blocks before
+it submits the next job. Decision 4 already lets one job wrap a whole part,
+and a run is a slice of one. A run's job is sized against the inline floor
+at its blocks together: the logs scan at the run's block count times the
+part's largest block, the spans scan at the sum of the run's uncompressed
+page lengths. A run below the floor still runs inline, so the work it puts
+on a worker stays under the floor. With no gate on the fetcher, blocks
+decode inline one at a time, as before.
+
+Why a run of 8 and a 16 MiB cap. A criterion bench,
+`crates/ravel-bench/benches/logs_scan_gate_runs.rs`, scans 16 parts of 8
+blocks of 8192 rows with a `GROUP BY` over a URL-like body, with no gate,
+one job per block, and runs of 2, 4 and 8 blocks, at 1 and 16 partitions
+against a 15-permit gate. On a shared 15-core macOS host, over four bench
+runs, one job per block cost a median of 1.3 us a block more than no gate at
+one partition and 3.4 us at sixteen, against about 1400 us and 250 us a
+block, inside a run-to-run spread of up to 41 us a block at sixteen
+partitions. Runs of 2, 4 and 8 blocks landed between 31 us a block faster
+and 68 us slower than no gate at sixteen partitions, no signal either way
+at that noise. That host does not show the reference box's regression, so
+the run size comes from the reference figure instead: a per-job cost of 15%
+spread over 8 blocks is under 2%, the bound the fix has to meet. The cap
+bounds what one run holds.
+
+Memory stays charged as decision 6 requires. On the logs scan, the job
+charges each block's built batches (columnar path) or decoded records (row
+path) to a run reservation before it decodes the next block; the decoded
+block behind the columnar reader stays charged as before. When the stream
+takes a block from the run, that block's charge moves to the stream's
+charge for the block it is emitting, which the stream releases batch by
+batch as before. The spans scan's decoded blocks were not charged to any
+pool before this amendment and a run's blocks are not either. On the spans
+columnar exit that adds nothing, since it holds every block of its
+partition until it emits; on the row exit a run holds up to its blocks at
+once where one job per block held one, bounded by the cap.
+
+Stopping early. Under a `LIMIT` pushed into the logs scan, or a confirmed
+TopK threshold the scan reads before each block, a run is one block, so the
+scan decodes no block past the one the limit is reached in, as before. A
+stream dropped while its run's job is decoding stops the job after the
+block it is on, which keeps decision 5's bound on abandoned work at one
+block per job. A logs stream dropped after a run returned discards the
+blocks it had not handed on: at most the 7 blocks after the one it was
+emitting, holding less than 16 MiB plus one block, of decode nobody used.
+
+Metrics (decision 11): for these scans, `ravel_cpu_gate_jobs_total` and
+`ravel_cpu_gate_inline_total` at the `log_block` and `span_block` sites
+count one per run.
