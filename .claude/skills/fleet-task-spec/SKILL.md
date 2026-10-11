@@ -191,7 +191,7 @@ Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 54 && df -h /tmp . "$HOME"
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 70 && df -h /tmp . "$HOME"
 
 Every step is joined with `&&` so a failure anywhere fails the command:
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
@@ -203,12 +203,12 @@ in the next.
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a cold workspace gate writes 54 to 70 GB of
 target (CLAUDE.md's measured band; the largest lane completed in 56 GB),
-so a host without 54 GB free cannot finish it, and the run would die
-mid-link with a fake compiler error (two gate runs died at link on a
-shared executor volume another task filled mid-run; 5 GB was the old
-floor and it measured nothing the gate needed). The floor is the band's
-low end because a crate-scoped gate writes less; a spec that runs the
-full workspace gate asks for 70. Then run every long gate in the LONG COMMANDS form, into
+so a host without 70 GB free cannot be trusted to finish the template's
+workspace clippy, and the run would die mid-link with a fake compiler
+error (two gate runs died at link on a shared executor volume another
+task filled mid-run; 5 GB was the old floor and it measured nothing the
+gate needed). A spec whose gates are all crate-scoped may ask for 54, the
+band's low end, and must say so. Then run every long gate in the LONG COMMANDS form, into
 `.gate-logs/<step>.log` with its `EXIT=` marker.
 
 HOME on the amd64 executor class is a 1 GB tmpfs: pointing the log
