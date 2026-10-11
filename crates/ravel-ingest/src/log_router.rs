@@ -490,7 +490,7 @@ impl LogIngestRouter {
             });
         }
 
-        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): taken
+        // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
         // before the byte budget below, so a refused submit holds no charge.
         let permit = match mode {
             WriteMode::Strict => Some(
@@ -821,7 +821,7 @@ impl LogIngestRouter {
             });
         }
 
-        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): taken
+        // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
         // before the byte budget below, so a refused submit holds no charge.
         // A caller that already holds its own charge (`held`) still takes a
         // pending-ack permit here: the two budgets are independent.

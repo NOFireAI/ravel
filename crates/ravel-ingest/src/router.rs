@@ -714,7 +714,7 @@ impl IngestRouter {
             });
         }
 
-        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): take
+        // The router's pending-strict-ack budget (ADR-2793 decision 4): take
         // the permit, strict mode only, before the byte budget below is
         // charged and before any shard is touched, so a submit this refuses
         // holds no charge and sends nothing.

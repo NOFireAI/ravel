@@ -80,8 +80,9 @@ pub enum WriteError {
     /// with [`Self::DeferralCapReached`] instead.
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
-    /// The process-wide pending-strict-ack budget
-    /// (`IngestConfig::max_pending_strict_acks`, ADR-2793 decision 4) is at its
+    /// The router's pending-strict-ack budget (ADR-2793 decision 4; one
+    /// shared `Arc` sized from `IngestConfig::max_pending_strict_acks` makes it
+    /// process-wide, #2797) is at its
     /// ceiling: `submit` could not take a pending-ack permit, so the write is
     /// refused before the byte budget is charged and before any shard is
     /// touched, with no commit token issued. Retryable, classified the same as

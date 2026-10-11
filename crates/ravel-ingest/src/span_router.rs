@@ -466,7 +466,7 @@ impl SpanIngestRouter {
             });
         }
 
-        // Process-wide pending-strict-ack budget (ADR-2793 decision 4): taken
+        // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
         // before the byte budget below, so a refused submit holds no charge.
         let permit = match mode {
             WriteMode::Strict => Some(
