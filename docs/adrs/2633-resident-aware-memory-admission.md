@@ -5,15 +5,21 @@ Status: Accepted (2026-10-09).
 Revised (2026-10-10): the high-water mark is re-derived from the uncharged heap
 measured after the aggregate hold (PR #2685); the default moves from 75 % to 70 %.
 
+Revised (2026-10-11): the gate closes on host available memory below a floor,
+not on the process's resident size against a mark (the #2806 amendment below);
+the mark and its 70 % default are superseded, and the derived floors are
+clamped to an eighth and a quarter of host memory so a small host starts.
+
 Issue #2633, epic #2040. Builds on ADR-1170 (one
 process-wide memory budget) and, once accepted, changes the ADR-1170 sentences
 listed in section 6. No persistent format changes: no object Ravel writes, no
 key it builds and no protobuf schema changes. This decision adds a gate in
-front of the process `MemoryBudget` that reads the allocator's resident
-figure, forces a purge at a high-water mark, and refuses growth with the typed
-budget error while the mark is still exceeded. It also moves every
-memory-budget refusal on the fetch path, and the catalog decode refusal
-(`CatalogError::MemoryExhausted`), from 503 to the budget's 422.
+front of the process `MemoryBudget` that reads the host's available memory,
+forces a jemalloc purge while it is below a purge floor, and refuses growth
+with the typed budget error (the `HostMemory` cause) while it is below a close
+floor. It also moves every memory-budget refusal on the fetch path, and the
+catalog decode refusal (`CatalogError::MemoryExhausted`), from 503 to the
+budget's 422.
 
 ## Context
 
@@ -411,25 +417,30 @@ Task 4 covers both.
 
 ADR-1170 is Proposed, so it is not edited by this draft. The implementing
 change (task 5) adds the amendment below at the end of ADR-1170 and the
-inline pointer "see the resident-gate amendment below" to each named section,
-and beside each of the four retired 503 sentences (items 4, 5, 7 and 8) on
-the line before or after it, since `check-amendment-integrity.sh` accepts a
-retired phrase only with the pointer in that window. This follows the
-"Amending an ADR" convention in the decision-record index. The
-sentences it changes, quoted from ADR-1170:
+inline pointer "see the host-memory gate amendment below" to each named
+section, and beside each of the four retired 503 sentences (items 4, 5, 7
+and 8) on the line before or after it, since `check-amendment-integrity.sh`
+accepts a retired phrase only with the pointer in that window. This follows
+the "Amending an ADR" convention in the decision-record index. The block
+and items 1 and 2 below are as the host-memory amendment (2026-10-11,
+#2806) rewrote them: the gate they describe closes on host available
+memory, not on `stats.resident` at a mark. The sentences it changes, quoted
+from ADR-1170:
 
 1. Constraints, constraint 4: "The ceiling cannot be RSS. MemTotal and
    `memory.max` are kill boundaries; DataFusion's `grow` allocates before a
    breach is detectable. The honest claim is "tracked allocations are bounded,
    with a measured overhead reserve"." Still true of the ceiling. It changes
-   in that the allocator's `resident` figure, not RSS, becomes a second,
-   admission-side bound under the ceiling.
+   in that the host's available memory, sampled at a bounded rate, becomes
+   a second, admission-side bound under the ceiling: the gate closes before
+   the kill boundary is reached, not at it.
 2. Rejected alternatives: "**Use RSS or `memory.max` as the ceiling.** Kill
    boundaries, not budgets; `grow` has already allocated by the time a breach
    is visible (constraint 4). The budget bounds tracked allocations and the
    acceptance test measures the residual against a stated reserve." The
-   rejection of RSS as the ceiling stands. The acceptance test changes to
-   peak VmRSS against the budget plus a stated slack.
+   rejection of RSS as the ceiling stands. The acceptance test becomes the
+   host-memory amendment's criteria (a) to (d); peak VmRSS is a reported
+   figure beside them, not a pass criterion.
 3. Consequences: "process survival is guaranteed for tracked allocations and
    bounded, not guaranteed, for that path, by the overhead reserve exceeding
    `partitions x max batch bytes`." The gate closes that path too, by tripping
@@ -454,22 +465,32 @@ sentences it changes, quoted from ADR-1170:
 The amendment text task 5 appends, with its markers:
 
 ```markdown
-## Amendment (ADR-2633): a resident gate in front of the budget
+## Amendment (ADR-2633): a host-memory gate in front of the budget
 
-<!-- amendment-applies: sections="Constraints a governor has to satisfy|Rejected alternatives|Consequences|Amendment 2026-09-26 (issue #1255): decision 2 reaches the server|Amendment (2026-09-29, issue #2086): the SQL path's fetchers reserve against the budget|Amendment (2026-10-03, issue #2367): the budget starts from available memory" pointer="resident-gate amendment" -->
-<!-- amendment-supersedes: phrase="returned as 503" pointer="resident-gate amendment" -->
-<!-- amendment-supersedes: phrase="answers 503 (`unavailable`) over HTTP" pointer="resident-gate amendment" -->
-<!-- amendment-supersedes: phrase="a fetch the remainder cannot admit answers 503" pointer="resident-gate amendment" -->
-<!-- amendment-supersedes: phrase="still answers 503" pointer="resident-gate amendment" -->
+<!-- amendment-applies: sections="Constraints a governor has to satisfy|Rejected alternatives|Consequences|Amendment 2026-09-26 (issue #1255): decision 2 reaches the server|Amendment (2026-09-29, issue #2086): the SQL path's fetchers reserve against the budget|Amendment (2026-10-03, issue #2367): the budget starts from available memory" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="returned as 503" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="answers 503 (`unavailable`) over HTTP" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="a fetch the remainder cannot admit answers 503" pointer="host-memory gate amendment" -->
+<!-- amendment-supersedes: phrase="still answers 503" pointer="host-memory gate amendment" -->
 
-ADR-2633 adds a gate that reads jemalloc's `stats.resident`, forces a purge
-at a high-water mark (70 % of the budget by default), and refuses admission
-and reservation growth with the budget's 422 while the mark is still
-exceeded. Constraint 4 and the rejected "RSS as the ceiling" alternative stand
-for the ceiling itself; the acceptance test becomes peak VmRSS at or below the
-budget plus 512 MiB. The infallible `grow` path trips its breach while the
-gate is closed. Every `FetchMemoryExhausted` and every
-`CatalogError::MemoryExhausted` answers 422, not 503.
+ADR-2633 (as amended 2026-10-11, #2806) adds a gate that samples the host's
+available memory (`MemAvailable`, and under a finite cgroup memory limit the
+smaller of that and the cgroup's headroom) every 100 ms, forces a jemalloc
+purge while the reading is below a purge floor (default the smaller of twice
+the close floor and a quarter of host memory, at most once per 5 s), and
+refuses admission and reservation growth with the budget's 422 and the
+`HostMemory` cause while the reading is below a close floor (default
+`min(max(512 MiB, 2 % of host memory), host memory / 8)`). Constraint 4 and
+the rejected "RSS as the ceiling" alternative stand for the ceiling itself:
+the gate is a bound under the kill boundary, not a ceiling. The acceptance
+is ADR-2633's criteria (a) to (d): the ClickBench concurrent error ratio at
+most 0.10 on a stock c6a.4xlarge, q33 to q35 answering on a warm server, no
+process killed at a 27 GB budget on a 32 GB host with the gate's refusals
+carrying the host-memory cause, and purges bounded by the minimum interval;
+peak VmRSS is a reported figure beside them, not a band. The infallible
+`grow` path trips its breach while the gate is closed. Every
+`FetchMemoryExhausted` and every `CatalogError::MemoryExhausted` answers
+422, not 503.
 ```
 
 ## Rejected alternatives
@@ -726,7 +747,7 @@ the mark and the budget.
 
 ## Amendment (2026-10-11, #2806): the gate closes on host available memory
 
-<!-- amendment-applies: sections="1. A gate that reads `stats.resident` at a bounded rate|2. A forced purge at the high-water mark, and the default mark|4. Observability|Consequences|Pre-registered acceptance test|Implementation tasks" pointer="host-memory amendment" -->
+<!-- amendment-applies: sections="1. A gate that reads `stats.resident` at a bounded rate|2. A forced purge at the high-water mark, and the default mark|4. Observability|6. ADR-1170: the sentences that change|Consequences|Pre-registered acceptance test|Implementation tasks" pointer="host-memory amendment" -->
 <!-- amendment-supersedes: phrase="The percentage applies to the budget, not the host" pointer="host-memory amendment" -->
 <!-- amendment-supersedes: phrase="default 70, accepted 1 to 100" pointer="host-memory amendment" -->
 <!-- amendment-supersedes: phrase="ingest_buffer_in_mark_check=false" pointer="host-memory amendment" -->
@@ -826,14 +847,22 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
    sample's final available reading is below the close floor,
    `--memory-gate-min-available-bytes`, and open otherwise; the budget's
    gate setter is written on every successful sample. The default close
-   floor is `max(512 MiB, 2 % of host memory)`, where host memory is
-   `MemTotal` capped by the cgroup limit, the figure the performance
-   defaults resolve; the flag accepts 64 MiB and up. On a 32 GiB host that
-   is 687,194,767 bytes.
+   floor is `min(max(512 MiB, 2 % of host memory), host memory / 8)`,
+   where host memory is `MemTotal` capped by the cgroup limit, the figure
+   the performance defaults resolve. From 4 GiB up the clamp does not
+   bind, since an eighth of host memory is at or above 512 MiB there; on a
+   32 GiB host the floor is 687,194,767 bytes. Below 4 GiB the floor is an
+   eighth of host memory: 134,217,728 bytes on 1 GiB, 67,108,864 on
+   512 MiB, 33,554,432 on 256 MiB. The flag accepts 64 MiB and up; that
+   minimum applies to a flagged value only, and a derived floor below it
+   is accepted, so a host ADR-1170's small-host amendment (#2607) keeps
+   bootable is not refused by the gate.
 2. **The purge runs at a higher floor, rate-limited.** When the available
-   reading is below `--memory-gate-purge-available-bytes` (default twice the
-   close floor, 1,374,389,534 bytes on a 32 GiB host; it must be above the
-   close floor) and at least `--memory-gate-purge-min-interval-ms` (default
+   reading is below `--memory-gate-purge-available-bytes` (default
+   `min(2 x close floor, host memory / 4)`: 1,374,389,534 bytes on a
+   32 GiB host, 268,435,456 on 1 GiB, 134,217,728 on 512 MiB, 67,108,864
+   on 256 MiB; a flagged value must be above the close floor) and at least
+   `--memory-gate-purge-min-interval-ms` (default
    5000, accepted 100 to 600000) has passed since the previous purge
    started, the sampler purges as section 2 describes, per arena, and
    re-reads both figures before deciding the gate. A sample below the close
@@ -870,10 +899,19 @@ every run in the Context tables peaks above it (8.82 to 10.44 GB against an
    `disabled-no-host-memory` when `/proc/meminfo`'s `MemAvailable` or
    `MemTotal` cannot be read: without the first the sampler has nothing
    to decide on, without the second there is no host memory to take the
-   default floor of. The resolve refuses a purge floor not above the close
-   floor, and either floor at or above host memory (a purge floor there
-   would have every reading below it and run the purge at every minimum
-   interval for the process's life). The cache-caps check of section 2
+   default floor of. The resolve checks flagged floors only: it refuses a
+   flagged close floor at or above host memory, a flagged purge floor not
+   above the close floor, and a flagged purge floor at or above host
+   memory (every reading would be below it and the purge would run at
+   every minimum interval for the process's life). A derived purge floor
+   is above a derived close floor on every host size, since the close
+   floor is at most an eighth of host memory and the purge floor is twice
+   it up to a quarter; with a close floor flagged at or above a quarter of
+   host memory the derived purge floor is not above it, and the resolve
+   refuses with `PurgeFloorNotDerivable`, whose message says to pass
+   `--memory-gate-purge-available-bytes` explicitly. That is the only
+   refusal a derived purge floor can produce, and it needs a flagged close
+   floor; a derived configuration never refuses. The cache-caps check of section 2
    and the startup-check amendment is dropped: it compared the caps with a
    mark on the process's own memory, which no longer exists, and the
    stamp fields it left (`ingest_buffer_bytes`,
@@ -902,6 +940,10 @@ purge floor. An `all`-mode process's ingest buffers still count, now in the
 host's used memory, so heavy ingest can still close the gate on queries.
 The pre-registered acceptance test below replaces the one above: the 8 GB
 scaled run's VmRSS band becomes a reported figure, not a pass criterion.
+Section 6's ADR-1170 amendment text (the block task 5 appends) is rewritten
+to this gate and this acceptance: it no longer describes a gate on
+`stats.resident` at a mark, and its acceptance is criteria (a) to (d) below
+rather than a VmRSS band; section 6's items 1 and 2 carry the same change.
 
 ### Pre-registered acceptance (task 6, #2734)
 
