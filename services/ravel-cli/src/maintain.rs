@@ -219,6 +219,9 @@ pub enum CompactorKnobError {
 
 /// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
 /// with: defaults, plus the dry-run switch and the optional operator overrides.
+/// It carries the refusing format-floor policy (ADR-1746 decision 4), so a
+/// compaction into a bucket whose recorded floor is above the version it
+/// writes is refused before its claim and every PUT.
 ///
 /// A FRESH [`MergeMemoryTracker`] is installed on every call, so the per-phase
 /// peak-memory event `ravel_maintain::rewrite_and_publish` emits fires for the
@@ -277,6 +280,9 @@ pub fn build_compactor_config(
     let mut config = CompactorConfig {
         dry_run,
         merge_memory_tracker: Some(MergeMemoryTracker::new()),
+        // ADR-1746 decision 4: refuse to write below a bucket's recorded
+        // format floor, the default `migrate_family` also falls back to.
+        format_floor: Some(ravel_ingest::FormatFloorPolicy::default()),
         ..CompactorConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
