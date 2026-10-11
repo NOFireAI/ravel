@@ -68,10 +68,12 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to resolve the host-derived performance defaults")?;
     performance.emit(host);
     configure_allocator();
-    // ADR-2633 task 2: the resident memory gate's mark, from the budget just
-    // resolved. Refuses a mark the cache caps and ingest ceiling reach.
+    // ADR-2633 task 2, amended for issue #2806: the memory gate's floors on
+    // host available memory, from the same host profile the budget resolved
+    // from. Refuses a purge floor not above the close floor, and a close
+    // floor at or above host memory.
     let memory_gate = cli
-        .resolve_memory_gate(&performance)
+        .resolve_memory_gate(&performance, host)
         .context("failed to resolve the memory gate")?;
     memory_gate.emit();
     // ADR-1702 decision 3: the read and write CPU gates' permits, derived from

@@ -1,12 +1,15 @@
-//! ADR-2633 section 4: every memory gate family appears on a scraped
-//! `/metrics`, reading the server's own process memory budget and the
-//! sampler thread's stats. Before the sampler starts, both gate gauges read
-//! the off state; once it runs, they carry its readings.
+//! ADR-2633 section 4, as amended for issue #2806: every memory gate family
+//! appears on a scraped `/metrics`, reading the server's own process memory
+//! budget and the sampler thread's stats. Before the sampler starts, all
+//! four gate gauges read the off state; once it runs, they carry its
+//! readings.
 //!
-//! The sampler starts at most once per process and runs for the process's
-//! life, so this file holds one test.
+//! The sampler reads host available memory from `/proc/meminfo`, so this
+//! runs on Linux only; on every other target the gate resolves off and the
+//! sampler never starts. It starts at most once per process and runs for the
+//! process's life, so this file holds one test.
 
-#![cfg(not(target_env = "msvc"))]
+#![cfg(target_os = "linux")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
@@ -15,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::memory::MemoryStore;
-use ravel_server::memory_gate::{self, MemoryGate};
+use ravel_server::memory_gate::{self, HostMemorySource, MemoryGate};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
@@ -103,9 +106,11 @@ async fn scrape(client: &reqwest::Client, base: &str) -> String {
     response.text().await.expect("metrics body is text")
 }
 
-const FAMILIES: [(&str, &str); 8] = [
+const FAMILIES: [(&str, &str); 10] = [
+    ("ravel_memory_gate_available_bytes", "gauge"),
+    ("ravel_memory_gate_available_floor_bytes", "gauge"),
+    ("ravel_memory_gate_purge_floor_bytes", "gauge"),
     ("ravel_memory_gate_resident_bytes", "gauge"),
-    ("ravel_memory_gate_high_water_bytes", "gauge"),
     ("ravel_memory_gate_purges_total", "counter"),
     ("ravel_memory_gate_samples_total", "counter"),
     ("ravel_memory_gate_epoch_refresh_seconds_total", "counter"),
@@ -145,27 +150,43 @@ fn assert_every_family(body: &str) {
     }
 }
 
-/// A mark of 1 byte puts every reading at or above it, so each sample
-/// purges and the scrape shows the purge, the re-read, and the mark.
+/// Floors above any host's available memory put every reading below both,
+/// so each sample closes the gate, the first one purges, and the scrape
+/// shows the purge, the readings and both floors.
 #[tokio::test]
 async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
+    const CLOSE_FLOOR: u64 = u64::MAX - 1;
+    const PURGE_FLOOR: u64 = u64::MAX;
+
     let running = start_test_server().await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
     let body = scrape(&client, &base).await;
     assert_every_family(&body);
-    assert_eq!(value(&body, "ravel_memory_gate_resident_bytes"), 0.0);
-    assert_eq!(value(&body, "ravel_memory_gate_high_water_bytes"), 0.0);
+    for gauge in [
+        "ravel_memory_gate_available_bytes",
+        "ravel_memory_gate_available_floor_bytes",
+        "ravel_memory_gate_purge_floor_bytes",
+        "ravel_memory_gate_resident_bytes",
+    ] {
+        assert_eq!(
+            value(&body, gauge),
+            0.0,
+            "{gauge} before the sampler starts"
+        );
+    }
 
     let gate = MemoryGate {
         enabled: true,
-        high_water_bytes: 1,
-        high_water_percent: 1,
-        memory_budget_bytes: 100,
+        host_memory_bytes: 0,
+        min_available_bytes: CLOSE_FLOOR,
+        purge_available_bytes: PURGE_FLOOR,
+        purge_min_interval_ms: memory_gate::MIN_PURGE_MIN_INTERVAL_MS,
         interval_ms: 10,
         wait_ms: memory_gate::DEFAULT_WAIT_MS,
-        ingest_buffer_bytes: 0,
+        memory_budget_bytes: 100,
+        host_memory_source: HostMemorySource::MemInfo,
         source: memory_gate::SOURCE_FLAG,
     };
     let budget = running.process_memory_budget();
@@ -175,9 +196,9 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
     let body = loop {
         let body = scrape(&client, &base).await;
         // The sampler records the purge before it writes the gate, so a scrape
-        // between the two reads the count with the gauges still at 0.
+        // between the two reads the count with the budget's gauges still at 0.
         if value(&body, "ravel_memory_gate_purge_seconds_count") >= 1.0
-            && value(&body, "ravel_memory_gate_high_water_bytes") >= 1.0
+            && value(&body, "ravel_memory_gate_available_floor_bytes") >= 1.0
         {
             break body;
         }
@@ -185,7 +206,18 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_every_family(&body);
-    assert_eq!(value(&body, "ravel_memory_gate_high_water_bytes"), 1.0);
+    assert_eq!(
+        value(&body, "ravel_memory_gate_available_floor_bytes"),
+        CLOSE_FLOOR as f64
+    );
+    assert_eq!(
+        value(&body, "ravel_memory_gate_purge_floor_bytes"),
+        PURGE_FLOOR as f64
+    );
+    assert!(
+        value(&body, "ravel_memory_gate_available_bytes") >= 1.0,
+        "{body}"
+    );
     assert!(
         value(&body, "ravel_memory_gate_resident_bytes") >= 1.0,
         "{body}"
@@ -203,6 +235,7 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         "{body}"
     );
     assert!(!budget.gate_open());
+    assert_eq!(budget.gate_floor(), CLOSE_FLOOR);
 
     running.shutdown().await.expect("graceful shutdown");
 }

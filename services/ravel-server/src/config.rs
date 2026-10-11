@@ -2093,22 +2093,54 @@ pub struct Cli {
     #[arg(long)]
     pub disable_cache: bool,
 
-    /// Resident high-water mark of the memory gate, as a percentage (1 to 100) of the resolved memory budget; default 70.
+    /// Close the memory gate while the host's available memory is below this many bytes (64 MiB or more); default max(512 MiB, 2% of host memory).
     ///
-    /// At or above the mark the `ravel-memory-gate` sampler forces a jemalloc
-    /// purge and, if the post-purge reading is still at or above it, closes
-    /// the gate (ADR-2633 section 2). Startup refuses a mark that the cache
-    /// hard caps plus, in `all` mode, a bounded `--max-ingest-buffer-bytes`
-    /// reach. The gate is off in `gateway` mode, with a fallback-sized
-    /// budget, and in a build whose allocator is not jemalloc. See
+    /// Every `--memory-gate-interval-ms` the `ravel-memory-gate` sampler
+    /// reads `MemAvailable` from `/proc/meminfo` (under a cgroup memory
+    /// limit, `memory.max` minus `memory.current`) and closes the gate when
+    /// the reading is below this floor; a closed gate refuses memory
+    /// reservations until a reading at or above it (ADR-2633 section 2, as
+    /// amended for issue #2806). Host memory is `MemTotal` capped by the
+    /// cgroup memory limit, the figure the performance defaults resolve.
+    /// Startup refuses a floor at or above host memory. The gate is off in
+    /// `gateway` mode, with a fallback-sized budget, in a build whose
+    /// allocator is not jemalloc, and when host memory cannot be read. See
     /// [`crate::memory_gate`].
-    #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(1..=100))]
-    pub memory_gate_high_water_percent: Option<u8>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(u64).range(crate::memory_gate::MIN_AVAILABLE_FLOOR_BYTES..)
+    )]
+    pub memory_gate_min_available_bytes: Option<u64>,
+
+    /// Force a jemalloc purge while the host's available memory is below this many bytes; must be above --memory-gate-min-available-bytes, default twice it.
+    ///
+    /// Below this floor the sampler returns every arena's unused dirty and
+    /// muzzy pages to the operating system and re-reads before deciding the
+    /// gate, so retained-but-freed memory is given back before the close
+    /// floor is reached. Purges are spaced by
+    /// `--memory-gate-purge-min-interval-ms`.
+    #[arg(long, value_name = "BYTES")]
+    pub memory_gate_purge_available_bytes: Option<u64>,
+
+    /// Shortest spacing between two forced purges of the memory gate, in milliseconds (100 to 600000).
+    ///
+    /// A sample below the purge floor whose purge is rate-limited decides
+    /// the gate on the reading it has.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = crate::memory_gate::DEFAULT_PURGE_MIN_INTERVAL_MS,
+        value_parser = clap::value_parser!(u64).range(
+            crate::memory_gate::MIN_PURGE_MIN_INTERVAL_MS..=crate::memory_gate::MAX_PURGE_MIN_INTERVAL_MS
+        )
+    )]
+    pub memory_gate_purge_min_interval_ms: u64,
 
     /// Memory gate sampling interval in milliseconds (10 to 1000).
     ///
-    /// Each sample refreshes the jemalloc stats epoch and reads
-    /// `stats.resident` (ADR-2633 section 1).
+    /// Each sample reads the host's available memory, refreshes the jemalloc
+    /// stats epoch and reads `stats.resident` (ADR-2633 section 1).
     #[arg(
         long,
         value_name = "MS",
@@ -2124,7 +2156,7 @@ pub struct Cli {
     #[arg(long, value_name = "MS", default_value_t = crate::memory_gate::DEFAULT_WAIT_MS)]
     pub memory_gate_wait_ms: u64,
 
-    /// Turn the resident memory gate off: no sampler thread, no forced purge, and the gate never closes.
+    /// Turn the memory gate off: no sampler thread, no forced purge, and the gate never closes.
     #[arg(long)]
     pub disable_memory_gate: bool,
 
@@ -3122,15 +3154,17 @@ impl HostProfile {
         None
     }
 
+    /// Read at startup for the budget derivation and again on every memory
+    /// gate sample (`crate::memory_gate::read_available`).
     #[cfg(target_os = "linux")]
-    fn detect_mem_available_bytes() -> Option<u64> {
+    pub(crate) fn detect_mem_available_bytes() -> Option<u64> {
         std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|meminfo| parse_meminfo_field_bytes(&meminfo, "MemAvailable:"))
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn detect_mem_available_bytes() -> Option<u64> {
+    pub(crate) fn detect_mem_available_bytes() -> Option<u64> {
         None
     }
 
@@ -3140,7 +3174,7 @@ impl HostProfile {
     /// already-capped total and exposes neither the limit nor the raw total
     /// on their own.
     #[cfg(target_os = "linux")]
-    fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+    pub(crate) fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
         std::fs::read_to_string("/sys/fs/cgroup/memory.max")
             .ok()
             .and_then(|contents| parse_cgroup_memory_limit_bytes(&contents))
@@ -3152,7 +3186,27 @@ impl HostProfile {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+    pub(crate) fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+        None
+    }
+
+    /// The cgroup's current memory usage, the figure the memory gate
+    /// subtracts from the limit on each sample: v2 `memory.current` first,
+    /// then v1 `memory.usage_in_bytes`, in the same precedence as the limit.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn detect_cgroup_memory_current_bytes() -> Option<u64> {
+        std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+            .or_else(|| {
+                std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+                    .ok()
+                    .and_then(|contents| contents.trim().parse().ok())
+            })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn detect_cgroup_memory_current_bytes() -> Option<u64> {
         None
     }
 
