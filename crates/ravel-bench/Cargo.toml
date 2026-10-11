@@ -245,6 +245,22 @@ proptest = { workspace = true }
 # Corpus-loader tests write malformed and well-formed corpus files to a temp
 # directory that cleans itself up; workspace pin, no new external crate.
 tempfile = { workspace = true }
+# The `ingest_write_gate_overhead` bench (issue #2669) drives the server's
+# OTLP-HTTP and Remote Write handlers in-process, gated and ungated by the
+# ADR-1702 write gate. ravel-server is named by path as the optional
+# `saturation` entry above names it, here without the `sql` feature; the
+# others are workspace pins ravel-server already links. No new external crate.
+ravel-server = { path = "../../services/ravel-server", version = "0.23.0" }
+ravel-cpu-gate = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+flate2 = { workspace = true }
+opentelemetry-proto = { workspace = true }
+
+# The same bench runs under jemalloc, the allocator the shipped server binary
+# installs, since where a gated job allocates and frees is part of its cost.
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
 
 [lib]
 # Only the criterion `[[bench]]` targets below understand `cargo bench`'s
@@ -577,6 +593,11 @@ harness = false
 
 [[bench]]
 name = "series_id_hash"
+harness = false
+
+# ADR-1702 write gate overhead on the ingest write path (issue #2669).
+[[bench]]
+name = "ingest_write_gate_overhead"
 harness = false
 
 [[bin]]
