@@ -72,9 +72,12 @@ What the two repositories do today (read on 2026-10-11, claude-fleet at
 - **Duplicate guards (ravel).** `assert-no-duplicate-dispatch.sh` compares
   whole file paths; `check-duplicate-work.sh` compares whole-diff patch ids
   and shared files. Six source files exceed 13,000 lines
-  (`services/ravel-server/src/config.rs` 18,575; `metrics.rs` 16,726;
-  `crates/ravel-query/src/log_fetcher.rs` 14,659; `catalog.rs` 13,763;
-  `maintain.rs` 13,421; `crates/ravel-sql/src/logs_scan.rs` 13,101), so two
+  (`services/ravel-server/src/config.rs` 18,575;
+  `services/ravel-server/src/metrics.rs` 16,726;
+  `crates/ravel-query/src/log_fetcher.rs` 14,659;
+  `crates/ravel-catalog/src/catalog.rs` 13,763;
+  `services/ravel-server/src/maintain.rs` 13,421;
+  `crates/ravel-sql/src/logs_scan.rs` 13,101), so two
   edits anywhere in one of them read as a collision. No PR size or lifetime
   rule exists beyond the three-review-round cap.
 - **Claims (ravel).** The CLAIMS AUDIT paragraph tells an executor to
@@ -165,13 +168,21 @@ In ravel, `benchmarks/clickbench/kit/`:
    pre-registered band read from the band file, and an evidence tarball
    to `s3://<bucket>/runs/<run-id>/out/`, writes `DONE` or `FAILED` beside
    them, and terminates the instance.
-3. `fetch.sh` (laptop): waits on the `DONE` marker, downloads
-   `results.json`, prints the band table, exits non-zero on any miss.
+3. `fetch.sh` (laptop): waits for `DONE` or `FAILED` under a wait bound,
+   downloads `results.json`, prints the band table, and exits non-zero on
+   any miss, on `FAILED`, on the bound, and with a distinct code when S3
+   could not be reached.
 4. Bands live in one file per lane, `benchmarks/clickbench/bands/<lane>.toml`,
    with the existing `parquet/prereg.toml` moved under it; the issue
    comment that pre-registers a run links the file and its commit, and the
    kit refuses a band file with a placeholder value, as `parse_prereg`
-   already does.
+   already does. The runbook's section 9 constants (the T2 bands inside
+   its inline `analyse.py`, registered against #913) become
+   `bands/t2.toml`, and that script reads the file instead of carrying the
+   figures, so the kit's on-box evaluation and the laptop check read one
+   band set; until that lands with change 2 the hand-run path keeps its
+   constants and the kit's acceptance is judged by the band file, not by
+   the script.
 
 Acceptance: a dry-run mode exercises every step with a stub `aws` and a
 stub box (the pattern `fresh-box.test.sh` uses), and one real run of the
@@ -221,7 +232,7 @@ In ravel:
    no open PR touches the file, with a `git log --follow` check that
    blame survives: the ingest handlers into `decode`, `admission` and
    `mode` modules (store-96, after #2797), and `logs_scan.rs` into its
-   plan, scan and threshold halves (ravel-perf, after #2774).
+   plan, scan and threshold parts (ravel-perf, after #2774).
 
 Acceptance: guard cases for a hunk overlap, a same-file different-hunk
 pass, and a docs same-section collision; `cargo check` on each split with
@@ -243,7 +254,10 @@ In ravel:
    keyed on the fleet-clone path test alone (the `/fleet/work/` and
    `/var/lib/fleet` test inside `isExemptCheckout`, not the whole
    function: its `RAVEL_GUARD_ALLOW_PRIMARY` escape belongs to the worktree
-   rule and must not switch this refusal off).
+   rule and must not switch this refusal off). The hook sees only the
+   command text, so `gates.sh` itself refuses to run unscoped (no `-p`)
+   when its checkout is a fleet clone, with the same path test; the hook
+   covers the hand-typed spelling, the script covers its own.
 2. `fleet-result-merge.sh` runs `assert-struct-literals-current.sh`
    before `gh pr create`, so a shape break is a local refusal, not a CI
    cycle.
@@ -254,8 +268,15 @@ In ravel:
    controls block order (#2851); the remaining half of #2783 is closed
    with the test that fixed it named.
 
-Owners: store-43 (template, gates, hook, merge script), store-00 (#2851,
-#2783 closure).
+Acceptance: the hook's suite refuses `cargo clippy --workspace` under a
+`/var/lib/fleet` path and allows it in a linked worktree; a `gates.sh`
+case shows `-p ravel-query` selecting the `sql` and `flight-sql` lanes and
+`-p ravel-logseg` pulling `ravel-ingest` into the closure; a merge-script
+case shows the shape guard refusing before the PR step; the TopK endpoint
+test passes 50 consecutive runs quiet and 50 under a concurrent build, and
+its new order-controlled test fails under both flips (skip made a no-op;
+threshold published after the scan). Owners: store-43 (template, gates,
+hook, merge script), store-00 (#2851, #2783 closure).
 
 ### 6. Specs cite their numbers
 
@@ -272,8 +293,20 @@ In ravel:
    when no band table is found at all. Wired into `gates.sh` and the
    doc-scripts job, cases first. `check_docs.py`'s TRACKER rule stays as
    it is: ADRs are history scope and may cite issues.
+3. Backfill, in the same commit as the guard, so the gate lands green:
+   every ADR band table that fails the rule on the day the guard lands is
+   sourced in that commit. On 2026-10-11 the anchored scan finds eight
+   ADRs with such a table (ADR-2707's acceptance table and ADR-2677's
+   decision 8 rows among them); each basis cell gets the comment id,
+   report path or `measured <date>` stamp its figure came from, or, where
+   the figure was a prediction with no measurement behind it, the cell is
+   marked `predicted` and the guard accepts that token too, so a reader
+   can tell the two apart. There is no cutoff and no allowlist.
 
-Owner: ravel-hardening.
+Acceptance: the guard's suite covers a cell without a source (exit 1
+naming it), a sourced cell, a `predicted` cell and a tree with no band
+table (exit 70); the guard exits 0 on the commit that lands it. Owner:
+ravel-hardening.
 
 ### 7. Instrumentation that answers "where did the time go" in one run
 
@@ -286,6 +319,15 @@ Owner: ravel-hardening.
    metrics, so no HTTP surface changes (store-00, after #2774).
 4. One `perf record` of a hot run per statement in the kit, as an opt-in
    lane (part of change 2).
+
+Acceptance: both gate counter families appear on the scraped `/metrics`
+with their site labels and an artificial delay inside the gate lands in
+the handoff counter only; a stub concurrent phase writes one `calls.jsonl`
+line per call and the band evaluation reads pooled error and QPS from it;
+`ravel-cli sql explain --analyze` over an in-memory tenant prints
+`CompactSlicesExec` metrics and per-operator `elapsed_compute` while the
+HTTP endpoint still refuses `EXPLAIN`. Owners: ravel-hardening (item 1),
+ravel-perf (items 2 and 4), store-00 (item 3).
 
 ## Rejected alternatives
 
