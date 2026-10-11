@@ -4293,17 +4293,24 @@ mod tests {
         // fetcher cache), one run.
         let cache = build_read_cache(64 << 20);
         let cached = cold_executor(&store, &[], Some(cache), settings)
-            .expect("build cached executor")
-            .executor;
+            .expect("build cached executor");
+        let on_wire = cached.wire_bytes.clone();
+        let cached = cached.executor;
         let on = cached.execute(th, &req).await.expect("cached run");
 
         // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
         // no fetcher cache), one run. The catalog contribution is the same in
         // both, so any delta is the fetcher cache alone.
         let uncached = cold_executor(&store, &[], None, settings)
-            .expect("build uncached executor")
-            .executor;
+            .expect("build uncached executor");
+        let off_wire = uncached.wire_bytes.clone();
+        let uncached = uncached.executor;
         let off = uncached.execute(th, &req).await.expect("uncached run");
+        for (n, w) in [("on", on_wire.snapshot()), ("off", off_wire.snapshot())] {
+            for ph in QueryPhase::ALL {
+                eprintln!("DEBUG {n} {ph:?} req={} bytes={}", w.phase_requests(ph), w.phase(ph));
+            }
+        }
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
         let get_off = off.accounting.s3_requests(AccountedOp::Get);
