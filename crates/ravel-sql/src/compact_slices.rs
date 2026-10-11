@@ -58,12 +58,16 @@
 //! without an aggregate it costs nothing. The referenced bytes are computed
 //! into nested columns: a List, LargeList or Map column counts the child
 //! range its offsets cover, a FixedSizeList column its child slice, a Struct
-//! column its sliced children, a Dictionary column its keys slice plus its
-//! values once, and a byte-view column its views plus the data bytes those
-//! views point at. `ArrayData::get_slice_memory_size` alone would not do:
-//! it adds every child in full, because `ArrayData::slice` only slices the
-//! children of a Struct, so a sliced List column would read as unsliced. The
-//! copy is one pass over each sliced batch; it happens once per aggregate
+//! column its sliced children, a Dictionary column its keys slice plus each
+//! distinct value its keys point at, once, and a byte-view column its views
+//! plus the data bytes those views point at. A Dictionary whose value type
+//! has no per-value size here (anything but a fixed-width primitive,
+//! FixedSizeBinary, Utf8, Binary, their Large forms and the byte views: a
+//! Boolean, List or Map, for example) counts its values in full.
+//! `ArrayData::get_slice_memory_size` alone would not do: it adds every
+//! child in full, because `ArrayData::slice` only slices the children of a
+//! Struct, so a sliced List column would read as unsliced. The copy is one
+//! pass over each sliced batch; it happens once per aggregate
 //! output that feeds an exchange or a sort, and it is reported through the
 //! exec's `copied_bytes`, `compacted_batches` and `passed_through_batches`
 //! metrics.
@@ -79,10 +83,15 @@
 //! (`concat` drops a Dictionary's unreferenced values only when it holds at
 //! least as many values as the output has rows,
 //! `should_merge_dictionary_values`; below that `MutableArrayData` copies the
-//! values whole). The copy follows the nesting the measure does: a List or
-//! LargeList column rebuilds its offsets from zero over its compacted child
-//! range, and a Struct column compacts its children, so a byte-view or
-//! Dictionary child is copied the same way at any depth. `concat` through a
+//! values whole). A Dictionary whose value type arrow's cast cannot pack
+//! (Boolean, List, Map and others: the cast errors), or whose values hold a
+//! null (the round trip would turn a valid key that points at it null), is
+//! copied by `concat` instead and keeps its values whole unless
+//! `should_merge_dictionary_values` merges them, which it never does for a
+//! Boolean, List or Map value type. The copy follows the nesting the measure
+//! does: a List or LargeList column rebuilds its offsets from zero over its
+//! compacted child range, and a Struct column compacts its children, so a
+//! byte-view or Dictionary child is copied the same way at any depth. `concat` through a
 //! Map or FixedSizeList copies exactly the rows of a plain child but keeps a
 //! byte-view or Dictionary child's buffers whole: `MutableArrayData` carries
 //! a view array's data buffers over as they are. Such a column stays
@@ -92,11 +101,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, GenericByteViewArray, GenericListArray, OffsetSizeTrait, StructArray,
-    new_empty_array,
+    AnyDictionaryArray, Array, ArrayRef, AsArray, GenericByteViewArray, GenericListArray,
+    OffsetSizeTrait, StructArray, new_empty_array,
 };
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
-use datafusion::arrow::compute::{can_cast_types, cast, concat};
+use datafusion::arrow::compute::{cast, concat};
 use datafusion::arrow::datatypes::{ByteViewType, DataType, FieldRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::Result as DFResult;
@@ -234,7 +243,8 @@ pub struct CompactSlicesExec {
 struct CompactMetrics {
     /// The referenced-bytes estimate of every batch the exec compacted,
     /// summed: an estimate of the bytes the copies wrote, and the figure the
-    /// consumer above is charged afterwards to within the copy's own slack.
+    /// consumer above is charged afterwards to within the copy's own slack
+    /// and the columns the module docs name as copied with whole buffers.
     copied_bytes: Count,
     /// Batches the exec copied.
     compacted_batches: Count,
@@ -413,11 +423,81 @@ fn referenced_array_bytes(array: &dyn Array) -> DFResult<usize> {
             total
         }
         DataType::Dictionary(_, _) => {
-            referenced_array_bytes(array.as_any_dictionary().values().as_ref())?
+            referenced_dictionary_values_bytes(array.as_any_dictionary())?
         }
         _ => children_in_full,
     };
     Ok(own.saturating_add(reached))
+}
+
+/// The bytes of the values a (possibly sliced) dictionary's valid keys point
+/// at, each distinct value counted once. A value type [`value_sizer`] cannot
+/// size one value at a time counts its values in full.
+fn referenced_dictionary_values_bytes(dictionary: &dyn AnyDictionaryArray) -> DFResult<usize> {
+    let values = dictionary.values();
+    let Some(value_bytes) = value_sizer(values.as_ref()) else {
+        return referenced_array_bytes(values.as_ref());
+    };
+    if values.is_empty() {
+        return Ok(0);
+    }
+    let keys = dictionary.keys();
+    let mut referenced: Vec<usize> = dictionary
+        .normalized_keys()
+        .into_iter()
+        .enumerate()
+        .filter(|(row, _)| keys.is_valid(*row))
+        .map(|(_, key)| key)
+        .collect();
+    referenced.sort_unstable();
+    referenced.dedup();
+    Ok(referenced
+        .into_iter()
+        .map(value_bytes)
+        .fold(0usize, usize::saturating_add))
+}
+
+/// The bytes one value of `values` occupies, by index: its width for a
+/// fixed-width type, its data bytes plus its offset for Utf8 and Binary, its
+/// view plus its out-of-line bytes for a byte-view type. `None` for any other
+/// type.
+fn value_sizer(values: &dyn Array) -> Option<Box<dyn Fn(usize) -> usize + '_>> {
+    fn offset_sized<O: OffsetSizeTrait>(offsets: &[O]) -> Box<dyn Fn(usize) -> usize + '_> {
+        Box::new(move |i| {
+            let len = match (offsets.get(i), offsets.get(i + 1)) {
+                (Some(start), Some(end)) => end.as_usize().saturating_sub(start.as_usize()),
+                _ => 0,
+            };
+            len.saturating_add(size_of::<O>())
+        })
+    }
+    fn view_sized(views: &[u128]) -> Box<dyn Fn(usize) -> usize + '_> {
+        Box::new(move |i| {
+            let len = views.get(i).map_or(0, |view| *view as u32);
+            let data = if len > INLINE_VIEW_LEN {
+                len as usize
+            } else {
+                0
+            };
+            size_of::<u128>().saturating_add(data)
+        })
+    }
+    if let Some(width) = values.data_type().primitive_width() {
+        return Some(Box::new(move |_| width));
+    }
+    match values.data_type() {
+        DataType::FixedSizeBinary(width) => {
+            let width = usize::try_from(*width).unwrap_or(0);
+            Some(Box::new(move |_| width))
+        }
+        DataType::Utf8 => Some(offset_sized(values.as_string::<i32>().value_offsets())),
+        DataType::LargeUtf8 => Some(offset_sized(values.as_string::<i64>().value_offsets())),
+        DataType::Binary => Some(offset_sized(values.as_binary::<i32>().value_offsets())),
+        DataType::LargeBinary => Some(offset_sized(values.as_binary::<i64>().value_offsets())),
+        DataType::Utf8View => Some(view_sized(values.as_string_view().views())),
+        DataType::BinaryView => Some(view_sized(values.as_binary_view().views())),
+        _ => None,
+    }
 }
 
 /// The referenced bytes of the child rows a (possibly sliced) list array's
@@ -483,24 +563,17 @@ fn compact_batch(batch: RecordBatch, metrics: &CompactMetrics) -> DFResult<Recor
 }
 
 /// A copy of `array` whose buffers hold exactly its rows, into its children.
-/// A Dictionary column is re-encoded through its value type so the copy holds
-/// only the values the slice references (a Dictionary whose value type arrow
-/// cannot pack, by `can_cast_types`, goes through `concat` and keeps every
-/// value); a List or LargeList column rebuilds its offsets from zero over its
-/// compacted child range; a Struct column compacts its children. Everything
-/// else goes through `concat`, which copies exactly the rows of a plain
-/// column but keeps a byte-view or Dictionary child's buffers whole under a
-/// Map or FixedSizeList.
+/// A Dictionary column goes through [`compact_dictionary`]; a List or
+/// LargeList column rebuilds its offsets from zero over its compacted child
+/// range; a Struct column compacts its children. Everything else goes
+/// through `concat`, which copies exactly the rows of a plain column but
+/// keeps a byte-view or Dictionary child's buffers whole under a Map or
+/// FixedSizeList.
 fn compact_array(array: &ArrayRef) -> DFResult<ArrayRef> {
     match array.data_type() {
         DataType::Utf8View => Ok(Arc::new(array.as_string_view().gc())),
         DataType::BinaryView => Ok(Arc::new(array.as_binary_view().gc())),
-        dictionary @ DataType::Dictionary(_, value_type)
-            if can_cast_types(value_type, dictionary) =>
-        {
-            let rows = cast(array.as_ref(), value_type)?;
-            Ok(cast(rows.as_ref(), dictionary)?)
-        }
+        DataType::Dictionary(_, value_type) => compact_dictionary(array, value_type),
         DataType::List(field) => compact_list(array.as_list::<i32>(), field),
         DataType::LargeList(field) => compact_list(array.as_list::<i64>(), field),
         DataType::Struct(fields) => {
@@ -516,11 +589,32 @@ fn compact_array(array: &ArrayRef) -> DFResult<ArrayRef> {
                 compact_nulls(strukt.nulls()),
             )?))
         }
-        other => {
-            let empty = new_empty_array(other);
-            Ok(concat(&[array.as_ref(), empty.as_ref()])?)
-        }
+        _ => concat_copy(array.as_ref()),
     }
+}
+
+/// A copy of `array` through `concat` with an empty array of its type, which
+/// takes `concat`'s copying path (one array alone is returned as it is).
+fn concat_copy(array: &dyn Array) -> DFResult<ArrayRef> {
+    let empty = new_empty_array(array.data_type());
+    Ok(concat(&[array, empty.as_ref()])?)
+}
+
+/// A Dictionary column re-encoded through its value type: cast to the value
+/// type and back, so the copy holds only the values the slice references. A
+/// Dictionary whose value type arrow's cast cannot pack (Boolean, List, Map
+/// and others: the cast errors), or whose values hold a null (the round trip
+/// would turn a valid key that points at it null), is copied by `concat`
+/// instead, which keeps that column's values whole unless
+/// `should_merge_dictionary_values` merges them.
+fn compact_dictionary(array: &ArrayRef, value_type: &DataType) -> DFResult<ArrayRef> {
+    if array.as_any_dictionary().values().null_count() == 0
+        && let Ok(rows) = cast(array.as_ref(), value_type)
+        && let Ok(packed) = cast(rows.as_ref(), array.data_type())
+    {
+        return Ok(packed);
+    }
+    concat_copy(array.as_ref())
 }
 
 /// `list` over its compacted child range, with offsets rebuilt from zero.
@@ -530,8 +624,7 @@ fn compact_list<O: OffsetSizeTrait>(
 ) -> DFResult<ArrayRef> {
     let offsets = list.value_offsets();
     let (Some(first), Some(last)) = (offsets.first(), offsets.last()) else {
-        let empty = new_empty_array(list.data_type());
-        return Ok(concat(&[list, empty.as_ref()])?);
+        return concat_copy(list);
     };
     let start = first.as_usize();
     let len = last.as_usize().saturating_sub(start);
@@ -558,14 +651,17 @@ mod tests {
     use super::*;
 
     use datafusion::arrow::array::{
-        DictionaryArray, Int32Array, Int64Array, ListArray, StringArray, StringViewArray,
+        BooleanArray, DictionaryArray, Int32Array, Int64Array, ListArray, MapBuilder, StringArray,
+        StringBuilder, StringViewArray,
     };
-    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
     use datafusion::arrow::compute::{SortOptions, concat_batches};
-    use datafusion::arrow::datatypes::{Field, Int32Type, Schema, SchemaRef};
+    use datafusion::arrow::datatypes::{Field, Int32Type, Int64Type, Schema, SchemaRef};
+    use datafusion::common::{ScalarValue, SplitPoint};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::RangePartitioning;
     use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
     use datafusion::physical_expr::expressions::{binary, col, lit};
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
@@ -760,7 +856,7 @@ mod tests {
     /// FLIP: make the Dictionary arm of `compact_array` return
     /// `Ok(Arc::clone(array))` and the values assertion fails with 1000
     /// against 10. FLIP: route a List column through the `concat` arm and the
-    /// charge assertion fails on piece 0 with 522,270 charged against 12,181
+    /// charge assertion fails on piece 0 with 522,270 charged against 12,177
     /// referenced: `MutableArrayData` carries the child's view data buffers
     /// over whole.
     #[tokio::test]
@@ -863,8 +959,227 @@ mod tests {
         }
     }
 
-    /// The batch stays under the source's `batch_size`, so it reaches the
-    /// exec as one batch.
+    /// Run one batch through `compact_batch` and return what came out and
+    /// the exec's metrics.
+    fn compact_one(batch: RecordBatch) -> (DFResult<RecordBatch>, ExecutionPlanMetricsSet) {
+        let set = ExecutionPlanMetricsSet::new();
+        let metrics = CompactMetrics::new(&set, 0);
+        (compact_batch(batch, &metrics), set)
+    }
+
+    fn metric_of(set: &ExecutionPlanMetricsSet, name: &str) -> usize {
+        set.clone_inner()
+            .sum_by_name(name)
+            .map(|m| m.as_usize())
+            .unwrap_or(0)
+    }
+
+    /// Distinct values of each dictionary in [`unpackable_batch_of`].
+    const UNPACKABLE_VALUES: usize = 10;
+
+    /// `Dictionary(Int32, Map(Utf8, Utf8))` (the shape of `samples.labels`),
+    /// `Dictionary(Int32, Boolean)` and `Dictionary(Int32, List(Int64))`: value
+    /// types arrow's cast cannot pack into a dictionary. Each column has
+    /// `rows` keys over [`UNPACKABLE_VALUES`] values, so the keys dominate the
+    /// batch and a slice of it is over-charged.
+    fn unpackable_batch_of(rows: usize) -> RecordBatch {
+        let keys = || {
+            Int32Array::from(
+                (0..rows)
+                    .map(|i| (i % UNPACKABLE_VALUES) as i32)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for v in 0..UNPACKABLE_VALUES {
+            maps.keys().append_value("__name__");
+            maps.values().append_value(format!("metric-{v}"));
+            maps.keys().append_value("job");
+            maps.values().append_value(format!("job-{v}"));
+            maps.append(true).expect("map entry");
+        }
+        let maps = DictionaryArray::<Int32Type>::try_new(keys(), Arc::new(maps.finish()))
+            .expect("map dictionary");
+        let booleans = DictionaryArray::<Int32Type>::try_new(
+            keys(),
+            Arc::new(BooleanArray::from(
+                (0..UNPACKABLE_VALUES)
+                    .map(|v| v % 3 == 0)
+                    .collect::<Vec<_>>(),
+            )),
+        )
+        .expect("boolean dictionary");
+        let lists = DictionaryArray::<Int32Type>::try_new(
+            keys(),
+            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                (0..UNPACKABLE_VALUES as i64).map(|v| Some(vec![Some(v), Some(v * 10)])),
+            )),
+        )
+        .expect("list dictionary");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("m", maps.data_type().clone(), false),
+            Field::new("b", booleans.data_type().clone(), false),
+            Field::new("l", lists.data_type().clone(), false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(maps) as ArrayRef,
+                Arc::new(booleans),
+                Arc::new(lists),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// A sliced batch of dictionaries whose value types arrow's cast cannot
+    /// pack (Map, Boolean, List) is copied without an error, and every column
+    /// of every piece compares equal to the piece that went in.
+    ///
+    /// FLIP: drop the fallback to `concat` in `compact_dictionary` (return the
+    /// cast's error) and `compact_batch` fails on piece 0 with "Unsupported
+    /// output type for dictionary packing" (the Map column, first).
+    #[test]
+    fn dictionaries_arrow_cannot_pack_are_copied_with_their_contents() {
+        let pieces = pieces_of(&unpackable_batch_of(ROWS));
+        for (i, before) in pieces.into_iter().enumerate() {
+            let (after, set) = compact_one(before.clone());
+            let after = after.unwrap_or_else(|e| panic!("piece {i} compacts: {e}"));
+            assert_eq!(
+                metric_of(&set, "compacted_batches"),
+                1,
+                "piece {i} is classified as sliced and copied"
+            );
+            assert_eq!(after.num_rows(), before.num_rows());
+            for (column, (b, a)) in before.columns().iter().zip(after.columns()).enumerate() {
+                assert_eq!(a, b, "piece {i}, column {column} compares equal");
+            }
+        }
+    }
+
+    /// Rows, and distinct values, of the dictionary-dominated fixture: one
+    /// row per group, as an aggregate grouped on the dictionary emits.
+    const DICT_GROUPS: usize = 1_000;
+
+    /// Bytes of each dictionary value in [`dict_dominated_batch_of`].
+    const DICT_VALUE_LEN: usize = 20;
+
+    /// A `Dictionary(Int32, Utf8)` column with [`DICT_GROUPS`] distinct
+    /// [`DICT_VALUE_LEN`]-byte values, one per row, and an Int64 count
+    /// column: a batch whose bytes are mostly dictionary values. Every buffer
+    /// is sized exactly to its contents (a string builder's doubling would
+    /// add slack the charge counts).
+    fn dict_dominated_batch_of() -> RecordBatch {
+        let data: Vec<u8> = (0..DICT_GROUPS)
+            .flat_map(|v| format!("value-{v:010}-pad").into_bytes())
+            .collect();
+        assert_eq!(data.len(), DICT_GROUPS * DICT_VALUE_LEN);
+        let values = StringArray::try_new(
+            OffsetBuffer::from_lengths(std::iter::repeat_n(DICT_VALUE_LEN, DICT_GROUPS)),
+            Buffer::from_vec(data),
+            None,
+        )
+        .expect("values");
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from((0..DICT_GROUPS as i32).collect::<Vec<_>>()),
+            Arc::new(values),
+        )
+        .expect("dictionary");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", dictionary_type(), false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(dictionary) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64; DICT_GROUPS])),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// A slice of a batch that is mostly dictionary values references only
+    /// the values its keys point at: each 10-row piece references 10 keys
+    /// (40 bytes), 10 values of 20 bytes plus a 4-byte offset each (240) and
+    /// 10 counts (80), 360 bytes, against the whole batch's 36,844 charged,
+    /// so it is classified as sliced and copied down to its 10 values. The
+    /// copy is charged 5,604, most of it the room for 1,024 values and 1,024
+    /// data bytes that arrow's dictionary packing reserves whatever the row
+    /// count, a fixed floor that dwarfs a 10-row piece.
+    ///
+    /// FLIP: count a Dictionary's values in full (`referenced_array_bytes` of
+    /// `values()`) and the first assertion fails with 24,124 against 360: by
+    /// that figure the 36,844 charged is within 2x (48,248) and the piece
+    /// passes through with the whole batch's charge.
+    #[test]
+    fn a_sliced_dictionary_batch_is_classified_as_sliced() {
+        let pieces = pieces_of(&dict_dominated_batch_of());
+        let piece_rows = DICT_GROUPS / PIECES;
+        for (i, before) in pieces.into_iter().enumerate() {
+            let referenced = referenced_bytes(&before).expect("sized");
+            assert_eq!(
+                referenced,
+                piece_rows * (4 + DICT_VALUE_LEN + 4 + 8),
+                "piece {i}: keys, referenced values with their offsets, and counts"
+            );
+            assert_eq!(referenced, 360);
+            let charged = before.get_array_memory_size();
+            assert_eq!(charged, 36_844, "piece {i} is charged the whole batch");
+
+            let (after, set) = compact_one(before.clone());
+            let after = after.expect("compacts");
+            assert_eq!(metric_of(&set, "compacted_batches"), 1, "piece {i}");
+            assert_eq!(metric_of(&set, "copied_bytes"), referenced, "piece {i}");
+            assert_eq!(after.column(0), before.column(0), "piece {i}");
+            assert_eq!(after.column(1), before.column(1), "piece {i}");
+            assert_eq!(
+                after.column(0).as_dictionary::<Int32Type>().values().len(),
+                piece_rows,
+                "piece {i} keeps only the values it references"
+            );
+            assert_eq!(
+                after.get_array_memory_size(),
+                5_604,
+                "piece {i}: the copy is charged its rows plus the packing builder's reserve"
+            );
+        }
+    }
+
+    /// A non-nullable Dictionary field whose values hold a null that valid
+    /// keys reference: the cast round trip would turn those keys null and the
+    /// batch would be rejected, so the column is copied by `concat` and keeps
+    /// its keys valid.
+    ///
+    /// FLIP: drop the values-hold-a-null test in `compact_dictionary` and
+    /// `compact_batch` fails on piece 0 with "Column 'd' is declared as
+    /// non-nullable but contains null values".
+    #[test]
+    fn a_non_nullable_dictionary_whose_values_hold_a_null_is_copied() {
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from((0..ROWS).map(|i| (i % 3) as i32).collect::<Vec<_>>()),
+            Arc::new(StringArray::from(vec![
+                Some("first-value-padding"),
+                None,
+                Some("third-value-padding"),
+            ])),
+        )
+        .expect("dictionary");
+        let schema = Arc::new(Schema::new(vec![Field::new("d", dictionary_type(), false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(dictionary) as ArrayRef]).expect("batch");
+        for (i, before) in pieces_of(&batch).into_iter().enumerate() {
+            let (after, set) = compact_one(before.clone());
+            let after = after.unwrap_or_else(|e| panic!("piece {i} compacts: {e}"));
+            assert_eq!(metric_of(&set, "compacted_batches"), 1, "piece {i}");
+            assert_eq!(after.column(0), before.column(0), "piece {i}");
+            assert_eq!(
+                after.column(0).null_count(),
+                0,
+                "piece {i}: the keys stay valid"
+            );
+        }
+    }
     ///
     /// FLIP: make `compact_batch` always copy (drop the pass-through arm) and
     /// the pointer equality fails on every column.
@@ -1166,6 +1481,35 @@ mod tests {
             .expect("repartition"),
         );
         let before = plan_text(&plan);
+        let after = plan_text(&optimize(plan));
+        assert_eq!(before, after);
+    }
+
+    /// A range repartition routes rows with the same `take` and coalescer as
+    /// a hash one, so the aggregate below it is left alone too.
+    ///
+    /// FLIP: make `charges_by_capacity` return `true` for every
+    /// `RepartitionExec` and the text gains a line.
+    #[test]
+    fn an_aggregate_under_a_range_repartition_gets_nothing() {
+        let aggregated = partial_then_final(scan(4));
+        let schema = aggregated.schema();
+        let range = RangePartitioning::try_new(
+            LexOrdering::new([PhysicalSortExpr::new_default(
+                col("count(v)", &schema).expect("count"),
+            )])
+            .expect("one sort key"),
+            vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])],
+        )
+        .expect("range");
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(aggregated, Partitioning::Range(range)).expect("repartition"),
+        );
+        let before = plan_text(&plan);
+        assert!(
+            before.contains("RepartitionExec: partitioning=Range"),
+            "{before}"
+        );
         let after = plan_text(&optimize(plan));
         assert_eq!(before, after);
     }

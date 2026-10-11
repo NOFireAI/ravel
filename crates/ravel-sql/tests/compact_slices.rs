@@ -37,8 +37,8 @@ use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use ravel_query::{PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
-    COMPACT_SLICES_RULE, RavelTableProvider, SessionTable, SpillDecision, SqlConfig,
-    TenantMemoryAccountant, build_session,
+    COMPACT_SLICES_RULE, CompactSlicesExec, RavelTableProvider, SessionTable, SpillDecision,
+    SqlConfig, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantId;
 use ravel_types::accounting::QueryAccounting;
@@ -49,6 +49,12 @@ const COLD_GROUPS: i64 = 20_000;
 
 /// Groups `0..HOT_GROUPS` get extra samples: group `j` ends with `j + 2`.
 const HOT_GROUPS: i64 = 10;
+
+/// Cold groups of the labels test: 2,570 groups with the hot ones, 11
+/// slices. At [`COLD_GROUPS`] the final aggregate's `first_value(labels)`
+/// alone exhausts the 1 GiB measuring pool (measured: 44,234,496 bytes asked
+/// on top of 1,032,085,576 reserved), before any slice reaches the exec.
+const LABELS_COLD_GROUPS: i64 = 2_560;
 
 /// Rows per aggregate output slice. 20,000 groups over this is 79 slices.
 const BATCH_SIZE: usize = 256;
@@ -71,6 +77,14 @@ const ALL_GROUPS: &str = "SELECT concat('g', CAST(CAST(value AS BIGINT) AS VARCH
                           count(value) AS n, min(CAST(ts AS VARCHAR)) AS s, avg(value) AS a \
                           FROM samples GROUP BY k";
 
+/// The q29 shape again, carrying `samples.labels`, a
+/// `Dictionary(Int32, Map(Utf8, Utf8))` column whose value type arrow's cast
+/// cannot pack into a dictionary, through the aggregate's output.
+const TOP_K_LABELS: &str = "SELECT concat('g', CAST(CAST(value AS BIGINT) AS VARCHAR)) AS k, \
+                            count(value) AS n, first_value(labels) AS l, avg(value) AS a \
+                            FROM samples GROUP BY k HAVING count(value) > 1 \
+                            ORDER BY 2 DESC LIMIT 10";
+
 fn tenant() -> TenantId {
     tenant_id("compact-slices-2720")
 }
@@ -78,8 +92,13 @@ fn tenant() -> TenantId {
 /// One sample per cold group, then `j + 1` extra samples for hot group `j`,
 /// all in one series so the key is the `value` column alone.
 fn corpus() -> Vec<SegSpec> {
-    let mut samples: Vec<(i64, f64)> = (0..COLD_GROUPS).map(|i| (i, i as f64)).collect();
-    let mut ts = COLD_GROUPS;
+    corpus_of(COLD_GROUPS)
+}
+
+/// [`corpus`] with `cold_groups` cold groups.
+fn corpus_of(cold_groups: i64) -> Vec<SegSpec> {
+    let mut samples: Vec<(i64, f64)> = (0..cold_groups).map(|i| (i, i as f64)).collect();
+    let mut ts = cold_groups;
     for j in 0..HOT_GROUPS {
         for _ in 0..=j {
             samples.push((ts, j as f64));
@@ -141,6 +160,7 @@ fn without_rule(ctx: &SessionContext) -> SessionContext {
 
 struct Run {
     plan: String,
+    physical: Arc<dyn ExecutionPlan>,
     batches: Vec<RecordBatch>,
     peak_intermediate_bytes: u64,
 }
@@ -198,7 +218,7 @@ async fn run_with_pool(
         .await
         .expect("physical plan");
     let plan = displayable(physical.as_ref()).indent(true).to_string();
-    let batches = collect(physical, ctx.task_ctx()).await?;
+    let batches = collect(Arc::clone(&physical), ctx.task_ctx()).await?;
     assert_eq!(
         pool.reserved(),
         0,
@@ -206,9 +226,25 @@ async fn run_with_pool(
     );
     Ok(Run {
         plan,
+        physical,
         batches,
         peak_intermediate_bytes: accounting.snapshot().peak_intermediate_bytes,
     })
+}
+
+/// `name` summed over every `CompactSlicesExec` in an executed `plan`.
+fn compact_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+    let own = if plan.is::<CompactSlicesExec>() {
+        plan.metrics()
+            .and_then(|metrics| metrics.sum_by_name(name))
+            .map_or(0, |metric| metric.as_usize())
+    } else {
+        0
+    };
+    plan.children()
+        .into_iter()
+        .map(|child| compact_metric(child, name))
+        .fold(own, |total, child| total + child)
 }
 
 /// One batch of all of `batches`, for a whole-output comparison.
@@ -447,4 +483,45 @@ async fn the_executor_plans_the_exec_under_the_round_robin_repartition() {
         .expect("query runs");
     let batches: Vec<RecordBatch> = outcome.output.batches().to_vec();
     assert_eq!(rows(&batches), expected_top_k());
+}
+
+/// An aggregate output carrying `samples.labels`, a
+/// `Dictionary(Int32, Map(Utf8, Utf8))` column, is copied by the exec and the
+/// query answers with the rule on, the same rows and columns as with it off.
+///
+/// FLIP: drop the fallback to `concat` in the module's `compact_dictionary`
+/// (return the cast's error) and the rule-on run fails with "Unsupported
+/// output type for dictionary packing" at the `expect` in `run`.
+#[tokio::test]
+async fn an_aggregate_output_carrying_the_labels_dictionary_answers_with_the_rule_on() {
+    let specs = corpus_of(LABELS_COLD_GROUPS);
+    let fixture = Fixture::memory(&[(&tenant(), &specs)]).await;
+    let on = run(&fixture, TOP_K_LABELS, true).await;
+    let off = run(&fixture, TOP_K_LABELS, false).await;
+    assert_round_robin_over_final_aggregate(&on.plan, true);
+    assert_round_robin_over_final_aggregate(&off.plan, false);
+
+    let labels = on.batches[0].schema().field(2).data_type().clone();
+    assert_eq!(
+        labels,
+        ravel_sql::public_schema()
+            .field_with_name("labels")
+            .expect("labels")
+            .data_type()
+            .clone(),
+        "the output carries the labels dictionary"
+    );
+    assert!(
+        compact_metric(&on.physical, "compacted_batches") > 0,
+        "the exec copied the aggregate's slices, the labels column included:\n{}",
+        on.plan
+    );
+    assert_eq!(compact_metric(&off.physical, "compacted_batches"), 0);
+
+    assert_eq!(rows(&on.batches), expected_top_k());
+    assert_eq!(
+        one_batch(&on.batches),
+        one_batch(&off.batches),
+        "every column, the labels dictionary included, is the same on both sides"
+    );
 }
