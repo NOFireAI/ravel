@@ -220,7 +220,9 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
                 DEFAULT_MAX_INFLIGHT_FLUSHES,
                 DEFAULT_DECODE_QUEUE_BATCHES,
                 Some(target_bytes),
-                None,
+                // The 1 MiB case parks on an ack that only the age trigger
+                // answers, on the wall clock; 2 s keeps that wait short.
+                Some(Duration::from_secs(2)),
                 RlogZstdLevel::DEFAULT,
                 None,
                 NOW_NS,
