@@ -14,10 +14,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
-use crate::config::IngestConfig;
+use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION};
 use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
-use crate::format_floor::FormatFloorPolicy;
+use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_view,
@@ -801,6 +801,17 @@ impl IngestRouter {
         #[cfg(feature = "stage-timing")]
         let route_start = std::time::Instant::now();
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        // ADR-1746 decision 4: a write whose object would sit below the
+        // tenant's recorded RSEG floor is refused here, on the view just
+        // routed with, before any shard buffers it. This is the only refusal a
+        // buffered write can get for the floor, since it is acknowledged at
+        // enqueue; the flush-open check stays as the backstop for rows
+        // buffered before a refresh raised the floor.
+        self.switch.admit_floor(
+            tenant.hash(),
+            FormatFamily::Rseg,
+            u32::from(SEGMENT_FORMAT_VERSION),
+        )?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<IngestPoint>> = HashMap::new();
         for point in points {

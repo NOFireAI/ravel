@@ -795,6 +795,33 @@ impl<H> GenerationSwitch<H> {
         }
     }
 
+    /// The format-floor check of a write at admission (ADR-1746 decision 4),
+    /// before anything is buffered: refuses, and counts, a write whose
+    /// `family` object at version `writing` would sit below the floor of
+    /// `tenant`'s cached view. Reads only the cached view. Admits when the
+    /// override is on (the flush counts the overridden write) and when no view
+    /// is cached (the flush-open check then decides).
+    pub(crate) fn admit_floor(
+        &self,
+        tenant: TenantHash,
+        family: FormatFamily,
+        writing: u32,
+    ) -> Result<(), BelowFormatFloor> {
+        let floor = match self.lock().views.get(&tenant) {
+            Some(view) => view.format_floor,
+            None => return Ok(()),
+        };
+        let policy = self
+            .floor_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if policy.write_below_floor() {
+            return Ok(());
+        }
+        policy.admit(family, floor, writing).map(|_| ())
+    }
+
     /// Give the switch the store, signal and clock its flush-open check
     /// re-reads a tenant's provisioning record with when it finds no view it
     /// can trust (ADR-1642 scan-set amendment).

@@ -22,9 +22,9 @@ use crate::budget::{
     BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge,
 };
 use crate::clock::Clock;
-use crate::config::IngestConfig;
+use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION};
 use crate::deferral::DeferralCapFlag;
-use crate::format_floor::FormatFloorPolicy;
+use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
     load_view,
@@ -375,6 +375,17 @@ impl LogIngestRouter {
         self
     }
 
+    /// The admission-time format-floor check both submit paths make on the
+    /// view they just routed with (ADR-1746 decision 4).
+    fn admit_floor(&self, tenant: ravel_types::TenantHash) -> Result<(), LogWriteError> {
+        self.switch.admit_floor(
+            tenant,
+            FormatFamily::Rlog,
+            u32::from(LOG_SEGMENT_FORMAT_VERSION),
+        )?;
+        Ok(())
+    }
+
     pub fn metrics(&self) -> &LogIngestMetrics {
         &self.metrics
     }
@@ -556,6 +567,9 @@ impl LogIngestRouter {
         #[cfg(feature = "stage-timing")]
         let route_start = std::time::Instant::now();
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        // ADR-1746 decision 4, as in `IngestRouter`: refused against the RLOG
+        // floor of the view just routed with, before any shard buffers it.
+        self.admit_floor(tenant.hash())?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<NormalizedLogRecord>> = HashMap::new();
         for record in records {
@@ -876,8 +890,10 @@ impl LogIngestRouter {
                 .map_err(|_| LogWriteError::BufferBudgetExceeded)?,
         });
 
-        // Route against the tenant's current generation view, exactly as `submit`.
+        // Route against the tenant's current generation view, and check its
+        // format floor, exactly as `submit`.
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        self.admit_floor(tenant.hash())?;
         let shard_count = set.len() as u32;
 
         // Partition into per-shard column selections. `partition_columnar`
