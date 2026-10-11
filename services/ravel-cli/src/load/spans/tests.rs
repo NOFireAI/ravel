@@ -459,9 +459,10 @@ fn dictionary_columns_are_resolved_once_per_batch() {
     );
 }
 
-/// One `attrs` map cell: `None` is a null cell, a `None` key or value
-/// a null one.
-type DictMapCell = Option<Vec<(Option<String>, Option<String>)>>;
+/// One `attrs` map cell: `None` is a null cell, a `None` value a null
+/// one. A key cannot be null: Arrow 59 refuses a map whose key field is
+/// nullable, and a struct refuses a null in a non-nullable child.
+type DictMapCell = Option<Vec<(String, Option<String>)>>;
 
 /// A map column whose keys and values are both dictionary-encoded
 /// `Utf8`, one cell per row.
@@ -470,9 +471,9 @@ fn dict_attrs_map(cells: &[DictMapCell]) -> ArrayRef {
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Fields;
 
-    let entries: Vec<&(Option<String>, Option<String>)> =
-        cells.iter().flatten().flatten().collect();
-    let keys: DictionaryArray<Int32Type> = entries.iter().map(|(key, _)| key.as_deref()).collect();
+    let entries: Vec<&(String, Option<String>)> = cells.iter().flatten().flatten().collect();
+    let keys: DictionaryArray<Int32Type> =
+        entries.iter().map(|(key, _)| Some(key.as_str())).collect();
     let values: DictionaryArray<Int32Type> =
         entries.iter().map(|(_, value)| value.as_deref()).collect();
     let mut offsets = vec![0i32];
@@ -480,12 +481,8 @@ fn dict_attrs_map(cells: &[DictMapCell]) -> ArrayRef {
         let len = cell.as_ref().map_or(0, Vec::len);
         offsets.push(offsets[offsets.len() - 1] + len as i32);
     }
-    // Arrow declares a map's key field non-nullable, and a struct
-    // refuses a null in a non-nullable child, so a fixture with a null
-    // key has to declare the field nullable to be built at all.
-    let null_keys = keys.null_count() > 0;
     let fields = Fields::from(vec![
-        Field::new("keys", keys.data_type().clone(), null_keys),
+        Field::new("keys", keys.data_type().clone(), false),
         Field::new("values", values.data_type().clone(), true),
     ]);
     let entries = StructArray::new(
@@ -511,29 +508,28 @@ fn some_entries(entries: &[(&str, Option<&str>)]) -> DictMapCell {
     Some(
         entries
             .iter()
-            .map(|(key, value)| (Some(key.to_string()), value.map(str::to_string)))
+            .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
             .collect(),
     )
 }
 
 /// One row per `attrs_map_column` outcome, over a map whose keys and
 /// values are dictionary-encoded: plain entries, a null cell, a null
-/// value, an over-cap value, each per-entry refusal (a null key among
-/// them, alone and with a null value), the per-record cap,
+/// value, an over-cap value, each per-entry refusal, the per-record cap,
 /// and a refusal that sits after the cap is passed, which the row
 /// still reports rather than the cap.
 fn dict_attrs_map_fixture() -> (SpansMapping, RecordBatch) {
     let cap = LOADER_MAX_ATTRIBUTES_PER_RECORD;
     let long = "v".repeat(SpanIngestLimits::default().max_attribute_value_len + 1);
-    let numbered = |count: usize| -> Vec<(Option<String>, Option<String>)> {
+    let numbered = |count: usize| -> Vec<(String, Option<String>)> {
         (0..count)
-            .map(|i| (Some(format!("k{i:04}")), Some("v".to_string())))
+            .map(|i| (format!("k{i:04}"), Some("v".to_string())))
             .collect()
     };
     let mut reserved_after_cap = numbered(cap);
-    reserved_after_cap.push((Some("_kind".to_string()), Some("server".to_string())));
+    reserved_after_cap.push(("_kind".to_string(), Some("server".to_string())));
     let mut duplicate_after_cap = numbered(cap);
-    duplicate_after_cap.push((Some("k0000".to_string()), Some("w".to_string())));
+    duplicate_after_cap.push(("k0000".to_string(), Some("w".to_string())));
     let cells: Vec<DictMapCell> = vec![
         some_entries(&[("zone", Some("eu")), ("peer", Some("db"))]),
         None,
@@ -546,11 +542,6 @@ fn dict_attrs_map_fixture() -> (SpansMapping, RecordBatch) {
         some_entries(&[("peer", Some("db")), ("http.method", Some("POST"))]),
         some_entries(&[("_kind", Some("server"))]),
         some_entries(&[("zone", Some("eu")), ("zone", Some("us"))]),
-        Some(vec![
-            (Some("peer".to_string()), Some("db".to_string())),
-            (None, Some("x".to_string())),
-        ]),
-        Some(vec![(None, None)]),
         some_entries(&[]),
         Some(numbered(cap - 1)),
         Some(numbered(cap)),
@@ -676,7 +667,6 @@ fn a_dictionary_encoded_attrs_map_reads_every_outcome_exactly() {
                              mapping.";
     let reserved = "attrs_map_column \"attrs\" holds the reserved attribute key \
                             \"_kind\", which holds a span field this version does not map";
-    let null_key = "attrs_map_column \"attrs\" holds a null key";
     let twice = |key: &str| {
         format!(
             "attrs_map_column \"attrs\" holds the key {key:?} twice. A span carries one \
@@ -697,8 +687,6 @@ fn a_dictionary_encoded_attrs_map_reads_every_outcome_exactly() {
         Err(collision.to_string()),
         Err(reserved.to_string()),
         Err(twice("zone")),
-        Err(null_key.to_string()),
-        Err(null_key.to_string()),
         Ok((vec![method.clone()], 0)),
         Ok((at_cap, 0)),
         Err(over_cap(cap + 1)),
@@ -802,8 +790,9 @@ fn an_attrs_map_key_a_resource_attribute_names_is_refused() {
 /// A map child whose dictionary is empty is answered row by row rather
 /// than taking the batch down in arrow's `normalized_keys`, which
 /// asserts the dictionary is non-empty. Every entry of such a child is
-/// null: a null value skips its entry, a null key refuses its own row,
-/// and the rows around it load.
+/// null, so only the value child can be empty: Arrow 59 refuses a map
+/// whose key field is nullable, and a struct refuses a null in a
+/// non-nullable child. A null value skips its entry and every row loads.
 #[test]
 fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
     use arrow::array::StructArray;
@@ -824,7 +813,7 @@ fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
     // Row 1 holds the map's one entry; rows 0 and 2 hold none.
     let batch_of = |keys: ArrayRef, values: ArrayRef| -> RecordBatch {
         let fields = Fields::from(vec![
-            Field::new("keys", keys.data_type().clone(), keys.null_count() > 0),
+            Field::new("keys", keys.data_type().clone(), false),
             Field::new("values", values.data_type().clone(), true),
         ]);
         let entries = StructArray::new(fields.clone(), vec![keys, values], None);
@@ -864,15 +853,12 @@ fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
         vec![method(), method(), method()],
         "an empty value dictionary skips its null entry"
     );
-    assert_eq!(
-        outcomes(&batch_of(empty_dictionary(), plain("eu"))),
-        vec![
-            method(),
-            Err("attrs_map_column \"attrs\" holds a null key".to_string()),
-            method(),
-        ],
-        "an empty key dictionary refuses only the row holding its entry"
-    );
+    let key_fields = Fields::from(vec![
+        Field::new("keys", empty_dictionary().data_type().clone(), false),
+        Field::new("values", DataType::Utf8, true),
+    ]);
+    StructArray::try_new(key_fields, vec![empty_dictionary(), plain("eu")], None)
+        .expect_err("an empty key dictionary cannot fill a map's non-nullable key field");
 }
 
 /// The map's dictionary children are read in place: the resolved child
