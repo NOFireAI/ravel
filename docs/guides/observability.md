@@ -2531,6 +2531,20 @@ The gate is full when `ravel_cpu_gate_running` equals
 | A rising mean wait and a full gate. | The node needs more replicas or more permits. On a node shared with other CPU-heavy work, lower the read gate's permits instead. |
 | A per-worker busy rate near 1 on every worker, from `rate(ravel_runtime_worker_busy_seconds_total[5m])`. | The runtime workers are saturated, which the gates do not cover. |
 
+### Memory gate (`ravel_memory_gate_*`)
+
+Labels: `mode` only. The `ravel-memory-gate` sampler reads the host's
+available memory every `--memory-gate-interval-ms` and closes the memory gate
+once `--memory-gate-close-after-samples` consecutive readings are below
+`ravel_memory_gate_available_floor_bytes`; one reading at or above the floor
+reopens it. The last reading is `ravel_memory_gate_available_bytes`, written
+on every sample, so it shows a dip below the floor while the gate is still
+open.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_memory_gate_samples_below_floor_total` | Counter. Samples whose available reading was below the close floor, whether or not the sample closed the gate. Rising while `ravel_memory_gate_refusals_total` stays flat means dips too short to close the gate; raise `--memory-gate-close-after-samples` only if the refusals that do come are from dips you would rather ride out. |
+
 ## Reading estimate against actual
 
 The estimate is an upper envelope, not a prediction. The planner takes the
