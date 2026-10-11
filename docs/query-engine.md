@@ -1513,8 +1513,10 @@ method:
   fan-out width PromQL's per-selector fetch streams use.
 
 `ravel-server` exposes these as `--store-get-concurrency`,
-`--sql-partition-count`, and `--promql-fetch-fanout` (each unset derives from
-host cores like `--fetch-concurrency` always has). `--fetch-concurrency`
+`--sql-partition-count`, and `--promql-fetch-fanout`. Unset, the last two
+derive from host cores like `--fetch-concurrency` always has, and
+`--store-get-concurrency` derives from the process memory budget (ADR-2677
+decision 7), capped at `LATENCY_FIRST_MEASURED_CONCURRENCY`. `--fetch-concurrency`
 still sets all three together (source `legacy-flag` in the startup log);
 combining it with any of the three, or passing `0` to any of the four, is a
 startup error naming the offending flag(s), raised before any fetcher,

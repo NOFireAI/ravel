@@ -63,7 +63,8 @@ the query remainder to 6.76 GB.
 
 1. **A loopback store is back on whole-object fetching by default.** With
    `--logs-fetch-policy` unset, every deployment resolves `cost-based`, as
-   ADR-1196 decided. This supersedes ADR-2014's decision. An explicit
+   ADR-1196 decided (see the ADR-2677 loopback amendment below: a loopback
+   store now resolves `latency-first`). This supersedes ADR-2014's decision. An explicit
    `--logs-fetch-policy byte-minimal` still gives the ranged plan, where its
    single-query gain is the goal, for example a tuned benchmark entry.
    The rate `cost-based` resolves on the intra-region profile and the
@@ -136,6 +137,9 @@ tried a larger cache, and the stock ClickBench entry passes no flags.
 - A single-host deployment on a loopback store reads whole objects again: its
   single-query cold time returns to the pre-ADR-2014 figure, and its
   concurrent throughput with it. The ranged plan is an explicit opt-in.
+  The ADR-2677 loopback amendment below makes the ranged `latency-first` plan
+  the loopback default again, with the GET permits derived from the memory
+  budget.
 - The larger loopback share cuts hot times, since whole objects held in a
   corpus-sized cache serve every statement that touches them. The competing
   explanation, that the host page cache already holds the corpus for the store
@@ -204,7 +208,8 @@ without giving back the hot-time gain.
 
 <!-- amendment-applies: sections="Decision" pointer="ADR-2414 amendment" -->
 
-Decision 1 keeps `cost-based` as every deployment's default. ADR-2414
+Decision 1 keeps `cost-based` as every deployment's default (every remote
+deployment's since the ADR-2677 loopback amendment below). ADR-2414
 decision A3 changes what that policy resolves to: the store cost profile
 carries a request latency and a per-connection throughput beside its
 prices, the request cost in bytes is the larger of the price-derived rate
@@ -254,4 +259,48 @@ the planned route. What moves is the band between 18,900,000 and 31,500,000
 bytes: an object there that a narrow projection skips more than 18,900,000
 bytes of reads ranged on the fast path, and the planned route probes every
 object there before the coverage crossover decides.
+
+## Amendment (2026-10-11, Refs: #2683): latency-first on a loopback store, with GET permits from the memory budget
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-2677 loopback amendment" -->
+<!-- amendment-supersedes: phrase="every deployment resolves `cost-based`" pointer="ADR-2677 loopback amendment" -->
+<!-- amendment-supersedes: phrase="every deployment's default" pointer="ADR-2677 loopback amendment" -->
+
+This is the ADR-2677 loopback amendment, ADR-2677 decision 7 applied to
+decision 1 for the loopback case only. With `--logs-fetch-policy` unset, a
+`--store s3` deployment against a loopback `--s3-endpoint` (the same
+`Cli::store_is_loopback` predicate decision 3 uses) resolves `latency-first`,
+and startup logs its source as `default-loopback`. Every other deployment
+still resolves `cost-based`, where ADR-1196 measured it, with source
+`default`. An explicit `--logs-fetch-policy` wins on every store, so the
+whole-object plan decision 1 chose stays one flag away on loopback.
+
+Decision 1 left the ranged route because it cut concurrent throughput when
+the GET concurrency was not raised with it. The same change therefore
+derives `--store-get-concurrency` from memory instead of cores, on every
+store: the permit count times the largest whole-object read the fetcher
+reserves stays within 60% of `memory_budget_bytes`
+(`STORE_GET_MEMORY_PERCENT`). No public item bounds a single permit's
+reservation, since a whole-object GET reserves the object's full size, so
+the per-permit figure is the fetcher's default run bound,
+`ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES`, 64 MiB
+(`STORE_GET_PERMIT_BYTES`). The count is clamped to at least 8 and at most
+`LATENCY_FIRST_MEASURED_CONCURRENCY`, 256: 256 on the 30 GiB budget of the
+32 GB reference host, 134 at a 14 GiB budget (16 GiB host), 57 at 6 GiB
+(8 GiB host). Startup logs it with source `budget-share` and the budget,
+share, per-permit bytes, and ceiling it used. An explicit
+`--store-get-concurrency` or `--fetch-concurrency` wins; with no known
+budget (the fallback) or in gateway mode the permits keep the core
+derivation, `max(8, 2 x cores)`.
+
+The 60% share sits beside decision 3's 40% loopback cache carve rather than
+inside the remainder it leaves: it bounds what the permits may ask for, not
+memory set aside for them. Each fetch still reserves its bytes on the
+process memory budget (#2086), which refuses a fetch it cannot hold. The
+SQL partition count does not follow the permits and stays at its core
+derivation (ADR-1195), so the `latency-first` startup line still reports
+its concurrency precondition unmet on a stock loopback deployment until
+`--sql-partition-count` is raised. Decision 4's error-ratio bar is the bar
+ADR-2677 decision 8 measures this default against; this amendment records
+the rule, not that measurement.
 
