@@ -65,10 +65,10 @@ use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
-const TENANT: TenantHash = TenantHash([7u8; 16]);
+pub(super) const TENANT: TenantHash = TenantHash([7u8; 16]);
 /// The deadline a test fan-out carries: never reached on either clock, and a
 /// request deadline distinct enough that a stop reporting it is recognisable.
-fn test_deadline() -> WallDeadline {
+pub(super) fn test_deadline() -> WallDeadline {
     WallDeadline {
         unix_ns: i64::MAX,
         request: Duration::from_secs(7),
@@ -195,7 +195,7 @@ async fn write_segment_prov(
 /// Starts a real `tonic` `SeriesFetch` worker on `127.0.0.1:0` over `store` and
 /// `segments`, and returns a `RemoteSliceFetcher` connected to it plus the
 /// server task handle (abort it to shut the worker down).
-async fn spawn_worker(
+pub(super) async fn spawn_worker(
     store: Arc<MemoryStore>,
     segments: Vec<SegmentRef>,
 ) -> (RemoteSliceFetcher, JoinHandle<()>) {
@@ -3436,7 +3436,7 @@ async fn partial_pushdown_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
 
 /// A `FetchRequest` for the whole pinned set, with `partial_aggregate` set to
 /// `want`.
-fn pushdown_request(
+pub(super) fn pushdown_request(
     segments: &[SegmentRef],
     want: Option<pb::PartialAggregateRequest>,
 ) -> pb::FetchRequest {

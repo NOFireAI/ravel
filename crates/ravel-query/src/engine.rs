@@ -2604,6 +2604,10 @@ impl QueryEngine {
                     source: StoreError::Corrupted(source.to_string()),
                 })
             }
+            log_series::LogSeriesError::Fetch(LogFetchError::UnsupportedVersion {
+                key,
+                version,
+            }) => QueryError::Fetch(FetchError::UnsupportedVersion { key, version }),
             log_series::LogSeriesError::Fetch(LogFetchError::FetchMemoryExhausted {
                 requested,
                 reserved,

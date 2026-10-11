@@ -304,6 +304,19 @@ async fn publish_log_segment(
     index: usize,
     records: &[LogRecord],
 ) {
+    publish_log_segment_rewritten(store, tenant, index, records, |_| {}).await;
+}
+
+/// [`publish_log_segment`], with `rewrite` applied to the object bytes before
+/// the content hash is taken, so the commit record describes the rewritten
+/// object.
+async fn publish_log_segment_rewritten(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    records: &[LogRecord],
+    rewrite: impl FnOnce(&mut Vec<u8>),
+) {
     let tenant_hash = tenant.hash();
 
     let mut min_event_ts_ns = i64::MAX;
@@ -327,7 +340,8 @@ async fn publish_log_segment(
     for rec in records {
         writer.push(rec.clone()).expect("push log record");
     }
-    let bytes = writer.finish().expect("finish rlog object");
+    let mut bytes = writer.finish().expect("finish rlog object");
+    rewrite(&mut bytes);
     let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
 
     let rec = record::build(NewCommitRecord {
@@ -2902,6 +2916,60 @@ async fn a_corrupt_segment_answers_500_not_503() {
     let value: Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(value["errorType"], "internal");
     assert_eq!(value["error"], ravel_sql::MSG_CORRUPT);
+}
+
+/// ADR-2708 D5a: an RLOG object whose trailer declares a version outside this
+/// build's reader window, with bytes matching the commit record's content
+/// hash, answers 422 with the version-only message. It is neither the
+/// corruption 500 nor the retryable 503, and the body names no object key.
+#[tokio::test]
+async fn an_out_of_window_rlog_answers_422_not_500() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let version = ravel_logseg::footer::VERSION + 1;
+    assert!(!ravel_logseg::footer::SUPPORTED_VERSIONS.contains(version));
+    publish_log_segment_rewritten(
+        store.as_ref(),
+        &tenant,
+        0,
+        &[log_record("api", 100, "hello world")],
+        |bytes| {
+            ravel_logseg::footer::rewrite_trailer_version(bytes, version)
+                .expect("rewrite trailer version");
+        },
+    )
+    .await;
+
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        None,
+        body("SELECT ts, body FROM logs"),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_body_redacted(&bytes, &tenant);
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains(".rlog"),
+        "leaked the log segment suffix"
+    );
+    let value: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(value["errorType"], "execution");
+    assert_eq!(
+        value["error"],
+        format!(
+            "stored object version {version} is outside this build's reader window; it needs \
+             migration"
+        )
+    );
+    assert_ne!(value["error"], ravel_sql::MSG_CORRUPT);
 }
 
 /// A transient store fault on the same read keeps the retryable 503.

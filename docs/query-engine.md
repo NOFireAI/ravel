@@ -1104,7 +1104,13 @@ same RAII `reserve` API, so they read under `component="fetch"`.
   attached the endpoint returns the empty object.
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
-  (400 bad_data, 422 unprocessable for unsupported constructs, 500 internal
+  (400 bad_data, 422 unprocessable for unsupported constructs and for an
+  RSEG or RLOG data object whose trailer declares a format version
+  outside this build's reader window while the object's bytes match the
+  content hash its catalog entry recorded (message `stored object version N
+  is outside this build's reader window; it needs migration`, ADR-2708 D5a;
+  the same trailer over bytes that do not match the recorded hash is corrupt
+  data, 500), 500 internal
   for corrupt stored data, including a catalog object (commit, compaction or
   rewrite record, erasure request, HEAD, snapshot part or postings) whose
   stored bytes fail to decode at a format version this build covers, carry a
@@ -2320,6 +2326,13 @@ Failures map to the same typed outcomes the local path produces:
   per slice; a second occurrence fails.
 - **`Corrupt`:** terminal immediately, no retry, matching local semantics
   (retrying could mask corruption behind a clean local read).
+- **A data object outside the worker's reader window** (ADR-2708 D5a): the
+  worker answers `Unsupported`, not `Corrupt`, and the coordinator runs the
+  query locally. The local read refuses the same object with the same
+  out-of-window error when the coordinator's window does not cover the
+  version either, so a distributed query answers what a local one does.
+  A federated remote is different; see the `Unsupported` paragraph under
+  Cross-cluster federation.
 - **Budget trip** on a slice or on the folded total: the same typed
   `TooManySeries` / `TooManyBytesScanned` errors the local path produces.
 - **Deadline:** the coordinator deadline (already bounded by the `sys/gc`
@@ -2460,7 +2473,13 @@ marked partial, and the warning names only the operator-facing cluster (the
 remote's internal status text is redacted out); under `=false` it fails with a
 typed `Federation` error naming the cluster. Treating it as a non-skippable hard
 fault would defeat exactly the availability `skip_unavailable` exists to provide
-during a mixed-version fan-out rollout. Federation composes over all five fan-out
+during a mixed-version fan-out rollout. The same path takes a remote that
+answers `Unsupported` because one of its data objects is outside its reader
+window (ADR-2708 D5a), so a federated query does not surface that object as
+the local 422: with `skip_unavailable=false` the client gets the retryable
+`QueryError::Federation` (503); with `skip_unavailable=true` it gets 200 with
+partial results and the `remote cluster X unavailable; results are partial`
+warning. Federation composes over all five fan-out
 signals with no code beyond the per-signal `SliceFetcher`, and a per-signal
 federation test proves it rather than assuming it.
 

@@ -336,6 +336,19 @@ pub enum FetchError {
     },
     #[error("etag changed between reads of segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// The object's trailer declares a format version outside this build's
+    /// reader window, and the object's bytes match the content hash its catalog
+    /// entry recorded, so the version is the writer's and not a damaged byte
+    /// (ADR-2708 D5a). Not corruption: the object needs migration, or a build
+    /// whose window covers `version`.
+    #[error("{} (segment {key})", unsupported_version_message(*version))]
+    UnsupportedVersion { key: String, version: u32 },
+    /// The object's trailer declares a version outside the reader window and
+    /// its bytes do not match the content hash its catalog entry recorded, so
+    /// the version field is as likely a damaged byte as a writer's stamp
+    /// (ADR-2708 D5a). Corruption, classified with [`FetchError::Corrupt`].
+    #[error("corrupt segment {key}: content hash mismatch: {}", version_hash_mismatch_detail(*version))]
+    ContentHashMismatch { key: String, version: u16 },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
     /// reservation for the bytes this GET would materialize, or for the bytes
     /// a catalog decode would produce (ADR-1702 decision 6). Carries only the
@@ -1246,6 +1259,56 @@ impl SegmentFetcher {
         Ok(got)
     }
 
+    /// The error for an object whose trailer declared `version`, outside this
+    /// build's window: [`FetchError::UnsupportedVersion`] when the object's
+    /// bytes match the recorded content hash, [`FetchError::ContentHashMismatch`]
+    /// when they do not.
+    ///
+    /// `held` is the object's bytes when the read that refused the version
+    /// already holds all of them (a whole-object open); they are hashed in
+    /// place and nothing is re-read. Otherwise the object is re-read in
+    /// [`CONTENT_HASH_CHUNK_BYTES`] ranges, each reserved against the fetch
+    /// memory budget (released once the chunk is hashed) and issued through
+    /// [`Self::store_get`], so it waits on the GET limiter and is recorded on
+    /// `accounting`, the phase handle of the read that refused the version: one
+    /// GET and its wire bytes as transferred per ranged read. A budget refusal
+    /// or a store failure on the re-read is returned as that error.
+    async fn settle_version_refusal(
+        &self,
+        seg_ref: &SegmentRef,
+        version: u16,
+        held: Option<&Bytes>,
+        accounting: &QueryAccounting,
+    ) -> FetchError {
+        let key = seg_ref.data_object_key.as_str();
+        let matched = match held {
+            Some(bytes) => Ok(content_hash_matches(seg_ref, bytes)),
+            None => {
+                matches_content_hash(seg_ref, |start, end| async move {
+                    let reservation = self.reserve_fetch(end.saturating_sub(start))?;
+                    let got = self
+                        .store_get(key, GetRange::Range(start, end), accounting)
+                        .await
+                        .map_err(|source| FetchError::Store {
+                            key: key.to_string(),
+                            source,
+                        })?;
+                    Ok::<_, FetchError>((got, reservation))
+                })
+                .await
+            }
+        };
+        let key = key.to_string();
+        match matched {
+            Ok(true) => FetchError::UnsupportedVersion {
+                key,
+                version: u32::from(version),
+            },
+            Ok(false) => FetchError::ContentHashMismatch { key, version },
+            Err(err) => err,
+        }
+    }
+
     /// This is the funnel every ranged GET in this file passes through
     /// (ADR-0044 "2. Accounting is recorded at existing funnels only", and
     /// ADR-0046 decision 1). A GET that goes to the store records one
@@ -1690,9 +1753,16 @@ impl SegmentFetcher {
             let first_start = total_size.saturating_sub(first.data.len() as u64);
             regions.insert(first_start, first.data.clone());
 
-            let footer = match open_from_suffix(&first.data, total_size, self.limits)
-                .map_err(|source| corrupt(key, source))?
-            {
+            let opened = match open_from_suffix(&first.data, total_size, self.limits) {
+                Err(ravel_segment::SegmentError::UnsupportedVersion(version)) => {
+                    let whole = (first.data.len() as u64 == total_size).then_some(&first.data);
+                    return Err(self
+                        .settle_version_refusal(seg_ref, version, whole, accounting)
+                        .await);
+                }
+                other => other.map_err(|source| corrupt(key, source))?,
+            };
+            let footer = match opened {
                 FooterOutcome::Ready(loc) => loc.footer,
                 FooterOutcome::NeedRange { offset, len } => {
                     let (got, got_cost) = self
@@ -1709,9 +1779,15 @@ impl SegmentFetcher {
                     span_requests = span_requests.saturating_add(got_cost.requests);
                     span_bytes = span_bytes.saturating_add(got_cost.bytes);
                     regions.insert(offset, got.data.clone());
-                    match open_from_suffix(&got.data, total_size, self.limits)
-                        .map_err(|source| corrupt(key, source))?
-                    {
+                    let reopened = match open_from_suffix(&got.data, total_size, self.limits) {
+                        Err(ravel_segment::SegmentError::UnsupportedVersion(version)) => {
+                            return Err(self
+                                .settle_version_refusal(seg_ref, version, None, accounting)
+                                .await);
+                        }
+                        other => other.map_err(|source| corrupt(key, source))?,
+                    };
+                    match reopened {
                         FooterOutcome::Ready(loc) => loc.footer,
                         FooterOutcome::NeedRange { .. } => {
                             return Err(corrupt(key, ravel_segment::SegmentError::Truncated));
@@ -3311,6 +3387,80 @@ fn corrupt(key: &str, source: ravel_segment::SegmentError) -> FetchError {
         key: key.to_string(),
         source,
     }
+}
+
+/// The client-visible text for an object whose format version this build does
+/// not read (ADR-2708 D5a). Carries the version only, never an object key or a
+/// tenant value, so every query surface may show it verbatim.
+pub fn unsupported_version_message(version: u32) -> String {
+    format!(
+        "stored object version {version} is outside this build's reader window; it needs migration"
+    )
+}
+
+/// The `Corrupted` detail for an object whose trailer declared an out-of-window
+/// version but whose bytes do not match the content hash its catalog entry
+/// recorded: the version field is as likely a damaged byte as a writer's stamp.
+pub(crate) fn version_hash_mismatch_detail(version: u16) -> String {
+    format!(
+        "trailer declares version {version} outside the reader window, but the object does not \
+         match its recorded content hash"
+    )
+}
+
+/// Largest single range GET [`matches_content_hash`] issues, so confirming a
+/// large L1 part never materializes the whole object at once.
+pub(crate) const CONTENT_HASH_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Whether the stored object's bytes hash (blake3) to `seg_ref.content_hash`,
+/// the hash its commit record (L0) or the part's own entry (L1) recorded.
+///
+/// Every reader checks the trailer version before the footer crc, so a version
+/// refusal alone cannot tell a writer's stamp from a flipped byte. This is the
+/// check that can, run only after a reader has refused a version.
+///
+/// `read(start, end)` issues one ranged GET for `[start, end)` and returns it
+/// with a guard (the caller's fetch-memory reservation) that is dropped once
+/// that chunk is hashed. Chunks are [`CONTENT_HASH_CHUNK_BYTES`] wide. A ref
+/// with no recorded size reads `[0, CONTENT_HASH_CHUNK_BYTES)` first and takes
+/// the object's size from that response.
+pub(crate) async fn matches_content_hash<G, E, F, Fut>(
+    seg_ref: &SegmentRef,
+    mut read: F,
+) -> Result<bool, E>
+where
+    F: FnMut(u64, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<(GetOutcome, G), E>>,
+{
+    let mut hasher = blake3::Hasher::new();
+    let mut size = (seg_ref.object_size != 0).then_some(seg_ref.object_size);
+    let mut start = 0u64;
+    loop {
+        let wide = start.saturating_add(CONTENT_HASH_CHUNK_BYTES);
+        let end = size.map_or(wide, |size| wide.min(size));
+        let (got, guard) = read(start, end).await?;
+        let total = *size.get_or_insert(got.total_size);
+        // A stored object of another size, or a short chunk, is not the object
+        // the hash describes.
+        let expected = end.min(total).saturating_sub(start);
+        if got.total_size != total || got.data.len() as u64 != expected {
+            return Ok(false);
+        }
+        hasher.update(&got.data);
+        drop(got);
+        drop(guard);
+        start = start.saturating_add(expected);
+        if start >= total || expected == 0 {
+            break;
+        }
+    }
+    Ok(hasher.finalize().as_bytes() == &seg_ref.content_hash)
+}
+
+/// Whether `bytes`, the whole object already in memory, hash (blake3) to
+/// `seg_ref.content_hash`.
+pub(crate) fn content_hash_matches(seg_ref: &SegmentRef, bytes: &[u8]) -> bool {
+    blake3::hash(bytes).as_bytes() == &seg_ref.content_hash
 }
 
 /// Builds the `GetOutcome` a cache-routed `guarded_get` returns, whether the
@@ -7434,5 +7584,210 @@ mod tests {
                 prop_assert_eq!(ord_ids, mat_ids);
             }
         }
+    }
+}
+
+/// Cost and admission of the content-hash check behind an out-of-window RSEG
+/// trailer (ADR-2708 D5a): which phase pays for it, how much, and that the
+/// re-read waits on the fetch memory budget.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod version_refusal_cost_tests {
+    use std::sync::Arc;
+
+    use ravel_catalog::{SegmentLevel, SegmentRef};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::accounting::AccountedOp;
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
+    use uuid::Uuid;
+
+    use super::{FetchError, SegmentFetcher};
+    use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot, QueryPhase};
+
+    const TENANT: TenantHash = TenantHash([9u8; 16]);
+    /// The footer tail the ranged tests read first: wide enough to hold the
+    /// trailer, far narrower than the object, so the open is a ranged one.
+    const TAIL: u64 = 64;
+
+    /// One RSEG object whose trailer declares a version one past the newest
+    /// this build reads. `content_hash` is the blake3 of the stored bytes when
+    /// `genuine`, and a different digest otherwise.
+    async fn stamped(store: &MemoryStore, genuine: bool) -> (SegmentRef, u16) {
+        let version = ravel_segment::SUPPORTED_VERSIONS.newest() + 1;
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "old".to_string(),
+        }])
+        .expect("labels");
+        let tenant = TenantId::new("acme".to_string());
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id: SeriesId::compute(&tenant, "old", &labels).expect("series id"),
+                labels,
+                samples: vec![Sample {
+                    ts_ns: 1_000,
+                    value: 1.0,
+                }],
+            }],
+            SegmentIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let mut bytes = written.bytes.to_vec();
+        let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+        bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+        let mut content_hash = *blake3::hash(&bytes).as_bytes();
+        if !genuine {
+            content_hash[0] ^= 0xff;
+        }
+        let key = "seg/old.rseg".to_string();
+        let seg = SegmentRef {
+            data_object_key: key.clone(),
+            object_size: bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 100,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        assert!(
+            seg.object_size > TAIL,
+            "the ranged tests need an object wider than the footer tail"
+        );
+        store
+            .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put segment");
+        (seg, version)
+    }
+
+    fn ranged(store: Arc<MemoryStore>) -> SegmentFetcher {
+        SegmentFetcher::new(store)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(TAIL)
+    }
+
+    async fn refuse(
+        fetcher: &SegmentFetcher,
+        seg: &SegmentRef,
+    ) -> (FetchError, PhaseAccountingSnapshot) {
+        let phase = PhaseAccounting::new();
+        let err = fetcher
+            .fetch_series_phase_accounted(TENANT, seg, &[], &phase)
+            .await
+            .expect_err("an out-of-window object is refused");
+        (err, phase.snapshot())
+    }
+
+    fn get_requests(snap: &PhaseAccountingSnapshot, phase: QueryPhase) -> u64 {
+        snap.phase(phase).s3_requests(AccountedOp::Get)
+    }
+
+    fn get_bytes(snap: &PhaseAccountingSnapshot, phase: QueryPhase) -> u64 {
+        snap.phase(phase).s3_bytes(AccountedOp::Get)
+    }
+
+    fn assert_only_plan_paid(snap: &PhaseAccountingSnapshot) {
+        for phase in [QueryPhase::Resolve, QueryPhase::Probe, QueryPhase::Scan] {
+            assert_eq!(get_requests(snap, phase), 0, "{phase:?} requests");
+            assert_eq!(get_bytes(snap, phase), 0, "{phase:?} bytes");
+        }
+    }
+
+    /// A ranged open refuses the version on its footer tail; the hash re-read
+    /// is charged to that open's phase (plan): exactly one more GET, carrying
+    /// exactly the object's size in wire bytes.
+    #[tokio::test]
+    async fn a_ranged_refusal_charges_the_hash_reread_to_plan() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, version) = stamped(&store, true).await;
+        let (err, snap) = refuse(&ranged(Arc::clone(&store)), &seg).await;
+        assert!(
+            matches!(&err, FetchError::UnsupportedVersion { version: v, .. } if *v == u32::from(version)),
+            "{err:?}"
+        );
+        assert_eq!(
+            get_requests(&snap, QueryPhase::Plan),
+            2,
+            "tail GET + one re-read GET"
+        );
+        assert_eq!(
+            get_bytes(&snap, QueryPhase::Plan),
+            TAIL + seg.object_size,
+            "tail bytes + the whole object re-read"
+        );
+        assert_only_plan_paid(&snap);
+    }
+
+    /// A whole-object open already holds every byte, so the hash is taken over
+    /// those and nothing is re-read: one GET of the object's size, no more.
+    #[tokio::test]
+    async fn a_whole_object_refusal_issues_no_reread() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, _) = stamped(&store, true).await;
+        let fetcher = SegmentFetcher::new(Arc::clone(&store) as _)
+            .with_whole_object_threshold(seg.object_size);
+        let (err, snap) = refuse(&fetcher, &seg).await;
+        assert!(
+            matches!(err, FetchError::UnsupportedVersion { .. }),
+            "{err:?}"
+        );
+        assert_eq!(get_requests(&snap, QueryPhase::Plan), 1);
+        assert_eq!(get_bytes(&snap, QueryPhase::Plan), seg.object_size);
+        assert_only_plan_paid(&snap);
+    }
+
+    /// The re-read reserves each chunk against the fetch memory budget before
+    /// issuing it: a budget one byte short of the chunk refuses with the
+    /// budget's error, and the only GET on record is the footer tail.
+    #[tokio::test]
+    async fn the_hash_reread_is_refused_by_a_budget_smaller_than_one_chunk() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, _) = stamped(&store, true).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(seg.object_size - 1));
+        let fetcher = ranged(Arc::clone(&store)).with_memory_budget(budget);
+        let (err, snap) = refuse(&fetcher, &seg).await;
+        assert!(
+            matches!(err, FetchError::FetchMemoryExhausted { requested, .. } if requested == seg.object_size),
+            "{err:?}"
+        );
+        assert_eq!(get_requests(&snap, QueryPhase::Plan), 1, "no re-read GET");
+        assert_eq!(get_bytes(&snap, QueryPhase::Plan), TAIL);
+        assert_only_plan_paid(&snap);
+    }
+
+    /// Bytes that do not match the recorded hash are corruption, said in
+    /// those words, and not chained to the version refusal.
+    #[tokio::test]
+    async fn a_hash_mismatch_is_reported_as_corruption_without_a_version_source() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, version) = stamped(&store, false).await;
+        let (err, _) = refuse(&ranged(Arc::clone(&store)), &seg).await;
+        assert!(
+            matches!(&err, FetchError::ContentHashMismatch { version: v, .. } if *v == version),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("content hash mismatch"), "{err}");
+        assert!(std::error::Error::source(&err).is_none(), "{err:?}");
     }
 }

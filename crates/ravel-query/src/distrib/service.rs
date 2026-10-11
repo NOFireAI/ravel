@@ -1880,8 +1880,16 @@ fn map_fetch_error(err: FetchError) -> (pb::status::Code, String) {
             ..
         } => (pb::status::Code::SnapshotInvalidated, err.to_string()),
         FetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
-        FetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        FetchError::Corrupt { .. } | FetchError::ContentHashMismatch { .. } => {
+            (pb::status::Code::Corrupt, err.to_string())
+        }
         FetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // An object outside this worker's reader window is not corruption
+        // (ADR-2708 D5a). `Unsupported` sends the coordinator to local
+        // execution, which reads the object under its own window: the same
+        // refusal when the builds match, a successful read when the
+        // coordinator's build covers the version.
+        FetchError::UnsupportedVersion { .. } => (pb::status::Code::Unsupported, err.to_string()),
         // A memory-budget refusal is terminal for this slice, never
         // `Unavailable`. On this codebase `Unavailable` is the re-dispatch class:
         // the coordinator's `try_remote` quarantines the refusing worker and
@@ -1918,6 +1926,10 @@ fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
         LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         LogFetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
         LogFetchError::CarryMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // See the rationale on [`map_fetch_error`].
+        LogFetchError::UnsupportedVersion { .. } => {
+            (pb::status::Code::Unsupported, err.to_string())
+        }
         // Terminal, not `Unavailable`: see the rationale on [`map_fetch_error`].
         LogFetchError::FetchMemoryExhausted { .. } => {
             (pb::status::Code::BudgetExceeded, err.to_string())
@@ -1940,6 +1952,10 @@ fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
         SpanFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         SpanFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         SpanFetchError::TenantMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // See the rationale on [`map_fetch_error`].
+        SpanFetchError::UnsupportedVersion { .. } => {
+            (pb::status::Code::Unsupported, err.to_string())
+        }
         // Terminal, not `Unavailable`: see the rationale on [`map_fetch_error`].
         SpanFetchError::FetchMemoryExhausted { .. } => {
             (pb::status::Code::BudgetExceeded, err.to_string())
@@ -2965,5 +2981,160 @@ mod reconstruct_tests {
             .expect_err("an empty snapshot resolves nothing");
         assert!(matches!(err, ResolveIdentityError::Unknown { .. }));
         assert_eq!(err.status_code(), pb::status::Code::SnapshotInvalidated);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod unsupported_version_tests {
+    use std::sync::Arc;
+
+    use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_proto::queryfrag::v1 as pb;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::accounting::QueryAccounting;
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
+    use uuid::Uuid;
+
+    use super::super::tests::{TENANT, pushdown_request, spawn_worker, test_deadline};
+    use crate::config::EngineConfig;
+    use crate::distrib::Distributed;
+    use crate::distrib::client::SliceFetcher;
+    use crate::distrib::partition::DistribThresholds;
+    use crate::fetcher::{FetchError, SegmentFetcher};
+
+    /// One RSEG segment whose trailer declares a version one past the newest
+    /// this build reads, with the content hash of those rewritten bytes.
+    async fn out_of_window_segment(store: &MemoryStore) -> (SegmentRef, u16) {
+        let version = ravel_segment::SUPPORTED_VERSIONS.newest() + 1;
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "old".to_string(),
+        }])
+        .expect("labels");
+        let tenant = TenantId::new("acme".to_string());
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id: SeriesId::compute(&tenant, "old", &labels).expect("series id"),
+                labels,
+                samples: vec![Sample {
+                    ts_ns: 1_000,
+                    value: 1.0,
+                }],
+            }],
+            SegmentIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let mut bytes = written.bytes.to_vec();
+        let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+        bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+        let key = "seg/old.rseg".to_string();
+        let seg = SegmentRef {
+            data_object_key: key.clone(),
+            object_size: bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 100,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        store
+            .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put segment");
+        (seg, version)
+    }
+
+    /// ADR-2708 D5a over a fragment: the worker reports an out-of-window
+    /// object as `Code::Unsupported` with the version-only text, the
+    /// coordinator reads that as "run it locally" rather than as a terminal
+    /// failure, and the local read reports the same `UnsupportedVersion` class,
+    /// so a distributed query ends where a local one does.
+    #[tokio::test]
+    async fn unsupported_version_fragment_round_trips_as_unsupported() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, version) = out_of_window_segment(&store).await;
+        let segments = vec![seg.clone()];
+
+        // Worker side, over a real tonic server.
+        let (remote, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(&remote, pushdown_request(&segments, None))
+            .await
+            .expect("worker answers with a typed status");
+        assert_eq!(response.status, pb::status::Code::Unsupported);
+        assert!(
+            response.status_message.contains(&format!(
+                "stored object version {version} is outside this build's reader window"
+            )),
+            "{}",
+            response.status_message
+        );
+
+        // Receiving side: the coordinator's fan-out over the same worker.
+        let distributed = Distributed::new(
+            Arc::new(remote),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let outcome = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &Snapshot {
+                    segments: segments.clone(),
+                    segments_pruned: 0,
+                    pending_erasure: Vec::new(),
+                },
+                &[],
+                &[],
+                &QueryAccounting::new(),
+                &EngineConfig::default(),
+                test_deadline(),
+                None,
+            )
+            .await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(None)),
+            "the coordinator must fall back to local execution, got {outcome:?}"
+        );
+
+        // The local execution the fallback runs.
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let err = SegmentFetcher::new(backend)
+            .fetch_soa_and_histograms_accounted(TENANT, &seg, &[], &QueryAccounting::new())
+            .await
+            .expect_err("the local read refuses the version too");
+        match err {
+            FetchError::UnsupportedVersion { key, version: got } => {
+                assert_eq!(key, seg.data_object_key);
+                assert_eq!(got, u32::from(version));
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
     }
 }

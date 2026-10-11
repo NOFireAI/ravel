@@ -1710,6 +1710,228 @@ async fn corrupt_segment_bytes_return_500_not_wrong_data() {
     assert_eq!(body["errorType"], "internal");
 }
 
+/// A version no build in this window reads: one past the newest.
+fn out_of_window_rseg_version() -> u16 {
+    let version = ravel_segment::SUPPORTED_VERSIONS.newest() + 1;
+    assert!(!ravel_segment::SUPPORTED_VERSIONS.contains(version));
+    version
+}
+
+/// Publishes one RSEG segment whose trailer declares `version`. With `rehash`
+/// the commit record carries the blake3 of the rewritten bytes, as it would for
+/// an object a writer of that version produced; without it the record keeps
+/// the original hash, so only the version bytes differ from what was committed.
+async fn publish_rseg_stamped(
+    store: &MemoryStore,
+    tid: &TenantId,
+    now: i64,
+    metric: &str,
+    version: u16,
+    rehash: bool,
+) {
+    let th = tid.hash();
+    let written = SegmentWriter::write(
+        vec![series_input(tid, metric, &[], &[(now - NS_PER_MIN, 1.0)])],
+        SegmentIdentity {
+            tenant_hash: th.0,
+            shard: 0,
+            writer_id: Uuid::from_u128(77).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+    let mut bytes = written.bytes.to_vec();
+    // RSEG trailer: footer_len(4) footer_crc32c(4) version(2) signal reserved magic(4).
+    let at = bytes.len() - ravel_segment::TRAILER_LEN as usize + 8;
+    bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+    let content_hash = if rehash {
+        *blake3::hash(&bytes).as_bytes()
+    } else {
+        written.summary.blake3
+    };
+    let rec = record::build(NewCommitRecord {
+        tenant_hash: th,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id: Uuid::from_u128(77),
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: now,
+        ingest_hour_bucket: u32::try_from(now / NS_PER_HOUR).expect("hour bucket"),
+    })
+    .expect("valid commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &data_key, Bytes::from(bytes))
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// ADR-2708 D5a over the PromQL route: an RSEG object whose trailer version is
+/// outside this build's window, with bytes matching their recorded content
+/// hash, answers 422 with the version-only message, not the corruption 500.
+#[tokio::test]
+async fn an_out_of_window_rseg_answers_422() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let now = now_ns();
+    let version = out_of_window_rseg_version();
+    publish_rseg_stamped(&store, &tid, now, "old_metric", version, true).await;
+
+    let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
+    let uri = format!(
+        "/api/v1/query?query={}&time={}",
+        encode_query_param("old_metric"),
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["errorType"], "execution");
+    assert_eq!(
+        body["error"],
+        format!(
+            "stored object version {version} is outside this build's reader window; it needs \
+             migration"
+        )
+    );
+}
+
+/// The guard behind the test above: the same out-of-window version in the
+/// trailer, but the commit record keeps the hash of the original bytes, so the
+/// version bytes are the only damage. That is corruption (500), not a version
+/// to migrate.
+#[tokio::test]
+async fn a_corrupt_version_byte_is_reported_as_corruption() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let now = now_ns();
+    let version = out_of_window_rseg_version();
+    publish_rseg_stamped(&store, &tid, now, "flipped_metric", version, false).await;
+
+    let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
+    let uri = format!(
+        "/api/v1/query?query={}&time={}",
+        encode_query_param("flipped_metric"),
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["errorType"], "internal");
+    assert_eq!(body["error"], ravel_query::http::MSG_CORRUPT);
+}
+
+/// ADR-2708 D5a over PromQL-on-logs: an RLOG object whose trailer version is
+/// outside this build's window, rewritten the way a writer of that version
+/// would and committed with the hash of those bytes, answers 422 with the
+/// version-only message.
+#[tokio::test]
+async fn an_out_of_window_rlog_answers_422_over_promql() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    let now = now_ns();
+    let ts = now - NS_PER_MIN;
+    let version = ravel_logseg::footer::VERSION + 1;
+    assert!(!ravel_logseg::footer::SUPPORTED_VERSIONS.contains(version));
+
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let mut writer = RlogWriter::new(
+        RlogConfig::default(),
+        ObjectIdentity {
+            tenant_hash: th.0,
+            shard: 0,
+            writer_id: [3u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    );
+    writer
+        .push(LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: "hello".to_string(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .expect("push log record");
+    let mut bytes = writer.finish().expect("finish rlog");
+    ravel_logseg::footer::rewrite_trailer_version(&mut bytes, version).expect("rewrite trailer");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash: th,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id: Uuid::from_bytes([3u8; 16]),
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash: *blake3::hash(&bytes).as_bytes(),
+        sample_count: 1,
+        series_count: 1,
+        min_event_ts_ns: ts,
+        max_event_ts_ns: ts,
+        min_ingest_ts_ns: ts,
+        max_ingest_ts_ns: ts,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        created_unix_ns: ts,
+        ingest_hour_bucket: u32::try_from(ts / NS_PER_HOUR).expect("hour bucket"),
+    })
+    .expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(&*store, &data_key, Bytes::from(bytes))
+        .await
+        .expect("put data object");
+    publish::publish(&*store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+
+    let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
+    let uri = format!(
+        "/api/v1/query?query={}&time={}",
+        encode_query_param("count_over_time(ravel_log_lines[1h])"),
+        now / NS_PER_SEC
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["errorType"], "execution");
+    assert_eq!(
+        body["error"],
+        format!(
+            "stored object version {version} is outside this build's reader window; it needs \
+             migration"
+        )
+    );
+}
+
 #[tokio::test]
 async fn auth_rejects_missing_and_unknown_tokens() {
     let store = Arc::new(MemoryStore::new());

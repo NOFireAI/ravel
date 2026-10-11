@@ -20,7 +20,7 @@ use ravel_cpu_gate::CpuGateError;
 use ravel_object_store::StoreError;
 
 use crate::QueryError;
-use crate::fetcher::FetchError;
+use crate::fetcher::{FetchError, unsupported_version_message};
 use crate::http::json::ApiResponse;
 use crate::http::params::ParamError;
 use crate::http::tenant::AuthError;
@@ -106,6 +106,13 @@ impl From<QueryError> for ApiError {
             } else {
                 ApiError::Unavailable(redacted.to_string())
             };
+        }
+        // An object outside this build's reader window (ADR-2708 D5a): not
+        // corruption and not an outage. 422 with the version-only message; the
+        // object key stays in the server log.
+        if let QueryError::Fetch(FetchError::UnsupportedVersion { version, .. }) = &e {
+            tracing::warn!(error = %e, "query read an object outside the reader window");
+            return ApiError::Unsupported(unsupported_version_message(*version));
         }
         match &e {
             QueryError::Parse(_)
@@ -220,7 +227,9 @@ impl From<QueryError> for ApiError {
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => match fetch {
-            FetchError::Corrupt { .. } => Some(MSG_CORRUPT),
+            FetchError::Corrupt { .. } | FetchError::ContentHashMismatch { .. } => {
+                Some(MSG_CORRUPT)
+            }
             // An RLOG fault reaches this enum as `Store` carrying a
             // `Corrupted` source, because `FetchError::Corrupt` can only hold
             // an RSEG `SegmentError`: `engine`'s log-series mapper folds
@@ -237,6 +246,10 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             // budget class, never a key, and is not a storage fault: it is
             // echoed, not redacted (the `From` impl maps it to a 422).
             FetchError::FetchMemoryExhausted { .. } => None,
+            // Handled in `From<QueryError>` ahead of this function: its message
+            // carries the version and is not one of the fixed strings.
+            // Matched only for exhaustiveness.
+            FetchError::UnsupportedVersion { .. } => None,
         },
         // An over-wide-window refusal carries only counts and is
         // safe to show; like the budget errors it is not a storage fault, so
@@ -581,6 +594,27 @@ mod tests {
         assert_redacted(&p.message);
         assert_eq!(p.status.as_u16(), 500);
         assert_eq!(p.error_type, "internal");
+    }
+
+    /// ADR-2708 D5a: an object outside this build's reader window is 422
+    /// `execution` with the version-only message, neither the corruption 500
+    /// nor the transient 503, and the object key stays out of the body.
+    #[test]
+    fn unsupported_version_answers_422() {
+        let err = QueryError::Fetch(FetchError::UnsupportedVersion {
+            key: LEAKY_KEY.to_string(),
+            version: 9,
+        });
+        assert!(err.to_string().contains(LEAKY_KEY));
+        let p = ApiError::from(err).into_parts();
+        assert_eq!(p.status.as_u16(), 422);
+        assert_eq!(p.error_type, "execution");
+        assert_eq!(
+            p.message,
+            "stored object version 9 is outside this build's reader window; it needs migration"
+        );
+        assert_ne!(p.message, MSG_CORRUPT);
+        assert_redacted(&p.message);
     }
 
     /// A decode failure of stored catalog bytes whose format version this build

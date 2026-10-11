@@ -38,7 +38,7 @@ use ravel_commit::record::RecordError;
 use ravel_cpu_gate::CpuGateError;
 use ravel_object_store::StoreError;
 use ravel_parquet::{ParquetReadError, ParquetTableError};
-use ravel_query::{FetchError, FoldLag, LogFetchError};
+use ravel_query::{FetchError, FoldLag, LogFetchError, unsupported_version_message};
 
 use crate::parquet::ParquetQueryError;
 use crate::spans_fetcher::SpanFetchError;
@@ -509,6 +509,14 @@ impl SqlError {
             | SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(_)) => {
                 ErrorClass::Unsupported
             }
+            // An object outside this build's reader window (ADR-2708 D5a): the
+            // same 422 the PromQL surface answers, ahead of the generic fetch
+            // arm so it does not collapse into the transient class.
+            SqlError::Fetch(FetchError::UnsupportedVersion { .. })
+            | SqlError::LogFetch(LogFetchError::UnsupportedVersion { .. })
+            | SqlError::SpanFetch(SpanFetchError::UnsupportedVersion { .. }) => {
+                ErrorClass::Unsupported
+            }
             SqlError::Catalog(_)
             | SqlError::ColumnStats(_)
             | SqlError::Fetch(_)
@@ -602,6 +610,7 @@ impl SqlError {
                 // A store-side checksum mismatch is the same permanent data
                 // fault as a failed decode, as on the PromQL path.
                 FetchError::Corrupt { .. }
+                | FetchError::ContentHashMismatch { .. }
                 | FetchError::Store {
                     source: StoreError::Corrupted(_),
                     ..
@@ -612,6 +621,10 @@ impl SqlError {
                 // Never reached: the budget arm above echoes it. Matched
                 // only for exhaustiveness.
                 FetchError::FetchMemoryExhausted { .. } => self.to_string(),
+                // Carries the version only; the object key stays server-side.
+                FetchError::UnsupportedVersion { version, .. } => {
+                    unsupported_version_message(*version)
+                }
             },
             SqlError::LogFetch(fetch) => match fetch {
                 // A carry paired with the wrong segment is an integrity
@@ -629,6 +642,9 @@ impl SqlError {
                 }
                 // Never reached: the budget arm above echoes it.
                 LogFetchError::FetchMemoryExhausted { .. } => self.to_string(),
+                LogFetchError::UnsupportedVersion { version, .. } => {
+                    unsupported_version_message(*version)
+                }
             },
             SqlError::SpanFetch(fetch) => match fetch {
                 // A cross-tenant object is an integrity violation of the fetched
@@ -643,6 +659,9 @@ impl SqlError {
                 SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
                 // Never reached: the budget arm above echoes it.
                 SpanFetchError::FetchMemoryExhausted { .. } => self.to_string(),
+                SpanFetchError::UnsupportedVersion { version, .. } => {
+                    unsupported_version_message(*version)
+                }
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::Parquet(parquet) => parquet.client_message(),
@@ -885,6 +904,40 @@ mod tests {
             !message.contains(RAW_STORE_TEXT),
             "leaked raw store text: {message}"
         );
+    }
+
+    /// ADR-2708 D5a: an object outside this build's reader window, from any of
+    /// the three fetchers, is the 422 class with the version-only message, not
+    /// the corruption message and not the transient one.
+    #[test]
+    fn unsupported_version_is_not_corruption() {
+        let expected =
+            "stored object version 3 is outside this build's reader window; it needs migration";
+        let errors = [
+            SqlError::Fetch(FetchError::UnsupportedVersion {
+                key: LEAKY_KEY.to_string(),
+                version: 3,
+            }),
+            SqlError::LogFetch(LogFetchError::UnsupportedVersion {
+                key: LEAKY_KEY.to_string(),
+                version: 3,
+            }),
+            SqlError::SpanFetch(SpanFetchError::UnsupportedVersion {
+                key: LEAKY_KEY.to_string(),
+                version: 3,
+            }),
+        ];
+        for err in &errors {
+            assert!(
+                err.to_string().contains(LEAKY_KEY),
+                "log detail lost the key"
+            );
+            let message = err.client_message();
+            assert_eq!(message, expected, "{err:?}");
+            assert_ne!(message, MSG_CORRUPT, "{err:?}");
+            assert_redacted(&message);
+            assert_eq!(err.class(), ErrorClass::Unsupported, "{err:?}");
+        }
     }
 
     /// Issue #1976: a column-stats store fault must not tell the client the

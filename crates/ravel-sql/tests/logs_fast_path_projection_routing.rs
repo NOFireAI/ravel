@@ -835,8 +835,9 @@ async fn plan_path_over_previous_version_segment_is_refused_before_any_request()
     );
 }
 
-/// Assert `err` carries `LogSegError::UnsupportedVersion(version)` through the
-/// `SqlError` boundary, whatever DataFusion wrapped it in.
+/// Assert `err` carries `LogFetchError::UnsupportedVersion` for `version`
+/// through the `SqlError` boundary, whatever DataFusion wrapped it in: the
+/// out-of-window class, not corruption (ADR-2708 D5a).
 fn assert_unsupported_version(err: &datafusion::error::DataFusionError, version: u16) {
     let root = err.find_root();
     let datafusion::error::DataFusionError::External(inner) = root else {
@@ -846,11 +847,14 @@ fn assert_unsupported_version(err: &datafusion::error::DataFusionError, version:
         panic!("expected a SqlError, got {inner}");
     };
     match sql {
-        ravel_sql::SqlError::LogFetch(LogFetchError::Corrupt { source, .. }) => assert!(
-            matches!(source, ravel_logseg::LogSegError::UnsupportedVersion(v) if *v == version),
-            "expected UnsupportedVersion({version}), got {source:?}"
-        ),
-        other => panic!("expected SqlError::LogFetch(Corrupt), got {other:?}"),
+        ravel_sql::SqlError::LogFetch(LogFetchError::UnsupportedVersion { version: v, .. }) => {
+            assert_eq!(
+                *v,
+                u32::from(version),
+                "expected UnsupportedVersion({version})"
+            )
+        }
+        other => panic!("expected SqlError::LogFetch(UnsupportedVersion), got {other:?}"),
     }
 }
 

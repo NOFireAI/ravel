@@ -4007,19 +4007,21 @@ impl PartitionCtx {
 ///
 /// This is a pre-filter, not the gate: the object's own trailer is still
 /// checked on open, so a catalog entry that disagrees with the bytes is caught
-/// there. The error it produces is the same shape that check produces, so a
-/// caller cannot tell which one refused the object.
+/// there. The error it produces is the one that check produces for an object
+/// whose bytes match their recorded content hash (ADR-2708 D5a). No content
+/// hash is read here: the version is the commit record's, not a trailer byte
+/// that could have been damaged.
 fn refuse_unreadable_version(seg: &SegmentRef) -> Result<(), SqlError> {
     // The catalog carries the version as u32 and an RLOG trailer is u16, so a
-    // value that does not fit is one no build could read; it is reported at the
-    // u16 ceiling rather than silently truncated into the supported window.
-    let declared = u16::try_from(seg.segment_format_version).unwrap_or(u16::MAX);
-    if ravel_logseg::footer::SUPPORTED_VERSIONS.contains(declared) {
+    // value that does not fit is one no build could read; it is refused and
+    // reported as recorded, never truncated into the supported window.
+    let declared = seg.segment_format_version;
+    if u16::try_from(declared).is_ok_and(|v| ravel_logseg::footer::SUPPORTED_VERSIONS.contains(v)) {
         return Ok(());
     }
-    Err(SqlError::LogFetch(LogFetchError::Corrupt {
+    Err(SqlError::LogFetch(LogFetchError::UnsupportedVersion {
         key: seg.data_object_key.clone(),
-        source: LogSegError::UnsupportedVersion(declared),
+        version: declared,
     }))
 }
 

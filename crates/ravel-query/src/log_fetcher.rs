@@ -670,6 +670,11 @@ pub enum LogFetchError {
     /// (ADR-0107 decision 1).
     #[error("etag changed between reads of log segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// Mirrors [`crate::FetchError::UnsupportedVersion`]: the trailer declares
+    /// a version outside this build's reader window and the object's bytes
+    /// match the content hash its catalog entry recorded.
+    #[error("{} (log segment {key})", crate::fetcher::unsupported_version_message(*version))]
+    UnsupportedVersion { key: String, version: u32 },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
     /// reservation for the bytes this GET would materialize. Carries only the
     /// budget's figures and the class of the refusal (`cause`), never an
@@ -1194,6 +1199,69 @@ impl LogSegmentFetcher {
         self.block_range.memory_budget_for_test()
     }
 
+    /// Reclassifies a version refusal from any open path of `seg_ref`: an
+    /// out-of-window trailer version on an object whose bytes match the
+    /// recorded content hash is [`LogFetchError::UnsupportedVersion`]; on one
+    /// whose bytes do not, it stays corruption. Every other result passes
+    /// through unchanged.
+    ///
+    /// A refusal raised over bytes that held the whole object was already
+    /// settled against those bytes ([`settle_held_version`]) and passes through
+    /// here. What reaches this re-read is a ranged open's refusal: the object
+    /// is read again in [`crate::fetcher::CONTENT_HASH_CHUNK_BYTES`] ranges,
+    /// each reserved against the fetch memory budget (released once the chunk
+    /// is hashed) and issued under the GET limiter. Each range is recorded on
+    /// `accounting` and on the wire-byte counter under `phase`, the phase of
+    /// the read that refused the version: one GET and its wire bytes as
+    /// transferred per range, the same figures that phase's other reads record.
+    /// A budget refusal or a store failure on the re-read is returned as that
+    /// error.
+    async fn settle_version_refusal<T>(
+        &self,
+        seg_ref: &SegmentRef,
+        phase: QueryPhase,
+        accounting: &QueryAccounting,
+        result: Result<T, LogFetchError>,
+    ) -> Result<T, LogFetchError> {
+        let Err(LogFetchError::Corrupt {
+            key,
+            source: LogSegError::UnsupportedVersion(version),
+        }) = result
+        else {
+            return result;
+        };
+        let read = |start: u64, end: u64| {
+            let key = key.as_str();
+            async move {
+                let reservation = self.reserve_fetch(end.saturating_sub(start))?;
+                let store_error = |source| LogFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                };
+                let got = {
+                    let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                        store_error(StoreError::Transient(
+                            "GetLimiter semaphore closed unexpectedly".to_string(),
+                        ))
+                    })?;
+                    self.store
+                        .get(key, GetRange::Range(start, end))
+                        .await
+                        .map_err(store_error)?
+                };
+                let len = got.data.len() as u64;
+                accounting.record_s3_request(AccountedOp::Get);
+                accounting.add_s3_bytes(AccountedOp::Get, len);
+                self.wire_bytes.record(phase, len);
+                Ok::<_, LogFetchError>((got, reservation))
+            }
+        };
+        match crate::fetcher::matches_content_hash(seg_ref, read).await {
+            Ok(matched) => Err(version_verdict(key, version, matched)),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Reserves `n` bytes against this fetcher's budget before a whole-object
     /// GET, mapping a refusal to [`LogFetchError::FetchMemoryExhausted`]. The
     /// guard is owned for the fetched buffer's lifetime (ADR-1170 decision 2).
@@ -1653,10 +1721,14 @@ impl LogSegmentFetcher {
             // This funnel issues exactly one whole-object GET per call.
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", bytes.len() as u64);
+            settle_held_version(seg_ref, &bytes)?;
             self.decode_spanned(key, &bytes.into(), query, accounting)
                 .await
         }
         .await;
+        let result = self
+            .settle_version_refusal(seg_ref, ReadPhases::SCAN.blocks, accounting, result)
+            .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         result
     }
@@ -1724,6 +1796,9 @@ impl LogSegmentFetcher {
                 .await
         }
         .await;
+        let result = self
+            .settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
+            .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         result
     }
@@ -1770,6 +1845,23 @@ impl LogSegmentFetcher {
     /// handle directly; no in-scope caller does, which is a #796 report
     /// finding, not a bug fixed here.
     pub async fn scan_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let result = self
+            .scan_accounted_with_tenant_unsettled(seg_ref, tenant_hash, query, columns, accounting)
+            .await;
+        self.settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
+            .await
+    }
+
+    /// The body of the public method of the same name, before
+    /// [`settle_version_refusal`](Self::settle_version_refusal).
+    async fn scan_accounted_with_tenant_unsettled(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -1845,6 +1937,29 @@ impl LogSegmentFetcher {
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
     /// comment.
     pub async fn scan_whole_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let result = self
+            .scan_whole_accounted_with_tenant_unsettled(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                accounting,
+            )
+            .await;
+        self.settle_version_refusal(seg_ref, ReadPhases::SCAN.blocks, accounting, result)
+            .await
+    }
+
+    /// The body of the public method of the same name, before
+    /// [`settle_version_refusal`](Self::settle_version_refusal).
+    async fn scan_whole_accounted_with_tenant_unsettled(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -2158,6 +2273,9 @@ impl LogSegmentFetcher {
             )))
         }
         .await;
+        let result = self
+            .settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         // ADR-0996 decision 3: record this data object as touched, once, at the
         // plan-then-stripe designated-recorder point. `plan_segment` runs once
@@ -2401,6 +2519,22 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Option<BlockStatsReport>, LogFetchError> {
+        let result = self
+            .plan_segment_block_stats_unsettled(seg_ref, tenant_hash, query, accounting)
+            .await;
+        self.settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await
+    }
+
+    /// The body of the public method of the same name, before
+    /// [`settle_version_refusal`](Self::settle_version_refusal).
+    async fn plan_segment_block_stats_unsettled(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<BlockStatsReport>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
@@ -2512,22 +2646,25 @@ impl LogSegmentFetcher {
         carried_whole: Option<CarriedWholeObject>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
-        self.scan_accounted_with_tenant_subset_impl(
-            seg_ref,
-            tenant_hash,
-            query,
-            columns,
-            indices,
-            false,
-            // Unused: the ordinal case never reaches the raw-subset open that
-            // checks a survivor list against this.
-            &[],
-            footer,
-            carried_whole,
-            None,
-            accounting,
-        )
-        .await
+        let result = self
+            .scan_accounted_with_tenant_subset_impl(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                indices,
+                false,
+                // Unused: the ordinal case never reaches the raw-subset open that
+                // checks a survivor list against this.
+                &[],
+                footer,
+                carried_whole,
+                None,
+                accounting,
+            )
+            .await;
+        self.settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
+            .await
     }
 
     /// [`scan_accounted_with_tenant_subset`](Self::scan_accounted_with_tenant_subset),
@@ -2568,20 +2705,23 @@ impl LogSegmentFetcher {
         dirs: Option<&Arc<SegmentDirectories>>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
-        self.scan_accounted_with_tenant_subset_impl(
-            seg_ref,
-            tenant_hash,
-            query,
-            columns,
-            indices,
-            true,
-            expected_survivors,
-            footer,
-            carried_whole,
-            dirs,
-            accounting,
-        )
-        .await
+        let result = self
+            .scan_accounted_with_tenant_subset_impl(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                indices,
+                true,
+                expected_survivors,
+                footer,
+                carried_whole,
+                dirs,
+                accounting,
+            )
+            .await;
+        self.settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2884,7 +3024,27 @@ impl LogSegmentFetcher {
     /// [`ReadPhases::blocks`]: on a scan that is [`QueryPhase::Scan`], and on
     /// `plan_segment`'s whole-object fallback it is [`QueryPhase::Plan`], which
     /// keeps a planning read out of the scan-phase numerator.
+    ///
+    /// An object whose trailer declares an out-of-window version is refused
+    /// here, settled against the bytes just read ([`settle_held_version`]), so
+    /// the funnel's own settle never re-reads an object it already holds.
     async fn whole_object_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        phase: QueryPhase,
+        accounting: &QueryAccounting,
+    ) -> Result<LogObjectBytes, LogFetchError> {
+        let bytes = self
+            .whole_object_bytes_unchecked(seg_ref, tenant_hash, phase, accounting)
+            .await?;
+        if let Some(whole) = bytes.whole() {
+            settle_held_version(seg_ref, whole)?;
+        }
+        Ok(bytes)
+    }
+
+    async fn whole_object_bytes_unchecked(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -3427,6 +3587,21 @@ impl LogSegmentFetcher {
     /// cost model counts on; a segment none of whose streams match is pruned
     /// on that read alone.
     pub(crate) async fn fetch_stream_dir(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Vec<(LogStreamId, Vec<u8>)>>, LogFetchError> {
+        let result = self
+            .fetch_stream_dir_unsettled(seg_ref, tenant_hash, accounting)
+            .await;
+        self.settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await
+    }
+
+    /// The body of the public method of the same name, before
+    /// [`settle_version_refusal`](Self::settle_version_refusal).
+    async fn fetch_stream_dir_unsettled(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -4208,6 +4383,14 @@ enum ObjectRepr {
 }
 
 impl LogObjectBytes {
+    /// The object's bytes when they are held whole rather than placed.
+    fn whole(&self) -> Option<&Bytes> {
+        match &self.0 {
+            ObjectRepr::Whole(bytes) => Some(bytes),
+            ObjectRepr::Placed(_) => None,
+        }
+    }
+
     fn fetched_directories(&self) -> Option<&FetchedDirectories> {
         match &self.0 {
             ObjectRepr::Whole(_) => None,
@@ -5251,6 +5434,9 @@ impl BlockRangeFetcher {
         }
         let mut resident = vec![(probe_start, probe_bytes.clone())];
 
+        if probe_start == 0 {
+            settle_held_version(seg_ref, &probe_bytes)?;
+        }
         let footer = match open_from_suffix(&probe_bytes, total_size)
             .map_err(|source| corrupt(key, source))?
         {
@@ -5863,6 +6049,9 @@ impl BlockRangeFetcher {
                 // Parse from the probe suffix, chasing one range if the suffix
                 // did not cover the whole footer (mirrors
                 // `SegmentFetcher::open_segment`).
+                if probe_start == 0 {
+                    settle_held_version(seg_ref, &probe_bytes)?;
+                }
                 match open_from_suffix(&probe_bytes, total_size)
                     .map_err(|source| corrupt(key, source))?
                 {
@@ -7480,6 +7669,18 @@ fn to_cache_error(err: LogFetchError) -> crate::fetcher::CacheFetchError {
             key,
             message: source.to_string(),
         },
+        // Unreachable: only `settle_version_refusal` builds this, after the
+        // fetch that carried a single-flight closure has returned. Kept a hard,
+        // non-retryable class rather than flattened into a transient one.
+        err @ LogFetchError::UnsupportedVersion { .. } => {
+            crate::fetcher::CacheFetchError::Corrupt {
+                key: match &err {
+                    LogFetchError::UnsupportedVersion { key, .. } => key.clone(),
+                    _ => String::new(),
+                },
+                message: err.to_string(),
+            }
+        }
         // Unreachable in practice: every fetch-memory reservation (ADR-1170
         // decision 2) is taken BEFORE the `get_or_fetch` closure this channel
         // carries, so a refusal fails the caller before any cache single-flight
@@ -7839,6 +8040,45 @@ fn corrupt(key: &str, source: LogSegError) -> LogFetchError {
     LogFetchError::Corrupt {
         key: key.to_string(),
         source,
+    }
+}
+
+/// The verdict on an out-of-window trailer `version` (ADR-2708 D5a), given
+/// whether the object's bytes matched the recorded content hash.
+fn version_verdict(key: String, version: u16, matched: bool) -> LogFetchError {
+    if matched {
+        LogFetchError::UnsupportedVersion {
+            key,
+            version: u32::from(version),
+        }
+    } else {
+        LogFetchError::Corrupt {
+            key,
+            source: LogSegError::Corrupted(crate::fetcher::version_hash_mismatch_detail(version)),
+        }
+    }
+}
+
+/// Refuses `bytes`, the whole object of `seg_ref` already in memory, when its
+/// trailer declares an out-of-window version, settling the verdict by hashing
+/// those bytes rather than re-reading them. The trailer is checked in the order
+/// every open checks it (magic, then version), so any other trailer fault is
+/// left for the open that follows to report.
+fn settle_held_version(seg_ref: &SegmentRef, bytes: &[u8]) -> Result<(), LogFetchError> {
+    let Some(trailer) = bytes
+        .len()
+        .checked_sub(footer::TRAILER_LEN)
+        .and_then(|at| bytes.get(at..))
+    else {
+        return Ok(());
+    };
+    match open_from_suffix(trailer, bytes.len() as u64) {
+        Err(LogSegError::UnsupportedVersion(version)) => Err(version_verdict(
+            seg_ref.data_object_key.clone(),
+            version,
+            crate::fetcher::content_hash_matches(seg_ref, bytes),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -14064,6 +14304,352 @@ mod owned_block_plan_tests {
             assert_eq!(stats.block_range_gets, 1);
             assert_eq!(stats.block_bytes_fetched, end - start);
             assert_eq!(placed_blocks(&fx, &bytes), *share);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod version_refusal_tests {
+    //! ADR-2708 D5a: a trailer version outside this build's window is
+    //! `UnsupportedVersion` only when the object's bytes match the content hash
+    //! the catalog recorded; otherwise it is corruption.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const KEY: &str = "t/old.rlog";
+
+    fn object() -> Vec<u8> {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: [2u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for ts in 1..=4 {
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "hello".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: Vec::new(),
+            })
+            .expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// Stores an RLOG object whose trailer declares an out-of-window version.
+    /// `genuine` rewrites it the way a writer of that version would (footer crc
+    /// recomputed) and records the hash of those bytes; otherwise only the two
+    /// version bytes change and the recorded hash is the original object's.
+    async fn stamped(genuine: bool) -> (Arc<MemoryStore>, SegmentRef, u16) {
+        let version = ravel_logseg::footer::VERSION + 1;
+        assert!(!ravel_logseg::footer::SUPPORTED_VERSIONS.contains(version));
+        let original = object();
+        let mut bytes = original.clone();
+        let content_hash = if genuine {
+            ravel_logseg::footer::rewrite_trailer_version(&mut bytes, version)
+                .expect("rewrite trailer");
+            *blake3::hash(&bytes).as_bytes()
+        } else {
+            let at = bytes.len() - ravel_logseg::footer::TRAILER_LEN + 8;
+            bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+            *blake3::hash(&original).as_bytes()
+        };
+        let store = Arc::new(MemoryStore::new());
+        let size = bytes.len() as u64;
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let seg = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: 1,
+            max_event_ts_ns: 4,
+            ingest_hour_bucket: 0,
+            sample_count: 4,
+            series_count: 1,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        (store, seg, version)
+    }
+
+    /// The result of every tenant-aware RLOG funnel over `seg`, on both the
+    /// whole-object and the ranged (suffix-probe) open paths. The ranged probe
+    /// is narrower than the object, so its refusal is settled by the re-read.
+    async fn every_funnel(store: Arc<MemoryStore>, seg: &SegmentRef) -> Vec<LogFetchError> {
+        assert!(seg.object_size > PROBE);
+        let whole = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let ranged = ranged(store);
+        let q = LogQuery::new(0, 10);
+        let all = ColumnSelection::all();
+        let acc = QueryAccounting::new();
+        let mut out = Vec::new();
+        for f in [&whole, &ranged] {
+            out.push(
+                f.fetch_accounted_with_tenant(seg, TENANT, &q, &acc)
+                    .await
+                    .expect_err("fetch_accounted_with_tenant refuses"),
+            );
+            out.push(
+                f.scan_accounted_with_tenant(seg, TENANT, &q, &all, &acc)
+                    .await
+                    .err()
+                    .expect("scan_accounted_with_tenant refuses"),
+            );
+            out.push(
+                f.scan_whole_accounted_with_tenant(seg, TENANT, &q, &all, &acc)
+                    .await
+                    .err()
+                    .expect("scan_whole_accounted_with_tenant refuses"),
+            );
+            out.push(
+                f.plan_segment(seg, TENANT, &q, &acc)
+                    .await
+                    .err()
+                    .expect("plan_segment refuses"),
+            );
+            out.push(
+                f.fetch_stream_dir(seg, TENANT, &acc)
+                    .await
+                    .expect_err("fetch_stream_dir refuses"),
+            );
+            out.push(
+                f.scan_accounted_with_tenant_subset(seg, TENANT, &q, &all, &[0], None, None, &acc)
+                    .await
+                    .err()
+                    .expect("scan_accounted_with_tenant_subset refuses"),
+            );
+            out.push(
+                f.scan_accounted_with_tenant_subset_raw(
+                    seg,
+                    TENANT,
+                    &q,
+                    &all,
+                    &[0],
+                    &[0],
+                    None,
+                    None,
+                    None,
+                    &acc,
+                )
+                .await
+                .err()
+                .expect("scan_accounted_with_tenant_subset_raw refuses"),
+            );
+        }
+        // At or below the plan's whole-object bound the block-stats path
+        // answers `None` without a GET, so only the ranged fetcher reads here.
+        assert!(seg.object_size <= whole.plan_whole_object_bound());
+        assert!(
+            whole
+                .plan_segment_block_stats(seg, TENANT, &q, &acc)
+                .await
+                .expect("no read, no refusal")
+                .is_none()
+        );
+        out.push(
+            ranged
+                .plan_segment_block_stats(seg, TENANT, &q, &acc)
+                .await
+                .expect_err("plan_segment_block_stats refuses"),
+        );
+        out
+    }
+
+    /// The footer probe the ranged cost tests read first: wide enough to hold
+    /// the trailer, narrower than the object, so the open is a ranged one.
+    const PROBE: u64 = 64;
+
+    fn ranged(store: Arc<MemoryStore>) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store)
+            .with_block_range_threshold(0)
+            .with_projection_break_even_bytes(Some(0))
+            .with_suffix_len(PROBE)
+    }
+
+    /// GET requests and wire bytes per phase, from the fetcher's wire counter,
+    /// in `QueryPhase::ALL` order.
+    fn wire(f: &LogSegmentFetcher) -> [(u64, u64); 4] {
+        let snap = f.phase_wire_byte_counter().snapshot();
+        QueryPhase::ALL.map(|p| (snap.phase_requests(p), snap.phase(p)))
+    }
+
+    fn only(phase: QueryPhase, requests: u64, bytes: u64) -> [(u64, u64); 4] {
+        QueryPhase::ALL.map(|p| {
+            if p == phase {
+                (requests, bytes)
+            } else {
+                (0, 0)
+            }
+        })
+    }
+
+    fn pooled_gets(acc: &QueryAccounting) -> (u64, u64) {
+        let snap = acc.snapshot();
+        (
+            snap.s3_requests(AccountedOp::Get),
+            snap.s3_bytes(AccountedOp::Get),
+        )
+    }
+
+    /// A ranged scan refuses the version on its metadata probe; the hash
+    /// re-read is charged to that probe's phase: one more GET carrying exactly
+    /// the object's size in wire bytes, on the phase counter and the caller's
+    /// accounting alike.
+    #[tokio::test]
+    async fn a_ranged_scan_charges_the_hash_reread_to_the_probe_phase() {
+        let (store, seg, _) = stamped(true).await;
+        assert!(seg.object_size > PROBE);
+        let f = ranged(store);
+        let acc = QueryAccounting::new();
+        let err = f
+            .scan_accounted_with_tenant(
+                &seg,
+                TENANT,
+                &LogQuery::new(0, 10),
+                &ColumnSelection::all(),
+                &acc,
+            )
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, LogFetchError::UnsupportedVersion { .. }),
+            "{err:?}"
+        );
+        let want = (2, PROBE + seg.object_size);
+        assert_eq!(wire(&f), only(ReadPhases::SCAN.metadata, want.0, want.1));
+        assert_eq!(pooled_gets(&acc), want);
+    }
+
+    /// The planner's probe is a plan-phase read, so its hash re-read is too.
+    #[tokio::test]
+    async fn a_ranged_plan_charges_the_hash_reread_to_the_plan_phase() {
+        let (store, seg, _) = stamped(true).await;
+        let f = ranged(store);
+        let acc = QueryAccounting::new();
+        let err = f
+            .plan_segment(&seg, TENANT, &LogQuery::new(0, 10), &acc)
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, LogFetchError::UnsupportedVersion { .. }),
+            "{err:?}"
+        );
+        let want = (2, PROBE + seg.object_size);
+        assert_eq!(wire(&f), only(QueryPhase::Plan, want.0, want.1));
+        assert_eq!(pooled_gets(&acc), want);
+    }
+
+    /// A whole-object read already holds every byte, so the hash is taken over
+    /// those and nothing is re-read.
+    #[tokio::test]
+    async fn a_whole_object_refusal_issues_no_reread() {
+        let (store, seg, _) = stamped(true).await;
+        let f = LogSegmentFetcher::new(store);
+        let acc = QueryAccounting::new();
+        let err = f
+            .scan_whole_accounted_with_tenant(
+                &seg,
+                TENANT,
+                &LogQuery::new(0, 10),
+                &ColumnSelection::all(),
+                &acc,
+            )
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, LogFetchError::UnsupportedVersion { .. }),
+            "{err:?}"
+        );
+        assert_eq!(pooled_gets(&acc), (1, seg.object_size));
+    }
+
+    /// The re-read reserves each chunk against the fetch memory budget before
+    /// issuing it: a budget one byte short of the chunk refuses with the
+    /// budget's error, and the only GET on record is the probe.
+    #[tokio::test]
+    async fn the_hash_reread_is_refused_by_a_budget_smaller_than_one_chunk() {
+        let (store, seg, _) = stamped(true).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(seg.object_size - 1));
+        let f = ranged(store).with_memory_budget(budget);
+        let acc = QueryAccounting::new();
+        let err = f
+            .scan_accounted_with_tenant(
+                &seg,
+                TENANT,
+                &LogQuery::new(0, 10),
+                &ColumnSelection::all(),
+                &acc,
+            )
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, LogFetchError::FetchMemoryExhausted { requested, .. } if requested == seg.object_size),
+            "{err:?}"
+        );
+        assert_eq!(wire(&f), only(ReadPhases::SCAN.metadata, 1, PROBE));
+        assert_eq!(pooled_gets(&acc), (1, PROBE));
+    }
+
+    #[tokio::test]
+    async fn an_out_of_window_object_is_unsupported_version() {
+        let (store, seg, version) = stamped(true).await;
+        for err in every_funnel(store, &seg).await {
+            match err {
+                LogFetchError::UnsupportedVersion { key, version: got } => {
+                    assert_eq!(key, KEY);
+                    assert_eq!(got, u32::from(version));
+                }
+                other => panic!("expected UnsupportedVersion, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_version_byte_is_reported_as_corruption() {
+        let (store, seg, _) = stamped(false).await;
+        for err in every_funnel(store, &seg).await {
+            match err {
+                LogFetchError::Corrupt {
+                    source: LogSegError::Corrupted(message),
+                    ..
+                } => assert!(message.contains("content hash"), "{message}"),
+                other => panic!("expected Corrupt, got {other:?}"),
+            }
         }
     }
 }

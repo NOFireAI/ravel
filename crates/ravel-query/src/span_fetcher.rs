@@ -163,6 +163,11 @@ pub enum SpanFetchError {
     },
     #[error("span segment {key} belongs to a different tenant than the query")]
     TenantMismatch { key: String },
+    /// Mirrors [`crate::FetchError::UnsupportedVersion`]: the trailer declares
+    /// a version outside this build's reader window and the object's bytes
+    /// match the content hash its catalog entry recorded.
+    #[error("{} (span segment {key})", crate::fetcher::unsupported_version_message(*version))]
+    UnsupportedVersion { key: String, version: u32 },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
     /// reservation for the bytes this GET would materialize. Carries only the
     /// budget's figures and the class of the refusal (`cause`), never a key
@@ -422,16 +427,18 @@ impl SpanSegmentFetcher {
         // handle, exactly as the logs side routes `fetch` through
         // `fetch_accounted(&QueryAccounting::new())`. The row output is
         // unchanged.
-        let scan = self.open_scan(
-            got.data,
-            key.to_string(),
-            *query,
-            duration_ns,
-            status_mask,
-            predicates,
-            BlockProjection::All,
-            QueryAccounting::new(),
-        )?;
+        let scan = self
+            .open_scan(
+                got.data.clone(),
+                key.to_string(),
+                *query,
+                duration_ns,
+                status_mask,
+                predicates,
+                BlockProjection::All,
+                QueryAccounting::new(),
+            )
+            .map_err(|err| settle_version_refusal(seg_ref, &got.data, err))?;
         Ok(Some(drain_rows(scan).await?))
     }
 
@@ -480,7 +487,8 @@ impl SpanSegmentFetcher {
         // Tenant identity guard: an object whose footer names a different
         // tenant is never decoded. The footer trailer is parsed here (cheap);
         // `open_scan` re-opens it for the BLOCKS section descriptor.
-        let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
+        let footer = open(&bytes)
+            .map_err(|source| settle_version_refusal(seg_ref, &bytes, corrupt(key, source)))?;
         if footer.tenant_hash != tenant_hash.0 {
             return Err(SpanFetchError::TenantMismatch {
                 key: key.to_string(),
@@ -545,7 +553,8 @@ impl SpanSegmentFetcher {
             .whole_object_bytes(seg_ref, tenant_hash, accounting)
             .await?;
 
-        let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
+        let footer = open(&bytes)
+            .map_err(|source| settle_version_refusal(seg_ref, &bytes, corrupt(key, source)))?;
         if footer.tenant_hash != tenant_hash.0 {
             return Err(SpanFetchError::TenantMismatch {
                 key: key.to_string(),
@@ -1297,6 +1306,38 @@ fn abs_block_range(
         .checked_add(len)
         .ok_or_else(|| SpanSegError::Corrupted("block range overflow".into()))?;
     Ok((start, end))
+}
+
+/// Reclassifies a version refusal over the whole object `bytes`: an
+/// out-of-window trailer version on bytes that match the recorded content hash
+/// is [`SpanFetchError::UnsupportedVersion`]; on bytes that do not, it is
+/// corruption. Every other error passes through unchanged.
+fn settle_version_refusal(
+    seg_ref: &SegmentRef,
+    bytes: &[u8],
+    err: SpanFetchError,
+) -> SpanFetchError {
+    match err {
+        SpanFetchError::Corrupt {
+            key,
+            source: SpanSegError::UnsupportedVersion(version),
+        } => {
+            if blake3::hash(bytes).as_bytes() == &seg_ref.content_hash {
+                SpanFetchError::UnsupportedVersion {
+                    key,
+                    version: u32::from(version),
+                }
+            } else {
+                SpanFetchError::Corrupt {
+                    key,
+                    source: SpanSegError::Corrupted(crate::fetcher::version_hash_mismatch_detail(
+                        version,
+                    )),
+                }
+            }
+        }
+        other => other,
+    }
 }
 
 fn corrupt(key: &str, source: SpanSegError) -> SpanFetchError {
@@ -2335,6 +2376,104 @@ mod tests {
                 ..
             } => assert!(message.contains("panicked"), "{message}"),
             other => panic!("expected the decode error, got {other:?}"),
+        }
+    }
+
+    /// Writes one RSPAN object, overwrites its trailer version with an
+    /// out-of-window value, and returns its `SegmentRef`. With `rehash` the ref
+    /// carries the blake3 of the rewritten bytes (an object a writer of that
+    /// version produced); without it, the blake3 of the original bytes, so the
+    /// version bytes are the only damage.
+    async fn write_stamped_object(store: &MemoryStore, rehash: bool) -> (SegmentRef, u16) {
+        let version = ravel_rspan::footer::VERSION + 1;
+        assert!(!ravel_rspan::footer::SUPPORTED_VERSIONS.contains(version));
+        let mut seg = write_object(store, 41, &[bare_span(trace(1), span(1), 10, 20)]).await;
+        let original = store
+            .get(&seg.data_object_key, GetRange::Full)
+            .await
+            .expect("object present")
+            .data;
+        let mut bytes = original.to_vec();
+        let at = bytes.len() - ravel_rspan::footer::TRAILER_LEN + 8;
+        bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+        seg.content_hash = if rehash {
+            *blake3::hash(&bytes).as_bytes()
+        } else {
+            *blake3::hash(&original).as_bytes()
+        };
+        store
+            .put(
+                &seg.data_object_key,
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite");
+        (seg, version)
+    }
+
+    /// Every RSPAN read funnel's result for `seg`, the tenant-blind one included.
+    async fn every_funnel(store: Arc<MemoryStore>, seg: &SegmentRef) -> Vec<SpanFetchError> {
+        let fetcher = SpanSegmentFetcher::new(store);
+        let q = all_query();
+        let accounting = QueryAccounting::new();
+        vec![
+            fetcher
+                .fetch(seg, &q, None, None, &[])
+                .await
+                .expect_err("fetch refuses"),
+            fetcher
+                .fetch_accounted(seg, TENANT, &q, None, None, &[], &accounting)
+                .await
+                .expect_err("fetch_accounted refuses"),
+            fetcher
+                .fetch_accounted_columnar(
+                    seg,
+                    TENANT,
+                    &q,
+                    None,
+                    None,
+                    &[],
+                    &FIXED_PROJECTION,
+                    &accounting,
+                )
+                .await
+                .err()
+                .expect("fetch_accounted_columnar refuses"),
+        ]
+    }
+
+    /// ADR-2708 D5a: an out-of-window RSPAN object whose bytes match their
+    /// recorded content hash is `UnsupportedVersion` on every funnel.
+    #[tokio::test]
+    async fn an_out_of_window_object_is_unsupported_version() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, version) = write_stamped_object(&store, true).await;
+        for err in every_funnel(store, &seg).await {
+            match err {
+                SpanFetchError::UnsupportedVersion { key, version: got } => {
+                    assert_eq!(key, seg.data_object_key);
+                    assert_eq!(got, u32::from(version));
+                }
+                other => panic!("expected UnsupportedVersion, got {other:?}"),
+            }
+        }
+    }
+
+    /// The same trailer version over bytes that no longer match the recorded
+    /// content hash is corruption, not a version to migrate.
+    #[tokio::test]
+    async fn a_corrupt_version_byte_is_reported_as_corruption() {
+        let store = Arc::new(MemoryStore::new());
+        let (seg, _) = write_stamped_object(&store, false).await;
+        for err in every_funnel(store, &seg).await {
+            match err {
+                SpanFetchError::Corrupt {
+                    source: SpanSegError::Corrupted(message),
+                    ..
+                } => assert!(message.contains("content hash"), "{message}"),
+                other => panic!("expected Corrupt, got {other:?}"),
+            }
         }
     }
 }
