@@ -1009,9 +1009,11 @@ at least 9.25 GB above everything the ledgers reserved, even with both cache
 ceilings counted as full. No memory refusal was logged, so the accounted total
 never reached its ceiling before the kernel acted. A budget that fits the host
 is a floor: it removes the case where perfect accounting would still overcommit
-the host. It does not bound memory the ledgers never see. That remains issue
-#2367, which stays open on attributing those allocation sites and charging them
-to a ledger.
+the host. It does not bound memory the ledgers never see (narrowed, not
+closed, by the host-memory gate amendment below: the gate reads host
+available memory, so growth the ledgers never see can still close it).
+That remains issue #2367, which stays open on attributing those allocation
+sites and charging them to a ledger.
 
 **Rejected.** Measuring co-resident processes by name (rustfs, minio) was
 rejected: it is a list that is wrong on the next host. Re-deriving the budget
@@ -1183,7 +1185,8 @@ stamped, not yet read) and has the infallible `grow` path trip its breach
 while the gate is closed, which is what would narrow the residual the
 Consequences name. Until it lands a closed gate refuses a reservation at
 once, `grow` still reserves unchecked, and the `admission` and `grow` sites
-of both refusal counters read 0.
+of the gate counter and the `grow` site of the budget counter read 0 (the
+budget counter has no `admission` site).
 
 Constraint 4 and the rejected "RSS as the ceiling" alternative stand for the
 ceiling itself: the gate is a bound under the kill boundary, not a ceiling.

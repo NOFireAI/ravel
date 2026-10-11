@@ -2552,9 +2552,10 @@ The families render in every mode. The gate is off in `gateway` mode, with a
 fallback-sized memory budget, in a build whose allocator is not jemalloc,
 when `MemAvailable` or `MemTotal` cannot be read, and under
 `--disable-memory-gate`; the four gauges then read 0. The startup line
-`memory gate resolved` carries `enabled`, the two floors, the purge spacing,
-the sampling interval, `close_after_samples`, `wait_ms`, `available_source`
-and `source` (who set the floors, or why the gate is off).
+`memory gate resolved` carries `enabled`, `host_memory_bytes`, the two floors,
+the purge spacing, the sampling interval, `close_after_samples`, `wait_ms`,
+`memory_budget_bytes`, `available_source` and `source` (who set the floors,
+or why the gate is off).
 
 | Metric | Meaning |
 |---|---|
