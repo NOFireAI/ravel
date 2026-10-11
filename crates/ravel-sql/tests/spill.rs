@@ -546,9 +546,11 @@ async fn drain_with_accounting(
 ///    leaves and must reach its spill threshold;
 /// 4. the error is `SpillBudgetExhausted`, which this crate raises only for the
 ///    quota refusal of DataFusion's spill-file writer, so the aggregate reached
-///    its spill threshold and began a spill file; a second run read through
-///    the pinned stream asserts the same thing without the variant, from the
-///    aggregate's own spill-file count;
+///    its spill threshold and tried to spill; the quota refused its first
+///    batch write before any row landed, so it wrote nothing to scratch. A
+///    second run read through the pinned stream shows the attempt from the
+///    aggregate's own spill counters, which DataFusion moves only inside a
+///    spill write: a spill file opened, zero rows written into it;
 /// 5. the quota in those figures is [`TINY_SCRATCH_BYTES`], so the refusal came
 ///    from this query's configured scratch ceiling and not from some other
 ///    limit, and the written figure is below it: DataFusion 55 refuses a write
@@ -675,10 +677,11 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
         "the gauge never holds a write the quota refused; got {written} of {quota}"
     );
 
-    // 4, without the variant: the same query fails again, and the plan's spill
-    // counters show the aggregate opened a spill file before the refusal.
-    // DataFusion counts a spill file when it opens one, before the refused
-    // batch write, so the count moves though the gauge above reads 0.
+    // 4, the attempt: the same query fails again, and the plan's spill
+    // counters show the aggregate opened a spill file. DataFusion counts a
+    // spill file only in `InProgressSpillFile::append_batch`, after opening its
+    // writer and before the batch write the quota refuses, so the count moves
+    // though the gauge above reads 0, and no rows are counted.
     let snapshot = fixture.snapshot(&tenant).await;
     let mut stream = fixture
         .executor
@@ -694,16 +697,17 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
         .execute()
         .await
         .expect("the spilling query starts");
-    let mut failed = false;
+    let mut pinned_err = None;
     while let Some(next) = stream.next().await {
-        if next.is_err() {
-            failed = true;
+        if let Err(e) = next {
+            pinned_err = Some(e);
             break;
         }
     }
+    let pinned_err = pinned_err.expect("the tiny scratch quota must trip on the pinned stream too");
     assert!(
-        failed,
-        "the tiny scratch quota must trip on the pinned stream too"
+        matches!(pinned_err, SqlError::SpillBudgetExhausted(_)),
+        "the pinned run must fail on the same quota refusal; got {pinned_err:?}"
     );
     let (spilled, by_operator) = stream.spill_counts();
     // The stream holds the query's scratch until it drops.
@@ -719,6 +723,11 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
             .iter()
             .any(|op| op.operator.contains("Aggregate") && op.files >= 1),
         "the spill file must be the aggregate's; got {by_operator:?}"
+    );
+    assert_eq!(
+        spilled.rows_written, 0,
+        "the quota refuses the aggregate's first batch write, so no row reaches \
+         the spill file; got {spilled:?}"
     );
 
     // Requirement 7: a typed error cleans up its scratch too.

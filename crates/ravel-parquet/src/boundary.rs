@@ -116,6 +116,7 @@ impl ExecutionPlan for ParquetPanicBoundaryExec {
         vec![&self.inner]
     }
 
+    // Visits nothing: this node holds no physical expression it evaluates.
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DfResult<TreeNodeRecursion>,
