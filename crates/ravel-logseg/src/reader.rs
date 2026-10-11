@@ -27,8 +27,9 @@ use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
 use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
 use crate::record::{
-    COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
-    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
+    COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
+    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate,
+    resolve_value,
 };
 use crate::rlog_bloom::RlogBloomSection;
 use crate::rlog_codec::decode_dict_page;
@@ -1655,18 +1656,38 @@ fn verify_and_read(
 #[derive(Clone, Debug)]
 enum Arm {
     /// `TsRange`, inclusive at both ends.
-    Ts { min: i64, max: i64 },
+    Ts {
+        min: i64,
+        max: i64,
+    },
     /// `StreamIn`, as the sorted, deduplicated stream refs its ids resolve to.
     /// An id this object has no stream for matches no row, so it has no ref.
-    Stream { refs: Vec<u32> },
+    Stream {
+        refs: Vec<u32>,
+    },
     /// Equality on a string or bytes column (plain or dictionary pages).
-    BytesEq { col: u32, target: Vec<u8> },
-    I64Eq { col: u32, target: i64 },
+    BytesEq {
+        col: u32,
+        target: Vec<u8>,
+    },
+    I64Eq {
+        col: u32,
+        target: i64,
+    },
     /// Equality on an f64 column by bit pattern.
-    F64Eq { col: u32, bits: u64 },
-    BoolEq { col: u32, target: bool },
+    F64Eq {
+        col: u32,
+        bits: u64,
+    },
+    BoolEq {
+        col: u32,
+        target: bool,
+    },
     /// `HasWord` on a string column.
-    Word { col: u32, word: String },
+    Word {
+        col: u32,
+        word: String,
+    },
     /// An `Equals` that no row can satisfy (`body` against a non-string).
     Never,
     /// An attribute arm whose field has no FIELD_DIR column of the type the
@@ -1687,8 +1708,10 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
                 max: *max_ns,
             },
             Predicate::StreamIn(ids) => {
-                let mut refs: Vec<u32> =
-                    ids.iter().filter_map(|id| stream_dir.stream_ref(id)).collect();
+                let mut refs: Vec<u32> = ids
+                    .iter()
+                    .filter_map(|id| stream_dir.stream_ref(id))
+                    .collect();
                 refs.sort_unstable();
                 refs.dedup();
                 Arm::Stream { refs }
@@ -1793,8 +1816,7 @@ impl Arm {
                 }
                 // Every ref in `lo..=hi` is in the set: the set's refs inside
                 // the bounds number as many as the bounds span.
-                let inside =
-                    refs.partition_point(|&r| r <= hi) - refs.partition_point(|&r| r < lo);
+                let inside = refs.partition_point(|&r| r <= hi) - refs.partition_point(|&r| r < lo);
                 inside as u64 == u64::from(hi - lo) + 1 && complete(COL_STREAM_REF)
             }
             _ => false,
@@ -6397,17 +6419,19 @@ mod tests {
                     proptest::option::of(0usize..ZZ.len()),
                 ),
             )
-                .prop_map(|((stream, ts, body), (lo, hi, n, flag), (blob, f, zz))| Row {
-                    stream,
-                    ts,
-                    body,
-                    lo,
-                    hi,
-                    n,
-                    flag,
-                    blob,
-                    f,
-                    zz,
+                .prop_map(|((stream, ts, body), (lo, hi, n, flag), (blob, f, zz))| {
+                    Row {
+                        stream,
+                        ts,
+                        body,
+                        lo,
+                        hi,
+                        n,
+                        flag,
+                        blob,
+                        f,
+                        zz,
+                    }
                 })
         }
 
@@ -6726,8 +6750,14 @@ mod tests {
             let obj = build(cfg, recs);
             let reader = RlogReader::new(&obj, &cfg).expect("open object");
             let fd = &*reader.field_dir;
-            let lo = fd.column("lo", FieldType::Str).expect("lo column").column_id;
-            let hi = fd.column("hi", FieldType::Str).expect("hi column").column_id;
+            let lo = fd
+                .column("lo", FieldType::Str)
+                .expect("lo column")
+                .column_id;
+            let hi = fd
+                .column("hi", FieldType::Str)
+                .expect("hi column")
+                .column_id;
             assert!(fd.column("zz", FieldType::Str).is_none(), "zz overflows");
             let mut scan = reader
                 .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
@@ -6805,7 +6835,10 @@ mod tests {
             assert_eq!(stats.blocks_scanned, 4);
             assert_eq!(eval_calls() - evals, 0, "no per-row eval");
             assert_eq!(kernel_arms() - kernels, 0, "no block kernel");
-            assert_eq!(stats.blocks_predicate_dropped, 4, "every block drops every arm");
+            assert_eq!(
+                stats.blocks_predicate_dropped, 4,
+                "every block drops every arm"
+            );
             assert_eq!(stats.rows_predicate_evaluated, 0);
 
             let mut with_overflow = covering;
@@ -6815,11 +6848,7 @@ mod tests {
             });
             let (evals, kernels) = (eval_calls(), kernel_arms());
             let mut scan = reader
-                .scan_blocks(
-                    &Predicate::And(with_overflow),
-                    &[],
-                    &ColumnSelection::all(),
-                )
+                .scan_blocks(&Predicate::And(with_overflow), &[], &ColumnSelection::all())
                 .expect("scan");
             let mut rows = 0;
             while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
