@@ -54,9 +54,10 @@ pub const SOURCE_DISABLED_FALLBACK_BUDGET: &str = "disabled-fallback-budget";
 pub const SOURCE_DISABLED_FLAG: &str = "disabled-flag";
 /// Stamp source: off, because this build does not run under jemalloc.
 pub const SOURCE_NOT_JEMALLOC: &str = "not-jemalloc";
-/// Stamp source: off, because neither `/proc/meminfo` nor the cgroup memory
-/// files could be read, so there is no host memory to take a floor of and
-/// nothing for the sampler to read.
+/// Stamp source: off, because `/proc/meminfo`'s `MemAvailable` or `MemTotal`
+/// could not be read at startup: without `MemAvailable` the sampler has
+/// nothing to decide on, and without `MemTotal` there is no host memory to
+/// take the default floor of or to check a flagged floor against.
 pub const SOURCE_DISABLED_NO_HOST_MEMORY: &str = "disabled-no-host-memory";
 
 /// The memory gate flags, as parsed.
@@ -70,17 +71,38 @@ pub struct MemoryGateFlags {
     pub disabled: bool,
 }
 
-/// Where the sampler reads the host's available memory from, decided once
-/// at startup from the same host profile the budget derivation reads.
+/// Which terms an available-memory reading came from. The stamp's
+/// `available_source` is the value resolved at startup from the host
+/// profile; [`read_available`] decides it again on every sample from the
+/// files it could read, and the sampler warns once when the two differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMemorySource {
-    /// `MemAvailable` from `/proc/meminfo`.
+    /// `MemAvailable` from `/proc/meminfo` alone: no finite cgroup limit is
+    /// in effect, or its files could not be read on this sample.
     MemInfo,
-    /// The cgroup memory limit minus the cgroup's current usage: v2
-    /// `memory.max` minus `memory.current`, else v1 `memory.limit_in_bytes`
-    /// minus `memory.usage_in_bytes`. Chosen when the process runs under a
-    /// finite cgroup limit, the branch the budget derivation takes too.
+    /// The smaller of `MemAvailable` and the cgroup's own headroom, the
+    /// limit minus its current usage plus its inactive file cache (v2
+    /// `memory.max`, `memory.current` and `memory.stat`'s `inactive_file`;
+    /// v1 `memory.limit_in_bytes`, `memory.usage_in_bytes` and
+    /// `memory.stat`'s `total_inactive_file`). Resolved at startup when the
+    /// host profile carries a finite cgroup limit, the branch the budget
+    /// derivation takes too.
+    MemInfoAndCgroup,
+    /// The cgroup headroom alone, because `/proc/meminfo` could not be read
+    /// on this sample. Never resolved at startup: a host without
+    /// `MemAvailable` turns the gate off.
     Cgroup,
+}
+
+impl HostMemorySource {
+    /// The stamp spelling: `meminfo`, `meminfo+cgroup` or `cgroup`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MemInfo => "meminfo",
+            Self::MemInfoAndCgroup => "meminfo+cgroup",
+            Self::Cgroup => "cgroup",
+        }
+    }
 }
 
 /// The sampler's two floors and the purge spacing, the part of a resolved
@@ -113,8 +135,10 @@ pub struct MemoryGate {
     /// The resolved `memory_budget_bytes`, stamped beside the floors so a
     /// reader can see what the gate no longer derives from.
     pub memory_budget_bytes: u64,
-    /// Where the sampler reads available memory.
-    pub host_memory_source: HostMemorySource,
+    /// Where the sampler's available reading comes from, as resolved at
+    /// startup: `meminfo+cgroup` under a finite cgroup limit, else
+    /// `meminfo`.
+    pub available_source: HostMemorySource,
     /// One of the `SOURCE_*` constants: who set the floors, or why the gate
     /// is off.
     pub source: &'static str,
@@ -132,6 +156,7 @@ impl MemoryGate {
             interval_ms = self.interval_ms,
             wait_ms = self.wait_ms,
             memory_budget_bytes = self.memory_budget_bytes,
+            available_source = self.available_source.as_str(),
             source = self.source,
             "memory gate resolved"
         );
@@ -165,6 +190,13 @@ pub enum MemoryGateFloorError {
         min_available_bytes: u64,
         host_memory_bytes: u64,
     },
+    /// The purge floor is at or above host memory, so every sample would be
+    /// below it and the purge would run at every minimum interval for the
+    /// process's life.
+    PurgeFloorReachesHostMemory {
+        purge_available_bytes: u64,
+        host_memory_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for MemoryGateFloorError {
@@ -188,6 +220,16 @@ impl std::fmt::Display for MemoryGateFloorError {
                  ({host_memory_bytes} bytes): available memory can never be at or above it, so \
                  the gate would never open. Lower the floor or pass --disable-memory-gate"
             ),
+            Self::PurgeFloorReachesHostMemory {
+                purge_available_bytes,
+                host_memory_bytes,
+            } => write!(
+                f,
+                "--memory-gate-purge-available-bytes ({purge_available_bytes}) reaches host \
+                 memory ({host_memory_bytes} bytes): available memory is always below it, so the \
+                 forced purge would run at every --memory-gate-purge-min-interval-ms for the \
+                 process's life. Lower the floor or pass --disable-memory-gate"
+            ),
         }
     }
 }
@@ -209,9 +251,9 @@ pub fn default_min_available_bytes(host_memory_bytes: u64) -> u64 {
 /// Resolves the gate from its flags and the facts that turn it off. The off
 /// reasons are checked in the order the stamp's sources list them: gateway
 /// mode, a fallback budget, `--disable-memory-gate`, a build without
-/// jemalloc, a host whose memory could not be read. An enabled gate's floors
-/// are then checked: the purge floor must be above the close floor, and the
-/// close floor below host memory.
+/// jemalloc, a host whose `MemAvailable` or `MemTotal` could not be read.
+/// An enabled gate's floors are then checked: the purge floor must be above
+/// the close floor, and both floors below host memory.
 pub fn resolve(
     flags: MemoryGateFlags,
     mode: Mode,
@@ -227,7 +269,7 @@ pub fn resolve(
         Some(SOURCE_DISABLED_FLAG)
     } else if !jemalloc {
         Some(SOURCE_NOT_JEMALLOC)
-    } else if host.mem_total_bytes.is_none() {
+    } else if host.mem_available_bytes.is_none() || host.mem_total_bytes.is_none() {
         Some(SOURCE_DISABLED_NO_HOST_MEMORY)
     } else {
         None
@@ -241,8 +283,8 @@ pub fn resolve(
         interval_ms: flags.interval_ms,
         wait_ms: flags.wait_ms,
         memory_budget_bytes: performance.memory_budget_bytes,
-        host_memory_source: if host.cgroup_memory_limit_bytes.is_some() {
-            HostMemorySource::Cgroup
+        available_source: if host.cgroup_memory_limit_bytes.is_some() {
+            HostMemorySource::MemInfoAndCgroup
         } else {
             HostMemorySource::MemInfo
         },
@@ -268,6 +310,12 @@ pub fn resolve(
     if min_available_bytes >= gate.host_memory_bytes {
         return Err(MemoryGateFloorError::CloseFloorReachesHostMemory {
             min_available_bytes,
+            host_memory_bytes: gate.host_memory_bytes,
+        });
+    }
+    if purge_available_bytes >= gate.host_memory_bytes {
+        return Err(MemoryGateFloorError::PurgeFloorReachesHostMemory {
+            purge_available_bytes,
             host_memory_bytes: gate.host_memory_bytes,
         });
     }
@@ -309,18 +357,159 @@ impl Cli {
     }
 }
 
-/// The host's available memory right now, from `source`. `None` when the
-/// files behind it cannot be read or parsed; the sampler then keeps the
-/// gate's last state.
-pub fn read_available(source: HostMemorySource) -> Option<u64> {
-    match source {
-        HostMemorySource::MemInfo => HostProfile::detect_mem_available_bytes(),
-        HostMemorySource::Cgroup => {
-            let limit = HostProfile::detect_cgroup_memory_limit_bytes()?;
-            let current = HostProfile::detect_cgroup_memory_current_bytes()?;
-            Some(limit.saturating_sub(current))
+/// The files one available-memory sample reads, each at its fixed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMemoryFile {
+    /// `/proc/meminfo`, for `MemAvailable`.
+    MemInfo,
+    /// cgroup v2 `memory.max`: the limit, or `max`.
+    CgroupV2Max,
+    /// cgroup v2 `memory.current`: the cgroup's charged bytes, page cache
+    /// included.
+    CgroupV2Current,
+    /// cgroup v2 `memory.stat`, for `inactive_file`.
+    CgroupV2Stat,
+    /// cgroup v1 `memory.limit_in_bytes`.
+    CgroupV1Limit,
+    /// cgroup v1 `memory.usage_in_bytes`.
+    CgroupV1Usage,
+    /// cgroup v1 `memory.stat`, for `total_inactive_file`.
+    CgroupV1Stat,
+}
+
+impl HostMemoryFile {
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::MemInfo => "/proc/meminfo",
+            Self::CgroupV2Max => "/sys/fs/cgroup/memory.max",
+            Self::CgroupV2Current => "/sys/fs/cgroup/memory.current",
+            Self::CgroupV2Stat => "/sys/fs/cgroup/memory.stat",
+            Self::CgroupV1Limit => "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            Self::CgroupV1Usage => "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            Self::CgroupV1Stat => "/sys/fs/cgroup/memory/memory.stat",
         }
     }
+}
+
+/// The sampler's file reader: [`ProcFiles`] in the process, a fixture in
+/// tests, so [`read_available`] is tested without `/proc` or `/sys`.
+pub trait HostMemoryFiles {
+    /// The file's text, `None` when it cannot be read.
+    fn read(&mut self, file: HostMemoryFile) -> Option<String>;
+}
+
+/// Reads each [`HostMemoryFile`] from its path on every call, so a limit
+/// that changes or a file that goes away is seen on the next sample.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProcFiles;
+
+impl HostMemoryFiles for ProcFiles {
+    fn read(&mut self, file: HostMemoryFile) -> Option<String> {
+        std::fs::read_to_string(file.path()).ok()
+    }
+}
+
+/// One available-memory reading and the terms it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AvailableReading {
+    pub bytes: u64,
+    pub source: HostMemorySource,
+}
+
+/// The host's available memory right now: the smaller of `MemAvailable` and
+/// the cgroup's headroom, over whichever of the two can be read. `None` when
+/// neither can; the sampler then keeps the gate's last state.
+///
+/// The cgroup term is `limit - current + inactive_file`, saturating at zero:
+/// the kubelet's working-set figure. `memory.current` charges page cache,
+/// which the kernel reclaims under pressure, so `limit - current` alone falls
+/// toward zero on a healthy container whose cache or spill directory has
+/// filled the page cache; adding back the inactive file pages counts only
+/// what cannot be reclaimed. The term is present only when a finite limit is
+/// in effect on this sample (v2 `memory.max`, else v1
+/// `memory.limit_in_bytes`) and both its other files parse, and it is never
+/// trusted alone against the host: a limit above physical memory, or an
+/// overcommitted node, reads high while the host runs out, which is what the
+/// `min` with `MemAvailable` catches.
+pub fn read_available(files: &mut impl HostMemoryFiles) -> Option<AvailableReading> {
+    let host = files
+        .read(HostMemoryFile::MemInfo)
+        .and_then(|meminfo| crate::config::parse_meminfo_field_bytes(&meminfo, "MemAvailable:"));
+    let cgroup = read_cgroup_available(files);
+    match (host, cgroup) {
+        (Some(host), Some(cgroup)) => Some(AvailableReading {
+            bytes: host.min(cgroup),
+            source: HostMemorySource::MemInfoAndCgroup,
+        }),
+        (Some(bytes), None) => Some(AvailableReading {
+            bytes,
+            source: HostMemorySource::MemInfo,
+        }),
+        (None, Some(bytes)) => Some(AvailableReading {
+            bytes,
+            source: HostMemorySource::Cgroup,
+        }),
+        (None, None) => None,
+    }
+}
+
+/// The cgroup term of [`read_available`]: v2 first, then v1, in the
+/// precedence the startup limit detection uses. `None` when no finite limit
+/// is in effect or the usage or stat file of the same hierarchy does not
+/// parse.
+fn read_cgroup_available(files: &mut impl HostMemoryFiles) -> Option<u64> {
+    const V2: (HostMemoryFile, HostMemoryFile, &str) = (
+        HostMemoryFile::CgroupV2Current,
+        HostMemoryFile::CgroupV2Stat,
+        "inactive_file",
+    );
+    const V1: (HostMemoryFile, HostMemoryFile, &str) = (
+        HostMemoryFile::CgroupV1Usage,
+        HostMemoryFile::CgroupV1Stat,
+        "total_inactive_file",
+    );
+    let (limit, (current_file, stat_file, key)) =
+        if let Some(limit) = read_cgroup_limit(files, HostMemoryFile::CgroupV2Max) {
+            (limit, V2)
+        } else {
+            (read_cgroup_limit(files, HostMemoryFile::CgroupV1Limit)?, V1)
+        };
+    let current = files
+        .read(current_file)
+        .and_then(|contents| parse_cgroup_memory_current_bytes(&contents))?;
+    let inactive_file = files
+        .read(stat_file)
+        .and_then(|contents| parse_cgroup_memory_stat_bytes(&contents, key))?;
+    Some(limit.saturating_add(inactive_file).saturating_sub(current))
+}
+
+/// A finite cgroup limit from `file`; `max`, the v1 no-limit sentinel, and
+/// an unreadable file are `None`.
+fn read_cgroup_limit(files: &mut impl HostMemoryFiles, file: HostMemoryFile) -> Option<u64> {
+    files
+        .read(file)
+        .and_then(|contents| crate::config::parse_cgroup_memory_limit_bytes(&contents))
+}
+
+/// A cgroup usage file (`memory.current` or `memory.usage_in_bytes`): one
+/// decimal byte count. Anything else is `None`.
+pub(crate) fn parse_cgroup_memory_current_bytes(contents: &str) -> Option<u64> {
+    contents.trim().parse().ok()
+}
+
+/// A `memory.stat` counter by exact key: the line whose first token is `key`
+/// and whose second is a decimal byte count. A missing key, a line with no
+/// count, or a non-numeric count is `None`. The match is on the whole
+/// token, so `inactive_file` does not read v1's `total_inactive_file` line
+/// and the other way round.
+pub(crate) fn parse_cgroup_memory_stat_bytes(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != key {
+            return None;
+        }
+        fields.next()?.parse().ok()
+    })
 }
 
 /// Upper bounds, in microseconds, of the `ravel_memory_gate_purge_seconds`
@@ -530,7 +719,7 @@ pub fn start_sampler(gate: &MemoryGate, budget: Arc<MemoryBudget>) -> std::io::R
         .store(gate.purge_available_bytes, Ordering::Relaxed);
     let floors = gate.floors();
     let interval = gate.interval();
-    let source = gate.host_memory_source;
+    let source = gate.available_source;
     let spawned = std::thread::Builder::new()
         .name("ravel-memory-gate".to_string())
         .spawn(move || run_sampler(&budget, floors, interval, source));
@@ -547,11 +736,25 @@ fn run_sampler(
     budget: &MemoryBudget,
     floors: Floors,
     interval: Duration,
-    source: HostMemorySource,
+    resolved_source: HostMemorySource,
 ) {
     let mut now = Instant::now;
     let mut last_purge = None;
-    let mut read_available = move || read_available(source);
+    let mut files = ProcFiles;
+    let mut warned_source = false;
+    let mut read_available = move || {
+        let reading = read_available(&mut files)?;
+        if reading.source != resolved_source && !warned_source {
+            warned_source = true;
+            tracing::warn!(
+                resolved = resolved_source.as_str(),
+                read = reading.source.as_str(),
+                "memory gate available-memory source differs from the one resolved at startup; \
+                 ravel_memory_gate_available_bytes carries what was read"
+            );
+        }
+        Some(reading.bytes)
+    };
     let mut read_resident = crate::mem_stats::read_resident;
     let mut purge = || {
         let report = crate::mem_stats::purge_arenas();
@@ -657,9 +860,23 @@ mod tests {
         cli.resolve_performance(host).expect("performance resolves")
     }
 
-    /// A 32 GiB host with no cgroup limit.
+    /// A 32 GiB host with no cgroup limit and 20 GiB available.
     fn host() -> HostProfile {
-        HostProfile::new(8, Some(32 * GIB), Some(32 * GIB), None, None, None)
+        HostProfile::new(
+            8,
+            Some(32 * GIB),
+            Some(32 * GIB),
+            None,
+            Some(20 * GIB),
+            None,
+        )
+    }
+
+    /// `Cli` from `args` alone, for the flag range tests.
+    fn parse_cli(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["ravel-server"];
+        argv.extend_from_slice(args);
+        <Cli as clap::Parser>::try_parse_from(argv)
     }
 
     fn mode_arg(mode: Mode) -> &'static str {
@@ -718,7 +935,7 @@ mod tests {
     /// memory to spare admits work. Available 1.0 GB on the 32 GiB host is
     /// above the 687 MB close floor, so resident 29 GB decides nothing.
     ///
-    /// FLIP: close on `resident >= 19.4 GB` (70 % of the 27.8 GB stock
+    /// FLIP: close on `resident >= 20.1 GB` (70 % of the 28.8 GB stock
     /// budget, the mark before this fix) or on `resident >= 28.8 GB` (90 %
     /// of a 32 GB host) and the gate is closed here.
     #[test]
@@ -902,12 +1119,15 @@ mod tests {
         assert_eq!(stats.snapshot().purges, 1);
     }
 
-    /// With the injected clock, 100 samples below the purge floor 100 ms
-    /// apart run exactly 2 purges: one at the first sample and one at the
-    /// first sample 5 s or more later, `floor(9.9 s / 5 s) + 1`.
+    /// With the injected clock, 51 samples below the purge floor 100 ms
+    /// apart run exactly 2 purges: one at the first sample (0 ms) and one at
+    /// the last (5000 ms), exactly the 5000 ms minimum interval after the
+    /// first. A purge is due at the interval boundary, not past it.
     ///
     /// FLIP: purge on every sample below the purge floor (drop the
-    /// `last_purge` spacing) and the count reads 100.
+    /// `last_purge` spacing) and the count reads 51; space purges with `>`
+    /// instead of `>=` (`duration_since(last) > purge_min_interval`) and the
+    /// sample at 5000 ms is not due, so the count reads 1.
     #[test]
     fn purges_are_spaced_by_the_minimum_interval() {
         let budget = MemoryBudget::new(u64::MAX);
@@ -915,7 +1135,8 @@ mod tests {
         let clock = TestClock::new();
         let mut last_purge = None;
         let mut purges = 0;
-        for index in 0..100 {
+        let mut purged_at = Vec::new();
+        for index in 0..51 {
             if index > 0 {
                 clock.advance(Duration::from_millis(100));
             }
@@ -929,17 +1150,73 @@ mod tests {
                 &mut || Some(20 * GB),
                 &mut || purges += 1,
             );
-            assert!(matches!(sample, Sample::Sampled { closed: false, .. }));
+            match sample {
+                Sample::Sampled {
+                    purged,
+                    closed: false,
+                    ..
+                } => {
+                    if purged {
+                        purged_at.push(index);
+                    }
+                }
+                other => panic!("sample {index}: {other:?}"),
+            }
         }
         assert_eq!(purges, 2);
+        assert_eq!(purged_at, [0, 50]);
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.purges, 2);
         assert_eq!(snapshot.purge_buckets.iter().sum::<u64>(), 2);
-        assert_eq!(snapshot.samples, 100);
+        assert_eq!(snapshot.samples, 51);
+    }
+
+    /// A reading exactly at the close floor leaves the gate open: the gate
+    /// closes below the floor, not at it.
+    ///
+    /// FLIP: `closed: available <= floors.min_available` and this sample
+    /// reports closed; `open.store(available > floor)` in the budget's
+    /// setter and the gate is closed.
+    #[test]
+    fn a_reading_at_the_close_floor_stays_open() {
+        let budget = MemoryBudget::new(u64::MAX);
+        let stats = MemoryGateStats::new();
+        let clock = TestClock::new();
+        let mut last_purge = None;
+        let sample = run_sample(&budget, &stats, &clock, &mut last_purge, FLOOR_32G, 20 * GB);
+        assert_eq!(
+            sample,
+            Sample::Sampled {
+                available: FLOOR_32G,
+                resident: Some(20 * GB),
+                purged: true,
+                closed: false,
+            }
+        );
+        assert!(budget.gate_open());
+        assert_eq!(budget.gate_available(), FLOOR_32G);
+        budget.try_reserve(1).expect("a gate at the floor admits");
+
+        // One byte below closes.
+        clock.advance(Duration::from_millis(DEFAULT_INTERVAL_MS));
+        let sample = run_sample(
+            &budget,
+            &stats,
+            &clock,
+            &mut last_purge,
+            FLOOR_32G - 1,
+            20 * GB,
+        );
+        assert!(matches!(sample, Sample::Sampled { closed: true, .. }));
+        assert!(!budget.gate_open());
     }
 
     /// An unreadable available memory leaves the gate in its last state and
-    /// never reaches the setter, closed or open.
+    /// never reaches the setter, closed or open, and leaves the purge
+    /// spacing where the last readable sample put it.
+    ///
+    /// FLIP: `*last_purge = None` on the unread path and the spacing
+    /// assertion fails.
     #[test]
     fn an_unreadable_available_reading_leaves_the_gate_alone() {
         let budget = MemoryBudget::new(u64::MAX);
@@ -973,9 +1250,16 @@ mod tests {
             20 * GB,
         );
         assert!(!budget.gate_open());
+        let purged_at = last_purge.expect("the readable sample purged");
+        clock.advance(Duration::from_secs(10));
         assert_eq!(unread(&budget, &mut last_purge), Sample::Unread);
         assert!(!budget.gate_open(), "a closed gate stays closed");
         assert_eq!(budget.gate_available(), 600_000_000);
+        assert_eq!(
+            last_purge,
+            Some(purged_at),
+            "an unread sample leaves the purge spacing alone"
+        );
         assert_eq!(purges, 0, "an unread sample purges nothing");
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.purges, 1, "only the readable sample purged");
@@ -1056,7 +1340,8 @@ mod tests {
         assert_eq!(gate.purge_available_bytes, PURGE_FLOOR_32G);
         assert_eq!(gate.purge_min_interval_ms, 5000);
         assert_eq!(gate.memory_budget_bytes, 27 * GB);
-        assert_eq!(gate.host_memory_source, HostMemorySource::MemInfo);
+        assert_eq!(gate.available_source, HostMemorySource::MemInfo);
+        assert_eq!(gate.available_source.as_str(), "meminfo");
         assert_eq!(gate.floors(), floors());
     }
 
@@ -1134,8 +1419,8 @@ mod tests {
         );
         let flagged = resolve(
             MemoryGateFlags {
-                min_available_bytes: Some(32 * GIB - 1),
-                purge_available_bytes: Some(32 * GIB),
+                min_available_bytes: Some(32 * GIB - 2),
+                purge_available_bytes: Some(32 * GIB - 1),
                 ..flags()
             },
             Mode::Query,
@@ -1143,10 +1428,71 @@ mod tests {
             host(),
             true,
         )
-        .expect("one byte under host memory");
+        .expect("both floors under host memory");
         assert_eq!(flagged.source, SOURCE_FLAG);
-        assert_eq!(flagged.min_available_bytes, 32 * GIB - 1);
-        assert_eq!(flagged.purge_available_bytes, 32 * GIB);
+        assert_eq!(flagged.min_available_bytes, 32 * GIB - 2);
+        assert_eq!(flagged.purge_available_bytes, 32 * GIB - 1);
+
+        // A purge floor at or above host memory is refused: every reading
+        // would be below it and the purge would run at every minimum
+        // interval forever. The close floor is checked first, so this one
+        // passes a close floor under host memory.
+        //
+        // FLIP: drop the purge-floor check in `resolve` and this resolves.
+        for purge_available_bytes in [32 * GIB, 64 * GIB] {
+            let refused = resolve(
+                MemoryGateFlags {
+                    min_available_bytes: Some(GB),
+                    purge_available_bytes: Some(purge_available_bytes),
+                    ..flags()
+                },
+                Mode::Query,
+                &on,
+                host(),
+                true,
+            )
+            .expect_err("purge floor at host memory");
+            assert_eq!(
+                refused,
+                MemoryGateFloorError::PurgeFloorReachesHostMemory {
+                    purge_available_bytes,
+                    host_memory_bytes: 32 * GIB,
+                }
+            );
+            let message = refused.to_string();
+            assert!(
+                message.contains(&format!(
+                    "--memory-gate-purge-available-bytes ({purge_available_bytes}) reaches host \
+                     memory ({} bytes)",
+                    32 * GIB
+                )),
+                "{message}"
+            );
+            assert!(
+                message.contains("would run at every --memory-gate-purge-min-interval-ms"),
+                "{message}"
+            );
+        }
+        // A flagged close floor whose default purge floor (twice it) reaches
+        // host memory is refused the same way.
+        let refused = resolve(
+            MemoryGateFlags {
+                min_available_bytes: Some(16 * GIB),
+                ..flags()
+            },
+            Mode::Query,
+            &on,
+            host(),
+            true,
+        )
+        .expect_err("default purge floor at host memory");
+        assert_eq!(
+            refused,
+            MemoryGateFloorError::PurgeFloorReachesHostMemory {
+                purge_available_bytes: 32 * GIB,
+                host_memory_bytes: 32 * GIB,
+            }
+        );
 
         // An off gate checks nothing.
         let off = resolve(
@@ -1247,21 +1593,78 @@ mod tests {
         assert!(!off.enabled);
         assert_eq!(off.host_memory_bytes, 0);
 
-        // Under a cgroup limit the sampler reads the cgroup files.
+        // `MemTotal` without `MemAvailable` (a kernel before 3.14): the
+        // sampler would have nothing to decide on, so the gate is off, with
+        // host memory still stamped.
+        //
+        // FLIP: resolve on `mem_total_bytes.is_none()` alone and this gate
+        // stamps `enabled=true`.
+        let no_available = HostProfile::new(8, Some(32 * GIB), Some(32 * GIB), None, None, None);
+        let on_no_available = performance(Mode::Query, 27 * GB, no_available);
+        let off =
+            resolve(flags(), Mode::Query, &on_no_available, no_available, true).expect("resolves");
+        assert_eq!(off.source, SOURCE_DISABLED_NO_HOST_MEMORY);
+        assert!(!off.enabled);
+        assert_eq!(off.host_memory_bytes, 32 * GIB);
+        assert_eq!(off.min_available_bytes, 0);
+
+        // `MemAvailable` without `MemTotal`: no host memory to take the
+        // default floor of, so the gate is off too.
+        let no_total = HostProfile::new(8, None, None, None, Some(20 * GIB), None);
+        let on_no_total = performance(Mode::Query, 27 * GB, no_total);
+        let off = resolve(flags(), Mode::Query, &on_no_total, no_total, true).expect("resolves");
+        assert_eq!(off.source, SOURCE_DISABLED_NO_HOST_MEMORY);
+        assert!(!off.enabled);
+
+        // Under a cgroup limit the reading takes the cgroup term too.
         let limited = HostProfile::new(
             8,
             Some(16 * GIB),
             Some(32 * GIB),
             Some(16 * GIB),
-            None,
+            Some(20 * GIB),
             None,
         );
         let on_limited = performance(Mode::Query, 8 * GB, limited);
         let gate = resolve(flags(), Mode::Query, &on_limited, limited, true).expect("resolves");
         assert!(gate.enabled);
-        assert_eq!(gate.host_memory_source, HostMemorySource::Cgroup);
+        assert_eq!(gate.available_source, HostMemorySource::MemInfoAndCgroup);
+        assert_eq!(gate.available_source.as_str(), "meminfo+cgroup");
         assert_eq!(gate.host_memory_bytes, 16 * GIB);
         assert_eq!(gate.min_available_bytes, 512 * MIB);
+    }
+
+    /// clap refuses a close floor under 64 MiB and a purge spacing outside
+    /// 100 to 600000 ms, and accepts each bound.
+    ///
+    /// FLIP: widen either range in `Cli` (`range(0..)`, `range(1..)`) and
+    /// the refused value parses.
+    #[test]
+    fn the_flag_ranges_are_enforced_at_parse() {
+        let refused = parse_cli(&["--memory-gate-min-available-bytes", "67108863"])
+            .expect_err("one byte under 64 MiB");
+        assert_eq!(refused.kind(), clap::error::ErrorKind::ValueValidation);
+        let accepted =
+            parse_cli(&["--memory-gate-min-available-bytes", "67108864"]).expect("64 MiB parses");
+        assert_eq!(accepted.memory_gate_min_available_bytes, Some(64 * MIB));
+        assert_eq!(MIN_AVAILABLE_FLOOR_BYTES, 67_108_864);
+
+        for refused in ["99", "600001"] {
+            let error = parse_cli(&["--memory-gate-purge-min-interval-ms", refused])
+                .expect_err("outside 100 to 600000");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+        for (accepted, expected) in [("100", 100), ("600000", 600_000)] {
+            let cli = parse_cli(&["--memory-gate-purge-min-interval-ms", accepted])
+                .expect("inside 100 to 600000");
+            assert_eq!(cli.memory_gate_purge_min_interval_ms, expected);
+        }
+        assert_eq!(
+            parse_cli(&[])
+                .expect("defaults parse")
+                .memory_gate_purge_min_interval_ms,
+            DEFAULT_PURGE_MIN_INTERVAL_MS
+        );
     }
 
     #[test]
@@ -1294,13 +1697,32 @@ mod tests {
 
     #[test]
     fn an_off_gate_starts_no_sampler_and_never_sets_the_gate() {
-        for (mode, fallback) in [(Mode::Gateway, false), (Mode::Query, true)] {
-            let mut performance = performance(mode, 27 * GB, host());
-            if fallback {
-                performance.sources.memory_budget_bytes = PERF_SOURCE_FALLBACK;
-            }
-            let gate = resolve(flags(), mode, &performance, host(), true).expect("resolves");
+        let no_available = HostProfile::new(8, Some(32 * GIB), Some(32 * GIB), None, None, None);
+        let mut fallback = performance(Mode::Query, 27 * GB, host());
+        fallback.sources.memory_budget_bytes = PERF_SOURCE_FALLBACK;
+        for (mode, performance, host, source) in [
+            (
+                Mode::Gateway,
+                performance(Mode::Gateway, 27 * GB, host()),
+                host(),
+                SOURCE_DISABLED_GATEWAY,
+            ),
+            (
+                Mode::Query,
+                fallback,
+                host(),
+                SOURCE_DISABLED_FALLBACK_BUDGET,
+            ),
+            (
+                Mode::Query,
+                performance(Mode::Query, 27 * GB, no_available),
+                no_available,
+                SOURCE_DISABLED_NO_HOST_MEMORY,
+            ),
+        ] {
+            let gate = resolve(flags(), mode, &performance, host, true).expect("resolves");
             assert!(!gate.enabled);
+            assert_eq!(gate.source, source);
             let budget = Arc::new(MemoryBudget::new(GIB));
             assert!(!start_sampler(&gate, budget.clone()).expect("no spawn to fail"));
             std::thread::sleep(Duration::from_millis(3 * DEFAULT_INTERVAL_MS));
@@ -1366,6 +1788,7 @@ mod tests {
             "interval_ms=100",
             "wait_ms=2000",
             &format!("memory_budget_bytes={}", 27 * GB),
+            "available_source=\"meminfo\"",
             "source=\"default\"",
         ] {
             assert_eq!(
@@ -1375,5 +1798,350 @@ mod tests {
                 lines[0]
             );
         }
+    }
+
+    /// A fixture reader: the files present and their text, nothing else.
+    struct Files(Vec<(HostMemoryFile, &'static str)>);
+
+    impl HostMemoryFiles for Files {
+        fn read(&mut self, file: HostMemoryFile) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(present, _)| *present == file)
+                .map(|(_, text)| (*text).to_string())
+        }
+    }
+
+    const MEMINFO: &str = "MemTotal:       33554432 kB\nMemFree:          102400 kB\n\
+                           MemAvailable:     976563 kB\nBuffers:            1024 kB\n";
+    /// `MemAvailable` above, in bytes.
+    const MEMINFO_AVAILABLE: u64 = 1_000_000_512;
+    /// A 2 GiB limit with 1.5 GiB charged, 100 MiB of it inactive file
+    /// cache: a headroom of 512 MiB + 100 MiB.
+    const V2_MAX: &str = "2147483648\n";
+    const V2_CURRENT: &str = "1610612736\n";
+    const V2_STAT: &str = "anon 4096\nfile 209715200\nkernel 8192\ninactive_file 104857600\n\
+                           active_file 104857600\n";
+    const CGROUP_AVAILABLE: u64 = 641_728_512;
+
+    fn reading(files: Vec<(HostMemoryFile, &'static str)>) -> Option<AvailableReading> {
+        read_available(&mut Files(files))
+    }
+
+    /// No cgroup files: `MemAvailable` alone, from `meminfo`.
+    #[test]
+    fn read_available_from_meminfo_alone() {
+        assert_eq!(
+            reading(vec![(HostMemoryFile::MemInfo, MEMINFO)]),
+            Some(AvailableReading {
+                bytes: MEMINFO_AVAILABLE,
+                source: HostMemorySource::MemInfo,
+            })
+        );
+    }
+
+    /// A finite v2 limit whose headroom is below `MemAvailable`: the reading
+    /// is the headroom, limit minus current plus inactive file cache.
+    ///
+    /// FLIP: drop `inactive_file` from the term (`limit - current`) and the
+    /// reading is 536,870,912; drop the `min` and take `MemAvailable` and it
+    /// is 1,000,000,512.
+    #[test]
+    fn read_available_takes_the_smaller_cgroup_term() {
+        assert_eq!(
+            reading(vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV2Max, V2_MAX),
+                (HostMemoryFile::CgroupV2Current, V2_CURRENT),
+                (HostMemoryFile::CgroupV2Stat, V2_STAT),
+            ]),
+            Some(AvailableReading {
+                bytes: CGROUP_AVAILABLE,
+                source: HostMemorySource::MemInfoAndCgroup,
+            })
+        );
+        // The same figures through the v1 files, where the key is
+        // `total_inactive_file` and the bare `inactive_file` line is the
+        // cgroup without its children.
+        assert_eq!(
+            reading(vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV1Limit, V2_MAX),
+                (HostMemoryFile::CgroupV1Usage, V2_CURRENT),
+                (
+                    HostMemoryFile::CgroupV1Stat,
+                    "cache 209715200\nrss 4096\ninactive_file 1\ntotal_inactive_file 104857600\n",
+                ),
+            ]),
+            Some(AvailableReading {
+                bytes: CGROUP_AVAILABLE,
+                source: HostMemorySource::MemInfoAndCgroup,
+            })
+        );
+    }
+
+    /// A limit above what the host has: `MemAvailable` is the smaller term
+    /// and the reading, with the cgroup still counted in the source.
+    ///
+    /// FLIP: read the cgroup term alone under a limit (the branch before
+    /// this fix) and the reading is 63 GiB.
+    #[test]
+    fn read_available_takes_the_smaller_meminfo_term() {
+        assert_eq!(
+            reading(vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV2Max, "68719476736\n"),
+                (HostMemoryFile::CgroupV2Current, "1073741824\n"),
+                (HostMemoryFile::CgroupV2Stat, "inactive_file 0\n"),
+            ]),
+            Some(AvailableReading {
+                bytes: MEMINFO_AVAILABLE,
+                source: HostMemorySource::MemInfoAndCgroup,
+            })
+        );
+    }
+
+    /// `memory.max` reading `max`, or the v1 no-limit sentinel: no cgroup
+    /// term, `MemAvailable` alone, even with the usage files present.
+    ///
+    /// FLIP: `?` on the limit (the branch before this fix) and this sample
+    /// is unread.
+    #[test]
+    fn read_available_without_a_finite_limit_is_meminfo_alone() {
+        for (limit_file, limit) in [
+            (HostMemoryFile::CgroupV2Max, "max\n"),
+            (HostMemoryFile::CgroupV1Limit, "9223372036854771712\n"),
+        ] {
+            assert_eq!(
+                reading(vec![
+                    (HostMemoryFile::MemInfo, MEMINFO),
+                    (limit_file, limit),
+                    (HostMemoryFile::CgroupV2Current, V2_CURRENT),
+                    (HostMemoryFile::CgroupV2Stat, V2_STAT),
+                    (HostMemoryFile::CgroupV1Usage, V2_CURRENT),
+                    (
+                        HostMemoryFile::CgroupV1Stat,
+                        "total_inactive_file 104857600\n"
+                    ),
+                ]),
+                Some(AvailableReading {
+                    bytes: MEMINFO_AVAILABLE,
+                    source: HostMemorySource::MemInfo,
+                }),
+                "{limit_file:?} {limit:?}"
+            );
+        }
+    }
+
+    /// A finite limit whose `memory.current` is missing, or whose
+    /// `memory.stat` lacks the key: no cgroup term, `MemAvailable` alone.
+    #[test]
+    fn read_available_without_the_usage_files_is_meminfo_alone() {
+        for files in [
+            vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV2Max, V2_MAX),
+                (HostMemoryFile::CgroupV2Stat, V2_STAT),
+            ],
+            vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV2Max, V2_MAX),
+                (HostMemoryFile::CgroupV2Current, V2_CURRENT),
+                (HostMemoryFile::CgroupV2Stat, "anon 4096\nfile 8192\n"),
+            ],
+            vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV2Max, V2_MAX),
+                (HostMemoryFile::CgroupV2Current, "garbage\n"),
+                (HostMemoryFile::CgroupV2Stat, V2_STAT),
+            ],
+        ] {
+            assert_eq!(
+                reading(files),
+                Some(AvailableReading {
+                    bytes: MEMINFO_AVAILABLE,
+                    source: HostMemorySource::MemInfo,
+                })
+            );
+        }
+    }
+
+    /// Neither term readable: the sample is unread. `MemAvailable` missing
+    /// from a readable `/proc/meminfo` counts as unreadable.
+    #[test]
+    fn read_available_with_neither_term_is_unread() {
+        assert_eq!(reading(vec![]), None);
+        assert_eq!(
+            reading(vec![(HostMemoryFile::MemInfo, "MemTotal: 33554432 kB\n")]),
+            None
+        );
+        assert_eq!(
+            reading(vec![
+                (HostMemoryFile::MemInfo, "MemTotal: 33554432 kB\n"),
+                (HostMemoryFile::CgroupV2Max, V2_MAX),
+            ]),
+            None
+        );
+    }
+
+    /// `/proc/meminfo` unreadable under a finite limit: the cgroup term
+    /// alone, reported as such.
+    #[test]
+    fn read_available_from_the_cgroup_alone() {
+        assert_eq!(
+            reading(vec![
+                (HostMemoryFile::CgroupV2Max, V2_MAX),
+                (HostMemoryFile::CgroupV2Current, V2_CURRENT),
+                (HostMemoryFile::CgroupV2Stat, V2_STAT),
+            ]),
+            Some(AvailableReading {
+                bytes: CGROUP_AVAILABLE,
+                source: HostMemorySource::Cgroup,
+            })
+        );
+    }
+
+    /// Charged bytes past the limit plus the inactive cache read as 0, not
+    /// as a wrapped figure.
+    #[test]
+    fn read_available_saturates_the_cgroup_term_at_zero() {
+        assert_eq!(
+            reading(vec![
+                (HostMemoryFile::MemInfo, MEMINFO),
+                (HostMemoryFile::CgroupV2Max, "1073741824\n"),
+                (HostMemoryFile::CgroupV2Current, "2147483648\n"),
+                (HostMemoryFile::CgroupV2Stat, "inactive_file 4096\n"),
+            ]),
+            Some(AvailableReading {
+                bytes: 0,
+                source: HostMemorySource::MemInfoAndCgroup,
+            })
+        );
+    }
+
+    /// The files are read on every call: a limit that reads `max` on the
+    /// second sample drops the cgroup term then, with nothing fixed at the
+    /// first.
+    ///
+    /// FLIP: decide the source once (cache the first `memory.max` read) and
+    /// the second reading keeps the cgroup term.
+    #[test]
+    fn read_available_decides_the_source_on_every_call() {
+        struct Changing {
+            calls: usize,
+        }
+        impl HostMemoryFiles for Changing {
+            fn read(&mut self, file: HostMemoryFile) -> Option<String> {
+                match file {
+                    HostMemoryFile::MemInfo => Some(MEMINFO.to_string()),
+                    HostMemoryFile::CgroupV2Max => {
+                        self.calls += 1;
+                        Some(if self.calls == 1 { V2_MAX } else { "max\n" }.to_string())
+                    }
+                    HostMemoryFile::CgroupV2Current => Some(V2_CURRENT.to_string()),
+                    HostMemoryFile::CgroupV2Stat => Some(V2_STAT.to_string()),
+                    _ => None,
+                }
+            }
+        }
+        let mut files = Changing { calls: 0 };
+        assert_eq!(
+            read_available(&mut files),
+            Some(AvailableReading {
+                bytes: CGROUP_AVAILABLE,
+                source: HostMemorySource::MemInfoAndCgroup,
+            })
+        );
+        assert_eq!(
+            read_available(&mut files),
+            Some(AvailableReading {
+                bytes: MEMINFO_AVAILABLE,
+                source: HostMemorySource::MemInfo,
+            })
+        );
+        assert_eq!(files.calls, 2);
+    }
+
+    #[test]
+    fn memory_stat_parses_by_exact_key() {
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes(V2_STAT, "inactive_file"),
+            Some(104_857_600)
+        );
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes("anon 1\ninactive_file 123456\n", "inactive_file"),
+            Some(123_456)
+        );
+        let v1 = "cache 209715200\ninactive_file 5\ntotal_inactive_file 123456\n";
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes(v1, "total_inactive_file"),
+            Some(123_456)
+        );
+        // The whole token, not a prefix or a suffix.
+        assert_eq!(parse_cgroup_memory_stat_bytes(v1, "inactive_file"), Some(5));
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes("total_inactive_file 123456\n", "inactive_file"),
+            None
+        );
+        // Missing key, and garbage.
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes("anon 4096\nfile 8192\n", "inactive_file"),
+            None
+        );
+        assert_eq!(parse_cgroup_memory_stat_bytes("", "inactive_file"), None);
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes("inactive_file\n", "inactive_file"),
+            None
+        );
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes("inactive_file abc\n", "inactive_file"),
+            None
+        );
+        assert_eq!(
+            parse_cgroup_memory_stat_bytes("inactive_file -1\n", "inactive_file"),
+            None
+        );
+    }
+
+    #[test]
+    fn memory_current_parses_one_decimal_count() {
+        assert_eq!(
+            parse_cgroup_memory_current_bytes(V2_CURRENT),
+            Some(1_610_612_736)
+        );
+        assert_eq!(parse_cgroup_memory_current_bytes("0"), Some(0));
+        assert_eq!(parse_cgroup_memory_current_bytes(""), None);
+        assert_eq!(parse_cgroup_memory_current_bytes("garbage\n"), None);
+        assert_eq!(parse_cgroup_memory_current_bytes("1 2\n"), None);
+        assert_eq!(parse_cgroup_memory_current_bytes("-5\n"), None);
+    }
+
+    #[test]
+    fn every_host_memory_file_has_its_fixed_path() {
+        assert_eq!(HostMemoryFile::MemInfo.path(), "/proc/meminfo");
+        assert_eq!(
+            HostMemoryFile::CgroupV2Max.path(),
+            "/sys/fs/cgroup/memory.max"
+        );
+        assert_eq!(
+            HostMemoryFile::CgroupV2Current.path(),
+            "/sys/fs/cgroup/memory.current"
+        );
+        assert_eq!(
+            HostMemoryFile::CgroupV2Stat.path(),
+            "/sys/fs/cgroup/memory.stat"
+        );
+        assert_eq!(
+            HostMemoryFile::CgroupV1Limit.path(),
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+        );
+        assert_eq!(
+            HostMemoryFile::CgroupV1Usage.path(),
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+        );
+        assert_eq!(
+            HostMemoryFile::CgroupV1Stat.path(),
+            "/sys/fs/cgroup/memory/memory.stat"
+        );
     }
 }

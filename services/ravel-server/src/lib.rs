@@ -1156,8 +1156,8 @@ pub struct Running {
     /// to the end of [`Running::shutdown`], so the heartbeat keeps beating
     /// through the drain.
     runtime_heartbeat_task: Option<AbortOnDrop>,
-    /// The ADR-1170 process memory budget, which the memory gate sampler
-    /// (ADR-2633) writes the resident gate of.
+    /// The ADR-1170 process memory budget, whose host-memory gate the memory
+    /// gate sampler (ADR-2633, as amended for issue #2806) writes.
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     /// This process's hold on `<cache-dir>/sql-spill/<instance-id>` (ADR-0954
     /// requirement 7, amended by issue #2416), `Some` when SQL spill resolved
