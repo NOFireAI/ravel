@@ -285,6 +285,27 @@ impl IngestPoint {
     }
 }
 
+/// The object-bytes figure an empty metrics shard buffer's size trigger reaches
+/// after merging `points`: every point's sample bytes, plus each distinct
+/// series' bytes once, at its first sighting. Public so a bulk loader can size
+/// `target_bytes` in rows from one decoded batch. A later batch repeating a
+/// buffered series adds only its sample bytes, so the figure per point is an
+/// upper bound on what a later batch of the same shape adds.
+pub fn est_points_object_bytes(points: &[IngestPoint]) -> usize {
+    let mut seen = std::collections::HashSet::with_capacity(points.len());
+    points
+        .iter()
+        .map(|p| {
+            let series = if seen.insert(p.series_id) {
+                p.est_object_series_bytes()
+            } else {
+                0
+            };
+            p.est_object_sample_bytes() + series
+        })
+        .sum()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

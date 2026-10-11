@@ -66,6 +66,7 @@ pub use lifecycle::{
 };
 pub use log_error::LogWriteError;
 pub use log_metrics::{FlushTriggerMix, LogIngestMetrics, LogIngestMetricsSnapshot};
+pub use log_shard::{est_columnar_log_batch_object_bytes, est_log_records_object_bytes};
 pub use log_router::{
     LogIndexedFields, LogIngestRouter, LogSubmitted, LogWriteReceipt, NoIndexedFields,
 };
@@ -82,9 +83,10 @@ pub use router::{IngestRouter, Submitted, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 pub use span_router::{SpanIngestRouter, SpanSubmitted, SpanWriteReceipt, shard_for_span};
+pub use span_shard::est_spans_object_bytes;
 #[cfg(feature = "stage-timing")]
 pub use stage_timing::{
     LogStage, LogStageSnapshot, LogStageTimings, MetricStage, MetricStageSnapshot,
     MetricStageTimings, StageTotals,
 };
-pub use value::{IngestExemplar, IngestPoint, IngestValue};
+pub use value::{IngestExemplar, IngestPoint, IngestValue, est_points_object_bytes};

@@ -165,6 +165,13 @@ pub(crate) fn est_span_object_bytes(span: &NormalizedSpan) -> usize {
         + SPAN_OBJECT_FIXED_BYTES
 }
 
+/// The object-bytes figure a span shard buffer's size trigger adds for
+/// `spans`: [`est_span_object_bytes`] summed. Public so a bulk loader can size
+/// `target_bytes` in rows from one decoded batch.
+pub fn est_spans_object_bytes(spans: &[NormalizedSpan]) -> usize {
+    spans.iter().map(est_span_object_bytes).sum()
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedSpan`] to the
 /// writer's [`SpanRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename. In particular `attrs` is already the
