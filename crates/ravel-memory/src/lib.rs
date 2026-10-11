@@ -15,10 +15,10 @@
 //! through a `try_reserve`/`reserve`/`reserve_unchecked` call is invisible
 //! to it (ADR-1170 constraint 4).
 //!
-//! Each budget also carries a resident gate (ADR-2633): a flag that, while
-//! closed, makes every `try_reserve` of more than zero bytes refuse with
-//! [`ExhaustionCause::Resident`], whatever the ledger holds. See
-//! [`MemoryBudget::set_resident_gate`].
+//! Each budget also carries a memory gate (ADR-2633, as amended for issue
+//! #2806): a flag that, while closed, makes every `try_reserve` of more than
+//! zero bytes refuse with [`ExhaustionCause::HostMemory`], whatever the
+//! ledger holds. See [`MemoryBudget::set_host_memory_gate`].
 
 use std::error::Error;
 use std::fmt;
@@ -38,31 +38,32 @@ pub struct MemoryBudget {
     refusals: RefusalCounts,
 }
 
-/// The resident gate's state (ADR-2633 section 1): whether it is open, the
-/// last process resident reading, and the last high-water mark.
+/// The memory gate's state (ADR-2633 section 1, as amended for issue #2806):
+/// whether it is open, the last host available-memory reading, and the
+/// floor it was compared against.
 ///
-/// Written only by [`MemoryBudget::set_resident_gate`], whose caller is the
-/// server's memory-gate sampler thread (ADR-2633 task 2, issue #2730). A
+/// Written only by [`MemoryBudget::set_host_memory_gate`], whose caller is
+/// the server's memory-gate sampler thread (ADR-2633 task 2, issue #2730). A
 /// process with the gate off never starts the sampler, so its budget stays
 /// open and `try_reserve` behaves as it did before the gate.
 ///
-/// The reading and the mark are two independent relaxed stores, so a reader
-/// can see the reading of one setter call beside the mark of the next. The
-/// pair is consistent in practice only because the server derives the mark
-/// once at startup and passes the same value on every call.
+/// The reading and the floor are two independent relaxed stores, so a
+/// reader can see the reading of one setter call beside the floor of the
+/// next. The floor is fixed for the process's life, which is what keeps the
+/// pair consistent: the server resolves it once at startup and passes the
+/// same value on every call.
 ///
 /// The 128-byte alignment gives the group a block of its own, apart from
 /// `reserved`: a check site's load of `open` never shares a cache line with
-/// a reservation's CAS, and `set_resident_gate` is the only writer to the
-/// line. 128 rather than 64 covers
-/// adjacent-line prefetch on x86_64 and the 128-byte lines of some aarch64
-/// cores.
+/// a reservation's CAS, and `set_host_memory_gate` is the only writer to
+/// the line. 128 rather than 64 covers adjacent-line prefetch on x86_64 and
+/// the 128-byte lines of some aarch64 cores.
 #[derive(Debug)]
 #[repr(align(128))]
 struct ResidentGate {
     open: AtomicBool,
-    resident: AtomicU64,
-    high_water: AtomicU64,
+    available: AtomicU64,
+    floor: AtomicU64,
 }
 
 /// Refusals of `try_reserve`, by cause, on a block of their own so a burst
@@ -76,7 +77,7 @@ struct RefusalCounts {
 
 impl MemoryBudget {
     /// Builds a budget that admits at most `limit` reserved bytes at a time.
-    /// The resident gate starts open, with a reading and mark of 0.
+    /// The memory gate starts open, with a reading and floor of 0.
     pub fn new(limit: u64) -> Self {
         Self {
             limit,
@@ -85,8 +86,8 @@ impl MemoryBudget {
             handoff_overlap: AtomicU64::new(0),
             gate: ResidentGate {
                 open: AtomicBool::new(true),
-                resident: AtomicU64::new(0),
-                high_water: AtomicU64::new(0),
+                available: AtomicU64::new(0),
+                floor: AtomicU64::new(0),
             },
             refusals: RefusalCounts {
                 accounted: AtomicU64::new(0),
@@ -95,45 +96,44 @@ impl MemoryBudget {
         }
     }
 
-    /// Records a process resident reading against the high-water mark and
-    /// sets the gate from them: closed when `resident >= high_water`, open
-    /// otherwise. This is the gate's only writer; the server's sampler thread
-    /// calls it once per sample with the post-purge reading (ADR-2633
-    /// section 2), and a test can call it to hold the gate closed.
+    /// Records a host available-memory reading against the floor and sets
+    /// the gate from them: closed when `available < floor`, open otherwise.
+    /// This is the gate's only writer; the server's sampler thread calls it
+    /// once per sample with the final reading of that sample (ADR-2633
+    /// section 2, as amended for issue #2806), and a test can call it to
+    /// hold the gate closed.
     ///
-    /// The gate is disabled by never calling this, never by a mark of 0: a
-    /// mark of 0 closes the gate for every reading.
-    pub fn set_resident_gate(&self, resident: u64, high_water: u64) {
-        self.gate.resident.store(resident, Ordering::Relaxed);
-        self.gate.high_water.store(high_water, Ordering::Relaxed);
+    /// The gate is disabled by never calling this. A floor of 0 opens the
+    /// gate for every reading.
+    pub fn set_host_memory_gate(&self, available: u64, floor: u64) {
+        self.gate.available.store(available, Ordering::Relaxed);
+        self.gate.floor.store(floor, Ordering::Relaxed);
         // Release pairs with the acquire fence on the refusal path, so a
         // refusal reads each figure from this call or a later one; see the
         // `ResidentGate` doc for why the pair stays consistent.
-        self.gate
-            .open
-            .store(resident < high_water, Ordering::Release);
+        self.gate.open.store(available >= floor, Ordering::Release);
     }
 
-    /// Whether the resident gate is open. A relaxed load: the check sites
-    /// need the flag, not an ordering with the reading or the mark.
+    /// Whether the memory gate is open. A relaxed load: the check sites
+    /// need the flag, not an ordering with the reading or the floor.
     pub fn gate_open(&self) -> bool {
         self.gate.open.load(Ordering::Relaxed)
     }
 
-    /// The resident reading of the last [`set_resident_gate`] call, 0 before
-    /// the first.
+    /// The host available-memory reading of the last
+    /// [`set_host_memory_gate`] call, 0 before the first.
     ///
-    /// [`set_resident_gate`]: MemoryBudget::set_resident_gate
-    pub fn gate_resident(&self) -> u64 {
-        self.gate.resident.load(Ordering::Relaxed)
+    /// [`set_host_memory_gate`]: MemoryBudget::set_host_memory_gate
+    pub fn gate_available(&self) -> u64 {
+        self.gate.available.load(Ordering::Relaxed)
     }
 
-    /// The high-water mark of the last [`set_resident_gate`] call, 0 before
-    /// the first.
+    /// The floor of the last [`set_host_memory_gate`] call, 0 before the
+    /// first.
     ///
-    /// [`set_resident_gate`]: MemoryBudget::set_resident_gate
-    pub fn gate_high_water(&self) -> u64 {
-        self.gate.high_water.load(Ordering::Relaxed)
+    /// [`set_host_memory_gate`]: MemoryBudget::set_host_memory_gate
+    pub fn gate_floor(&self) -> u64 {
+        self.gate.floor.load(Ordering::Relaxed)
     }
 
     /// `try_reserve` calls (including those made by [`reserve`]) refused
@@ -146,8 +146,8 @@ impl MemoryBudget {
     }
 
     /// `try_reserve` calls (including those made by [`reserve`]) refused
-    /// because the resident gate was closed: the
-    /// [`ExhaustionCause::Resident`] refusals.
+    /// because the memory gate was closed: the
+    /// [`ExhaustionCause::HostMemory`] refusals.
     ///
     /// [`reserve`]: MemoryBudget::reserve
     pub fn gate_refusals(&self) -> u64 {
@@ -219,14 +219,14 @@ impl MemoryBudget {
         self.reserved().saturating_sub(self.fetch_reserved())
     }
 
-    /// Reserves `n` bytes if the resident gate is open and doing so would
+    /// Reserves `n` bytes if the memory gate is open and doing so would
     /// not exceed `limit`. On success, `reserved()` grows by exactly `n`. On
     /// failure, `reserved()` does not change and exactly one of
     /// [`accounted_refusals`] and [`gate_refusals`] grows by one.
     ///
     /// Gate rule: while the gate is closed, any `n > 0` is refused with
-    /// [`ExhaustionCause::Resident`] before the reservation CAS runs, unless
-    /// the reading and mark it then loads show the gate already reopened. A
+    /// [`ExhaustionCause::HostMemory`] before the reservation CAS runs, unless
+    /// the reading and floor it then loads show the gate already reopened. A
     /// zero-byte reservation is always admitted by the gate (the ledger
     /// still refuses it when it is already over `limit`).
     ///
@@ -240,7 +240,7 @@ impl MemoryBudget {
     pub fn try_reserve(&self, n: u64) -> Result<(), MemoryExhausted> {
         if n > 0
             && !self.gate_open()
-            && let Some(refusal) = self.refuse_resident(n)
+            && let Some(refusal) = self.refuse_host_memory(n)
         {
             return Err(refusal);
         }
@@ -276,14 +276,14 @@ impl MemoryBudget {
     /// then goes on to the ledger, and no refusal is counted.
     #[cold]
     #[inline(never)]
-    fn refuse_resident(&self, n: u64) -> Option<MemoryExhausted> {
-        // Pairs with the release store in `set_resident_gate`: each figure
-        // below is from the write that closed the gate or a later one; see
-        // the `ResidentGate` doc for why the pair stays consistent.
+    fn refuse_host_memory(&self, n: u64) -> Option<MemoryExhausted> {
+        // Pairs with the release store in `set_host_memory_gate`: each
+        // figure below is from the write that closed the gate or a later
+        // one; see the `ResidentGate` doc for why the pair stays consistent.
         fence(Ordering::Acquire);
-        let resident = self.gate_resident();
-        let high_water = self.gate_high_water();
-        if resident < high_water {
+        let available = self.gate_available();
+        let floor = self.gate_floor();
+        if available >= floor {
             return None;
         }
         self.refusals.gate.fetch_add(1, Ordering::Relaxed);
@@ -291,10 +291,7 @@ impl MemoryBudget {
             requested: n,
             reserved: self.reserved.load(Ordering::Relaxed),
             limit: self.limit,
-            cause: ExhaustionCause::Resident {
-                resident,
-                high_water,
-            },
+            cause: ExhaustionCause::HostMemory { available, floor },
         })
     }
 
@@ -307,7 +304,7 @@ impl MemoryBudget {
     /// budget refuse (per its overflow rule above), which is the closest
     /// this type can come to surfacing the caller's error.
     ///
-    /// The resident gate does not apply here: a closed gate neither refuses
+    /// The memory gate does not apply here: a closed gate neither refuses
     /// nor counts this call.
     pub fn reserve_unchecked(&self, n: u64) -> u64 {
         let mut current = self.reserved.load(Ordering::Acquire);
@@ -489,7 +486,7 @@ impl Drop for Reservation {
 ///
 /// `requested`, `reserved` and `limit` are filled for both causes:
 /// `reserved` is the ledger's total as the refusal read it. For a
-/// [`ExhaustionCause::Resident`] refusal they do not explain the refusal
+/// [`ExhaustionCause::HostMemory`] refusal they do not explain the refusal
 /// (the ledger is usually far from `limit` when the gate closes); the cause
 /// carries the figures that do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,10 +502,10 @@ pub struct MemoryExhausted {
 pub enum ExhaustionCause {
     /// The ledger would have exceeded its limit (or overflowed a `u64`).
     Accounted,
-    /// The resident gate was closed. `resident` and `high_water` are the
-    /// gate's figures as the refusal read them, and `resident` is at or above
-    /// `high_water`.
-    Resident { resident: u64, high_water: u64 },
+    /// The memory gate was closed. `available` and `floor` are the gate's
+    /// figures as the refusal read them: the host's available memory in
+    /// bytes, and the floor it is below.
+    HostMemory { available: u64, floor: u64 },
 }
 
 impl fmt::Display for MemoryExhausted {
@@ -519,13 +516,10 @@ impl fmt::Display for MemoryExhausted {
                 "memory exhausted: requested {} bytes, {} of {} byte limit already reserved",
                 self.requested, self.reserved, self.limit
             ),
-            ExhaustionCause::Resident {
-                resident,
-                high_water,
-            } => write!(
+            ExhaustionCause::HostMemory { available, floor } => write!(
                 f,
-                "memory exhausted: process resident {resident} bytes at or above the \
-                 {high_water} byte high-water mark (requested {})",
+                "memory exhausted: host available memory {available} bytes is below the \
+                 {floor} byte floor (requested {})",
                 self.requested
             ),
         }
@@ -768,23 +762,23 @@ mod tests {
         assert_eq!(budget.handoff_overlap(), 0);
     }
 
-    /// A closed gate refuses with the resident cause before the reservation
-    /// CAS runs, on a ledger that has room.
+    /// A closed gate refuses with the host-memory cause before the
+    /// reservation CAS runs, on a ledger that has room.
     ///
     /// FLIP: move the gate check in `try_reserve` after the CAS (refusing
     /// once `compare_exchange_weak` succeeds) and `reserved()` reads 11, not
     /// 10. Make it part of the ledger's limit arm instead and
     /// `try_reserve(1)` is admitted, since 11 of 100 fits.
     #[test]
-    fn a_closed_gate_refuses_with_the_resident_cause_and_reserves_nothing() {
+    fn a_closed_gate_refuses_with_the_host_memory_cause_and_reserves_nothing() {
         let budget = MemoryBudget::new(100);
         budget.try_reserve(10).expect("the gate starts open");
         assert!(budget.gate_open());
 
-        budget.set_resident_gate(700, 500);
+        budget.set_host_memory_gate(300, 500);
         assert!(!budget.gate_open());
-        assert_eq!(budget.gate_resident(), 700);
-        assert_eq!(budget.gate_high_water(), 500);
+        assert_eq!(budget.gate_available(), 300);
+        assert_eq!(budget.gate_floor(), 500);
 
         let err = budget
             .try_reserve(1)
@@ -795,9 +789,9 @@ mod tests {
                 requested: 1,
                 reserved: 10,
                 limit: 100,
-                cause: ExhaustionCause::Resident {
-                    resident: 700,
-                    high_water: 500,
+                cause: ExhaustionCause::HostMemory {
+                    available: 300,
+                    floor: 500,
                 },
             }
         );
@@ -809,27 +803,35 @@ mod tests {
         assert_eq!(budget.reserved(), 10);
     }
 
+    /// The floor is open: a reading equal to it keeps the gate open, and
+    /// one byte below it closes.
+    ///
+    /// FLIP: close on `available <= floor` in `set_host_memory_gate` and the
+    /// first `gate_open()` assertion fails.
     #[test]
-    fn a_reading_equal_to_the_mark_closes_and_one_below_reopens() {
+    fn a_reading_at_the_floor_opens_and_one_below_closes() {
         let budget = Arc::new(MemoryBudget::new(100));
-        budget.set_resident_gate(500, 500);
-        assert!(!budget.gate_open(), "at the mark closes");
+        budget.set_host_memory_gate(500, 500);
+        assert!(budget.gate_open(), "at the floor opens");
+        let guard = budget.reserve(1).expect("an open gate admits");
+        assert_eq!(budget.reserved(), 1);
+        drop(guard);
+
+        budget.set_host_memory_gate(499, 500);
+        assert!(!budget.gate_open(), "below the floor closes");
         budget
             .reserve(1)
             .expect_err("reserve goes through the closed gate");
 
-        budget.set_resident_gate(499, 500);
-        assert!(budget.gate_open(), "below the mark opens");
-        let guard = budget.reserve(1).expect("a reopened gate admits");
-        assert_eq!(budget.reserved(), 1);
-        drop(guard);
+        budget.set_host_memory_gate(1_000, 500);
+        assert!(budget.gate_open(), "above the floor reopens");
         budget.try_reserve(100).expect("the whole limit fits again");
     }
 
     /// Each refusal kind moves its own counter by exactly one.
     ///
     /// FLIP: count both causes in one counter (increment
-    /// `refusals.accounted` in `refuse_resident`) and the first
+    /// `refusals.accounted` in `refuse_host_memory`) and the first
     /// `gate_refusals()` assertion reads 0, the `accounted_refusals()` one 1.
     #[test]
     fn each_refusal_kind_moves_only_its_own_counter() {
@@ -839,7 +841,7 @@ mod tests {
             (0, 0)
         );
 
-        budget.set_resident_gate(10, 5);
+        budget.set_host_memory_gate(4, 5);
         budget.try_reserve(1).expect_err("closed");
         assert_eq!(budget.gate_refusals(), 1);
         assert_eq!(budget.accounted_refusals(), 0);
@@ -850,7 +852,7 @@ mod tests {
             "an admitted call counts nothing"
         );
 
-        budget.set_resident_gate(4, 5);
+        budget.set_host_memory_gate(10, 5);
         let err = budget.try_reserve(101).expect_err("101 of 100");
         assert_eq!(
             err,
@@ -875,13 +877,13 @@ mod tests {
     }
 
     /// A caller that loaded the flag closed while the setter was reopening
-    /// it goes on to the ledger rather than reporting a reading below the
-    /// mark as "at or above" it. The flag is stored directly to hold that
+    /// it goes on to the ledger rather than reporting a reading at or above
+    /// the floor as "below" it. The flag is stored directly to hold that
     /// window open.
     #[test]
-    fn a_closed_flag_with_a_reading_below_the_mark_admits_and_counts_nothing() {
+    fn a_closed_flag_with_a_reading_at_the_floor_admits_and_counts_nothing() {
         let budget = MemoryBudget::new(100);
-        budget.set_resident_gate(400, 500);
+        budget.set_host_memory_gate(500, 500);
         budget.gate.open.store(false, Ordering::Relaxed);
         budget
             .try_reserve(1)
@@ -896,7 +898,7 @@ mod tests {
     #[test]
     fn reserve_unchecked_ignores_a_closed_gate() {
         let budget = MemoryBudget::new(100);
-        budget.set_resident_gate(10, 5);
+        budget.set_host_memory_gate(4, 5);
         assert_eq!(budget.reserve_unchecked(30), 30);
         assert_eq!(budget.reserved(), 30);
         assert_eq!(
@@ -917,19 +919,19 @@ mod tests {
             accounted.to_string(),
             "memory exhausted: requested 3 bytes, 98 of 100 byte limit already reserved"
         );
-        let resident = MemoryExhausted {
+        let host_memory = MemoryExhausted {
             requested: 3,
             reserved: 98,
             limit: 100,
-            cause: ExhaustionCause::Resident {
-                resident: 700,
-                high_water: 500,
+            cause: ExhaustionCause::HostMemory {
+                available: 300,
+                floor: 500,
             },
         };
         assert_eq!(
-            resident.to_string(),
-            "memory exhausted: process resident 700 bytes at or above the 500 byte \
-             high-water mark (requested 3)"
+            host_memory.to_string(),
+            "memory exhausted: host available memory 300 bytes is below the 500 byte \
+             floor (requested 3)"
         );
     }
 
