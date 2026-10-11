@@ -1203,6 +1203,18 @@ pub struct IngestPipelineSnapshot {
     /// this count renders only once it has recorded activity: a tenant
     /// resharded above the default, or a retiring generation (ADR-0052).
     pub active_shard_count: u32,
+    /// Flushes opened because every pending write in the buffer had been
+    /// acknowledged, under `WriteMode::StrictArrival` (ADR-2793 decision 1).
+    /// Carried for every signal, flat rather than `Option`-gated: all three
+    /// shard actors support the trigger, so a process running under
+    /// `--strict-flush-policy aged` (where it never fires) still renders a
+    /// real zero rather than an absent sample.
+    pub flushes_by_arrival: u64,
+    /// Arrival-trigger flush attempts coalesced into an already-opening
+    /// flush for the same buffer (ADR-2793 decision 1), rather than spawning
+    /// a second one. Carried for every signal, the same as
+    /// `flushes_by_arrival`.
+    pub arrival_coalesced: u64,
 }
 
 /// Exemplar admission counters, mirroring
@@ -1318,6 +1330,8 @@ impl IngestPipelineSnapshot {
             clock_lag_bypassed_at_shutdown: snapshot.clock_lag_bypassed_at_shutdown,
             shard_skew: Vec::new(),
             active_shard_count: 0,
+            flushes_by_arrival: snapshot.flushes_by_arrival,
+            arrival_coalesced: snapshot.arrival_coalesced,
         }
     }
 
@@ -1373,6 +1387,8 @@ impl IngestPipelineSnapshot {
             clock_lag_bypassed_at_shutdown: snapshot.clock_lag_bypassed_at_shutdown,
             shard_skew: Vec::new(),
             active_shard_count: 0,
+            flushes_by_arrival: snapshot.flushes_by_arrival,
+            arrival_coalesced: snapshot.arrival_coalesced,
         }
     }
 
@@ -1419,6 +1435,8 @@ impl IngestPipelineSnapshot {
             clock_lag_bypassed_at_shutdown: snapshot.clock_lag_bypassed_at_shutdown,
             shard_skew: Vec::new(),
             active_shard_count: 0,
+            flushes_by_arrival: snapshot.flushes_by_arrival,
+            arrival_coalesced: snapshot.arrival_coalesced,
         }
     }
 }
@@ -1496,6 +1514,42 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_flushes_by_age_floor_total",
             &labels(mode, pipeline.signal),
             pipeline.flushes_by_age_floor,
+        );
+    }
+
+    // ADR-2793 decision 1: the arrival trigger, selectable by
+    // --strict-flush-policy or the x-ravel-ingest-mode header. Unconditional,
+    // the same as the floor family above: all three shard actors support the
+    // trigger, so a process that never selects it still renders a real zero.
+    write_header(
+        out,
+        "ravel_ingest_flushes_by_arrival_total",
+        "Flushes opened because every pending write in the tenant buffer had been \
+         acknowledged (WriteMode::StrictArrival), by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_flushes_by_arrival_total",
+            &labels(mode, pipeline.signal),
+            pipeline.flushes_by_arrival,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_arrival_coalesced_total",
+        "Arrival-trigger flush attempts coalesced into an already-opening flush for the \
+         same buffer, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_arrival_coalesced_total",
+            &labels(mode, pipeline.signal),
+            pipeline.arrival_coalesced,
         );
     }
 

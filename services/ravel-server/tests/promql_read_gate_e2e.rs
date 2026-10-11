@@ -127,6 +127,7 @@ async fn start_query_server(store: Arc<MemoryStore>) -> ravel_server::Running {
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

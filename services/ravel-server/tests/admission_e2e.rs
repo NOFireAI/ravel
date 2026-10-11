@@ -96,6 +96,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
     let mut tenants = HashMap::new();
     tenants.insert(TenantId::new(TENANT), tenant_limits);
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

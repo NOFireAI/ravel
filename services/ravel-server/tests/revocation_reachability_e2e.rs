@@ -51,6 +51,7 @@ fn now_ns() -> i64 {
 async fn start_keyed_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(HashMap::new(), false);
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

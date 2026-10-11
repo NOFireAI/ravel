@@ -882,6 +882,12 @@ pub struct ServerConfig {
     /// into the catalog window and every admission bound; see
     /// [`resolve_ingest_lag`].
     pub max_ingest_lag: Duration,
+    /// The process default strict flush policy from `--strict-flush-policy`
+    /// (ADR-2793 decision 1), carried onto [`otlp_http::GatewayState`] and
+    /// [`remote_write::RemoteWriteState`] by [`gateway_state`] and
+    /// [`remote_write_state`]. See [`crate::config::StrictFlushPolicy`] for
+    /// the header-interaction semantics.
+    pub strict_flush_policy: crate::config::StrictFlushPolicy,
 }
 
 impl ServerConfig {
@@ -1794,6 +1800,7 @@ fn gateway_state(
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
     max_ingest_lag_ns: i64,
+    strict_flush_policy: config::StrictFlushPolicy,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -1843,6 +1850,7 @@ fn gateway_state(
         budget: ingest_buffer_budget.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
+        strict_flush_policy,
     })
 }
 
@@ -1857,6 +1865,7 @@ fn remote_write_state(
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     max_ingest_lag_ns: i64,
+    strict_flush_policy: config::StrictFlushPolicy,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -1874,6 +1883,7 @@ fn remote_write_state(
         clock: Arc::new(SystemClock),
         metadata_sink: metadata_sink.clone(),
         budget: ingest_buffer_budget.clone(),
+        strict_flush_policy,
     })
 }
 
@@ -2707,6 +2717,7 @@ pub async fn start_with_heartbeat(
             &ingest_buffer_budget,
             &metadata_sink,
             ingest_lag.admission_lag_ns,
+            config.strict_flush_policy,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -2719,6 +2730,7 @@ pub async fn start_with_heartbeat(
             &metadata_sink,
             &ingest_buffer_budget,
             ingest_lag.admission_lag_ns,
+            config.strict_flush_policy,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -2738,6 +2750,7 @@ pub async fn start_with_heartbeat(
                 &ingest_buffer_budget,
                 &metadata_sink,
                 ingest_lag.admission_lag_ns,
+                config.strict_flush_policy,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -2749,6 +2762,7 @@ pub async fn start_with_heartbeat(
                 &metadata_sink,
                 &ingest_buffer_budget,
                 ingest_lag.admission_lag_ns,
+                config.strict_flush_policy,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -3708,6 +3722,7 @@ pub async fn start_with_heartbeat(
             &ingest_buffer_budget,
             &metadata_sink,
             ingest_lag.admission_lag_ns,
+            config.strict_flush_policy,
         )),
         _ => None,
     };
@@ -5351,6 +5366,7 @@ mod startup_test_support {
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             drain_settle_interval: Duration::ZERO,
             max_ingest_lag: DEFAULT_MAX_INGEST_LAG,
+            strict_flush_policy: config::StrictFlushPolicy::Aged,
         }
     }
 }

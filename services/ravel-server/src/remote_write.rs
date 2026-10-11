@@ -4,7 +4,10 @@
 //! This surface is strict-mode only regardless of the OTLP ingest mode
 //! header: a Remote Write sender expects a 2xx to mean the samples are
 //! durable, so the buffered-mode override honored by `otlp_http`/`otlp_grpc`
-//! is never read here.
+//! is never read here. Which strict write mode that is comes from the
+//! process `--strict-flush-policy` default alone (ADR-2793 decision 1):
+//! this surface has no per-request override, since there is no header read
+//! here to carry one.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,7 +22,7 @@ use axum::routing::post;
 use bytes::Bytes;
 use ravel_ingest::{
     AdmissionController, Clock, IngestByteBudget, IngestByteCharge, IngestPoint, IngestRouter,
-    IngestValue, RequestRejection, WriteError, WriteMode, plausible_ingest_clock,
+    IngestValue, RequestRejection, WriteError, plausible_ingest_clock,
 };
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
@@ -306,6 +309,11 @@ pub struct RemoteWriteState {
     /// normalization, so the expansion is inside the declared bound rather than
     /// a transient outside it (issue #1419).
     pub budget: Arc<IngestByteBudget>,
+    /// The process default strict flush policy (ADR-2793 decision 1),
+    /// resolved from `--strict-flush-policy`. This surface reads no header
+    /// (see the module doc comment above), so every write resolves through
+    /// this value alone.
+    pub strict_flush_policy: crate::config::StrictFlushPolicy,
 }
 
 impl crate::ingest_admission::IngestAdmissionState for RemoteWriteState {
@@ -578,7 +586,12 @@ async fn remote_write(
     drop(inflate_charge);
     let receipt = match state
         .router
-        .write_values(tenant, ingest_points, WriteMode::Strict, state.ack_deadline)
+        .write_values(
+            tenant,
+            ingest_points,
+            state.strict_flush_policy.write_mode(),
+            state.ack_deadline,
+        )
         .await
     {
         Ok(receipt) => receipt,
@@ -769,6 +782,7 @@ mod tests {
             clock,
             metadata_sink: None,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            strict_flush_policy: crate::config::StrictFlushPolicy::Aged,
         })
     }
 

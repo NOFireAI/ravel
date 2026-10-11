@@ -1771,6 +1771,7 @@ mod catalog_cache_tests {
             shutdown_timeout: crate::DEFAULT_SHUTDOWN_TIMEOUT,
             drain_settle_interval: Duration::ZERO,
             max_ingest_lag: crate::DEFAULT_MAX_INGEST_LAG,
+            strict_flush_policy: crate::config::StrictFlushPolicy::Aged,
         }
     }
 

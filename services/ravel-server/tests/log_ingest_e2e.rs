@@ -86,6 +86,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

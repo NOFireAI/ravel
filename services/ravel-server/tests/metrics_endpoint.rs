@@ -115,6 +115,7 @@ async fn start_test_server_with_store_metrics(
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
     };
     match heartbeat {
         Some(heartbeat) => ravel_server::start_with_heartbeat(
@@ -1187,6 +1188,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
             tenants,
             ..LimitsConfig::default()
         },
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
     };
     ravel_server::start(
         config,
@@ -1418,6 +1420,7 @@ async fn start_attribution_server() -> ravel_server::Running {
             tenants,
             ..LimitsConfig::default()
         },
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
     };
     ravel_server::start(
         config,

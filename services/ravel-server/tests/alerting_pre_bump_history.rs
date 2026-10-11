@@ -119,6 +119,7 @@ async fn start_server(store: Arc<MemoryStore>) -> ravel_server::Running {
         ..ravel_server::AlertEvalConfig::default()
     };
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

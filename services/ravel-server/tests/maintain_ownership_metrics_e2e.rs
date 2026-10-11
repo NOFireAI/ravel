@@ -77,6 +77,7 @@ const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// under test.
 fn maintain_config(tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

@@ -114,6 +114,7 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
