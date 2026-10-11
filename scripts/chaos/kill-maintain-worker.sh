@@ -355,9 +355,9 @@ log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; worker A's interrupted buckets: $(ch
 # ---- Oracle (each pinned assertion independently, survivor = worker B) ----
 oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
 oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
-# Worker A is dead, so its log is its state at the kill: the bucket it was
-# merging, read from it, is the one the store must hold a compaction record
-# for. The oracle also reads CHAOS_KILL_ON_GAUGE, set above.
+# Worker A is dead, so its log is its state at the kill: every bucket it had
+# open, read from it, must have a compaction record in the store. The oracle
+# also reads CHAOS_KILL_ON_GAUGE, set above.
 oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
   "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true
 oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
