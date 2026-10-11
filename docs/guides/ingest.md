@@ -1211,7 +1211,7 @@ the affected range pays the per-object cost (LIST, footer read, per-object
 decode setup).
 
 `--target-bytes 1 --batch-rows N` restores the layout every load had
-before issue #2753, when `1` was the default: each write flushes at once,
+when `1` was the default target: each write flushes at once,
 one flush is one object per involved shard, and `--batch-rows` sets how
 many objects a load leaves behind. A 100M-row load at `--batch-rows 10000`
 is then on the order of 10000 flushes, each an object per shard. A larger
@@ -1335,7 +1335,8 @@ outcome:
   `--target-bytes` above 1,850,000,000 for still larger objects was not
   measured.
 - `--max-flush-delay 30s` lets a buffer live long enough to fill. At 2s,
-  the default before issue #2753, 798 of 916 objects closed on age and the median object was
+  the earlier default, 798 of 916 objects closed on age and the median
+  object was
   10.2 MB.
 - `--pipeline-depth` sets the load time once objects are large, because
   each Strict write waits for its batch's flush. At a 1,650,000,000
