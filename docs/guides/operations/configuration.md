@@ -735,6 +735,17 @@ memory above. The three are additive and none bounds the others.
 The gRPC path is bounded at 16 MiB per in-flight request, so the same
 arithmetic applies with a 16 MiB factor.
 
+The permit is returned once the request's points are enqueued, before a strict
+write waits for its durability acknowledgement, and the decompression buffer
+is gone by then. So the ack wait is not bounded by
+`--max-inflight-ingest-requests`. A separate process-wide ceiling,
+`--max-pending-strict-acks` (default 8,192, 0 = unlimited), bounds how many
+strict writes may wait for their ack at once, and refuses one over it with
+HTTP 429 or gRPC `RESOURCE_EXHAUSTED` before anything is buffered. A waiting
+write holds no decompression buffer: the memory its enqueued points occupy is
+counted by the ingest buffer budget, so this ceiling adds no term to the sum
+above.
+
 ## Read cache tiers
 
 The read cache has a RAM tier and an opt-in local-disk tier.
