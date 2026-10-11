@@ -35,6 +35,7 @@ fn maintain_config(tenant: &TenantId) -> ServerConfig {
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: Duration::from_secs(2),
