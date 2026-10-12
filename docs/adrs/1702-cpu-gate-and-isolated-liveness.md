@@ -864,25 +864,46 @@ that built it, unless that state is the job's output. Decision 7 moved the
 logs scan's columnar block decode and Arrow build into one `log_block` job, but
 the scan cursor kept the block's decoded columns after the job returned. They
 were freed only at the start of the next block's decode, in the next job, which
-can run on another blocking thread, or on the runtime worker when the scan was
-dropped at the end of a segment. A decoded block holds one heap allocation per
-present cell of each plain-encoded string and fixed-width column, up to 8192
-per such column at the default block target, and each of those frees could
-land on a thread other than the one that made them. #2795 traces its
-+14% hot regression on the ClickBench logs aggregates to that free. The
-`cpu_gate_round_trip` microbench posted on #2795, run at 9a9dbaee2 on a fresh
-c6a.4xlarge, priced freeing such a result on a thread other than the one that
-built it at 108 to 328 us more per job than freeing it on the building thread,
-growing with the allocation count, against about 19 us for the gate dispatch
-itself. A flat buffer cost nothing either way.
+can run on another blocking thread. A segment's last block was not freed by a
+decode at all: once no surviving block remained,
+`LogSegmentScan::next_block_columnar` returned `Exhausted` without decoding,
+and the block was freed on the runtime worker when
+`LogScanStream::finish_segment` dropped the scan. A decoded block holds one
+heap allocation per present cell of each plain-encoded string and fixed-width
+column, up to 8192 per such column at the default block target, and each of
+those frees could land on a thread other than the one that made them. #2795
+attributes its +14% hot regression on the ClickBench logs aggregates to that
+free, from a microbench of the mechanism; the effect of this change on
+ClickBench has not been measured yet. The `cpu_gate_round_trip` microbench
+posted on #2795, run at 9a9dbaee2 on a fresh c6a.4xlarge, priced freeing such
+a result on a thread other than the one that built it at 108 to 328 us more
+per job than freeing it on the building thread, growing with the allocation
+count, against about 19 us for the gate dispatch itself. A flat buffer cost
+nothing either way.
 
 So `ColumnarBlockJob::run` (`crates/ravel-sql/src/logs_scan.rs`) ends by
 calling `release_decoded`, which calls `LogSegmentScan::release_decoded_block`
 to drop the block and its surviving-row list, and then releases the block's
-`resident` charge, in that order: the charge is sized to the block when its decode returns and is never
-released before the block is freed. The job hands the scan back holding no
-decoded block and an empty charge. The inline path runs the same function. The
-batches the job returns are copies; they do not borrow the block.
+`resident` charge, in that order: the charge is sized to the block when its
+decode returns and is not released before the block is freed. The job hands
+the scan back holding no decoded block and an empty charge. The inline path
+runs the same function. The batches the job returns are copies; they do not
+borrow the block.
+
+This widens a window in which decoded bytes are resident and uncharged. Every
+block's decode now runs before its charge is resized: a job starts with an
+empty `resident`, and `ColumnarBlockJob::build` resizes it to the block's
+decoded size only after `next_block_columnar` has returned. So while a decode
+is in progress, up to one block's decoded size per running `log_block` permit
+is uncharged. Main already had that full-block window for each segment's first
+block and for the first block after a fallback, where the charge entering the
+decode was 0; for every other block the previous block's charge stayed in place
+through the decode, which freed that block first. Decision 6's model is charge
+after decode, so this widens an existing window rather than breaking an
+invariant. With the read gate on, the uncharged bytes are bounded by the gate's
+permit count times the largest decoded block. Without a read gate the decode
+runs inline in the partition's `poll_next`, so the window is one block per
+partition stream being polled.
 
 Two drains still move many-allocation state across the job boundary, because
 that state is the job's output rather than state it left behind:
