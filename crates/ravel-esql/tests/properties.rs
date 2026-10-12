@@ -427,10 +427,10 @@ fn source_command() -> impl Strategy<Value = Command> {
             Just("METADATA".to_owned()),
         ]
         .prop_map(|text| SourcePattern {
-                text,
-                quoted: false,
-                span: NO_SPAN,
-            }),
+            text,
+            quoted: false,
+            span: NO_SPAN,
+        }),
         string_value().prop_map(|text| SourcePattern {
             text,
             quoted: true,

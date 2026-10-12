@@ -41,13 +41,7 @@ const RESERVED: &[&str] = &[
 
 /// Source commands recognised by keyword and not parsed yet, each as the
 /// words that name it.
-const UNSUPPORTED_SOURCE: &[&[&str]] = &[
-    &["EXPLAIN"],
-    &["METRICS"],
-    &["SET"],
-    &["SHOW"],
-    &["TS"],
-];
+const UNSUPPORTED_SOURCE: &[&[&str]] = &[&["EXPLAIN"], &["METRICS"], &["SET"], &["SHOW"], &["TS"]];
 
 /// Processing commands recognised by keyword and not parsed yet, each as the
 /// words that name it. The first entry whose words all match is reported, so
@@ -755,10 +749,7 @@ impl<'a> Parser<'a> {
 
     fn expr_loop(&mut self, min_bp: u8) -> Result<Parsed, Error> {
         let mut lhs = self.prefix(min_bp)?;
-        loop {
-            let Some(infix) = self.infix() else {
-                break;
-            };
+        while let Some(infix) = self.infix() {
             let lbp = infix.precedence();
             if lbp < min_bp {
                 break;
