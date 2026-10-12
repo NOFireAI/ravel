@@ -1458,15 +1458,16 @@ pub struct Cli {
     )]
     pub sql_parallel_final_aggregation: bool,
 
-    /// Decode the SQL `logs` and `spans` scans' blocks on the tokio worker polling the scan instead of on the read CPU gate, the behaviour before ADR-1702 follow-up task 8.
-    ///
-    /// The catalog, PromQL and maintenance read gate sites are unaffected, and
-    /// so is the `samples` scan's RSEG catalog decode. Off by default. The flag
-    /// exists to measure the gate's cost against its liveness benefit (issue
-    /// #2795), and setting it gives up the isolation ADR-1702 decision 7 gives
-    /// scans: a scan over a large part holds a worker for each block's
-    /// decompress. The mode is logged at startup. Meaningful only in a build
-    /// with the `sql` feature; inert otherwise.
+    /// Decode the SQL `logs` and `spans` scans' blocks on the tokio worker
+    /// polling the scan instead of on the read CPU gate, the behaviour before
+    /// ADR-1702 follow-up task 8. The catalog, PromQL and maintenance read gate
+    /// sites are unaffected, and so is the `samples` scan's RSEG catalog
+    /// decode. Off by default. The flag exists to measure the gate's cost
+    /// against its liveness benefit (issue #2795), and setting it gives up the
+    /// isolation ADR-1702 decision 7 gives scans: a scan over a large part
+    /// holds a worker for each block's decompress. The mode is logged at
+    /// startup. Meaningful only in a build with the `sql` feature; inert
+    /// otherwise.
     #[arg(long, env = "RAVEL_SQL_SCAN_DECODE_INLINE")]
     pub sql_scan_decode_inline: bool,
 
