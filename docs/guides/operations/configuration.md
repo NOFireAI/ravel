@@ -1481,9 +1481,8 @@ constant.
 - On a loopback store the default concurrency measured the other way. On
   ClickBench over a RustFS loopback endpoint on c6a.4xlarge boxes, one run
   per arm, `latency-first` took 368.6 s cold against `cost-based`'s
-  478.1 s, at about the same hot time (60.03 s against 59.90 s, issue
-  #2044). That is why it is the unset
-  default there (ADR-2677 decision 7).
+  478.1 s, at about the same hot time (60.03 s against 59.90 s). That is
+  why it is the unset default there.
 - Treat the concurrency as a precondition of the real-S3 trade. The startup
   line says which side of it this process is on. It reports the precondition
   met only when both the GET permits and the scan width are raised. On the

@@ -252,7 +252,7 @@ The engine configuration carries the constant when nothing resolves over it.
 `--logs-fetch-policy byte-minimal` and `latency-first` resolve to it while
 this flag is unset. On the shipped flag set against a remote store it is not
 the value in force. Against a loopback `--s3-endpoint` the unset
-`--logs-fetch-policy` is `latency-first` (ADR-2677 decision 7), so the
+`--logs-fetch-policy` is `latency-first`, so the
 constant is the value in force there.
 
 ### The derived value
