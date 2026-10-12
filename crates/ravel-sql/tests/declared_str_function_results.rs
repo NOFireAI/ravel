@@ -1,10 +1,12 @@
 //! A scalar function over a declared `Str` column, which reaches Arrow as
 //! `Dictionary(Int32, Utf8)` (ADR-0099 decision 5), is typed by the value it
-//! computes, not by that wire type (issue #2918). DataFusion 55.2's encoding
-//! preservation makes `length` and its relatives return
-//! `Dictionary(Int32, Int32)`; the session plans each such call as
-//! `CAST(<call> AS Int32)` instead, so unary minus plans and an integer `avg`
-//! over it takes its exact, partitioned path.
+//! computes, not by that wire type. DataFusion 55.2's encoding preservation
+//! makes `length` and its relatives return `Dictionary(Int32, Int32)`; the
+//! session plans each such call as `CAST(<call> AS Int32)` instead, so unary
+//! minus plans and an integer `avg` over it takes its exact, partitioned
+//! path. Only the functions that return such a dictionary are replaced, so a
+//! call an expression planner builds and its by-name spelling stay one
+//! expression.
 //!
 //! Everything here goes through the production session: `build_session` for
 //! the registry walk, and `SqlExecutor::plan_pinned` / `explain` / `execute`
@@ -12,14 +14,25 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::arrow::array::{Array, Float64Array, Int32Array, Int64Array};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::array::{
+    Array, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
+use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::empty::EmptyTable;
-use datafusion::physical_plan::displayable;
+use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::logical_expr::{Expr, col, lit};
+use datafusion::physical_expr::create_physical_expr;
+use datafusion::physical_expr::execution_props::ExecutionProps;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::expressions::CastExpr;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use datafusion::prelude::SessionContext;
 use ravel_catalog::{Catalog, CatalogConfig, Snapshot};
 use ravel_commit::publish::RetryPolicy;
@@ -177,6 +190,15 @@ impl Fixture {
     /// The output `(name, type)` of `sql` as `plan_pinned` reports it, and
     /// the indented physical plan it builds.
     async fn plan(&self, sql: &str) -> (Vec<(String, DataType)>, String) {
+        let (fields, physical) = self.physical_plan(sql).await;
+        (
+            fields,
+            format!("{}", displayable(physical.as_ref()).indent(true)),
+        )
+    }
+
+    /// The output `(name, type)` of `sql` and the physical plan it builds.
+    async fn physical_plan(&self, sql: &str) -> (Vec<(String, DataType)>, Arc<dyn ExecutionPlan>) {
         let accounting = QueryAccounting::new();
         let planned = self
             .executor
@@ -194,10 +216,7 @@ impl Fixture {
             .create_physical_plan()
             .await
             .expect("physical plan builds");
-        (
-            fields,
-            format!("{}", displayable(physical.as_ref()).indent(true)),
-        )
+        (fields, physical)
     }
 
     async fn execute(&self, sql: &str) -> Vec<datafusion::arrow::array::RecordBatch> {
@@ -305,6 +324,31 @@ async fn planned_types(ctx: &SessionContext, sql: &str) -> Result<(DataType, Dat
     Ok((unoptimized, optimized.schema().field(0).data_type().clone()))
 }
 
+/// The type of the first argument of the first partial aggregate in `plan`,
+/// and, when that argument is a cast, the type of the cast's input.
+fn partial_aggregate_argument(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<(DataType, Option<DataType>)> {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        && *aggregate.mode() == AggregateMode::Partial
+    {
+        let schema = aggregate.input_schema();
+        let argument = aggregate
+            .aggr_expr()
+            .first()?
+            .expressions()
+            .into_iter()
+            .next()?;
+        let under_cast = argument
+            .downcast_ref::<CastExpr>()
+            .and_then(|cast| cast.expr().data_type(&schema).ok());
+        return Some((argument.data_type(&schema).ok()?, under_cast));
+    }
+    plan.children()
+        .into_iter()
+        .find_map(partial_aggregate_argument)
+}
+
 fn is_dictionary_of_non_strings(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -313,9 +357,9 @@ fn is_dictionary_of_non_strings(data_type: &DataType) -> bool {
     )
 }
 
-/// Argument lists tried in order for each function; the first that plans is
-/// the one examined. `c` is the declared `Str` column and `n` is
-/// `length(c)`, an integer computed from it, for the numeric functions.
+/// Argument lists tried for each function; every one that plans is checked.
+/// `c` is the declared `Str` column and `n` is `length(c)`, an integer
+/// computed from it, for the numeric functions.
 const CALL_SHAPES: [&str; 12] = [
     "c",
     "c, 1",
@@ -345,7 +389,16 @@ async fn avg_of_length_over_a_declared_str_is_exact_and_partitioned() {
     let fixture = Fixture::build().await;
     let sql = "SELECT k, avg(length(\"Referer\")) AS a FROM logs GROUP BY k ORDER BY k";
 
-    let (_, plan) = fixture.plan(sql).await;
+    let (_, physical) = fixture.physical_plan(sql).await;
+    let plan = format!("{}", displayable(physical.as_ref()).indent(true));
+    let (argument, under_cast) = partial_aggregate_argument(&physical)
+        .unwrap_or_else(|| panic!("a partial aggregate with an argument; got:\n{plan}"));
+    assert!(
+        argument == DataType::Int32
+            || (argument == DataType::Int64 && under_cast == Some(DataType::Int32)),
+        "avg's argument is Int32 or a cast of it to Int64, never a dictionary or a Float64; \
+         got {argument} over {under_cast:?} in:\n{plan}"
+    );
     assert!(
         plan.contains("AggregateExec: mode=FinalPartitioned"),
         "avg over an integer computed from a declared Str is exact, so its final \
@@ -411,6 +464,30 @@ async fn negated_length_over_a_declared_str_plans_and_answers() {
     assert_eq!(values, expected);
 }
 
+/// The functions no call shape plans for, and why: each needs an argument
+/// none of [`CALL_SHAPES`] supplies.
+const SKIPPED: [(&str, &str); 6] = [
+    ("arrow_cast", "its second argument must name an Arrow type"),
+    (
+        "arrow_try_cast",
+        "its second argument must name an Arrow type",
+    ),
+    ("get_field", "its first argument must be a struct or a map"),
+    ("pi", "it takes no arguments"),
+    ("to_local_time", "its argument must be a timestamp"),
+    ("union_extract", "its first argument must be a union"),
+];
+
+/// The functions whose stock result is a dictionary of non-strings for a
+/// call shape over the declared `Str` column, by canonical name.
+const STOCK_NUMERIC_DICTIONARIES: [&str; 5] = [
+    "ascii",
+    "bit_length",
+    "character_length",
+    "coalesce",
+    "octet_length",
+];
+
 #[tokio::test]
 async fn no_scalar_function_returns_a_dictionary_of_non_strings() {
     let production = production_session();
@@ -420,41 +497,50 @@ async fn no_scalar_function_returns_a_dictionary_of_non_strings() {
         .scalar_functions()
         .values()
         .map(|udf| udf.name().to_string())
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
 
-    let mut examined: BTreeMap<String, (String, String, DataType, DataType)> = BTreeMap::new();
+    let mut examined = BTreeSet::new();
     let mut skipped = Vec::new();
     let mut offenders = Vec::new();
+    let mut stock_numeric = BTreeSet::new();
     for name in &names {
-        let mut found = None;
         for shape in CALL_SHAPES {
             let sql = call_sql(name, shape);
-            if let Ok((unoptimized, optimized)) = planned_types(&production, &sql).await {
-                found = Some((shape, sql, unoptimized, optimized));
-                break;
+            let Ok((unoptimized, optimized)) = planned_types(&production, &sql).await else {
+                continue;
+            };
+            let before = planned_types(&stock, &sql)
+                .await
+                .ok()
+                .map(|(before, _)| before);
+            if is_dictionary_of_non_strings(&unoptimized)
+                || is_dictionary_of_non_strings(&optimized)
+            {
+                offenders.push(format!("{name}({shape}): {unoptimized} / {optimized}"));
+            }
+            if !shape.contains('n') && before.as_ref().is_some_and(is_dictionary_of_non_strings) {
+                stock_numeric.insert(name.clone());
+            }
+            // The first shape that plans, and every shape whose result is a
+            // dictionary before or after the rule.
+            let dictionary = |t: &DataType| matches!(t, DataType::Dictionary(..));
+            if examined.insert(name.clone())
+                || before.as_ref().is_some_and(dictionary)
+                || dictionary(&unoptimized)
+            {
+                let before = before
+                    .map_or_else(|| "(not in a stock session)".to_string(), |t| t.to_string());
+                println!(
+                    "{name:<24} ({shape:<12}) before: {before:<28} after: {unoptimized} / {optimized}"
+                );
             }
         }
-        let Some((shape, sql, unoptimized, optimized)) = found else {
+        if !examined.contains(name) {
             println!("{name:<24} skipped: no call shape plans");
             skipped.push(name.clone());
-            continue;
-        };
-        let before = match planned_types(&stock, &sql).await {
-            Ok((before, _)) => format!("{before}"),
-            Err(_) => "(not in a stock session)".to_string(),
-        };
-        println!(
-            "{name:<24} ({shape:<12}) before: {before:<28} after: {unoptimized} / {optimized}"
-        );
-        if is_dictionary_of_non_strings(&unoptimized) || is_dictionary_of_non_strings(&optimized) {
-            offenders.push(format!("{name}({shape}): {unoptimized} / {optimized}"));
         }
-        examined.insert(
-            name.clone(),
-            (shape.to_string(), before, unoptimized, optimized),
-        );
     }
     println!(
         "examined {}, skipped {}: {skipped:?}",
@@ -466,36 +552,43 @@ async fn no_scalar_function_returns_a_dictionary_of_non_strings() {
         offenders.is_empty(),
         "functions still typed as a dictionary of non-strings: {offenders:#?}"
     );
-    assert!(
-        examined.len() >= 20,
-        "only {} functions planned with a declared Str argument",
-        examined.len()
+    assert_eq!(
+        skipped,
+        SKIPPED.map(|(name, _)| name.to_string()),
+        "the functions no call shape plans for"
     );
-    for name in ["character_length", "octet_length", "bit_length", "ascii"] {
-        let (_, before, unoptimized, optimized) = examined
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} examined"));
-        assert_eq!(before, "Dictionary(Int32, Int32)", "{name} before the rule");
-        assert_eq!(unoptimized, &DataType::Int32, "{name} after the rule");
-        assert_eq!(optimized, &DataType::Int32, "{name} after optimization");
-    }
-    // `length` and `char_length` are aliases of `character_length`, which the
-    // walk above examined under that name; each spelling is checked here.
-    for alias in ["length", "char_length"] {
-        let sql = call_sql(alias, "c");
+    assert_eq!(examined.len(), names.len() - SKIPPED.len());
+    assert_eq!(
+        stock_numeric,
+        BTreeSet::from(STOCK_NUMERIC_DICTIONARIES.map(String::from)),
+        "the functions whose stock result is a dictionary of non-strings"
+    );
+
+    // Each spelling of each affected function, at the shape that reaches a
+    // numeric dictionary in a stock session, plans as the value type.
+    for (name, shape, value) in [
+        ("character_length", "c", DataType::Int32),
+        ("length", "c", DataType::Int32),
+        ("char_length", "c", DataType::Int32),
+        ("octet_length", "c", DataType::Int32),
+        ("bit_length", "c", DataType::Int32),
+        ("ascii", "c", DataType::Int32),
+        ("coalesce", "c, 1", DataType::Int64),
+    ] {
+        let sql = call_sql(name, shape);
         let (before, _) = planned_types(&stock, &sql).await.expect("stock plans");
         assert_eq!(
             before,
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
-            "{alias} before the rule"
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(value.clone())),
+            "{name}({shape}) before the rule"
         );
         let (unoptimized, optimized) = planned_types(&production, &sql)
             .await
             .expect("production plans");
         assert_eq!(
             (unoptimized, optimized),
-            (DataType::Int32, DataType::Int32),
-            "{alias} after the rule"
+            (value.clone(), value),
+            "{name}({shape}) after the rule"
         );
     }
     let (unoptimized, optimized) = planned_types(
@@ -540,9 +633,20 @@ async fn the_cast_wraps_the_result_not_the_argument() {
 async fn length_keeps_its_output_name_and_type() {
     let fixture = Fixture::build().await;
     let stock = stock_session();
-    for sql in [
-        "SELECT length(\"Referer\") FROM logs",
-        "SELECT length(\"Referer\"), count(*) FROM logs GROUP BY 1",
+    for (sql, data_type) in [
+        ("SELECT length(\"Referer\") FROM logs", DataType::Int32),
+        (
+            "SELECT length(\"Referer\"), count(*) FROM logs GROUP BY 1",
+            DataType::Int32,
+        ),
+        (
+            "SELECT length(\"Referer\") FROM logs ORDER BY length(\"Referer\")",
+            DataType::Int32,
+        ),
+        (
+            "SELECT count(*) OVER (PARTITION BY length(\"Referer\")) FROM logs",
+            DataType::Int64,
+        ),
     ] {
         let stock_name = stock
             .sql(sql)
@@ -555,7 +659,7 @@ async fn length_keeps_its_output_name_and_type() {
         let (fields, _) = fixture.plan(sql).await;
         assert_eq!(
             fields[0],
-            (stock_name.clone(), DataType::Int32),
+            (stock_name.clone(), data_type.clone()),
             "{sql}: planned name and type"
         );
         assert!(!fields[0].0.contains("CAST("), "{sql}: {fields:?}");
@@ -563,16 +667,14 @@ async fn length_keeps_its_output_name_and_type() {
         let executed = batches.first().expect("rows").schema();
         assert_eq!(
             (executed.field(0).name(), executed.field(0).data_type()),
-            (&stock_name, &DataType::Int32),
+            (&stock_name, &data_type),
             "{sql}: executed name and type"
         );
     }
 }
 
-/// Calls whose result is a string, or the column itself, keep the types they
-/// had before the rule: the rule only touches dictionaries of non-strings.
-/// The expected types are the ones these statements planned to on `main`
-/// before this rule existed.
+/// Calls whose result is a string, and the column itself, keep their stock
+/// DataFusion types: the rule only touches dictionaries of non-strings.
 #[tokio::test]
 async fn string_results_and_the_column_keep_their_types() {
     let production = production_session();
@@ -592,5 +694,157 @@ async fn string_results_and_the_column_keep_their_types() {
             .await
             .unwrap_or_else(|e| panic!("{sql} plans: {e}"));
         assert_eq!((&unoptimized, &optimized), (&expected, &expected), "{sql}");
+    }
+}
+
+/// The rows of `sql`, rendered, so two spellings of one statement compare.
+async fn rendered_rows(fixture: &Fixture, sql: &str) -> String {
+    datafusion::arrow::util::pretty::pretty_format_batches(&fixture.execute(sql).await)
+        .expect("render rows")
+        .to_string()
+}
+
+/// A call an expression planner builds from SQL syntax and the same call
+/// spelled by name are one expression, so a GROUP BY written in one spelling
+/// matches a SELECT written in the other.
+#[tokio::test]
+async fn a_syntax_built_call_matches_its_by_name_spelling() {
+    let fixture = Fixture::build().await;
+    let mut failures = Vec::new();
+    for (mixed, single) in [
+        (
+            "SELECT EXTRACT(HOUR FROM ts) AS g, count(*) AS n FROM logs \
+             GROUP BY date_part('HOUR', ts) ORDER BY 1",
+            "SELECT EXTRACT(HOUR FROM ts) AS g, count(*) AS n FROM logs \
+             GROUP BY EXTRACT(HOUR FROM ts) ORDER BY 1",
+        ),
+        (
+            "SELECT attrs['Referer'] AS g, count(*) AS n FROM logs \
+             GROUP BY get_field(attrs, 'Referer') ORDER BY 1",
+            "SELECT attrs['Referer'] AS g, count(*) AS n FROM logs \
+             GROUP BY attrs['Referer'] ORDER BY 1",
+        ),
+        (
+            "SELECT SUBSTRING(\"Referer\" FROM 1 FOR 3) AS g, count(*) AS n FROM logs \
+             GROUP BY \"substr\"(\"Referer\", 1, 3) ORDER BY 1",
+            "SELECT SUBSTRING(\"Referer\" FROM 1 FOR 3) AS g, count(*) AS n FROM logs \
+             GROUP BY SUBSTRING(\"Referer\" FROM 1 FOR 3) ORDER BY 1",
+        ),
+        (
+            "SELECT position('b' IN \"Referer\") AS g, count(*) AS n FROM logs \
+             GROUP BY strpos(\"Referer\", 'b') ORDER BY 1",
+            "SELECT position('b' IN \"Referer\") AS g, count(*) AS n FROM logs \
+             GROUP BY position('b' IN \"Referer\") ORDER BY 1",
+        ),
+    ] {
+        let accounting = QueryAccounting::new();
+        if let Err(e) = fixture
+            .executor
+            .plan_pinned(
+                tenant().hash(),
+                fixture.snapshot().await,
+                mixed,
+                &accounting,
+                &declared(),
+            )
+            .await
+        {
+            failures.push(format!("{mixed}\n  {e}"));
+            continue;
+        }
+        assert_eq!(
+            rendered_rows(&fixture, mixed).await,
+            rendered_rows(&fixture, single).await,
+            "{mixed}"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A cast the caller names is not one of the wrapped functions, so a
+/// dictionary of integers asked for by name keeps that type.
+#[tokio::test]
+async fn an_explicit_cast_to_a_numeric_dictionary_keeps_its_type() {
+    let production = production_session();
+    let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int64));
+    let (unoptimized, optimized) = planned_types(
+        &production,
+        "SELECT arrow_cast(1, 'Dictionary(Int32, Int64)') AS v",
+    )
+    .await
+    .expect("arrow_cast plans");
+    assert_eq!((unoptimized, optimized), (dictionary.clone(), dictionary));
+    let batches = production
+        .sql("SELECT arrow_typeof(arrow_cast(1, 'Dictionary(Int32, Int64)')) AS t")
+        .await
+        .expect("arrow_typeof plans")
+        .collect()
+        .await
+        .expect("arrow_typeof runs");
+    assert_eq!(
+        array_value_to_string(batches[0].column(0), 0).expect("render"),
+        "Dictionary(Int32, Int64)"
+    );
+}
+
+/// The wrapper's own evaluation casts the inner function's dictionary result
+/// to the value type: a constant-folded call, and a physical expression
+/// built from the wrapped function without simplification, both answer
+/// `Int32`.
+#[tokio::test]
+async fn a_folded_or_unsimplified_call_answers_the_value_type() {
+    let production = production_session();
+    let batches = production
+        .sql("SELECT length(arrow_cast('abc', 'Dictionary(Int32, Utf8)')) AS v")
+        .await
+        .expect("plans")
+        .collect()
+        .await
+        .expect("runs");
+    let folded = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("a folded length is Int32");
+    assert_eq!(folded.values().to_vec(), vec![3]);
+
+    let length = production
+        .state()
+        .scalar_functions()
+        .get("length")
+        .cloned()
+        .expect("length is registered");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "c",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let values: DictionaryArray<Int32Type> = vec!["abc", "a", "abc"].into_iter().collect();
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).expect("batch");
+    let df_schema = DFSchema::try_from(schema.as_ref().clone()).expect("schema");
+    let abc = ScalarValue::Dictionary(
+        Box::new(DataType::Int32),
+        Box::new(ScalarValue::from("abc")),
+    );
+    for (argument, expected) in [(col("c"), vec![3, 1, 3]), (lit(abc), vec![3, 3, 3])] {
+        let call =
+            Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&length), vec![argument]));
+        let physical = create_physical_expr(
+            &call,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .expect("physical");
+        let result = physical
+            .evaluate(&batch)
+            .expect("evaluates")
+            .into_array(batch.num_rows())
+            .expect("array");
+        let lengths = result
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap_or_else(|| panic!("{call} is Int32, got {}", result.data_type()));
+        assert_eq!(lengths.values().to_vec(), expected, "{call}");
     }
 }
