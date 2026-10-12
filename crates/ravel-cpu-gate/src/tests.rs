@@ -741,3 +741,333 @@ fn permits_are_floored_at_one_and_defaults_follow_the_adr() {
         ]
     );
 }
+
+fn multi_thread_runtime(workers: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn floorless_gate_with<S: GateSite>(permits: usize, dispatch: Dispatch) -> Arc<CpuGate<S>> {
+    Arc::new(
+        CpuGate::new(
+            CpuGateConfig {
+                permits,
+                inline_floor_bytes: 0,
+                eval_floor_samples: 0,
+            },
+            Arc::new(InstantClock::new()),
+        )
+        .with_dispatch(dispatch),
+    )
+}
+
+/// The thread a spawned task calls `run` from, and the thread the gated job
+/// ran on.
+fn caller_and_job_threads(
+    dispatch: Dispatch,
+) -> (std::thread::ThreadId, std::thread::ThreadId, CpuGateSnapshot<ReadSite>) {
+    multi_thread_runtime(2).block_on(async move {
+        let gate = floorless_gate_with::<ReadSite>(1, dispatch);
+        let job_gate = Arc::clone(&gate);
+        let (caller, job) = tokio::spawn(async move {
+            let caller = std::thread::current().id();
+            let job = job_gate
+                .run(ReadSite::LogBlock, JobSize::Bytes(1 << 20), || {
+                    std::thread::current().id()
+                })
+                .await
+                .unwrap();
+            (caller, job)
+        })
+        .await
+        .unwrap();
+        (caller, job, gate.snapshot())
+    })
+}
+
+/// Under `InPlace` the job runs on the worker that called `run`, so its
+/// output never changes thread, and it still counts as a permitted job.
+#[test]
+fn in_place_job_runs_on_the_calling_thread() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running one in-place job"),
+        || {
+            let (caller, job, snapshot) = caller_and_job_threads(Dispatch::InPlace);
+            assert_eq!(caller, job, "an in-place job runs on the calling worker");
+            assert_eq!(snapshot.in_place_fallback, 0);
+            assert_eq!((snapshot.wait_count, snapshot.run_count), (1, 1));
+            let site = snapshot.sites[ReadSite::LogBlock.index()];
+            assert_eq!((site.jobs, site.inline), (1, 0));
+            assert_eq!((site.handoff_count, site.return_count), (1, 1));
+        },
+    );
+}
+
+/// The default dispatch hands the job to the blocking pool, another thread.
+#[test]
+fn spawn_blocking_job_runs_on_another_thread() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running one blocking-pool job"),
+        || {
+            assert_eq!(
+                CpuGate::<ReadSite>::new(
+                    CpuGateConfig::with_permits(1),
+                    Arc::new(InstantClock::new())
+                )
+                .dispatch(),
+                Dispatch::SpawnBlocking,
+                "a gate dispatches to the blocking pool unless told otherwise"
+            );
+            let (caller, job, snapshot) = caller_and_job_threads(Dispatch::SpawnBlocking);
+            assert_ne!(caller, job, "a spawn_blocking job runs off the caller");
+            assert_eq!(snapshot.in_place_fallback, 0);
+        },
+    );
+}
+
+/// An in-place job that blocks its worker still leaves that worker's queued
+/// tasks runnable: on a one-worker runtime the job parks until a task spawned
+/// after it releases it. Run inline without `block_in_place`, the job would
+/// hold the only worker, the releasing task would never run, and the
+/// watchdog would fire.
+#[test]
+fn in_place_job_leaves_the_worker_queue_runnable() {
+    run_with_watchdog(
+        WATCHDOG,
+        || {
+            format!(
+                "test hung for {WATCHDOG:?}: the in-place job held the only worker, so the \
+                 task releasing it never ran"
+            )
+        },
+        || {
+            multi_thread_runtime(1).block_on(async {
+                let gate = floorless_gate_with::<ReadSite>(1, Dispatch::InPlace);
+                let (began_tx, mut began_rx) = unbounded_channel();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+                let job_gate = Arc::clone(&gate);
+                let job = tokio::spawn(async move {
+                    job_gate
+                        .run(
+                            ReadSite::SpanBlock,
+                            JobSize::Bytes(u64::MAX),
+                            parked_job(1, began_tx, release_rx),
+                        )
+                        .await
+                });
+                assert_eq!(began_rx.recv().await, Some(1));
+                let release = tokio::spawn(async move {
+                    drop(release_tx);
+                });
+                release.await.unwrap();
+                assert_eq!(job.await.unwrap(), Ok(1));
+                assert_eq!(gate.in_place_fallbacks(), 0);
+            });
+        },
+    );
+}
+
+/// `InPlace` takes the same permit: with one permit, a second job queues
+/// while the first runs and starts only once the first returns.
+#[test]
+fn in_place_permits_cap_running_jobs() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} waiting for the second in-place job to queue"),
+        || {
+            multi_thread_runtime(2).block_on(async {
+                let gate = floorless_gate_with::<ReadSite>(1, Dispatch::InPlace);
+                let (began_tx, mut began_rx) = unbounded_channel();
+                let (first_release, first_rx) = mpsc::channel::<()>();
+                let (second_release, second_rx) = mpsc::channel::<()>();
+
+                let first_gate = Arc::clone(&gate);
+                let first_job = parked_job(1, began_tx.clone(), first_rx);
+                let first = tokio::spawn(async move {
+                    first_gate
+                        .run(ReadSite::LogBlock, JobSize::Bytes(u64::MAX), first_job)
+                        .await
+                });
+                assert_eq!(began_rx.recv().await, Some(1));
+
+                let second_gate = Arc::clone(&gate);
+                let second_job = parked_job(2, began_tx, second_rx);
+                let second = tokio::spawn(async move {
+                    second_gate
+                        .run(ReadSite::LogBlock, JobSize::Bytes(u64::MAX), second_job)
+                        .await
+                });
+                wait_until_queued(
+                    &gate,
+                    &mut began_rx,
+                    1,
+                    "a second in-place job must queue behind the only permit",
+                )
+                .await;
+                assert_eq!(gate.running(), 1);
+
+                drop(first_release);
+                assert_eq!(first.await.unwrap(), Ok(1));
+                assert_eq!(began_rx.recv().await, Some(2));
+                drop(second_release);
+                assert_eq!(second.await.unwrap(), Ok(2));
+
+                let snapshot = gate.snapshot();
+                assert_eq!((snapshot.running, snapshot.queued), (0, 0));
+                assert_eq!((snapshot.wait_count, snapshot.run_count), (2, 2));
+                assert_eq!(snapshot.in_place_fallback, 0);
+            });
+        },
+    );
+}
+
+/// A job that panics inside `block_in_place` is `Panicked` for its caller,
+/// not an unwind through it, and its permit comes back.
+#[test]
+fn in_place_panic_is_an_error_and_releases_its_permit() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?}: a panicked in-place job kept its permit"),
+        || {
+            multi_thread_runtime(2).block_on(async {
+                let gate = floorless_gate_with::<ReadSite>(1, Dispatch::InPlace);
+                let job_gate = Arc::clone(&gate);
+                let failed = tokio::spawn(async move {
+                    job_gate
+                        .run(ReadSite::LogPostings, JobSize::Bytes(1), || -> u32 {
+                            panic!("decode panicked")
+                        })
+                        .await
+                })
+                .await
+                .expect("the panic does not unwind through the caller's task");
+                assert_eq!(failed, Err(CpuGateError::Panicked));
+                assert_eq!(gate.running(), 0);
+                assert_eq!(
+                    gate.run(ReadSite::LogPostings, JobSize::Bytes(1), || 3)
+                        .await,
+                    Ok(3)
+                );
+                let snapshot = gate.snapshot();
+                assert_eq!(snapshot.run_count, 2);
+                assert_eq!(snapshot.in_place_fallback, 0);
+                let site = snapshot.sites[ReadSite::LogPostings.index()];
+                assert_eq!(
+                    (site.handoff_count, site.return_count),
+                    (2, 1),
+                    "a panicked in-place job records its handoff and no post-return"
+                );
+            });
+        },
+    );
+}
+
+/// On a current_thread runtime `block_in_place` would panic, so an `InPlace`
+/// job runs on the blocking pool and the fallback counter moves by one.
+#[test]
+fn in_place_on_a_current_thread_runtime_falls_back() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running a fallen-back job"),
+        || {
+            current_thread_runtime().block_on(async {
+                let gate = floorless_gate_with::<ReadSite>(1, Dispatch::InPlace);
+                let caller = std::thread::current().id();
+                let job = gate
+                    .run(ReadSite::Fold, JobSize::Bytes(1), || {
+                        std::thread::current().id()
+                    })
+                    .await;
+                assert_ne!(job, Ok(caller), "the fallback runs on the blocking pool");
+                assert!(job.is_ok());
+                let snapshot = gate.snapshot();
+                assert_eq!(snapshot.in_place_fallback, 1);
+                assert_eq!(gate.in_place_fallbacks(), 1);
+                let site = snapshot.sites[ReadSite::Fold.index()];
+                assert_eq!((site.jobs, site.handoff_count, site.return_count), (1, 1, 1));
+            });
+        },
+    );
+}
+
+/// Inside a `LocalSet` on a multi-thread runtime the flavor check passes but
+/// `block_in_place` refuses before running the job; the job falls back.
+#[test]
+fn in_place_inside_a_local_set_falls_back() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running a job inside a LocalSet"),
+        || {
+            let runtime = multi_thread_runtime(1);
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async {
+                let gate = floorless_gate_with::<ReadSite>(1, Dispatch::InPlace);
+                assert_eq!(
+                    gate.run(ReadSite::Fold, JobSize::Bytes(1), || 4).await,
+                    Ok(4)
+                );
+                let snapshot = gate.snapshot();
+                assert_eq!(snapshot.in_place_fallback, 1);
+                assert_eq!((snapshot.running, snapshot.run_count), (0, 1));
+            }));
+        },
+    );
+}
+
+/// Under `InPlace` every stamp, the run's included, is taken on the caller's
+/// thread: there is no thread handoff to measure, only `block_in_place`'s
+/// own entry and exit.
+#[test]
+fn in_place_stamps_are_all_taken_on_the_caller_thread() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running one in-place job"),
+        || {
+            let clock = Arc::new(ThreadClock {
+                reads: Mutex::new(Vec::new()),
+            });
+            let (caller, snapshot) = multi_thread_runtime(2).block_on({
+                let clock = Arc::clone(&clock);
+                async move {
+                    tokio::spawn(async move {
+                        let gate = CpuGate::<WriteSite>::new(
+                            CpuGateConfig {
+                                permits: 1,
+                                inline_floor_bytes: 0,
+                                eval_floor_samples: 0,
+                            },
+                            clock,
+                        )
+                        .with_dispatch(Dispatch::InPlace);
+                        let caller = std::thread::current().id();
+                        assert_eq!(
+                            gate.run(WriteSite::LogFlush, JobSize::Bytes(0), || 1).await,
+                            Ok(1)
+                        );
+                        (caller, gate.snapshot())
+                    })
+                    .await
+                    .unwrap()
+                }
+            });
+            let reads = clock.reads.lock().unwrap().clone();
+            assert_eq!(
+                reads,
+                vec![caller; 6],
+                "wait start, wait end, handoff, run start, run end and resume all on the caller"
+            );
+            let site = snapshot.sites[WriteSite::LogFlush.index()];
+            assert_eq!(
+                (site.handoff_nanos_sum, site.return_nanos_sum),
+                (10, 10),
+                "handoff spans handoff stamp to run start, post-return run end to resume"
+            );
+            assert_eq!(snapshot.run_nanos_sum, 10);
+        },
+    );
+}

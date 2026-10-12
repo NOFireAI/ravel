@@ -7,6 +7,12 @@
 //! size is below the gate's inline floor runs on the calling thread and takes
 //! no permit (decision 4).
 //!
+//! A gate built with [`Dispatch::InPlace`] (the dispatch amendment, issue
+//! #2795) takes the same permit and then runs the job on the calling worker
+//! under `tokio::task::block_in_place`, which hands that worker's other queued
+//! tasks to another thread for the job's duration. Where `block_in_place` is
+//! unavailable it falls back to the blocking pool and counts the fallback.
+//!
 //! Cancellation (decision 5): a waiter dropped before it holds a permit never
 //! runs its job. A job that has started runs to completion, because a bulk
 //! codec call cannot be interrupted; if its waiter is gone when it returns,
@@ -18,7 +24,8 @@
 //! Counters (decision 11): the permit count, jobs running and waiters queued
 //! right now, the wait and run time sums and counts, abandoned jobs, and per
 //! call site the jobs dispatched, the jobs run inline, and the handoff and
-//! post-return time sums and counts (the handoff and post-return amendment).
+//! post-return time sums and counts (the handoff and post-return amendment),
+//! and the [`Dispatch::InPlace`] jobs that fell back to the blocking pool.
 //! Times come from an injected [`MonotonicClock`].
 
 mod clock;
@@ -93,6 +100,23 @@ impl CpuGateConfig {
     }
 }
 
+/// Where a gated job runs once it holds a permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dispatch {
+    /// On tokio's blocking pool, through `spawn_blocking` (ADR-1702 decision
+    /// 2).
+    #[default]
+    SpawnBlocking,
+    /// On the calling thread, through `tokio::task::block_in_place`, so the
+    /// job's output never changes thread. The runtime moves the calling
+    /// worker's other queued tasks to another thread while the job runs. On a
+    /// runtime that is not multi-threaded, or anywhere `block_in_place`
+    /// refuses to run (inside a `LocalSet`), the job runs as
+    /// [`Dispatch::SpawnBlocking`] instead and the gate's fallback counter
+    /// moves by one. Experimental (issue #2795).
+    InPlace,
+}
+
 /// Why a gated job produced no result. A caller maps this to its own decode
 /// error; the gate never panics on a job's behalf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -118,6 +142,7 @@ struct Counters {
     run_nanos_sum: AtomicU64,
     run_count: AtomicU64,
     abandoned: AtomicU64,
+    in_place_fallback: AtomicU64,
     /// One entry per site, in [`GateSite::ALL`] order. Shared with the
     /// blocking closure, which records the handoff time.
     sites: Box<[SiteCounters]>,
@@ -138,6 +163,7 @@ pub struct CpuGate<S: GateSite> {
     semaphore: Arc<Semaphore>,
     permits: usize,
     config: CpuGateConfig,
+    dispatch: Dispatch,
     clock: Arc<dyn MonotonicClock>,
     counters: Arc<Counters>,
     _site: PhantomData<fn(S)>,
@@ -157,6 +183,7 @@ impl<S: GateSite> CpuGate<S> {
             semaphore: Arc::new(Semaphore::new(permits)),
             permits,
             config,
+            dispatch: Dispatch::SpawnBlocking,
             clock,
             counters: Arc::new(Counters {
                 sites: S::ALL.iter().map(|_| SiteCounters::default()).collect(),
@@ -164,6 +191,17 @@ impl<S: GateSite> CpuGate<S> {
             }),
             _site: PhantomData,
         }
+    }
+
+    /// The same gate, running permitted jobs as `dispatch` says.
+    pub fn with_dispatch(mut self, dispatch: Dispatch) -> Self {
+        self.dispatch = dispatch;
+        self
+    }
+
+    /// How this gate runs a permitted job.
+    pub fn dispatch(&self) -> Dispatch {
+        self.dispatch
     }
 
     /// Which gate this is.
@@ -191,8 +229,14 @@ impl<S: GateSite> CpuGate<S> {
         self.counters.abandoned.load(Ordering::Acquire)
     }
 
+    /// [`Dispatch::InPlace`] jobs that ran on the blocking pool instead.
+    pub fn in_place_fallbacks(&self) -> u64 {
+        self.counters.in_place_fallback.load(Ordering::Relaxed)
+    }
+
     /// Runs `job` for `site`: inline when `size` is below the matching floor,
-    /// otherwise on the blocking pool once a permit is free.
+    /// otherwise, once a permit is free, on the blocking pool or, under
+    /// [`Dispatch::InPlace`], on the calling thread.
     pub async fn run<F, R>(&self, site: S, size: JobSize, job: F) -> Result<R, CpuGateError>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -232,7 +276,22 @@ impl<S: GateSite> CpuGate<S> {
             site_index,
             permit,
         );
-        let handed_off_at = self.clock.now_nanos();
+        let mut handed_off_at = self.clock.now_nanos();
+        let (running, job) = match self.dispatch {
+            Dispatch::SpawnBlocking => (running, job),
+            Dispatch::InPlace => {
+                match self.run_in_place(running, handed_off_at, job, site_counters) {
+                    Ok(result) => return result,
+                    Err((running, job)) => {
+                        self.counters
+                            .in_place_fallback
+                            .fetch_add(1, Ordering::Relaxed);
+                        handed_off_at = self.clock.now_nanos();
+                        (running, job)
+                    }
+                }
+            }
+        };
         let handle = tokio::task::spawn_blocking(move || {
             let mut running = running;
             let started_at = running.clock.now_nanos();
@@ -266,6 +325,67 @@ impl<S: GateSite> CpuGate<S> {
         }
     }
 
+    /// Runs a permitted job on this thread under `block_in_place`, or hands
+    /// the guard and the unstarted job back when this thread cannot block.
+    ///
+    /// Handoff is measured from `handed_off_at` to the job's first instruction
+    /// and post-return from its last instruction to `block_in_place`
+    /// returning, both on this thread: the cost of moving the worker's core
+    /// away and of leaving the blocking section.
+    #[allow(clippy::type_complexity)]
+    fn run_in_place<F, R>(
+        &self,
+        mut running: JobGuard,
+        handed_off_at: u64,
+        job: F,
+        site_counters: Option<&SiteCounters>,
+    ) -> Result<Result<R, CpuGateError>, (JobGuard, F)>
+    where
+        F: FnOnce() -> R,
+    {
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if !multi_thread {
+            return Err((running, job));
+        }
+        let mut slot = Some(job);
+        // `block_in_place` panics before calling its closure inside a
+        // `LocalSet`; the job is then still in `slot` and falls back.
+        let entered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                let job = slot.take()?;
+                let started_at = running.clock.now_nanos();
+                running.started_at = Some(started_at);
+                running.record_handoff(started_at.saturating_sub(handed_off_at));
+                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).ok();
+                let ended_at = running.clock.now_nanos();
+                if output.is_some() {
+                    running.ended_at = Some(ended_at);
+                }
+                Some(output.map(|output| (output, ended_at)))
+            })
+        }));
+        let resumed_at = self.clock.now_nanos();
+        match entered {
+            Ok(Some(Some((output, ended_at)))) => {
+                drop(running);
+                if let Some(counters) = site_counters {
+                    counters
+                        .return_nanos_sum
+                        .fetch_add(resumed_at.saturating_sub(ended_at), Ordering::Relaxed);
+                    counters.return_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Ok(output))
+            }
+            Err(_) => match slot.take() {
+                Some(job) => Err((running, job)),
+                None => Ok(Err(CpuGateError::Panicked)),
+            },
+            Ok(_) => Ok(Err(CpuGateError::Panicked)),
+        }
+    }
+
     /// Every counter, read once.
     pub fn snapshot(&self) -> CpuGateSnapshot<S> {
         let counters = &self.counters;
@@ -279,6 +399,7 @@ impl<S: GateSite> CpuGate<S> {
             run_nanos_sum: counters.run_nanos_sum.load(Ordering::Relaxed),
             run_count: counters.run_count.load(Ordering::Relaxed),
             abandoned: counters.abandoned.load(Ordering::Acquire),
+            in_place_fallback: counters.in_place_fallback.load(Ordering::Relaxed),
             sites: S::ALL
                 .iter()
                 .zip(counters.sites.iter())
@@ -306,10 +427,13 @@ pub struct CpuGateSnapshot<S> {
     /// Nanoseconds spent waiting for a permit, over waits that got one.
     pub wait_nanos_sum: u64,
     pub wait_count: u64,
-    /// Nanoseconds jobs spent running on the blocking pool, panics included.
+    /// Nanoseconds jobs spent running past their permit, panics included.
     pub run_nanos_sum: u64,
     pub run_count: u64,
     pub abandoned: u64,
+    /// [`Dispatch::InPlace`] jobs that ran on the blocking pool because this
+    /// thread could not block in place.
+    pub in_place_fallback: u64,
     /// One entry per site, in [`GateSite::ALL`] order.
     pub sites: Vec<SiteSnapshot<S>>,
 }
@@ -318,17 +442,23 @@ pub struct CpuGateSnapshot<S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SiteSnapshot<S> {
     pub site: S,
-    /// Jobs that took a permit and were dispatched to the blocking pool.
+    /// Jobs that took a permit and were dispatched, to the blocking pool or
+    /// in place.
     pub jobs: u64,
     /// Jobs below the inline floor, run on the calling thread.
     pub inline: u64,
     /// Nanoseconds from handing a permitted job to `spawn_blocking` to the
     /// job's first instruction on the blocking thread, over jobs that started.
+    /// Under [`Dispatch::InPlace`] the job starts on the calling thread, and
+    /// this is the time from the permit's handoff stamp to the job's first
+    /// instruction inside `block_in_place`.
     pub handoff_nanos_sum: u64,
     pub handoff_count: u64,
     /// Nanoseconds from a job's last instruction to its awaiting caller
     /// resuming, over jobs that returned to a caller still waiting. A job
-    /// that panicked, or whose caller was gone, adds to neither.
+    /// that panicked, or whose caller was gone, adds to neither. Under
+    /// [`Dispatch::InPlace`] it is the time from the job's last instruction
+    /// to `block_in_place` returning on the same thread.
     pub return_nanos_sum: u64,
     pub return_count: u64,
 }
