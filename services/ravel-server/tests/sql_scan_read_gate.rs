@@ -468,19 +468,26 @@ async fn started_server_runs_sql_metrics_catalog_decodes_through_its_read_gate()
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// The `logs` and `spans` statements each arm of the inline A/B runs.
-const INLINE_AB_STATEMENTS: [&str; 2] = [
-    "SELECT ts, body FROM logs ORDER BY ts",
-    "SELECT trace_id, name FROM spans ORDER BY trace_id",
+/// The statements each arm of the inline A/B runs, with each one's row count.
+const INLINE_AB_STATEMENTS: [(&str, i64); 3] = [
+    ("SELECT ts, body FROM logs ORDER BY ts", BLOCKS as i64),
+    (
+        "SELECT trace_id, name FROM spans ORDER BY trace_id",
+        BLOCKS as i64,
+    ),
+    (
+        "SELECT ts, value FROM samples ORDER BY ts",
+        METRIC_SEGMENTS as i64 * METRIC_SAMPLES,
+    ),
 ];
 
 /// Starts a server over `store`, runs [`INLINE_AB_STATEMENTS`], and returns
 /// each statement's rows with the `(jobs, inline)` counts of `log_block`,
-/// `span_block` and `catalog_part` read after both ran.
+/// `span_block`, `segment_section` and `catalog_part` read after they ran.
 async fn run_inline_ab_arm(
     store: Arc<dyn ObjectStoreBackend>,
     scan_decode_inline: bool,
-) -> (Vec<Vec<serde_json::Value>>, [(u64, u64); 3]) {
+) -> (Vec<Vec<serde_json::Value>>, [(u64, u64); 4]) {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let mut config = server_config(tokens);
@@ -498,12 +505,15 @@ async fn run_inline_ab_arm(
     let client = reqwest::Client::new();
 
     let mut rows = Vec::new();
-    for sql in INLINE_AB_STATEMENTS {
-        rows.push(sql_rows(&client, &base, sql).await);
+    for (sql, expected) in INLINE_AB_STATEMENTS {
+        let got = sql_rows(&client, &base, sql).await;
+        assert_eq!(got.len() as i64, expected, "{sql} row count");
+        rows.push(got);
     }
     let sites = [
         read_gate_site(&client, &base, "log_block").await,
         read_gate_site(&client, &base, "span_block").await,
+        read_gate_site(&client, &base, "segment_section").await,
         read_gate_site(&client, &base, "catalog_part").await,
     ];
     running.shutdown().await.expect("graceful shutdown");
@@ -513,8 +523,9 @@ async fn run_inline_ab_arm(
 /// Issue #2795: with `--sql-scan-decode-inline` the `logs` and `spans` scans
 /// decode off the read gate, so `log_block` and `span_block` stay at `(0, 0)`
 /// after both statements, while the catalog's `catalog_part` decode of the
-/// folded snapshot is still counted at the gate, and both statements return
-/// the same rows as a gated server over the same store.
+/// folded snapshot and the `samples` scan's `segment_section` decodes are
+/// still counted at the gate, and every statement returns the same rows as a
+/// gated server over the same store.
 ///
 /// Fails if the flag is parsed but `start` still hands the scans the gate
 /// (the two scan sites read `(0, BLOCKS)`), or if the flag takes the gate off
@@ -526,6 +537,7 @@ async fn sql_scan_decode_inline_server_keeps_scan_decodes_off_the_read_gate() {
     let tenant = TenantId::new(TENANT);
     publish_logs(store.as_ref(), &tenant).await;
     publish_spans(store.as_ref(), &tenant).await;
+    publish_metric_segments(store.as_ref(), &tenant).await;
     // A folded snapshot gives every resolve a `catalog_part` decode.
     let folder = ravel_catalog::Catalog::new(
         store.clone(),
@@ -546,13 +558,10 @@ async fn sql_scan_decode_inline_server_keeps_scan_decodes_off_the_read_gate() {
     let (gated_rows, gated_sites) = run_inline_ab_arm(store.clone(), false).await;
     let (inline_rows, inline_sites) = run_inline_ab_arm(store, true).await;
 
-    for rows in &gated_rows {
-        assert_eq!(rows.len(), BLOCKS as usize, "one row per fixture block");
-    }
     assert_eq!(
-        gated_sites[..2],
-        [(0, BLOCKS), (0, BLOCKS)],
-        "the gated arm counts every scan block decode at the gate"
+        gated_sites[..3],
+        [(0, BLOCKS), (0, BLOCKS), (0, METRIC_SEGMENTS)],
+        "the gated arm counts every scan decode at the gate"
     );
     assert_eq!(
         inline_rows, gated_rows,
@@ -568,10 +577,15 @@ async fn sql_scan_decode_inline_server_keeps_scan_decodes_off_the_read_gate() {
         (0, 0),
         "no spans block decode reaches the read gate"
     );
-    let (jobs, inline) = inline_sites[2];
+    assert_eq!(
+        inline_sites[2],
+        (0, METRIC_SEGMENTS),
+        "the samples scan's catalog decodes stay on the read gate"
+    );
+    let (jobs, inline) = inline_sites[3];
     assert!(
         jobs + inline >= 1,
         "the catalog still decodes its snapshot part on the read gate: {:?}",
-        inline_sites[2]
+        inline_sites[3]
     );
 }
