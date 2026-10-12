@@ -3349,6 +3349,32 @@ fn rspan_block_count(object: &[u8]) -> u64 {
     ravel_rspan::open(object).expect("open footer").block_count
 }
 
+/// The probe-phase bytes a ranged trace read of `object` moves with a
+/// `probe_len` tail probe, for a fixture where that read is exactly three
+/// GETs: the probe, a footer chase, and a SKIP_IDX read. Asserts the geometry
+/// that makes it three: the footer does not fit in the probe, and the SKIP_IDX
+/// section lies wholly before the probe.
+fn three_probe_get_bytes(object: &[u8], probe_len: u64) -> u64 {
+    let size = object.len() as u64;
+    let suffix = &object[object.len() - probe_len as usize..];
+    let chase = match ravel_rspan::open_from_suffix(suffix, size).expect("probe holds the trailer")
+    {
+        ravel_rspan::SuffixOutcome::NeedRange { len, .. } => len,
+        ravel_rspan::SuffixOutcome::Ready(_) => {
+            panic!("fixture: the footer must not fit the probe")
+        }
+    };
+    let footer = ravel_rspan::open(object).expect("open footer");
+    let skip = footer
+        .section(ravel_rspan::footer::kind::SKIP_IDX)
+        .expect("SKIP_IDX section");
+    assert!(
+        skip.offset + skip.len <= size - probe_len,
+        "fixture: SKIP_IDX lies before the probe, so it is a GET of its own"
+    );
+    probe_len + chase + skip.len
+}
+
 /// Run `sql` against `provider` registered as `table` in a plain session.
 async fn run_sql(
     table: &str,
@@ -3539,9 +3565,14 @@ async fn worker_fragment_carries_the_trace_id_pushdown() {
         .iter()
         .map(|f| f.phases.snapshot().scan.s3_bytes(AccountedOp::Get))
         .sum();
-    assert!(
-        probe_gets >= 2 && probe_bytes > 0,
-        "each object's tail probe, footer and sections are probe reads: {probe_gets} GETs, {probe_bytes} bytes"
+    // Per object: the 64-byte tail probe, a footer chase (the footer is longer
+    // than the probe) and a SKIP_IDX read (the section lies before the probe).
+    // No BLOOM read: the statement has no service_name or name predicate.
+    assert_eq!(probe_gets, 6, "three probe GETs per object, two objects");
+    assert_eq!(
+        probe_bytes,
+        three_probe_get_bytes(&obj0, 64) + three_probe_get_bytes(&obj1, 64),
+        "probe bytes are each object's probe, footer chase and SKIP_IDX section"
     );
     assert_eq!(
         scan_gets, 2,

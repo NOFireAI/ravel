@@ -71,7 +71,7 @@
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 8
+//! version       1   = 8, or 9 for a ticket carrying the pushdown block
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -127,8 +127,8 @@
 //!         limit      8   u64
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
-//! [pushdown]        optional slice pushdown block, absent unless a
-//!                   coordinator attached one (see below)
+//! [pushdown]        version 9 only: the slice pushdown block a
+//!                   coordinator attached (see below)
 //!   kind         1   1 = spans, 2 = logs
 //!   ts_lo        1 (+8)  flag 0 = absent, 1 = present, then i64
 //!   ts_hi        1 (+8)  same
@@ -155,13 +155,13 @@
 //! The pushdown block (issue #2755) is how a distributed SQL coordinator
 //! hands a worker the trace id, the time bounds and the prune comparisons it
 //! extracted, so the worker's fragment reads only the blocks they admit. See
-//! [`SlicePushdown`]. It is optional and additive: a ticket without it is the
-//! no-pushdown query, and [`FlightTicket::encode`] never writes it. Only the
-//! slice surface carries it. It sits under the MAC like every other field.
-//! The version stays 8: tickets are ephemeral and minted per request by the
-//! same build that redeems them, and a decoder from before this block
-//! rejects one carrying it as [`FlightTicketError::TrailingBytes`] rather than
-//! misreading it.
+//! [`SlicePushdown`]. A ticket without it is the no-pushdown query, and
+//! [`FlightTicket::encode`] never writes it. Only the slice surface carries
+//! it. It sits under the MAC like every other field. A ticket that carries
+//! the block is version 9; one without it is still version 8, byte for byte,
+//! so a metrics slice or a coordinator built before the block mints exactly
+//! what it always did. See "Version history" below for why the block needs
+//! the bump.
 //!
 //! # Integrity: a keyed MAC, not a checksum
 //!
@@ -304,6 +304,30 @@
 //! never reinterpreted under the v8 layout. Consistent with every earlier
 //! extension, this is a version bump on an ephemeral MAC'd blob, not a `.proto`
 //! schema change and not an ADR of its own.
+//!
+//! # Version history
+//!
+//! - 1: segment key, writer epoch and content hash only.
+//! - 2: every [`SegmentRef`] field, FNV-1a-64 checksum.
+//! - 3: keyed BLAKE3 MAC replaces the checksum.
+//! - 4: `slice_index`/`slice_count` (ADR-0071).
+//! - 5: pending erasure predicates (ADR-0064).
+//! - 6: declared attribute columns (ADR-0090).
+//! - 7: per-segment on-object format version (issue #862).
+//! - 8: pinned Parquet tables and lowered budgets (issue #2240).
+//! - 9: the slice pushdown block after the statement (issue #2755). Written
+//!   only when a pushdown is attached; a ticket without one stays 8, and this
+//!   codec decodes both.
+//!
+//! Every layout change bumps the byte, even though a ticket is ephemeral,
+//! because the build that mints a ticket and the build that redeems it can
+//! differ: a slice ticket is minted by a coordinator and redeemed by a worker
+//! in another process, and during a rolling upgrade the two run different
+//! releases. A decoder that meets a version above its own returns
+//! [`FlightTicketError::UnsupportedVersion`] after the MAC verifies, so skew
+//! reads as skew. Without the bump a version-8 decoder parses up to the
+//! statement and refuses the block as [`FlightTicketError::TrailingBytes`],
+//! which the slice surface could not tell apart from a forged ticket.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
@@ -325,7 +349,12 @@ use crate::spans_pushdown::SpansPushdown;
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
+/// Version of a ticket without the slice pushdown block, and the oldest this
+/// codec decodes.
 const VERSION: u8 = 8;
+/// Version of a ticket carrying the slice pushdown block, and the newest this
+/// codec decodes.
+pub(crate) const VERSION_PUSHDOWN: u8 = 9;
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -779,7 +808,11 @@ impl FlightTicket {
 
         let mut buf = Vec::with_capacity(MIN_ENCODED_LEN + self.statement.len());
         buf.extend_from_slice(&MAGIC);
-        buf.push(VERSION);
+        buf.push(if pushdown.is_some() {
+            VERSION_PUSHDOWN
+        } else {
+            VERSION
+        });
         buf.extend_from_slice(&self.tenant.0);
         buf.extend_from_slice(&self.now_ns.to_le_bytes());
         buf.extend_from_slice(&self.deadline_ns.to_le_bytes());
@@ -856,11 +889,22 @@ impl FlightTicket {
     }
 
     /// [`Self::decode`], also returning the slice pushdown block when the
-    /// ticket carries one. A ticket without the block decodes to `None`,
-    /// which is the no-pushdown query.
+    /// ticket carries one. A version 8 ticket has no block and decodes to
+    /// `None`, which is the no-pushdown query.
     pub fn decode_with_pushdown(
         bytes: &[u8],
         key: &TicketKey,
+    ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
+        Self::decode_up_to(bytes, key, VERSION_PUSHDOWN)
+    }
+
+    /// The decoder for versions [`VERSION`] through `max_version`. Pinned at
+    /// [`VERSION`] it is the decoder from before the pushdown block, which is
+    /// how the tests reproduce an older worker.
+    fn decode_up_to(
+        bytes: &[u8],
+        key: &TicketKey,
+        max_version: u8,
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
         if bytes.len() < MIN_ENCODED_LEN {
             return Err(FlightTicketError::Truncated);
@@ -879,7 +923,7 @@ impl FlightTicket {
             return Err(FlightTicketError::BadMagic);
         }
         let version = cur.read_u8()?;
-        if version != VERSION {
+        if !(VERSION..=max_version).contains(&version) {
             return Err(FlightTicketError::UnsupportedVersion(version));
         }
         let tenant = TenantHash(cur.read_array::<16>()?);
@@ -973,10 +1017,10 @@ impl FlightTicket {
         let statement =
             std::str::from_utf8(stmt_bytes).map_err(|_| FlightTicketError::InvalidUtf8)?;
 
-        let pushdown = if cur.is_empty() {
-            None
-        } else {
+        let pushdown = if version == VERSION_PUSHDOWN {
             Some(read_pushdown(&mut cur)?)
+        } else {
+            None
         };
 
         if !cur.is_empty() {
@@ -2029,7 +2073,7 @@ mod tests {
         let key = test_key();
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
-        body.push(VERSION.wrapping_add(1));
+        body.push(VERSION_PUSHDOWN.wrapping_add(1));
         body.extend_from_slice(&[0u8; 16]);
         body.extend_from_slice(&0i64.to_le_bytes());
         body.extend_from_slice(&0i64.to_le_bytes());
@@ -3074,6 +3118,73 @@ mod tests {
         assert_eq!(carried, None);
     }
 
+    /// A worker built before the pushdown block decodes only version 8. A
+    /// ticket carrying the block is version 9, so that decoder refuses it on
+    /// its version byte, after the MAC verifies, rather than parsing up to the
+    /// statement and calling the block trailing garbage; a ticket without the
+    /// block is still version 8 and that decoder serves it unchanged.
+    #[test]
+    fn a_pre_pushdown_decoder_refuses_a_pushdown_ticket_on_its_version() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        for pushdown in [sample_spans_pushdown(), sample_logs_pushdown()] {
+            let bytes = ticket
+                .encode_with_pushdown(&key, Some(&pushdown))
+                .expect("encode");
+            assert_eq!(bytes[4], 9);
+            assert_eq!(
+                FlightTicket::decode_up_to(&bytes, &key, VERSION),
+                Err(FlightTicketError::UnsupportedVersion(9))
+            );
+        }
+
+        let plain = ticket.encode(&key).expect("encode");
+        assert_eq!(plain[4], 8);
+        assert_eq!(
+            FlightTicket::decode_up_to(&plain, &key, VERSION),
+            Ok((ticket, None))
+        );
+    }
+
+    /// The current decoder takes a version 8 ticket as the no-pushdown
+    /// query, and the block's presence must match the version byte: a
+    /// signed version 8 ticket with a block appended is trailing bytes, and
+    /// a signed version 9 ticket that ends at the statement is truncated.
+    #[test]
+    fn the_pushdown_block_is_present_exactly_when_the_version_is_9() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let resign = |mut body: Vec<u8>| {
+            let tag = mac(&key, &body);
+            body.extend_from_slice(&tag);
+            body
+        };
+
+        let plain = ticket.encode(&key).expect("encode");
+        assert_eq!(plain[4], 8);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&plain, &key),
+            Ok((ticket.clone(), None))
+        );
+
+        let with_block = ticket
+            .encode_with_pushdown(&key, Some(&sample_spans_pushdown()))
+            .expect("encode");
+        let mut v8_with_block = with_block[..with_block.len() - MAC_LEN].to_vec();
+        v8_with_block[4] = VERSION;
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(v8_with_block), &key),
+            Err(FlightTicketError::TrailingBytes)
+        );
+
+        let mut v9_without_block = plain[..plain.len() - MAC_LEN].to_vec();
+        v9_without_block[4] = VERSION_PUSHDOWN;
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(v9_without_block), &key),
+            Err(FlightTicketError::Truncated)
+        );
+    }
+
     /// Plain `decode` accepts a ticket that carries a pushdown and returns
     /// the same ticket, so a surface that ignores the pushdown still serves.
     #[test]
@@ -3311,6 +3422,7 @@ mod tests {
             let key = test_key();
             let plain = sample_ticket().encode(&key).expect("encode");
             let mut body = plain[..plain.len() - MAC_LEN].to_vec();
+            body[4] = VERSION_PUSHDOWN;
             body.extend_from_slice(&tail);
             let tag = mac(&key, &body);
             body.extend_from_slice(&tag);
