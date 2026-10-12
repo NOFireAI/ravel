@@ -3271,7 +3271,8 @@ impl LogsFetchStamp {
         }
         if let Some(measured_concurrency) = self.latency_first_measured_concurrency {
             let precondition_met = self.latency_first_precondition_met() == Some(true);
-            if !precondition_met && self.policy_source == LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK {
+            if !precondition_met && self.policy_source == LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+            {
                 tracing::info!(
                     policy = self.policy,
                     store_get_concurrency = self.store_get_concurrency,
@@ -13231,7 +13232,10 @@ mod tests {
         assert!(line.contains("policy=\"latency-first\""), "{line}");
         assert!(line.contains("store_get_concurrency=32"), "{line}");
         assert!(line.contains("sql_partition_count=32"), "{line}");
-        assert!(line.contains("cost-based has measured slower cold"), "{line}");
+        assert!(
+            line.contains("cost-based has measured slower cold"),
+            "{line}"
+        );
         assert!(!line.contains("default policy"), "{line}");
         drop(lines);
         drop(_guard);
@@ -17714,9 +17718,8 @@ mod tests {
         assert_eq!(cache_lines.len(), 1, "lines: {lines:?}");
         assert!(
             cache_lines[0].contains("value=6666001121")
-                && cache_lines[0].contains(&format!(
-                    "source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\""
-                )),
+                && cache_lines[0]
+                    .contains(&format!("source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\"")),
             "the cache_max_bytes line must carry the 24% value and the loopback source: {}",
             cache_lines[0]
         );
