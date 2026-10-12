@@ -1,7 +1,8 @@
 //! Structural limits: each is accepted at its value and refused one past it,
 //! and the refusal comes before parsing, so a syntax error placed ahead of
 //! the breach does not mask it. The worst shapes the default limits admit
-//! parse, print and drop on a 2 MiB stack.
+//! parse, print, compare with `==`, clone, format with `{:?}` and drop on a
+//! 2 MiB stack.
 
 #![allow(clippy::expect_used)]
 
@@ -213,6 +214,41 @@ fn printed_text_past_the_byte_limit_is_refused_under_that_limit() {
     );
 }
 
+#[test]
+fn nesting_depth_error_says_the_limit_bounds_tree_height() {
+    let limits = Limits::default();
+    let d = limits.max_depth;
+    let at = format!("ROW x = a{}", " OR a".repeat(d - 1));
+    accepted(&at, &limits);
+    let past = format!("ROW x = a{}", " OR a".repeat(d));
+    assert!(!past.contains('('));
+    let span = refused(&past, &limits, LimitKind::NestingDepth);
+    let error = Error::LimitExceeded {
+        limit: LimitKind::NestingDepth,
+        max: d,
+        span,
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "nesting depth limit of 128 exceeded at byte {}; the depth limit bounds syntax \
+             tree height, so a flat chain such as `a OR a OR ...` with more operands than the \
+             limit is refused although it has no brackets",
+            span.start
+        )
+    );
+    // The other limits carry no note.
+    let bytes = Error::LimitExceeded {
+        limit: LimitKind::StatementBytes,
+        max: 9,
+        span: Span::new(9, 13),
+    };
+    assert_eq!(
+        bytes.to_string(),
+        "statement byte limit of 9 exceeded at byte 9"
+    );
+}
+
 /// The deepest expression shapes the default limits admit, one per recursion
 /// path through the parser and printer.
 fn worst_admitted_inputs(limits: &Limits) -> Vec<String> {
@@ -224,6 +260,7 @@ fn worst_admitted_inputs(limits: &Limits) -> Vec<String> {
         format!("{}true", "NOT ".repeat(d - 1)),
         format!("{}1", "-".repeat(d - 1)),
         format!("1{}", " + 1".repeat(d - 1)),
+        format!("a{}", " OR a".repeat(d - 1)),
         format!("1{}", "::long".repeat(d - 1)),
         // Two levels per step, so one more pair of parentheses reaches `d`
         // when it is even.
@@ -252,6 +289,10 @@ fn worst_admitted_input_fits_a_two_mebibyte_stack() {
                 let printed = print(&query, &limits).expect("prints");
                 let reparsed = parse(&printed, &limits).expect("printed text parses");
                 assert!(reparsed.eq_ignoring_spans(&query), "{printed}");
+                let copy = query.clone();
+                assert!(copy == query);
+                assert_eq!(format!("{copy:?}"), format!("{query:?}"));
+                drop(copy);
                 drop(reparsed);
                 drop(query);
                 let one_deeper = format!("ROW x = ({expr})");

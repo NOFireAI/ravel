@@ -9,8 +9,10 @@ use crate::span::{LineCol, Span};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A structural limit was exceeded.
-    #[error("{limit} limit of {max} exceeded at byte {}", .span.start)]
+    /// A structural limit was exceeded. For [`LimitKind::NestingDepth`] the
+    /// message adds that the limit bounds syntax tree height, so a flat chain
+    /// such as `a OR a OR ...` with more operands than the limit is refused.
+    #[error("{limit} limit of {max} exceeded at byte {}{}", .span.start, .limit.note())]
     LimitExceeded {
         /// Which limit.
         limit: LimitKind,
