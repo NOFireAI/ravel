@@ -136,7 +136,9 @@ rule on thread placement.
    owned permit, then runs `f` under `spawn_blocking`. The permit moves into
    the closure and drops when `f` returns. So a dropped waiter can never free
    a permit while its thread still burns CPU. A `JoinError` maps to the
-   caller's decode error, never a panic.
+   caller's decode error, never a panic. (Given an experimental second
+   dispatch for the read gate by the in-place dispatch amendment below; the
+   default is unchanged.)
 
 3. **Two gate instances.** The server builds a read gate for query, catalog
    and maintenance decode. It builds a separate write gate for flush encode
@@ -876,3 +878,47 @@ The default is unchanged: with the flag unset, decision 7 stands as written.
 The flag exists to measure the gate's cost against its liveness benefit.
 Setting it gives up the isolation decision 7 gives scans: a scan over a large
 part holds a worker for the length of each block's decompress.
+
+## Amendment (2026-10-12): the in-place dispatch amendment (issue #2795)
+
+<!-- amendment-applies: sections="Decision" pointer="in-place dispatch amendment" -->
+
+Decision 2 runs every permitted job under `spawn_blocking`. Issue #2795's
+paired-box ClickBench A/B measured the two arms the scan-decode opt-out
+amendment above allows: with SQL logs and spans scan decode inline on the
+polling worker, the hot sum was x0.852 of the gated build's, but `/healthz`
+p99 under concurrent load sat at the sampler's 2.0 s timeout against 0.07 to
+0.34 s gated. To measure a third arm, `CpuGate` gains a dispatch setting,
+`Dispatch::SpawnBlocking` (decision 2, the default) or `Dispatch::InPlace`,
+and `ravel-server` gains `--cpu-gate-read-dispatch` (env
+`RAVEL_CPU_GATE_READ_DISPATCH`, values `spawn-blocking` and `in-place`), which
+sets it on the read gate only. The write gate keeps `spawn_blocking`.
+
+Under `in-place`, `run` takes the permit exactly as decision 2 describes, so
+the permit count still caps how many gated jobs run at once, and the wait,
+run, job and per-site counters are recorded as before. It then runs the job
+on the calling thread through `tokio::task::block_in_place`. The decoded
+output never changes thread, as with inline decode, and the runtime moves the
+calling worker's other queued tasks to another thread while the job runs, so
+the main router's `/healthz` is still served, as with the gate
+(`services/ravel-server/tests/read_gate_in_place_liveness.rs`). A job that
+panics is caught on that thread and is `CpuGateError::Panicked` for its
+caller, as on the blocking pool. Abandonment (decision 5) cannot happen in
+this mode: the caller does not yield between the job's start and its return.
+
+`block_in_place` panics on a `current_thread` runtime and inside a
+`LocalSet`. The gate checks the runtime flavor first, and catches a refusal
+that happens before the job starts; either way the job runs under
+`spawn_blocking` instead, and `ravel_cpu_gate_in_place_fallback_total{gate}`
+counts it, so the A/B can see whether the mode ran.
+
+The handoff and post-return amendment's two windows keep their names and
+stamps. With no thread change, handoff is the time from the stamp taken after
+the permit is acquired to the job's first clock reading inside
+`block_in_place`, which covers handing the worker's queued tasks to another
+thread; post-return is the time from the job's last clock reading to
+`block_in_place` returning on the same thread.
+
+The default is unchanged: with the flag unset, decision 2 stands as written.
+The mode is experimental and exists for the #2795 A/B; startup logs which
+mode the read gate runs in.
