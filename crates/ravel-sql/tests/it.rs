@@ -36,6 +36,8 @@ mod deadline;
 mod distinct_on;
 #[path = "erasure_dedup_positions.rs"]
 mod erasure_dedup_positions;
+#[path = "exact_typed_classification_q29.rs"]
+mod exact_typed_classification_q29;
 #[path = "expr_planner_surface.rs"]
 mod expr_planner_surface;
 #[path = "extract_field.rs"]
