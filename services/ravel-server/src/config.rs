@@ -3722,9 +3722,10 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 ///
 /// ADR-2023 first set this share at 40%, sized to hold the ClickBench
 /// corpus's whole objects. Its 2026-10-12 amendment (ADR-2677 decision 7)
-/// lowered it to 24%, one point under [`CACHE_MEMORY_PERCENT`]: on four
-/// ClickBench c6a.4xlarge machines over RustFS, an explicit 7 GB fetch cache
-/// (23.8% of their budget) brought the pooled concurrent error ratio from
+/// lowered it to 24%, one point under [`CACHE_MEMORY_PERCENT`]: in ClickBench
+/// over RustFS, one run per arm on four c6a.4xlarge boxes, an explicit 7 GB
+/// fetch cache (23.8% of their budget) brought the pooled concurrent error
+/// ratio from
 /// 0.099 at the 40% carve to 0.029 with the same hot sum (59.92 s against
 /// 59.90 s). The carve comes out of the budget whose remainder queries and
 /// fetches share, and on stock main 60% of concurrent refusals were that

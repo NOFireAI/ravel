@@ -170,7 +170,9 @@ concurrent queries on the ClickBench reference machine, the loopback
 `byte-minimal` default cut throughput from about 0.40 to 0.12 queries per
 second, and reached 0.170 even with a corpus-sized fetch cache (#2014, #2023).
 ADR-2023 decision 1 withdraws the exception: with `--logs-fetch-policy` unset,
-every deployment resolves `cost-based` again, as this ADR decided.
+every deployment resolves `cost-based` again, as this ADR decided. ADR-2023's
+issue #2683 amendment adds a different one: with the flag unset, a loopback
+store resolves `latency-first`.
 
 ## Amendment (2026-10-03, ADR-2414): the time-term amendment
 

@@ -217,9 +217,10 @@ struct Args {
     /// the rate from the pass's store cost profile, which at the reference
     /// intra-region profile resolves to request-minimal behaviour.
     ///
-    /// The default therefore measures the shape a stock server produces,
-    /// including against a loopback `--s3-endpoint` (ADR-2023 decision 1
-    /// resolves `cost-based` there too, with no loopback exception). Before
+    /// The default measures the shape a stock server produces against a
+    /// remote `--s3-endpoint`. Against a loopback endpoint a stock server
+    /// resolves `latency-first` instead (ADR-2023's loopback amendment), so
+    /// pass `--logs-fetch-policy latency-first` to measure that shape. Before
     /// this flag existed the bench routed at a fixed 512 KiB threshold whatever
     /// the request cost said, so a full-scan statement range-read every object
     /// per block while the server read each one whole; pass `byte-minimal` to

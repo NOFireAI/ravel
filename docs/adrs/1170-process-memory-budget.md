@@ -459,8 +459,9 @@ per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
 the shared remainder equals the budget by construction, and startup refuses a
 flag combination whose hard caps alone exceed it (the 2026-09-07 amendment
 below exempts `--disable-cache` from this refusal). On a loopback store the
-fetch cache takes a larger share, and `--cache-max-bytes` no longer sizes the
-catalog cache: see the loopback amendment below. A gateway derives no budget
+fetch cache takes its own share, and `--cache-max-bytes` no longer sizes the
+catalog cache: see the loopback amendment below, and the loopback share
+amendment for the share's current value. A gateway derives no budget
 and is not refused: see the gateway amendment below. The budget no longer
 starts from all of `MemTotal` on a host without a cgroup limit: see the
 available-memory amendment below.
@@ -756,7 +757,8 @@ below). The M5 reserve calibration (#1256) remains open.
 
 Decision 3's 25% fetch-cache share stays for every deployment except one whose
 store is on loopback. There the fetch cache derives at a larger share, measured
-against the concurrent phase before it ships (ADR-2023, #2014).
+against the concurrent phase before it ships (ADR-2023, #2014). The loopback
+share amendment below lowers it to 24%, under the remote 25%.
 `--cache-max-bytes` bounds the fetch cache only; the catalog byte cache derives
 at its own share unless `--catalog-cache-max-bytes` sets it. The refusal of a
 combination whose caps exceed `memory_budget_bytes` is unchanged.
@@ -984,7 +986,8 @@ cache:
 | loopback (the ClickBench entry's local RustFS) | 40%, 11,110,001,868 | 1,388,750,233 | 15,276,252,571 | **13,748,627,313, capped by item 3** |
 
 The loopback row is the case item 3 exists for: 90% of the remainder after the
-larger cache carve is below 50% of `MemTotal`. Both pool values are above q33's
+larger cache carve is below 50% of `MemTotal` (the loopback share amendment
+below changes this row: at 24% the cap no longer binds). Both pool values are above q33's
 measured peak reservation of 10,855,811,936 bytes, so the claim of 43 of 43
 statements in the stock configuration still holds by derivation on both stores.
 It is re-measured stock on that host before this lands.
@@ -1233,3 +1236,22 @@ available-memory amendment's decision 3. Out of scope and unchanged: a DDL
 `LOCATION` snapshot whose footer read the budget refuses still answers 503
 when that read alone fits the budget's limit, and 422 when it does not
 (`DdlExecuteError::Snapshot` in `crates/ravel-sql/src/ddl.rs`, #2840).
+
+## Amendment (2026-10-12, ADR-2023 issue #2683 amendment): the loopback fetch-cache share is 24%
+
+<!-- amendment-applies: sections="3. A static carve under one number|Amendment (2026-09-26, ADR-2023): a loopback fetch-cache share and a catalog cache sized on its own|Amendment (2026-10-03, issue #2367): the budget starts from available memory" pointer="loopback share amendment" -->
+
+This is the loopback share amendment. ADR-2023's issue #2683 amendment lowers
+the loopback fetch-cache share from 40% to 24% of `memory_budget_bytes`, one
+point under decision 3's 25% remote share, which is unchanged. A loopback
+store's remainder is therefore one point larger than a remote store's, not 15
+points smaller, and the 90% remainder cap on the derived SQL pools no longer
+binds there on the reference box: the remainder is 19,720,253,318 bytes, its
+90% is 17,748,227,986, and both pools stay at 16,451,897,344.
+
+The loopback fetcher cache on that box falls to 6,666,001,121 bytes, which
+no longer holds the 9,844,635,064-byte corpus the available-memory amendment
+sized the 40% share against. A 7 GB cache, 23.8% of a 29.4 GB budget,
+measured the same hot sum as the 40% share (59.92 s against 59.90 s,
+ADR-2023's issue #2683 amendment), so on that corpus the set the warm runs
+re-read fit in 7 GB; 6.67 GB itself was not measured.

@@ -304,7 +304,17 @@ in comment 6115323679). That run set both by flag on the code before this
 amendment: a 3.1 GB cache, about 24% of its 13.2 GB budget, and
 `latency-first`. Against stock it read a pooled error ratio of 0.259
 against 0.282, 0.313 QPS against 0.310, and a cold sum of 357.0 s against
-453.1 s, and it refused no statement that stock answers. Its minimum `MemAvailable` was 0.11 GB, and it spent several
-times stock's time below the host memory gate's floor, so the margin at
-16 GB is thinner than at 32 GB.
+453.1 s, and it refused no statement that stock answers. Its minimum
+`MemAvailable` was 0.11 GB, and it spent several times stock's time below
+the host memory gate's floor, so the margin at 16 GB is thinner than at
+32 GB.
+
+Decision 4 was not re-run for this amendment, and no stock run of the
+shipped defaults exists yet. Its control-arm rule credits a share raised
+above the remote 25%, on hot sum or QPS. This amendment lowers the share to
+one point under 25%, and on those two metrics the carve alone tied on hot
+sum (59.92 s against 59.90 s) and cost 11% of QPS (0.512 against 0.574): its
+gain is the error ratio, which decision 4 does not credit. The next stock
+release measurement is the run that checks the shipped defaults against
+decision 4's four bars.
 

@@ -583,7 +583,8 @@ admitted `date_part`.
 
 The bar, measured through `ravel-server` on the reference machine with
 loopback RustFS. Every figure is stamped with the fetch-cache size the
-server derived (40% of the memory budget on a loopback store, ADR-2023)
+server derived (40% of the memory budget on a loopback store, ADR-2023;
+24% since ADR-2023's issue #2683 amendment)
 and the per-query memory cap:
 
 - **Correctness.**
