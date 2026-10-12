@@ -2364,7 +2364,7 @@ builds that feature; a source build reaches this code only by asking for it.
 #### Pushdown on the slice ticket (logs and spans)
 
 A worker fragment scans under the coordinator's pushdown, so it decodes only
-the blocks the predicate admits instead of its whole slice (issue #2755). The
+the blocks the predicate admits instead of its whole slice. The
 coordinator extracts the pushdown from the statement's filters exactly as the
 single-node scan does (`extract_spans`, `extract_logs`), and
 `DistributedSliceScanExec` hands it to `WorkerSliceClient::fetch_slice_with_pushdown`
@@ -2382,8 +2382,8 @@ The pushdown-aware fragment is built by the provider's
 `worker_fragment_with_pushdown`. No production `DoGet` calls it yet: the Flight
 SQL service's slice `DoGet` decodes the ticket with `SqlTicketKeys::decode`,
 which validates and drops the block, and serves only the metrics samples scan
-(`crates/ravel-sql/src/flight/service.rs`). Issue #2899 wires a logs and spans
-slice `DoGet` to it. Nor does production mint the block yet: the executor
+(`crates/ravel-sql/src/flight/service.rs`). A logs and spans slice `DoGet`
+that executes it is not built yet. Nor does production mint the block yet: the executor
 installs a distributed scan on the metrics provider only, and a metrics slice
 carries no block. What follows describes the fragment as
 `worker_fragment_with_pushdown` builds it, which the tests in
