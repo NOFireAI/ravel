@@ -583,9 +583,11 @@ admitted `date_part`.
 
 The bar, measured through `ravel-server` on the reference machine with
 loopback RustFS. Every figure is stamped with the fetch-cache size the
-server derived (40% of the memory budget on a loopback store, ADR-2023;
-24% since ADR-2023's issue #2683 amendment)
-and the per-query memory cap:
+server derived (40% of the memory budget on a loopback store, ADR-2023),
+the logs fetch policy it resolved, and the per-query memory cap. Since
+ADR-2023's issue #2683 amendment a stock loopback server derives a 24%
+share and resolves `latency-first`, so figures from either side of that
+change are compared only with both stamps read:
 
 - **Correctness.**
   - Every statement's rows are compared with datafusion-cli's on arm B's

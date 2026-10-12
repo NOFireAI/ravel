@@ -499,11 +499,14 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   still read whole; `latency-first`
   resolves the byte-minimizing quantities as an intent rather than from prices,
   and pays off only at the concurrency its trade was measured at, which a pass
-  sets with `--fetch-concurrency`. So a bench run at
-  default flags measures the shape a stock server produces, loopback
-  `--s3-endpoint` or not (ADR-2023 decision 1): roughly one GET per object
-  for a full-scan statement, not one per block, including against the
-  ClickBench entry's local RustFS. Before the flag existed
+  sets with `--fetch-concurrency` (on a loopback store it also measured
+  faster cold at the core-derived concurrency, ADR-2023's issue #2683
+  amendment). So a bench run at default flags measures the shape a stock
+  server produces against a remote `--s3-endpoint`: roughly one GET per
+  object for a full-scan statement, not one per block. Against the
+  ClickBench entry's local RustFS a stock server resolves `latency-first`
+  instead, so pass `--logs-fetch-policy latency-first` to measure that
+  shape (#2920 tracks the bench default). Before the flag existed
   the bench routed at a fixed 512 KiB threshold, which range-read every larger
   object per block and made an in-process table incomparable with the server's;
   pass `byte-minimal` to reach that older shape deliberately. The requested
