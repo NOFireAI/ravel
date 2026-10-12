@@ -435,8 +435,8 @@ grep -E "watermark_hour|seal_through_hour|buckets_folded|entry_count|part_bytes"
 Check the output before continuing. `--signal` is not optional in practice: a
 fold defaulting to the wrong signal on a logs-only tenant succeeds and seals
 nothing. `seal_through_hour` names the hour the fold sealed through, and
-`entry_count` should be close to the number of objects the load wrote. If the
-fold covered under 80% of them, the shard count or signal is wrong.
+`entry_count` should be at least 0.8 of the number of objects the load wrote.
+If the fold covered under 80% of them, the shard count or signal is wrong.
 
 ### Declare the typed columns
 
@@ -541,7 +541,13 @@ differs between them.
 **With the kit.** `run.toml`'s `memory_budget_bytes` is that pinned value,
 the same on both arms. `box/run.sh` writes the binaries and every server flag
 to `/root/kit/arm.env` once and every server start sources it, so a restart
-runs the flags the first start ran. Its `benchmark` phase runs each statement
+runs the flags the first start ran. The load must report `rows_written` equal
+to `run.toml`'s `rows_expected` (99,997,497 for `hits.parquet`), or the box
+fails at step `load`. After the declare, a `verify` step sends the corpus's
+`q01` (`SELECT COUNT(*) FROM logs`) once through the same endpoint and window
+the benchmark uses; an answer other than `rows_expected` fails the box at step
+`verify` before any statement is timed, and the three counts are stamped as
+`provenance.row_count`. Its `benchmark` phase runs each statement
 cold (server restarted, page cache dropped) and then twice hot, and every
 call goes through `run_query`, which records it in
 `out/benchmark/calls.jsonl`. Every request body carries an explicit `start`
@@ -551,10 +557,13 @@ otherwise reads only the last hour. Each answer's row count is checked against
 the statement's `expected_rows` in `hits.corpus.json`, or, where that is null,
 against the cold try's count; a mismatch is recorded as a `wrong_answer` error
 and counts in the pooled error rate. `results.json` has the shape of
-`sql_latency_bench`'s report: an `entries` array of `id`, `min_ms` (fastest of
-the three tries), `cold_ms` and `per_run_accounting` (null over HTTP), a
-`failed` array of `id`, `run` and `error`, and the provenance and band
-verdicts as further top-level keys. The box
+`sql_latency_bench`'s report: an `entries` array of `id`, `min_ms` (the hot
+figure: the best of tries 2 and 3), `cold_ms` (try 1), `median_ms` and
+`max_ms` (over all three tries) and `per_run_accounting` (null over HTTP), a
+`failed` array of `id`, `run` and `error`, a `timing_definition` string that
+states those definitions, and the provenance and band verdicts as further
+top-level keys. `sql_latency_bench`'s own `min_ms` is over all three runs, so
+the two are not the same figure. The box
 then writes `results.json`, `evidence.tgz` and `progress.log`, uploads them
 with `DONE` (or `FAILED`, naming the step) to its `out/<arm>/` prefix, and
 terminates itself.
@@ -1028,9 +1037,15 @@ single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
 each arm's absolute bands and then arm B's relative bands against arm A, and
 exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
 3 on timeout and 4 when S3 is unreachable or a download fails with anything
-but a missing object (a 403 included); two arms whose corpus digests,
-mapping digests, `hardware.cpu` or RustFS versions differ are not compared
-and exit 2, naming the field. The script above reads an arm's
+but a missing object (a 403 included). Two arms whose dataset, mapping or
+corpus digest, `hardware.cpu`, RustFS version, audit mode, query window length
+(`window_hours`) or resolved server settings differ, or that were judged by
+different band sections, are not compared and exit 2, naming the field; each
+arm's binary is not compared, since that is what differs by design. Arm B's
+relative bands also miss when fewer statements than the band file's
+`min_both_answered` were answered by both arms, when either arm answered none,
+and when a statement both answered returned a different row count on B than
+on A; each such miss names the statements. The script above reads an arm's
 `results.json` unchanged, and its sums match the kit's. Its cost-class bands
 need `per_run_accounting`, which the HTTP endpoint does not return, so on a
 kit report it lists each statement as `no per_run_accounting; cold cost not

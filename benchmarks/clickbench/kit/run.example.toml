@@ -52,6 +52,11 @@ dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
 # The dataset's sha256. A box whose download has another digest fails, and
 # fetch.sh refuses two arms that did not load the same dataset.
 dataset_sha256 = "FILL-IN-DATASET-SHA256"
+# The rows the dataset holds: hits.parquet has 99,997,497. The load must report
+# exactly this many rows_written, and SELECT COUNT(*) FROM logs (the corpus's
+# q01, sent once before the benchmark through the same endpoint and window)
+# must answer it, or the box fails at step load or step verify.
+rows_expected = 99997497
 
 # The loopback RustFS release the store runs on, pinned by digest.
 rustfs_url = "FILL-IN-RUSTFS-RELEASE-URL"
@@ -66,7 +71,7 @@ audit_mode = "off"
 # Optional: expected_statements (default 43), fold_min_entry_ratio (default
 # 0.8), query_timeout_s (default 900), window_hours (default 200000). Every
 # statement is sent with an explicit start and end window_hours apart, ending
-# when the benchmark phase starts, as sql_latency_bench --window-hours does;
+# when the verify step starts, as sql_latency_bench --window-hours does;
 # without one the server reads only the last hour.
 
 # One band file per lane, relative to the repository root.
