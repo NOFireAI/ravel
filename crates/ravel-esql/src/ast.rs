@@ -383,7 +383,10 @@ pub(crate) fn interval_unit_kind(unit: &str) -> Option<IntervalKind> {
         .any(|u| u.eq_ignore_ascii_case(unit))
     {
         Some(IntervalKind::TimeDuration)
-    } else if DATE_PERIOD_UNITS.iter().any(|u| u.eq_ignore_ascii_case(unit)) {
+    } else if DATE_PERIOD_UNITS
+        .iter()
+        .any(|u| u.eq_ignore_ascii_case(unit))
+    {
         Some(IntervalKind::DatePeriod)
     } else {
         None

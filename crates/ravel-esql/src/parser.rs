@@ -12,15 +12,15 @@
 //! neither the parser's recursion nor the finished tree exceeds the limit.
 
 use crate::ast::{
-    interval_unit_kind, prec, Aggregate, ArrayLiteral, Binary, BinaryOp, Call, CallArgs, Cast,
-    Command, DropCommand, EvalCommand, Expr, Field, FromCommand, InList, Interval, IsNull,
-    KeepCommand, Like, LikeKind, LimitCommand, Literal, LiteralValue, Metadata, NamePart,
-    NullsOrder, Parameter, QualifiedName, Query, RenameCommand, RenamePair, RowCommand,
-    SortCommand, SortKey, SortOrder, SourcePattern, StatsCommand, Unary, UnaryOp, WhereCommand,
+    Aggregate, ArrayLiteral, Binary, BinaryOp, Call, CallArgs, Cast, Command, DropCommand,
+    EvalCommand, Expr, Field, FromCommand, InList, Interval, IsNull, KeepCommand, Like, LikeKind,
+    LimitCommand, Literal, LiteralValue, Metadata, NamePart, NullsOrder, Parameter, QualifiedName,
+    Query, RenameCommand, RenamePair, RowCommand, SortCommand, SortKey, SortOrder, SourcePattern,
+    StatsCommand, Unary, UnaryOp, WhereCommand, interval_unit_kind, prec,
 };
 use crate::error::Error;
 use crate::guard;
-use crate::lexer::{tokenize, Token, TokenKind};
+use crate::lexer::{Token, TokenKind, tokenize};
 use crate::limits::{LimitKind, Limits};
 use crate::span::Span;
 
@@ -196,7 +196,11 @@ impl<'a> Parser<'a> {
     fn unexpected(&self, expected: &'static str) -> Error {
         match self.peek() {
             Some(token) => {
-                let text: String = self.text(token.span).chars().take(FOUND_MAX_CHARS).collect();
+                let text: String = self
+                    .text(token.span)
+                    .chars()
+                    .take(FOUND_MAX_CHARS)
+                    .collect();
                 Error::UnexpectedToken {
                     found: format!("`{text}`"),
                     expected,
@@ -254,7 +258,7 @@ impl<'a> Parser<'a> {
             return Err(self.unexpected(EXPECTED));
         };
         match keyword.as_str() {
-            "FROM" => self.from_command(span),
+            "FROM" => self.parse_from_command(span),
             "ROW" => self.row_command(span),
             k if UNSUPPORTED_SOURCE.contains(&k) => Err(Error::UnsupportedSyntax {
                 command: keyword,
@@ -298,7 +302,7 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
-    fn from_command(&mut self, keyword: Span) -> Result<Command, Error> {
+    fn parse_from_command(&mut self, keyword: Span) -> Result<Command, Error> {
         self.bump();
         let sources = self.comma_list(|p| p.source_pattern())?;
         let mut end = sources.last().map_or(keyword, |s| s.span);
@@ -427,7 +431,9 @@ impl<'a> Parser<'a> {
                     Some(_) => Some(p.expr()?),
                     None => None,
                 };
-                let span = field.span.to(filter.as_ref().map_or(field.span, Expr::span));
+                let span = field
+                    .span
+                    .to(filter.as_ref().map_or(field.span, Expr::span));
                 Ok(Aggregate {
                     field,
                     filter,
@@ -583,15 +589,15 @@ impl<'a> Parser<'a> {
     /// `name = expr` or `expr`.
     fn field(&mut self) -> Result<Field, Error> {
         let save = self.pos;
-        if let Ok(name) = self.qualified_name() {
-            if self.eat(&TokenKind::Assign).is_some() {
-                let expr = self.expr()?;
-                return Ok(Field {
-                    span: name.span.to(expr.span()),
-                    name: Some(name),
-                    expr,
-                });
-            }
+        if let Ok(name) = self.qualified_name()
+            && self.eat(&TokenKind::Assign).is_some()
+        {
+            let expr = self.expr()?;
+            return Ok(Field {
+                span: name.span.to(expr.span()),
+                name: Some(name),
+                expr,
+            });
         }
         self.pos = save;
         let expr = self.expr()?;
@@ -728,9 +734,9 @@ impl<'a> Parser<'a> {
                 break;
             }
             if lbp == prec::COMPARISON && lhs.bound == prec::COMPARISON {
-                return Err(self.unexpected(
-                    "`AND`, `OR`, `|` or end of input (comparisons do not chain)",
-                ));
+                return Err(
+                    self.unexpected("`AND`, `OR`, `|` or end of input (comparisons do not chain)")
+                );
             }
             lhs = match infix {
                 Infix::Binary(BinaryOp::Match) => self.match_rhs(lhs)?,
@@ -1026,7 +1032,10 @@ impl<'a> Parser<'a> {
                 operand: Box::new(literal.expr),
                 span: token.span.to(number.span),
             });
-            return Ok((self.node(expr, literal.height, prec::UNARY)?, ConstantKind::Number));
+            return Ok((
+                self.node(expr, literal.height, prec::UNARY)?,
+                ConstantKind::Number,
+            ));
         }
         let (expr, kind) = match &token.kind {
             TokenKind::Integer => (

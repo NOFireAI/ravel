@@ -50,7 +50,7 @@ impl LineCol {
         let mut line = 1;
         let mut column = 1;
         for (index, c) in source.char_indices() {
-            if index >= offset {
+            if index + c.len_utf8() > offset {
                 break;
             }
             if c == '\n' {

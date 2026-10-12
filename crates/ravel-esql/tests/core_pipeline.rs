@@ -10,7 +10,7 @@ use ravel_esql::ast::{
     Parameter, QualifiedName, Query, RenameCommand, RenamePair, RowCommand, SortCommand, SortKey,
     SortOrder, SourcePattern, StatsCommand, Unary, UnaryOp, WhereCommand,
 };
-use ravel_esql::{parse, print, Limits, Span};
+use ravel_esql::{Limits, Span, parse, print};
 
 const NO_SPAN: Span = Span::new(0, 0);
 
@@ -19,7 +19,8 @@ fn parsed(source: &str) -> Query {
 }
 
 fn slice(source: &str, span: Span) -> &str {
-    span.slice(source).expect("span falls on character boundaries")
+    span.slice(source)
+        .expect("span falls on character boundaries")
 }
 
 fn name(dotted: &str) -> QualifiedName {
@@ -204,11 +205,7 @@ fn parses_both_adr_acceptance_pipelines_with_spans() {
                 condition: bin(
                     BinaryOp::GtEq,
                     col("@timestamp"),
-                    bin(
-                        BinaryOp::Sub,
-                        call("NOW", vec![]),
-                        interval("1", "hour"),
-                    ),
+                    bin(BinaryOp::Sub, call("NOW", vec![]), interval("1", "hour")),
                 ),
                 span: NO_SPAN,
             }),
@@ -221,10 +218,7 @@ fn parses_both_adr_acceptance_pipelines_with_spans() {
                 groupings: vec![
                     field(
                         Some("window"),
-                        call(
-                            "BUCKET",
-                            vec![col("@timestamp"), interval("5", "minutes")],
-                        ),
+                        call("BUCKET", vec![col("@timestamp"), interval("5", "minutes")]),
                     ),
                     field(None, col("service.name")),
                 ],
@@ -245,7 +239,10 @@ fn parses_both_adr_acceptance_pipelines_with_spans() {
     let Command::From(from_cmd) = &q.source else {
         panic!("expected FROM");
     };
-    assert_eq!(slice(first, from_cmd.span), "FROM logs-prod-* METADATA _index");
+    assert_eq!(
+        slice(first, from_cmd.span),
+        "FROM logs-prod-* METADATA _index"
+    );
     assert_eq!(slice(first, from_cmd.sources[0].span), "logs-prod-*");
     let metadata = from_cmd.metadata.as_ref().expect("metadata");
     assert_eq!(slice(first, metadata.span), "METADATA _index");
@@ -372,14 +369,18 @@ fn parses_both_adr_acceptance_pipelines_with_spans() {
         panic!("expected STATS");
     };
     assert_eq!(
-        slice(second, stats.aggregates[0].filter.as_ref().expect("filter").span()),
+        slice(
+            second,
+            stats.aggregates[0].filter.as_ref().expect("filter").span()
+        ),
         "log.level == \"ERROR\""
     );
 }
 
 #[test]
 fn per_aggregate_where_attaches_to_its_own_aggregate() {
-    let source = "FROM t | STATS a = COUNT(*) WHERE x == 1, b = SUM(y), c = MAX(y) WHERE x == 2 BY g";
+    let source =
+        "FROM t | STATS a = COUNT(*) WHERE x == 1, b = SUM(y), c = MAX(y) WHERE x == 2 BY g";
     let expected = query(
         from(&["t"], &[]),
         vec![Command::Stats(StatsCommand {
@@ -443,7 +444,8 @@ fn stats_with_only_by_and_with_only_aggregates() {
 
 #[test]
 fn row_command_with_literals() {
-    let source = "ROW a = 1, b = 2.5, c = \"x\\ty\", d = null, e = TRUE, f = false, g = [1, -2, 3.0], 1e3";
+    let source =
+        "ROW a = 1, b = 2.5, c = \"x\\ty\", d = null, e = TRUE, f = false, g = [1, -2, 3.0], 1e3";
     let q = assert_tree(
         source,
         &query(
@@ -518,7 +520,10 @@ fn from_command_forms() {
         panic!("expected FROM");
     };
     assert_eq!(slice(source, f.sources[1].span), "\"other index\"");
-    assert_eq!(slice(source, f.metadata.as_ref().expect("metadata").span), "metadata _index, _id");
+    assert_eq!(
+        slice(source, f.metadata.as_ref().expect("metadata").span),
+        "metadata _index, _id"
+    );
 }
 
 #[test]
@@ -556,7 +561,10 @@ fn eval_command_assigns_and_keeps_spelling() {
     let Command::Eval(eval) = &q.processing[0] else {
         panic!("expected EVAL");
     };
-    assert_eq!(slice(source, eval.span), "eval `odd name` = Length(msg), y = x::LONG, `a``b`.c");
+    assert_eq!(
+        slice(source, eval.span),
+        "eval `odd name` = Length(msg), y = x::LONG, `a``b`.c"
+    );
     assert_eq!(slice(source, eval.fields[1].expr.span()), "x::LONG");
     let Expr::Field(qualified) = &eval.fields[2].expr else {
         panic!("expected a field");
@@ -784,11 +792,19 @@ fn intervals_have_kinds() {
 fn and_binds_tighter_than_or() {
     assert_where(
         "a OR b AND c",
-        &bin(BinaryOp::Or, col("a"), bin(BinaryOp::And, col("b"), col("c"))),
+        &bin(
+            BinaryOp::Or,
+            col("a"),
+            bin(BinaryOp::And, col("b"), col("c")),
+        ),
     );
     assert_where(
         "a AND b OR c",
-        &bin(BinaryOp::Or, bin(BinaryOp::And, col("a"), col("b")), col("c")),
+        &bin(
+            BinaryOp::Or,
+            bin(BinaryOp::And, col("a"), col("b")),
+            col("c"),
+        ),
     );
 }
 
@@ -796,7 +812,11 @@ fn and_binds_tighter_than_or() {
 fn multiplication_binds_tighter_than_addition() {
     assert_where(
         "a + b * c",
-        &bin(BinaryOp::Add, col("a"), bin(BinaryOp::Mul, col("b"), col("c"))),
+        &bin(
+            BinaryOp::Add,
+            col("a"),
+            bin(BinaryOp::Mul, col("b"), col("c")),
+        ),
     );
     assert_where(
         "a * b + c % d",
@@ -847,15 +867,27 @@ fn unary_minus_binds_tighter_than_multiplication_and_looser_than_cast() {
 fn binary_operators_associate_left() {
     assert_where(
         "a - b - c",
-        &bin(BinaryOp::Sub, bin(BinaryOp::Sub, col("a"), col("b")), col("c")),
+        &bin(
+            BinaryOp::Sub,
+            bin(BinaryOp::Sub, col("a"), col("b")),
+            col("c"),
+        ),
     );
     assert_where(
         "a / b * c",
-        &bin(BinaryOp::Mul, bin(BinaryOp::Div, col("a"), col("b")), col("c")),
+        &bin(
+            BinaryOp::Mul,
+            bin(BinaryOp::Div, col("a"), col("b")),
+            col("c"),
+        ),
     );
     assert_where(
         "a OR b OR c",
-        &bin(BinaryOp::Or, bin(BinaryOp::Or, col("a"), col("b")), col("c")),
+        &bin(
+            BinaryOp::Or,
+            bin(BinaryOp::Or, col("a"), col("b")),
+            col("c"),
+        ),
     );
 }
 
@@ -881,20 +913,21 @@ fn comments_and_case_insensitive_keywords() {
     let Command::Where(w) = &q.processing[0] else {
         panic!("expected WHERE");
     };
-    assert!(w
-        .condition
-        .eq_ignoring_spans(&bin(BinaryOp::And, col("A"), unary(UnaryOp::Not, col("B")))));
+    assert!(w.condition.eq_ignoring_spans(&bin(
+        BinaryOp::And,
+        col("A"),
+        unary(UnaryOp::Not, col("B"))
+    )));
     assert_eq!(slice(source, w.span), "where A and not B");
 }
 
 #[test]
 fn triple_quoted_string() {
     let expr = where_expr("ROW a = 1 | WHERE a == \"\"\"say \"hi\"\n\\n\"\"\"");
-    assert!(expr.eq_ignoring_spans(&bin(
-        BinaryOp::Eq,
-        col("a"),
-        string("say \"hi\"\n\\n"),
-    )));
+    assert!(expr.eq_ignoring_spans(&bin(BinaryOp::Eq, col("a"), string("say \"hi\"\n\\n"),)));
+    // Quotes in the closing run beyond the last three belong to the body.
+    let expr = where_expr("ROW a = 1 | WHERE a == \"\"\"x\"\"\"\"\"");
+    assert!(expr.eq_ignoring_spans(&bin(BinaryOp::Eq, col("a"), string("x\"\""))));
 }
 
 #[test]

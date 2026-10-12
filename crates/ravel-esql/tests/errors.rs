@@ -3,7 +3,7 @@
 
 #![allow(clippy::expect_used)]
 
-use ravel_esql::{parse, Error, LimitKind, LineCol, Limits, Span};
+use ravel_esql::{Error, LimitKind, Limits, LineCol, Span, parse};
 
 fn refuse(source: &str, limits: &Limits) -> Error {
     match parse(source, limits) {
@@ -221,6 +221,38 @@ fn unexpected_token_on_line_three_counts_characters() {
         3,
         15,
     );
+}
+
+#[test]
+fn unexpected_token_text_is_truncated_to_forty_characters() {
+    let token = format!("\"{}\"", "é".repeat(60));
+    let source = format!("ROW a = 1 {token}");
+    assert_error(
+        &source,
+        &Limits::default(),
+        Error::UnexpectedToken {
+            found: format!("`\"{}`", "é".repeat(39)),
+            expected: "`|` or end of input",
+            span: Span::new(10, 10 + token.len()),
+        },
+        1,
+        11,
+    );
+}
+
+#[test]
+fn line_col_of_any_byte_offset() {
+    let source = "aé\nb";
+    let at = |offset| LineCol::at(source, offset);
+    assert_eq!(at(0), LineCol { line: 1, column: 1 });
+    assert_eq!(at(1), LineCol { line: 1, column: 2 });
+    // Inside the two-byte `é`: that character's column.
+    assert_eq!(at(2), LineCol { line: 1, column: 2 });
+    assert_eq!(at(3), LineCol { line: 1, column: 3 });
+    assert_eq!(at(4), LineCol { line: 2, column: 1 });
+    // At or past the end: just after the last character.
+    assert_eq!(at(5), LineCol { line: 2, column: 2 });
+    assert_eq!(at(99), LineCol { line: 2, column: 2 });
 }
 
 #[test]

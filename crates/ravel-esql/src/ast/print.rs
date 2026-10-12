@@ -3,8 +3,8 @@
 use std::fmt::Write as _;
 
 use super::{
-    prec, BinaryOp, CallArgs, Command, Expr, Field, LikeKind, LiteralValue, NullsOrder, ParamName,
-    QualifiedName, Query, SortOrder, UnaryOp,
+    BinaryOp, CallArgs, Command, Expr, Field, LikeKind, LiteralValue, NullsOrder, ParamName,
+    QualifiedName, Query, SortOrder, UnaryOp, prec,
 };
 use crate::error::Error;
 use crate::limits::{LimitKind, Limits};

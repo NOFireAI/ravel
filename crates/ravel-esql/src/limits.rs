@@ -12,9 +12,7 @@ use std::fmt;
 ///
 /// The defaults are sized so that the deepest tree they admit parses, prints
 /// and drops on a thread with a 2 MiB stack; `tests/limits.rs` runs each
-/// worst-case shape there. The tightest shape, nested function calls, still
-/// fitted at a depth of 164 in an unoptimised build when the default of 128
-/// was chosen.
+/// worst-case shape there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Maximum statement length in bytes.

@@ -5,7 +5,7 @@
 
 #![allow(clippy::expect_used)]
 
-use ravel_esql::{parse, print, Error, LimitKind, Limits, Span};
+use ravel_esql::{Error, LimitKind, Limits, Span, parse, print};
 
 fn accepted(source: &str, limits: &Limits) {
     if let Err(error) = parse(source, limits) {
@@ -60,6 +60,11 @@ fn each_structural_limit_refuses_before_parsing() {
     };
     let at = "ROW a = 1, b = 2, c = 3";
     accepted(at, &limits);
+    // Whitespace and comments are not tokens.
+    accepted(
+        "ROW a = 1, /* x y z */ b = 2,\n  // p q r\n  c = 3",
+        &limits,
+    );
     let past = "ROW ) = 1, b = 2, c = 3 d";
     let span = refused(past, &limits, LimitKind::Tokens);
     assert_eq!(span.slice(past), Some("d"));
@@ -92,7 +97,10 @@ fn each_structural_limit_refuses_before_parsing() {
                 nested(open, inner, close, max_depth)
             );
             let span = refused(&past, &limits, LimitKind::NestingDepth);
-            assert_eq!(span.start, past.rfind(open).expect("an opener") + open.len() - 1);
+            assert_eq!(
+                span.start,
+                past.rfind(open).expect("an opener") + open.len() - 1
+            );
         }
     }
 
@@ -184,7 +192,12 @@ fn worst_admitted_inputs(limits: &Limits) -> Vec<String> {
         // when it is even.
         nested("(", &nested("1 + (", "1", ")", (d - 1) / 2), ")", 1 - d % 2),
         nested("(", &nested("-(", "1", ")", (d - 1) / 2), ")", 1 - d % 2),
-        nested("(", &nested("NOT (", "true", ")", (d - 1) / 2), ")", 1 - d % 2),
+        nested(
+            "(",
+            &nested("NOT (", "true", ")", (d - 1) / 2),
+            ")",
+            1 - d % 2,
+        ),
     ]
 }
 
@@ -195,7 +208,9 @@ fn worst_admitted_input_fits_a_two_mebibyte_stack() {
         .spawn(|| {
             let limits = Limits::default();
             for expr in worst_admitted_inputs(&limits) {
-                let source = format!("ROW x = {expr} | WHERE {expr} | STATS y = {expr} WHERE {expr} BY {expr}");
+                let source = format!(
+                    "ROW x = {expr} | WHERE {expr} | STATS y = {expr} WHERE {expr} BY {expr}"
+                );
                 let query = parse(&source, &limits).expect("admitted");
                 let printed = print(&query, &limits).expect("prints");
                 let reparsed = parse(&printed, &limits).expect("printed text parses");
@@ -203,7 +218,10 @@ fn worst_admitted_input_fits_a_two_mebibyte_stack() {
                 drop(reparsed);
                 drop(query);
                 let one_deeper = format!("ROW x = ({expr})");
-                assert!(parse(&one_deeper, &limits).is_err(), "one level past the limit");
+                assert!(
+                    parse(&one_deeper, &limits).is_err(),
+                    "one level past the limit"
+                );
             }
         })
         .expect("spawn");

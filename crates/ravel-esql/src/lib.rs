@@ -11,8 +11,9 @@
 //!
 //! The parsed pipeline is a source command (`FROM` or `ROW`) followed by the
 //! processing commands `WHERE`, `EVAL`, `KEEP`, `DROP`, `RENAME`, `STATS`,
-//! `SORT` and `LIMIT`. Other ES|QL commands are recognised by keyword and
-//! refused with [`Error::UnsupportedSyntax`].
+//! `SORT` and `LIMIT`. Other ES|QL commands the parser knows by keyword, such
+//! as `GROK` or `SHOW`, are refused with [`Error::UnsupportedSyntax`]; a word
+//! it does not know there is an [`Error::UnexpectedToken`].
 //!
 //! [`print`] renders a tree back to ES|QL text that parses to the same tree
 //! ignoring spans ([`ast::Query::eq_ignoring_spans`]).
