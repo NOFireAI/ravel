@@ -903,8 +903,9 @@ calling worker's other queued tasks to another thread while the job runs, so
 the main router's `/healthz` is still served, as with the gate
 (`services/ravel-server/tests/read_gate_in_place_liveness.rs`). A job that
 panics is caught on that thread and is `CpuGateError::Panicked` for its
-caller, as on the blocking pool. Abandonment (decision 5) cannot happen in
-this mode: the caller does not yield between the job's start and its return.
+caller, as on the blocking pool. A job that runs in place cannot be
+abandoned (decision 5): its caller does not yield between the job's start and
+its return.
 
 `block_in_place` panics on a `current_thread` runtime and inside a
 `LocalSet`. The gate checks the runtime flavor first, and catches a refusal
