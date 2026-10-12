@@ -176,7 +176,9 @@ flowchart TD
 `crates/ravel-esql` is a new pure Rust crate: lexer, parser, syntax tree,
 language types, function signatures and the typed program a binder
 produces. It depends on no Arrow, no DataFusion and no object store,
-as `ravel-promql` and `ravel-analytics` do not. It adds no external
+as `ravel-promql` and `ravel-analytics` do not. Its one internal
+dependency is `ravel-promql`, for the embedded PromQL region (D5), which
+is itself free of all three. It adds no external
 dependency: the lexer and parser are hand-written (D5).
 
 `crates/ravel-sql/src/esql/` holds everything that needs the engine:
@@ -330,6 +332,18 @@ Field names resolve in this order:
 4. Any other name is an attribute key, read as `get_field(attrs, key)`,
    typed `keyword`, null when the record lacks it.
 
+Native columns outside the D9 type set are typed as follows.
+`severity_num` and `flags` are `long`. `trace_id`, `span_id` and a
+declared `Bytes` column are `keyword`, rendered as lowercase hex, which is
+how an attribute holding bytes already reads. The `attrs` map is not a
+field: `FROM logs` with no `KEEP` projects the native columns except
+`attrs` and the declared columns, and attribute keys are reached by name
+through rule 4.
+
+Rule 1 shadows an attribute of the same name: a record carrying an
+attribute key `message` or `@timestamp` cannot be read by that name in
+this epic. That is recorded in the manifest beside the rule 4 divergence.
+
 Rule 4 is a known divergence, recorded in the manifest: Elasticsearch
 refuses a field absent from every mapping, and Ravel cannot tell an
 unmapped field from an absent one until fields are declared in a catalog.
@@ -352,20 +366,25 @@ that redefines `@timestamp`:
 - A lower and an upper bound give the window.
 - A lower bound alone gives a window that ends at the query clock. This is
   the common shape, `WHERE @timestamp >= NOW() - 1 hour`.
-- No lower bound gives a window that starts at the earliest time the
-  catalog holds for the tenant. Such a query is valid ES|QL and is not
-  refused for its shape. The existing segment and request budgets decide
-  whether it runs, and a breach is the same typed resource error SQL
-  returns. The response stats state the window that was used.
+- No lower bound gives a window that starts at the Unix epoch. The binder
+  looks nothing up to choose it. Such a query is valid ES|QL and is not
+  refused for its shape. The catalog's own bound on window width
+  (`CatalogError::WindowTooWide`) and the segment and request budgets
+  decide whether it runs, and a refusal is the same typed error SQL
+  returns for the same window. The response stats state the window that
+  was used.
 
 The request may also pass `start` and `end`. They narrow the window and
 are applied as a filter on `@timestamp`, so they change the result and
 are visible in the request, never implied. `ROW` queries need no window
 and no catalog access.
 
-A test drives a query with no time bound through catalog resolution and
-asserts both outcomes: it runs on a small tenant, and it is refused with
-the budget error, not a shape error, on one past the segment ceiling.
+This epic does not change the catalog's bound on window width, so a
+query with no lower bound may be refused on every tenant until a later
+decision narrows the window another way. A test drives such a query
+through catalog resolution and asserts what happens: the error, if there
+is one, is the catalog's window or budget error and names the window,
+and is never a parse or verification error.
 
 ### D12. Service and transport
 
@@ -378,7 +397,7 @@ and no data.
 
 `POST /api/v1/esql` takes `{"query", "start"?, "end"?, "timeout"?,
 "params"?}` and returns Ravel's existing envelope,
-`{"status": "success", "data": {"columns": [{"name", "type"}], "values":
+`{"status": "success", "data": {"columns": [{"name", "type"}], "rows":
 [[...]]}, "warnings"?, "stats"}`, with ES|QL type names in `type`. The
 Elasticsearch response shape belongs to the later `POST /_query` adapter.
 The route is attached to both the primary and the mTLS service. Errors use the
