@@ -32,9 +32,10 @@
 #               s3://<bucket>/<prefix>/runs/<run-id>/out/<arm>/
 #
 # It ends by uploading DONE (or FAILED, naming the step that failed) beside
-# those files and terminating its own instance through the instance role,
-# falling back to `shutdown -h now`, which the launch's terminate behaviour
-# turns into a termination. An absolute band miss is a verdict, not a
+# those files and terminating its own instance through the instance role, then
+# running `shutdown -h now` in every case (a run that failed before it knew its
+# region uploads nothing and only shuts down), which the launch's terminate
+# behaviour turns into a termination. An absolute band miss is a verdict, not a
 # failure: DONE records `bands=miss` and fetch.sh exits 1 on it.
 #
 # Every statement goes through run_query, which records one JSON line per call
@@ -195,18 +196,25 @@ upload_out() {
   return "$code"
 }
 
+# terminate_self: terminate through the instance role when the region is
+# known, then `shutdown -h now` whatever happened, so a run that failed before
+# load_config set REGION still ends its instance.
 terminate_self() {
   local token id
-  token="$(curl -sS --max-time 5 -X PUT "$IMDS/latest/api/token" \
-    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" || token=""
-  id="$(curl -sS --max-time 5 -H "X-aws-ec2-metadata-token: $token" \
-    "$IMDS/latest/meta-data/instance-id")" || id=""
-  if [[ "$id" =~ ^i-[0-9a-z]+$ ]] \
-    && aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" --output text >/dev/null; then
-    stamp "terminate instance=$id"
-    return 0
+  if [ -n "${REGION:-}" ]; then
+    token="$(curl -sS --max-time 5 -X PUT "$IMDS/latest/api/token" \
+      -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" || token=""
+    id="$(curl -sS --max-time 5 -H "X-aws-ec2-metadata-token: $token" \
+      "$IMDS/latest/meta-data/instance-id")" || id=""
+    if [[ "$id" =~ ^i-[0-9a-z]+$ ]] \
+      && aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" --output text >/dev/null; then
+      stamp "terminate instance=$id"
+    else
+      stamp "terminate fallback=shutdown"
+    fi
+  else
+    stamp "terminate fallback=shutdown reason=no-region"
   fi
-  stamp "terminate fallback=shutdown"
   shutdown -h now
 }
 
@@ -220,7 +228,7 @@ fail_run() {
   printf 'FAILED step=%s at=%s\n' "$name" "$(utc_now)" >"$KIT/FAILED"
   tail -n 20 "$KIT/run.log" >>"$KIT/FAILED" 2>/dev/null || true
   write_evidence || true
-  if [ -n "${OUT_URI:-}" ]; then
+  if [ -n "${OUT_URI:-}" ] && [ -n "${REGION:-}" ]; then
     upload_out || true
     aws s3 cp --region "$REGION" --only-show-errors "$KIT/FAILED" "$OUT_URI/FAILED" || true
   fi
@@ -689,6 +697,8 @@ write_stamps() {
   cores="$(nproc)"
   mem="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
   cpu="$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)"
+  # An arm64 /proc/cpuinfo has no model name line; lscpu still names the core.
+  [ -n "$cpu" ] || cpu="$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -n 1)"
   printf '{"instance_type": %s, "cores": %s, "mem_total_kb": %s, "cpu": %s, "arch": %s}\n' \
     "$(json_str "$itype")" "$(json_num "$cores")" "$(json_num "$mem")" \
     "$(json_str "$cpu")" "$(json_str "$(uname -m)")" >"$STAMPS/hardware"
@@ -738,16 +748,38 @@ write_results() {
   stamp "bands=$BANDS_VERDICT"
 }
 
+# write_evidence: evidence.tgz from a copy of the logs and outputs with every
+# value in secrets.env replaced by [redacted]; RustFS or a server may log a key.
+# A secret still present after that refuses the tarball.
 write_evidence() {
-  local items="" f g
+  local items="" f g s hits secrets="" stage="$KIT/evidence-stage"
+  rm -f "$KIT/evidence.tgz"
   for f in server-*.log rustfs.log run.log progress.log arm.env fold.out load.time \
     compact.time object-counts stamps out phases.json burst-start.json burst-end.json; do
     # shellcheck disable=SC2086 # globs expand here on purpose
     for g in $(cd "$KIT" && ls -d $f 2>/dev/null); do items="$items $g"; done
   done
   [ -n "$items" ] || return 0
+  rm -rf "$stage"
+  mkdir -p "$stage" || return 1
   # shellcheck disable=SC2086 # items is a space-separated list of names
-  tar -czf "$KIT/evidence.tgz" -C "$KIT" --exclude='out/*/requests' $items
+  (cd "$KIT" && cp -R $items "$stage/") || return 1
+  rm -rf "$stage"/out/*/requests
+  [ ! -f "$SECRETS_ENV" ] || secrets="$(sed -n 's/^[A-Z_]*=//p' "$SECRETS_ENV")"
+  for s in $secrets; do
+    [[ "$s" =~ ^[0-9a-f]+$ ]] || { say "secrets.env holds a value that is not hex"; return 1; }
+    hits="$(grep -rlF -e "$s" "$stage")"
+    while IFS= read -r f; do
+      [ -z "$f" ] || sed -i "s/$s/[redacted]/g" "$f" || return 1
+    done <<<"$hits"
+    if grep -rqF -e "$s" "$stage"; then
+      say "a box secret is still in the evidence after redaction; evidence.tgz not written"
+      return 1
+    fi
+  done
+  # shellcheck disable=SC2086 # items is a space-separated list of names
+  tar -czf "$KIT/evidence.tgz" -C "$stage" $items || return 1
+  rm -rf "$stage"
 }
 
 main() {

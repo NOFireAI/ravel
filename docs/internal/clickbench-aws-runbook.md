@@ -221,9 +221,10 @@ curl -s -H "X-aws-ec2-metadata-token: $T" \
 **With the kit.** `benchmarks/clickbench/kit/launch.sh run.toml` (copy
 `benchmarks/clickbench/kit/run.example.toml` and fill it in) replaces this
 section for an A/B pass. It refuses a band file that still holds a `FILL-IN`
-value, naming the key, and refuses with the role's name when
-`simulate-principal-policy` says the instance profile's role cannot read the
-run's `in/` prefix or write its `out/` prefix. It then uploads the kit to
+value in a section `band_sections` selects, a missing, unknown or removed
+band key, naming each, and refuses with exit 65 when the instance profile
+cannot be read or `simulate-principal-policy` says its role cannot read the
+run's `in/` prefix or write its `out/` prefix, naming the role. It then uploads the kit to
 `s3://<bucket>/<prefix>/runs/<run-id>/in/` and launches one instance per arm
 under that run id, each with the instance profile, a 500 GB gp3 root volume,
 `--instance-initiated-shutdown-behavior terminate` and a user-data that arms
@@ -286,14 +287,25 @@ echo "BOOT DONE"
 `hits.parquet` is about 14 GB. Watch with `tail -f /root/bootstrap.log`; the
 run is finished when `/root/BOOT_DONE` or `/root/BOOT_FAILED` appears.
 
-**With the kit.** Nobody logs in. The user-data checks the sha256 of the kit
-and of every file in it, writes the arm name to `/root/kit/ARM` and starts
-`box/run.sh` under `nohup`; a failed check uploads `FAILED` to the arm's
-`out/` prefix and shuts the box down before `run.sh` starts. `run.sh` runs
-this section's packages, toolchain, clone of the arm's SHA and frame-pointer
-build itself, then the section 7 load, compact, fold and declare against a
-loopback RustFS store whose keys it generates on the box, so no SSM parameter
-is read. Each step is stamped in `/root/kit/progress.log`.
+**With the kit.** Nobody logs in. The user-data checks `kit.tgz` and
+`run.toml` against sha256 digests that `launch.sh` wrote into the user-data
+itself (not against a file in S3, so rewriting both objects there does not
+pass), then every file in the kit against its `SHA256SUMS`, writes the arm
+name to `/root/kit/ARM` and starts `box/run.sh` under `nohup`; a failed check
+uploads `FAILED` to the arm's `out/` prefix and shuts the box down before
+`run.sh` starts. `run.sh` runs this section's packages, toolchain, clone of
+the arm's SHA and frame-pointer build itself, then the section 7 load,
+compact, fold and declare against a loopback RustFS store on the gp3 root
+volume whose keys it generates on the box, so no SSM parameter is read. The
+kit uses that store rather than this runbook's S3 bucket for three reasons:
+each arm's data is private to its own box, so the two arms cannot read or
+overwrite each other's tenant; the instance role needs no access beyond the
+run's `in/` and `out/` prefixes; and it is the store the ClickBench Parquet
+lane (ADR-2040 D7) measures against. The cost is that a kit figure includes
+no network round trip to S3, so it is not comparable with a pass against the
+bucket. Each step is stamped in `/root/kit/progress.log`, and `evidence.tgz`
+is written from a copy of the logs with every generated key replaced by
+`[redacted]`.
 
 ## 7. Load, compact, fold, declare
 
@@ -1015,7 +1027,10 @@ a miss writes `DONE` with `bands=miss`. `benchmarks/clickbench/kit/fetch.sh
 single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
 each arm's absolute bands and then arm B's relative bands against arm A, and
 exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
-3 on timeout and 4 when S3 is unreachable. The script above reads an arm's
+3 on timeout and 4 when S3 is unreachable or a download fails with anything
+but a missing object (a 403 included); two arms whose corpus digests,
+mapping digests, `hardware.cpu` or RustFS versions differ are not compared
+and exit 2, naming the field. The script above reads an arm's
 `results.json` unchanged, and its sums match the kit's. Its cost-class bands
 need `per_run_accounting`, which the HTTP endpoint does not return, so on a
 kit report it lists each statement as `no per_run_accounting; cold cost not
@@ -1112,9 +1127,11 @@ aws ssm delete-parameter --name /ravel-clickbench/bucket
 An idle instance bills at its full on-demand rate. Stop it when a run finishes.
 
 **With the kit.** A kit box does not wait to be stopped: after uploading
-`DONE` or `FAILED` it terminates itself through the instance role, falling
-back to `shutdown -h now`, which the terminate behaviour turns into a
-termination, and the `shutdown -h +600` timer covers a box whose run hangs.
+`DONE` or `FAILED` it terminates itself through the instance role and then
+runs `shutdown -h now` in every case, which the terminate behaviour turns
+into a termination; a run that failed before reading its region uploads
+nothing and only shuts down. The `shutdown -h +600` timer covers a box whose
+run hangs.
 Nothing on its volume is kept; the results live under the run's `out/`
 prefix. If `launch.sh` fails on the second arm, it terminates the first. The
 run's `s3://<bucket>/<prefix>/runs/<run-id>/` objects stay until removed

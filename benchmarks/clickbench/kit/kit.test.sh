@@ -33,13 +33,18 @@ cat >"$STUBS/aws" <<'STUB'
 #!/usr/bin/env bash
 # S3 is $FAKE_S3/<bucket>/<key>. STUB_S3_DOWN=1 fails every s3 call as an
 # unreachable endpoint would (exit 255); STUB_S3_HANG=1 never answers.
-# STUB_DENY_ACTION names an IAM action the simulated role lacks;
+# STUB_DENY_ACTION names an IAM action the simulated role lacks; the role
+# may only get in/* and put out/* under the kit-test-bucket's clickbench-kit/
+# runs. STUB_NO_PROFILE=1 makes the instance profile unreadable.
+# STUB_S3_DENY_KEY makes a download of any key containing it a 403.
 # STUB_FAIL_ARM names the arm whose run-instances fails.
 echo "aws $*" >>"$STUB_LOG"
 endpoint=""
 pos=()
 userdata=""
 token=""
+resource=""
+action=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --region|--query|--output|--instance-profile-name|--policy-source-arn|--name|--image-ids|--filters|--instance-ids)
@@ -47,7 +52,8 @@ while [ $# -gt 0 ]; do
     --endpoint-url) endpoint="$2"; shift 2; continue ;;
     --user-data) userdata="$2"; shift 2; continue ;;
     --client-token) token="$2"; shift 2; continue ;;
-    --action-names) pos+=("action=$2"); shift 2; continue ;;
+    --action-names) action="$2"; pos+=("action=$2"); shift 2; continue ;;
+    --resource-arns) resource="$2"; shift 2; continue ;;
     --only-show-errors|--recursive|--summarize) shift; continue ;;
   esac
   pos+=("$1")
@@ -71,6 +77,9 @@ case "${pos[0]:-} ${pos[1]:-}" in
     dst="${pos[@]: -1}"
     case "$src" in
       s3://*) f="$(s3path "$src")"
+        case "$src" in *"${STUB_S3_DENY_KEY:-/none/}"*)
+          echo "fatal error: An error occurred (403) when calling the HeadObject operation: Forbidden" >&2; exit 1 ;;
+        esac
         [ -f "$f" ] || { echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"$src\" does not exist" >&2; exit 1; }
         mkdir -p "$(dirname "$dst")" && cp "$f" "$dst" ;;
       *) f="$(s3path "$dst")"
@@ -82,12 +91,20 @@ case "${pos[0]:-} ${pos[1]:-}" in
     [ -d "$d" ] && [ -n "$(ls -A "$d")" ] || exit 1
     for f in "$d"/*; do printf '2026-10-11 10:00:00 %10s %s\n' "$(wc -c <"$f" | tr -d ' ')" "$(basename "$f")"; done
     ;;
-  "iam get-instance-profile") echo "arn:aws:iam::123456789012:role/kit-test-role" ;;
+  "iam get-instance-profile")
+    [ -z "${STUB_NO_PROFILE:-}" ] || { echo "An error occurred (NoSuchEntity) when calling the GetInstanceProfile operation" >&2; exit 254; }
+    echo "arn:aws:iam::123456789012:role/kit-test-role" ;;
   "iam simulate-principal-policy")
-    case " ${pos[*]} " in
-      *" action=${STUB_DENY_ACTION:-none} "*) echo implicitDeny ;;
-      *) echo allowed ;;
-    esac
+    runs="arn:aws:s3:::kit-test-bucket/clickbench-kit/runs/"
+    rest="${resource#"$runs"}"
+    if [ "$action" = "${STUB_DENY_ACTION:-none}" ] || [ "$rest" = "$resource" ]; then
+      echo implicitDeny
+    else
+      case "$action $rest" in
+        "s3:GetObject "*/in/\*|"s3:PutObject "*/out/\*) echo allowed ;;
+        *) echo implicitDeny ;;
+      esac
+    fi
     ;;
   "ssm get-parameter") echo ami-0123456789abcdef0 ;;
   "ec2 describe-images") echo /dev/xvda ;;
@@ -163,7 +180,8 @@ STUB
 
 # The box's binaries. The server logs its argv and the five settings stamps,
 # then sleeps until stopped; the CLI logs its argv, and `load` adds 100
-# objects to the store. STUB_FOLD=unsealed makes the fold seal nothing.
+# objects to the store. STUB_FOLD=unsealed makes the fold seal nothing, and
+# STUB_FOLD_ENTRIES sets the entry_count it prints (default 100).
 cat >"$BINSTUBS/ravel-server" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >>"$STUB_DIR/server-argv"
@@ -180,7 +198,7 @@ case " $* " in
   *" load "*) echo 110 >"$STUB_DIR/objects" ;;
   *" catalog fold "*)
     if [ "${STUB_FOLD:-}" = unsealed ]; then echo "seal_through_hour: None"; else echo "seal_through_hour: Some(491234)"; fi
-    printf 'watermark_hour: Some(491235)\nentry_count: 100\nbuckets_folded: 5\npart_bytes: 12345\n' ;;
+    printf 'watermark_hour: Some(491235)\nentry_count: %s\nbuckets_folded: 5\npart_bytes: 12345\n' "${STUB_FOLD_ENTRIES:-100}" ;;
 esac
 exit 0
 STUB
@@ -275,6 +293,19 @@ else
   fail "dry-run" "exit $code, run id '$run_id', $n_launch launches, tokens '$tokens', aws calls $(wc -l <"$STUB_LOG")"
 fi
 DRY_STAGE="$(sed -n 's/^launch: staged in\/ files kept in //p' "$TMP/dry.err")"
+
+# Catches: a user-data that does not carry the staged kit.tgz's and run.toml's
+# own digests, leaving the box to trust a kit.sha256 read from S3.
+kit_sha="$(sha256sum "$DRY_STAGE/in/kit.tgz" 2>/dev/null | cut -d' ' -f1)"
+toml_sha="$(sha256sum "$DRY_STAGE/in/run.toml" 2>/dev/null | cut -d' ' -f1)"
+ud="$(sed -n '/^DRY-RUN user-data B:$/,/^DRY-RUN end user-data B$/p' "$TMP/dry.err")"
+if [ -n "$kit_sha" ] && [ -n "$toml_sha" ] \
+  && [[ "$ud" == *"printf '%s  %s\\n' $kit_sha kit.tgz $toml_sha run.toml >\"\$KIT/in/kit.sha256\""* ]] \
+  && [[ "$ud" == *'for f in kit.tgz run.toml; do'* ]]; then
+  pass "the user-data embeds the staged kit.tgz and run.toml digests and downloads no kit.sha256"
+else
+  fail "embedded digests" "kit.tgz $kit_sha, run.toml $toml_sha not in the user-data"
+fi
 [ -z "$DRY_STAGE" ] || rm -rf "$DRY_STAGE"
 
 # Catches: a band file still holding a FILL-IN placeholder in a section the
@@ -317,6 +348,28 @@ else
   fail "relative placeholder" "exit $code: $(head -c 300 "$TMP/relph.err")"
 fi
 
+# band_case NAME SED WANT: kit.py check-bands on a copy of the filled band file
+# edited by SED must exit 2 with WANT in its message.
+band_case() {
+  local name="$1" edit="$2" want="$3" code=0
+  sed "$edit" "$BANDS" >"$TMP/rlog-$name.toml"
+  python3 "$KIT_SRC/lib/kit.py" check-bands rlog "$TMP/rlog-$name.toml" relative absolute \
+    >/dev/null 2>"$TMP/bands-$name.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/bands-$name.err"; then
+    pass "check-bands refuses a $name key, naming it"
+  else
+    fail "check-bands $name" "exit $code: $(head -c 300 "$TMP/bands-$name.err")"
+  fi
+}
+# Catches: a key the kit no longer reads (the old concurrency ceiling) kept in
+# a band file as if it still bound something.
+band_case removed 's/^\[relative\]$/[relative]\nconcurrency_error_ratio_ceiling = 0.01/' \
+  'removed key(s) relative.concurrency_error_ratio_ceiling; delete them'
+# Catches: a misspelt key accepted, leaving the band it meant unset.
+band_case unknown 's/^qps_min_ratio = /qps_min_ratoi = /' 'unknown key(s) relative.qps_min_ratoi for lane rlog'
+# Catches: a band file with a required key absent judged anyway.
+band_case missing '/^cold_sum_max_ratio = /d' 'missing required key(s) relative.cold_sum_max_ratio'
+
 # Catches: launching (or uploading) when the instance role could not write
 # results, or a refusal that does not name the role.
 reset_log
@@ -327,6 +380,33 @@ if [ "$code" = 65 ] && grep -q 'role arn:aws:iam::123456789012:role/kit-test-rol
   pass "a role without s3:PutObject is refused by name before any upload"
 else
   fail "role check" "exit $code: $(head -c 300 "$TMP/deny.err")"
+fi
+
+# Catches: a role check that asks about some resource other than the run's own
+# in/ and out/ prefixes. The stub role may only use clickbench-kit/runs/, so a
+# run under another prefix must be refused, naming the resource.
+reset_log
+sed 's/^prefix = .*/prefix = "elsewhere"/' "$RUN_TOML" >"$TMP/run-prefix.toml"
+code=0
+bash "$KIT_SRC/launch.sh" "$TMP/run-prefix.toml" >/dev/null 2>"$TMP/prefix.err" || code=$?
+if [ "$code" = 65 ] && grep -q 'lacks s3:GetObject on arn:aws:s3:::kit-test-bucket/elsewhere/runs/.*/in/\*' "$TMP/prefix.err" \
+  && grep -q 'simulate-principal-policy .*--resource-arns arn:aws:s3:::kit-test-bucket/elsewhere/runs/' "$STUB_LOG" \
+  && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
+  pass "the role check asks about the run's own prefix and refuses a role that lacks it"
+else
+  fail "role prefix" "exit $code: $(head -c 300 "$TMP/prefix.err")"
+fi
+
+# Catches: an unreadable instance profile treated as anything but a role
+# refusal (exit 65), or reaching an upload.
+reset_log
+code=0
+STUB_NO_PROFILE=1 bash "$KIT_SRC/launch.sh" "$RUN_TOML" >/dev/null 2>"$TMP/noprofile.err" || code=$?
+if [ "$code" = 65 ] && grep -q 'cannot read instance profile ravel-clickbench-box' "$TMP/noprofile.err" \
+  && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
+  pass "a missing instance profile exits 65 before any upload"
+else
+  fail "missing profile" "exit $code: $(head -c 300 "$TMP/noprofile.err")"
 fi
 
 # Catches: a failed second launch leaving the first instance running.
@@ -410,8 +490,9 @@ fi
 rm -rf "$RUN_DIR/out/B"
 cp "$IN_SAVED/kit.tgz" "$RUN_DIR/in/kit.tgz"
 
-# Catches: dropping the SHA256SUMS check: a kit file changed inside a kit.tgz
-# whose own digest was recomputed must still fail.
+# Catches: a box that trusts a kit.sha256 read from S3: whoever can rewrite
+# kit.tgz there can rewrite that file too, so a changed kit.tgz under a
+# recomputed kit.sha256 must still fail against the user-data's own digests.
 reset_log
 mkdir -p "$TMP/retar"
 tar -xzf "$IN_SAVED/kit.tgz" -C "$TMP/retar"
@@ -419,12 +500,30 @@ echo 'echo tampered' >>"$TMP/retar/kit/box/run.sh"
 tar -czf "$RUN_DIR/in/kit.tgz" -C "$TMP/retar" kit
 (cd "$RUN_DIR/in" && sha256sum kit.tgz run.toml >kit.sha256)
 boot_box B "$BOX_T"
-if grep -q 'FAILED step=user-data sha256 check of the kit files' "$RUN_DIR/out/B/FAILED" 2>/dev/null \
+if grep -q 'FAILED step=user-data sha256 check of kit.tgz and run.toml' "$RUN_DIR/out/B/FAILED" 2>/dev/null \
+  && ! grep -q '^nohup' "$STUB_LOG" && grep -q '^shutdown -h now' "$STUB_LOG"; then
+  pass "a tampered kit.tgz under a recomputed kit.sha256 fails on the user-data's digests"
+else
+  fail "recomputed kit.sha256" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+rm -rf "$RUN_DIR/out/B"
+
+# Catches: dropping the SHA256SUMS check: the same changed kit file, with the
+# user-data's own kit.tgz digest updated to match, must fail on SHA256SUMS.
+reset_log
+cp "$TMP/userdata-B" "$TMP/userdata-B.orig"
+old_sha="$(sha256sum "$IN_SAVED/kit.tgz" | cut -d' ' -f1)"
+new_sha="$(sha256sum "$RUN_DIR/in/kit.tgz" | cut -d' ' -f1)"
+sed "s/$old_sha kit.tgz/$new_sha kit.tgz/" "$TMP/userdata-B.orig" >"$TMP/userdata-B"
+boot_box B "$BOX_T"
+if grep -q "$new_sha kit.tgz" "$TMP/userdata-B" \
+  && grep -q 'FAILED step=user-data sha256 check of the kit files' "$RUN_DIR/out/B/FAILED" 2>/dev/null \
   && ! grep -q '^nohup' "$STUB_LOG"; then
-  pass "a kit file changed under a recomputed kit.sha256 fails on SHA256SUMS"
+  pass "a kit file changed under matching kit.tgz digests fails on SHA256SUMS"
 else
   fail "SHA256SUMS check" "log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
 fi
+mv "$TMP/userdata-B.orig" "$TMP/userdata-B"
 rm -rf "$RUN_DIR/out/B"
 cp "$IN_SAVED/kit.tgz" "$IN_SAVED/kit.sha256" "$RUN_DIR/in/"
 
@@ -456,7 +555,16 @@ bootstrap_build() {
   cp "$BINSTUBS/ravel-server" "$BIN_DIR/ravel-server-$SHA"
 }
 wait_dataset() { echo 1111111111111111111111111111111111111111111111111111111111111111 >"$KIT/dataset.sha256"; }
-bootstrap_rustfs() { make_secrets && echo 'rustfs 1.0.0-stub' >"$KIT/rustfs.version"; }
+# RustFS logging its own keys, which the evidence must not carry.
+bootstrap_rustfs() {
+  make_secrets && echo 'rustfs 1.0.0-stub' >"$KIT/rustfs.version" && . "$SECRETS_ENV" \
+    && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >"$KIT/rustfs.log"
+}
+drop_caches() {
+  echo drop >>"$STUB_DIR/sequence"
+  sync
+  echo 3 >"$DROP_CACHES_FILE"
+}
 # GNU time is not on every CI image; the load and compact flags stay as run.sh has them.
 do_load() { "$CLI_BIN" --store s3 --tenant-hash-unkeyed load --parquet "$DATASET" --tenant "$TENANT" \
   --mapping "$MAPPING" --shards "$SHARDS" --read-cursors 8 --batch-rows 65536; }
@@ -465,6 +573,7 @@ do_compact() { "$CLI_BIN" --store s3 --tenant-hash-unkeyed maintain compact-tena
 eval "real_run_query() $(declare -f run_query | tail -n +2)"
 run_query() {
   echo "$*" >>"$STUB_DIR/run_query-calls"
+  echo "try$4" >>"$STUB_DIR/sequence"
   real_run_query "$@"
 }
 main
@@ -477,7 +586,7 @@ run_box() {
   shift 2
   reset_log
   rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/curl-sql" "$STUB_DIR/run_query-calls" \
-    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies"
+    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies" "$STUB_DIR/sequence"
   boot_box "$arm" "$box" || return 1
   env "$@" bash "$TMP/box-driver.sh" "$box" >"$box/kit/run.log" 2>&1 || code=$?
   return "$code"
@@ -645,6 +754,17 @@ else
   fail "server starts" "$(sort "$STUB_DIR/server-argv" | uniq -c | head -n 3)"
 fi
 
+# Catches: a hot try run after a cache drop, a cold try without one, or a drop
+# missing or doubled: the run must be exactly one drop then tries 1, 2 and 3,
+# 43 times over.
+want_seq="$(for ((i = 0; i < 43; i++)); do printf 'drop try1 try2 try3 '; done)"
+got_seq="$(tr '\n' ' ' <"$STUB_DIR/sequence")"
+if [ "$got_seq" = "$want_seq" ]; then
+  pass "one cache drop before each cold try and none before a hot try"
+else
+  fail "drop sequence" "$(head -c 200 <<<"$got_seq")"
+fi
+
 # Catches: a step that runs without a UTC stamp, or the phases running before
 # the fold precondition was checked. The uploaded copy ends at evidence: upload
 # is stamped after it is sent.
@@ -661,15 +781,20 @@ case "$order" in
 esac
 
 # Catches: evidence.tgz missing the server log, the samplers or the object
-# counts, or any box secret (RustFS keys, tenant token) leaving the box.
+# counts, or any box secret (RustFS keys, tenant token) leaving the box. The
+# stub RustFS logs both of its keys into rustfs.log, so an evidence step that
+# only leaves secrets.env out still uploads them.
 mkdir -p "$TMP/evidence-a"
 tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a"
 token="$(sed -n 's/^KIT_TENANT_TOKEN=//p' "$BOX_A/kit/secrets.env")"
 secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$BOX_A/kit/secrets.env")"
+access="$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$BOX_A/kit/secrets.env")"
 if [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TMP/evidence-a/object-counts/before-load.txt" ] \
   && [ -f "$TMP/evidence-a/object-counts/after-load.txt" ] && [ -f "$TMP/evidence-a/out/benchmark/samplers/server-rss.log" ] \
-  && [ -f "$TMP/evidence-a/arm.env" ] && [ -n "$token" ] && [ -n "$secret" ] \
-  && ! grep -rqF -e "$token" -e "$secret" "$TMP/evidence-a" "$OUT_A" \
+  && [ -f "$TMP/evidence-a/arm.env" ] && [ -n "$token" ] && [ -n "$secret" ] && [ -n "$access" ] \
+  && grep -qF "$secret" "$BOX_A/kit/rustfs.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/rustfs.log" \
+  && ! grep -rqF -e "$token" -e "$secret" -e "$access" "$TMP/evidence-a" "$OUT_A" \
   && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ]; then
   pass "evidence.tgz holds server logs, samplers and object counts, and no box secret is uploaded"
 else
@@ -747,6 +872,46 @@ else
   fail "fold precondition" "exit $code, FAILED: $(head -n 1 "$OUT_A/FAILED" 2>/dev/null)"
 fi
 rm -rf "$OUT_A"
+
+# Catches: a fold whose entry_count is far under the objects the load wrote
+# (50 of 100, under the 0.8 ratio) read as met because it sealed an hour.
+code=0
+run_box A box-foldratio STUB_FOLD_ENTRIES=50 || code=$?
+fold_stamp="$(python3 -c 'import json, sys; f = json.load(open(sys.argv[1])); print(f["precondition"], f["entry_count"], f["objects_written_by_load"])' \
+  "$TMP/box-foldratio/kit/stamps/fold" 2>/dev/null)"
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && grep -q 'fold entry_count 50 is under 0.8 of the 100 objects the load wrote' "$OUT_A/FAILED" \
+  && [ "$fold_stamp" = "failed 50 100" ] && [ ! -e "$TMP/box-foldratio/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a fold with too few entries for the objects written fails as FAILED step=fold"
+else
+  fail "fold entry ratio" "exit $code, stamp '$fold_stamp', FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a run that dies before load_config set REGION and OUT_URI hanging
+# on an unset variable or an upload to nowhere instead of shutting down.
+BOX_K="$TMP/box-early"
+reset_log
+boot_box A "$BOX_K"
+: >"$STUB_LOG"
+cat >"$TMP/early-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1" KIT_RUN_SH_LIB=1 KIT_IMDS=http://imds.invalid
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+load_config() { kill -TERM $$; }
+main
+DRIVER
+code=0
+bash "$TMP/early-driver.sh" "$BOX_K" >"$TMP/early.log" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q '^shutdown -h now$' "$STUB_LOG" \
+  && grep -q '^FAILED step=config ' "$BOX_K/kit/FAILED" 2>/dev/null \
+  && grep -q 'terminate fallback=shutdown reason=no-region' "$BOX_K/kit/progress.log" \
+  && ! grep -q '^aws ' "$STUB_LOG" && ! grep -q 'unbound variable' "$TMP/early.log"; then
+  pass "a run killed in load_config uploads nothing and still runs shutdown -h now"
+else
+  fail "early kill" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 300); $(tail -n 3 "$TMP/early.log")"
+fi
 
 # Catches: resolve_arm_env rewriting arm.env on a restart, or start_server
 # reading live variables instead of arm.env.
@@ -927,6 +1092,101 @@ if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *hot_sum_s <= 1.05 x A (42 both a
   pass "relative sums run over the statements both arms answered"
 else
   fail "relative sums" "exit $code: $(grep -v '^PASS' "$TMP/fetch-sums.out" | head -n 6)"
+fi
+
+# Catches: a cold-sum band that is never judged, or judged on hot figures: arm
+# B's cold tries are 10% slower (23.65 s against 1.05 x 21.5 s) and its hot
+# tries match A's.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cold-b" '
+for e in r["entries"]:
+    e["cold_ms"] = 550.0'
+fixture run-cold "$TMP/fixture-pass" "$TMP/fixture-cold-b"
+fetch cold run-cold --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *cold_sum_s <= 1.05 x A (43 both answered)  *23.650  *22.575$' "$TMP/fetch-cold.out" \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-cold.out" \
+  && [ "$(grep -c '^MISS' "$TMP/fetch-cold.out")" = 1 ]; then
+  pass "a cold sum over the band misses on its own"
+else
+  fail "cold sum" "exit $code: $(grep -v '^PASS' "$TMP/fetch-cold.out" | head -n 4)"
+fi
+
+# Catches: a QPS band that stays inconclusive when both arms ran a concurrency
+# phase, or compares the wrong way: B's 0.9 against 0.95 x A's 1.0 misses.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-qps-a" 'r["concurrency"] = {"qps": 1.0}'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-qps-b" 'r["concurrency"] = {"qps": 0.9}'
+fixture run-qps "$TMP/fixture-qps-a" "$TMP/fixture-qps-b"
+fetch qps run-qps --timeout 30
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *qps >= 0.95 x A  *0.900  *0.950$' "$TMP/fetch-qps.out" \
+  && [ "$(grep -c '^MISS' "$TMP/fetch-qps.out")" = 1 ]; then
+  pass "a QPS under the ratio misses when both arms measured it"
+else
+  fail "qps" "exit $code: $(grep -v '^PASS' "$TMP/fetch-qps.out" | head -n 4)"
+fi
+
+# Catches: two arms compared when they ran on different data, a different
+# mapping, a different CPU model or a different RustFS build. Each must exit
+# 2 naming the field.
+for edit in 'corpus_digest|dataset_sha256|"2" * 64' 'corpus_digest|mapping_sha256|"3" * 64' \
+  'hardware|cpu|"Some Other CPU"' 'backend|version|"rustfs 9.9.9"'; do
+  block="${edit%%|*}"
+  field="${edit#*|}"
+  value="${field#*|}"
+  field="${field%%|*}"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" "r[\"provenance\"][\"$block\"][\"$field\"] = $value"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-cmp-b/results.json" \
+    >"$TMP/cmp.out" 2>"$TMP/cmp.err" || code=$?
+  if [ "$code" = 2 ] && grep -q "arms are not comparable: provenance.$block.$field differs" "$TMP/cmp.err" \
+    && ! grep -q 'B vs A' "$TMP/cmp.out"; then
+    pass "arms with a different $block.$field are refused with exit 2, naming it"
+  else
+    fail "comparable $field" "exit $code: $(head -c 300 "$TMP/cmp.err")"
+  fi
+done
+# The same refusal through fetch, which must not read it as a band miss.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'r["provenance"]["hardware"]["cpu"] = "Some Other CPU"'
+fixture run-cmp "$TMP/fixture-pass" "$TMP/fixture-cmp-b"
+fetch cmp run-cmp --timeout 30
+if [ "$code" = 2 ] && grep -q 'provenance.hardware.cpu differs' "$TMP/fetch-cmp.err"; then
+  pass "fetch exits 2 on arms that are not comparable"
+else
+  fail "fetch comparable" "exit $code: $(tail -n 2 "$TMP/fetch-cmp.err")"
+fi
+
+# Catches: a report with a null sum judged (or crashing into exit 1, which
+# every caller reads as a band miss).
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-null" 'r["totals"]["hot_sum_s"] = None'
+code=0
+python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-null/results.json" \
+  >/dev/null 2>"$TMP/null.err" || code=$?
+if [ "$code" = 2 ] && grep -q 'totals.hot_sum_s is None, not a number' "$TMP/null.err"; then
+  pass "a null totals.hot_sum_s exits 2, naming the field"
+else
+  fail "null sum" "exit $code: $(head -c 300 "$TMP/null.err")"
+fi
+
+# Catches: an unexpected exception exiting 1 (a band miss to every caller) or
+# without its traceback. A phases block that is not an object passes validate
+# and breaks the error ratio.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-crash" 'r["phases"] = {"benchmark": 5}'
+code=0
+python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-crash/results.json" \
+  >/dev/null 2>"$TMP/crash.err" || code=$?
+if [ "$code" = 2 ] && grep -q '^Traceback ' "$TMP/crash.err" \
+  && grep -q 'kit: unexpected error in relative; see the traceback above' "$TMP/crash.err"; then
+  pass "an unexpected exception exits 2 with its traceback"
+else
+  fail "unexpected exception" "exit $code: $(tail -c 300 "$TMP/crash.err")"
+fi
+
+# Catches: a 403 on a download read as a missing object (exit 2) rather than
+# as an S3 failure (exit 4).
+STUB_S3_DENY_KEY=evidence.tgz fetch deny run-pass --timeout 30
+if [ "$code" = 4 ] && grep -q '(403)' "$TMP/fetch-deny.err" \
+  && grep -q 'download of .*/out/A/evidence.tgz failed (aws exit 1)' "$TMP/fetch-deny.err"; then
+  pass "a 403 on a download exits 4"
+else
+  fail "fetch 403" "exit $code: $(tail -n 2 "$TMP/fetch-deny.err")"
 fi
 
 # Catches: a FAILED arm read as a pass, or its reason not shown.

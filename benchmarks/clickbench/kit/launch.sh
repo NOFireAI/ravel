@@ -8,12 +8,13 @@
 # `aws iam simulate-principal-policy` that the instance profile's role may
 # s3:GetObject the run's in/ prefix and s3:PutObject its out/ prefix (refusing
 # with the role's name otherwise), tars the kit with a SHA256SUMS sidecar,
-# uploads kit.tgz, kit.sha256 and run.toml to
-# s3://<bucket>/<prefix>/runs/<run-id>/in/, and launches arm A and arm B
-# under that run id. Each instance gets the instance profile, a 500 GB gp3
-# root volume, --instance-initiated-shutdown-behavior terminate, and a
-# user-data that arms `shutdown -h +600`, downloads in/ with the instance
-# role, checks every sha256, writes the arm name to /root/kit/ARM and starts
+# uploads kit.tgz, kit.sha256 (a record; the box does not read it) and
+# run.toml to s3://<bucket>/<prefix>/runs/<run-id>/in/, and launches arm A and
+# arm B under that run id. Each instance gets the instance profile, a 500 GB
+# gp3 root volume, --instance-initiated-shutdown-behavior terminate, and a
+# user-data that arms `shutdown -h +600`, downloads kit.tgz and run.toml with
+# the instance role, checks them against the sha256 digests written into the
+# user-data itself, checks SHA256SUMS inside the kit, writes the arm name to /root/kit/ARM and starts
 # box/run.sh under nohup, logging to /root/kit/run.log. A failed download or
 # check uploads FAILED to the arm's out/ prefix and shuts the instance down
 # (which terminates it) before run.sh starts. From then on the instance role
@@ -35,8 +36,8 @@
 #   0   both instances launched (or, under --dry-run, every command printed)
 #   1   an aws call failed; any instance already launched was terminated
 #   64  bad usage, or run.toml or a band file refused; nothing was uploaded
-#   65  the instance profile's role lacks S3 access to the run prefix;
-#       nothing was uploaded
+#   65  the instance profile cannot be read (missing, or no role) or its role
+#       lacks S3 access to the run prefix; nothing was uploaded
 set -euo pipefail
 
 usage() {
@@ -190,7 +191,8 @@ trap cleanup EXIT
 
 # The role's access, before anything is uploaded.
 ROLE_ARN="$(capture "arn:aws:iam::000000000000:role/DRY-RUN" aws iam get-instance-profile \
-  --instance-profile-name "$PROFILE" --query 'InstanceProfile.Roles[0].Arn' --output text)"
+  --instance-profile-name "$PROFILE" --query 'InstanceProfile.Roles[0].Arn' --output text)" \
+  || { echo "launch: cannot read instance profile $PROFILE (missing, or this principal may not read it)" >&2; exit 65; }
 [[ "$ROLE_ARN" =~ ^arn:aws[a-z-]*:iam::[0-9]+:role/ ]] \
   || { echo "launch: instance profile $PROFILE has no role (got '$ROLE_ARN')" >&2; exit 65; }
 for check in "s3:GetObject arn:aws:s3:::$BUCKET/$PREFIX/runs/$RUN_ID/in/*" \
@@ -214,11 +216,23 @@ cp "$CORPUS_PATH" "$STAGE/kit/corpus.json"
 for lane in $LANES; do
   cp "$(resolve "$(toml "bands.$lane")")" "$STAGE/kit/bands/$lane.toml"
 done
-(cd "$STAGE/kit" && find . -type f | LC_ALL=C sort | while read -r f; do sha256 "$f"; done) >"$STAGE/SHA256SUMS"
+(cd "$STAGE/kit" && find . -type f | LC_ALL=C sort >"$STAGE/kit-files") \
+  || { echo "launch: cannot list the staged kit files" >&2; exit 1; }
+while read -r f; do
+  (cd "$STAGE/kit" && sha256 "$f") || { echo "launch: cannot hash kit file $f" >&2; exit 1; }
+done <"$STAGE/kit-files" >"$STAGE/SHA256SUMS"
+[ "$(wc -l <"$STAGE/SHA256SUMS")" -eq "$(wc -l <"$STAGE/kit-files")" ] \
+  || { echo "launch: SHA256SUMS does not list every kit file" >&2; exit 1; }
 mv "$STAGE/SHA256SUMS" "$STAGE/kit/SHA256SUMS"
 COPYFILE_DISABLE=1 tar -czf "$STAGE/in/kit.tgz" -C "$STAGE" kit
 cp "$RUN_TOML" "$STAGE/in/run.toml"
 (cd "$STAGE/in" && sha256 kit.tgz run.toml >kit.sha256)
+# The user-data carries these two digests itself and the box checks against
+# them, so rewriting kit.tgz and kit.sha256 in S3 together does not pass.
+KIT_TGZ_SHA="$(sed -n 's/^\([0-9a-f]\{64\}\)  kit\.tgz$/\1/p' "$STAGE/in/kit.sha256")"
+RUN_TOML_SHA="$(sed -n 's/^\([0-9a-f]\{64\}\)  run\.toml$/\1/p' "$STAGE/in/kit.sha256")"
+[ -n "$KIT_TGZ_SHA" ] && [ -n "$RUN_TOML_SHA" ] \
+  || { echo "launch: cannot read the kit.tgz and run.toml digests" >&2; exit 1; }
 
 for f in kit.tgz kit.sha256 run.toml; do
   run aws s3 cp --region "$REGION" --only-show-errors "$STAGE/in/$f" "$RUN_URI/in/$f"
@@ -255,9 +269,10 @@ fail() {
   shutdown -h now
   exit 1
 }
-for f in kit.tgz kit.sha256 run.toml; do
+for f in kit.tgz run.toml; do
   aws s3 cp --region "\$REGION" --only-show-errors "\$IN/\$f" "\$KIT/in/\$f" || fail "download \$f"
 done
+printf '%s  %s\n' $KIT_TGZ_SHA kit.tgz $RUN_TOML_SHA run.toml >"\$KIT/in/kit.sha256" || fail "write kit.sha256"
 (cd "\$KIT/in" && sha256sum -c kit.sha256) || fail "sha256 check of kit.tgz and run.toml"
 tar -xzf "\$KIT/in/kit.tgz" -C "\$KIT" || fail "untar kit.tgz"
 (cd "\$KIT/kit" && sha256sum -c SHA256SUMS) || fail "sha256 check of the kit files"
