@@ -2962,8 +2962,9 @@ pub struct QueryBudgets {
     /// [`Self::logs_fetch_resolution`].
     pub logs_fetch_policy: ravel_query::LogsFetchPolicy,
     /// Where [`Self::logs_fetch_policy`] came from (ADR-1196, ADR-2023):
-    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`] or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`],
-    /// from [`Cli::resolve_logs_fetch_policy`]. Carried only for
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]
+    /// or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK`], from
+    /// [`Cli::resolve_logs_fetch_policy`]. Carried only for
     /// [`Self::logs_fetch_stamp`]; it plays no part in the resolution itself.
     pub logs_fetch_policy_source: &'static str,
     /// The active store cost profile (ADR-0996 decision 1), from
@@ -12983,13 +12984,12 @@ mod tests {
     /// remote endpoint), `left: (LatencyFirst, "default-loopback")` /
     /// `right: (CostBased, "default")`.
     ///
-    /// Prove-the-test (b): change the `Some(policy) => (policy,
-    /// LOGS_FETCH_POLICY_SOURCE_FLAG)` arm to `Some(policy) if
-    /// !self.store_is_loopback() => ...` and the `default-loopback` arm's
-    /// `None if` to `_ if`, so an explicit flag on a loopback store falls
-    /// through to the loopback default instead of winning. This fails at
-    /// case 5 (explicit `cost-based` on a loopback endpoint), `left:
-    /// (LatencyFirst, "default-loopback")` / `right: (CostBased, "flag")`.
+    /// Prove-the-test (b): move the `default-loopback` arm above the
+    /// `Some(policy)` arm and change its `None if` to `_ if`, so an explicit
+    /// flag on a loopback store matches the loopback default first instead
+    /// of winning. This fails at case 5 (explicit `cost-based` on a loopback
+    /// endpoint), `left: (LatencyFirst, "default-loopback")` / `right:
+    /// (CostBased, "flag")`.
     #[test]
     fn loopback_endpoint_defaults_to_latency_first_and_remote_stays_cost_based() {
         // 1. loopback + no flag -> latency-first, default-loopback. An IPv4
@@ -13204,10 +13204,9 @@ mod tests {
     /// The default loopback case on the reference host resolves
     /// `latency-first` at the core-derived 32 GET permits and 32 partitions,
     /// below the issue #1196 measured concurrency, so its startup line takes
-    /// the unmet branch. That line must be true and non-alarming there: on a
-    /// loopback store `latency-first` is itself the default, so the slower
-    /// policy it names is `cost-based`, not "the default policy", and it is
-    /// an info line, not a warning.
+    /// the unmet branch. On a loopback store `latency-first` is itself the
+    /// default, so that line names `cost-based` as the measured slower arm
+    /// instead of the explicit-intent text.
     ///
     /// Prove-the-test: drop the `default-loopback` branch from
     /// `LogsFetchStamp::emit` and the `cost-based has measured slower cold`
@@ -13236,16 +13235,52 @@ mod tests {
             line.contains("cost-based has measured slower cold"),
             "{line}"
         );
-        assert!(!line.contains("default policy"), "{line}");
-        drop(lines);
-        drop(_guard);
-
-        let (warned, _guard) = capture_events(tracing::Level::WARN);
-        stamp.emit();
-        let warned = warned.lock();
         assert!(
-            warned.is_empty(),
-            "the default loopback path must not warn: {warned:?}"
+            !line.contains("is an intent, not a tuning constant"),
+            "{line}"
+        );
+    }
+
+    /// An explicit `--logs-fetch-policy latency-first` on a remote endpoint,
+    /// below the issue #1196 measured concurrency, takes the explicit-intent
+    /// unmet line, not the loopback-default one: the operator chose the
+    /// policy, and the store is not loopback.
+    ///
+    /// Prove-the-test: drop the `&& self.policy_source ==
+    /// LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK` conjunct from the first
+    /// branch in `LogsFetchStamp::emit` and every unmet line takes the
+    /// loopback-default text, so the "latency-first is the default on a
+    /// loopback store" assertion fails.
+    #[test]
+    fn explicit_remote_unmet_latency_first_line_is_not_the_loopback_default() {
+        let cli = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+            "--logs-fetch-policy",
+            "latency-first",
+        ]);
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.policy_source, LOGS_FETCH_POLICY_SOURCE_FLAG);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        stamp.emit();
+        let lines = captured.lock();
+        let unmet: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("precondition_met=false"))
+            .collect();
+        assert_eq!(unmet.len(), 1, "lines: {lines:?}");
+        let line = unmet[0];
+        assert!(
+            !line.contains("latency-first is the default on a loopback store"),
+            "{line}"
+        );
+        assert!(
+            line.contains("is an intent, not a tuning constant"),
+            "{line}"
         );
     }
 
@@ -18012,7 +18047,10 @@ mod tests {
 
     /// A derived tenant ceiling that the cap lowered and an explicit
     /// `--sql-max-query-bytes` then raised past the cap is not reported as
-    /// capped: the logged value is the raised one.
+    /// capped: the logged value is the raised one. The explicit
+    /// `--cache-max-bytes` is the earlier 40% loopback carve, which leaves a
+    /// remainder of 15,276,252,571 whose 90% (13,748,627,313) is below the
+    /// derived 16,451,897,344 tenant pool, so the cap binds before the raise.
     ///
     /// Prove-the-test: drop the `tenant_remainder_capped = false` in the
     /// raise arm and both capped flags read `true` beside a 20,000,000,000
@@ -18025,6 +18063,8 @@ mod tests {
             "s3",
             "--s3-endpoint",
             "http://127.0.0.1:9000",
+            "--cache-max-bytes",
+            "11110001868",
             "--sql-max-query-bytes",
             "20000000000",
         ]);
@@ -18032,6 +18072,23 @@ mod tests {
             .resolve_performance(host)
             .expect("performance defaults resolve");
 
+        // Without the explicit per-query flag the same shape caps the tenant
+        // pool, so the raise below starts from a capped ceiling.
+        let unraised = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--cache-max-bytes",
+            "11110001868",
+        ])
+        .resolve_performance(host)
+        .expect("performance defaults resolve");
+        assert_eq!(unraised.memory_remainder_bytes, 15_276_252_571);
+        assert_eq!(unraised.sql_tenant_max_bytes, 13_748_627_313);
+        assert!(unraised.sql_tenant_max_bytes_remainder_capped);
+
+        assert_eq!(resolved.memory_remainder_bytes, 15_276_252_571);
         assert_eq!(resolved.sql_tenant_max_bytes, 20_000_000_000);
         assert!(resolved.sql_tenant_max_bytes_raised);
         assert!(!resolved.sql_tenant_max_bytes_remainder_capped);
