@@ -199,7 +199,9 @@ per block. `logs_schema_with_declared`
 (`crates/ravel-sql/src/logs_schema.rs:109-115`) therefore types every declared
 `Str` column as `Dictionary(Int32, Utf8)` unconditionally. "End to end" is
 the wire and scan type only: the grouping-type amendment below reads this
-decision down to that: the engine cannot group on it. A dict-encoded page
+decision down to that: the engine cannot group on it. Nor is it the type of a
+value a scalar function computes from the column (see the computed-value
+amendment below). A dict-encoded page
 becomes the dictionary and its ids with no per-row allocation; a plain page
 becomes a degenerate identity dictionary (values as-is, keys `0..n`), which
 costs no hashing and no dedup pass and leaves that case exactly as expensive
@@ -434,6 +436,75 @@ Two follow-ups this amendment does not close:
   path is not what issue #737 reported.
 - `severity_text` is still `Utf8`, unchanged and still deferred for the reason
   decision 5 gives.
+
+## Amendment: decision 5 is a wire type, not the type of a computed value (issue #2918)
+
+<!-- amendment-applies: sections="5. Declared `Str` columns are `Dictionary(Int32, Utf8)` end to end" pointer="computed-value amendment" -->
+
+Decision 5 and the grouping-type amendment above stand: a declared `Str`
+column is scanned and delivered as `Dictionary(Int32, Utf8)`, and its type in
+a plan is unchanged
+(`string_results_and_the_column_keep_their_types` in
+`crates/ravel-sql/tests/declared_str_function_results.rs`).
+
+What DataFusion 55.2 changed is the type of a function's result over that
+column. Its string functions declare
+`EncodingPreservation::dictionary()` on their argument (for example
+`datafusion-functions` `src/string/octet_length.rs:61-64`), and their return
+type keeps the argument's dictionary around the computed value type
+(`transform_leaf_type_preserving_encoding`, `src/utils.rs:81`). So `length`,
+`char_length`, `character_length`, `octet_length`, `bit_length` and `ascii`
+over a declared `Str` column return `Dictionary(Int32, Int32)`. The test
+`no_scalar_function_returns_a_dictionary_of_non_strings` reads that type from
+a stock DataFusion session for each of them. A dictionary of integers is not a
+type the SQL planner's unary minus accepts (it rejects
+`-length("Referer")`), and `avg`'s exact integer path does not admit it
+(`SequentialAvg::coerce_types`, `crates/ravel-sql/src/avg.rs:195`), so the
+average ran in Float64 with a single-partition final aggregation.
+
+The rule: a scalar function whose result would be `Dictionary(_, V)`, with `V`
+not `Utf8`, `LargeUtf8` or `Utf8View`, is typed `V` and planned as
+`CAST(<call> AS V)` (`computed_value_type`,
+`crates/ravel-sql/src/value_typed_results.rs:36`). The call's output name does
+not change: `SELECT length("Referer") FROM logs` still returns a column named
+`length(logs.Referer)`, typed `Int32`
+(`length_keeps_its_output_name_and_type`).
+`negated_length_over_a_declared_str_plans_and_answers` and
+`avg_of_length_over_a_declared_str_is_exact_and_partitioned` pin the two
+statements this restores.
+
+The result is cast, not the argument. Casting the argument to a string type
+would hydrate the column to one string per row before the function runs;
+given the dictionary, the function computes over the dictionary's values once
+and reuses the keys (`src/unicode/character_length.rs:127-130` in
+`datafusion-functions`), and the cast of its result back to `V` is a take of
+those values. The physical plan therefore reads
+`CAST(character_length(Referer@0) AS Int32)`, with the column passed uncast
+(`the_cast_wraps_the_result_not_the_argument`).
+
+Out of scope: a function whose result is a dictionary of strings keeps that
+type, because a string-valued dictionary is the column's own wire type and
+the grouping-type amendment above already keeps it off the row-based group
+values. These are `lower`, `upper`, `btrim`, `ltrim`, `rtrim`, `initcap`,
+`reverse`, `coalesce`, `greatest`, `least` and `with_metadata`
+(`Dictionary(Int32, Utf8)`) and `union_tag` (`Dictionary(Int8, Utf8)`), as
+the registry test prints them; `lower` is pinned by
+`string_results_and_the_column_keep_their_types`.
+
+Where it is installed: `build_session` calls `unpack_dictionary_results`
+(`crates/ravel-sql/src/session.rs:952`) after its last scalar registration.
+That replaces every function in the session's scalar registry with a wrapper
+whose return type is already `V` when the SQL planner and the analyzer read
+it (`return_type` and `return_field_from_args`,
+`value_typed_results.rs:114` and `:128`), and whose `simplify`
+(`value_typed_results.rs:173`) rewrites the call into the cast of the
+unwrapped function's call. Every session `SqlExecutor` plans in is built by
+`build_session`, including the throwaway session it analyses a statement in to
+decide whether its aggregates are exact (`analyzed_classification_plan`,
+`crates/ravel-sql/src/executor.rs`); the averaging test fails if that session
+alone keeps the unwrapped functions. An analyzer or physical rule could not do
+this: unary minus is refused while the SQL text is planned, before either runs
+(`datafusion-sql` `src/expr/unary_op.rs:132`).
 
 ## Amendment (2026-10-11, #2720): the arrow version split is gone
 
