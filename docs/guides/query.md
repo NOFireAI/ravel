@@ -539,7 +539,9 @@ The three concurrency flags set three independent values:
 before the three flags existed.
 
 `--logs-fetch-policy latency-first` resolves these three concurrency settings
-the same way as every other policy. It pays off only after an operator raises
+the same way as every other policy. It is the unset policy against a loopback
+`--s3-endpoint`, where it measured faster cold than `cost-based` at the
+derived concurrency. On real S3 it pays off only after an operator raises
 them explicitly, and it has a memory caveat. Before you turn it on, read the
 fetch-policy table in
 [Operations: configuration](operations/configuration.md#logs-fetch-policy-and-store-cost-profile).

@@ -17983,7 +17983,7 @@ mod tests {
     ///
     /// Prove-the-test: drop the `!tenant_explicit` guard in
     /// `tenant_remainder_capped` and `sql_tenant_max_bytes` reads
-    /// 13,748,627,313 (the 90%-of-remainder cap) against the explicit
+    /// 17,748,227,986 (the 90%-of-remainder cap) against the explicit
     /// 20,000,000,000.
     #[test]
     fn an_explicit_sql_tenant_max_bytes_is_never_capped() {
