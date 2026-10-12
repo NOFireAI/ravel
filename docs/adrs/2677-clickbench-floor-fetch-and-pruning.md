@@ -338,6 +338,10 @@ a full pool with spill off), one lever at a time. The permits derivation
 and the loopback policy default land only on a baseline that meets the
 bar, and must meet it themselves.
 
+The loopback re-scope amendment below drops the permit derivation:
+`store_get_concurrency` keeps its core derivation, and this decision lands
+as the loopback policy default plus a 24% loopback fetch-cache share.
+
 ### 8. Measurement protocol and targets
 
 Every arm runs on a fresh bot-style c6a.4xlarge (the pass launcher and the
@@ -378,6 +382,11 @@ The v0.23 nine-machine pass already in flight (pre-registration #2592
 comment 6070942990) is the "large objects, tuned fetch and cache" arm. It
 is reconciled against its own bands before any arm of this epic launches,
 and its result stays separate from stock.
+
+Since the loopback re-scope amendment below there are no derived permits:
+the "derived permits and loopback policy" row and the concurrent row's
+"derived defaults" mean the loopback policy and the 24% loopback cache share
+at the core-derived permit count.
 
 ## Rejected alternatives
 
@@ -448,7 +457,11 @@ and its result stays separate from stock.
   endpoint, `cost-based` elsewhere, with the permits derived from memory.
   The tuned entry's `RAVEL_HOLD_STOCK_QUERY_BYTES` probe becomes
   unnecessary once a release carries the derivation; #1196's flag-doc
-  precondition is met by the derivation rather than by prose.
+  precondition is met by the derivation rather than by prose. The loopback
+  re-scope amendment below drops the derivation: the ADR-2023 amendment
+  carries the loopback policy and a 24% share for ADR-2023 decision 3, and
+  #1196's precondition is not met on the loopback default, which the
+  startup line says.
 - Three levers leave this epic as numbers on #2677: either closed, or a
   follow-up ADR under the format-change procedure.
 
@@ -463,7 +476,7 @@ measurements are orchestrator work on bot-style boxes.
 | T2 `stats.timings`, `stats.pruning`, pruning reachability through HTTP | 4, 5 | ravel-sql, ravel-server, docs | low |
 | T3 loop-stable memory cache, ADR-0046 amendment: deferred, see the decision 3 deferral amendment | 3 | ravel-cache, docs | medium |
 | T4 no plan phase for segments at or under `plan_whole_object_bound()` | 2 | ravel-query (`log_fetcher.rs`), ravel-sql | medium |
-| T5 permits and loopback policy from host memory, ADR-2023 amendment, the three stale doc comments in `crates/ravel-query/src/config.rs` (the "not bounded" note, LatencyFirst's "operator opt-in", `LATENCY_FIRST_MEASURED_CONCURRENCY`) | 7 | ravel-server, docs, ravel-query (doc comments in `config.rs` only) | medium |
+| T5 permits and loopback policy from host memory (re-scoped by the loopback re-scope amendment below: the loopback policy and a 24% loopback cache share, no permit derivation), ADR-2023 amendment, the three stale doc comments in `crates/ravel-query/src/config.rs` (the "not bounded" note, LatencyFirst's "operator opt-in", `LATENCY_FIRST_MEASURED_CONCURRENCY`) | 7 | ravel-server, docs, ravel-query (doc comments in `config.rs` only) | medium |
 | T6 (#2044) admission wait on accounted headroom; fetch-memory refusal message | 7 | ravel-query (admission), ravel-sql (Flight admission, error message), ravel-server (callers) | medium |
 | T7 (#2694) ordered block skip from the TopK dynamic filter | 6 | ravel-sql, ravel-logseg (reader), ravel-query (scan passthrough) | medium |
 | T8 (#2691) operator-sealed hours stay open to late commits until their natural seal | 1 | ravel-catalog, docs | medium |
@@ -480,7 +493,9 @@ Before it, one measurement: how much of the fetch figure is cache-hit
 bytes charged a second time (`handoff_overlap`); if most of it, removing
 that double charge goes first. T6 also renames the client message a
 refused fetch reservation carries, which today reads as a storage error.
-T5 does not dispatch before T6 lands and its arm meets the bar.
+T5 does not dispatch before T6 lands and its arm meets the bar. Under the
+loopback re-scope amendment below, T5's own smaller cache share meets the
+bar on the reference box.
 
 T7 (#2694, medium) is the ordered block skip decision 6's measurement
 cleared: blocks visited 0.42% for q25 and 2.8% for q24 on the stored
@@ -659,3 +674,65 @@ takes the read-once route there and the cache has no second read to absorb
 within a run. `cache_flag_cuts_store_gets_within_a_run` in `ravel-bench`
 measured that saving on sub-bound segments; it now measures it on segments
 above the bound, which keep the planned route.
+
+## Amendment (2026-10-12): decision 7 drops the permit derivation and carves a smaller loopback cache
+
+<!-- amendment-applies: sections="7. GET permits and the loopback fetch policy resolve from host memory|8. Measurement protocol and targets|Consequences|Plan" pointer="loopback re-scope amendment" -->
+
+Refs: #2683.
+
+This is the loopback re-scope amendment. Decision 7 no longer derives
+`store_get_concurrency` from host memory. On the c6a.2xlarge (16 GB) lever
+run, the memory-derived permit count bought no cold gain and cost QPS and
+concurrent errors, and `latency-first` carried all of the cold gain (#2683
+comment 6114054762). The same run measured `latency-first` alone at a pooled
+error ratio of 0.459 against 0.349, 0.110 worse. With the smaller cache
+carve below added, the 16 GB confirmation read under stock, which suggests
+the carve offsets it; no 16 GB run measured the carve alone.
+`store_get_concurrency` keeps its core-derived default
+(ADR-1195), and an explicit `--store-get-concurrency` still wins.
+
+T5 is now two loopback defaults, both scoped to a `--store s3` deployment
+whose `--s3-endpoint` is loopback, and both recorded as amendments to
+ADR-2023:
+
+- with `--logs-fetch-policy` unset the policy resolves `latency-first`,
+  source `default-loopback`. Decision 7 named the policy; the
+  `default-loopback` source is new with this amendment;
+- the fetch cache's loopback share, ADR-2023 decision 3, drops from 40% to
+  24% of `memory_budget_bytes`.
+
+ClickBench over a RustFS loopback endpoint on four c6a.4xlarge boxes, one run
+per arm (#2044 comment 6115248576):
+
+| arm | concurrent error ratio | concurrent QPS | cold sum | hot sum |
+|---|---|---|---|---|
+| stock, 40% share, `cost-based` | 0.099 | 0.574 | 478.1 s | 59.90 s |
+| 7 GB cache, `cost-based` | 0.029 | 0.512 | 478.1 s | 59.92 s |
+| 40% share, `latency-first` | 0.093 | 0.703 | 368.6 s | 60.03 s |
+| 7 GB cache, `latency-first` | 0.040 | 0.678 | 370.2 s | 60.61 s |
+
+A replicate of the stock arm read 0.092 and 0.612 QPS (#2720 comment
+6115316539). 7 GB is 23.8% of those boxes' roughly 29.4 GB budget, hence 24%.
+
+Decision 7's precondition was a baseline that meets ADR-2023 decision 4's
+bar, a concurrent error ratio of at most 0.058. On the reference box the
+carve meets it by itself (0.029), so the baseline condition is met by T5's
+own change rather than ahead of it; the combined arm read 0.040. 60% of the
+concurrent refusals on stock main are the process budget filling (#2044
+comment 6114049172), which a smaller carve relieves. These are single runs
+per arm, not decision 8's three paired phases.
+
+The 16 GB confirmation passed (#2683 comment 6116274802, requested in
+comment 6115323679). That run set both by flag on the code before this
+amendment: a 3.1 GB cache, about 24% of its 13.2 GB budget, and
+`latency-first`. Against stock it read a pooled error ratio of 0.259
+against 0.282, 0.313 QPS against 0.310, and a cold sum of 357.0 s against
+453.1 s, and it refused no statement that stock answers. Its minimum `MemAvailable` was 0.11 GB, and it spent several times
+stock's time below the host memory gate's floor, so the margin at 16 GB is
+thinner than at 32 GB.
+
+`latency-first` on the loopback default runs at the core-derived permit
+count, not at the 256 of #1196's measurement, so its flag-doc precondition
+is not met there; the startup line names that as a precondition of the
+measured trade, not of the default.

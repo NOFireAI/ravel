@@ -68,7 +68,8 @@ the query remainder to 6.76 GB.
    single-query gain is the goal, for example a tuned benchmark entry.
    The rate `cost-based` resolves on the intra-region profile and the
    break-even a narrow projection is routed by are changed by the ADR-2414
-   amendment below.
+   amendment below. On a loopback S3 endpoint the unset default is
+   `latency-first` since the issue #2683 amendment below.
 2. **`--cache-max-bytes` bounds the fetch cache only.** The catalog byte cache
    derives at its own share (`CATALOG_CACHE_MEMORY_PERCENT`, 5%) whether or not
    `--cache-max-bytes` is set, and `--catalog-cache-max-bytes` sets it
@@ -89,7 +90,9 @@ the query remainder to 6.76 GB.
    here and above the 9.84 GB corpus v0.21.0 loads. The 12.03 GB figure for
    the 30 GiB reference host stands only where that host has no co-resident
    process. Otherwise it follows that host's `MemAvailable` reading, which
-   this ADR does not record.
+   this ADR does not record. The share is 24%, below the remote 25%, since
+   the issue #2683 amendment below; the figures in this decision are the 40%
+   ones.
 4. **The combination is measured before it ships.** A fresh bot-style
    end-to-end run of the stock entry, built from the change, must reach:
    - concurrent throughput at or above 0.40 QPS;
@@ -151,6 +154,8 @@ tried a larger cache, and the stock ClickBench entry passes no flags.
 - With `--cache-dir` set, the fetcher cache's disk tier is bounded by the same
   resolved ceiling as its RAM tier, so on a loopback store the disk tier also
   grows from 25% to 40% of the budget, on the same disk the store reads from.
+  The issue #2683 amendment below sets the loopback share to 24%, so neither
+  the smaller remainder nor the larger disk tier holds there any more.
 - `--cache-max-bytes` no longer resizes the catalog cache. A deployment that
   relied on the flag to grow both sets `--catalog-cache-max-bytes` as well.
 
@@ -254,4 +259,52 @@ the planned route. What moves is the band between 18,900,000 and 31,500,000
 bytes: an object there that a narrow projection skips more than 18,900,000
 bytes of reads ranged on the fast path, and the planned route probes every
 object there before the coverage crossover decides.
+
+## Amendment (2026-10-12, Refs: #2683): latency-first on a loopback store and a 24% fetch-cache share
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="issue #2683 amendment" -->
+
+This is the issue #2683 amendment, ADR-2677 decision 7 as re-scoped there.
+
+Decision 1 changes for a loopback store only. With `--logs-fetch-policy`
+unset, a `--store s3` deployment whose `--s3-endpoint` is loopback resolves
+`latency-first`, and the startup line names the source `default-loopback`.
+Every other deployment keeps `cost-based`, and an explicit flag wins on
+loopback as anywhere else. `latency-first` runs at the core-derived
+`--store-get-concurrency`, which this amendment does not change.
+
+Decision 3's share drops from 40% to 24% (`LOOPBACK_CACHE_MEMORY_PERCENT`).
+The source stays `budget-carve-loopback`; the loopback share is now one point
+below the remote 25%, so the remainder the SQL pools and the PromQL fetches
+share is one point larger there than on a remote store, not 15 points
+smaller, and with `--cache-dir` set the disk tier is bounded at 24% too.
+
+Both rest on ClickBench over a RustFS loopback endpoint on four c6a.4xlarge
+boxes, one run per arm (issue #2044 comment 6115248576):
+
+| arm | concurrent error ratio | concurrent QPS | cold sum | hot sum |
+|---|---|---|---|---|
+| stock, 40% share, `cost-based` | 0.099 | 0.574 | 478.1 s | 59.90 s |
+| 7 GB cache, `cost-based` | 0.029 | 0.512 | 478.1 s | 59.92 s |
+| 40% share, `latency-first` | 0.093 | 0.703 | 368.6 s | 60.03 s |
+| 7 GB cache, `latency-first` | 0.040 | 0.678 | 370.2 s | 60.61 s |
+
+A replicate of the stock arm read 0.092 and 0.612 QPS (issue #2720 comment
+6115316539). The 7 GB cache is 23.8% of those boxes' roughly 29.4 GB budget,
+hence 24%. The smaller cache cut the error ratio from 0.099 to 0.029 at the
+same hot sum, so the hot-time gain decision 3 was credited with does not need
+the 40% share on this corpus; 60% of the concurrent refusals on stock main
+are the process budget filling (issue #2044 comment 6114049172), which is
+what a smaller carve relieves. `latency-first` cut the cold sum by 23% and
+raised QPS on both cache sizes. Decision 4's error-ratio bar, 0.058, is met
+by the carve alone (0.029); the combined arm read 0.040, also under it.
+
+The confirmation on a 16 GB box passed (#2683 comment 6116274802, requested
+in comment 6115323679). That run set both by flag on the code before this
+amendment: a 3.1 GB cache, about 24% of its 13.2 GB budget, and
+`latency-first`. Against stock it read a pooled error ratio of 0.259
+against 0.282, 0.313 QPS against 0.310, and a cold sum of 357.0 s against
+453.1 s, and it refused no statement that stock answers. Its minimum `MemAvailable` was 0.11 GB, and it spent several
+times stock's time below the host memory gate's floor, so the margin at
+16 GB is thinner than at 32 GB.
 
