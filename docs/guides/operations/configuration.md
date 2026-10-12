@@ -1485,9 +1485,11 @@ constant.
   why it is the unset default there.
 - Treat the concurrency as a precondition of the real-S3 trade. The startup
   line says which side of it this process is on. It reports the precondition
-  met only when both the GET permits and the scan width are raised. On the
-  loopback default the line says instead that `cost-based` has measured
-  slower there, and it is an info line, not a warning.
+  met only when both the GET permits and the scan width are raised. Below
+  the precondition it is an info line either way. An explicit flag gets the
+  intent text, which says the measurement found this routing slower than
+  `cost-based` below that concurrency. The loopback default gets a line
+  that names `cost-based` as the slower measured arm on a loopback store.
 - A concurrency raise also raises in-flight fetch memory. Logs fetches
   reserve their bytes on the process memory budget, which refuses a fetch
   it cannot hold, so an under-provisioned raise shows up as refused

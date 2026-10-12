@@ -47,11 +47,10 @@ present.
 
 ### Log objects on default flags
 
-On default flags, Ravel makes the choice per object against a projection
-break-even. `--logs-fetch-policy` defaults to `cost-based`, and at the shipped
-reference cost profile the break-even is 18,900,000 bytes. Against a loopback
-`--s3-endpoint` it defaults to `latency-first` instead, which routes objects
-as `byte-minimal` does.
+Against a remote store on default flags, Ravel makes the choice per object
+against a projection break-even. `--logs-fetch-policy` defaults to
+`cost-based` there, and at the shipped reference cost profile the break-even
+is 18,900,000 bytes:
 
 - The blocks of an object of that size or less are read in one whole-object
   GET with no tail probe.
@@ -59,6 +58,13 @@ as `byte-minimal` does.
   projection skips exceed the break-even. Otherwise it is read whole.
 - To get the block-range shape for every object that the threshold routes
   there, set `--logs-fetch-policy byte-minimal` explicitly.
+
+Against a loopback `--s3-endpoint`, `--logs-fetch-policy` defaults to
+`latency-first` instead, which routes objects as `byte-minimal` does. No
+projection break-even applies there: the routing threshold,
+`--logs-block-range-threshold` (512 KiB by default), is the crossover, so an
+object above it takes the block-range shape. See
+[the cost model](cost-model.md#three-decisions-from-one-value) for the cases.
 
 See the [flag table](#cli-flags), and
 [the cost model](cost-model.md#the-derived-value) for the derivation.
@@ -146,7 +152,7 @@ reclaiming a pre-namespacing cache directory.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cache-max-bytes <n>` | derived: 25% of the process memory budget, or 24% against a loopback `--s3-endpoint` (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the fetcher cache's RAM tier holds. Bounds the fetcher cache only; the catalog byte cache has its own `--catalog-cache-max-bytes` below and this flag never reaches it. **Unset**, it derives from the process memory budget (effective, cgroup-capped memory minus an overhead reserve, not raw host memory -- fixed at 2 GiB from 8 GiB of memory up and scaled down below it at the default ingest ceiling, and raised above 2 GiB in `--mode all` by an ingest ceiling above 1.75 GiB, see the [configuration guide](operations/configuration.md)): 25% (`7516192768` on the 30 GiB reference host) normally, or 24% (`7215545057` there) when the store is `s3` against a loopback endpoint. The loopback share comes from a ClickBench measurement on a RustFS loopback store: a cache of about 7 GB in place of the earlier 40% carve cut the concurrent error ratio from 0.099 to 0.029 at the same hot time, because the cache is carved from the budget that queries and fetches share. Set `--cache-max-bytes` to keep a larger cache. Startup refuses to start, rather than silently clamping, if an explicit value here together with the catalog byte cache's ceiling brings their sum to or above the process memory budget (not under `--disable-cache`, which builds neither cache, so neither cap claims anything, and not in `--mode gateway`, which serves no query and derives no memory budget). Read once at startup; there is no live resize. |
+| `--cache-max-bytes <n>` | derived: 25% of the process memory budget, or 24% against a loopback `--s3-endpoint` (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the fetcher cache's RAM tier holds. Bounds the fetcher cache only; the catalog byte cache has its own `--catalog-cache-max-bytes` below and this flag never reaches it. **Unset**, it derives from the process memory budget (effective, cgroup-capped memory minus an overhead reserve, not raw host memory -- fixed at 2 GiB from 8 GiB of memory up and scaled down below it at the default ingest ceiling, and raised above 2 GiB in `--mode all` by an ingest ceiling above 1.75 GiB, see the [configuration guide](operations/configuration.md)): 25% (`7516192768` on the 30 GiB reference host) normally, or 24% (`7215545057` there) when the store is `s3` against a loopback endpoint. The loopback share comes from a ClickBench measurement on a RustFS loopback store: a cache of about 7 GB in place of the earlier 40% carve cut the concurrent error ratio from 0.099 to 0.029 at the same hot time, because the cache is carved from the budget that queries and fetches share. That gain has a cost: with the smaller carve alone, concurrent throughput was 11% lower (0.512 QPS against 0.574), while the smaller carve together with the loopback `latency-first` default raised it to 0.678 QPS. Set `--cache-max-bytes` to keep a larger cache. Startup refuses to start, rather than silently clamping, if an explicit value here together with the catalog byte cache's ceiling brings their sum to or above the process memory budget (not under `--disable-cache`, which builds neither cache, so neither cap claims anything, and not in `--mode gateway`, which serves no query and derives no memory budget). Read once at startup; there is no live resize. |
 | `--catalog-cache-max-bytes <n>` | derived: 5% of the process memory budget (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog byte cache's RAM tier holds. A separate ceiling from `--cache-max-bytes` above; unset, it derives its own 5% share of the process memory budget (`1503238553` on the 30 GiB reference host) regardless of `--cache-max-bytes` or the loopback share it may have taken. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by its resolved `--cache-max-bytes`, the catalog byte cache's by its resolved `--catalog-cache-max-bytes`. There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
 | `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. It covers the caches of object bytes only: the catalog's two per-tenant record caches stay on, held at their 10,000-entry floor rather than the derived capacity, about 18 MB per actively-queried tenant. See [the catalog record caches](#the-catalog-record-caches). Because neither cache exists, neither ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
