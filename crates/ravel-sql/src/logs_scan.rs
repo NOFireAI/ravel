@@ -13364,6 +13364,144 @@ mod read_gate_tests {
         }
         assert_eq!(releases, PLAIN_BLOCKS);
     }
+
+    /// [`BLOCKS`] one-record blocks whose two attributes overflow a
+    /// one-column dynamic budget, so every block carries an `attrs_raw` page
+    /// and every columnar decode of it ends in [`ColumnarStep::Fallback`].
+    fn overflow_object() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            max_dynamic_columns: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [5u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for ts in 0..BLOCKS as i64 {
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {ts} {}", "payload ".repeat(16)),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![
+                        ("a".to_string(), AttrValue::Str(format!("a{ts}"))),
+                        ("b".to_string(), AttrValue::Str(format!("b{ts}"))),
+                    ],
+                })
+                .expect("push");
+        }
+        let obj = writer.finish().expect("finish");
+
+        // The premise: every block carries an `attrs_raw` page.
+        let reader = ravel_logseg::RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let mut blocks = 0;
+        while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+            assert!(view.has_attrs_raw_page(), "block {blocks} has attrs_raw");
+            blocks += 1;
+        }
+        assert_eq!(blocks, BLOCKS, "the fixture's block count");
+        obj
+    }
+
+    /// A `log_block` job whose block carries an `attrs_raw` page ends in
+    /// [`ColumnarStep::Fallback`] and still frees the block and its charge
+    /// before it returns: the stream's Fallback arm releases neither, so the
+    /// job's own [`release_decoded`] is the only release on that outcome.
+    /// Each such job hands back a scan holding no decoded block and a charge
+    /// of 0, after charging the block at its decoded size while it was held.
+    ///
+    /// Fails with `release_decoded` skipped on the Fallback outcome only:
+    /// every job's scan comes back holding its block, charged at its size.
+    #[tokio::test]
+    async fn a_fallback_log_block_job_returns_its_scan_holding_no_decoded_block() {
+        const FALLBACK_KEY: &str = "t/probe-fallback.rlog";
+        let (store, segments) = stored(FALLBACK_KEY, overflow_object(), BLOCKS).await;
+        let projection = [crate::logs_schema::LOG_COL_TS];
+        BLOCK_PROBES
+            .lock()
+            .expect("probes")
+            .push((FALLBACK_KEY.to_string(), Vec::new()));
+        let gate = floor_zero_gate();
+        let gated = exec_projected(&store, &segments, Some(Arc::clone(&gate)), &projection);
+        let batches = collect(&gated).await;
+        let probes = {
+            let mut armed = BLOCK_PROBES.lock().expect("probes");
+            let at = armed
+                .iter()
+                .position(|(k, _)| k == FALLBACK_KEY)
+                .expect("armed key");
+            armed.swap_remove(at).1
+        };
+
+        // One entry per columnar job that decoded a block: its decoded size,
+        // its release, and what it handed back.
+        let mut jobs = Vec::new();
+        let mut decoded = None;
+        let mut released = None;
+        for probe in &probes {
+            match *probe {
+                BlockProbe::Decoded { bytes, .. } => {
+                    assert!(decoded.is_none(), "one decode per job");
+                    decoded = Some(bytes);
+                }
+                BlockProbe::Released { .. } => released = Some(*probe),
+                BlockProbe::JobReturned { held, charge } => {
+                    let release = released.take();
+                    if let Some(bytes) = decoded.take() {
+                        jobs.push((bytes, release, held, charge));
+                    }
+                }
+                BlockProbe::SegmentFinished { .. } => {}
+            }
+        }
+        // Every block has an `attrs_raw` page, so every decoding job fell
+        // back: one row-path reopen each. The first fallback drains one block
+        // on the row path and returns to the columnar path; the second
+        // consecutive one commits the segment to the row path.
+        assert_eq!(jobs.len(), MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1);
+        assert_eq!(metric_total(&gated, "reopens"), jobs.len());
+        assert_eq!(metric_total(&gated, "columnar_batches"), 0);
+        for (job, (bytes, release, held, charge)) in jobs.into_iter().enumerate() {
+            assert!(bytes > 0, "job {job}: a decoded block has a size");
+            assert!(!held, "job {job}: the scan came back holding no block");
+            assert_eq!(charge, 0, "job {job}: the charge came back empty");
+            let Some(BlockProbe::Released {
+                held_before,
+                held_after,
+                charge_before,
+                charge_after,
+                ..
+            }) = release
+            else {
+                panic!("job {job}: released its block");
+            };
+            assert!(held_before, "job {job}: the block was held until released");
+            assert!(!held_after, "job {job}: the release dropped the block");
+            assert_eq!(charge_before, bytes, "job {job}: charged while held");
+            assert_eq!(charge_after, 0, "job {job}: released with the block");
+        }
+
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, BLOCKS as usize);
+        let inline = collect(&exec_projected(&store, &segments, None, &projection)).await;
+        assert_eq!(batches, inline, "gated and inline output agree");
+    }
 }
 
 #[cfg(test)]
