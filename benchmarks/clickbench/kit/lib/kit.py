@@ -5,7 +5,8 @@ launch.sh and fetch.sh run this on the laptop and box/run.sh runs it on the
 box, so it uses the standard library only and runs on Python 3.6 (no
 tomllib): both macOS's python3 and Amazon Linux 2023's are older than 3.11.
 
-Subcommands (each exits 0 on success, 2 on a refusal, 64 on bad usage):
+Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
+64 on bad usage):
 
   get FILE KEY                 print one run.toml value; an array prints one
                                item per line; a dotted key reads a table
@@ -29,7 +30,8 @@ Subcommands (each exits 0 on success, 2 on a refusal, 64 on bad usage):
                                shape below requires
   absolute LABEL FILE          print a results.json's absolute band table,
                                exit 1 on a miss
-  relative BANDS A.json B.json evaluate the lane's relative bands, print the
+  relative BANDS A.json B.json refuse two arms that are not comparable, else
+                               evaluate the lane's relative bands, print the
                                table, exit 1 on a miss
 
 results.json carries SqlLatencyReport's statement shape
@@ -49,6 +51,7 @@ import math
 import os
 import re
 import sys
+import traceback
 
 PLACEHOLDER_PREFIX = "FILL-IN"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -114,6 +117,16 @@ STAMPED_SETTINGS = (
     "cache_max_bytes", "catalog_cache_max_bytes", "fetch_concurrency",
     "sql_max_query_bytes", "sql_tenant_max_bytes",
 )
+# Two arms whose provenance differs on one of these did not measure the same
+# thing, so no relative band between them stands.
+COMPARABLE = (
+    ("corpus_digest", "dataset_sha256"),
+    ("corpus_digest", "mapping_sha256"),
+    ("hardware", "cpu"),
+    ("backend", "version"),
+)
+
+
 class Refusal(Exception):
     pass
 
@@ -398,9 +411,25 @@ def absolute_bands(lane, path, sections, report):
     return out
 
 
+def check_comparable(a, b):
+    pa, pb = a["provenance"], b["provenance"]
+    for block, field in COMPARABLE:
+        va, vb = lookup(pa, "%s.%s" % (block, field)), lookup(pb, "%s.%s" % (block, field))
+        if va in (None, "") or vb in (None, ""):
+            raise Refusal("arms are not comparable: provenance.%s.%s is missing on %s"
+                          % (block, field, "A" if va in (None, "") else "B"))
+        if va != vb:
+            raise Refusal("arms are not comparable: provenance.%s.%s differs (A %r, B %r)"
+                          % (block, field, va, vb))
+    if pa["band_sections"] != pb["band_sections"]:
+        raise Refusal("arms are not comparable: provenance.band_sections differs (A %r, B %r)"
+                      % (pa["band_sections"], pb["band_sections"]))
+
+
 def relative_bands(path, a, b):
     """Arm B judged against arm A, over the statements both arms answered. A
     statement A answered and B did not is a miss of its own."""
+    check_comparable(a, b)
     sections = a["provenance"]["band_sections"]
     if "relative" not in sections:
         return []
@@ -766,6 +795,12 @@ def main(argv):
             return 64
     except Refusal as e:
         print("kit: %s" % e, file=sys.stderr)
+        return 2
+    except Exception:
+        # Exit 1 means a band miss to every caller, so a crash must not read
+        # as one.
+        traceback.print_exc()
+        print("kit: unexpected error in %s; see the traceback above" % cmd, file=sys.stderr)
         return 2
     return 0
 

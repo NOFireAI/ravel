@@ -34,6 +34,7 @@
 #   3   --timeout elapsed before both arms wrote a marker
 #   4   S3 unreachable: --unreachable-tries consecutive polls failed (default
 #       3), or a download failed with an error other than a missing object
+#       (a 403 included)
 #   64  bad usage
 set -uo pipefail
 
@@ -101,12 +102,14 @@ PREFIX="$(kit_py get "$RUN_TOML" prefix)" || die64 "run.toml has no prefix"
 RUN_URI="s3://$BUCKET/${PREFIX%/}/runs/$RUN_ID"
 
 # bounded CMD...: CMD, killed once it has run CALL_LIMIT seconds (exit 124).
+# The watcher's sleep holds none of the caller's descriptors: it outlives the
+# watcher, and a captured stderr would stay open until it ended.
 bounded() {
   local pid watcher code=0
   "$@" &
   pid=$!
   (
-    sleep "$CALL_LIMIT"
+    sleep "$CALL_LIMIT" </dev/null >/dev/null 2>&1
     kill -TERM "$pid" 2>/dev/null && echo "fetch: killed an aws call after ${CALL_LIMIT} s" >&2
   ) </dev/null >/dev/null &
   watcher=$!
@@ -129,16 +132,23 @@ marker() {
   esac
 }
 
-# download KEY DEST: 0 fetched, 2 not there, 4 S3 unreachable.
+# download KEY DEST: 0 fetched, 2 not there, 4 any other failure. `aws s3 cp`
+# exits 1 for a 403 as well as a 404, so only a 404 reads as not there.
 download() {
-  local code=0
+  local code=0 msg
   mkdir -p "$(dirname "$2")"
-  bounded aws s3 cp --region "$REGION" --only-show-errors "$RUN_URI/$1" "$2" || code=$?
+  msg="$(bounded aws s3 cp --region "$REGION" --only-show-errors "$RUN_URI/$1" "$2" 2>&1)" || code=$?
+  [ -z "$msg" ] || printf '%s\n' "$msg" >&2
   case "$code" in
     0) return 0 ;;
-    1) echo "fetch: $RUN_URI/$1 is not there" >&2; return 2 ;;
-    *) echo "fetch: download of $RUN_URI/$1 failed (aws exit $code)" >&2; return 4 ;;
+    1)
+      case "$msg" in
+        *"(404)"*|*NoSuchKey*|*"does not exist"*)
+          echo "fetch: $RUN_URI/$1 is not there" >&2; return 2 ;;
+      esac ;;
   esac
+  echo "fetch: download of $RUN_URI/$1 failed (aws exit $code)" >&2
+  return 4
 }
 
 START="$(date +%s)"
