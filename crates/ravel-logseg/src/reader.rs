@@ -1159,10 +1159,12 @@ pub struct BlockScan {
     next: usize,
     stats: ScanStats,
     /// The block [`Self::decode_block`] most recently decoded, held only for as
-    /// long as one of the two exits is reading it. Dropped at the start of the
-    /// next decode, and dropped by [`Self::next_block`] before it returns, so
-    /// the row path holds exactly one block's decoded columns at a time as it
-    /// did before the columnar exit existed (ADR-0087 decision 2).
+    /// long as one of the two exits is reading it. Dropped by
+    /// [`Self::next_block`] before it returns, by
+    /// [`Self::release_decoded_block`] once a columnar caller is done with
+    /// its view, and otherwise at the start of the next decode, so the scan
+    /// holds at most one block's decoded columns at a time (ADR-0087
+    /// decision 2).
     current: Option<DecodedBlock>,
     /// Row positions of [`Self::current`] that matched `content`, ascending.
     surviving: Vec<usize>,
@@ -1227,7 +1229,8 @@ impl BlockScan {
     /// `false`, and does nothing, once the cursor is exhausted.
     ///
     /// The previously decoded block, if any, stays held until the next decode
-    /// call releases it, exactly as if this block had not been there.
+    /// call or [`Self::release_decoded_block`] releases it, exactly as if this
+    /// block had not been there.
     pub fn skip_next_block(&mut self) -> bool {
         if self.next >= self.blocks.len() {
             return false;
@@ -1293,8 +1296,9 @@ impl BlockScan {
     /// than handing out a view whose `ts` and stream identity read as absent.
     ///
     /// The returned view borrows this cursor, so it must be dropped before the
-    /// next call. The decoded block is released on the next call to either
-    /// exit.
+    /// next call. The decoded block is released by
+    /// [`Self::release_decoded_block`] or, failing that, on the next call to
+    /// either exit.
     pub fn next_block_columnar<S: ByteSource + ?Sized>(
         &mut self,
         object_bytes: &S,
@@ -1329,6 +1333,29 @@ impl BlockScan {
             decoded,
             &self.surviving,
         )))
+    }
+
+    /// Drop the block the last decode left held, with its surviving row
+    /// positions, once the exit reading it is done. A no-op when nothing is
+    /// held.
+    ///
+    /// A decoded block holds one heap allocation per present cell of each
+    /// plain-encoded string and fixed-width column, so a caller that decodes
+    /// on one thread calls this on that same thread rather than leave the
+    /// block to the next decode, which may run on another: freeing that many
+    /// allocations on another thread was measured at more than the read
+    /// gate's own dispatch costs (#2795; ADR-1702, the decoded-state release
+    /// amendment).
+    pub fn release_decoded_block(&mut self) {
+        self.current = None;
+        self.surviving.clear();
+    }
+
+    /// Whether a decoded block is held, i.e. a columnar decode has run and
+    /// neither [`Self::release_decoded_block`] nor a later decode has dropped
+    /// it yet.
+    pub fn holds_decoded_block(&self) -> bool {
+        self.current.is_some()
     }
 
     /// The decode primitive both exits run on: locate the next surviving block,
@@ -7174,5 +7201,41 @@ mod tests {
             assert_eq!(rows, 16, "the rows whose lo is \"x\" or \"x y\"");
             assert_eq!(dict_word_memos() - memos, 1, "one memo for the dictionary");
         }
+    }
+
+    /// `release_decoded_block` drops the block a columnar decode left held, and
+    /// the cursor goes on to decode the next block as if nothing happened:
+    /// the release changes when the block is freed, not what is read.
+    ///
+    /// Fails with the release a no-op (`holds_decoded_block` stays true after
+    /// it), and with `surviving` left uncleared.
+    #[test]
+    fn release_decoded_block_drops_the_held_block_and_the_scan_goes_on() {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let recs = (0..12).map(|i| rec(1, i, &format!("body {i}"))).collect();
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        assert!(!scan.holds_decoded_block(), "nothing decoded yet");
+        let mut blocks = 0;
+        let mut first_ts = Vec::new();
+        while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
+            assert_eq!(view.surviving_count(), 4);
+            first_ts.push(view.ts(0));
+            assert!(scan.holds_decoded_block(), "the decode left the block held");
+            scan.release_decoded_block();
+            assert!(!scan.holds_decoded_block(), "the release dropped it");
+            assert!(scan.surviving.is_empty(), "and its surviving rows");
+            scan.release_decoded_block();
+            blocks += 1;
+        }
+        assert_eq!(blocks, 3);
+        assert_eq!(first_ts, vec![Some(0), Some(4), Some(8)]);
+        assert!(!scan.holds_decoded_block(), "exhaustion holds nothing");
     }
 }

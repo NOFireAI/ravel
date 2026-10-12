@@ -692,9 +692,9 @@ async fn the_rule_rewrites_the_gated_shape() {
 const PEAK_ON_SMALL: u64 = 1_050_112;
 
 /// The same statement over the 200,000-key fixture with the rule installed.
-/// Ten times the groups for 1.44 times the bytes, and the growth that is left
+/// Ten times the groups for 1.31 times the bytes, and the growth that is left
 /// is the scan's own batches, not aggregate state.
-const PEAK_ON_LARGE: u64 = 1_509_688;
+const PEAK_ON_LARGE: u64 = 1_378_424;
 
 /// The 20,000-key fixture with the rule uninstalled.
 const PEAK_OFF_SMALL: u64 = 1_143_040;
@@ -708,17 +708,17 @@ const PEAK_OFF_LARGE: u64 = 9_438_720;
 ///
 /// With the rule off, `peak_intermediate_bytes` for the admitted statement
 /// grows with the distinct-key count (8.26x for 10x the keys): the aggregate
-/// holds one accumulator per group. With the rule on it does not (1.44x, and
+/// holds one accumulator per group. With the rule on it does not (1.31x, and
 /// that residue is scan batches), because the aggregate holds `k` groups
 /// whatever the key count is. At the large fixture the ratio between the two
-/// is 6.25x.
+/// is 6.85x.
 ///
 /// All four figures are pinned, and the three ratios are asserted separately so
 /// a change that moved every figure by the same factor still has to explain
 /// itself. Changing `Some(TOP_K)` to `None` on the `on_large` line below is the
 /// demonstration that the bound assertion is load-bearing: `on_large` becomes
 /// `PEAK_OFF_LARGE` and the first assertion, `assert_eq!(on_large,
-/// PEAK_ON_LARGE, ...)`, fails with `9438720` against `1509688`.
+/// PEAK_ON_LARGE, ...)`, fails with `9438720` against `1378424`.
 #[tokio::test]
 async fn peak_intermediate_bytes_stops_scaling_with_the_key_count() {
     let sql = topk_sql(TOP_K);
