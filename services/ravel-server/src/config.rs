@@ -152,6 +152,29 @@ pub struct RavelS3Bucket {
     pub region: String,
 }
 
+/// How the read CPU gate runs a job once it holds a permit
+/// (`--cpu-gate-read-dispatch`, issue #2795). The CLI-facing mirror of
+/// [`ravel_cpu_gate::Dispatch`], which lives in a crate that does not depend on
+/// clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum CpuGateDispatch {
+    /// On tokio's blocking pool, through `spawn_blocking`.
+    #[default]
+    SpawnBlocking,
+    /// On the calling worker, through `tokio::task::block_in_place`.
+    InPlace,
+}
+
+impl CpuGateDispatch {
+    /// The library-level dispatch this flag value selects.
+    pub fn dispatch(self) -> ravel_cpu_gate::Dispatch {
+        match self {
+            CpuGateDispatch::SpawnBlocking => ravel_cpu_gate::Dispatch::SpawnBlocking,
+            CpuGateDispatch::InPlace => ravel_cpu_gate::Dispatch::InPlace,
+        }
+    }
+}
+
 /// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
 /// of [`ravel_object_store::s3::S3AuthMode`], which lives in a crate that does
 /// not depend on clap.
@@ -2322,6 +2345,25 @@ pub struct Cli {
     #[arg(long = "cpu-gate-write-permits", value_name = "COUNT")]
     pub cpu_gate_write_permits: Option<usize>,
 
+    /// How the read CPU gate runs a job once it holds a permit (issue #2795,
+    /// experimental). `spawn-blocking`, the default, runs it on tokio's
+    /// blocking pool. `in-place` runs it on the worker thread that asked,
+    /// through `tokio::task::block_in_place`: the job's output stays on that
+    /// thread, and the runtime moves the worker's other queued tasks to
+    /// another thread while the job runs. The permit count still caps how
+    /// many gated jobs run at once. Where `block_in_place` cannot run, the job
+    /// takes the blocking pool and
+    /// `ravel_cpu_gate_in_place_fallback_total{gate="read"}` moves. The write
+    /// gate always uses the blocking pool. The mode is logged at startup.
+    #[arg(
+        long = "cpu-gate-read-dispatch",
+        env = "RAVEL_CPU_GATE_READ_DISPATCH",
+        value_name = "MODE",
+        value_enum,
+        default_value_t = CpuGateDispatch::SpawnBlocking
+    )]
+    pub cpu_gate_read_dispatch: CpuGateDispatch,
+
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
     /// (`query::build_catalog`) both, not just the fetcher cache.
@@ -3599,16 +3641,18 @@ pub fn derive_catalog_resolve_concurrency(q: usize) -> usize {
         .min(INTERIM_CATALOG_RESOLVE_CEILING)
 }
 
-/// The resolved permit counts of the two ADR-1702 CPU gates, from
-/// [`Cli::resolve_cpu_gate_permits`]. `Default` is the one-core derivation,
-/// one permit each, which is what a test that builds a `ServerConfig` by hand
-/// gets.
+/// The resolved permit counts of the two ADR-1702 CPU gates and the read
+/// gate's dispatch, from [`Cli::resolve_cpu_gate_permits`]. `Default` is the
+/// one-core derivation, one permit each, on the blocking pool, which is what a
+/// test that builds a `ServerConfig` by hand gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuGatePermits {
     /// `--cpu-gate-read-permits`, or `max(1, cores - 1)`.
     pub read: usize,
     /// `--cpu-gate-write-permits`, or `max(1, cores / 2)`.
     pub write: usize,
+    /// `--cpu-gate-read-dispatch`, or the blocking pool.
+    pub read_dispatch: ravel_cpu_gate::Dispatch,
 }
 
 impl CpuGatePermits {
@@ -3617,6 +3661,7 @@ impl CpuGatePermits {
         CpuGatePermits {
             read: ravel_cpu_gate::default_read_permits(cores),
             write: ravel_cpu_gate::default_write_permits(cores),
+            read_dispatch: ravel_cpu_gate::Dispatch::SpawnBlocking,
         }
     }
 }
@@ -6289,12 +6334,14 @@ impl Cli {
 
     /// Resolve the two CPU gates' permit counts (ADR-1702 decision 3): each
     /// flag verbatim when set, otherwise the core-count derivation for
-    /// `host`. A `0` is refused by [`Self::validate`], not clamped here.
+    /// `host`. A `0` is refused by [`Self::validate`], not clamped here. The
+    /// read gate's dispatch is `--cpu-gate-read-dispatch`.
     pub fn resolve_cpu_gate_permits(&self, host: HostProfile) -> CpuGatePermits {
         let derived = CpuGatePermits::derive(host.cores);
         CpuGatePermits {
             read: self.cpu_gate_read_permits.unwrap_or(derived.read),
             write: self.cpu_gate_write_permits.unwrap_or(derived.write),
+            read_dispatch: self.cpu_gate_read_dispatch.dispatch(),
         }
     }
 
@@ -13816,27 +13863,44 @@ mod tests {
     /// gate's derivation.
     #[test]
     fn cpu_gate_permits_derive_from_cores_unless_a_flag_is_set() {
+        const SPAWN_BLOCKING: ravel_cpu_gate::Dispatch = ravel_cpu_gate::Dispatch::SpawnBlocking;
         let host = HostProfile::new(8, None, None, None, None, None);
         let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
         assert_eq!(
             unset.resolve_cpu_gate_permits(host),
-            CpuGatePermits { read: 7, write: 4 }
+            CpuGatePermits {
+                read: 7,
+                write: 4,
+                read_dispatch: SPAWN_BLOCKING
+            }
         );
         assert_eq!(
             unset.resolve_cpu_gate_permits(HostProfile::new(1, None, None, None, None, None)),
-            CpuGatePermits { read: 1, write: 1 }
+            CpuGatePermits {
+                read: 1,
+                write: 1,
+                read_dispatch: SPAWN_BLOCKING
+            }
         );
         let read_only =
             Cli::try_parse_from(["ravel-server", "--cpu-gate-read-permits", "3"]).expect("parses");
         assert_eq!(
             read_only.resolve_cpu_gate_permits(host),
-            CpuGatePermits { read: 3, write: 4 }
+            CpuGatePermits {
+                read: 3,
+                write: 4,
+                read_dispatch: SPAWN_BLOCKING
+            }
         );
         let write_only =
             Cli::try_parse_from(["ravel-server", "--cpu-gate-write-permits", "9"]).expect("parses");
         assert_eq!(
             write_only.resolve_cpu_gate_permits(host),
-            CpuGatePermits { read: 7, write: 9 }
+            CpuGatePermits {
+                read: 7,
+                write: 9,
+                read_dispatch: SPAWN_BLOCKING
+            }
         );
     }
 
@@ -13872,6 +13936,58 @@ mod tests {
         assert_eq!(
             arg.get_env().and_then(|e| e.to_str()),
             Some("RAVEL_SQL_SCAN_DECODE_INLINE")
+        );
+    }
+
+    /// Issue #2795: `--cpu-gate-read-dispatch` defaults to the blocking pool,
+    /// reads `RAVEL_CPU_GATE_READ_DISPATCH`, and reaches the read gate's
+    /// resolved settings only.
+    #[test]
+    fn cpu_gate_read_dispatch_defaults_to_spawn_blocking_and_resolves() {
+        use clap::CommandFactory;
+
+        let host = HostProfile::new(4, None, None, None, None, None);
+        let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
+        assert_eq!(unset.cpu_gate_read_dispatch, CpuGateDispatch::SpawnBlocking);
+        assert_eq!(
+            unset.resolve_cpu_gate_permits(host).read_dispatch,
+            ravel_cpu_gate::Dispatch::SpawnBlocking
+        );
+        assert_eq!(
+            CpuGatePermits::default().read_dispatch,
+            ravel_cpu_gate::Dispatch::SpawnBlocking
+        );
+
+        let set = Cli::try_parse_from(["ravel-server", "--cpu-gate-read-dispatch", "in-place"])
+            .expect("parses");
+        assert_eq!(
+            set.resolve_cpu_gate_permits(host),
+            CpuGatePermits {
+                read: 3,
+                write: 2,
+                read_dispatch: ravel_cpu_gate::Dispatch::InPlace,
+            }
+        );
+        let explicit =
+            Cli::try_parse_from(["ravel-server", "--cpu-gate-read-dispatch", "spawn-blocking"])
+                .expect("parses");
+        assert_eq!(
+            explicit.cpu_gate_read_dispatch,
+            CpuGateDispatch::SpawnBlocking
+        );
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--cpu-gate-read-dispatch", "inline"]).is_err(),
+            "an unknown mode is a parse error"
+        );
+
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some("cpu-gate-read-dispatch"))
+            .expect("the flag is registered");
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("RAVEL_CPU_GATE_READ_DISPATCH")
         );
     }
 

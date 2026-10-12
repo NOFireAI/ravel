@@ -328,6 +328,7 @@ pub async fn start_server(
         cpu_gate_permits: ravel_server::config::CpuGatePermits {
             read: ravel_cpu_gate::default_read_permits(cores),
             write: ravel_cpu_gate::default_write_permits(cores),
+            read_dispatch: ravel_cpu_gate::Dispatch::SpawnBlocking,
         },
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,

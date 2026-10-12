@@ -18,14 +18,18 @@ pub struct CpuGates {
 
 impl CpuGates {
     /// Both gates with the resolved permit counts and the default inline
-    /// floors, measuring with one monotonic clock.
+    /// floors, measuring with one monotonic clock. The read gate takes the
+    /// resolved dispatch; the write gate always uses the blocking pool.
     pub fn new(permits: CpuGatePermits) -> Self {
         let clock: Arc<dyn MonotonicClock> = Arc::new(InstantClock::new());
         CpuGates {
-            read: Arc::new(ReadGate::new(
-                CpuGateConfig::with_permits(permits.read),
-                Arc::clone(&clock),
-            )),
+            read: Arc::new(
+                ReadGate::new(
+                    CpuGateConfig::with_permits(permits.read),
+                    Arc::clone(&clock),
+                )
+                .with_dispatch(permits.read_dispatch),
+            ),
             write: Arc::new(WriteGate::new(
                 CpuGateConfig::with_permits(permits.write),
                 clock,

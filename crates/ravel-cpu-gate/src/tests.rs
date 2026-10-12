@@ -768,7 +768,11 @@ fn floorless_gate_with<S: GateSite>(permits: usize, dispatch: Dispatch) -> Arc<C
 /// ran on.
 fn caller_and_job_threads(
     dispatch: Dispatch,
-) -> (std::thread::ThreadId, std::thread::ThreadId, CpuGateSnapshot<ReadSite>) {
+) -> (
+    std::thread::ThreadId,
+    std::thread::ThreadId,
+    CpuGateSnapshot<ReadSite>,
+) {
     multi_thread_runtime(2).block_on(async move {
         let gate = floorless_gate_with::<ReadSite>(1, dispatch);
         let job_gate = Arc::clone(&gate);
@@ -989,7 +993,10 @@ fn in_place_on_a_current_thread_runtime_falls_back() {
                 assert_eq!(snapshot.in_place_fallback, 1);
                 assert_eq!(gate.in_place_fallbacks(), 1);
                 let site = snapshot.sites[ReadSite::Fold.index()];
-                assert_eq!((site.jobs, site.handoff_count, site.return_count), (1, 1, 1));
+                assert_eq!(
+                    (site.jobs, site.handoff_count, site.return_count),
+                    (1, 1, 1)
+                );
             });
         },
     );

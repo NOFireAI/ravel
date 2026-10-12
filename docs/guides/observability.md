@@ -2549,6 +2549,10 @@ read gate's `span_section` site has no call site yet, so its figures stay at
 inline on the polling worker, so for SQL statements every site their
 fetchers use, `log_block`, `log_postings`, `log_section` and `span_block`,
 stays at 0. PromQL and LogQL reads of the same objects still count there.
+With `--cpu-gate-read-dispatch in-place` (experimental, issue #2795) the read
+gate still takes a permit for each job and counts it as below, but runs it on
+the worker thread that asked, under `tokio::task::block_in_place`, instead of
+on the blocking pool. The write gate always uses the blocking pool.
 
 | Metric | Meaning |
 |---|---|
@@ -2556,12 +2560,13 @@ stays at 0. PromQL and LogQL reads of the same objects still count there.
 | `ravel_cpu_gate_running` | Gauge. Jobs holding a permit right now, including a job whose caller stopped waiting. |
 | `ravel_cpu_gate_queued` | Gauge. Callers waiting for a permit right now. |
 | `ravel_cpu_gate_wait_seconds_sum`, `ravel_cpu_gate_wait_seconds_count` | Summary with no quantiles. Time callers waited for a permit, and the number of waits, counting only waits that got a permit. |
-| `ravel_cpu_gate_run_seconds_sum`, `ravel_cpu_gate_run_seconds_count` | Summary with no quantiles. Time jobs ran on the blocking pool, and the number of jobs. |
+| `ravel_cpu_gate_run_seconds_sum`, `ravel_cpu_gate_run_seconds_count` | Summary with no quantiles. Time jobs ran once they held a permit, on the blocking pool or in place, and the number of jobs. |
 | `ravel_cpu_gate_abandoned_total` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
+| `ravel_cpu_gate_in_place_fallback_total` | Counter. Jobs of a gate dispatching in place (`--cpu-gate-read-dispatch in-place`) that ran on the blocking pool instead, because the calling thread could not block in place: a runtime that is not multi-threaded, or a `LocalSet`. It stays at 0 for a gate on the blocking pool, so on a node with the flag set a value equal to the gate's job count means the mode never ran. |
 | `ravel_cpu_gate_jobs_total{site}` | Counter. Jobs a call site ran through a permit. |
 | `ravel_cpu_gate_inline_total{site}` | Counter. Jobs a call site ran inline, below the inline floor. |
-| `ravel_cpu_gate_handoff_seconds_sum{site}`, `ravel_cpu_gate_handoff_seconds_count{site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means jobs are slow to start once they hold a permit: either the blocking pool is slow to pick them up, or the host is oversubscribed, with more runnable threads than cores, so the blocking thread waits for a core. |
-| `ravel_cpu_gate_return_seconds_sum{site}`, `ravel_cpu_gate_return_seconds_count{site}` | Summary with no quantiles. Time from a job's last instruction to its caller resuming, and the number of jobs that returned to a waiting caller. The window also covers dropping the job's guard on the blocking thread, which releases the permit and wakes the next waiter, so a growing mean points at that release or at the async runtime being slow to reschedule the caller; a panicked or abandoned job is not counted, and inline jobs add to neither family. |
+| `ravel_cpu_gate_handoff_seconds_sum{site}`, `ravel_cpu_gate_handoff_seconds_count{site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means jobs are slow to start once they hold a permit: either the blocking pool is slow to pick them up, or the host is oversubscribed, with more runnable threads than cores, so the blocking thread waits for a core. Under in-place dispatch there is no thread change: it is the time from the handoff stamp to the job's first instruction inside `block_in_place` on the same thread, which covers the runtime moving the worker's queued tasks to another thread. |
+| `ravel_cpu_gate_return_seconds_sum{site}`, `ravel_cpu_gate_return_seconds_count{site}` | Summary with no quantiles. Time from a job's last instruction to its caller resuming, and the number of jobs that returned to a waiting caller. The window also covers dropping the job's guard on the blocking thread, which releases the permit and wakes the next waiter, so a growing mean points at that release or at the async runtime being slow to reschedule the caller; a panicked or abandoned job is not counted, and inline jobs add to neither family. Under in-place dispatch it is the time from the job's last instruction to `block_in_place` returning on the same thread. |
 | `ravel_runtime_workers` | Gauge. Worker threads of the tokio runtime serving the process. |
 | `ravel_runtime_alive_tasks` | Gauge. Tasks alive on the runtime. |
 | `ravel_runtime_global_queue_depth` | Gauge. Tasks waiting in the runtime's global queue. |

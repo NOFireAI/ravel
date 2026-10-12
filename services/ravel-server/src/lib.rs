@@ -1190,6 +1190,8 @@ pub struct Running {
     /// The ADR-1170 process memory budget, whose host-memory gate the memory
     /// gate sampler (ADR-2633, as amended for issue #2806) writes.
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// The ADR-1702 read CPU gate every read path in this process shares.
+    read_gate: Arc<ravel_cpu_gate::ReadGate>,
     /// This process's hold on `<cache-dir>/sql-spill/<instance-id>` (ADR-0954
     /// requirement 7, amended by issue #2416), `Some` when SQL spill resolved
     /// under `--cache-dir`. Its lock tells every other process's startup sweep
@@ -1435,6 +1437,13 @@ impl Running {
     /// sampler on (ADR-2633 task 2).
     pub fn process_memory_budget(&self) -> Arc<ravel_memory::MemoryBudget> {
         self.process_memory_budget.clone()
+    }
+
+    /// The read CPU gate this server's query, catalog and maintenance decode
+    /// run on, built with `--cpu-gate-read-permits` and
+    /// `--cpu-gate-read-dispatch`.
+    pub fn read_gate(&self) -> Arc<ravel_cpu_gate::ReadGate> {
+        self.read_gate.clone()
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
@@ -2373,6 +2382,14 @@ pub async fn start_with_heartbeat(
     // Built before the ingest routers, whose flush encodes run on the write
     // gate.
     let cpu_gates = cpu_gates::CpuGates::new(config.cpu_gate_permits);
+    tracing::info!(
+        cpu_gate_read_dispatch = ?config.cpu_gate_permits.read_dispatch,
+        "read CPU gate runs permitted jobs {}",
+        match config.cpu_gate_permits.read_dispatch {
+            ravel_cpu_gate::Dispatch::SpawnBlocking => "on the blocking pool",
+            ravel_cpu_gate::Dispatch::InPlace => "in place on the calling worker",
+        }
+    );
 
     // The one format-floor policy every writer in this process checks with
     // (ADR-1746 decisions 4 and 5). `--write-below-format-floor` is resolved
@@ -4443,6 +4460,7 @@ pub async fn start_with_heartbeat(
         query_worker_heartbeat,
         runtime_heartbeat_task: None,
         process_memory_budget,
+        read_gate: cpu_gates.read.clone(),
         #[cfg(feature = "sql")]
         sql_spill_owner,
     })

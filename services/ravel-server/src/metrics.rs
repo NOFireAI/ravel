@@ -3280,6 +3280,7 @@ struct CpuGateRow {
     run_nanos_sum: u64,
     run_count: u64,
     abandoned: u64,
+    in_place_fallback: u64,
     sites: Vec<CpuGateSiteRow>,
 }
 
@@ -3319,6 +3320,7 @@ impl CpuGateRow {
             run_nanos_sum: snapshot.run_nanos_sum,
             run_count: snapshot.run_count,
             abandoned: snapshot.abandoned,
+            in_place_fallback: snapshot.in_place_fallback,
             sites: snapshot
                 .sites
                 .iter()
@@ -3346,13 +3348,17 @@ impl CpuGateRow {
 /// `_count` under one `summary` header, the shape Prometheus reads a mean
 /// from. A wait is counted when it ends with a permit, so a waiter dropped in
 /// the queue adds to neither. `abandoned_total` counts started jobs whose
-/// waiter was gone when they returned.
+/// waiter was gone when they returned. `in_place_fallback_total` counts jobs
+/// a gate dispatching in place (`--cpu-gate-read-dispatch in-place`, issue
+/// #2795) ran on the blocking pool instead, because the calling thread could
+/// not block in place; it stays 0 for a gate on the blocking pool.
 ///
 /// The per-site `handoff_seconds` and `return_seconds` summaries (the ADR-1702
 /// handoff and post-return amendment) time a gated job's trip onto the blocking
 /// pool and back: from `spawn_blocking` to the job's first instruction, and
-/// from its last instruction to the caller resuming. Inline jobs add to
-/// neither.
+/// from its last instruction to the caller resuming. Under in-place dispatch
+/// the job runs on the caller's thread, and the two time `block_in_place`'s
+/// entry and exit instead. Inline jobs add to neither.
 fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot) {
     let rows = [
         CpuGateRow::new(&gates.read, Label::ReadGateSite),
@@ -3396,7 +3402,7 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
         ),
         (
             "ravel_cpu_gate_run_seconds",
-            "Time CPU gate jobs ran on the blocking pool.",
+            "Time CPU gate jobs ran once they held a permit.",
             |row| (row.run_nanos_sum, row.run_count),
         ),
     ];
@@ -3427,10 +3433,25 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
         );
     }
 
+    write_header(
+        out,
+        "ravel_cpu_gate_in_place_fallback_total",
+        "CPU gate jobs dispatched in place (--cpu-gate-read-dispatch in-place) that ran on the blocking pool because the calling thread could not block in place.",
+        "counter",
+    );
+    for row in &rows {
+        write_sample(
+            out,
+            "ravel_cpu_gate_in_place_fallback_total",
+            &[Label::Mode(mode), row.gate.clone()],
+            row.in_place_fallback,
+        );
+    }
+
     let per_site: [(&str, &str, SiteFigure); 2] = [
         (
             "ravel_cpu_gate_jobs_total",
-            "Jobs a call site ran on the blocking pool through a CPU gate permit.",
+            "Jobs a call site ran through a CPU gate permit, on the blocking pool or in place.",
             |site| site.jobs,
         ),
         (
@@ -3456,12 +3477,12 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
     let per_site_summaries: [(&str, &str, SiteSumCount); 2] = [
         (
             "ravel_cpu_gate_handoff_seconds",
-            "Time from handing a CPU gate job to the blocking pool to its first instruction there, per call site.",
+            "Time from handing a CPU gate job to the blocking pool (or, in place, to block_in_place) to its first instruction, per call site.",
             |site| (site.handoff_nanos_sum, site.handoff_count),
         ),
         (
             "ravel_cpu_gate_return_seconds",
-            "Time from a CPU gate job's last instruction to its waiting caller resuming, per call site.",
+            "Time from a CPU gate job's last instruction to its waiting caller resuming (or, in place, to block_in_place returning), per call site.",
             |site| (site.return_nanos_sum, site.return_count),
         ),
     ];
@@ -9290,14 +9311,18 @@ mod tests {
     /// `{mode, gate}` (plus `site`, or `worker` for the runtime busy counter).
     #[test]
     fn cpu_gate_and_runtime_families_render_each_name_once() {
-        let gates =
-            crate::cpu_gates::CpuGates::new(crate::config::CpuGatePermits { read: 7, write: 3 });
+        let gates = crate::cpu_gates::CpuGates::new(crate::config::CpuGatePermits {
+            read: 7,
+            write: 3,
+            read_dispatch: ravel_cpu_gate::Dispatch::InPlace,
+        });
         let mut snapshot = CpuGatesSnapshot::from_gates(&gates);
         snapshot.read.running = 5;
         snapshot.read.queued = 2;
         snapshot.read.wait_nanos_sum = 1_500_000_000;
         snapshot.read.wait_count = 4;
         snapshot.read.abandoned = 1;
+        snapshot.read.in_place_fallback = 12;
         snapshot.read.sites[0].jobs = 9;
         snapshot.read.sites[0].inline = 6;
         snapshot.write.run_nanos_sum = 250_000_000;
@@ -9325,6 +9350,7 @@ mod tests {
             ("ravel_cpu_gate_wait_seconds", "summary"),
             ("ravel_cpu_gate_run_seconds", "summary"),
             ("ravel_cpu_gate_abandoned_total", "counter"),
+            ("ravel_cpu_gate_in_place_fallback_total", "counter"),
             ("ravel_cpu_gate_jobs_total", "counter"),
             ("ravel_cpu_gate_inline_total", "counter"),
             ("ravel_cpu_gate_handoff_seconds", "summary"),
@@ -9354,6 +9380,8 @@ mod tests {
             "ravel_cpu_gate_run_seconds_count{mode=\"all\",gate=\"write\"} 2",
             "ravel_cpu_gate_abandoned_total{mode=\"all\",gate=\"read\"} 1",
             "ravel_cpu_gate_abandoned_total{mode=\"all\",gate=\"write\"} 0",
+            "ravel_cpu_gate_in_place_fallback_total{mode=\"all\",gate=\"read\"} 12",
+            "ravel_cpu_gate_in_place_fallback_total{mode=\"all\",gate=\"write\"} 0",
             "ravel_cpu_gate_jobs_total{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 9",
             "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 6",
             "ravel_cpu_gate_jobs_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 8",
@@ -9396,6 +9424,7 @@ mod tests {
             "ravel_cpu_gate_permits{",
             "ravel_cpu_gate_wait_seconds_sum{",
             "ravel_cpu_gate_run_seconds_count{",
+            "ravel_cpu_gate_in_place_fallback_total{",
         ] {
             assert_eq!(
                 body.lines().filter(|line| line.starts_with(family)).count(),
