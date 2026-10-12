@@ -374,7 +374,9 @@ pub enum LogsFetchPolicy {
     /// the projection break-even
     /// ([`ResolvedLogsFetch::projection_break_even_bytes`]), and every object
     /// at or below the break-even reads whole; at egress prices it resolves
-    /// to a small byte cost the floors clamp. The default.
+    /// to a small byte cost the floors clamp. The default, and the server's
+    /// unset `--logs-fetch-policy` on every deployment except a loopback S3
+    /// endpoint.
     #[default]
     CostBased,
     /// Trade money for wall-clock (issue #1196): resolves the rate and routing
@@ -390,12 +392,14 @@ pub enum LogsFetchPolicy {
     /// `s3-intra-region-2026` prices, where at that commit free transfer and
     /// retrieval saturated the cost-based rate to whole-object reads (the
     /// profile carried no time term yet, ADR-2414 decision A3). Cost-first stays
-    /// the default because it is right for the bill; this is an operator
-    /// opt-in for the deployments where the clock matters more than the
-    /// request bill, at a concurrency the operator raises explicitly. It
-    /// carries a memory precondition: in-flight fetch memory at the
-    /// concurrency it needs to pay off is not bounded by a process-wide
-    /// budget today (#1170, #1007).
+    /// the default for a remote store because it is right for the bill; there
+    /// this is an operator opt-in for the deployments where the clock matters
+    /// more than the request bill, at a concurrency the operator raises
+    /// explicitly. On a loopback S3 endpoint the server resolves it as the
+    /// unset default at the derived concurrency, where it measured faster cold
+    /// than `cost-based` (ADR-2677 decision 7). Logs fetches reserve their bytes on the process
+    /// memory budget (issue #2086), which refuses a fetch it cannot hold; a
+    /// fallback budget is unlimited and refuses none.
     LatencyFirst,
 }
 
@@ -404,9 +408,10 @@ pub enum LogsFetchPolicy {
 /// (issue #1196): a documentation constant only, naming the concurrency
 /// `--fetch-concurrency 256` set for the GET permits, the SQL partition
 /// count, and the PromQL fan-out together. `latency-first` resolves no
-/// concurrency default from this value; an operator who wants the measured
-/// trade sets `--store-get-concurrency` (and, for SQL,
-/// `--sql-partition-count`) to it explicitly.
+/// concurrency default from this value, including where it is the server's
+/// loopback default; an operator who wants the measured trade sets
+/// `--store-get-concurrency` (and, for SQL, `--sql-partition-count`) to it
+/// explicitly.
 pub const LATENCY_FIRST_MEASURED_CONCURRENCY: usize = 256;
 
 impl LogsFetchPolicy {
