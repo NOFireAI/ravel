@@ -1968,6 +1968,28 @@ async fn write_rlog_segment(
     created_unix_ns: i64,
     records: &[LogRecord],
 ) -> SegmentRef {
+    write_rlog_segment_with(
+        store,
+        key,
+        shard,
+        writer_seq,
+        created_unix_ns,
+        records,
+        RlogConfig::default(),
+    )
+    .await
+}
+
+/// [`write_rlog_segment`] under `cfg`.
+async fn write_rlog_segment_with(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    shard: u32,
+    writer_seq: u64,
+    created_unix_ns: i64,
+    records: &[LogRecord],
+    cfg: RlogConfig,
+) -> SegmentRef {
     let identity = ObjectIdentity {
         tenant_hash: TENANT.0,
         shard,
@@ -1975,7 +1997,7 @@ async fn write_rlog_segment(
         writer_epoch: 1,
         writer_seq,
     };
-    let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    let mut w = RlogWriter::new(cfg, identity);
     for r in records {
         w.push(r.clone()).expect("push record");
     }
@@ -2847,6 +2869,30 @@ async fn write_rspan_segment(
     created_unix_ns: i64,
     records: &[SpanRecord],
 ) -> SegmentRef {
+    write_rspan_object(
+        store,
+        key,
+        shard,
+        writer_seq,
+        created_unix_ns,
+        records,
+        RspanConfig::default(),
+    )
+    .await
+    .0
+}
+
+/// [`write_rspan_segment`] under `cfg`, also returning the object bytes so a
+/// test can compute the exact byte ranges a ranged read must fetch.
+async fn write_rspan_object(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    shard: u32,
+    writer_seq: u64,
+    created_unix_ns: i64,
+    records: &[SpanRecord],
+    cfg: RspanConfig,
+) -> (SegmentRef, Vec<u8>) {
     let identity = RspanObjectIdentity {
         tenant_hash: TENANT.0,
         shard,
@@ -2854,14 +2900,14 @@ async fn write_rspan_segment(
         writer_epoch: 1,
         writer_seq,
     };
-    let mut w = RspanWriter::new(RspanConfig::default(), identity);
+    let mut w = RspanWriter::new(cfg, identity);
     for r in records {
         w.push(r.clone());
     }
     let bytes = w.finish().expect("finish object");
     let size = bytes.len() as u64;
     store
-        .put(key, Bytes::from(bytes), PutOptions::default())
+        .put(key, Bytes::from(bytes.clone()), PutOptions::default())
         .await
         .expect("put object");
 
@@ -2871,7 +2917,7 @@ async fn write_rspan_segment(
         .min()
         .expect("nonempty");
     let max = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
-    SegmentRef {
+    let seg = SegmentRef {
         data_object_key: key.to_string(),
         object_size: size,
         min_event_ts_ns: min,
@@ -2888,7 +2934,8 @@ async fn write_rspan_segment(
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_rspan::footer::VERSION),
         declared_column_stats: Default::default(),
-    }
+    };
+    (seg, bytes)
 }
 
 /// The in-process spans worker: rebuilds the slice's snapshot from the ticket and
@@ -3116,6 +3163,550 @@ async fn distributed_spans_plan_merges_without_dedup() {
         !text.to_lowercase().contains("dedup"),
         "spans have no query-time dedup; the merge must not introduce one:\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #2755: the slice ticket carries the coordinator's pushdown
+// ---------------------------------------------------------------------------
+//
+// The workers below take the pushdown the coordinator attached to each slice,
+// send it through the real slice-ticket codec (encode under the slice key,
+// decode back, as the Flight hop does), and build their fragment from what
+// decoded. Each asserts the exact number of blocks the worker decoded.
+//
+// prove-the-test (worker_fragment_carries_the_trace_id_pushdown): passing
+// `None` instead of the pushdown in `SpansTableProvider::scan`'s distributed
+// branch (the pre-change coordinator), ignoring it in
+// `worker_fragment_with_pushdown` (a fragment that drops the predicate), or
+// leaving `trace_id` out of `SlicePushdown::spans` (time bounds only) each
+// decodes all six blocks instead of three, and fails the `blocks_decoded`
+// assertion first.
+
+use ravel_rspan::RspanRangeReader;
+use ravel_sql::{DeclaredColumn, DeclaredType, SlicePushdown};
+use ravel_types::accounting::AccountedOp;
+
+/// The slice ticket and pushdown as a worker receives them: encoded under the
+/// slice key and decoded back.
+fn over_the_wire(
+    ticket: &FlightTicket,
+    pushdown: Option<&SlicePushdown>,
+) -> DFResult<(FlightTicket, Option<SlicePushdown>)> {
+    let keys = SqlTicketKeys::from_file_keys([SQL_FILE_KEY])
+        .ok_or_else(|| DataFusionError::Internal("no slice ticket key".into()))?;
+    let bytes = keys
+        .encode_with_pushdown(ticket, TicketSurface::Slice, pushdown)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    keys.decode_with_pushdown(&bytes, TicketSurface::Slice)
+        .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+/// One fragment a pushdown-aware worker ran: its plan, the phase accounting
+/// its scan recorded into, and the pushdown it decoded from the ticket.
+struct RanFragment {
+    plan: Arc<dyn ExecutionPlan>,
+    phases: PhaseAccounting,
+    pushdown: Option<SlicePushdown>,
+}
+
+fn record_fragment(ran: &Mutex<Vec<RanFragment>>, fragment: RanFragment) -> DFResult<()> {
+    ran.lock()
+        .map_err(|_| DataFusionError::Internal("worker fragment list poisoned".into()))?
+        .push(fragment);
+    Ok(())
+}
+
+/// A spans worker that builds its fragment from the pushdown its slice ticket
+/// carried and keeps every fragment it ran.
+struct PushdownSpanWorker {
+    fetcher: SpanSegmentFetcher,
+    ran: Mutex<Vec<RanFragment>>,
+}
+
+impl std::fmt::Debug for PushdownSpanWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("PushdownSpanWorker")
+    }
+}
+
+impl WorkerSliceClient for PushdownSpanWorker {
+    fn fetch_slice(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        limit: Option<usize>,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        self.fetch_slice_with_pushdown(location, ticket, None, limit, context)
+    }
+
+    fn fetch_slice_with_pushdown(
+        &self,
+        _location: &str,
+        ticket: &FlightTicket,
+        pushdown: Option<&SlicePushdown>,
+        _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let (ticket, pushdown) = over_the_wire(ticket, pushdown)?;
+        let snapshot = ticket.snapshot();
+        let target_partitions = snapshot.segments.len().max(1);
+        let phases = PhaseAccounting::new();
+        let plan = SpansTableProvider::new(
+            snapshot,
+            TENANT,
+            self.fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .with_phase_accounting(phases.clone())
+        .worker_fragment_with_pushdown(target_partitions, pushdown.as_ref())?;
+        record_fragment(
+            &self.ran,
+            RanFragment {
+                plan: Arc::clone(&plan),
+                phases,
+                pushdown,
+            },
+        )?;
+        execute_stream(plan, Arc::new(TaskContext::default()))
+    }
+}
+
+/// A logs worker over `declared` that builds its fragment from the pushdown
+/// its slice ticket carried and keeps every fragment it ran.
+struct PushdownLogsWorker {
+    fetcher: LogSegmentFetcher,
+    declared: Vec<DeclaredColumn>,
+    ran: Mutex<Vec<RanFragment>>,
+}
+
+impl std::fmt::Debug for PushdownLogsWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("PushdownLogsWorker")
+    }
+}
+
+impl WorkerSliceClient for PushdownLogsWorker {
+    fn fetch_slice(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        limit: Option<usize>,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        self.fetch_slice_with_pushdown(location, ticket, None, limit, context)
+    }
+
+    fn fetch_slice_with_pushdown(
+        &self,
+        _location: &str,
+        ticket: &FlightTicket,
+        pushdown: Option<&SlicePushdown>,
+        _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let (ticket, pushdown) = over_the_wire(ticket, pushdown)?;
+        let snapshot = ticket.snapshot();
+        let target_partitions = snapshot.segments.len().max(1);
+        let phases = PhaseAccounting::new();
+        let plan = LogsTableProvider::new(snapshot, TENANT, self.fetcher.clone(), phases.clone())
+            .with_declared_columns(self.declared.clone())
+            .worker_fragment_with_pushdown(target_partitions, pushdown.as_ref())?;
+        record_fragment(
+            &self.ran,
+            RanFragment {
+                plan: Arc::clone(&plan),
+                phases,
+                pushdown,
+            },
+        )?;
+        execute_stream(plan, Arc::new(TaskContext::default()))
+    }
+}
+
+/// The byte length of the contiguous block run holding `trace` in the RSPAN
+/// object `object`: exactly what a ranged trace read fetches as data.
+fn trace_run_len(object: &[u8], trace: &[u8; 16]) -> u64 {
+    let footer = ravel_rspan::open(object).expect("open footer");
+    let desc = footer
+        .section(ravel_rspan::footer::kind::SKIP_IDX)
+        .expect("SKIP_IDX section");
+    let skip = ravel_rspan::read_section(
+        object,
+        desc,
+        ravel_rspan::footer::DEFAULT_MAX_SECTION_UNCOMP,
+    )
+    .expect("read SKIP_IDX");
+    RspanRangeReader::from_sections(&footer, &skip)
+        .expect("range reader")
+        .trace_block_span(trace)
+        .expect("trace block span")
+        .expect("the trace is in the object")
+        .byte_len()
+}
+
+fn rspan_block_count(object: &[u8]) -> u64 {
+    ravel_rspan::open(object).expect("open footer").block_count
+}
+
+/// The probe-phase bytes a ranged trace read of `object` moves with a
+/// `probe_len` tail probe, for a fixture where that read is exactly three
+/// GETs: the probe, a footer chase, and a SKIP_IDX read. Asserts the geometry
+/// that makes it three: the footer does not fit in the probe, and the SKIP_IDX
+/// section lies wholly before the probe.
+fn three_probe_get_bytes(object: &[u8], probe_len: u64) -> u64 {
+    let size = object.len() as u64;
+    let suffix = &object[object.len() - probe_len as usize..];
+    let chase = match ravel_rspan::open_from_suffix(suffix, size).expect("probe holds the trailer")
+    {
+        ravel_rspan::SuffixOutcome::NeedRange { len, .. } => len,
+        ravel_rspan::SuffixOutcome::Ready(_) => {
+            panic!("fixture: the footer must not fit the probe")
+        }
+    };
+    let footer = ravel_rspan::open(object).expect("open footer");
+    let skip = footer
+        .section(ravel_rspan::footer::kind::SKIP_IDX)
+        .expect("SKIP_IDX section");
+    assert!(
+        skip.offset + skip.len <= size - probe_len,
+        "fixture: SKIP_IDX lies before the probe, so it is a GET of its own"
+    );
+    probe_len + chase + skip.len
+}
+
+/// Run `sql` against `provider` registered as `table` in a plain session.
+async fn run_sql(
+    table: &str,
+    provider: Arc<dyn TableProvider>,
+    sql: &str,
+) -> (Arc<dyn ExecutionPlan>, Vec<RecordBatch>) {
+    let ctx = SessionContext::new();
+    ctx.register_table(table, provider).expect("register table");
+    let plan = ctx
+        .sql(sql)
+        .await
+        .expect("statement plans")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("statement runs");
+    (plan, batches)
+}
+
+#[tokio::test]
+async fn worker_fragment_carries_the_trace_id_pushdown() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let cfg = RspanConfig {
+        block_target_records: 2,
+        ..RspanConfig::default()
+    };
+    let before = [0x01u8; 16];
+    let target = [0x05u8; 16];
+    let after = [0x09u8; 16];
+    let last = [0x0cu8; 16];
+    // Two spans per block, sorted by trace id. Shard 0 holds blocks
+    // [before][target][target][after], shard 1 holds [target][last], so the
+    // target trace lives in two adjacent blocks of one object and one block of
+    // the other: three of the six blocks.
+    let (s0, obj0) = write_rspan_object(
+        backend.as_ref(),
+        "spans/pushdown-0.rspan",
+        0,
+        1,
+        10,
+        &[
+            span(before, [1u8; 8], 10, "b10"),
+            span(before, [2u8; 8], 11, "b11"),
+            span(target, [1u8; 8], 20, "t20"),
+            span(target, [2u8; 8], 21, "t21"),
+            span(target, [3u8; 8], 22, "t22"),
+            span(target, [4u8; 8], 23, "t23"),
+            span(after, [1u8; 8], 30, "a30"),
+            span(after, [2u8; 8], 31, "a31"),
+        ],
+        cfg,
+    )
+    .await;
+    let (s1, obj1) = write_rspan_object(
+        backend.as_ref(),
+        "spans/pushdown-1.rspan",
+        1,
+        1,
+        20,
+        &[
+            span(target, [5u8; 8], 40, "t40"),
+            span(target, [6u8; 8], 41, "t41"),
+            span(last, [1u8; 8], 50, "l50"),
+            span(last, [2u8; 8], 51, "l51"),
+        ],
+        cfg,
+    )
+    .await;
+    assert_eq!(
+        rspan_block_count(&obj0),
+        4,
+        "fixture: four blocks in shard 0"
+    );
+    assert_eq!(
+        rspan_block_count(&obj1),
+        2,
+        "fixture: two blocks in shard 1"
+    );
+    let run_bytes = trace_run_len(&obj0, &target) + trace_run_len(&obj1, &target);
+    let whole_bytes = s0.object_size + s1.object_size;
+    assert!(run_bytes < whole_bytes);
+
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let endpoints = rlog_endpoints_for(&snapshot);
+    let slices = endpoints.len();
+    assert_eq!(slices, 2, "fixture: one slice per shard");
+
+    let hex: String = target.iter().map(|b| format!("{b:02x}")).collect();
+    let sql = format!(
+        "SELECT start_ts, name FROM spans WHERE trace_id = X'{hex}' \
+         AND start_ts >= arrow_cast(5, 'Timestamp(Nanosecond, None)') \
+         AND start_ts <= arrow_cast(1000, 'Timestamp(Nanosecond, None)')"
+    );
+
+    // Independent single-node reference over the same objects.
+    let fetcher = SpanSegmentFetcher::new(Arc::clone(&backend));
+    let (_, local) = run_sql(
+        "spans",
+        Arc::new(SpansTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )),
+        &sql,
+    )
+    .await;
+    let mut want = ts_and(&local, "start_ts", "name");
+    want.sort();
+    assert_eq!(
+        want,
+        vec![
+            (20, "t20".to_string()),
+            (21, "t21".to_string()),
+            (22, "t22".to_string()),
+            (23, "t23".to_string()),
+            (40, "t40".to_string()),
+            (41, "t41".to_string()),
+        ]
+    );
+
+    // The minimum probe, so the block runs are never inside the tail probe and
+    // every data byte is a scan GET.
+    let worker = Arc::new(PushdownSpanWorker {
+        fetcher: fetcher.clone().with_trace_probe_bytes(64),
+        ran: Mutex::new(Vec::new()),
+    });
+    let client: Arc<dyn WorkerSliceClient> = Arc::clone(&worker) as Arc<dyn WorkerSliceClient>;
+    let (dist_plan, got) = run_sql(
+        "spans",
+        Arc::new(
+            SpansTableProvider::new(snapshot, TENANT, fetcher, QueryAccounting::new())
+                .with_distributed_scan(endpoints, client),
+        ),
+        &sql,
+    )
+    .await;
+    let mut got = ts_and(&got, "start_ts", "name");
+    got.sort();
+    assert_eq!(got, want, "distributed rows equal single-node rows");
+
+    let ran = std::mem::take(&mut *worker.ran.lock().expect("worker fragments"));
+    assert_eq!(ran.len(), slices, "one fragment per slice");
+    let blocks_decoded: usize = ran
+        .iter()
+        .map(|f| sum_metric(&f.plan, "SpansScanExec", "blocks_decoded"))
+        .sum();
+    assert_eq!(
+        blocks_decoded, 3,
+        "the workers decode only the three blocks holding the trace, of six"
+    );
+    let shown = displayable(dist_plan.as_ref()).indent(true).to_string();
+    assert!(
+        shown.contains("DistributedSliceScanExec") && shown.contains("pushdown=spans"),
+        "the coordinator attaches a spans pushdown to its slices:\n{shown}"
+    );
+    for f in &ran {
+        let carried = f
+            .pushdown
+            .as_ref()
+            .and_then(SlicePushdown::as_spans)
+            .expect("the ticket carried a spans pushdown");
+        assert_eq!(carried.trace_id, Some(target));
+        assert_eq!((carried.ts_lo, carried.ts_hi), (Some(5), Some(1000)));
+        let text = displayable(f.plan.as_ref()).indent(true).to_string();
+        assert!(
+            text.contains("SpansScanExec: partitions=1, trace_id=true, ts=[5, 1000]"),
+            "the worker scan reports the pushdown it received:\n{text}"
+        );
+    }
+
+    let probe_gets: u64 = ran
+        .iter()
+        .map(|f| f.phases.snapshot().probe.s3_requests(AccountedOp::Get))
+        .sum();
+    let probe_bytes: u64 = ran
+        .iter()
+        .map(|f| f.phases.snapshot().probe.s3_bytes(AccountedOp::Get))
+        .sum();
+    let scan_gets: u64 = ran
+        .iter()
+        .map(|f| f.phases.snapshot().scan.s3_requests(AccountedOp::Get))
+        .sum();
+    let scan_bytes: u64 = ran
+        .iter()
+        .map(|f| f.phases.snapshot().scan.s3_bytes(AccountedOp::Get))
+        .sum();
+    // Per object: the 64-byte tail probe, a footer chase (the footer is longer
+    // than the probe) and a SKIP_IDX read (the section lies before the probe).
+    // No BLOOM read: the statement has no service_name or name predicate.
+    assert_eq!(probe_gets, 6, "three probe GETs per object, two objects");
+    assert_eq!(
+        probe_bytes,
+        three_probe_get_bytes(&obj0, 64) + three_probe_get_bytes(&obj1, 64),
+        "probe bytes are each object's probe, footer chase and SKIP_IDX section"
+    );
+    assert_eq!(
+        scan_gets, 2,
+        "one scan GET per object, for its one block run"
+    );
+    assert_eq!(
+        scan_bytes, run_bytes,
+        "the scan phase moves exactly the two block runs, not the {whole_bytes} object bytes"
+    );
+}
+
+#[tokio::test]
+async fn worker_fragment_carries_the_declared_comparison_pushdown() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let one_per_block = RlogConfig {
+        block_target_records: 1,
+        ..RlogConfig::default()
+    };
+    let records = |range: std::ops::RangeInclusive<i64>| -> Vec<LogRecord> {
+        range
+            .map(|ts| {
+                log_record(
+                    &res,
+                    &[("status_code".to_string(), AttrValue::I64(ts * 100))],
+                    ts,
+                    &format!("body {ts}"),
+                )
+            })
+            .collect()
+    };
+    // Twelve blocks, one record each; only ts 11 and 12 carry
+    // status_code >= 1100, both in shard 1.
+    let s0 = write_rlog_segment_with(
+        backend.as_ref(),
+        "logs/pushdown-0.rlog",
+        0,
+        1,
+        10,
+        &records(1..=6),
+        one_per_block,
+    )
+    .await;
+    let s1 = write_rlog_segment_with(
+        backend.as_ref(),
+        "logs/pushdown-1.rlog",
+        1,
+        1,
+        20,
+        &records(7..=12),
+        one_per_block,
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let endpoints = rlog_endpoints_for(&snapshot);
+    let slices = endpoints.len();
+    assert_eq!(slices, 2, "fixture: one slice per shard");
+    let declared = vec![DeclaredColumn::new("status_code", DeclaredType::I64)];
+    let sql = "SELECT ts, body FROM logs WHERE status_code >= 1100";
+
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+    let (_, local) = run_sql(
+        "logs",
+        Arc::new(
+            LogsTableProvider::new(
+                snapshot.clone(),
+                TENANT,
+                fetcher.clone(),
+                PhaseAccounting::new(),
+            )
+            .with_declared_columns(declared.clone()),
+        ),
+        sql,
+    )
+    .await;
+    let mut want = ts_and(&local, "ts", "body");
+    want.sort();
+    assert_eq!(
+        want,
+        vec![(11, "body 11".to_string()), (12, "body 12".to_string())]
+    );
+
+    let worker = Arc::new(PushdownLogsWorker {
+        fetcher: fetcher.clone(),
+        declared: declared.clone(),
+        ran: Mutex::new(Vec::new()),
+    });
+    let client: Arc<dyn WorkerSliceClient> = Arc::clone(&worker) as Arc<dyn WorkerSliceClient>;
+    let (dist_plan, got) = run_sql(
+        "logs",
+        Arc::new(
+            LogsTableProvider::new(snapshot, TENANT, fetcher, PhaseAccounting::new())
+                .with_declared_columns(declared)
+                .with_distributed_scan(endpoints, client),
+        ),
+        sql,
+    )
+    .await;
+    let mut got = ts_and(&got, "ts", "body");
+    got.sort();
+    assert_eq!(got, want, "distributed rows equal single-node rows");
+
+    let ran = std::mem::take(&mut *worker.ran.lock().expect("worker fragments"));
+    assert_eq!(ran.len(), slices, "one fragment per slice");
+    let total = |name: &str| -> usize {
+        ran.iter()
+            .map(|f| sum_metric(&f.plan, "LogsScanExec", name))
+            .sum()
+    };
+    assert_eq!(total("blocks_total"), 12);
+    assert_eq!(
+        total("blocks_scanned"),
+        2,
+        "the workers decode only the two blocks the declared comparison admits, of twelve"
+    );
+    let shown = displayable(dist_plan.as_ref()).indent(true).to_string();
+    assert!(
+        shown.contains("DistributedSliceScanExec") && shown.contains("pushdown=logs"),
+        "the coordinator attaches a logs pushdown to its slices:\n{shown}"
+    );
+    for f in &ran {
+        let carried = f
+            .pushdown
+            .as_ref()
+            .and_then(SlicePushdown::as_logs)
+            .expect("the ticket carried a logs pushdown");
+        assert_eq!(carried.prune.len(), 1, "the one declared comparison");
+        let text = displayable(f.plan.as_ref()).indent(true).to_string();
+        assert!(
+            text.contains("prune=1"),
+            "the worker scan reports the prune arm it received:\n{text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
