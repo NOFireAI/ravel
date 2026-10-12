@@ -518,7 +518,7 @@ async fn q29_grouped_by_the_string_column_plans_final_partitioned() {
 }
 
 #[tokio::test]
-async fn float_avg_argument_and_float_group_key_stay_single_partition() {
+async fn float_avg_argument_stays_single_partition() {
     let on = Fixture::build(true).await;
 
     let float_avg = r#"SELECT REGEXP_REPLACE("Referer", '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(CAST(length("Referer") AS DOUBLE)) AS l, COUNT(*) AS c FROM logs WHERE "Referer" <> '' GROUP BY k"#;
@@ -529,6 +529,11 @@ async fn float_avg_argument_and_float_group_key_stay_single_partition() {
         partial.contains("[avg_sum]:Float64"),
         "avg over a Float64 argument folds its sum as Float64; got:\n{partial}"
     );
+}
+
+#[tokio::test]
+async fn float_group_key_stays_single_partition() {
+    let on = Fixture::build(true).await;
 
     // Every aggregate here is exact, so the float key is the only thing that
     // keeps this plan single-partition.

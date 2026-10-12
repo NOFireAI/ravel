@@ -1349,23 +1349,30 @@ mod tests {
     /// A dictionary whose value type is not an admitted integer keeps the
     /// built-in's coercion, so it never reaches the exact integer accumulator.
     #[test]
-    fn coerce_types_delegates_a_dictionary_of_a_non_admitted_type() {
-        let avg = SequentialAvg::new();
-        for value_type in [DataType::UInt64, DataType::Float64] {
-            let dictionary = dictionary_of(value_type);
-            let builtin = builtin_coercion(&dictionary);
-            assert_ne!(
-                builtin,
-                vec![DataType::Int64],
-                "precondition: the built-in does not itself coerce {dictionary} to Int64"
-            );
-            assert_eq!(
-                avg.coerce_types(std::slice::from_ref(&dictionary))
-                    .expect("coerces"),
-                builtin,
-                "{dictionary} must coerce exactly as the built-in coerces it"
-            );
-        }
+    fn coerce_types_delegates_a_dictionary_of_uint64() {
+        assert_dictionary_coerces_as_the_builtin(DataType::UInt64);
+    }
+
+    #[test]
+    fn coerce_types_delegates_a_dictionary_of_float64() {
+        assert_dictionary_coerces_as_the_builtin(DataType::Float64);
+    }
+
+    fn assert_dictionary_coerces_as_the_builtin(value_type: DataType) {
+        let dictionary = dictionary_of(value_type);
+        let builtin = builtin_coercion(&dictionary);
+        assert_ne!(
+            builtin,
+            vec![DataType::Int64],
+            "precondition: the built-in does not itself coerce {dictionary} to Int64"
+        );
+        assert_eq!(
+            SequentialAvg::new()
+                .coerce_types(std::slice::from_ref(&dictionary))
+                .expect("coerces"),
+            builtin,
+            "{dictionary} must coerce exactly as the built-in coerces it"
+        );
     }
 
     /// Fold `array` through the exact integer accumulator.
