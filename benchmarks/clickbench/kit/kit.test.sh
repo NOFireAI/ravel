@@ -125,10 +125,15 @@ cat >"$STUBS/curl" <<'STUB'
 #!/usr/bin/env bash
 # IMDS and readiness answer at once. A SQL call logs its request body to
 # sql-bodies, writes an answer to -o and prints "<status> <seconds>":
-# STUB_SQL_TIME seconds (default 0.5), and a 422 resource_exhausted refusal
-# for statement STUB_SQL_REFUSE_N. An answer holds the statement's expected
-# row count from the index.tsv beside its body (3 rows where the corpus states
-# none), or STUB_SQL_ROWS rows for statement STUB_SQL_ROWS_N.
+# STUB_SQL_TIME seconds (default 0.5), or the try's field of STUB_SQL_TIMES
+# ("cold hot hot"), and a 422 resource_exhausted refusal for statement
+# STUB_SQL_REFUSE_N. An answer holds the statement's expected row count from
+# the index.tsv beside its body (3 rows where the corpus states none), or
+# STUB_SQL_ROWS rows for statement STUB_SQL_ROWS_N (only on try
+# STUB_SQL_ROWS_TRY when that is set). The try is read from the -o name,
+# <number>-<try>.json. A body under a verify/ directory is the box's row-count
+# check: it is logged to verify-bodies and answered with one cell,
+# STUB_COUNT_STAR (default the hits row count).
 out=""
 body=""
 url=""
@@ -147,8 +152,18 @@ case "$url" in
   */meta-data/instance-type) echo c6a.4xlarge ;;
   */readyz) echo ready ;;
   */api/v1/sql)
+    case "$body" in
+      */verify/*)
+        { cat "$body"; echo; } >>"$STUB_DIR/verify-bodies"
+        printf '{"status":"success","data":{"columns":["count(*)"],"rows":[[%s]]},"stats":{}}' \
+          "${STUB_COUNT_STAR:-99997497}" >"$out"
+        printf '200 0.1'
+        exit 0 ;;
+    esac
     echo "sql $(basename "$body")" >>"$STUB_DIR/curl-sql"
     n="$(basename "$body" .json)"
+    try="${out##*-}"
+    try="${try%.json}"
     { cat "$body"; echo; } >>"$STUB_DIR/sql-bodies"
     if [ "$n" = "${STUB_SQL_REFUSE_N:-none}" ]; then
       printf '{"status":"error","errorType":"resource_exhausted","error":"query pool exhausted"}' >"$out"
@@ -156,12 +171,17 @@ case "$url" in
     else
       rows="$(awk -F'\t' -v n="$n" '$1 == n { print $3 }' "$(dirname "$body")/index.tsv")"
       case "$rows" in ''|-) rows=3 ;; esac
-      [ "$n" != "${STUB_SQL_ROWS_N:-none}" ] || rows="$STUB_SQL_ROWS"
+      if [ "$n" = "${STUB_SQL_ROWS_N:-none}" ] \
+        && { [ -z "${STUB_SQL_ROWS_TRY:-}" ] || [ "$try" = "$STUB_SQL_ROWS_TRY" ]; }; then
+        rows="$STUB_SQL_ROWS"
+      fi
       json=""
       for ((i = 0; i < rows; i++)); do json="${json:+$json,}[$i]"; done
       json="[$json]"
       printf '{"status":"success","data":{"columns":["c"],"rows":%s},"stats":{}}' "$json" >"$out"
-      printf '200 %s' "${STUB_SQL_TIME:-0.5}"
+      seconds="${STUB_SQL_TIME:-0.5}"
+      [ -z "${STUB_SQL_TIMES:-}" ] || seconds="$(printf '%s\n' $STUB_SQL_TIMES | sed -n "${try}p")"
+      printf '200 %s' "$seconds"
     fi
     ;;
   *) echo "unexpected curl: $url" >&2; exit 7 ;;
@@ -180,7 +200,9 @@ STUB
 
 # The box's binaries. The server logs its argv and the five settings stamps,
 # then sleeps until stopped; the CLI logs its argv, and `load` adds 100
-# objects to the store. STUB_FOLD=unsealed makes the fold seal nothing, and
+# objects to the store and prints ravel-cli's load summary with
+# STUB_LOAD_ROWS rows written (default the hits row count). STUB_FOLD=unsealed
+# makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice, and
 # STUB_FOLD_ENTRIES sets the entry_count it prints (default 100).
 cat >"$BINSTUBS/ravel-server" <<'STUB'
 #!/usr/bin/env bash
@@ -195,10 +217,14 @@ cat >"$BINSTUBS/ravel-cli" <<'STUB'
 #!/usr/bin/env bash
 echo "cli $*" >>"$STUB_DIR/cli-argv"
 case " $* " in
-  *" load "*) echo 110 >"$STUB_DIR/objects" ;;
+  *" load "*)
+    echo 110 >"$STUB_DIR/objects"
+    printf 'bulk load complete\n  rows_skipped     : 0\n  rows_written     : %s\n  rows/sec         : 1000\n  objects written  : 100\n' \
+      "${STUB_LOAD_ROWS:-99997497}" ;;
   *" catalog fold "*)
     if [ "${STUB_FOLD:-}" = unsealed ]; then echo "seal_through_hour: None"; else echo "seal_through_hour: Some(491234)"; fi
-    printf 'watermark_hour: Some(491235)\nentry_count: %s\nbuckets_folded: 5\npart_bytes: 12345\n' "${STUB_FOLD_ENTRIES:-100}" ;;
+    printf 'previous_watermark_hour: Some(491200)\nwatermark_hour: Some(491235)\nentry_count: %s\nbuckets_folded: 5\npart_bytes: 12345\n' "${STUB_FOLD_ENTRIES:-100}"
+    [ "${STUB_FOLD:-}" != twice ] || echo "entry_count: 100" ;;
 esac
 exit 0
 STUB
@@ -239,6 +265,7 @@ shards = 8
 corpus = "benchmarks/clickbench/hits.corpus.json"
 dataset_url = "https://example.invalid/hits.parquet"
 dataset_sha256 = "$DATASET_SHA"
+rows_expected = 99997497
 rustfs_url = "https://example.invalid/rustfs.zip"
 rustfs_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 memory_budget_bytes = 25769803776
@@ -565,11 +592,9 @@ drop_caches() {
   sync
   echo 3 >"$DROP_CACHES_FILE"
 }
-# GNU time is not on every CI image; the load and compact flags stay as run.sh has them.
-do_load() { "$CLI_BIN" --store s3 --tenant-hash-unkeyed load --parquet "$DATASET" --tenant "$TENANT" \
-  --mapping "$MAPPING" --shards "$SHARDS" --read-cursors 8 --batch-rows 65536; }
-do_compact() { "$CLI_BIN" --store s3 --tenant-hash-unkeyed maintain compact-tenant \
-  --tenant "$TENANT" --signal logs --shards "$SHARDS"; }
+# GNU time is not on every CI image; run.sh's own do_load and do_compact run
+# with only the timing wrapper replaced.
+timed() { shift 2; "$@"; }
 eval "real_run_query() $(declare -f run_query | tail -n +2)"
 run_query() {
   echo "$*" >>"$STUB_DIR/run_query-calls"
@@ -581,13 +606,18 @@ DRIVER
 export BINSTUBS
 
 # run_box ARM NAME [ENV=VALUE...]: boot a box for ARM and run main on it.
+# BOX_TOML_SED, when set, is a sed script applied to the box's run.toml after
+# boot (the user-data has checked its digest by then).
 run_box() {
   local arm="$1" name="$2" box="$TMP/$2" code=0
   shift 2
   reset_log
   rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/curl-sql" "$STUB_DIR/run_query-calls" \
-    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies" "$STUB_DIR/sequence"
+    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies" "$STUB_DIR/sequence" "$STUB_DIR/verify-bodies"
   boot_box "$arm" "$box" || return 1
+  if [ -n "${BOX_TOML_SED:-}" ]; then
+    sed "$BOX_TOML_SED" "$box/kit/run.toml" >"$box/kit/run.toml.new" && mv "$box/kit/run.toml.new" "$box/kit/run.toml"
+  fi
   env "$@" bash "$TMP/box-driver.sh" "$box" >"$box/kit/run.log" 2>&1 || code=$?
   return "$code"
 }
@@ -623,13 +653,18 @@ def want(cond, what):
     if not cond:
         bad.append(what)
 for k in ("provenance", "entries", "skipped", "failed", "totals", "error_pooled", "concurrency",
-          "phases", "bands"):
+          "phases", "bands", "timing_definition"):
     want(k in r, "field " + k)
 for k in ("git_sha", "binary", "arm", "tenant", "server", "server_logs", "server_settings",
           "band_sections", "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
           "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold", "object_counts",
-          "query_window"):
+          "query_window", "row_count"):
     want(k in p, "provenance." + k)
+rc = p.get("row_count") or {}
+want(rc.get("rows_expected") == 99997497 and rc.get("load_rows_written") == 99997497
+     and rc.get("count_star") == 99997497 and rc.get("statement") == "q01_count_all", "row_count stamp %r" % rc)
+want(isinstance(r.get("timing_definition"), str) and "tries 2 and 3" in r["timing_definition"]
+     and "try 1" in r["timing_definition"], "timing_definition")
 want(p.get("git_sha") == sys.argv[2], "git_sha")
 want(p.get("arm") == "a" and p.get("kit_arm") == "A", "arm")
 want(p.get("server_settings", {}).get("sql_max_query_bytes") == 16451897344, "sql_max_query_bytes")
@@ -684,8 +719,10 @@ fi
 # Catches: a request body without an explicit window (the server's default is
 # the last hour, which would hide the load), a window other than 200000 h, a
 # window that differs between statements or from the provenance stamp, or a
-# body sending a statement other than the corpus's.
-window_ok="$(python3 - "$STUB_DIR/sql-bodies" "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" <<'PY'
+# body sending a statement other than the corpus's. The row-count check's one
+# body must send the corpus's COUNT(*) over the same window.
+window_ok="$(python3 - "$STUB_DIR/sql-bodies" "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" \
+  "$STUB_DIR/verify-bodies" <<'PY'
 import json, sys
 bodies = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 w = json.load(open(sys.argv[2]))["provenance"]["query_window"]
@@ -694,13 +731,18 @@ ok = len(bodies) == 129
 ok = ok and all(sorted(b) == ["end", "query", "start"] and b["start"] == w["start"]
                 and b["end"] == w["end"] and b["end"] - b["start"] == 200000 * 3600 for b in bodies)
 ok = ok and [b["query"] for b in bodies[::3]] == sqls
+try:
+    verify = [json.loads(l) for l in open(sys.argv[4]) if l.strip()]
+except OSError:
+    verify = []
+ok = ok and verify == [{"query": "SELECT COUNT(*) FROM logs", "start": w["start"], "end": w["end"]}]
 print("yes" if ok else "no")
 PY
 )"
 if [ "$window_ok" = yes ]; then
-  pass "every request body carries an explicit start and end 200000 hours apart"
+  pass "every request body, the row-count check's included, carries one start and end 200000 hours apart"
 else
-  fail "query window" "$(head -c 300 "$STUB_DIR/sql-bodies")"
+  fail "query window" "$(head -c 300 "$STUB_DIR/sql-bodies"); verify: $(head -c 200 "$STUB_DIR/verify-bodies" 2>/dev/null)"
 fi
 
 # Catches: the kit's results.json no longer reading in the runbook's analyse.py
@@ -744,12 +786,13 @@ else
   fail "run_query" "fields $fields_ok, run_query $(wc -l <"$STUB_DIR/run_query-calls" 2>/dev/null), curl $(wc -l <"$STUB_DIR/curl-sql" 2>/dev/null)"
 fi
 
-# Catches: a server start that does not take its flags from arm.env (all 43
-# restarts must run the same argv), or cold tries without a cache drop.
-if [ "$(wc -l <"$STUB_DIR/server-argv" | tr -d ' ')" = 43 ] && [ "$(sort -u "$STUB_DIR/server-argv" | wc -l | tr -d ' ')" = 1 ] \
+# Catches: a server start that does not take its flags from arm.env (the
+# row-count check's start and all 43 restarts must run the same argv), or cold
+# tries without a cache drop.
+if [ "$(wc -l <"$STUB_DIR/server-argv" | tr -d ' ')" = 44 ] && [ "$(sort -u "$STUB_DIR/server-argv" | wc -l | tr -d ' ')" = 1 ] \
   && grep -q -- '--memory-budget-bytes 25769803776 --audit-mode off' "$STUB_DIR/server-argv" \
   && [ "$(cat "$BOX_A/drop_caches")" = 3 ]; then
-  pass "each of the 43 cold starts runs the same server flags after a cache drop"
+  pass "the row-count check's start and each of the 43 cold starts run the same server flags"
 else
   fail "server starts" "$(sort "$STUB_DIR/server-argv" | uniq -c | head -n 3)"
 fi
@@ -766,14 +809,14 @@ else
 fi
 
 # Catches: a step that runs without a UTC stamp, or the phases running before
-# the fold precondition was checked. The uploaded copy ends at evidence: upload
-# is stamped after it is sent.
+# the fold precondition and the row-count check. The uploaded copy ends at
+# evidence: upload is stamped after it is sent.
 order="$(sed -n 's/^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z step=\([a-z-]*\) state=done$/\1/p' "$OUT_A/progress.log" | tr '\n' ' ')"
 unstamped="$(grep -vc '^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z ' "$OUT_A/progress.log")"
 case "$order" in
-  *"objects-before-load load objects-after-load compact fold declare phase-benchmark burst-end results evidence "*)
+  *"objects-before-load load objects-after-load compact fold declare verify phase-benchmark burst-end results evidence "*)
     if [ "$unstamped" = 0 ]; then
-      pass "progress.log stamps every step in UTC, fold before the phases"
+      pass "progress.log stamps every step in UTC, fold and the row-count check before the phases"
     else
       fail "progress.log" "$unstamped unstamped lines"
     fi ;;
@@ -885,6 +928,96 @@ if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null &
   pass "a fold with too few entries for the objects written fails as FAILED step=fold"
 else
   fail "fold entry ratio" "exit $code, stamp '$fold_stamp', FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a fold field read from the first of several matches: a fold.out
+# carrying entry_count twice is not a figure the kit can stamp.
+code=0
+run_box A box-foldtwice STUB_FOLD=twice || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold.out carries entry_count 2 times, not once' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-foldtwice/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a fold.out carrying a field twice fails as FAILED step=fold"
+else
+  fail "fold field twice" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a load whose row count is never checked: a load that wrote one row
+# short of run.toml's rows_expected must fail the run at step load.
+code=0
+run_box A box-loadrows STUB_LOAD_ROWS=99997496 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=load ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'load wrote 99997496 rows, run.toml rows_expected is 99997497' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-loadrows/kit/out/benchmark/calls.jsonl" ]; then
+  pass "a load that wrote other than rows_expected rows fails as FAILED step=load"
+else
+  fail "load rows" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: an answer check that never looks at the data the server reads: the
+# corpus COUNT(*), sent before the benchmark, answers one row short of
+# rows_expected, so the run must fail at step verify before any statement runs.
+code=0
+run_box A box-verify STUB_COUNT_STAR=99997496 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=verify ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'SELECT COUNT(\*) FROM logs answered 99997496, run.toml rows_expected is 99997497' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-verify/kit/out/benchmark/calls.jsonl" ] && [ ! -s "$STUB_DIR/curl-sql" ]; then
+  pass "a COUNT(*) other than rows_expected fails as FAILED step=verify before the benchmark"
+else
+  fail "verify rows" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the statement-count check dropped: a run.toml expecting 42
+# statements against the 43-statement corpus must fail before any is sent.
+code=0
+BOX_TOML_SED='1i\
+expected_statements = 42' run_box A box-count || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=phase-benchmark ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'corpus holds 43 statements, run.toml expects 42' "$OUT_A/FAILED" \
+  && [ ! -s "$STUB_DIR/curl-sql" ]; then
+  pass "a corpus holding other than expected_statements fails as FAILED step=phase-benchmark"
+else
+  fail "statement count" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a hot try checked against nothing when the corpus states no row
+# count (q08 answers 3 rows cold and 4 on try 2, which must be a wrong_answer),
+# and a hot figure taken over all three tries: with tries of 0.1, 0.6 and 0.4 s
+# hot is 0.4 s (the best of tries 2 and 3) and cold 0.1 s.
+code=0
+run_box A box-tries STUB_SQL_ROWS_N=08 STUB_SQL_ROWS=4 STUB_SQL_ROWS_TRY=2 'STUB_SQL_TIMES=0.1 0.6 0.4' || code=$?
+check="$(python3 - "$OUT_A/results.json" "$REPO_ROOT/benchmarks/clickbench/hits.corpus.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+q08 = json.load(open(sys.argv[2]))["entries"][7]["id"]
+bad = []
+def want(cond, what):
+    if not cond:
+        bad.append(what)
+failed = {f["id"]: f for f in r["failed"]}
+want(sorted(failed) == [q08], "failed ids %s" % sorted(failed))
+f = failed.get(q08, {})
+want(f.get("run") == 1 and "wrong_answer" in f.get("error", "")
+     and "answer has 4 rows, expected 3" in f.get("error", ""), "q08 error %r" % f.get("error"))
+want(len(r["entries"]) == 42, "42 entries")
+for e in r["entries"]:
+    want(abs(e["min_ms"] - 400.0) < 1e-6 and abs(e["cold_ms"] - 100.0) < 1e-6
+         and abs(e["median_ms"] - 400.0) < 1e-6 and abs(e["max_ms"] - 600.0) < 1e-6,
+         "%s timings %r" % (e["id"], [e["min_ms"], e["median_ms"], e["max_ms"], e["cold_ms"]]))
+want(abs(r["totals"]["hot_sum_s"] - 16.8) < 1e-6 and abs(r["totals"]["cold_sum_s"] - 4.2) < 1e-6,
+     "totals %r" % r["totals"])
+print(",".join(bad[:4]))
+PY
+)" || check="python failed"
+if [ "$code" = 0 ] && grep -q '^DONE bands=miss ' "$OUT_A/DONE" 2>/dev/null && [ -z "$check" ]; then
+  pass "a hot try with another row count than the cold try is a wrong_answer, and hot is the best of tries 2 and 3"
+else
+  fail "tries" "box exit $code: $check"
 fi
 rm -rf "$OUT_A"
 
@@ -1021,6 +1154,8 @@ if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both a
   && grep -q '^PASS  *B vs A  *error_pooled <= A + 0.02' "$TMP/fetch-pass.out" \
   && grep -q '^INCONCLUSIVE  *B vs A  *qps >= 0.95 x A' "$TMP/fetch-pass.out" \
   && grep -q '^PASS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *both answered >= 43  *43  *43$' "$TMP/fetch-pass.out" \
+  && grep -q '^PASS  *B vs A  *rows_returned = A (43 both answered)  *0  *0$' "$TMP/fetch-pass.out" \
   && [ -f "$TMP/fetch-pass/A/evidence.tgz" ] && [ -f "$TMP/fetch-pass/B/evidence.tgz" ]; then
   pass "fetch passes two matching arms and downloads both arms' results and evidence"
 else
@@ -1123,26 +1258,159 @@ else
   fail "qps" "exit $code: $(grep -v '^PASS' "$TMP/fetch-qps.out" | head -n 4)"
 fi
 
+# DROP_PY: a python edit helper for edit_arm. drop(r, qs) moves every entry
+# whose qNN prefix is in qs to failed and recomputes the totals.
+DROP_PY='
+def drop(r, qs):
+    keep = []
+    for e in r["entries"]:
+        if e["id"].split("_", 1)[0] in qs:
+            r["failed"].append({"id": e["id"], "run": 0, "error": "error HTTP 504 deadline: stub",
+                                "answer": dict(e["answer"], answered=False)})
+        else:
+            keep.append(e)
+    r["entries"] = keep
+    r["totals"].update(answered=len(keep), failed=[f["id"] for f in r["failed"]],
+                       hot_sum_s=sum(e["min_ms"] for e in keep) / 1000.0,
+                       cold_sum_s=sum(e["cold_ms"] for e in keep) / 1000.0)
+ALL = ["q%02d" % n for n in range(1, 44)]
+'
+# relative NAME A_DIR B_DIR [BANDS]: kit.py relative over two arms' reports,
+# output in $TMP/rel-NAME.out and .err, exit code in $code.
+relative() {
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" relative "${4:-$BANDS}" "$2/results.json" "$3/results.json" \
+    >"$TMP/rel-$1.out" 2>"$TMP/rel-$1.err" || code=$?
+}
+
+# Catches: a run where neither arm answered anything judged a pass: every sum
+# over the empty both-answered set is 0 against a bound of 0, so only the
+# answered-count band can miss.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-none-a" "$DROP_PY"'
+drop(r, ALL)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-none-b" "$DROP_PY"'
+drop(r, ALL)'
+relative none "$TMP/fixture-none-a" "$TMP/fixture-none-b"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *0  *43  *not answered by A: q01 q02 .* q43; not answered by B: q01 .* q43; arm A answered no statement; arm B answered no statement$' "$TMP/rel-none.out" \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (0 both answered)  *0.000  *0.000$' "$TMP/rel-none.out"; then
+  pass "two arms with 0 of 43 statements answered miss, naming the count and the statements"
+else
+  fail "0/43" "exit $code: $(grep -v '^PASS' "$TMP/rel-none.out" | head -c 400) $(head -c 300 "$TMP/rel-none.err")"
+fi
+
+# Catches: an answered-count band read as "anything answered": both arms
+# answered q01 only.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-one-a" "$DROP_PY"'
+drop(r, ALL[1:])'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-one-b" "$DROP_PY"'
+drop(r, ALL[1:])'
+relative one "$TMP/fixture-one-a" "$TMP/fixture-one-b"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *1  *43  *not answered by A: q02 .* q43; not answered by B: q02 .* q43$' "$TMP/rel-one.out"; then
+  pass "two arms with 1 of 43 statements answered miss"
+else
+  fail "1/43" "exit $code: $(grep -v '^PASS' "$TMP/rel-one.out" | head -c 400) $(head -c 300 "$TMP/rel-one.err")"
+fi
+
+# Catches: an arm with zero answered statements passing because the key allows
+# it, or the zero-answered rule applied to one arm only.
+mkdir -p "$TMP/bands-min1"
+sed 's/^min_both_answered = .*/min_both_answered = 1/' "$BANDS" >"$TMP/bands-min1/rlog.toml"
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-zero-b" "$DROP_PY"'
+drop(r, ALL)'
+relative zero-b "$TMP/fixture-pass" "$TMP/fixture-zero-b" "$TMP/bands-min1/rlog.toml"
+zero_b="$code"
+relative zero-a "$TMP/fixture-none-a" "$TMP/fixture-pass-b" "$TMP/bands-min1/rlog.toml"
+zero_a="$code"
+if [ "$zero_b" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 1  *0  *1  *.*arm B answered no statement' "$TMP/rel-zero-b.out" \
+  && [ "$zero_a" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 1  *0  *1  *.*arm A answered no statement' "$TMP/rel-zero-a.out"; then
+  pass "an arm that answered no statement misses whatever min_both_answered allows"
+else
+  fail "zero answered" "exits $zero_a/$zero_b:$(grep 'both answered >=' "$TMP/rel-zero-a.out" "$TMP/rel-zero-b.out") $(head -c 300 "$TMP/rel-zero-a.err")"
+fi
+
+# Catches: a statement one arm lost dropping out of the count: A43/B42 and
+# A42/B43 with min_both_answered 43. B's lost statement was already a miss by
+# id; A's lost statement was only ever inconclusive.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-b42" "$DROP_PY"'
+drop(r, ["q07"])'
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-a42" "$DROP_PY"'
+drop(r, ["q07"])'
+relative b42 "$TMP/fixture-pass" "$TMP/fixture-b42"
+b42="$code"
+relative a42 "$TMP/fixture-a42" "$TMP/fixture-pass-b"
+if [ "$b42" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *42  *43  *not answered by B: q07$' "$TMP/rel-b42.out" \
+  && [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *both answered >= 43  *42  *43  *not answered by A: q07$' "$TMP/rel-a42.out" \
+  && [ "$(grep -c '^MISS' "$TMP/rel-a42.out")" = 1 ]; then
+  pass "A43/B42 and A42/B43 both miss min_both_answered 43, naming the lost statement"
+else
+  fail "A43/B42, A42/B43" "exits $b42/$code: $(grep -v '^PASS' "$TMP/rel-b42.out" "$TMP/rel-a42.out" | head -c 600)"
+fi
+# The same A42/B43 pair passes when the band file names one known deadline miss.
+sed 's/^min_both_answered = .*/min_both_answered = 42/' "$BANDS" >"$TMP/bands-min1/rlog.toml"
+relative a42-42 "$TMP/fixture-a42" "$TMP/fixture-pass-b" "$TMP/bands-min1/rlog.toml"
+if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *both answered >= 42  *42  *42  *not answered by A: q07$' "$TMP/rel-a42-42.out"; then
+  pass "A42/B43 passes min_both_answered 42"
+else
+  fail "A42/B43 at 42" "exit $code: $(grep -v '^PASS' "$TMP/rel-a42-42.out" | head -c 400) $(head -c 300 "$TMP/rel-a42-42.err")"
+fi
+
+# Catches: answers never compared between the arms: both arms answered q08
+# (no expected row count in the corpus), A with 3 rows and B with 4.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-rows-b" '
+for e in r["entries"]:
+    if e["id"].startswith("q08"):
+        e["rows_returned"] = 4
+        e["answer"]["rows"] = 4'
+relative rows "$TMP/fixture-pass" "$TMP/fixture-rows-b"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *rows_returned = A (43 both answered)  *1  *0  *q08$' "$TMP/rel-rows.out" \
+  && grep -q '^MISS  *B vs A  *q08 rows_returned = A  *4  *3$' "$TMP/rel-rows.out" \
+  && [ "$(grep -c '^MISS' "$TMP/rel-rows.out")" = 2 ]; then
+  pass "a statement answering another row count on B than on A is a miss naming it"
+else
+  fail "rows_returned" "exit $code: $(grep -v '^PASS' "$TMP/rel-rows.out" | head -c 400) $(head -c 300 "$TMP/rel-rows.err")"
+fi
+
 # Catches: two arms compared when they ran on different data, a different
-# mapping, a different CPU model or a different RustFS build. Each must exit
-# 2 naming the field.
-for edit in 'corpus_digest|dataset_sha256|"2" * 64' 'corpus_digest|mapping_sha256|"3" * 64' \
-  'hardware|cpu|"Some Other CPU"' 'backend|version|"rustfs 9.9.9"'; do
-  block="${edit%%|*}"
-  field="${edit#*|}"
-  value="${field#*|}"
-  field="${field%%|*}"
-  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" "r[\"provenance\"][\"$block\"][\"$field\"] = $value"
+# mapping or corpus, a different CPU model, a different RustFS build, a
+# different audit mode, a different query window or under different server
+# settings. Each must exit 2 naming the field. Each entry is the provenance
+# path and the python edit that changes it on arm B.
+for edit in 'corpus_digest.dataset_sha256|p["corpus_digest"]["dataset_sha256"] = "2" * 64' \
+  'corpus_digest.mapping_sha256|p["corpus_digest"]["mapping_sha256"] = "3" * 64' \
+  'corpus_digest.corpus_sha256|p["corpus_digest"]["corpus_sha256"] = "4" * 64' \
+  'hardware.cpu|p["hardware"]["cpu"] = "Some Other CPU"' \
+  'backend.version|p["backend"]["version"] = "rustfs 9.9.9"' \
+  'audit_mode|p["audit_mode"] = "required, audit text redacted"' \
+  'query_window.window_hours|p["query_window"]["window_hours"] = 100000' \
+  'server_settings|p["server_settings"]["fetch_concurrency"] += 1'; do
+  field="${edit%%|*}"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" "p = r[\"provenance\"]
+${edit#*|}"
   code=0
   python3 "$KIT_SRC/lib/kit.py" relative "$BANDS" "$TMP/fixture-pass/results.json" "$TMP/fixture-cmp-b/results.json" \
     >"$TMP/cmp.out" 2>"$TMP/cmp.err" || code=$?
-  if [ "$code" = 2 ] && grep -q "arms are not comparable: provenance.$block.$field differs" "$TMP/cmp.err" \
+  if [ "$code" = 2 ] && grep -qF "arms are not comparable: provenance.$field differs" "$TMP/cmp.err" \
     && ! grep -q 'B vs A' "$TMP/cmp.out"; then
-    pass "arms with a different $block.$field are refused with exit 2, naming it"
+    pass "arms with a different $field are refused with exit 2, naming it"
   else
     fail "comparable $field" "exit $code: $(head -c 300 "$TMP/cmp.err")"
   fi
 done
+
+# Catches: arms judged by different band sections compared, and a comparable
+# field missing on one arm read as equal to nothing on the other.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'r["provenance"]["band_sections"] = ["relative"]'
+relative sections "$TMP/fixture-pass" "$TMP/fixture-cmp-b"
+sections_code="$code"
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'del r["provenance"]["hardware"]["cpu"]'
+relative missing "$TMP/fixture-pass" "$TMP/fixture-cmp-b"
+if [ "$sections_code" = 2 ] && grep -qF 'arms are not comparable: provenance.band_sections differs' "$TMP/rel-sections.err" \
+  && [ "$code" = 2 ] && grep -qF 'arms are not comparable: provenance.hardware.cpu is missing on B' "$TMP/rel-missing.err" \
+  && ! grep -q 'B vs A' "$TMP/rel-sections.out" "$TMP/rel-missing.out"; then
+  pass "arms with different band sections, or one missing a comparable field, are refused with exit 2"
+else
+  fail "band_sections / missing field" "exits $sections_code/$code: $(head -c 200 "$TMP/rel-sections.err") $(head -c 200 "$TMP/rel-missing.err")"
+fi
 # The same refusal through fetch, which must not read it as a band miss.
 as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" 'r["provenance"]["hardware"]["cpu"] = "Some Other CPU"'
 fixture run-cmp "$TMP/fixture-pass" "$TMP/fixture-cmp-b"

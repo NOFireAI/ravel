@@ -42,7 +42,10 @@ max_ms, cold_ms, rows_returned, per_run_accounting) and `failed` one
 FailedEntry per statement that did not answer (id, run, error). Both carry the
 kit's `answer` check and entries carry `"error": null`. per_run_accounting is
 null: an HTTP answer carries no executor accounting, as on the Flight lane.
-The kit's own blocks sit beside them: provenance, totals, error_pooled,
+min_ms (hot) is the best of tries 2 and 3 and cold_ms is try 1; median_ms and
+max_ms run over all three tries. The report says so in its own
+timing_definition string, because SqlLatencyReport's min_ms runs over all
+three. The kit's own blocks sit beside them: provenance, totals, error_pooled,
 concurrency, phases and bands.
 """
 
@@ -75,6 +78,7 @@ LANE_BANDS = {
         "relative": (
             "error_pooled_max_delta", "qps_min_ratio", "hot_statement_max_ratio",
             "hot_statement_floor_s", "hot_sum_max_ratio", "cold_sum_max_ratio",
+            "min_both_answered",
         ),
         "absolute": ("hot_sum_s_max", "cold_sum_s_max", "error_pooled_max"),
         "absolute.hot_s_max": STATEMENT_KEYS,
@@ -83,12 +87,14 @@ LANE_BANDS = {
 # Keys a band file may no longer carry, refused by name (parse_prereg in
 # crates/ravel-bench/src/clickbench_parquet/report.rs refuses the same).
 REMOVED_BAND_KEYS = ("concurrency_error_ratio_ceiling",)
+# Band keys that count statements: a whole number from 1 to the corpus size.
+COUNT_BAND_KEYS = ("relative.min_both_answered",)
 
 RUN_REQUIRED = (
     "sha_a", "sha_b", "lanes", "phases", "instance_type", "region", "bucket",
     "prefix", "instance_profile", "repo_url", "tenant", "shards", "corpus",
-    "dataset_url", "dataset_sha256", "rustfs_url", "rustfs_sha256",
-    "memory_budget_bytes", "audit_mode",
+    "dataset_url", "dataset_sha256", "rows_expected", "rustfs_url",
+    "rustfs_sha256", "memory_budget_bytes", "audit_mode",
 )
 DEFAULT_WINDOW_HOURS = 200000
 
@@ -99,9 +105,11 @@ ENTRY_FIELDS = (
 FAILED_FIELDS = ("id", "run", "error", "answer")
 ANSWER_FIELDS = ("answered", "rows", "expected_rows", "match")
 REPORT_FIELDS = (
-    "provenance", "entries", "skipped", "failed", "totals", "error_pooled",
-    "concurrency", "phases", "bands",
+    "provenance", "timing_definition", "entries", "skipped", "failed", "totals",
+    "error_pooled", "concurrency", "phases", "bands",
 )
+TIMING_DEFINITION = ("hot (min_ms) is the best of tries 2 and 3; cold (cold_ms) is try 1; "
+                     "median_ms and max_ms are over all three tries")
 PROVENANCE_FIELDS = (
     "git_sha", "binary", "arm", "tenant", "server", "server_logs",
     "server_settings", "band_sections",
@@ -111,19 +119,26 @@ TOTALS_FIELDS = ("cold_sum_s", "hot_sum_s", "answered", "failed")
 KIT_STAMPS = (
     "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
     "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold",
-    "object_counts", "query_window",
+    "object_counts", "query_window", "row_count",
 )
 STAMPED_SETTINGS = (
     "cache_max_bytes", "catalog_cache_max_bytes", "fetch_concurrency",
     "sql_max_query_bytes", "sql_tenant_max_bytes",
 )
 # Two arms whose provenance differs on one of these did not measure the same
-# thing, so no relative band between them stands.
+# thing, so no relative band between them stands. server_settings is compared
+# whole: it holds only the resolved STAMPED_SETTINGS, and each arm's binary
+# path and SHA live in provenance.binary, git_sha and server_flags, which are
+# not compared because they are what differs between the arms by design.
 COMPARABLE = (
-    ("corpus_digest", "dataset_sha256"),
-    ("corpus_digest", "mapping_sha256"),
-    ("hardware", "cpu"),
-    ("backend", "version"),
+    "corpus_digest.dataset_sha256",
+    "corpus_digest.mapping_sha256",
+    "corpus_digest.corpus_sha256",
+    "hardware.cpu",
+    "backend.version",
+    "audit_mode",
+    "query_window.window_hours",
+    "server_settings",
 )
 
 
@@ -274,7 +289,7 @@ def check_run(path):
         band_sections(data)
     except Refusal as e:
         raise Refusal("run.toml %s: %s" % (path, e))
-    for key in ("shards", "memory_budget_bytes"):
+    for key in ("shards", "memory_budget_bytes", "rows_expected"):
         if not isinstance(data[key], int) or isinstance(data[key], bool) or data[key] <= 0:
             raise Refusal("run.toml %s: %s must be a whole number above 0" % (path, key))
     hours = data.get("window_hours", DEFAULT_WINDOW_HOURS)
@@ -348,6 +363,14 @@ def check_bands(lane, path, sections=None):
     if malformed:
         raise Refusal("band file %s: %s must be a number of at least 0"
                       % (path, ", ".join(malformed)))
+    for name in COUNT_BAND_KEYS:
+        table, key = name.rsplit(".", 1)
+        if key not in schema.get(table, ()):
+            continue
+        v = data[table][key]
+        if not _placeholder(v) and (not isinstance(v, int) or not 1 <= v <= len(STATEMENT_KEYS)):
+            raise Refusal("band file %s: %s must be a whole number from 1 to %d, got %r"
+                          % (path, name, len(STATEMENT_KEYS), v))
     if placeholders:
         raise Refusal("band file %s: placeholder value in %s; fill it in on the reference "
                       "machine before selecting that section in band_sections"
@@ -413,22 +436,28 @@ def absolute_bands(lane, path, sections, report):
 
 def check_comparable(a, b):
     pa, pb = a["provenance"], b["provenance"]
-    for block, field in COMPARABLE:
-        va, vb = lookup(pa, "%s.%s" % (block, field)), lookup(pb, "%s.%s" % (block, field))
+    for field in COMPARABLE:
+        va, vb = lookup(pa, field), lookup(pb, field)
         if va in (None, "") or vb in (None, ""):
-            raise Refusal("arms are not comparable: provenance.%s.%s is missing on %s"
-                          % (block, field, "A" if va in (None, "") else "B"))
+            raise Refusal("arms are not comparable: provenance.%s is missing on %s"
+                          % (field, "A" if va in (None, "") else "B"))
         if va != vb:
-            raise Refusal("arms are not comparable: provenance.%s.%s differs (A %r, B %r)"
-                          % (block, field, va, vb))
+            raise Refusal("arms are not comparable: provenance.%s differs (A %r, B %r)"
+                          % (field, va, vb))
     if pa["band_sections"] != pb["band_sections"]:
         raise Refusal("arms are not comparable: provenance.band_sections differs (A %r, B %r)"
                       % (pa["band_sections"], pb["band_sections"]))
 
 
+def _qs(ids):
+    return " ".join(sid.split("_", 1)[0] for sid in sorted(ids))
+
+
 def relative_bands(path, a, b):
     """Arm B judged against arm A, over the statements both arms answered. A
-    statement A answered and B did not is a miss of its own."""
+    statement A answered and B did not is a miss of its own, and so is a
+    both-answered set smaller than min_both_answered, an arm that answered
+    nothing, or a statement whose row count differs between the arms."""
     check_comparable(a, b)
     sections = a["provenance"]["band_sections"]
     if "relative" not in sections:
@@ -457,9 +486,19 @@ def relative_bands(path, a, b):
     ea = {e["id"]: e for e in a["entries"]}
     eb = {e["id"]: e for e in b["entries"]}
     both = sorted(set(ea) & set(eb))
+    ids = set(ea) | set(eb) | set(f["id"] for r in (a, b) for f in r["failed"])
+    need = rel["min_both_answered"]
+    notes = ["not answered by %s: %s" % (arm, _qs(ids - set(e)))
+             for arm, e in (("A", ea), ("B", eb)) if ids - set(e)]
+    notes += ["arm %s answered no statement" % arm for arm, e in (("A", ea), ("B", eb)) if not e]
+    add("both answered >= %d" % need, len(both), need,
+        "pass" if len(both) >= need and ea and eb else "miss", "; ".join(notes))
     for sid in sorted(set(ea) - set(eb)):
         add("%s answered by B" % sid.split("_", 1)[0], None, None, "miss",
             "answered by A, not by B", statement=sid)
+    differ = [s for s in both if ea[s]["rows_returned"] != eb[s]["rows_returned"]]
+    add("rows_returned = A (%d both answered)" % len(both), len(differ), 0,
+        "miss" if differ else "pass", _qs(differ))
     for metric, field, key in (("hot_sum_s", "min_ms", "hot_sum_max_ratio"),
                                ("cold_sum_s", "cold_ms", "cold_sum_max_ratio")):
         sa = sum(ea[s][field] for s in both) / 1000.0
@@ -479,6 +518,9 @@ def relative_bands(path, a, b):
         ah, bh = ea[sid]["min_ms"] / 1000.0, eb[sid]["min_ms"] / 1000.0
         bound = max(r * ah, floor)
         add(label, bh, bound, "pass" if bh <= bound else "miss", statement=sid)
+    for sid in differ:
+        add("%s rows_returned = A" % sid.split("_", 1)[0], eb[sid]["rows_returned"],
+            ea[sid]["rows_returned"], "miss", statement=sid)
     return out
 
 
@@ -590,7 +632,7 @@ def statement_report(sid, expected, calls):
         return None, {"id": sid, "run": run, "error": error, "answer": answer}
     answer["answered"] = True
     ms = [float(c["duration_s"]) * 1000.0 for c in calls]
-    return {"id": sid, "min_ms": min(ms), "median_ms": _median(ms), "max_ms": max(ms),
+    return {"id": sid, "min_ms": min(ms[1:]), "median_ms": _median(ms), "max_ms": max(ms),
             "cold_ms": ms[0], "rows_returned": answer["rows"], "per_run_accounting": None,
             "error": None, "answer": answer, "tries_ms": ms}, None
 
@@ -659,6 +701,7 @@ def assemble(args):
     errors = sum(p.get("errors", 0) for p in phases.values())
     report = {
         "provenance": provenance,
+        "timing_definition": TIMING_DEFINITION,
         "entries": entries,
         "skipped": [],
         "failed": failed,
@@ -712,6 +755,9 @@ def validate(path):
     missing = [k for k in REPORT_FIELDS if k not in r]
     if missing:
         raise Refusal("%s: missing %s" % (path, ", ".join(missing)))
+    if r["timing_definition"] != TIMING_DEFINITION:
+        raise Refusal("%s: timing_definition %r is not this kit's (%r)"
+                      % (path, r["timing_definition"], TIMING_DEFINITION))
     p = r["provenance"]
     missing = [k for k in PROVENANCE_FIELDS + KIT_STAMPS if k not in p]
     if missing:
@@ -726,6 +772,12 @@ def validate(path):
     for k in ("start", "end", "window_hours"):
         if not _num((p["query_window"] or {}).get(k)):
             raise Refusal("%s: provenance query_window has no %s" % (path, k))
+    counts = [(p["row_count"] or {}).get(k) for k in ("rows_expected", "load_rows_written",
+                                                      "count_star")]
+    if not all(isinstance(c, int) and not isinstance(c, bool) for c in counts) \
+            or len(set(counts)) != 1:
+        raise Refusal("%s: provenance row_count %r does not hold one row count"
+                      % (path, p["row_count"]))
     seen = set()
     for kind, fields in (("entries", ENTRY_FIELDS), ("failed", FAILED_FIELDS)):
         for e in r[kind]:

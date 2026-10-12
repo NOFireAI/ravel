@@ -7,12 +7,20 @@
 # sections a run is judged by; a placeholder value is refused only in a selected
 # section.
 #
-# Hot is a statement's fastest of its three tries (min_ms) and cold its first
-# try (cold_ms), the figures the runbook's analyse.py sums.
+# Hot is a statement's best of its second and third tries (min_ms) and cold
+# its first try (cold_ms), the figures the runbook's analyse.py sums.
 
 # Arm B judged against arm A by fetch.sh. Both arms must be comparable first:
-# the same dataset digest, mapping digest, CPU model and RustFS version.
+# the same dataset, mapping and corpus digests, CPU model, RustFS version,
+# audit mode, query window length and resolved server settings.
 [relative]
+# Statements both arms must answer, out of 43. An arm that answered none
+# misses whatever this says. Set it to 43 minus the known deadline misses
+# listed here, each with its reason; this file lists none, so it is 43.
+min_both_answered = 43
+# Each statement both arms answered must return the same row count on B as on
+# A; a difference is a miss naming the statement. No key: there is no
+# tolerance.
 # Pooled error ratio (failed or wrong-answer calls over all calls) at most
 # arm A's plus this.
 error_pooled_max_delta = 0.02

@@ -19,9 +19,13 @@
 #               same flags
 #   load        runbook section 7: load, compact, fold with --writers-stopped
 #               and declare, with store object counts before and after the
-#               load; the fold must report seal_through_hour and an
+#               load; the load must report rows_written equal to run.toml's
+#               rows_expected, the fold must report seal_through_hour and an
 #               entry_count of at least fold_min_entry_ratio (default 0.8) of
 #               the objects the load wrote, and its figures are stamped
+#   verify      the corpus's q01, SELECT COUNT(*) FROM logs, once through the
+#               benchmark's endpoint and window; its one cell must equal
+#               rows_expected, and the three counts are stamped as row_count
 #   phases      each phase run.toml names, in order; phase NAME is the
 #               function phase_NAME and writes /root/kit/out/NAME/
 #   results     /root/kit/results.json (SqlLatencyReport's entries and failed
@@ -44,7 +48,7 @@
 # the expected one (the corpus's expected_rows, else the first try's) is an
 # error of class wrong_answer, not a success. Every request body names its
 # window: start window_hours (default 200000, the runbook's --window-hours)
-# before end, the epoch second the phase began. A new phase is a phase_NAME
+# before end, the epoch second the verify step began. A new phase is a phase_NAME
 # function plus its name in kit.py's KNOWN_PHASES; wrapping run_query wraps
 # every call.
 #
@@ -169,6 +173,7 @@ load_config() {
   SHARDS="$(toml shards)" || return 1
   DATASET_URL="$(toml dataset_url)" || return 1
   DATASET_SHA256="$(toml_or dataset_sha256 '')"
+  ROWS_EXPECTED="$(toml rows_expected)" || return 1
   RUSTFS_URL="$(toml rustfs_url)" || return 1
   RUSTFS_SHA256="$(toml rustfs_sha256)" || return 1
   MEMORY_BUDGET="$(toml memory_budget_bytes)" || return 1
@@ -522,25 +527,47 @@ stop_samplers() {
 
 # --- load, compact, fold, declare (runbook section 7) ----------------------
 
+# timed FILE FORMAT CMD...: CMD under /usr/bin/time, its figures in FILE.
+timed() {
+  local file="$1" format="$2"
+  shift 2
+  /usr/bin/time -f "$format" -o "$file" "$@"
+}
+
+# out_field FILE KEY: the value of FILE's one `KEY: value` line. No such line,
+# or more than one, is a failure naming the count.
+out_field() {
+  local n
+  n="$(grep -c "^[[:space:]]*$2[[:space:]]*:" "$1" 2>/dev/null)"
+  [ "$n" = 1 ] || { say "$(basename "$1") carries $2 ${n:-0} times, not once"; return 1; }
+  sed -n "s/^[[:space:]]*$2[[:space:]]*:[[:space:]]*//p" "$1"
+}
+
+# do_load: the load, then its row count: rows_written must be run.toml's
+# rows_expected, or every later figure measures other data.
 do_load() {
-  /usr/bin/time -f 'wall=%e rss_kb=%M user=%U sys=%S' -o "$KIT/load.time" \
+  local rows
+  timed "$KIT/load.time" 'wall=%e rss_kb=%M user=%U sys=%S' \
     "$CLI_BIN" --store s3 --tenant-hash-unkeyed load \
     --parquet "$DATASET" \
     --tenant "$TENANT" \
     --mapping "$MAPPING" \
     --shards "$SHARDS" \
     --read-cursors 8 \
-    --batch-rows 65536
+    --batch-rows 65536 >"$KIT/load.out" || return 1
+  rows="$(out_field "$KIT/load.out" rows_written)" || return 1
+  [ "$rows" = "$ROWS_EXPECTED" ] \
+    || { say "load wrote $rows rows, run.toml rows_expected is $ROWS_EXPECTED"; return 1; }
 }
 
 do_compact() {
-  /usr/bin/time -f 'wall=%e rss_kb=%M' -o "$KIT/compact.time" \
+  timed "$KIT/compact.time" 'wall=%e rss_kb=%M' \
     "$CLI_BIN" --store s3 --tenant-hash-unkeyed maintain compact-tenant \
     --tenant "$TENANT" --signal logs --shards "$SHARDS"
 }
 
 fold_field() {
-  sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" "$KIT/fold.out" | head -n 1
+  out_field "$KIT/fold.out" "$1"
 }
 
 # do_fold: the fold, then its precondition: a sealed hour, and entry_count at
@@ -550,11 +577,11 @@ do_fold() {
     --tenant "$TENANT" --shards "$SHARDS" --signal logs --writers-stopped \
     >"$KIT/fold.out" 2>&1 || return 1
   local seal entries watermark buckets part before after written ok
-  seal="$(fold_field seal_through_hour)"
-  watermark="$(fold_field watermark_hour)"
-  entries="$(fold_field entry_count)"
-  buckets="$(fold_field buckets_folded)"
-  part="$(fold_field part_bytes)"
+  seal="$(fold_field seal_through_hour)" || return 1
+  watermark="$(fold_field watermark_hour)" || return 1
+  entries="$(fold_field entry_count)" || return 1
+  buckets="$(fold_field buckets_folded)" || return 1
+  part="$(fold_field part_bytes)" || return 1
   before="$(cat "$KIT/object-counts/before-load")"
   after="$(cat "$KIT/object-counts/after-load")"
   written=$((after - before))
@@ -574,6 +601,53 @@ do_fold() {
 do_declare() {
   "$CLI_BIN" --store s3 --tenant-hash-unkeyed typed-attr-column set "$TENANT" \
     --from-mapping "$MAPPING"
+}
+
+# set_query_window: the window every request body names, set once so the
+# row-count check and every phase read the same data.
+set_query_window() {
+  WINDOW_END="$(date -u +%s)"
+  WINDOW_START=$((WINDOW_END - WINDOW_HOURS * 3600))
+  mkdir -p "$STAMPS"
+  printf '{"start": %s, "end": %s, "window_hours": %s}\n' "$WINDOW_START" "$WINDOW_END" \
+    "$WINDOW_HOURS" >"$STAMPS/query_window"
+}
+
+# do_verify: the corpus's q01, SELECT COUNT(*) FROM logs, once through the
+# benchmark's endpoint and window. Its one cell must be run.toml's
+# rows_expected; otherwise every answer the benchmark checks is checked
+# against data the server does not see.
+do_verify() {
+  local dir="$KIT/verify" n id exp w code=0 count
+  set_query_window
+  rm -rf "$dir"
+  kit_py request-bodies "$CORPUS" "$dir/requests" "$WINDOW_START" "$WINDOW_END" >/dev/null || return 1
+  IFS=$'\t' read -r n id exp <"$dir/requests/index.tsv"
+  python3 -c 'import json, sys
+sys.exit(json.load(open(sys.argv[1]))["query"] != "SELECT COUNT(*) FROM logs")' "$dir/requests/$n.json" \
+    || { say "corpus statement $id is not SELECT COUNT(*) FROM logs"; return 1; }
+  start_server || return 1
+  w="$(curl -sS -o "$dir/count.json" -w '%{http_code} %{time_total}' --max-time "$QUERY_TIMEOUT_S" \
+    -H @"$AUTH_HEADER" -H 'Content-Type: application/json' \
+    --data-binary @"$dir/requests/$n.json" "$SQL_URL" 2>"$dir/count.curl")" || code=$?
+  stop_server
+  if [ "$code" -ne 0 ] || [ "${w%% *}" != 200 ]; then
+    say "row-count check: curl exit $code, HTTP ${w%% *}: $(head -c 300 "$dir/count.json" 2>/dev/null)"
+    return 1
+  fi
+  count="$(python3 -c 'import json, sys
+rows = json.load(open(sys.argv[1]))["data"]["rows"]
+n = rows[0][0] if len(rows) == 1 and len(rows[0]) == 1 else None
+if not isinstance(n, int) or isinstance(n, bool):
+    sys.exit(1)
+print(n)' "$dir/count.json" 2>/dev/null)" \
+    || { say "row-count check: answer is not one whole-number cell: $(head -c 300 "$dir/count.json")"; return 1; }
+  mkdir -p "$STAMPS"
+  printf '{"rows_expected": %s, "load_rows_written": %s, "count_star": %s, "statement": %s, "verified_at": %s}\n' \
+    "$(json_num "$ROWS_EXPECTED")" "$(json_num "$(out_field "$KIT/load.out" rows_written)")" \
+    "$(json_num "$count")" "$(json_str "$id")" "$(json_str "$(utc_now)")" >"$STAMPS/row_count"
+  [ "$count" = "$ROWS_EXPECTED" ] \
+    || { say "SELECT COUNT(*) FROM logs answered $count, run.toml rows_expected is $ROWS_EXPECTED"; return 1; }
 }
 
 # --- queries ---------------------------------------------------------------
@@ -641,16 +715,13 @@ print("%s\t%s" % (d.get("errorType", ""), str(d.get("error", ""))[:300]))' "$res
 # --- phases ----------------------------------------------------------------
 
 # phase_benchmark: every corpus statement three times. Try 1 is cold (server
-# restarted and the page cache dropped first); tries 2 and 3 are hot. Tries 2
-# and 3 must return try 1's row count when the corpus states none.
+# restarted and the page cache dropped first) and tries 2 and 3 are hot; the
+# report's hot figure is the best of tries 2 and 3. Tries 2 and 3 must return
+# try 1's row count when the corpus states none.
 phase_benchmark() {
-  local dir="$OUT/benchmark" count n id exp expect try end start
-  end="$(date -u +%s)"
-  start=$((end - WINDOW_HOURS * 3600))
-  mkdir -p "$STAMPS"
-  printf '{"start": %s, "end": %s, "window_hours": %s}\n' "$start" "$end" "$WINDOW_HOURS" \
-    >"$STAMPS/query_window"
-  count="$(kit_py request-bodies "$CORPUS" "$dir/requests" "$start" "$end")" || return 1
+  local dir="$OUT/benchmark" count n id exp expect try
+  [ -n "${WINDOW_END:-}" ] || set_query_window
+  count="$(kit_py request-bodies "$CORPUS" "$dir/requests" "$WINDOW_START" "$WINDOW_END")" || return 1
   [ "$count" = "$EXPECTED_STATEMENTS" ] \
     || { say "corpus holds $count statements, run.toml expects $EXPECTED_STATEMENTS"; return 1; }
   : >"$dir/calls.jsonl"
@@ -754,8 +825,8 @@ write_results() {
 write_evidence() {
   local items="" f g s hits secrets="" stage="$KIT/evidence-stage"
   rm -f "$KIT/evidence.tgz"
-  for f in server-*.log rustfs.log run.log progress.log arm.env fold.out load.time \
-    compact.time object-counts stamps out phases.json burst-start.json burst-end.json; do
+  for f in server-*.log rustfs.log run.log progress.log arm.env load.out fold.out load.time \
+    compact.time object-counts stamps verify out phases.json burst-start.json burst-end.json; do
     # shellcheck disable=SC2086 # globs expand here on purpose
     for g in $(cd "$KIT" && ls -d $f 2>/dev/null); do items="$items $g"; done
   done
@@ -764,7 +835,7 @@ write_evidence() {
   mkdir -p "$stage" || return 1
   # shellcheck disable=SC2086 # items is a space-separated list of names
   (cd "$KIT" && cp -R $items "$stage/") || return 1
-  rm -rf "$stage"/out/*/requests
+  rm -rf "$stage"/out/*/requests "$stage"/verify/requests
   [ ! -f "$SECRETS_ENV" ] || secrets="$(sed -n 's/^[A-Z_]*=//p' "$SECRETS_ENV")"
   for s in $secrets; do
     [[ "$s" =~ ^[0-9a-f]+$ ]] || { say "secrets.env holds a value that is not hex"; return 1; }
@@ -810,6 +881,7 @@ main() {
   step compact do_compact
   step fold do_fold
   step declare do_declare
+  step verify do_verify
   run_phases
   step burst-end record_burst end
   step results write_results
