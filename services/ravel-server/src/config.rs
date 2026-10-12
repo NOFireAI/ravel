@@ -257,9 +257,9 @@ pub enum LogsFetchPolicyArg {
     /// 3 reps, it traded 5.30x the GET requests for 52% less cold wall-clock
     /// (per-rep range 50.3% to 54.2%) on the reference corpus,
     /// at a raised object-store GET concurrency the operator sets explicitly
-    /// (this policy carries no concurrency default of its own). In-flight
-    /// fetch memory at that concurrency is not yet bounded by a process-wide
-    /// budget (ADR-1196, #1170, #1007).
+    /// (this policy carries no concurrency default of its own). The unset
+    /// default on a loopback store (ADR-2677 decision 7), at the derived
+    /// concurrency.
     LatencyFirst,
 }
 
@@ -1518,10 +1518,10 @@ pub struct Cli {
     /// The expert escape hatch of ADR-0996 decision 2: SET, it WINS over
     /// `--logs-fetch-policy`'s derived rate and the deployment keeps exactly
     /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate:
-    /// under `cost-based` (the unset policy, on every deployment including a
-    /// loopback `--s3-endpoint`, ADR-2023) from the active store cost
-    /// profile, and under an explicit `byte-minimal` or `latency-first` as
-    /// the compiled-in default.
+    /// under `cost-based` (the unset policy on every deployment except a
+    /// loopback `--s3-endpoint`, ADR-2023 and ADR-2677) from the active store
+    /// cost profile, and under `byte-minimal` or `latency-first` (the unset
+    /// policy on a loopback `--s3-endpoint`) as the compiled-in default.
     /// `Option`-typed for that reason: "the operator asked for this many bytes"
     /// and "nobody asked, use the compiled-in default" are different inputs to
     /// the resolution, and a `default_value_t` would erase the difference.
@@ -1532,9 +1532,10 @@ pub struct Cli {
     /// at startup into the byte quantities the fetch layer runs on
     /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
     /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it
-    /// resolves `cost-based` (ADR-1196), on every deployment including a
-    /// `--store s3` deployment against a loopback `--s3-endpoint` (ADR-2023
-    /// decision 1).
+    /// resolves `latency-first` on a `--store s3` deployment against a
+    /// loopback `--s3-endpoint` (ADR-2677 decision 7, amending ADR-2023
+    /// decision 1 for loopback only) and `cost-based` (ADR-1196) on every
+    /// other deployment.
     ///
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
@@ -1555,8 +1556,9 @@ pub struct Cli {
     /// An explicit flag always wins, including an explicit `byte-minimal` or
     /// `cost-based` on a loopback endpoint.
     /// [`crate::config::Cli::resolve_logs_fetch_policy`] is the one place this
-    /// is decided; the resolved policy's source (`flag` or `default`) is on
-    /// the `logs fetch policy resolved` startup log line.
+    /// is decided; the resolved policy's source (`flag`, `default` or
+    /// `default-loopback`) is on the `logs fetch policy resolved` startup log
+    /// line.
     ///
     /// `latency-first` is an intent, not a tuning constant: it says spend
     /// requests to save wall time, and carries no concurrency default of its
@@ -1566,18 +1568,19 @@ pub struct Cli {
     /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256) -- set
     /// explicitly with `--fetch-concurrency` or with `--store-get-concurrency`
     /// plus `--sql-partition-count`, since both the GET permits and the SQL
-    /// scan width need to move together to reach it. At a lower concurrency
-    /// the trade does not pay off, and selecting this policy alone is not
-    /// inert: the byte quantities already change, so a logs read is routed the
-    /// way `byte-minimal` routes it, taking ranged reads wherever they save
-    /// more bytes than a request costs and whole-object reads where they do
-    /// not. On the reference corpus that shape at the default concurrency
-    /// measured 712.4 s against `cost-based`'s 525.0 s, 36% SLOWER, which is
-    /// why the concurrency is a precondition and not a tuning suggestion.
-    /// In-flight fetch memory at the
-    /// measured concurrency is not yet bounded by a process-wide budget (see
-    /// #1170 and #1007), so raising concurrency without watching process
-    /// memory can end in an out-of-memory kill instead of a faster query.
+    /// scan width need to move together to reach it. Selecting this policy
+    /// alone is not inert: the byte quantities already change, so a logs read
+    /// is routed the way `byte-minimal` routes it, taking ranged reads
+    /// wherever they save more bytes than a request costs and whole-object
+    /// reads where they do not. On that reference corpus the shape at the
+    /// default concurrency measured 712.4 s against `cost-based`'s 525.0 s,
+    /// 36% SLOWER. On a loopback store (ClickBench c6a.4xlarge over RustFS,
+    /// issue #2044) it measured the other way at the default concurrency:
+    /// 368.6 s cold against `cost-based`'s 478.1 s, which is what the
+    /// loopback default rests on (ADR-2677 decision 7). Logs fetches reserve
+    /// their bytes on the process memory budget (issue #2086), which refuses
+    /// a fetch it cannot hold; a fallback budget (no host memory figure
+    /// found) is unlimited and refuses none.
     #[arg(long = "logs-fetch-policy", value_enum)]
     pub logs_fetch_policy: Option<LogsFetchPolicyArg>,
 
@@ -2197,7 +2200,7 @@ pub struct Cli {
     /// with `--catalog-cache-max-bytes`. A value of `0` builds no fetcher cache.
     /// Read at startup only; there is no live resize. Ignored when
     /// `--disable-cache` is set. Unset, it derives at 25% of the memory budget,
-    /// or 40% on a `--store s3` deployment against a loopback `--s3-endpoint`,
+    /// or 24% on a `--store s3` deployment against a loopback `--s3-endpoint`,
     /// and 256 MiB when memory is unknown.
     ///
     /// Omitted, the value is DERIVED from the host
@@ -2210,10 +2213,11 @@ pub struct Cli {
     /// (ADR-1170, small-host reserve amendment), not raw `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
     /// reserve): 7,516,192,768. On a `--store s3` deployment whose
     /// `--s3-endpoint` is a loopback address, the fetcher cache instead takes
-    /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: a miss
-    /// there is served from the same local disk the store reads from, and a
-    /// share that holds the corpus's whole objects serves repeated statements
-    /// without going back to that disk (ADR-2023).
+    /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`, a share
+    /// set from a loopback measurement rather than sized to hold the corpus:
+    /// with the catalog cache's derived share it leaves the shared SQL and
+    /// fetch remainder about 71% of the budget (ADR-2023 decision 3, as
+    /// amended for ADR-2677 decision 7).
     /// Fallback when MemTotal is unknown: [`DEFAULT_CACHE_MAX_BYTES`]
     /// (256 MiB). Startup refuses (does not clamp) a value that, together
     /// with the resolved `--catalog-cache-max-bytes`, reaches or exceeds
@@ -3126,10 +3130,14 @@ pub const BREAK_EVEN_SOURCE_ROUTING_THRESHOLD: &str = "routing-threshold";
 /// explicitly (ADR-1196). Wins over the default, including on a loopback
 /// endpoint.
 pub const LOGS_FETCH_POLICY_SOURCE_FLAG: &str = "flag";
-/// [`LogsFetchStamp::policy_source`] when the flag was unset: `cost-based`,
-/// exactly as ADR-1196, on every deployment including a `--store s3`
-/// deployment against a loopback `--s3-endpoint` (ADR-2023 decision 1).
+/// [`LogsFetchStamp::policy_source`] when the flag was unset on a deployment
+/// whose store is not a loopback endpoint: `cost-based`, exactly as ADR-1196
+/// (ADR-2023 decision 1).
 pub const LOGS_FETCH_POLICY_SOURCE_DEFAULT: &str = "default";
+/// [`LogsFetchStamp::policy_source`] when the flag was unset on a `--store
+/// s3` deployment against a loopback `--s3-endpoint`: `latency-first`
+/// (ADR-2677 decision 7, amending ADR-2023 decision 1 for loopback only).
+pub const LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK: &str = "default-loopback";
 
 /// The effective logs fetch configuration a process resolved at startup, the
 /// provenance stamp of ADR-0996 decision 2.
@@ -3145,7 +3153,8 @@ pub struct LogsFetchStamp {
     /// policy `--logs-fetch-policy` resolved to when it was not given.
     pub policy: &'static str,
     /// Where [`Self::policy`] came from (ADR-1196, ADR-2023):
-    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`] or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`].
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]
+    /// or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK`].
     pub policy_source: &'static str,
     /// The active profile's name, from `--store-cost-profile` or the reference
     /// profile.
@@ -3261,17 +3270,33 @@ impl LogsFetchStamp {
             );
         }
         if let Some(measured_concurrency) = self.latency_first_measured_concurrency {
-            if self.latency_first_precondition_met() == Some(false) {
+            let precondition_met = self.latency_first_precondition_met() == Some(true);
+            if !precondition_met && self.policy_source == LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+            {
                 tracing::info!(
                     policy = self.policy,
                     store_get_concurrency = self.store_get_concurrency,
                     sql_partition_count = self.sql_partition_count,
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = false,
-                    "latency-first is an intent, not a tuning constant: its measured trade \
-                     needs both store_get_concurrency and sql_partition_count raised to \
-                     the measured concurrency explicitly, and below it this policy's \
-                     byte-minimal routing has measured slower than the default policy"
+                    "latency-first is the default on a loopback store (ADR-2677 decision 7): \
+                     on the loopback reference box at the core-derived concurrency, \
+                     cost-based has measured slower cold; latency_first_measured_concurrency \
+                     is the concurrency of the issue #1196 measurement and a precondition of \
+                     that measured trade only"
+                );
+            } else if !precondition_met {
+                tracing::info!(
+                    policy = self.policy,
+                    store_get_concurrency = self.store_get_concurrency,
+                    sql_partition_count = self.sql_partition_count,
+                    latency_first_measured_concurrency = measured_concurrency,
+                    precondition_met = false,
+                    "latency-first is an intent, not a tuning constant: its issue #1196 \
+                     measured trade needs both store_get_concurrency and sql_partition_count \
+                     raised to the measured concurrency explicitly, and below it that \
+                     measurement found this policy's byte-minimal routing slower than \
+                     cost-based"
                 );
             } else {
                 tracing::info!(
@@ -3281,8 +3306,9 @@ impl LogsFetchStamp {
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = true,
                     "latency-first is running at or above the concurrency its trade was \
-                     measured at; in-flight fetch memory there is still not bounded by a \
-                     process-wide budget, so watch process memory"
+                     measured at; the bytes fetches hold are bounded by the process memory \
+                     budget's refusals when the budget is known (a fallback budget is \
+                     unlimited and refuses nothing)"
                 );
             }
         }
@@ -3693,24 +3719,18 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// fetcher cache only; the catalog byte cache always derives at
 /// [`CATALOG_CACHE_MEMORY_PERCENT`], loopback or not.
 ///
-/// A cache miss on a loopback store still pays a local disk round trip
-/// rather than a network one, so the fetch cache can afford a larger share
-/// of the budget there without starving the rest of the process the way a
-/// larger share would on a remote store. A fetch cache sized to hold the
-/// working set's whole objects (ADR-2023 decision 1 restores whole-object
-/// fetching by default there) serves repeated statements without going back
-/// to the store's disk. ADR-2023 records the measured history this constant
-/// rests on: with the ranged plan (`byte-minimal`) and a derived,
-/// default-share fetch cache, concurrent throughput on the ClickBench
-/// reference machine was 0.123 queries per second; raising only the
-/// fetch-cache share to 40% while keeping the ranged plan reached 0.170,
-/// still short of the 0.40 bar the combination was measured against, which
-/// is why decision 1 restores whole-object fetching rather than keeping
-/// `byte-minimal` with a larger share alone. Measured under whole-object
-/// fetching against a 25% control of the same build, 40 cut the ClickBench
-/// hot sum by 67%, at the cost of memory-budget refusals from the smaller
-/// SQL remainder (ADR-2023, Acceptance).
-pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
+/// ADR-2023 first set this share at 40%, sized to hold the ClickBench
+/// corpus's whole objects. Its 2026-10-12 amendment (ADR-2677 decision 7)
+/// lowered it to 24%, one point under [`CACHE_MEMORY_PERCENT`]: on four
+/// ClickBench c6a.4xlarge machines over RustFS, an explicit 7 GB fetch cache
+/// (23.8% of their budget) brought the pooled concurrent error ratio from
+/// 0.099 at the 40% carve to 0.029 with the same hot sum (59.92 s against
+/// 59.90 s). The carve comes out of the budget whose remainder queries and
+/// fetches share, and on stock main 60% of concurrent refusals were that
+/// remainder filling (issue #2044). The separate constant stays because its
+/// value comes from a loopback measurement; nothing here re-measures a
+/// remote store.
+pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 24;
 
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
 /// SEPARATE ceiling from [`CACHE_MEMORY_PERCENT`]. The fetcher cache
@@ -3802,7 +3822,7 @@ pub const PERF_SOURCE_BUDGET_CARVE: &str = "budget-carve";
 /// host's memory is known, and the store is a `--store s3` deployment against
 /// a loopback `--s3-endpoint`, so the fetcher cache was carved at
 /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` rather than at
-/// [`CACHE_MEMORY_PERCENT`] (ADR-2023).
+/// [`CACHE_MEMORY_PERCENT`] (ADR-2023, as amended for ADR-2677 decision 7).
 pub const PERF_SOURCE_BUDGET_CARVE_LOOPBACK: &str = "budget-carve-loopback";
 /// [`ResolvedPerformanceDefaults`] source: this process's mode uses no part
 /// of the ADR-1170 memory budget ([`Mode::uses_memory_budget`]), so no budget
@@ -4416,11 +4436,11 @@ pub fn resolve_performance_defaults(
     // `DEFAULT_CACHE_MAX_BYTES` just because `host.mem_total_bytes` is `None`.
     let memory_budget_known = memory_budget_source != PERF_SOURCE_FALLBACK;
 
-    // ADR-2023: a loopback store's cache miss still costs a local disk round
-    // trip, not a network one, so the fetcher cache affords a larger share of
-    // the budget there. `--cache-max-bytes` always wins verbatim when set;
-    // the loopback share applies only in the derived (unset-flag,
-    // known-budget) arm, and only when `flags.store_is_loopback` is true.
+    // ADR-2023 decision 3, as amended for ADR-2677 decision 7: a loopback
+    // store's fetcher cache takes its own measured share of the budget.
+    // `--cache-max-bytes` wins verbatim when set; the loopback share applies
+    // only in the derived (unset-flag, known-budget) arm, and only when
+    // `flags.store_is_loopback` is true.
     let (cache_max_bytes, cache_source) = match flags.cache_max_bytes {
         Some(n) => (n, PERF_SOURCE_FLAG),
         None if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
@@ -4453,8 +4473,8 @@ pub fn resolve_performance_defaults(
     // `None` and `query::build_catalog` forces the byte cache's `0` disabled
     // sentinel. Both resolved ceilings above are then ceilings on nothing, so
     // charging them against the budget would carve memory no cache holds and
-    // shrink the shared SQL/fetch remainder by up to 45% of the budget (the
-    // loopback fetch share plus the catalog share).
+    // shrink the shared SQL/fetch remainder by up to 30% of the budget (the
+    // remote fetch share plus the catalog share).
     // A mode outside the budget is charged nothing either: its caches are
     // never read through, so an explicit ceiling there bounds no memory.
     let memory_hard_caps_bytes = if flags.disable_cache || flags.memory_budget_not_applicable {
@@ -6343,9 +6363,10 @@ impl Cli {
     /// Whether this deployment's store is a `--store s3` deployment against a
     /// loopback `--s3-endpoint`: the single place this predicate is computed
     /// (ADR-2023 decision 3), read by [`Self::performance_flags`] to size the
-    /// fetcher cache's loopback share. Gated on `--store s3` so a stray
-    /// exported `RAVEL_S3_ENDPOINT` cannot change behaviour for a `--store
-    /// memory` start.
+    /// fetcher cache's loopback share and by [`Self::resolve_logs_fetch_policy`]
+    /// for the loopback policy default (ADR-2677 decision 7). Gated on
+    /// `--store s3` so a stray exported `RAVEL_S3_ENDPOINT` cannot change
+    /// behaviour for a `--store memory` start.
     pub(crate) fn store_is_loopback(&self) -> bool {
         matches!(self.store, StoreKind::S3)
             && self
@@ -6355,21 +6376,25 @@ impl Cli {
     }
 
     /// Resolve `--logs-fetch-policy` and its provenance (ADR-1196, ADR-2023
-    /// decision 1). The one place this decision is made:
+    /// decision 1, ADR-2677 decision 7). The one place this decision is made:
     /// [`Self::query_budgets`] is its only caller, and both the engine-bound
     /// policy and the startup stamp ([`QueryBudgets::logs_fetch_stamp`]) come
     /// from the `QueryBudgets` it fills, so neither can independently
     /// re-derive a different answer.
     ///
     /// An explicit `--logs-fetch-policy` always wins, including on a loopback
-    /// endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]). Unset, every deployment
-    /// resolves `cost-based` ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]), exactly
-    /// as ADR-1196: ADR-2023 withdrew ADR-2014's loopback-endpoint
-    /// `byte-minimal` derivation, so this no longer consults
-    /// [`Self::store_is_loopback`] at all.
+    /// endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]). Unset, a loopback store
+    /// ([`Self::store_is_loopback`]) resolves `latency-first`
+    /// ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK`]), and every other
+    /// deployment resolves `cost-based` ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]),
+    /// exactly as ADR-1196.
     pub fn resolve_logs_fetch_policy(&self) -> (LogsFetchPolicyArg, &'static str) {
         match self.logs_fetch_policy {
             Some(policy) => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG),
+            None if self.store_is_loopback() => (
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK,
+            ),
             None => (
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT,
@@ -11339,24 +11364,24 @@ mod tests {
 
     /// ADR-2023 decision 3: on a `--store s3` deployment against a loopback
     /// `--s3-endpoint`, with no cache flags and known memory, the fetcher
-    /// cache takes [`LOOPBACK_CACHE_MEMORY_PERCENT`] (40%) of
-    /// `memory_budget_bytes` rather than the ordinary
+    /// cache takes [`LOOPBACK_CACHE_MEMORY_PERCENT`] (24%, as amended for
+    /// ADR-2677 decision 7) of `memory_budget_bytes` rather than the ordinary
     /// [`CACHE_MEMORY_PERCENT`] (25%), sourced `budget-carve-loopback`. The
     /// catalog byte cache is unaffected by loopback status: it still takes
     /// its own 5% share, sourced the ordinary `budget-carve`. The same
     /// `"performance default resolved"` line `emit()` writes for every other
     /// setting must carry the new source string.
     ///
-    /// Prove-the-test: change the `(None, Some(_)) if flags.store_is_loopback`
-    /// arm in `resolve_performance_defaults` to use `CACHE_MEMORY_PERCENT`
-    /// instead of `LOOPBACK_CACHE_MEMORY_PERCENT` and the fetch-cache
-    /// assertion reads 7,516,192,768 against the expected 12,025,908,428.
+    /// Prove-the-test: change the loopback arm in
+    /// `resolve_performance_defaults` to use `CACHE_MEMORY_PERCENT` instead
+    /// of `LOOPBACK_CACHE_MEMORY_PERCENT` and the fetch-cache assertion
+    /// reads 7,516,192,768 against the expected 7,215,545,057.
     #[test]
-    fn loopback_store_carves_a_larger_fetch_cache_share() {
+    fn loopback_store_carves_its_own_fetch_cache_share() {
         let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         let resolved = resolved_from(&loopback);
 
-        assert_eq!(resolved.cache_max_bytes, 12_025_908_428);
+        assert_eq!(resolved.cache_max_bytes, 7_215_545_057);
         assert_eq!(
             resolved.sources.cache_max_bytes,
             PERF_SOURCE_BUDGET_CARVE_LOOPBACK
@@ -11374,7 +11399,7 @@ mod tests {
             lines
                 .iter()
                 .any(|l| l.contains("setting=\"cache_max_bytes\"")
-                    && l.contains("value=12025908428")
+                    && l.contains("value=7215545057")
                     && l.contains(&format!("source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\""))),
             "the resolved fetch-cache line must carry the budget-carve-loopback source, \
              lines: {lines:?}"
@@ -11390,12 +11415,12 @@ mod tests {
     ///
     /// Prove-the-test (b/d): drop the `matches!(self.store, StoreKind::S3)
     /// &&` conjunct from `Cli::store_is_loopback`. The `--store memory` case
-    /// below then derives `budget-carve-loopback`/12,025,908,428 from the
+    /// below then derives `budget-carve-loopback`/7,215,545,057 from the
     /// loopback-shaped `--s3-endpoint` alone, against the expected
     /// `budget-carve`/7,516,192,768: a store that never resolves that
     /// endpoint would still have its fetch cache sized by it.
     #[test]
-    fn only_a_store_s3_loopback_endpoint_gets_the_larger_share() {
+    fn only_a_store_s3_loopback_endpoint_gets_the_loopback_share() {
         let remote = cli(&[
             "--store",
             "s3",
@@ -11437,7 +11462,7 @@ mod tests {
     /// Prove-the-test (c): move the `(Some(n), _) => (n, PERF_SOURCE_FLAG)`
     /// arm below the loopback arm in the fetch-cache match (so the loopback
     /// check runs unconditionally first). The assertion reads
-    /// 12,025,908,428/budget-carve-loopback against the expected
+    /// 7,215,545,057/budget-carve-loopback against the expected
     /// 4,096/flag.
     #[test]
     fn explicit_cache_max_bytes_wins_over_the_loopback_share() {
@@ -12942,60 +12967,59 @@ mod tests {
         );
     }
 
-    /// ADR-2023 decision 1: `--logs-fetch-policy` unset resolves `cost-based`
-    /// on EVERY deployment, including a `--store s3` deployment against a
-    /// loopback `--s3-endpoint`; ADR-2014's loopback `byte-minimal`
-    /// derivation is withdrawn. An explicit flag always wins, including on a
-    /// loopback endpoint. `resolve_logs_fetch_policy` is the one function
-    /// under test; `query_budgets` and `logs_fetch_stamp` only carry its
-    /// answer forward, so a wrong derivation here is a wrong derivation
+    /// ADR-2677 decision 7, amending ADR-2023 decision 1 for loopback only:
+    /// `--logs-fetch-policy` unset resolves `latency-first` (source
+    /// `default-loopback`) on a `--store s3` deployment against a loopback
+    /// `--s3-endpoint`, and `cost-based` (source `default`) on every other
+    /// deployment, a remote endpoint included. An explicit flag wins, on a
+    /// loopback endpoint too. `resolve_logs_fetch_policy` is the one
+    /// function under test; `query_budgets` and `logs_fetch_stamp` only carry
+    /// its answer forward, so a wrong derivation here is a wrong derivation
     /// everywhere it is consumed.
     ///
-    /// Prove-the-test (a): add a `None if self.store_is_loopback() =>
-    /// (LogsFetchPolicyArg::ByteMinimal, "derived-loopback-endpoint")` arm
-    /// ahead of the plain `None` arm in `resolve_logs_fetch_policy`,
-    /// reintroducing ADR-2014's withdrawn derivation. Measured: this fails
-    /// `resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint`
-    /// at its case-1 assertion (the `left: (ByteMinimal,
-    /// "derived-loopback-endpoint")` / `right: (CostBased, "default")`
-    /// mismatch on the plain loopback-IPv4 case, before the hostname,
-    /// no-endpoint or explicit-flag cases are even reached).
+    /// Prove-the-test (a): drop the `if self.store_is_loopback()` guard from
+    /// the `default-loopback` arm in `resolve_logs_fetch_policy`, so every
+    /// unset deployment resolves `latency-first`. This fails at case 2 (the
+    /// remote endpoint), `left: (LatencyFirst, "default-loopback")` /
+    /// `right: (CostBased, "default")`.
     ///
-    /// Prove-the-test (b): change the `match self.logs_fetch_policy { Some(policy)
-    /// => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), None => ... }` to `match
-    /// self.logs_fetch_policy { Some(policy) if !self.store_is_loopback() =>
-    /// (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), _ => ... }`, so an explicit
-    /// flag on a loopback store falls through to the default arm instead of
-    /// winning. Measured: this fails the same test at case 5 (explicit
-    /// `cost-based` on a loopback endpoint), `left: (CostBased, "default")` /
-    /// `right: (CostBased, "flag")`; case 6 (explicit `byte-minimal` on the
-    /// same endpoint) would fail identically but the test never reaches it.
+    /// Prove-the-test (b): change the `Some(policy) => (policy,
+    /// LOGS_FETCH_POLICY_SOURCE_FLAG)` arm to `Some(policy) if
+    /// !self.store_is_loopback() => ...` and the `default-loopback` arm's
+    /// `None if` to `_ if`, so an explicit flag on a loopback store falls
+    /// through to the loopback default instead of winning. This fails at
+    /// case 5 (explicit `cost-based` on a loopback endpoint), `left:
+    /// (LatencyFirst, "default-loopback")` / `right: (CostBased, "flag")`.
     #[test]
-    fn resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint() {
-        // 1. loopback + no flag -> cost-based, default. An IPv4 literal and
-        // the `localhost` name must both resolve it: ADR-2023 withdraws the
-        // loopback derivation entirely, so neither gets special treatment.
+    fn loopback_endpoint_defaults_to_latency_first_and_remote_stays_cost_based() {
+        // 1. loopback + no flag -> latency-first, default-loopback. An IPv4
+        // literal and the `localhost` name both count as loopback.
         let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         assert_eq!(
             loopback.resolve_logs_fetch_policy(),
             (
-                LogsFetchPolicyArg::CostBased,
-                LOGS_FETCH_POLICY_SOURCE_DEFAULT
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
             )
         );
         let loopback_stamp = stamp_from(&loopback);
-        assert_eq!(loopback_stamp.policy, "cost-based");
+        assert_eq!(loopback_stamp.policy, "latency-first");
         assert_eq!(
             loopback_stamp.policy_source,
-            LOGS_FETCH_POLICY_SOURCE_DEFAULT
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+        );
+        assert_eq!(
+            engine_from(&loopback).logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::LatencyFirst,
+            "the running engine must carry the loopback default, not only the stamp"
         );
 
         let loopback_hostname = cli(&["--store", "s3", "--s3-endpoint", "http://localhost:9000"]);
         assert_eq!(
             loopback_hostname.resolve_logs_fetch_policy(),
             (
-                LogsFetchPolicyArg::CostBased,
-                LOGS_FETCH_POLICY_SOURCE_DEFAULT
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
             )
         );
 
@@ -13012,6 +13036,12 @@ mod tests {
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT
             )
+        );
+        let remote_stamp = stamp_from(&remote);
+        assert_eq!(remote_stamp.policy, "cost-based");
+        assert_eq!(
+            engine_from(&remote).logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::CostBased
         );
 
         // 3. no endpoint at all -> cost-based, default.
@@ -13044,9 +13074,7 @@ mod tests {
         );
 
         // 5. loopback + explicit cost-based -> cost-based, flag: the
-        // explicit flag wins even though it names the same policy the
-        // no-flag default now resolves anyway, so the fixed point is the
-        // case worth pinning.
+        // explicit flag wins over the loopback default.
         let explicit_cost_based_on_loopback = cli(&[
             "--store",
             "s3",
@@ -13078,7 +13106,8 @@ mod tests {
             )
         );
 
-        // 7. loopback + explicit latency-first -> latency-first, flag.
+        // 7. loopback + explicit latency-first -> latency-first, flag: the
+        // same policy the default picks, but the source says who chose it.
         let explicit_latency_first = cli(&[
             "--store",
             "s3",
@@ -13095,21 +13124,41 @@ mod tests {
             )
         );
 
-        // Concurrency is untouched by the resolution: the loopback case and
-        // the no-endpoint case must resolve the identical
-        // store_get_concurrency/sql_partition_count on the same reference
-        // host.
-        let no_endpoint_stamp = stamp_from(&no_endpoint);
+        // 8. remote + explicit latency-first -> latency-first, flag: the
+        // policy stays reachable off loopback as an explicit opt-in.
+        let explicit_latency_first_remote = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+            "--logs-fetch-policy",
+            "latency-first",
+        ]);
+        assert_eq!(
+            explicit_latency_first_remote.resolve_logs_fetch_policy(),
+            (
+                LogsFetchPolicyArg::LatencyFirst,
+                LOGS_FETCH_POLICY_SOURCE_FLAG
+            )
+        );
+
+        // The policy does not move the concurrency: the loopback and remote
+        // cases resolve the identical core-derived store_get_concurrency
+        // and sql_partition_count on the same reference host.
         assert_eq!(
             loopback_stamp.store_get_concurrency,
-            no_endpoint_stamp.store_get_concurrency
+            remote_stamp.store_get_concurrency
         );
         assert_eq!(
             loopback_stamp.sql_partition_count,
-            no_endpoint_stamp.sql_partition_count
+            remote_stamp.sql_partition_count
         );
         assert_eq!(
             loopback_stamp.store_get_concurrency,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            loopback_stamp.sql_partition_count,
             REFERENCE_FETCH_CONCURRENCY
         );
     }
@@ -13117,10 +13166,10 @@ mod tests {
     /// The resolved policy's source must be operator-visible on the same
     /// "logs fetch policy resolved" startup line the policy itself and its
     /// request-cost source already appear on, not a second line an operator
-    /// has to correlate by hand. Pinned on a loopback endpoint (ADR-2023
-    /// decision 1: it resolves `cost-based`/`default` there too, exactly as
-    /// everywhere else) so a regression of the withdrawn ADR-2014 derivation
-    /// would also be caught here.
+    /// has to correlate by hand. Pinned on a loopback endpoint, where the
+    /// unset policy resolves `latency-first`/`default-loopback` (ADR-2677
+    /// decision 7), so the line tells an operator the loopback default chose
+    /// the policy rather than a flag.
     ///
     /// Prove-the-test: drop the `policy_source = self.policy_source` field
     /// from the `tracing::info!` call in `LogsFetchStamp::emit`, and
@@ -13129,7 +13178,10 @@ mod tests {
     fn logs_fetch_stamp_carries_the_policy_source_on_the_startup_line() {
         let cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         let stamp = stamp_from(&cli);
-        assert_eq!(stamp.policy_source, LOGS_FETCH_POLICY_SOURCE_DEFAULT);
+        assert_eq!(
+            stamp.policy_source,
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT_LOOPBACK
+        );
 
         let (captured, _guard) = capture_events(tracing::Level::INFO);
         stamp.emit();
@@ -13143,11 +13195,94 @@ mod tests {
             "policy_source must appear exactly once on the resolved-policy line, lines: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("policy=\"cost-based\"")
-                    && l.contains("policy_source=\"default\"")),
+            lines.iter().any(|l| l.contains("policy=\"latency-first\"")
+                && l.contains("policy_source=\"default-loopback\"")),
             "the resolved policy and its source must appear together on the same line, lines: {lines:?}"
+        );
+    }
+
+    /// The default loopback case on the reference host resolves
+    /// `latency-first` at the core-derived 32 GET permits and 32 partitions,
+    /// below the issue #1196 measured concurrency, so its startup line takes
+    /// the unmet branch. That line must be true and non-alarming there: on a
+    /// loopback store `latency-first` is itself the default, so the slower
+    /// policy it names is `cost-based`, not "the default policy", and it is
+    /// an info line, not a warning.
+    ///
+    /// Prove-the-test: drop the `default-loopback` branch from
+    /// `LogsFetchStamp::emit` and the `cost-based has measured slower cold`
+    /// assertion fails, because the line falls to the explicit-intent text.
+    #[test]
+    fn default_loopback_unmet_latency_first_line_names_cost_based_as_slower() {
+        let cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.sql_partition_count, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        stamp.emit();
+        let lines = captured.lock();
+        let unmet: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("precondition_met=false"))
+            .collect();
+        assert_eq!(unmet.len(), 1, "lines: {lines:?}");
+        let line = unmet[0];
+        assert!(line.contains("policy=\"latency-first\""), "{line}");
+        assert!(line.contains("store_get_concurrency=32"), "{line}");
+        assert!(line.contains("sql_partition_count=32"), "{line}");
+        assert!(
+            line.contains("cost-based has measured slower cold"),
+            "{line}"
+        );
+        assert!(!line.contains("default policy"), "{line}");
+        drop(lines);
+        drop(_guard);
+
+        let (warned, _guard) = capture_events(tracing::Level::WARN);
+        stamp.emit();
+        let warned = warned.lock();
+        assert!(
+            warned.is_empty(),
+            "the default loopback path must not warn: {warned:?}"
+        );
+    }
+
+    /// The met `latency-first` startup line names the budget's refusals as
+    /// the byte bound only where a budget is known: a fallback budget is
+    /// unlimited and refuses nothing, and the line says so.
+    ///
+    /// Prove-the-test: drop the qualifying clause from the met line in
+    /// `LogsFetchStamp::emit` and the text assertion fails; flip the branch
+    /// condition so a met precondition takes an unmet branch and no line
+    /// carries `precondition_met=true`.
+    #[test]
+    fn met_latency_first_line_qualifies_the_budget_byte_bound() {
+        let cli = cli(&[
+            "--logs-fetch-policy",
+            "latency-first",
+            "--fetch-concurrency",
+            "256",
+        ]);
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(true));
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        stamp.emit();
+        let lines = captured.lock();
+        let met: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("precondition_met=true"))
+            .collect();
+        assert_eq!(met.len(), 1, "lines: {lines:?}");
+        assert!(
+            met[0].contains(
+                "bounded by the process memory budget's refusals when the budget is \
+                 known (a fallback budget is unlimited and refuses nothing)"
+            ),
+            "{}",
+            met[0]
         );
     }
 
@@ -17492,14 +17627,15 @@ mod tests {
     }
 
     /// The same ADR reference host, but a loopback S3 store: the fetcher
-    /// cache carves 40% instead of 25% of the budget, which shrinks
-    /// `memory_remainder_bytes` enough that the 90%-of-remainder cap binds
-    /// both derived SQL pools down from their 50%-of-`MemTotal` shares.
+    /// cache carves 24% of the budget (ADR-2023 decision 3, as amended for
+    /// ADR-2677 decision 7), which leaves `memory_remainder_bytes` at
+    /// 19,720,253,318, whose 90% (17,748,227,986) is above both derived SQL
+    /// pools' 50%-of-`MemTotal` shares, so the cap does not bind.
     ///
-    /// Prove-the-test: drop the `SQL_POOL_REMAINDER_CAP_PERCENT` cap
-    /// entirely (use the uncapped 50%-of-`MemTotal` shares) and
-    /// `sql_tenant_max_bytes` reads 16,451,897,344 against the expected
-    /// 13,748,627,313, and `sql_pools_remainder_capped` reads `false`.
+    /// Prove-the-test: restore `LOOPBACK_CACHE_MEMORY_PERCENT` to 40 and the
+    /// cap binds: `sql_tenant_max_bytes` reads 13,748,627,313 against the
+    /// expected 16,451,897,344, and `sql_pools_remainder_capped` reads
+    /// `true`.
     #[test]
     fn adr_reference_figures_derive_the_available_memory_budget_for_loopback() {
         let host = adr_reference_host_no_cgroup();
@@ -17517,11 +17653,97 @@ mod tests {
             PERF_SOURCE_DERIVED_AVAILABLE
         );
 
-        assert_eq!(resolved.sql_tenant_max_bytes, 13_748_627_313);
-        assert_eq!(resolved.sql_max_query_bytes, 13_748_627_313);
-        assert!(resolved.sql_pools_remainder_capped);
+        assert_eq!(resolved.sql_tenant_max_bytes, 16_451_897_344);
+        assert_eq!(resolved.sql_max_query_bytes, 16_451_897_344);
+        assert!(!resolved.sql_pools_remainder_capped);
         assert!(!resolved.sql_tenant_max_bytes_raised);
         assert!(!resolved.sql_max_query_bytes_clamped);
+    }
+
+    /// ADR-2677 decision 7 (T5): on the reference box, resolved through the
+    /// `derived-available` budget of 27,775,004,672 B, a loopback store's
+    /// fetcher cache is `floor(budget * 24 / 100)` = 6,666,001,121 B, the
+    /// catalog cache keeps its 5% (1,388,750,233 B), and the remainder the
+    /// SQL pools and logs fetches share is 19,720,253,318 B. A remote S3
+    /// endpoint on the same host keeps the 25% carve, 6,943,751,168 B.
+    /// The startup line for `cache_max_bytes` names the loopback value and
+    /// source, and the remainder line names the remainder.
+    ///
+    /// Prove-the-test: (c) leave `LOOPBACK_CACHE_MEMORY_PERCENT` at 40 and
+    /// `cache_max_bytes` reads 11,110,001,868 against the expected
+    /// 6,666,001,121; (d) apply the loopback arm to every store (drop the
+    /// `flags.store_is_loopback` guard) and the remote case reads
+    /// 6,666,001,121/budget-carve-loopback against the expected
+    /// 6,943,751,168/budget-carve.
+    #[test]
+    fn loopback_carve_on_the_reference_box_is_24_percent_of_the_available_budget() {
+        let host = adr_reference_host_no_cgroup();
+        let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let resolved = loopback
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+
+        assert_eq!(
+            resolved.memory_budget_bytes,
+            AVAILABLE_ADR_EXPECTED_BUDGET_BYTES
+        );
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+        let expected_cache = AVAILABLE_ADR_EXPECTED_BUDGET_BYTES * 24 / 100;
+        assert_eq!(expected_cache, 6_666_001_121);
+        assert_eq!(resolved.cache_max_bytes, expected_cache);
+        assert_eq!(
+            resolved.sources.cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE_LOOPBACK
+        );
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_388_750_233);
+        assert_eq!(resolved.memory_hard_caps_bytes, 8_054_751_354);
+        assert_eq!(resolved.memory_remainder_bytes, 19_720_253_318);
+        assert_eq!(
+            resolved.memory_remainder_bytes,
+            AVAILABLE_ADR_EXPECTED_BUDGET_BYTES
+                - resolved.cache_max_bytes
+                - resolved.catalog_cache_max_bytes
+        );
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        resolved.emit(host);
+        let lines = captured.lock();
+        let cache_lines: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("setting=\"cache_max_bytes\""))
+            .collect();
+        assert_eq!(cache_lines.len(), 1, "lines: {lines:?}");
+        assert!(
+            cache_lines[0].contains("value=6666001121")
+                && cache_lines[0]
+                    .contains(&format!("source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\"")),
+            "the cache_max_bytes line must carry the 24% value and the loopback source: {}",
+            cache_lines[0]
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("setting=\"memory_remainder_bytes\"")
+                    && l.contains("value=19720253318")),
+            "the remainder line must carry the remainder left by the 24% carve, lines: {lines:?}"
+        );
+        drop(lines);
+
+        let remote = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+        ]);
+        let resolved = remote
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+        assert_eq!(resolved.cache_max_bytes, 6_943_751_168);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+        assert_eq!(resolved.memory_remainder_bytes, 19_442_503_271);
     }
 
     /// Under a finite cgroup limit the pre-amendment derivation is
@@ -17764,7 +17986,7 @@ mod tests {
     ///
     /// Prove-the-test: drop the `!tenant_explicit` guard in
     /// `tenant_remainder_capped` and `sql_tenant_max_bytes` reads
-    /// 13,748,627,313 (the 90%-of-remainder cap) against the explicit
+    /// 17,748,227,986 (the 90%-of-remainder cap) against the explicit
     /// 20,000,000,000.
     #[test]
     fn an_explicit_sql_tenant_max_bytes_is_never_capped() {
