@@ -1,0 +1,18 @@
+[package]
+name = "ravel-esql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# A pure front end (ADR-2887): text in, syntax tree or typed error out. The
+# lexer, structural guard and parser are written in-crate, so thiserror is the
+# only dependency and proptest the only dev-dependency.
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -4607,6 +4607,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-esql"
+version = "0.23.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "ravel-failure-tests"
 version = "0.23.0"
 dependencies = [
