@@ -53,7 +53,10 @@
 # every call.
 #
 # KIT_ROOT (default /root) relocates every path, and KIT_RUN_SH_LIB=1 defines
-# the functions without running main; kit.test.sh uses both.
+# the functions without running main; kit.test.sh uses both. It also sets
+# KIT_READY_TRIES and KIT_READY_INTERVAL (the server readiness poll, default 600
+# tries 1 s apart) and KIT_CPUINFO and KIT_MEMINFO (the hardware stamp's
+# sources, default /proc/cpuinfo and /proc/meminfo).
 
 set -uo pipefail
 
@@ -77,6 +80,9 @@ TARGET_DIR="$KIT_ROOT/target-fp"
 IMDS="${KIT_IMDS:-http://169.254.169.254}"
 DROP_CACHES_FILE="${KIT_DROP_CACHES_FILE:-/proc/sys/vm/drop_caches}"
 READY_TRIES="${KIT_READY_TRIES:-600}"
+READY_INTERVAL="${KIT_READY_INTERVAL:-1}"
+CPUINFO="${KIT_CPUINFO:-/proc/cpuinfo}"
+MEMINFO="${KIT_MEMINFO:-/proc/meminfo}"
 RUSTFS_ENDPOINT="http://127.0.0.1:9000"
 STORE_BUCKET="ravel-kit"
 SQL_URL="http://127.0.0.1:4318/api/v1/sql"
@@ -220,18 +226,40 @@ terminate_self() {
   else
     stamp "terminate fallback=shutdown reason=no-region"
   fi
+  shutdown_now
+}
+
+shutdown_now() {
+  trap - EXIT HUP INT TERM
   shutdown -h now
 }
 
+# arm_shutdown: from here until shutdown_now, any exit or signal still shuts
+# the box down. The signal traps shut down themselves because an EXIT trap set
+# inside a running EXIT handler (fail_run from on_exit) never fires.
+arm_shutdown() {
+  trap shutdown_now EXIT
+  trap 'shutdown_now; exit 1' HUP INT TERM
+}
+
 # fail_run STEP: FAILED naming STEP, partial outputs uploaded, instance gone.
+# FAILED quotes run.log's last 20 lines with every secret redacted, or says it
+# withheld them when a secret survives.
 fail_run() {
-  local name="$1"
-  trap - EXIT
+  local name="$1" tail_file="$KIT/FAILED.tail"
+  arm_shutdown
   FINISHED=1
   stop_samplers
   stop_server
   printf 'FAILED step=%s at=%s\n' "$name" "$(utc_now)" >"$KIT/FAILED"
-  tail -n 20 "$KIT/run.log" >>"$KIT/FAILED" 2>/dev/null || true
+  if tail -n 20 "$KIT/run.log" >"$tail_file" 2>/dev/null; then
+    if scrub "$tail_file" && ! leaked "$tail_file"; then
+      cat "$tail_file" >>"$KIT/FAILED"
+    else
+      echo "run.log tail withheld: a box secret survived redaction" >>"$KIT/FAILED"
+    fi
+  fi
+  rm -f "$tail_file"
   write_evidence || true
   if [ -n "${OUT_URI:-}" ] && [ -n "${REGION:-}" ]; then
     upload_out || true
@@ -246,7 +274,7 @@ on_exit() {
 }
 
 finish() {
-  trap - EXIT
+  arm_shutdown
   FINISHED=1
   printf 'DONE bands=%s at=%s\n' "$BANDS_VERDICT" "$(utc_now)" >"$KIT/DONE"
   aws s3 cp --region "$REGION" --only-show-errors "$KIT/DONE" "$OUT_URI/DONE" \
@@ -348,14 +376,16 @@ wait_dataset() {
 
 # --- store -----------------------------------------------------------------
 
-# secrets: RustFS keys and the tenant token, generated on the box once and
-# never uploaded.
+# secrets: RustFS keys, the tenant token and the audit token key, generated on
+# the box once and never uploaded. Every value is redacted from the evidence
+# and from FAILED.
 make_secrets() {
   if [ ! -s "$SECRETS_ENV" ]; then
     (
       umask 077
-      printf 'RUSTFS_ACCESS_KEY=%s\nRUSTFS_SECRET_KEY=%s\nKIT_TENANT_TOKEN=%s\n' \
-        "$(openssl rand -hex 12)" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" >"$SECRETS_ENV"
+      printf 'RUSTFS_ACCESS_KEY=%s\nRUSTFS_SECRET_KEY=%s\nKIT_TENANT_TOKEN=%s\nRAVEL_AUDIT_TOKEN_KEY=%s\n' \
+        "$(openssl rand -hex 12)" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" \
+        "$(openssl rand -hex 32)" >"$SECRETS_ENV"
     ) || return 1
   fi
   # shellcheck source=/dev/null
@@ -456,8 +486,10 @@ load_arm_env() {
 start_server() {
   load_arm_env || return 1
   make_secrets || return 1
+  # The server reads the key only for redacted audit text and reports it set
+  # under any other mode.
   if [ "$AUDIT_MODE" = required ] && [ "$AUDIT_TEXT" = redacted ]; then
-    [ -n "${RAVEL_AUDIT_TOKEN_KEY:-}" ] || export RAVEL_AUDIT_TOKEN_KEY="$(openssl rand -hex 32)"
+    export RAVEL_AUDIT_TOKEN_KEY
   fi
   SERVER_N=$((SERVER_N + 1))
   SERVER_LOG="$KIT/server-$SERVER_N.log"
@@ -469,9 +501,9 @@ start_server() {
   for ((i = 1; i <= READY_TRIES; i++)); do
     curl -sf --max-time 2 "$READY_URL" >/dev/null 2>&1 && return 0
     kill -0 "$SERVER_PID" 2>/dev/null || { say "server exited before ready; see $SERVER_LOG"; return 1; }
-    sleep 1
+    sleep "$READY_INTERVAL"
   done
-  say "server not ready after $READY_TRIES s"
+  say "server not ready after $READY_TRIES tries ${READY_INTERVAL}s apart"
   return 1
 }
 
@@ -766,8 +798,8 @@ write_stamps() {
   printf '[%s]\n' "$lanes_json" >"$STAMPS/lanes"
   itype="$(imds_get instance-type 2>/dev/null)" || itype="unknown"
   cores="$(nproc)"
-  mem="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
-  cpu="$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)"
+  mem="$(awk '/^MemTotal:/ { print $2 }' "$MEMINFO")"
+  cpu="$(awk -F': ' '/^model name/ { print $2; exit }' "$CPUINFO")"
   # An arm64 /proc/cpuinfo has no model name line; lscpu still names the core.
   [ -n "$cpu" ] || cpu="$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -n 1)"
   printf '{"instance_type": %s, "cores": %s, "mem_total_kb": %s, "cpu": %s, "arch": %s}\n' \
@@ -819,11 +851,38 @@ write_results() {
   stamp "bands=$BANDS_VERDICT"
 }
 
+# secret_values: every value in secrets.env, one per line; none before
+# make_secrets has run.
+secret_values() {
+  [ ! -f "$SECRETS_ENV" ] || sed -n 's/^[A-Z_]*=//p' "$SECRETS_ENV"
+}
+
+# scrub FILE: every secrets.env value in FILE replaced by [redacted].
+scrub() {
+  local s
+  for s in $(secret_values); do
+    [[ "$s" =~ ^[0-9a-f]+$ ]] || { say "secrets.env holds a value that is not hex"; return 1; }
+    if grep -qF -e "$s" "$1"; then
+      sed -i.bak "s/$s/[redacted]/g" "$1" && rm -f "$1.bak" || return 1
+    fi
+  done
+}
+
+# leaked PATH: succeeds when any secrets.env value is still in PATH (a file or
+# a directory, searched recursively).
+leaked() {
+  local s
+  for s in $(secret_values); do
+    grep -rqF -e "$s" "$1" && return 0
+  done
+  return 1
+}
+
 # write_evidence: evidence.tgz from a copy of the logs and outputs with every
 # value in secrets.env replaced by [redacted]; RustFS or a server may log a key.
 # A secret still present after that refuses the tarball.
 write_evidence() {
-  local items="" f g s hits secrets="" stage="$KIT/evidence-stage"
+  local items="" f g stage="$KIT/evidence-stage"
   rm -f "$KIT/evidence.tgz"
   for f in server-*.log rustfs.log run.log progress.log arm.env load.out fold.out load.time \
     compact.time object-counts stamps verify out phases.json burst-start.json burst-end.json; do
@@ -836,18 +895,13 @@ write_evidence() {
   # shellcheck disable=SC2086 # items is a space-separated list of names
   (cd "$KIT" && cp -R $items "$stage/") || return 1
   rm -rf "$stage"/out/*/requests "$stage"/verify/requests
-  [ ! -f "$SECRETS_ENV" ] || secrets="$(sed -n 's/^[A-Z_]*=//p' "$SECRETS_ENV")"
-  for s in $secrets; do
-    [[ "$s" =~ ^[0-9a-f]+$ ]] || { say "secrets.env holds a value that is not hex"; return 1; }
-    hits="$(grep -rlF -e "$s" "$stage")"
-    while IFS= read -r f; do
-      [ -z "$f" ] || sed -i "s/$s/[redacted]/g" "$f" || return 1
-    done <<<"$hits"
-    if grep -rqF -e "$s" "$stage"; then
-      say "a box secret is still in the evidence after redaction; evidence.tgz not written"
-      return 1
-    fi
-  done
+  while IFS= read -r f; do
+    scrub "$f" || return 1
+  done < <(find "$stage" -type f)
+  if leaked "$stage"; then
+    say "a box secret is still in the evidence after redaction; evidence.tgz not written"
+    return 1
+  fi
   # shellcheck disable=SC2086 # items is a space-separated list of names
   tar -czf "$KIT/evidence.tgz" -C "$stage" $items || return 1
   rm -rf "$stage"

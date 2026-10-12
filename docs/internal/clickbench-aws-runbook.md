@@ -220,9 +220,11 @@ curl -s -H "X-aws-ec2-metadata-token: $T" \
 
 **With the kit.** `benchmarks/clickbench/kit/launch.sh run.toml` (copy
 `benchmarks/clickbench/kit/run.example.toml` and fill it in) replaces this
-section for an A/B pass. It refuses a band file that still holds a `FILL-IN`
-value in a section `band_sections` selects, a missing, unknown or removed
-band key, naming each, and refuses with exit 65 when the instance profile
+section for an A/B pass. It refuses a run.toml with a missing required key
+or a key or table it does not know (a `[bands]` entry for a lane the kit does
+not run included), a band file that still holds a `FILL-IN` value in a
+section `band_sections` selects, and a missing, unknown or removed band key,
+naming each, and refuses with exit 65 when the instance profile
 cannot be read or `simulate-principal-policy` says its role cannot read the
 run's `in/` prefix or write its `out/` prefix, naming the role. It then uploads the kit to
 `s3://<bucket>/<prefix>/runs/<run-id>/in/` and launches one instance per arm
@@ -303,9 +305,16 @@ overwrite each other's tenant; the instance role needs no access beyond the
 run's `in/` and `out/` prefixes; and it is the store the ClickBench Parquet
 lane (ADR-2040 D7) measures against. The cost is that a kit figure includes
 no network round trip to S3, so it is not comparable with a pass against the
-bucket. Each step is stamped in `/root/kit/progress.log`, and `evidence.tgz`
-is written from a copy of the logs with every generated key replaced by
-`[redacted]`.
+bucket. Each step is stamped in `/root/kit/progress.log`. Every key the box
+generates (the RustFS access and secret keys, the tenant token and the audit
+token key, all in `/root/kit/secrets.env`, which is never uploaded) is
+replaced by `[redacted]` in a copy of the logs before `evidence.tgz` is
+written from it, and in the last 20 lines of `run.log` before `FAILED`
+quotes them. A key still present after that refuses the tarball, and
+`FAILED` then says the tail was withheld instead of quoting it; `FAILED` is
+still uploaded. The audit token key reaches the server only under
+`audit_mode = "required"` with redacted audit text, the one mode that reads
+it.
 
 ## 7. Load, compact, fold, declare
 
@@ -1037,8 +1046,8 @@ single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
 each arm's absolute bands and then arm B's relative bands against arm A, and
 exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
 3 on timeout and 4 when S3 is unreachable or a download fails with anything
-but a missing object (a 403 included). Two arms whose dataset, mapping or
-corpus digest, `hardware.cpu`, RustFS version, audit mode, query window length
+but a missing key (a 403 and a missing bucket included). Two arms whose
+dataset, mapping or corpus digest, `hardware.cpu`, RustFS version, audit mode, query window length
 (`window_hours`) or resolved server settings differ, or that were judged by
 different band sections, are not compared and exit 2, naming the field; each
 arm's binary is not compared, since that is what differs by design. Arm B's
@@ -1145,8 +1154,10 @@ An idle instance bills at its full on-demand rate. Stop it when a run finishes.
 `DONE` or `FAILED` it terminates itself through the instance role and then
 runs `shutdown -h now` in every case, which the terminate behaviour turns
 into a termination; a run that failed before reading its region uploads
-nothing and only shuts down. The `shutdown -h +600` timer covers a box whose
-run hangs.
+nothing and only shuts down. From the moment `run.sh` starts writing `DONE`
+or `FAILED` until that final shutdown, a signal (a hangup, an interrupt or
+a terminate) also runs `shutdown -h now`, once. The `shutdown -h +600`
+timer covers a box whose run hangs.
 Nothing on its volume is kept; the results live under the run's `out/`
 prefix. If `launch.sh` fails on the second arm, it terminates the first. The
 run's `s3://<bucket>/<prefix>/runs/<run-id>/` objects stay until removed

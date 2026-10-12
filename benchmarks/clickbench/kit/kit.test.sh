@@ -36,7 +36,8 @@ cat >"$STUBS/aws" <<'STUB'
 # STUB_DENY_ACTION names an IAM action the simulated role lacks; the role
 # may only get in/* and put out/* under the kit-test-bucket's clickbench-kit/
 # runs. STUB_NO_PROFILE=1 makes the instance profile unreadable.
-# STUB_S3_DENY_KEY makes a download of any key containing it a 403.
+# STUB_S3_DENY_KEY makes a download of any key containing it a 403, and
+# STUB_S3_NO_BUCKET=1 makes every download a NoSuchBucket error.
 # STUB_FAIL_ARM names the arm whose run-instances fails.
 echo "aws $*" >>"$STUB_LOG"
 endpoint=""
@@ -80,6 +81,8 @@ case "${pos[0]:-} ${pos[1]:-}" in
         case "$src" in *"${STUB_S3_DENY_KEY:-/none/}"*)
           echo "fatal error: An error occurred (403) when calling the HeadObject operation: Forbidden" >&2; exit 1 ;;
         esac
+        [ -z "${STUB_S3_NO_BUCKET:-}" ] || {
+          echo "fatal error: An error occurred (NoSuchBucket) when calling the GetObject operation: The specified bucket does not exist" >&2; exit 1; }
         [ -f "$f" ] || { echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"$src\" does not exist" >&2; exit 1; }
         mkdir -p "$(dirname "$dst")" && cp "$f" "$dst" ;;
       *) f="$(s3path "$dst")"
@@ -123,7 +126,10 @@ STUB
 
 cat >"$STUBS/curl" <<'STUB'
 #!/usr/bin/env bash
-# IMDS and readiness answer at once. A SQL call logs its request body to
+# IMDS answers at once. Readiness and SQL answer only while the stub server's
+# ready file exists, as a server that is not listening refuses (curl exit 7);
+# the stub server writes it only after logging its argv and settings, and
+# removes it when stopped. A SQL call logs its request body to
 # sql-bodies, writes an answer to -o and prints "<status> <seconds>":
 # STUB_SQL_TIME seconds (default 0.5), or the try's field of STUB_SQL_TIMES
 # ("cold hot hot"), and a 422 resource_exhausted refusal for statement
@@ -150,8 +156,11 @@ case "$url" in
   */latest/api/token) echo stub-imds-token ;;
   */meta-data/instance-id) echo i-0b0x00000000000001 ;;
   */meta-data/instance-type) echo c6a.4xlarge ;;
-  */readyz) echo ready ;;
+  */readyz)
+    [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
+    echo ready ;;
   */api/v1/sql)
+    [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
     case "$body" in
       */verify/*)
         { cat "$body"; echo; } >>"$STUB_DIR/verify-bodies"
@@ -198,8 +207,10 @@ cat >"$STUBS/nohup" <<'STUB'
 echo "nohup $*" >>"$STUB_LOG"
 STUB
 
-# The box's binaries. The server logs its argv and the five settings stamps,
-# then sleeps until stopped; the CLI logs its argv, and `load` adds 100
+# The box's binaries. The server logs its argv, the five settings stamps and
+# the store keys and audit key it was given (the evidence must not carry
+# them), then after STUB_READY_DELAY seconds (default 0.05) writes the ready
+# file and sleeps until stopped; the CLI logs its argv, and `load` adds 100
 # objects to the store and prints ravel-cli's load summary with
 # STUB_LOAD_ROWS rows written (default the hits row count). STUB_FOLD=unsealed
 # makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice, and
@@ -211,7 +222,13 @@ for kv in fetch_concurrency=32 store_get_concurrency=32 cache_max_bytes=76890777
   catalog_cache_max_bytes=1537815552 sql_max_query_bytes=16451897344 sql_tenant_max_bytes=32903794688; do
   printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' "${kv%%=*}" "${kv#*=}"
 done
-exec sleep 120
+echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
+sleep "${STUB_READY_DELAY:-0.05}"
+sleep 120 &
+pid=$!
+trap 'rm -f "$STUB_DIR/server-ready"; kill "$pid" 2>/dev/null; exit 0' TERM
+touch "$STUB_DIR/server-ready"
+wait "$pid"
 STUB
 cat >"$BINSTUBS/ravel-cli" <<'STUB'
 #!/usr/bin/env bash
@@ -230,6 +247,11 @@ exit 0
 STUB
 chmod +x "$STUBS"/* "$BINSTUBS"/*
 export PATH="$STUBS:$PATH"
+
+# The hardware the box stamps, so no case reads this machine's /proc.
+printf 'processor\t: 0\nmodel name\t: Stub CPU 9000 @ 2.00GHz\n' >"$TMP/cpuinfo"
+printf 'MemTotal:       32000000 kB\nMemFree:        1000 kB\n' >"$TMP/meminfo"
+export KIT_CPUINFO="$TMP/cpuinfo" KIT_MEMINFO="$TMP/meminfo"
 
 SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -390,12 +412,35 @@ band_case() {
 }
 # Catches: a key the kit no longer reads (the old concurrency ceiling) kept in
 # a band file as if it still bound something.
-band_case removed 's/^\[relative\]$/[relative]\nconcurrency_error_ratio_ceiling = 0.01/' \
+band_case removed '/^\[relative\]$/a\
+concurrency_error_ratio_ceiling = 0.01' \
   'removed key(s) relative.concurrency_error_ratio_ceiling; delete them'
 # Catches: a misspelt key accepted, leaving the band it meant unset.
 band_case unknown 's/^qps_min_ratio = /qps_min_ratoi = /' 'unknown key(s) relative.qps_min_ratoi for lane rlog'
 # Catches: a band file with a required key absent judged anyway.
 band_case missing '/^cold_sum_max_ratio = /d' 'missing required key(s) relative.cold_sum_max_ratio'
+
+# run_case NAME SED WANT: kit.py check-run on a copy of the run.toml edited by
+# SED must exit 2 with WANT in its message.
+run_case() {
+  local name="$1" edit="$2" want="$3" code=0
+  sed "$edit" "$RUN_TOML" >"$TMP/run-$name.toml"
+  python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-$name.toml" >/dev/null 2>"$TMP/run-$name.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/run-$name.err"; then
+    pass "check-run refuses $name, naming it"
+  else
+    fail "check-run $name" "exit $code: $(head -c 300 "$TMP/run-$name.err")"
+  fi
+}
+# Catches: a misspelt optional key accepted, leaving the default it meant to
+# override in force.
+run_case "an unknown top-level key" '/^shards = /i\
+shardz = 9' 'unknown key(s) shardz'
+run_case "an unknown table" '$a\
+[extra]\
+x = 1' 'unknown table(s) [extra]'
+run_case "an unknown [bands] key" '$a\
+parquet = "benchmarks/clickbench/bands/parquet.toml"' 'unknown key(s) bands.parquet'
 
 # Catches: launching (or uploading) when the instance role could not write
 # results, or a refusal that does not name the role.
@@ -565,9 +610,20 @@ export KIT_ROOT="$1"
 export KIT_RUN_SH_LIB=1
 export KIT_IMDS=http://imds.invalid
 export KIT_DROP_CACHES_FILE="$KIT_ROOT/drop_caches"
-export KIT_READY_TRIES=5
+export KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
 # shellcheck source=/dev/null
 . "$KIT_ROOT/kit/kit/box/run.sh"
+# DRIVER_NO_REDACT=1: redaction replaces nothing, so the leak check must
+# refuse what it is handed, and a key is logged again just before the evidence
+# step so it sits inside FAILED's run.log tail.
+if [ -n "${DRIVER_NO_REDACT:-}" ]; then
+  scrub() { :; }
+  eval "real_write_evidence() $(declare -f write_evidence | tail -n +2)"
+  write_evidence() {
+    echo "rustfs: still running with secret_key=$RUSTFS_SECRET_KEY" >&2
+    real_write_evidence
+  }
+fi
 bootstrap_packages() { :; }
 bootstrap_toolchain() { :; }
 bootstrap_source() {
@@ -582,10 +638,12 @@ bootstrap_build() {
   cp "$BINSTUBS/ravel-server" "$BIN_DIR/ravel-server-$SHA"
 }
 wait_dataset() { echo 1111111111111111111111111111111111111111111111111111111111111111 >"$KIT/dataset.sha256"; }
-# RustFS logging its own keys, which the evidence must not carry.
+# RustFS logging its own keys, into its log and into run.log, neither of
+# which the evidence or FAILED may carry.
 bootstrap_rustfs() {
   make_secrets && echo 'rustfs 1.0.0-stub' >"$KIT/rustfs.version" && . "$SECRETS_ENV" \
-    && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >"$KIT/rustfs.log"
+    && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >"$KIT/rustfs.log" \
+    && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >&2
 }
 drop_caches() {
   echo drop >>"$STUB_DIR/sequence"
@@ -613,7 +671,8 @@ run_box() {
   shift 2
   reset_log
   rm -f "$STUB_DIR/server-argv" "$STUB_DIR/cli-argv" "$STUB_DIR/curl-sql" "$STUB_DIR/run_query-calls" \
-    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies" "$STUB_DIR/sequence" "$STUB_DIR/verify-bodies"
+    "$STUB_DIR/objects" "$STUB_DIR/sql-bodies" "$STUB_DIR/sequence" "$STUB_DIR/verify-bodies" \
+    "$STUB_DIR/server-ready"
   boot_box "$arm" "$box" || return 1
   if [ -n "${BOX_TOML_SED:-}" ]; then
     sed "$BOX_TOML_SED" "$box/kit/run.toml" >"$box/kit/run.toml.new" && mv "$box/kit/run.toml.new" "$box/kit/run.toml"
@@ -636,6 +695,18 @@ if [ "$code" = 0 ] && grep -q '^DONE bands=pass ' "$OUT_A/DONE" 2>/dev/null && [
   pass "box run uploads results.json, evidence.tgz, progress.log and DONE, then terminates itself"
 else
   fail "box run" "exit $code; $(cat "$OUT_A/FAILED" 2>/dev/null | head -n 3); run.log: $(tail -n 5 "$BOX_A/kit/run.log")"
+fi
+
+# Catches: a terminate that succeeds through the API taken as the end of the
+# box: `shutdown -h now` must still run, exactly once, after it.
+term_line="$(grep -n 'ec2 terminate-instances' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+shut_line="$(grep -n '^shutdown -h now$' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+if [ -n "$term_line" ] && [ -n "$shut_line" ] && [ "$shut_line" -gt "$term_line" ] \
+  && [ "$(grep -c '^shutdown -h now$' "$STUB_LOG")" = 1 ] \
+  && grep -q 'terminate instance=i-0b0x00000000000001' "$BOX_A/kit/progress.log" 2>/dev/null; then
+  pass "a successful terminate is still followed by one shutdown -h now"
+else
+  fail "shutdown after terminate" "terminate at line '$term_line', shutdown at '$shut_line': $(tr '\n' ';' <"$STUB_LOG" | tail -c 300)"
 fi
 
 # Catches: results.json leaving SqlLatencyReport's statement shape (entries of
@@ -682,7 +753,9 @@ for side in ("start", "end"):
          "burst_balance." + side)
 want("--memory-budget-bytes 25769803776" in p.get("server_flags", {}).get("flags", ""), "server_flags")
 want(p.get("audit_mode") == "off", "audit_mode")
-want(p.get("hardware", {}).get("instance_type") == "c6a.4xlarge", "hardware")
+want(p.get("hardware", {}).get("instance_type") == "c6a.4xlarge"
+     and p["hardware"].get("cpu") == "Stub CPU 9000 @ 2.00GHz"
+     and p["hardware"].get("mem_total_kb") == 32000000, "hardware %r" % p.get("hardware"))
 want(p.get("backend", {}).get("store") == "rustfs", "backend")
 want(len(p.get("corpus_digest", {}).get("corpus_sha256", "")) == 64, "corpus_digest")
 want(p.get("toolchain", "").startswith("rustc 1.90.0"), "toolchain")
@@ -825,23 +898,33 @@ esac
 
 # Catches: evidence.tgz missing the server log, the samplers or the object
 # counts, or any box secret (RustFS keys, tenant token) leaving the box. The
-# stub RustFS logs both of its keys into rustfs.log, so an evidence step that
-# only leaves secrets.env out still uploads them.
+# stub RustFS logs both of its keys into rustfs.log and run.log, and the stub
+# server into its own log, so an evidence step that only leaves secrets.env
+# out, or redacts one log, still uploads them. The audit token key, generated
+# into secrets.env on every box, must not reach a server running audit_mode
+# off (box-a's), which would report it at startup.
 mkdir -p "$TMP/evidence-a"
 tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a"
 token="$(sed -n 's/^KIT_TENANT_TOKEN=//p' "$BOX_A/kit/secrets.env")"
 secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$BOX_A/kit/secrets.env")"
 access="$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$BOX_A/kit/secrets.env")"
-if [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TMP/evidence-a/object-counts/before-load.txt" ] \
+audit_off_ok=0
+grep -q '^RAVEL_AUDIT_TOKEN_KEY=[0-9a-f]\{64\}$' "$BOX_A/kit/secrets.env" \
+  && grep -q 'audit_key=none$' "$BOX_A/kit/server-1.log" \
+  && ! grep -q 'audit_key=[0-9a-f]' "$BOX_A/kit/server-"*.log && audit_off_ok=1
+if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TMP/evidence-a/object-counts/before-load.txt" ] \
   && [ -f "$TMP/evidence-a/object-counts/after-load.txt" ] && [ -f "$TMP/evidence-a/out/benchmark/samplers/server-rss.log" ] \
   && [ -f "$TMP/evidence-a/arm.env" ] && [ -n "$token" ] && [ -n "$secret" ] && [ -n "$access" ] \
-  && grep -qF "$secret" "$BOX_A/kit/rustfs.log" \
+  && grep -qF "$secret" "$BOX_A/kit/rustfs.log" && grep -qF "$secret" "$BOX_A/kit/run.log" \
+  && grep -qF "secret_key=$secret" "$BOX_A/kit/server-1.log" \
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/rustfs.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/run.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/server-1.log" \
   && ! grep -rqF -e "$token" -e "$secret" -e "$access" "$TMP/evidence-a" "$OUT_A" \
   && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ]; then
-  pass "evidence.tgz holds server logs, samplers and object counts, and no box secret is uploaded"
+  pass "evidence.tgz holds server logs, samplers and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
 else
-  fail "evidence" "$(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
+  fail "evidence" "audit key kept from an audit_mode off server: $audit_off_ok; $(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
 fi
 mv "$OUT_A" "$TMP/fixture-pass"
 
@@ -913,6 +996,56 @@ if [ "$code" = 1 ] && grep -q '^FAILED step=fold ' "$OUT_A/FAILED" 2>/dev/null &
   pass "a fold that sealed nothing fails the run as FAILED step=fold"
 else
   fail "fold precondition" "exit $code, FAILED: $(head -n 1 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+
+# Catches: FAILED carrying run.log's tail unredacted. The stub RustFS printed
+# its keys into run.log, inside the 20 lines FAILED quotes.
+secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$TMP/box-fold/kit/secrets.env")"
+access="$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$TMP/box-fold/kit/secrets.env")"
+if [ -n "$secret" ] && grep -qF "$secret" "$TMP/box-fold/kit/run.log" \
+  && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q 'fold sealed nothing' "$OUT_A/FAILED" \
+  && ! grep -rqF -e "$secret" -e "$access" "$OUT_A"; then
+  pass "FAILED quotes run.log's tail with every box secret redacted"
+else
+  fail "FAILED redaction" "$(grep -c "${secret:-none}" "$OUT_A/FAILED" 2>/dev/null) secret line(s) in FAILED: $(head -c 300 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a key that survives redaction uploaded anyway. With redaction
+# replacing nothing, evidence.tgz must not be written and FAILED must withhold
+# run.log's tail rather than quote the keys in it.
+code=0
+run_box A box-noredact DRIVER_NO_REDACT=1 || code=$?
+secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$TMP/box-noredact/kit/secrets.env")"
+if [ "$code" = 1 ] && grep -q '^FAILED step=evidence ' "$OUT_A/FAILED" 2>/dev/null \
+  && grep -q '^run.log tail withheld: a box secret survived redaction$' "$OUT_A/FAILED" \
+  && [ ! -e "$OUT_A/evidence.tgz" ] && [ ! -e "$TMP/box-noredact/kit/evidence.tgz" ] \
+  && grep -q 'evidence.tgz not written' "$TMP/box-noredact/kit/run.log" \
+  && [ -n "$secret" ] && ! grep -rqF -e "$secret" "$OUT_A"; then
+  pass "a key surviving redaction refuses evidence.tgz and withholds FAILED's run.log tail"
+else
+  fail "redaction refused" "exit $code, evidence $(ls "$OUT_A" 2>/dev/null | tr '\n' ' '), FAILED: $(head -c 300 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: the audit key generated outside secrets.env (so neither redaction
+# nor a restart sees it), or not handed to a server running audit_mode
+# required with redacted text.
+code=0
+BOX_TOML_SED='s/^audit_mode = .*/audit_mode = "required"/' run_box A box-audit || code=$?
+akey="$(sed -n 's/^RAVEL_AUDIT_TOKEN_KEY=//p' "$TMP/box-audit/kit/secrets.env" 2>/dev/null)"
+mkdir -p "$TMP/evidence-audit"
+tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-audit" 2>/dev/null
+if [ "$code" = 0 ] && [[ "$akey" =~ ^[0-9a-f]{64}$ ]] \
+  && grep -q -- '--audit-mode required --audit-text redacted' "$STUB_DIR/server-argv" \
+  && grep -qF "audit_key=$akey" "$TMP/box-audit/kit/server-1.log" \
+  && [ "$(grep -c "audit_key=$akey" "$TMP/box-audit/kit/server-44.log")" = 1 ] \
+  && grep -qF 'audit_key=[redacted]' "$TMP/evidence-audit/server-1.log" \
+  && ! grep -rqF -e "$akey" "$TMP/evidence-audit" "$OUT_A"; then
+  pass "audit_mode required runs every server with the audit key from secrets.env, redacted from the evidence"
+else
+  fail "audit key" "exit $code, key '$akey': $(grep -h audit_key "$TMP/box-audit/kit/server-1.log" 2>/dev/null | head -c 200)"
 fi
 rm -rf "$OUT_A"
 
@@ -1046,6 +1179,46 @@ else
   fail "early kill" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 300); $(tail -n 3 "$TMP/early.log")"
 fi
 
+# Catches: fail_run or finish dropping every trap before its own shutdown, so
+# a signal while it writes evidence or uploads ends run.sh with the box still
+# up. fail_run here runs from the EXIT trap (load_config is killed) and is
+# killed again inside write_evidence; finish is killed inside the DONE upload.
+# Each must still shut down, once.
+cat >"$TMP/late-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+export KIT_ROOT="$1" KIT_RUN_SH_LIB=1 KIT_IMDS=http://imds.invalid
+# shellcheck source=/dev/null
+. "$KIT_ROOT/kit/kit/box/run.sh"
+case "$2" in
+  fail_run)
+    load_config() { kill -TERM $$; }
+    write_evidence() { kill -TERM $$; }
+    main ;;
+  finish)
+    REGION=us-east-1 OUT_URI=s3://kit-test-bucket/late
+    mkdir -p "$KIT"
+    aws() { kill -TERM $$; }
+    finish ;;
+esac
+DRIVER
+late_ok=1
+late_msg=""
+for which in fail_run finish; do
+  : >"$STUB_LOG"
+  code=0
+  bash "$TMP/late-driver.sh" "$BOX_K" "$which" >"$TMP/late-$which.log" 2>&1 || code=$?
+  n="$(grep -c '^shutdown -h now$' "$STUB_LOG")"
+  if [ "$code" = 0 ] || [ "$n" != 1 ]; then
+    late_ok=0
+    late_msg="$late_msg $which: exit $code, $n shutdown(s);"
+  fi
+done
+if [ "$late_ok" = 1 ]; then
+  pass "a signal inside fail_run's evidence step or finish's DONE upload still shuts the box down once"
+else
+  fail "late kill" "$late_msg $(tail -n 2 "$TMP/late-fail_run.log")"
+fi
+
 # Catches: resolve_arm_env rewriting arm.env on a restart, or start_server
 # reading live variables instead of arm.env.
 BOX_R="$TMP/box-restart"
@@ -1053,7 +1226,7 @@ reset_log
 rm -f "$STUB_DIR/server-argv"
 boot_box A "$BOX_R"
 (
-  export KIT_ROOT="$BOX_R" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=5
+  export KIT_ROOT="$BOX_R" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
   # shellcheck source=/dev/null
   . "$BOX_R/kit/kit/box/run.sh"
   mkdir -p "$STAMPS"
@@ -1455,6 +1628,16 @@ if [ "$code" = 4 ] && grep -q '(403)' "$TMP/fetch-deny.err" \
   pass "a 403 on a download exits 4"
 else
   fail "fetch 403" "exit $code: $(tail -n 2 "$TMP/fetch-deny.err")"
+fi
+
+# Catches: a missing bucket read as a missing key (exit 2, "not there") because
+# its message also says "does not exist", rather than as an S3 failure (exit 4).
+STUB_S3_NO_BUCKET=1 fetch nobucket run-pass --timeout 30
+if [ "$code" = 4 ] && grep -q 'NoSuchBucket' "$TMP/fetch-nobucket.err" \
+  && grep -q 'download of .* failed (aws exit 1)' "$TMP/fetch-nobucket.err"; then
+  pass "a NoSuchBucket on a download exits 4"
+else
+  fail "fetch NoSuchBucket" "exit $code: $(tail -n 2 "$TMP/fetch-nobucket.err")"
 fi
 
 # Catches: a FAILED arm read as a pass, or its reason not shown.
