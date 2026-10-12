@@ -73,6 +73,26 @@ const HARMLESS_PREFIX =
 const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 
+// Workspace clippy in a fleet clone. It is not the executor's gate:
+// `scripts/gates.sh -p` runs clippy and tests over the changed crates'
+// reverse-dependency closure plus the `sql` and `flight-sql` lanes, and a
+// hand-run workspace clippy compiles neither lane. cargo's global flags may
+// precede the subcommand, as in GATE_HEAD, including the four that take a
+// separate value (`--color never`, `--config k=v`, `-C dir`, `-Z flag`);
+// `--all` is clippy's older spelling of `--workspace`. Only the arguments
+// before a bare `--` are cargo's.
+const CLIPPY_HEAD =
+  /^cargo(\s+(\+[A-Za-z0-9._-]+|(--color|--config|-C|-Z)\s+[^\s-]\S*|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+clippy(\s|$)/;
+const WORKSPACE_FLAG = /\s--(workspace|all)(\s|$)/;
+// The root manifest is virtual with no `default-members`, so a clippy with
+// no package selection is workspace-wide as well.
+const PACKAGE_SELECT = /\s(-p|--package|--manifest-path)(\s|=)/;
+// The escape hatch for a deliberate unscoped run in a fleet clone (ADR-2867
+// change 5), spelled inline at the front of the command like ALLOW_DESTRUCTIVE
+// and for the same reason: shell state does not survive between tool calls.
+const ALLOW_UNSCOPED_GATE =
+  /(^|[\s;&|(])RAVEL_GATES_ALLOW_UNSCOPED=(1|true|yes)(\s|$)/;
+
 // zsh marks these read-only; assigning to one kills the enclosing loop with
 // no output that looks like a failure.
 const RESERVED_ASSIGN = /(^|[;&|(]|\bdo\b|\bthen\b|\blocal\b|\bexport\b)\s*(status|path|argv|PWD)=/;
@@ -509,10 +529,43 @@ function scanTexts(command) {
   return texts;
 }
 
-function checkBash(rawCommand) {
+// Each `&&`, `||` or `|` part of a statement is its own command here, so a
+// workspace clippy chained after `cargo fmt --all &&` is still seen.
+function checkWorkspaceClippy(stmt) {
+  if (
+    ALLOW_UNSCOPED_GATE.test(stmt) ||
+    process.env.RAVEL_GATES_ALLOW_UNSCOPED === "1"
+  ) {
+    return;
+  }
+  for (const part of blankSubstitutions(stmt).split(/&&|\|\|?/)) {
+    const stripped = part.replace(HARMLESS_PREFIX, "").trim();
+    if (!CLIPPY_HEAD.test(stripped)) continue;
+    const cargoArgs = ` ${stripped}`.split(/\s--(?=\s|$)/)[0];
+    if (!WORKSPACE_FLAG.test(cargoArgs) && PACKAGE_SELECT.test(cargoArgs)) continue;
+    deny(
+      "`cargo clippy --workspace` (or a bare `cargo clippy`, which is " +
+        "workspace-wide here) is not a fleet executor's gate. Run " +
+        "`scripts/gates.sh -p <crate> [-p <crate2>]` instead: it runs clippy " +
+        "and tests over the named crates and every crate that depends on " +
+        "them, plus the `sql` lane when ravel-server is in that closure and " +
+        "the `flight-sql` lane when ravel-sql or ravel-server is. A hand-run " +
+        "workspace clippy compiles neither lane, which is how a sql-gated " +
+        "break reached CI on #2833. A deliberate unscoped run spells " +
+        "RAVEL_GATES_ALLOW_UNSCOPED=1 inline at the front of the command.",
+    );
+  }
+}
+
+function checkBash(rawCommand, cwd) {
   if (typeof rawCommand !== "string" || rawCommand === "") return;
   const command = stripHeredocBodies(rawCommand);
   const shaAllowed = shaLiteralAllowed(command);
+  let fleetClone = null;
+  const inFleetClone = () => {
+    if (fleetClone === null) fleetClone = cwdIsFleetClone(cwd);
+    return fleetClone;
+  };
 
   for (const raw of scanTexts(command).flatMap(splitStatements)) {
     const stmt = raw.trim();
@@ -551,6 +604,7 @@ function checkBash(rawCommand) {
 
     checkDestructiveGit(stmt);
     checkBareSha(stmt, shaAllowed);
+    if (/\bcargo\b/.test(stmt) && inFleetClone()) checkWorkspaceClippy(stmt);
   }
 }
 
@@ -574,13 +628,32 @@ function gitDirFor(startPath) {
 // it. Two independent signals, because a false block there loses a task:
 // the clone lives under the fleet work root, and it hosts no linked
 // worktrees of its own.
-function isExemptCheckout(repoRoot, gitPath) {
-  if (process.env.RAVEL_GUARD_ALLOW_PRIMARY === "1") return true;
+function isFleetClone(repoRoot, gitPath) {
   const normalized = repoRoot.split(sep).join("/");
   if (normalized.includes("/fleet/work/") || normalized.includes("/var/lib/fleet")) {
     return true;
   }
   return !existsSync(resolve(gitPath, "worktrees"));
+}
+
+function isExemptCheckout(repoRoot, gitPath) {
+  if (process.env.RAVEL_GUARD_ALLOW_PRIMARY === "1") return true;
+  return isFleetClone(repoRoot, gitPath);
+}
+
+// The checkout `cwd` sits in, for the workspace-clippy rule. Only the path
+// signal counts here: a refusal must never reach a plain clone, and a clone
+// without linked worktrees (which isFleetClone also reads as a fleet clone,
+// where that reading only grants an exemption) is the ordinary shape of a
+// fresh checkout. A linked worktree records .git as a file and is never a
+// fleet clone.
+function cwdIsFleetClone(cwd) {
+  if (typeof cwd !== "string" || cwd === "") return false;
+  const found = gitDirFor(resolve(cwd));
+  if (!found) return false;
+  if (!statSync(found.gitPath).isDirectory()) return false;
+  const normalized = found.repoRoot.split(sep).join("/");
+  return normalized.includes("/fleet/work/") || normalized.includes("/var/lib/fleet");
 }
 
 function checkFileWrite(filePath) {
@@ -627,7 +700,7 @@ try {
   const tool = payload.tool_name;
   const input = payload.tool_input ?? {};
 
-  if (tool === "Bash") checkBash(input.command);
+  if (tool === "Bash") checkBash(input.command, payload.cwd);
   else if (tool === "Write" || tool === "Edit" || tool === "MultiEdit") {
     checkFileWrite(input.file_path);
   } else if (tool === "ScheduleWakeup") checkWakeup(input);

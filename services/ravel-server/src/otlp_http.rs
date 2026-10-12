@@ -26,6 +26,7 @@ use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantId};
 
 use crate::ingest::{IngestRequestError, IngestState};
+use crate::ingest_admission::IngestPermitHeld;
 use crate::ingest_concurrency::IngestConcurrencyController;
 use crate::logs_ingest::{LogIngestRequestError, LogIngestState};
 use crate::traces_ingest::{SpanIngestRequestError, SpanIngestState};
@@ -635,6 +636,25 @@ pub(crate) fn ingest_concurrency_shed_response() -> Response {
     response
 }
 
+/// The body of a strict write refused by the process-wide pending
+/// strict-acknowledgement bound (`--max-pending-strict-acks`). Shared with the
+/// gRPC status message so both transports say the same thing.
+pub(crate) const PENDING_ACK_SHED_MESSAGE: &str =
+    "process pending strict-acknowledgement limit reached";
+
+/// 429 for a strict write refused by the pending strict-acknowledgement bound
+/// (ADR-2793 decision 4): the same status and `Retry-After` as the in-flight
+/// shed, since a held acknowledgement frees as soon as any strict write
+/// resolves. The refusal comes inside `submit`, after decode and before the
+/// byte charge, so no shard was touched and no commit token issued.
+pub(crate) fn pending_ack_shed_response() -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, PENDING_ACK_SHED_MESSAGE).into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 /// A fixed `Retry-After` for the process-wide ingest buffer byte budget shed
 /// (ADR-0069): like the in-flight shed above, the budget tracks no per-caller
 /// refill time -- a buffer slot frees as soon as any in-flight flush completes
@@ -782,6 +802,7 @@ pub(crate) fn resolve_write_mode(
 async fn export_metrics(
     State(state): State<Arc<GatewayState>>,
     Extension(tenant): Extension<TenantId>,
+    Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -818,7 +839,16 @@ async fn export_metrics(
     // and batch each fit the budget is not shed for their sum (issue #1297).
     drop(decode_charge);
 
-    match crate::ingest::handle_export(&state.ingest, tenant, mode, request, now_ns()).await {
+    match crate::ingest::handle_export_releasing(
+        &state.ingest,
+        tenant,
+        mode,
+        request,
+        now_ns(),
+        &permit,
+    )
+    .await
+    {
         Ok(outcome) => otlp_response(
             outcome.response.encode_to_vec(),
             encode_commit_tokens(&outcome.tokens).as_deref(),
@@ -837,6 +867,12 @@ async fn export_metrics(
         // durability failure, and the client should retry with backoff.
         Err(IngestRequestError::Write(WriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
+        }
+        // The pending strict-ack bound (ADR-2793 decision 4) refuses a strict
+        // write before it buffers anything: the same 429 as the in-flight
+        // shed, with its own body text.
+        Err(IngestRequestError::Write(WriteError::PendingAckLimitReached)) => {
+            pending_ack_shed_response()
         }
         Err(IngestRequestError::Write(err @ WriteError::DeferralCapReached)) => {
             ingest_deferral_cap_response(err.to_string())
@@ -862,6 +898,7 @@ async fn export_metrics(
 async fn export_logs(
     State(state): State<Arc<GatewayState>>,
     Extension(tenant): Extension<TenantId>,
+    Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -895,13 +932,14 @@ async fn export_logs(
 
     let idempotency_key = idempotency_key_from_headers(&headers);
 
-    match crate::logs_ingest::handle_export_logs(
+    match crate::logs_ingest::handle_export_logs_releasing(
         &state.logs_ingest,
         tenant,
         mode,
         request,
         now_ns(),
         idempotency_key,
+        &permit,
     )
     .await
     {
@@ -921,6 +959,9 @@ async fn export_logs(
         }
         Err(LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
+        }
+        Err(LogIngestRequestError::Write(LogWriteError::PendingAckLimitReached)) => {
+            pending_ack_shed_response()
         }
         Err(LogIngestRequestError::Write(err @ LogWriteError::DeferralCapReached)) => {
             ingest_deferral_cap_response(err.to_string())
@@ -946,6 +987,7 @@ async fn export_logs(
 async fn export_traces(
     State(state): State<Arc<GatewayState>>,
     Extension(tenant): Extension<TenantId>,
+    Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -979,13 +1021,14 @@ async fn export_traces(
 
     let idempotency_key = idempotency_key_from_headers(&headers);
 
-    match crate::traces_ingest::handle_export_traces(
+    match crate::traces_ingest::handle_export_traces_releasing(
         &state.traces_ingest,
         tenant,
         mode,
         request,
         now_ns(),
         idempotency_key,
+        &permit,
     )
     .await
     {
@@ -1004,6 +1047,9 @@ async fn export_traces(
         }
         Err(SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
+        }
+        Err(SpanIngestRequestError::Write(SpanWriteError::PendingAckLimitReached)) => {
+            pending_ack_shed_response()
         }
         Err(SpanIngestRequestError::Write(err @ SpanWriteError::DeferralCapReached)) => {
             ingest_deferral_cap_response(err.to_string())
@@ -1331,6 +1377,14 @@ pub(crate) mod tests {
         Extension(TenantId::new(TENANT))
     }
 
+    /// The marker a handler called directly sees: no layer admitted it, so
+    /// the handle holds nothing and its release is a no-op.
+    fn no_permit() -> Extension<IngestPermitHeld> {
+        Extension(IngestPermitHeld(
+            crate::ingest_concurrency::IngestPermitHandle::default(),
+        ))
+    }
+
     fn gzip_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
@@ -1359,6 +1413,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state.clone()),
             admitted_tenant(),
+            no_permit(),
             gzip_headers(),
             Bytes::from(compressed.clone()),
         )
@@ -1414,6 +1469,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state),
             admitted_tenant(),
+            no_permit(),
             gzip_headers(),
             Bytes::from(compressed),
         )
@@ -1459,6 +1515,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state),
             admitted_tenant(),
+            no_permit(),
             gzip_headers(),
             Bytes::from(compressed),
         )
@@ -1563,6 +1620,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state.clone()),
             admitted_tenant(),
+            no_permit(),
             gzip_headers(),
             Bytes::from(two_member),
         )
@@ -1592,6 +1650,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state),
             admitted_tenant(),
+            no_permit(),
             gzip_headers(),
             Bytes::from(body),
         )
@@ -1619,6 +1678,7 @@ pub(crate) mod tests {
             let response = export_metrics(
                 State(state),
                 admitted_tenant(),
+                no_permit(),
                 headers,
                 Bytes::from(gzip(&encoded)),
             )
@@ -1642,6 +1702,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state.clone()),
             admitted_tenant(),
+            no_permit(),
             HeaderMap::new(),
             Bytes::from(encoded.clone()),
         )
@@ -1665,6 +1726,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state),
             admitted_tenant(),
+            no_permit(),
             headers,
             Bytes::from(gzip(&encoded)),
         )
@@ -1701,6 +1763,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state.clone()),
             admitted_tenant(),
+            no_permit(),
             gzip_headers(),
             not_gzip,
         )
@@ -1737,6 +1800,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state),
             admitted_tenant(),
+            no_permit(),
             HeaderMap::new(),
             Bytes::from(encoded),
         )
@@ -1769,6 +1833,7 @@ pub(crate) mod tests {
         let response = export_metrics(
             State(state),
             admitted_tenant(),
+            no_permit(),
             HeaderMap::new(),
             Bytes::from(encoded),
         )
@@ -1798,6 +1863,7 @@ pub(crate) mod tests {
         let metrics_response = export_metrics(
             State(state.clone()),
             admitted_tenant(),
+            no_permit(),
             HeaderMap::new(),
             Bytes::from(compressible_request(1).encode_to_vec()),
         )
@@ -1811,6 +1877,7 @@ pub(crate) mod tests {
         let logs_response = export_logs(
             State(state.clone()),
             admitted_tenant(),
+            no_permit(),
             HeaderMap::new(),
             Bytes::from(minimal_log_request().encode_to_vec()),
         )
@@ -1824,6 +1891,7 @@ pub(crate) mod tests {
         let traces_response = export_traces(
             State(state),
             admitted_tenant(),
+            no_permit(),
             HeaderMap::new(),
             Bytes::from(minimal_trace_request().encode_to_vec()),
         )

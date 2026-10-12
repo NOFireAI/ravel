@@ -236,6 +236,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -312,6 +313,7 @@ async fn start_test_server() -> ravel_server::Running {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -796,7 +798,6 @@ async fn strict_flush_policy_arrival_applies_to_remote_write() {
 
     let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Metrics).await;
     let plain = spawn_write(&server, None, "aged_rw_metric");
-    server.assert_no_flush_yet(1).await;
     let headed = spawn_write(&server, Some("strict-arrival"), "headed_rw_metric");
     server.assert_no_flush_yet(2).await;
 
@@ -811,5 +812,47 @@ async fn strict_flush_policy_arrival_applies_to_remote_write() {
     assert_strict_ack(&headed);
     assert_eq!(server.flushes_by_age().await, 1, "both rode one age flush");
     assert_eq!(server.flushes_by_arrival().await, 0);
+    server.shutdown().await;
+}
+
+/// Remote Write is strict-only, so every write waits for its ack. With the
+/// in-flight ceiling at one, the first write returns its permit once its
+/// sample is enqueued, and a second write is admitted while the first still
+/// waits on its held data PUT; both ack with a token once the gate releases.
+#[tokio::test]
+async fn in_flight_permit_is_released_before_the_strict_ack() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.ingest_concurrency_limit =
+            ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1);
+    })
+    .await;
+
+    let mut first = spawn_write(&server, None, "first_rw_metric");
+    server.wait_for_buffered_while_pending(1, &mut first).await;
+    let mut second = spawn_write(&server, None, "second_rw_metric");
+    server.wait_for_buffered_while_pending(2, &mut second).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "both strict acks wait for the held data PUTs"
+    );
+    assert_eq!(
+        strict_flush::process_sample(
+            &server.scrape().await,
+            "ravel_ingest_concurrency_shed_total"
+        ),
+        0,
+        "the second write was admitted, not shed"
+    );
+
+    let (first, second) = release_until(&server.gate, async {
+        (
+            first.await.expect("write task"),
+            second.await.expect("write task"),
+        )
+    })
+    .await;
+    assert_strict_ack(&first);
+    assert_strict_ack(&second);
+
     server.shutdown().await;
 }

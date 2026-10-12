@@ -106,7 +106,13 @@ cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets --
 cargo test   -p ravel-server -p ravel-sql --features flight-sql
 ```
 
-`scripts/gates.sh` runs these when the crates are in scope. It also runs a
+`scripts/gates.sh` runs these when the crates are in scope. In scoped mode
+(`-p CRATE`) scope is the reverse-dependency closure of the named crates:
+the `sql` lane runs when ravel-server is in it and the `flight-sql` lane
+when ravel-sql or ravel-server is, so `-p ravel-query` runs both. A fleet
+executor's gate is `scripts/gates.sh -p <crate> [-p <crate2>]`, not a
+hand-listed workspace clippy, and the PreToolUse hook refuses `cargo
+clippy --workspace` in a fleet clone. gates.sh also runs a
 ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
 tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
 ravel-query, or ravel-ingest is in scope, and a `-p ravel-logseg -p
@@ -215,11 +221,22 @@ Use these instead of retyping the same shell each time; they exist
 because the ad-hoc version of each has broken in practice (a stale SSE
 connection, a pushed-but-broken main).
 
-- `scripts/gates.sh [-p CRATE ...]`: the Gates list above. No args runs
-  the full workspace gate; `-p CRATE` (repeatable) scopes clippy/test/doc
-  to specific crates for fast iteration. It also runs the `sql` and
-  `flight-sql` feature lanes, always in workspace mode and in scoped mode
-  when `ravel-server` or `ravel-sql` is named.
+- `scripts/gates.sh [-p CRATE ...] [--dry-run]`: the Gates list above. No
+  args runs the full workspace gate; `-p CRATE` (repeatable) scopes
+  clippy/test/doc to the named crates and every workspace crate that
+  depends on them, transitively (the closure `affected-tests.sh -n`
+  prints). It also runs the `sql` and `flight-sql` feature lanes, always
+  in workspace mode, and in scoped mode `sql` when `ravel-server` is in
+  the closure and `flight-sql` when `ravel-sql` or `ravel-server` is.
+  This is the executor's gate in fleet specs. A scoped run writes no
+  gates-pass receipt. `--dry-run` prints the closure and every cargo
+  command the same arguments would run, then exits 0 without building;
+  `scripts/gates.test.sh` pins that selection. In a dispatched fleet clone (a checkout under
+  the fleet work root) an unscoped run is refused with exit 64: the
+  executor's gate is the scoped form, and `RAVEL_GATES_ALLOW_UNSCOPED=1` is
+  the escape hatch for a deliberate workspace gate, which
+  `verify-dispatch-gates.sh` and `fleet-result-merge.sh` set for their
+  own runs.
 - `scripts/disk-reap.sh [-y]`: reclaims disk from merged clean worktrees
   and orphaned cargo target dirs (dry run by default; `-y` applies). Run
   it when free space drops below ~20 GB, and after a land worktree's PR
@@ -299,7 +316,10 @@ connection, a pushed-but-broken main).
   claim; look at what actually landed.
 - `scripts/fleet-result-merge.sh <task-id> <message-file> [-p CRATE ...]`:
   cleans `wip:`/fixup commits out of the reviewed result branch, runs
-  `gates.sh`, and opens a PR against `main` (`main` is protected; the
+  `gates.sh`, runs `scripts/guards/assert-struct-literals-current.sh`
+  against the branch it is about to push (any non-zero exit refuses the
+  PR; `ALLOW_STALE_SHAPE_SITES=1` passes exit 1 only), and opens a PR
+  against `main` (`main` is protected; the
   script never pushes or merges it directly). The PR opens WITHOUT
   auto-merge by default (standing rule, 2026-08-26): a bot review posts as
   a comment, not a required status check, so `--auto` used to merge before
@@ -366,11 +386,14 @@ connection, a pushed-but-broken main).
 - `scripts/affected-tests.sh [-n] -p CRATE [-p CRATE ...]`: runs tests
   for the named crates plus every workspace crate that depends on them
   (transitively), with the `ci` cargo profile; `-n` prints the affected
-  set without running. This is the executor-side test gate in fleet
-  specs: full-workspace tests still run at merge time
+  set without running. When ravel-server is in the closure it also runs
+  `-p ravel-server --features sql`, and when ravel-sql or ravel-server
+  is, `-p ravel-server -p ravel-sql --features flight-sql`, on the same
+  profile. Full-workspace tests still run at merge time
   (verify-dispatch-gates.sh and PR CI), so executors only pay for the
-  blast radius of their change. Doctests included (nextest skips them,
-  the script runs them separately).
+  blast radius of their change; fleet specs gate with `scripts/gates.sh
+  -p`, which reads its closure from this script's `-n`. Doctests included
+  (nextest skips them, the script runs them separately).
 
 ### Guard scripts (mechanical preconditions)
 
@@ -399,14 +422,21 @@ assignment to zsh's reserved `status`/`path`/
 `argv`/`PWD`, a `ScheduleWakeup` under 900 s, an `Edit`/`Write`
 inside the primary checkout, a bare 40-character hex literal in a Bash
 command, and three destructive git operations: `reset --hard/--soft` onto
-a remote ref, `filter-branch`, and a force-push naming `main`. The gate
+a remote ref, `filter-branch`, and a force-push naming `main`; and, in a
+checkout under the fleet work root only (a dispatched fleet clone, or an
+orchestrator checkout that lives there), `cargo clippy --workspace` or a
+bare `cargo clippy` with no `-p`, whose replacement is `scripts/gates.sh
+-p`. The gate
 patterns match cargo's global flags
 too (`cargo --locked test | tail -1` was allowed until they did). It
 fails open on any internal error, and it exempts a dispatched fleet clone
-(which is itself the isolated workspace).
+(which is itself the isolated workspace) from the worktree rule; the
+workspace-clippy rule is the one that applies only there.
 `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the worktree rule;
 `ALLOW_DESTRUCTIVE=1`, written inline at the front of the command (shell
 state does not survive between tool calls), is the one for the git rules.
+`RAVEL_GATES_ALLOW_UNSCOPED=1`, spelled the same way, is the one for the
+workspace-clippy rule, for a deliberate unscoped run in a fleet clone.
 `ALLOW_LITERAL_SHA=1`, spelled the same way, is the one for the hex rule,
 and which answer is right depends on where the literal came from. A SHA
 typed or finished from a prefix read off earlier output gets resolved in
@@ -655,7 +685,9 @@ than passing for "no pull request open".
   runs it for the pull request head before the merge line: exit 1 withholds
   the line, and `ALLOW_STALE_SHAPE_SITES=1` (for hits verified by hand as
   false positives) prints them with a note that the guard was overridden,
-  then the line; any other non-zero prints a warning and keeps it. Cases in
+  then the line; any other non-zero prints a warning and keeps it.
+  `scripts/fleet-result-merge.sh` runs it after the gates and before its
+  push, and refuses on any non-zero exit, exit 2 included. Cases in
   `scripts/guards/assert-struct-literals-current.test.sh`, run by
   `gates.sh` and CI's doc-scripts job.
 - `scripts/guards/assert-gh-auth.sh [hostname]`: exits non-zero when gh

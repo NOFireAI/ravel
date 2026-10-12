@@ -22,12 +22,15 @@ use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Int32Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{
     Distribution, EquivalenceProperties, LexOrdering, OrderingRequirements, PhysicalSortExpr,
 };
+use datafusion::physical_plan::InputDistributionRequirements;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -128,12 +131,22 @@ impl ExecutionPlan for RsegDedupExec {
     // defaults (`UnspecifiedDistribution`, no required ordering) tell the
     // optimizer this operator has no requirements, so `EnforceDistribution`
     // drops `SortPreservingMergeExec` outright instead of enforcing it.
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::SinglePartition])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![Some(self.input_ordering.clone())]
+    }
+
+    // Visits nothing: the dedup reads fixed columns by index, and
+    // `input_ordering` is a requirement on the input, not an expression this
+    // node evaluates.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

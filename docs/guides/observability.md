@@ -1549,10 +1549,35 @@ dimension.
 |---|---|
 | `ravel_maintain_workers_live` | Gauge. In-process maintenance workers this supervisor currently sees as live. |
 | `ravel_maintain_units_owned` | Gauge. Owned (tenant, signal, shard) units this process is currently maintaining. |
-| `ravel_maintain_compactions_in_flight` | Gauge. Bucket merges this process has started and not yet finished. A merge starts once the bucket has passed its gates and, for a run that takes a claim, its claim is held, before the first input catalog or block read, and ends when it publishes its compaction record, fails, is abandoned, or its task is dropped. The start also logs `compaction merge started` with `bucket=` set to the bucket's commit prefix, the prefix of the key its `compaction record published` line names, and the end logs `compaction merge ended` with the same `bucket=` and an `outcome=`: `published`, `converged`, `abandoned`, `skipped` (the pre-publish re-list or the writable-input count turned it away), `held` (an input outside the reader window), `failed`, `cancelled` (its claim was cancelled), `dry-run`, or `dropped` (its task was dropped or panicked). A bucket refused by its format floor, below the minimum input count, or skipped for another holder's claim never starts one. A bucket held for an input outside the reader window does: that input's read is what finds it, and the merge then ends. Erasure rewrites are not counted. Several units merge concurrently and merges run back to back, so a value at or above 1 for a long time is normal while there is a backlog; a merge that is not finishing shows as its `compaction merge started` line with no `compaction merge ended` line for that bucket after it. |
+| `ravel_maintain_compactions_in_flight` | Gauge. Bucket merges this process has started and not yet finished. Merges run concurrently and back to back, so a sustained value at or above 1 is normal during a backlog; a stuck merge shows in the log, as described below the table. |
 | `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. A pair's shard 0 unit also fails a tick when this process's sweep of another shard of the pair fails, since the owner of shard 0 sweeps every shard of the pair. Alert on a sustained nonzero value, not on any single scrape. |
 | `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
 | `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
+
+A merge counted by `ravel_maintain_compactions_in_flight` starts once the
+bucket has passed its gates and, for a run that takes a claim, its claim is
+held, before the first input catalog or block read. It ends when it publishes
+its compaction record, fails, is abandoned, or its task is dropped. A bucket
+refused by its format floor, below the minimum input count, or skipped for
+another holder's claim never starts one. A bucket held for an input outside
+the reader window does, because that input's read is what finds it, and the
+merge then ends. Erasure rewrites are not counted.
+
+The start logs `compaction merge started` with `bucket=` set to the bucket's
+commit prefix, the prefix of the key its `compaction record published` line
+names. The end logs `compaction merge ended` with the same `bucket=` and an
+`outcome=`:
+
+- `published`, `converged`, `abandoned` or `failed`;
+- `skipped`: the pre-publish re-list or the writable-input count turned it
+  away;
+- `held`: an input outside the reader window;
+- `cancelled`: its claim was cancelled;
+- `dry-run`;
+- `dropped`: its task was dropped or panicked.
+
+A merge that is not finishing shows as a `compaction merge started` line with
+no `compaction merge ended` line for that bucket after it.
 
 ### Maintenance loop liveness
 
@@ -2496,7 +2521,7 @@ PromQL fan-out does not move it.
 ### CPU gates and runtime
 
 Labels: `mode` and `gate` (`read`|`write`) on every CPU gate sample, plus
-`site` on the two per-site counters. The runtime gauges and the heartbeat age
+`site` on the per-site families. The runtime gauges and the heartbeat age
 carry `mode` only, and the per-worker busy counter adds `worker`. The
 families render in every mode.
 
@@ -2513,11 +2538,14 @@ A job below the gate's inline floor runs on the calling thread and takes no
 permit. The floor is 256 KiB of uncompressed bytes, or 100,000 samples for a
 PromQL evaluation.
 
-The catalog's snapshot part, postings and column-statistics decodes are the
-only work submitted to the gates so far. They use the read gate's
-`catalog_part`, `catalog_postings` and `catalog_column_stats` sites. The job
-and inline figures of every other site, and all of the write gate's figures,
-stay at 0 until that decode or encode moves onto a gate.
+Every site except one has a production call site. On the read gate those are
+`catalog_part`, `catalog_postings`, `catalog_column_stats`, `metrics_meta`,
+`segment_section`, `segment_sparse_catalog`, `log_block`, `log_postings`,
+`log_section`, `span_block`, `promql_eval`, `compaction`, `fold`, `scrub` and
+`reachability`; on the write gate, all six: `metrics_flush`, `log_flush`,
+`span_flush`, `otap_decode`, `otlp_http_gzip` and `remote_write_snappy`. The
+read gate's `span_section` site has no call site yet, so its figures stay at
+0.
 
 | Metric | Meaning |
 |---|---|
@@ -2529,6 +2557,8 @@ stay at 0 until that decode or encode moves onto a gate.
 | `ravel_cpu_gate_abandoned_total` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
 | `ravel_cpu_gate_jobs_total{site}` | Counter. Jobs a call site ran through a permit. |
 | `ravel_cpu_gate_inline_total{site}` | Counter. Jobs a call site ran inline, below the inline floor. |
+| `ravel_cpu_gate_handoff_seconds_sum{site}`, `ravel_cpu_gate_handoff_seconds_count{site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means jobs are slow to start once they hold a permit: either the blocking pool is slow to pick them up, or the host is oversubscribed, with more runnable threads than cores, so the blocking thread waits for a core. |
+| `ravel_cpu_gate_return_seconds_sum{site}`, `ravel_cpu_gate_return_seconds_count{site}` | Summary with no quantiles. Time from a job's last instruction to its caller resuming, and the number of jobs that returned to a waiting caller. The window also covers dropping the job's guard on the blocking thread, which releases the permit and wakes the next waiter, so a growing mean points at that release or at the async runtime being slow to reschedule the caller; a panicked or abandoned job is not counted, and inline jobs add to neither family. |
 | `ravel_runtime_workers` | Gauge. Worker threads of the tokio runtime serving the process. |
 | `ravel_runtime_alive_tasks` | Gauge. Tasks alive on the runtime. |
 | `ravel_runtime_global_queue_depth` | Gauge. Tasks waiting in the runtime's global queue. |

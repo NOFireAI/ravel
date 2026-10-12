@@ -791,6 +791,13 @@ pub struct ServerConfig {
     /// `query_concurrency_limit` above, this is never reconciled fleet-wide:
     /// each process sheds independently against its own local bound.
     pub ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit,
+    /// The process-wide ceiling on strict writes enqueued and awaiting their
+    /// durability acknowledgement, from `--max-pending-strict-acks` (default
+    /// 8,192, `0` = unlimited). [`start`] builds one shared
+    /// [`ravel_ingest::PendingAckBudget`] from this for the metrics, log, and
+    /// span routers, and refuses a value above
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`].
+    pub max_pending_strict_acks: u64,
     /// The process-wide ingest buffer byte budget (ADR-0069 decision 1),
     /// from `--max-ingest-buffer-bytes` (default `Bounded(512 MiB)`, `0`
     /// maps to `Unlimited`). [`start`] builds one shared
@@ -2353,6 +2360,14 @@ pub async fn start_with_heartbeat(
     let ingest_buffer_budget =
         ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
 
+    // The process-wide pending strict-ack ceiling (ADR-2793 decision 4), the
+    // same sharing shape: one budget across the three routers, so a single
+    // `--max-pending-strict-acks` bounds the sum across signals and the
+    // `/metrics` gauge and counter are one process-wide figure.
+    let max_pending_strict_acks =
+        crate::config::check_max_pending_strict_acks(config.max_pending_strict_acks)?;
+    let pending_ack_budget = Arc::new(PendingAckBudget::new(max_pending_strict_acks));
+
     // The ADR-1702 read and write CPU gates, built in every mode: every mode
     // decodes or encodes something, and `/metrics` renders both regardless.
     // Built before the ingest routers, whose flush encodes run on the write
@@ -2403,7 +2418,7 @@ pub async fn start_with_heartbeat(
                 store.clone(),
                 Signal::Metrics,
                 Arc::new(SystemClock),
-                Arc::new(PendingAckBudget::new(0)),
+                pending_ack_budget.clone(),
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
@@ -2487,7 +2502,7 @@ pub async fn start_with_heartbeat(
                 store.clone(),
                 Arc::new(SystemClock),
                 indexed_fields,
-                Arc::new(PendingAckBudget::new(0)),
+                pending_ack_budget.clone(),
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
@@ -2522,7 +2537,7 @@ pub async fn start_with_heartbeat(
                 span_ingest_config,
                 store.clone(),
                 Arc::new(SystemClock),
-                Arc::new(PendingAckBudget::new(0)),
+                pending_ack_budget.clone(),
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
@@ -5416,6 +5431,7 @@ mod startup_test_support {
             catalog_resolve_concurrency: None,
             cpu_gate_permits: Default::default(),
             ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+            max_pending_strict_acks: 8_192,
             ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit::Unlimited,
             idle_tenant_state_ttl: Duration::from_secs(3600),
             distrib: None,

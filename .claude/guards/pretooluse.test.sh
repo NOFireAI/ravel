@@ -476,6 +476,57 @@ else
   pass=$((pass + 1))
 fi
 
+# --- workspace clippy in a fleet clone ----------------------------------
+# A fleet executor's gate is scripts/gates.sh -p, which adds the reverse-
+# dependency closure and the sql/flight-sql lanes that a hand-run workspace
+# clippy never compiles (#2833). The path is the only signal for this rule:
+# a plain clone with no linked worktrees is an ordinary checkout here, not a
+# fleet clone, so the fleet-path fixture keeps a worktrees directory to prove
+# the path alone decides.
+bash_in() {
+  node -e 'process.stdout.write(JSON.stringify({tool_name:"Bash",cwd:process.argv[2],tool_input:{command:process.argv[1]}}))' "$1" "$2"
+}
+cliproot=$(mktemp -d)
+fleet="$cliproot/var/lib/fleet/work/task-1"
+mkdir -p "$fleet/.git/worktrees/other" "$fleet/src"
+mkdir -p "$cliproot/primary/.git/worktrees/wt" "$cliproot/primary/src"
+mkdir -p "$cliproot/linked/src"
+printf 'gitdir: %s/primary/.git/worktrees/wt\n' "$cliproot" > "$cliproot/linked/.git"
+mkdir -p "$cliproot/clone/.git"
+ws_clippy='cargo clippy --workspace --all-targets -- -D warnings'
+
+check deny  "workspace clippy in a /var/lib/fleet clone" "$(bash_in "$ws_clippy" "$fleet")"
+check deny  "workspace clippy from a clone subdirectory" "$(bash_in "$ws_clippy" "$fleet/src")"
+check deny  "global flag and env before clippy, fleet"  \
+  "$(bash_in 'CARGO_BUILD_JOBS=3 cargo --locked clippy --all-targets --workspace -- -D warnings' "$fleet")"
+check deny  "workspace clippy after cargo fmt &&, fleet" \
+  "$(bash_in 'cargo fmt --all && cargo clippy --workspace --all-targets' "$fleet")"
+check deny  "clippy --all spelling, fleet"              "$(bash_in 'cargo clippy --all --all-targets' "$fleet")"
+check deny  "bare clippy with no package selection, fleet" \
+  "$(bash_in 'cargo clippy --all-targets -- -D warnings' "$fleet")"
+check allow "clippy --package, fleet"                   "$(bash_in 'cargo clippy --package ravel-types' "$fleet")"
+check allow "workspace clippy in a clone with no worktrees" "$(bash_in "$ws_clippy" "$cliproot/clone")"
+check deny  "global flag with a value before clippy, fleet" \
+  "$(bash_in 'cargo --color never clippy --workspace --all-targets -- -D warnings' "$fleet")"
+check deny  "--config value before clippy, fleet" \
+  "$(bash_in 'cargo --config build.jobs=2 clippy --all-targets --workspace' "$fleet")"
+check allow "unscoped escape hatch inline, fleet" \
+  "$(bash_in 'RAVEL_GATES_ALLOW_UNSCOPED=1 cargo clippy --workspace --all-targets -- -D warnings' "$fleet")"
+check deny  "unscoped escape hatch set to 0, fleet" \
+  "$(bash_in 'RAVEL_GATES_ALLOW_UNSCOPED=0 cargo clippy --workspace --all-targets' "$fleet")"
+check allow "global flag with a value, crate-scoped, fleet" \
+  "$(bash_in 'cargo --color never clippy -p ravel-types --all-targets' "$fleet")"
+check allow "workspace clippy in a linked worktree"     "$(bash_in "$ws_clippy" "$cliproot/linked")"
+check allow "workspace clippy in a primary with worktrees" "$(bash_in "$ws_clippy" "$cliproot/primary")"
+check allow "workspace clippy with no cwd in the payload" "$(bash_payload "$ws_clippy")"
+check allow "crate-scoped clippy, fleet"                \
+  "$(bash_in 'cargo clippy -p ravel-sql --all-targets --all-features -- -D warnings' "$fleet")"
+check allow "--workspace after the -- separator, fleet" \
+  "$(bash_in 'cargo clippy -p ravel-sql -- --workspace' "$fleet")"
+check allow "workspace check, fleet"                    "$(bash_in 'cargo check --workspace' "$fleet")"
+check allow "scoped gates.sh, fleet"                    "$(bash_in 'scripts/gates.sh -p ravel-types' "$fleet")"
+rm -rf "$cliproot"
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"

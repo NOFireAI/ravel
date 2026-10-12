@@ -17,8 +17,9 @@
 //!
 //! Counters (decision 11): the permit count, jobs running and waiters queued
 //! right now, the wait and run time sums and counts, abandoned jobs, and per
-//! call site the jobs dispatched and the jobs run inline. Times come from an
-//! injected [`MonotonicClock`].
+//! call site the jobs dispatched, the jobs run inline, and the handoff and
+//! post-return time sums and counts (the handoff and post-return amendment).
+//! Times come from an injected [`MonotonicClock`].
 
 mod clock;
 mod site;
@@ -117,12 +118,19 @@ struct Counters {
     run_nanos_sum: AtomicU64,
     run_count: AtomicU64,
     abandoned: AtomicU64,
+    /// One entry per site, in [`GateSite::ALL`] order. Shared with the
+    /// blocking closure, which records the handoff time.
+    sites: Box<[SiteCounters]>,
 }
 
 #[derive(Debug, Default)]
 struct SiteCounters {
     jobs: AtomicU64,
     inline: AtomicU64,
+    handoff_nanos_sum: AtomicU64,
+    handoff_count: AtomicU64,
+    return_nanos_sum: AtomicU64,
+    return_count: AtomicU64,
 }
 
 /// A capped `spawn_blocking` for the sites of one [`GateSite`] type.
@@ -132,7 +140,6 @@ pub struct CpuGate<S: GateSite> {
     config: CpuGateConfig,
     clock: Arc<dyn MonotonicClock>,
     counters: Arc<Counters>,
-    sites: Box<[SiteCounters]>,
     _site: PhantomData<fn(S)>,
 }
 
@@ -151,8 +158,10 @@ impl<S: GateSite> CpuGate<S> {
             permits,
             config,
             clock,
-            counters: Arc::new(Counters::default()),
-            sites: S::ALL.iter().map(|_| SiteCounters::default()).collect(),
+            counters: Arc::new(Counters {
+                sites: S::ALL.iter().map(|_| SiteCounters::default()).collect(),
+                ..Counters::default()
+            }),
             _site: PhantomData,
         }
     }
@@ -189,7 +198,8 @@ impl<S: GateSite> CpuGate<S> {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let site_counters = self.sites.get(site.index());
+        let site_index = site.index();
+        let site_counters = self.counters.sites.get(site_index);
         if self.config.runs_inline(size) {
             if let Some(counters) = site_counters {
                 counters.inline.fetch_add(1, Ordering::Relaxed);
@@ -219,12 +229,19 @@ impl<S: GateSite> CpuGate<S> {
             &self.counters,
             Arc::clone(&self.clock),
             Arc::clone(&handoff),
+            site_index,
             permit,
         );
+        let handed_off_at = self.clock.now_nanos();
         let handle = tokio::task::spawn_blocking(move || {
             let mut running = running;
-            running.started_at = Some(running.clock.now_nanos());
-            job()
+            let started_at = running.clock.now_nanos();
+            running.started_at = Some(started_at);
+            running.record_handoff(started_at.saturating_sub(handed_off_at));
+            let output = job();
+            let ended_at = running.clock.now_nanos();
+            running.ended_at = Some(ended_at);
+            (output, ended_at)
         });
         let waiter = WaiterGuard {
             handoff,
@@ -232,14 +249,21 @@ impl<S: GateSite> CpuGate<S> {
             armed: true,
         };
         let joined = handle.await;
+        let resumed_at = self.clock.now_nanos();
         waiter.disarm();
-        joined.map_err(|err| {
-            if err.is_panic() {
-                CpuGateError::Panicked
-            } else {
-                CpuGateError::Cancelled
+        match joined {
+            Ok((output, ended_at)) => {
+                if let Some(counters) = site_counters {
+                    counters
+                        .return_nanos_sum
+                        .fetch_add(resumed_at.saturating_sub(ended_at), Ordering::Relaxed);
+                    counters.return_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(output)
             }
-        })
+            Err(err) if err.is_panic() => Err(CpuGateError::Panicked),
+            Err(_) => Err(CpuGateError::Cancelled),
+        }
     }
 
     /// Every counter, read once.
@@ -257,11 +281,15 @@ impl<S: GateSite> CpuGate<S> {
             abandoned: counters.abandoned.load(Ordering::Acquire),
             sites: S::ALL
                 .iter()
-                .zip(self.sites.iter())
+                .zip(counters.sites.iter())
                 .map(|(&site, counts)| SiteSnapshot {
                     site,
                     jobs: counts.jobs.load(Ordering::Relaxed),
                     inline: counts.inline.load(Ordering::Relaxed),
+                    handoff_nanos_sum: counts.handoff_nanos_sum.load(Ordering::Relaxed),
+                    handoff_count: counts.handoff_count.load(Ordering::Relaxed),
+                    return_nanos_sum: counts.return_nanos_sum.load(Ordering::Relaxed),
+                    return_count: counts.return_count.load(Ordering::Relaxed),
                 })
                 .collect(),
         }
@@ -294,6 +322,15 @@ pub struct SiteSnapshot<S> {
     pub jobs: u64,
     /// Jobs below the inline floor, run on the calling thread.
     pub inline: u64,
+    /// Nanoseconds from handing a permitted job to `spawn_blocking` to the
+    /// job's first instruction on the blocking thread, over jobs that started.
+    pub handoff_nanos_sum: u64,
+    pub handoff_count: u64,
+    /// Nanoseconds from a job's last instruction to its awaiting caller
+    /// resuming, over jobs that returned to a caller still waiting. A job
+    /// that panicked, or whose caller was gone, adds to neither.
+    pub return_nanos_sum: u64,
+    pub return_count: u64,
 }
 
 /// Holds one `queued` count for as long as a waiter is waiting, including a
@@ -328,7 +365,11 @@ struct JobGuard {
     counters: Arc<Counters>,
     clock: Arc<dyn MonotonicClock>,
     handoff: Arc<AtomicU8>,
+    site_index: usize,
     started_at: Option<u64>,
+    /// The job's end stamp, read once and shared by the run time and the
+    /// post-return time. `None` while running and when the job unwound.
+    ended_at: Option<u64>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -337,6 +378,7 @@ impl JobGuard {
         counters: &Arc<Counters>,
         clock: Arc<dyn MonotonicClock>,
         handoff: Arc<AtomicU8>,
+        site_index: usize,
         permit: OwnedSemaphorePermit,
     ) -> Self {
         counters.running.fetch_add(1, Ordering::AcqRel);
@@ -344,8 +386,17 @@ impl JobGuard {
             counters: Arc::clone(counters),
             clock,
             handoff,
+            site_index,
             started_at: None,
+            ended_at: None,
             _permit: permit,
+        }
+    }
+
+    fn record_handoff(&self, nanos: u64) {
+        if let Some(site) = self.counters.sites.get(self.site_index) {
+            site.handoff_nanos_sum.fetch_add(nanos, Ordering::Relaxed);
+            site.handoff_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -353,7 +404,8 @@ impl JobGuard {
 impl Drop for JobGuard {
     fn drop(&mut self) {
         if let Some(started_at) = self.started_at {
-            let ran = self.clock.now_nanos().saturating_sub(started_at);
+            let ended_at = self.ended_at.unwrap_or_else(|| self.clock.now_nanos());
+            let ran = ended_at.saturating_sub(started_at);
             self.counters
                 .run_nanos_sum
                 .fetch_add(ran, Ordering::Relaxed);

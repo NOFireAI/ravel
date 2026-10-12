@@ -1,7 +1,7 @@
 //! Integration tests for answering a predicate-free `SELECT COUNT(*) FROM
 //! logs` from catalog row counts instead of scanning. See issue #698.
 //!
-//! `LogsScanExec::partition_statistics` reports `num_rows =
+//! `LogsScanExec::statistics_from_inputs` reports `num_rows =
 //! Precision::Exact(sum of SegmentRef::sample_count)` for a predicate-free,
 //! erasure-free scan, so DataFusion's `AggregateStatistics` physical-optimizer
 //! rule rewrites `COUNT(*)` into a literal and never executes the scan. These
@@ -11,6 +11,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::sync::Arc;
 
 use datafusion::arrow::array::Int64Array;
@@ -201,7 +202,7 @@ fn provider_over(store: Arc<CountingStore>, snapshot: Snapshot) -> LogsTableProv
 ///
 /// Three objects with 7, 11, and 13 records: the answer is exactly 31.
 ///
-/// Pre-fix (with `LogsScanExec::partition_statistics` reverted to the trait
+/// Pre-fix (with `LogsScanExec::statistics_from_inputs` reverted to the trait
 /// default that reports `num_rows: Absent`): the plan contains `LogsScanExec`
 /// and `store.gets()` is 3 (one GET per object). Post-fix: no `LogsScanExec`
 /// and `store.gets()` is 0.
@@ -380,8 +381,8 @@ async fn count_with_pending_erasure_scans() {
 // Issue #723: widen the exact-stats condition so a ts bound that fully contains
 // every resolved segment still reports an exact row count and an exact ts span.
 //
-// These exercise `LogsScanExec::partition_statistics(None)` directly, over the
-// bare scan `LogsTableProvider::plan_filters` builds. That is the entry point
+// These exercise `LogsScanExec::statistics_from_inputs` directly, through
+// `StatisticsContext::compute` over the bare scan `LogsTableProvider::plan_filters` builds. That is the entry point
 // DataFusion's `AggregateStatistics` rule consults, and it needs no object-store
 // I/O, so a `CountingStore` pins exactly zero GETs. The three predicate-fallback
 // tests above still cover the whole-plan rewrite for the no-predicate case.
@@ -394,8 +395,9 @@ const NON_TS_COLS: &[usize] = &[ravel_sql::LOG_COL_OBSERVED_TS, ravel_sql::LOG_C
 fn scan_stats(store: &Arc<CountingStore>, snapshot: Snapshot, filters: &[Expr]) -> Arc<Statistics> {
     let provider = provider_over(Arc::clone(store), snapshot);
     let plan = provider.plan_filters(4, filters).expect("plan_filters");
-    plan.partition_statistics(None)
-        .expect("partition_statistics")
+    StatisticsContext::new()
+        .compute(plan.as_ref(), &StatisticsArgs::new())
+        .expect("statistics")
 }
 
 fn ts_ns(v: i64) -> Precision<ScalarValue> {

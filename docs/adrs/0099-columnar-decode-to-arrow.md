@@ -81,11 +81,12 @@ the scan (`logs_scan.rs:748`, ADR-0064). Anything that builds arrays straight
 from `DecodedBlock` bypasses both, and the failure mode of getting erasure
 wrong is an erased record served to a client, not a slow query.
 
-**Arrow version split.** `ravel-sql` does not compile against the workspace
-`arrow = "59"`; it uses `datafusion = "54"`, which carries arrow 58, and every
-import goes through `datafusion::arrow` (`crates/ravel-sql/Cargo.toml:39-62`
-records the split). Buffer-level code added to `ravel-sql` must use
-`datafusion::arrow::buffer`, and no arrow type may cross into `ravel-logseg`.
+**Arrow version split** (closed by the arrow 59 amendment below). At the
+time of this decision `ravel-sql` did not compile against the workspace
+`arrow = "59"`; it used `datafusion = "54"`, which carried arrow 58, and every
+import went through `datafusion::arrow`. Buffer-level code added to
+`ravel-sql` had to use `datafusion::arrow::buffer`, and no arrow type may
+cross into `ravel-logseg`.
 
 **Measurement.** The repo has an allocation-counting pattern
 (`stats_alloc` + a `Region` around one untimed run,
@@ -433,3 +434,21 @@ Two follow-ups this amendment does not close:
   path is not what issue #737 reported.
 - `severity_text` is still `Utf8`, unchanged and still deferred for the reason
   decision 5 gives.
+
+## Amendment (2026-10-11, #2720): the arrow version split is gone
+
+<!-- amendment-applies: sections="Context" pointer="arrow 59 amendment" -->
+
+The Context's "Arrow version split" paragraph described a tree in which
+`ravel-sql` built against `datafusion = "54"` and its arrow 58 while the
+rest of the workspace built against arrow 59. Issue #2720 moved `ravel-sql`
+to `datafusion = "55.2"` (`crates/ravel-sql/Cargo.toml`), which carries
+arrow 59, so every `arrow*` crate in `Cargo.lock` is one version, 59.3.0 at
+the time of this amendment, and the workspace carries one arrow major.
+
+What stays: `ravel-sql` keeps importing arrow through `datafusion::arrow`
+(38 of its source files do; 4 name the workspace crate directly, which now
+resolves to the same crate), and no arrow type crosses into `ravel-logseg`.
+That rule rests on decision 4's layering, not on the version split, and
+stands on its own. Buffer-level code in `ravel-sql` may use either path;
+there is no longer a second arrow to get wrong.

@@ -313,6 +313,7 @@ fn rendered_fold_last_success_secs(catalog: &Catalog) -> f64 {
         &[],
         0,
         IngestBufferBudgetSnapshot::default(),
+        ravel_server::metrics::PendingStrictAckSnapshot::default(),
         None,
         None,
         &[],

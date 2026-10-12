@@ -618,8 +618,8 @@ impl MapChild {
     /// builds a key vector the size of the whole child, so a row's entries
     /// would cost O(entries^2); it is called once here instead. A child whose
     /// dictionary is empty is left plain, so arrow's assertion in
-    /// `normalized_keys` is never reached: every key of such a child is null,
-    /// and its row is refused as holding a null key.
+    /// `normalized_keys` is never reached; every entry of such a child is
+    /// null.
     fn new(child: &ArrayRef) -> Self {
         if matches!(child.data_type(), DataType::Dictionary(_, _)) {
             let dict = child.as_any_dictionary();
@@ -734,8 +734,11 @@ fn read_span_attrs_map(
     let mut kept = 0usize;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for i in start..end {
-        // Before the null-value skip, so an entry with both null is refused:
-        // Arrow declares a map's key field non-nullable.
+        // Before the null-value skip, so an entry with both null is refused.
+        // Only `MapArray::try_new` refuses a nullable key field: the Parquet
+        // map reader builds its array from `ArrayData` unvalidated, so a file
+        // whose key column is OPTIONAL delivers its null keys here, and a
+        // dictionary key child can point a valid key at a null value.
         let key = map
             .keys
             .get(i)?

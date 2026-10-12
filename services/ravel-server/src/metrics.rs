@@ -403,8 +403,8 @@ pub enum Label {
     /// Which ADR-1702 CPU gate a `ravel_cpu_gate_*` sample belongs to:
     /// `read` or `write`. A closed enum owned by [`ravel_cpu_gate`].
     CpuGate(ravel_cpu_gate::GateKind),
-    /// Which read-gate call site a `ravel_cpu_gate_jobs_total` or
-    /// `ravel_cpu_gate_inline_total` sample counts. A closed enum owned by
+    /// Which read-gate call site a per-site CPU gate sample counts. A closed
+    /// enum owned by
     /// [`ravel_cpu_gate`]; shares the `site` key with [`Label::WriteGateSite`].
     ReadGateSite(ravel_cpu_gate::ReadSite),
     /// Which write-gate call site a per-site CPU gate sample counts. Shares the
@@ -3044,6 +3044,42 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
+/// The process-wide pending strict-ack family (ADR-2793 decision 4):
+/// strict writes enqueued and awaiting their acknowledgement, and the
+/// cumulative refusals at `--max-pending-strict-acks`. Mode-only labeled like
+/// `render_ingest_concurrency_family` above: one budget is shared across
+/// metrics, logs and traces with no per-signal breakdown.
+fn render_pending_strict_ack_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: PendingStrictAckSnapshot,
+) {
+    write_header(
+        out,
+        "ravel_ingest_pending_strict_acks",
+        "Strict ingest writes enqueued and awaiting their durability acknowledgement, process-wide.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_pending_strict_acks",
+        &[Label::Mode(mode)],
+        snapshot.pending_strict_acks,
+    );
+    write_header(
+        out,
+        "ravel_ingest_pending_ack_shed_total",
+        "Strict ingest writes refused by the process-wide pending strict-acknowledgement ceiling (--max-pending-strict-acks).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_pending_ack_shed_total",
+        &[Label::Mode(mode)],
+        snapshot.shed_total,
+    );
+}
+
 /// The process-wide ingest buffer byte budget family (ADR-0069 decision 1,
 /// amended): the current gauge of estimated buffered bytes plus in-flight
 /// OTLP HTTP gzip and Remote Write snappy decode state, the configured
@@ -3252,6 +3288,10 @@ struct CpuGateSiteRow {
     site: Label,
     jobs: u64,
     inline: u64,
+    handoff_nanos_sum: u64,
+    handoff_count: u64,
+    return_nanos_sum: u64,
+    return_count: u64,
 }
 
 /// Reads one whole-gate figure off a [`CpuGateRow`].
@@ -3260,6 +3300,9 @@ type GateFigure = fn(&CpuGateRow) -> u64;
 type GateSumCount = fn(&CpuGateRow) -> (u64, u64);
 /// Reads one per-site figure off a [`CpuGateSiteRow`].
 type SiteFigure = fn(&CpuGateSiteRow) -> u64;
+/// Reads one per-site summary's nanosecond sum and count off a
+/// [`CpuGateSiteRow`].
+type SiteSumCount = fn(&CpuGateSiteRow) -> (u64, u64);
 
 impl CpuGateRow {
     fn new<S: ravel_cpu_gate::GateSite>(
@@ -3283,6 +3326,10 @@ impl CpuGateRow {
                     site: site_label(site.site),
                     jobs: site.jobs,
                     inline: site.inline,
+                    handoff_nanos_sum: site.handoff_nanos_sum,
+                    handoff_count: site.handoff_count,
+                    return_nanos_sum: site.return_nanos_sum,
+                    return_count: site.return_count,
                 })
                 .collect(),
         }
@@ -3290,8 +3337,8 @@ impl CpuGateRow {
 }
 
 /// The ADR-1702 decision 11 CPU gate families. Every sample carries `{mode,
-/// gate}`; the two per-site counters add `site`, one sample for every site in
-/// that gate's closed set, zero included. A rising mean wait
+/// gate}`; the per-site counters and summaries add `site`, one sample for
+/// every site in that gate's closed set, zero included. A rising mean wait
 /// (`wait_seconds_sum / wait_seconds_count` over a window) with `running` at
 /// `permits` means the node is CPU-bound on decode.
 ///
@@ -3300,6 +3347,12 @@ impl CpuGateRow {
 /// from. A wait is counted when it ends with a permit, so a waiter dropped in
 /// the queue adds to neither. `abandoned_total` counts started jobs whose
 /// waiter was gone when they returned.
+///
+/// The per-site `handoff_seconds` and `return_seconds` summaries (the ADR-1702
+/// handoff and post-return amendment) time a gated job's trip onto the blocking
+/// pool and back: from `spawn_blocking` to the job's first instruction, and
+/// from its last instruction to the caller resuming. Inline jobs add to
+/// neither.
 fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot) {
     let rows = [
         CpuGateRow::new(&gates.read, Label::ReadGateSite),
@@ -3396,6 +3449,32 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
                     &[Label::Mode(mode), row.gate.clone(), site.site.clone()],
                     value(site),
                 );
+            }
+        }
+    }
+
+    let per_site_summaries: [(&str, &str, SiteSumCount); 2] = [
+        (
+            "ravel_cpu_gate_handoff_seconds",
+            "Time from handing a CPU gate job to the blocking pool to its first instruction there, per call site.",
+            |site| (site.handoff_nanos_sum, site.handoff_count),
+        ),
+        (
+            "ravel_cpu_gate_return_seconds",
+            "Time from a CPU gate job's last instruction to its waiting caller resuming, per call site.",
+            |site| (site.return_nanos_sum, site.return_count),
+        ),
+    ];
+    for (name, help, value) in per_site_summaries {
+        write_header(out, name, help, "summary");
+        let sum_name = format!("{name}_sum");
+        let count_name = format!("{name}_count");
+        for row in &rows {
+            for site in &row.sites {
+                let (nanos, count) = value(site);
+                let labels = [Label::Mode(mode), row.gate.clone(), site.site.clone()];
+                write_sample_f64(out, &sum_name, &labels, nanos_to_seconds(nanos));
+                write_sample(out, &count_name, &labels, count);
             }
         }
     }
@@ -7890,6 +7969,7 @@ pub fn render(
     query_accounting: &[QueryAccountingRow],
     ingest_concurrency_shed_total: u64,
     ingest_buffer_budget: IngestBufferBudgetSnapshot,
+    pending_strict_acks: PendingStrictAckSnapshot,
     distrib: Option<&DistribSnapshot>,
     durable_auth: Option<&DurableAuthCountersSnapshot>,
     attribution: &[TenantAttributionRow],
@@ -8053,6 +8133,7 @@ pub fn render(
         ingest_buffer_budget.ceiling,
         ingest_buffer_budget.shed_total,
     );
+    render_pending_strict_ack_family(&mut out, mode, pending_strict_acks);
     if let Some(snapshot) = distrib {
         render_distrib_family(&mut out, mode, snapshot);
     }
@@ -8085,6 +8166,15 @@ pub fn render(
 pub struct IngestBufferBudgetSnapshot {
     pub in_flight_bytes: u64,
     pub ceiling: u64,
+    pub shed_total: u64,
+}
+
+/// The process-wide pending strict-ack budget readings (ADR-2793 decision 4),
+/// read once from a router's `metrics_snapshot()`: the three routers share
+/// one budget, so any one of them reports the process-wide figures.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PendingStrictAckSnapshot {
+    pub pending_strict_acks: u64,
     pub shed_total: u64,
 }
 
@@ -8487,6 +8577,31 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         shed_total: state.ingest_buffer_budget.shed_total(),
     };
 
+    // The three routers share one pending-ack budget, so the first present
+    // router's snapshot is the process-wide figure; summing would count it
+    // once per signal.
+    let pending_strict_acks = if let Some(router) = &state.ingest_router {
+        let snapshot = router.metrics_snapshot();
+        PendingStrictAckSnapshot {
+            pending_strict_acks: snapshot.pending_strict_acks,
+            shed_total: snapshot.pending_ack_shed,
+        }
+    } else if let Some(router) = &state.log_ingest_router {
+        let snapshot = router.metrics_snapshot();
+        PendingStrictAckSnapshot {
+            pending_strict_acks: snapshot.pending_strict_acks,
+            shed_total: snapshot.pending_ack_shed,
+        }
+    } else if let Some(router) = &state.span_ingest_router {
+        let snapshot = router.metrics_snapshot();
+        PendingStrictAckSnapshot {
+            pending_strict_acks: snapshot.pending_strict_acks,
+            shed_total: snapshot.pending_ack_shed,
+        }
+    } else {
+        PendingStrictAckSnapshot::default()
+    };
+
     let distrib_snapshot = state
         .distrib
         .as_ref()
@@ -8577,6 +8692,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &query_rows,
         ingest_concurrency_shed_total,
         ingest_buffer_budget,
+        pending_strict_acks,
         distrib_snapshot.as_ref(),
         durable_auth_snapshot.as_ref(),
         &attribution,
@@ -8910,6 +9026,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9186,6 +9303,10 @@ mod tests {
         snapshot.write.run_nanos_sum = 250_000_000;
         snapshot.write.run_count = 2;
         snapshot.write.sites[5].jobs = 8;
+        snapshot.read.sites[0].handoff_nanos_sum = 3_000_000;
+        snapshot.read.sites[0].handoff_count = 3;
+        snapshot.write.sites[5].return_nanos_sum = 500_000;
+        snapshot.write.sites[5].return_count = 2;
         let runtime = RuntimeSnapshot {
             workers: 2,
             alive_tasks: 11,
@@ -9206,6 +9327,8 @@ mod tests {
             ("ravel_cpu_gate_abandoned_total", "counter"),
             ("ravel_cpu_gate_jobs_total", "counter"),
             ("ravel_cpu_gate_inline_total", "counter"),
+            ("ravel_cpu_gate_handoff_seconds", "summary"),
+            ("ravel_cpu_gate_return_seconds", "summary"),
             ("ravel_runtime_workers", "gauge"),
             ("ravel_runtime_alive_tasks", "gauge"),
             ("ravel_runtime_global_queue_depth", "gauge"),
@@ -9235,6 +9358,11 @@ mod tests {
             "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 6",
             "ravel_cpu_gate_jobs_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 8",
             "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 0",
+            "ravel_cpu_gate_handoff_seconds_sum{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 0.003",
+            "ravel_cpu_gate_handoff_seconds_count{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 3",
+            "ravel_cpu_gate_return_seconds_sum{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 0",
+            "ravel_cpu_gate_return_seconds_sum{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 0.0005",
+            "ravel_cpu_gate_return_seconds_count{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 2",
             "ravel_runtime_workers{mode=\"all\"} 2",
             "ravel_runtime_alive_tasks{mode=\"all\"} 11",
             "ravel_runtime_global_queue_depth{mode=\"all\"} 4",
@@ -9250,7 +9378,14 @@ mod tests {
 
         use ravel_cpu_gate::GateSite;
         let sites = ravel_cpu_gate::ReadSite::ALL.len() + ravel_cpu_gate::WriteSite::ALL.len();
-        for family in ["ravel_cpu_gate_jobs_total{", "ravel_cpu_gate_inline_total{"] {
+        for family in [
+            "ravel_cpu_gate_jobs_total{",
+            "ravel_cpu_gate_inline_total{",
+            "ravel_cpu_gate_handoff_seconds_sum{",
+            "ravel_cpu_gate_handoff_seconds_count{",
+            "ravel_cpu_gate_return_seconds_sum{",
+            "ravel_cpu_gate_return_seconds_count{",
+        ] {
             assert_eq!(
                 body.lines().filter(|line| line.starts_with(family)).count(),
                 sites,
@@ -9543,6 +9678,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9632,6 +9768,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9777,6 +9914,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -9961,6 +10099,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10044,6 +10183,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10293,6 +10433,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10371,6 +10512,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10440,6 +10582,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10560,6 +10703,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10648,6 +10792,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10758,6 +10903,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10845,6 +10991,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10937,6 +11084,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -10999,6 +11147,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11048,6 +11197,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11139,6 +11289,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11648,6 +11799,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11866,6 +12018,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11903,6 +12056,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -11977,6 +12131,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12037,6 +12192,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12126,6 +12282,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12245,6 +12402,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             Some(&snapshot),
             &[],
@@ -12304,6 +12462,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12415,6 +12574,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -12688,6 +12848,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             Some(&snapshot),
             None,
             &[],
@@ -12790,6 +12951,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13220,6 +13382,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13356,6 +13519,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13450,6 +13614,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13519,6 +13684,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13627,6 +13793,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -13838,6 +14005,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -14343,6 +14511,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -14577,6 +14746,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -14624,6 +14794,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15104,6 +15275,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15193,6 +15365,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15281,6 +15454,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15363,6 +15537,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15480,6 +15655,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &metrics.snapshot(),
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -15706,6 +15882,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             distrib,
             None,
             &[],
@@ -16588,6 +16765,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],
@@ -16715,6 +16893,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
             None,
             None,
             &[],

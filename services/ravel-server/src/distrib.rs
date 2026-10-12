@@ -3692,6 +3692,7 @@ mod tests {
             &[],
             0,
             crate::metrics::IngestBufferBudgetSnapshot::default(),
+            crate::metrics::PendingStrictAckSnapshot::default(),
             Some(&snapshot),
             None,
             &[],

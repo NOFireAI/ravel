@@ -1492,14 +1492,18 @@ chaos_line_count() {
 }
 
 # Seconds past the takeover window the conservation oracle allows for the
-# survivor's own merge of the interrupted bucket. Not measured: no merge at
+# survivor's own merges of the interrupted buckets. Not measured: no merge at
 # the scenario 2 fan-in has been timed (see the fixture note above); the
-# oracle's `merge durations:` line is where a run reports one. 300 s is
+# oracle's `merge durations:` line is where a run reports one. That figure
+# runs from the merge-start line, which comes after the merge has read all of
+# its inputs' commit records (load_inputs_with_ledger in compact.rs), so it
+# leaves out that load, which a survivor redoing the bucket also pays; read
+# it as a lower bound. 300 s is
 # one more maintenance tick; the chaos job's worst case with it is in the
 # comment above `timeout-minutes` in .github/workflows/k8s-nightly.yml.
 CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS="${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS:-300}"
 # Seconds the conservation oracle waits, from the kill, for the survivor to
-# publish the interrupted bucket. Empty means
+# publish every interrupted bucket. Empty means
 # chaos_conservation_wait_seconds. The test suite shortens it.
 CHAOS_CONSERVATION_WAIT_SECONDS="${CHAOS_CONSERVATION_WAIT_SECONDS:-}"
 # Seconds between reads of the survivor's log while waiting.
@@ -1538,13 +1542,13 @@ chaos_conservation_aborts_ok() {
 }
 
 # 4. conservation-holds, with a could-not-measure outcome.
-#    The store holds a compaction record for the bucket worker A was merging
-#    when it was killed, whoever wrote it, and the survivor's
+#    The store holds a compaction record for every bucket worker A had open
+#    when it was killed, whoever wrote each, and the survivor's
 #    conservation-abort counter did not advance across the interruption (the
 #    gate never had to reject a record-dropping publish). The store decides,
 #    not the survivor's log: A's record PUT can land before A logs its
 #    publish, or server-side after the SIGKILL, and the survivor then finds
-#    the bucket compacted and logs nothing.
+#    that bucket compacted and logs nothing.
 #
 #    Args: worker_a_log_file (read after the SIGKILL, so it is A's state at
 #    the kill), survivor_base_url, conservation_aborts_baseline,

@@ -17,6 +17,7 @@ use ravel_otlp::{
 };
 use ravel_types::{CommitToken, Signal, TenantId};
 
+use crate::ingest_concurrency::IngestPermitHandle;
 use crate::otlp_http::{
     MAX_IDEMPOTENCY_KEY_BYTES, encode_commit_tokens, request_ingest_hour_bucket,
 };
@@ -136,6 +137,30 @@ pub async fn handle_export_traces(
     ingest_ts_ns: i64,
     idempotency_key: Option<Vec<u8>>,
 ) -> Result<SpanIngestOutcome, SpanIngestRequestError> {
+    handle_export_traces_releasing(
+        state,
+        tenant,
+        mode,
+        request,
+        ingest_ts_ns,
+        idempotency_key,
+        &IngestPermitHandle::default(),
+    )
+    .await
+}
+
+/// [`handle_export_traces`] for a transport that holds the request's
+/// in-flight permit: `permit` is released once the write is enqueued, before
+/// the strict ack is awaited (ADR-2793 decision 4).
+pub async fn handle_export_traces_releasing(
+    state: &SpanIngestState,
+    tenant: TenantId,
+    mode: WriteMode,
+    request: ExportTraceServiceRequest,
+    ingest_ts_ns: i64,
+    idempotency_key: Option<Vec<u8>>,
+    permit: &IngestPermitHandle,
+) -> Result<SpanIngestOutcome, SpanIngestRequestError> {
     // Receiver-clock plausibility (ADR-0051 amendment): checked before
     // any other work; the hour bucket the marker path and normalize both
     // derive is nonsense on a bad clock. Whole-request 503 / UNAVAILABLE,
@@ -250,38 +275,41 @@ pub async fn handle_export_traces(
     let written_count = normalized.spans.len() as u64;
 
     drop(label_charge);
-    let receipt = state
+    let classify = |err: SpanWriteError| {
+        // A PartialWrite's durable siblings are real, durably committed
+        // data (docs/consistency-model.md "Opt-in client idempotency
+        // key"). OTLP has no error-response channel to hand their tokens
+        // back to the client, and no idempotency marker is written for
+        // them: the marker replay path always reports the original commit
+        // token with zero rejections, so marking a partial commit as the
+        // request's receipt would make the next retry skip resending the
+        // shard that never committed and permanently lose it, rather than
+        // the honest at-least-once duplication an unkeyed retry gets today.
+        // Logging the count is the only recovery this path offers.
+        let durable_shard_count = err.durable_tokens().len();
+        if durable_shard_count > 0 {
+            tracing::warn!(
+                tenant_hash = %tenant.hash().to_hex(),
+                durable_shard_count,
+                "span write partially committed before a sibling shard \
+                 failed; no idempotency marker written for the durable \
+                 siblings"
+            );
+        }
+        SpanIngestRequestError::Write(err)
+    };
+    let submitted = state
         .router
-        .write(
+        .submit(
             tenant.clone(),
             normalized.spans,
             mode,
             crate::logs_ingest::router_write_budget(keyed_deadline, state.ack_deadline),
         )
         .await
-        .map_err(|err| {
-            // A PartialWrite's durable siblings are real, durably committed
-            // data (docs/consistency-model.md "Opt-in client idempotency
-            // key"). OTLP has no error-response channel to hand their tokens
-            // back to the client, and no idempotency marker is written for
-            // them: the marker replay path always reports the original commit
-            // token with zero rejections, so marking a partial commit as the
-            // request's receipt would make the next retry skip resending the
-            // shard that never committed and permanently lose it, rather than
-            // the honest at-least-once duplication an unkeyed retry gets today.
-            // Logging the count is the only recovery this path offers.
-            let durable_shard_count = err.durable_tokens().len();
-            if durable_shard_count > 0 {
-                tracing::warn!(
-                    tenant_hash = %tenant.hash().to_hex(),
-                    durable_shard_count,
-                    "span write partially committed before a sibling shard \
-                     failed; no idempotency marker written for the durable \
-                     siblings"
-                );
-            }
-            SpanIngestRequestError::Write(err)
-        })?;
+        .map_err(classify)?;
+    permit.release();
+    let receipt = submitted.acks().await.map_err(classify)?;
 
     // Gate on whether anything was rejected at all, never on the unit count: a
     // zero-count rejection still has to reach the sender. The rule and the

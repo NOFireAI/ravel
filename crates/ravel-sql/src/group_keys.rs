@@ -5,7 +5,7 @@
 //!
 //! A declared `Str` attribute column reaches Arrow as `Dictionary(Int32,
 //! Utf8)` (ADR-0099 decision 5, [`crate::declared::DeclaredType::Str`]). That
-//! type is a wire contract for what a client receives, and DataFusion 54 has
+//! type is a wire contract for what a client receives, and DataFusion 55 has
 //! no specialized group-value table for it: `Dictionary` appears in neither
 //! the single-column dispatch in
 //! `datafusion_physical_plan::aggregates::group_values::new_group_values` nor
@@ -18,12 +18,12 @@
 //! that lands in `arrow_row::variable::decode_binary::<i32>`, which appends
 //! `i32` offsets into a single values buffer. One `Utf8` array cannot hold
 //! more than `i32::MAX` bytes, and the group table is decoded as one array,
-//! not in `batch_size` slices: the slicing in
-//! `aggregates::row_hash::GroupedHashAggregateStream` happens after the emit,
-//! on the batch the emit already built. A tenant with roughly ten million
-//! distinct URLs averaging 215 bytes crosses the limit and arrow panics with
-//! `offset overflow`. Nothing bounds it first. The memory pool cannot: the
-//! reservation is released before the emit. `EmitTo::First` would, but it is
+//! not in `batch_size` slices: DataFusion 55's `MaterializedAggregateOutput`
+//! slices after the emit, the batch the emit already built. A tenant with
+//! roughly ten million distinct URLs averaging 215 bytes crosses the limit and
+//! arrow panics with `offset overflow`. Nothing bounds it first. The memory
+//! pool cannot: the decode allocates before the stream next updates its
+//! reservation. `EmitTo::First` would, but it is
 //! reachable only under a `GroupOrdering` or the early-emit path.
 //!
 //! # The rewrite

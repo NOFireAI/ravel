@@ -132,6 +132,7 @@ async fn start_test_server() -> ravel_server::Running {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -310,6 +311,72 @@ async fn strict_arrival_header_acks_without_the_age_tick() {
         "a strict export acks with a commit token"
     );
     assert_eq!(server.flushes_by_arrival().await, 1);
+
+    server.shutdown().await;
+}
+
+/// The metrics gRPC handler returns its in-flight permit at enqueue too: with
+/// the ceiling at one, a second strict export is admitted while the first
+/// still waits on its held data PUT, and both ack with commit-token metadata
+/// once the gate releases.
+#[tokio::test]
+async fn in_flight_permit_is_released_before_the_strict_ack() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.ingest_concurrency_limit =
+            ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1);
+    })
+    .await;
+    let grpc_addr = server.running.grpc_addr.expect("gateway mode binds gRPC");
+    let spawn_export = |metric: &'static str| {
+        tokio::spawn(async move {
+            let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+                .await
+                .expect("gRPC client connects");
+            let mut request = tonic::Request::new(export_request(metric, "demo", 1.0, now_ns()));
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+            );
+            client.export(request).await
+        })
+    };
+
+    let mut first = spawn_export("first_grpc_metric");
+    server.wait_for_buffered_while_pending(1, &mut first).await;
+    let mut second = spawn_export("second_grpc_metric");
+    server.wait_for_buffered_while_pending(2, &mut second).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "both strict acks wait for the held data PUTs"
+    );
+    assert_eq!(
+        strict_flush::process_sample(
+            &server.scrape().await,
+            "ravel_ingest_concurrency_shed_total"
+        ),
+        0,
+        "the second export was admitted, not shed"
+    );
+
+    let (first, second) = release_until(&server.gate, async {
+        (
+            first.await.expect("export task"),
+            second.await.expect("export task"),
+        )
+    })
+    .await;
+    for response in [first, second] {
+        let response = response.expect("gRPC export succeeds");
+        assert!(
+            response
+                .metadata()
+                .get("x-ravel-commit-token")
+                .is_some_and(|value| !value.is_empty()),
+            "a strict export acks with commit-token metadata"
+        );
+    }
 
     server.shutdown().await;
 }

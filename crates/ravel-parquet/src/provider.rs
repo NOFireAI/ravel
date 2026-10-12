@@ -20,7 +20,7 @@ use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{
     Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType, cast, ident,
 };
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_datasource_parquet::{transform_binary_to_string, transform_schema_to_view};
 use object_store::ObjectMeta;
@@ -537,11 +537,14 @@ impl TableProvider for RawParquetScan {
             self.parallel,
             state.config().target_partitions(),
         );
+        // A declared partitioning keeps DataFusion from splitting the serial
+        // scan's one group by byte range and from stealing its files.
+        let declared = (!self.parallel).then(|| Partitioning::UnknownPartitioning(groups.len()));
         let config = FileScanConfigBuilder::new(self.url.clone(), Arc::new(source))
             .with_file_groups(groups)
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
-            .with_partitioned_by_file_group(!self.parallel)
+            .with_output_partitioning(declared)
             .build();
         Ok(Arc::new(ParquetPanicBoundaryExec::new(
             self.table.clone(),
@@ -562,7 +565,7 @@ mod tests {
         Array, Date32Array, Int64Array, TimestampMillisecondArray, TimestampSecondArray,
     };
     use datafusion::logical_expr::JoinType;
-    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::{ExecutionPlanProperties, StatisticsArgs, StatisticsContext};
     use datafusion::prelude::SessionConfig;
     use datafusion::prelude::{DataFrame, SessionContext};
     use datafusion_datasource_parquet::ParquetFileReaderFactory;
@@ -887,12 +890,14 @@ mod tests {
                 .downcast_to_file_source::<ParquetSource>()
                 .expect("a Parquet file source");
             assert_eq!(config.file_groups.len(), partitions, "{label}");
+            let statistics = |plan: &dyn ExecutionPlan| {
+                StatisticsContext::new()
+                    .compute(plan, &StatisticsArgs::new())
+                    .expect("statistics")
+            };
             assert_eq!(
-                boundary.partition_statistics(None).expect("statistics"),
-                boundary
-                    .inner()
-                    .partition_statistics(None)
-                    .expect("statistics"),
+                statistics(*boundary),
+                statistics(boundary.inner().as_ref()),
                 "{label}"
             );
             let got = read_all(&ctx, "t", &["a"]).await.expect("rows");

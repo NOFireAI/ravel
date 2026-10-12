@@ -433,6 +433,23 @@ pub enum AuditTextArg {
 /// `--tenant-hash-key-file` form an operator already handles.
 pub const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
 
+/// Refuses a `--max-pending-strict-acks` above
+/// [`tokio::sync::Semaphore::MAX_PERMITS`], the most permits the shared
+/// budget's semaphore can hold, rather than letting the budget clamp it
+/// silently. `0` (unlimited) and every value up to that maximum pass through
+/// unchanged.
+pub fn check_max_pending_strict_acks(limit: u64) -> anyhow::Result<u64> {
+    let max = tokio::sync::Semaphore::MAX_PERMITS;
+    if usize::try_from(limit).is_ok_and(|limit| limit <= max) {
+        Ok(limit)
+    } else {
+        anyhow::bail!(
+            "--max-pending-strict-acks {limit} exceeds the largest supported value {max}; \
+             pass a smaller bound, or 0 for unlimited"
+        )
+    }
+}
+
 /// Whether [`AUDIT_TOKEN_KEY_ENV`] is present in this process's environment,
 /// whatever its value. Under `--audit-mode off` the key is never read, so a
 /// deployment that sets it expecting the audit to run is told at startup.
@@ -1684,6 +1701,10 @@ pub struct Cli {
     /// gRPC gets `RESOURCE_EXHAUSTED`. The permit is taken from the request
     /// head, before the body is read or decoded and before the tenant
     /// credential is checked, so a shed request never buffers a body.
+    /// The permit is released once the request's write is enqueued, before
+    /// a strict write's durability acknowledgement, so this count bounds
+    /// requests reading and decoding at once and no longer covers the
+    /// strict ack wait; `--max-pending-strict-acks` bounds those waits.
     /// Unlike `--max-concurrent-queries`,
     /// this is never fleet-reconciled: each process enforces its own local
     /// bound independently. It bounds request COUNT, so the transient
@@ -1698,6 +1719,26 @@ pub struct Cli {
     /// `0` disables the limit.
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
+
+    /// The process-wide ceiling on strict writes that are enqueued and
+    /// waiting for their durability acknowledgement, summed across metrics,
+    /// logs, traces and Remote Write, every listener and every transport.
+    /// A strict write takes a slot when it is enqueued, after its body was
+    /// read and decoded, and returns it when its acknowledgement resolves or
+    /// its ack deadline elapses.
+    /// Over the limit, the write is refused before it is buffered and holds
+    /// no buffer byte charge: HTTP gets 429 with `Retry-After`, gRPC gets
+    /// `RESOURCE_EXHAUSTED`. This sheds after decode and does not replace
+    /// `--max-inflight-ingest-requests`, which sheds at the request head.
+    /// Buffered writes never take a slot. `0` disables the limit; a value
+    /// above the tokio semaphore's maximum permit count is refused at
+    /// startup.
+    #[arg(
+        long = "max-pending-strict-acks",
+        env = "RAVEL_MAX_PENDING_STRICT_ACKS",
+        default_value_t = 8192
+    )]
+    pub max_pending_strict_acks: u64,
 
     /// The process-wide ingest buffer byte budget (ADR-0069 decision 1,
     /// amended by issues #1297 and #1419): a ceiling on the sum of estimated
@@ -7124,6 +7165,8 @@ impl Cli {
         // than at the first ingest request.
         self.parse_ingest_concurrency_limit()?;
 
+        check_max_pending_strict_acks(self.max_pending_strict_acks)?;
+
         // Same rationale as above: `0` is a deliberate "unlimited", but parse
         // it so a malformed future extension fails startup, not first ingest.
         self.parse_ingest_buffer_budget()?;
@@ -8973,6 +9016,58 @@ mod tests {
                 );
             }
         }
+
+        // The in-flight permit is released at enqueue, so its help must say
+        // the count stops at the enqueue and name the flag that bounds the
+        // strict ack wait instead.
+        let inflight = long_help("max_inflight_ingest_requests");
+        for term in [
+            "released once the request's write is enqueued",
+            "no longer covers the strict ack wait",
+            "--max-pending-strict-acks",
+        ] {
+            assert!(
+                inflight.contains(term),
+                "--max-inflight-ingest-requests help must name {term:?}: {inflight}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_pending_strict_acks_defaults_to_8192_and_reads_its_env_var() {
+        use clap::CommandFactory;
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(cli.max_pending_strict_acks, 8_192);
+        let arg = Cli::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "max_pending_strict_acks")
+            .map(|a| a.get_env().map(|env| env.to_os_string()))
+            .expect("flag is defined");
+        assert_eq!(
+            arg,
+            Some(std::ffi::OsString::from("RAVEL_MAX_PENDING_STRICT_ACKS"))
+        );
+        let cli = Cli::try_parse_from(["ravel-server", "--max-pending-strict-acks", "0"])
+            .expect("0 parses");
+        assert_eq!(cli.max_pending_strict_acks, 0);
+    }
+
+    #[test]
+    fn max_pending_strict_acks_above_the_semaphore_maximum_is_refused() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS as u64;
+        assert_eq!(check_max_pending_strict_acks(0).expect("unlimited"), 0);
+        assert_eq!(
+            check_max_pending_strict_acks(max).expect("the maximum"),
+            max
+        );
+        let err = check_max_pending_strict_acks(max + 1)
+            .expect_err("one past the maximum is refused")
+            .to_string();
+        assert!(
+            err.contains("--max-pending-strict-acks") && err.contains(&max.to_string()),
+            "the refusal names the flag and the maximum: {err}"
+        );
     }
 
     /// `--max-queued-flushes`'s help states the per-(shard, tenant) memory

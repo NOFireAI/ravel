@@ -1196,7 +1196,7 @@ mod resolution {
     /// `RENAME` and a trailing `AS` alias select or rename the expanded
     /// columns by a rule this planner does not model, so a name under one is
     /// answered with a reason rather than with the base column of that name.
-    /// (DataFusion 54 refuses to plan the last two outright, which makes the
+    /// (DataFusion 55 refuses to plan the last two outright, which makes the
     /// refusal here the same answer the caller would have got for the
     /// statement it handed in.)
     fn wildcard_rest(options: &WildcardAdditionalOptions) -> Rest {

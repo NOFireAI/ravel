@@ -18,13 +18,19 @@
 //! reserved bytes return to zero without any explicit cleanup path. A pool that
 //! did not forward `shrink` would leak tenant budget on every cancellation.
 //!
-//! One exception: a grouped hash aggregate stream whose consumer cannot spill
-//! has its shrinks held on all three budgets rather than released, because
-//! DataFusion 54.1's `GroupedHashAggregateStream::emit` shrinks its reservation
-//! while the emitted batch still holds the bytes. The choice is made per
+//! One exception: a legacy grouped hash aggregate stream whose consumer cannot
+//! spill has its shrinks held on all three budgets rather than released,
+//! because `GroupedHashAggregateStream::emit` shrinks its reservation while the
+//! emitted batch still holds the bytes. DataFusion 55.2 runs that stream only
+//! for the aggregate shapes `AggregateExec::execute_typed` has not migrated,
+//! for example a single-stage aggregate with a limit or over ordered input;
+//! the migrated streams keep their emitted output reserved themselves, carry
+//! other consumer names, and are not held. The choice is made per
 //! stream, from the consumer itself. The hold is released when that consumer
 //! unregisters, which DataFusion does when the stream's last reservation
-//! drops, so cancellation still returns every byte.
+//! drops, so cancellation still returns every byte. It can be removed once
+//! Ravel runs a DataFusion release whose `execute_typed` no longer falls back
+//! to the legacy stream (apache/datafusion#22710, #25902).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -306,9 +312,13 @@ impl TenantMemoryAccountant {
     }
 }
 
-/// The name prefix DataFusion 54.1 gives a `GroupedHashAggregateStream`'s
-/// memory consumer: `"GroupedHashAggregateStream[{partition}] ({agg_fn_names})"`
-/// in `datafusion-physical-plan`'s `aggregates/row_hash.rs`.
+/// The name prefix DataFusion 55.2 gives the legacy
+/// `GroupedHashAggregateStream`'s memory consumer:
+/// `"GroupedHashAggregateStream[{partition}] ({agg_fn_names})"` in
+/// `datafusion-physical-plan`'s `aggregates/grouped_hash_stream.rs`. The
+/// migrated aggregate streams register under other names
+/// (`FinalHashAggregateStream[..]`, `SingleHashAggregateStream[..]` and so on),
+/// so this prefix selects only the shapes DataFusion has not migrated.
 pub const HASH_AGGREGATE_CONSUMER_PREFIX: &str = "GroupedHashAggregateStream[";
 
 /// Bytes currently held across every [`TenantDelegatingPool`] in the process:
@@ -416,8 +426,8 @@ impl TenantDelegatingPool {
             .fold(0usize, |sum, held| sum.saturating_add(*held))
     }
 
-    /// Whether `consumer`'s shrinks are held rather than released: a grouped
-    /// hash aggregate stream whose consumer cannot spill.
+    /// Whether `consumer`'s shrinks are held rather than released: a legacy
+    /// grouped hash aggregate stream whose consumer cannot spill.
     ///
     /// DataFusion marks the consumer `can_spill` when the stream answers memory
     /// pressure itself: a partial aggregate by emitting early into the exchange
@@ -469,7 +479,7 @@ impl TenantDelegatingPool {
     fn charge(&self, additional: usize) {
         // The trait requires this to be infallible, and both budgets grow
         // unconditionally -- this is not only reachable after a validated
-        // try_grow. datafusion 54.1.0's MemoryReservation::resize() and at
+        // try_grow. datafusion 55.2.0's MemoryReservation::resize() and at
         // least the nested-loop and sort-merge join operators call grow
         // directly with a delta that was never checked against either
         // ceiling (confirmed against the pinned datafusion source; matches
@@ -731,7 +741,8 @@ mod tests {
 
     use super::*;
 
-    /// The name DataFusion 54.1 gives a partition-0 grouped hash aggregate.
+    /// The name DataFusion 55.2 gives a partition-0 legacy grouped hash
+    /// aggregate.
     const AGGREGATE: &str = "GroupedHashAggregateStream[0] (count(1))";
 
     /// The three ledgers one query pool charges, plus the pool itself so a

@@ -36,10 +36,11 @@ impl LogsService for GrpcLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        // See `otlp_grpc::export`: normally already taken by
-        // `GrpcIngestAdmissionLayer` on the request head (issue #1705), and
-        // taken here only on the direct-call path.
-        let _permit =
+        // See `otlp_grpc::export`: normally a clone of the release handle
+        // `GrpcIngestAdmissionLayer` took on the request head (issue #1705),
+        // and a permit taken here only on the direct-call path. Read before
+        // `into_inner`, which drops the extensions.
+        let permit =
             crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
@@ -69,13 +70,14 @@ impl LogsService for GrpcLogsService {
 
         let idempotency_key = idempotency_key_from_headers(&headers);
 
-        let outcome = crate::logs_ingest::handle_export_logs(
+        let outcome = crate::logs_ingest::handle_export_logs_releasing(
             &self.state.logs_ingest,
             tenant,
             mode,
             request.into_inner(),
             now_ns(),
             idempotency_key,
+            &permit,
         )
         .await
         .map_err(|err| match err {
@@ -92,6 +94,9 @@ impl LogsService for GrpcLogsService {
             LogIngestRequestError::Write(
                 write_err @ ravel_ingest::LogWriteError::BufferBudgetExceeded,
             ) => Status::resource_exhausted(write_err.to_string()),
+            LogIngestRequestError::Write(ravel_ingest::LogWriteError::PendingAckLimitReached) => {
+                crate::otlp_grpc::pending_ack_shed_status()
+            }
             // A shard at the flush deferral cap refused the write before
             // buffering it: the same backpressure class as the budget shed.
             LogIngestRequestError::Write(

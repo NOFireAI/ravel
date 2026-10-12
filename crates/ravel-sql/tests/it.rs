@@ -16,6 +16,8 @@ mod util;
 
 #[path = "admission_parity.rs"]
 mod admission_parity;
+#[path = "aggregate_emit_reservation.rs"]
+mod aggregate_emit_reservation;
 #[path = "alerts_provider.rs"]
 mod alerts_provider;
 #[path = "attrs_map_vs_declared.rs"]
@@ -26,6 +28,8 @@ mod audit_provider;
 mod bounded_topk_aggregate;
 #[path = "ceiling_breach.rs"]
 mod ceiling_breach;
+#[path = "compact_slices.rs"]
+mod compact_slices;
 #[path = "deadline.rs"]
 mod deadline;
 #[path = "distinct_on.rs"]

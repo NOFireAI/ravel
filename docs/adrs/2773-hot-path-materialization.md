@@ -405,7 +405,7 @@ on the ratio new / main.
 |---|---|---|
 | Set I (q2, q3, q4, q8, q30), warm CPU sum | at most 0.70 | above 0.78 |
 | Set S (q11, q12, q13, q25, q26, q27), warm CPU sum | at most 0.85 | above 0.92 |
-| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 | above 0.92 |
+| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 (missed at 0.99; see the Set L amendment below) | above 0.92 |
 | Set N (11), warm wall sum | at most 0.80 | above 0.88 |
 | Suite (43), warm CPU sum | at most 0.90 | above 0.95 |
 | Suite (43), warm wall sum | at most 0.92 | above 0.97 |
@@ -424,8 +424,11 @@ pooled, which is the 0.70 band; q4, the lowest at 25%, may land near
 less the `UTF-8 validation` column it contains is 16.3, 14.0, 19.2, 23.2,
 24.0 and 24.1% (19.6% pooled); D3 removes most of it, and the band of
 0.85 asks for 15%. Set L: the same subtraction gives 20.5, 23.4, 25.1 and
-20.1% (22.7% pooled), so 0.85 again. Wall bands allow for the serial
-floor, which does not move.
+20.1% (22.7% pooled), so 0.85 again (see the Set L amendment below: the
+band did not hold, because those remaining points were treated as
+removable when only the builder's overhead was: about 11 points on q23
+in the profile's leaf frame, about 13.6 on this table's basis). Wall
+bands allow for the serial floor, which does not move.
 
 ## Rejected alternatives
 
@@ -577,3 +580,87 @@ runs overflow-attribute arms after the column arms, where `eval` ran the
 `And` in written order, so on a block with an absent `ts` or `stream_ref`
 cell or an undecodable `attrs_raw` cell, which error or exclusion a row
 gets can differ from main's; no well-formed object changes result.
+
+## Amendment (2026-10-11): the Set L band
+
+<!-- amendment-applies: sections="Targets and bars" pointer="the Set L amendment below" -->
+<!-- amendment-supersedes: phrase="so 0.85 again" pointer="the Set L amendment below" -->
+
+The Set L band (q21 to q24, the `LIKE` statements over `URL` and `Title`,
+warm CPU at most 0.85) did not hold, and the model it was derived from
+was wrong. Measured by the T5 sweep on #2790 (two arms interleaved on one
+c6a.4xlarge, 3 repetitions), as new / base like every band here: 0.998
+with new = main `bb171e615` and base = main `aaebcc008` (the pre-wave-1
+main, the parent of the first epic commit; the pre-registered comparison,
+whose 57 commits include 54 outside the epic), and 0.993 with the same
+new arm against base = `bb171e615` with 011d5fe11, 7e5ffb59a and
+bb171e615 reverted (the control, and the only arm that isolates the
+epic). The measured
+0.99 is the outcome of record; no new band is claimed for these
+statements by this ADR.
+
+What the derivation got wrong. "Targets and bars" took the `Declared Str
+build` column of the profile table less the `UTF-8 validation` column
+(45.7 less 20.6 on q23, 22.7% pooled) as the part D3 removes. The
+subtraction itself was right: the validation column already held all of
+the validation. The error was in what remained. Of the 25.1 points left
+on q23, D3 could only remove the per-cell overhead of the builder. On
+this corpus `URL` and `Title` are dictionary pages, so the pre-D3 build
+took the dictionary arm of `build_declared_str_columnar`
+(`crates/ravel-sql/src/logs_scan.rs` at `7e5ffb59a^`): once per
+dictionary entry per chunk, before the row loop (lines 6866 to 6872),
+`append_value` of the entry's text into a fresh values array; then per
+row, `plan.winning_idx(i)` (line 6878) and a key push into a second keys
+vector. The entry's text came from `StrDictText::entry` (lines 6305 to
+6309), which validated each entry once, lazily on its first read, through
+a `std::cell::OnceCell` and `cell_text` (lines 6273 to 6277). Read by
+leaf in the #2864 profile's control arm (the same tree minus the epic, 2
+repetitions pooled), the overhead is the winner selection (`winner_at`,
+5.1), the per-entry-per-chunk `append_value` (2.9, scaling with entries
+times chunks, not rows), the second keys vector (1.8) and the builder's
+own frame (1.5): 11.3 points on q23, and 10 to 12 on q21, q22 and q24. The
+rest of the column was the validation and the read and copy of each
+entry's bytes, the cost of the column, not an overhead. Those leaves are
+read in a `build_declared_str_columnar` frame of 37.9% inclusive, while
+the P1 table's `Declared Str build` column is a wider group (it also
+matches the cursor and dictionary-decode frames) at 45.7, so the build
+group is an exception to the 1-to-4-point agreement the control arm
+otherwise shows with the P1 table: on the table's basis the overhead
+scales to about 13.6 of the 25.1. The #2864 run's zstd share (18 to 20
+points) is likewise 2 to 3 above the table's 15.0 to 18.1; figures from
+the two runs are compared by group, not to the decimal.
+
+What landed. In the new tree the build frame is 13 to 17%: `winner_at`
+is not reached on these statements (their columns take the single
+matching branch of `build_str_block`, the function
+`build_declared_str_columnar` now delegates the block's build to,
+`crates/ravel-sql/src/logs_scan.rs` lines 7324 to 7332), the per-entry
+append and the second keys vector are gone, and the per-row predicate is
+0.2 to 0.4% (D2). The validation is
+unchanged at 8 to 20% of each statement and still once per dictionary
+entry; what moved is when it runs: eagerly, for every entry, when the
+block's `DictValues` is built from `decode_columns`
+(`crates/ravel-logseg/src/dict_values.rs`, `validate_entry`), instead of
+lazily on first read during the build, and the entry copy moved there
+with it (`decode_block` grew by 17.9 points on q23, of which 14.6 is the
+moved validation and the rest that copy); the shared values array and
+its cache (D3) add 4 to 5%. Net per statement in that run: q21 1.00,
+q22 1.00, q23 0.97, q24 0.95, a Set L sum of 0.98 for that run's own two
+repetitions; the T5 sweep's 0.993 above is the ratio of record. The leaf
+budget predicts a little more than that on q23: 11.3 removed plus about
+1.5 for D2, less 4.4 for the values array and cache, less about 3.3 for
+the eager copy, is about 0.95; the remaining 2 points sit inside the
+two runs' repetition spread (1.2%) and the basis difference above. The
+dominant phase on these statements is the decode of the long cells and
+their once-per-entry validation (zstd 15 to 20 points, validation 8 to
+20, the copy), which D1 to D3 do not touch and which this ADR's Rejected
+alternatives leave to a format-level validated flag.
+
+What moves Set L. A `LIKE '%literal%'` arm evaluated on the raw page bytes
+before the block's values are validated and built, so that only the
+surviving rows (15,911 of 99,997,497 on q21) pay the validation, the
+copy, the build and the `LIKE` kernel. That changes the pushed predicate
+language D2 holds fixed and makes D3's per-block values build lazy on
+that path, so it is its own decision: issue #2865, which sizes it at
+about 0.5 to 0.6 for Set L ahead of `DictValues` and about 0.8 behind
+it.

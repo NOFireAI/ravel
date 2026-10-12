@@ -177,6 +177,7 @@ async fn start_ingest_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: ravel_server::config::CpuGatePermits { read: 2, write: 2 },
+        max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),
         distrib: None,
@@ -217,10 +218,45 @@ fn write_gate_site(body: &str, site: &str) -> (u64, u64) {
     (figure("jobs_total"), figure("inline_total"))
 }
 
+/// The write gate's `(handoff, post-return)` summary counts for `site` on
+/// `/metrics`. Each `_count` and `_sum` sample must render exactly once under
+/// `{gate="write",site=...}`, and each sum must parse as seconds.
+fn write_gate_site_trip_counts(body: &str, site: &str) -> (u64, u64) {
+    let labels = format!("gate=\"write\",site=\"{site}\"}} ");
+    let sample = |name: &str| -> &str {
+        let prefix = format!("{name}{{");
+        let samples: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with(prefix.as_str()))
+            .filter_map(|line| line.split_once(labels.as_str()).map(|(_, value)| value))
+            .collect();
+        assert_eq!(
+            samples.len(),
+            1,
+            "{name}{{..{labels} must render once:\n{body}"
+        );
+        samples[0]
+    };
+    let count = |family: &str| {
+        let sum: f64 = sample(&format!("ravel_cpu_gate_{family}_seconds_sum"))
+            .parse()
+            .expect("summary sum is seconds");
+        assert!(sum >= 0.0, "{family} sum for {site} is {sum}");
+        sample(&format!("ravel_cpu_gate_{family}_seconds_count"))
+            .parse::<u64>()
+            .expect("summary count")
+    };
+    (count("handoff"), count("return"))
+}
+
 /// One gzip export and one Remote Write request are each one gated decode job
 /// at their own site, and the two strict writes flush in two flushes, each one
 /// gated `metrics_flush` job. Nothing at these sites runs inline: every unit is
 /// over the default floor.
+///
+/// Each of those jobs also lands once in its site's
+/// `ravel_cpu_gate_handoff_seconds` and `ravel_cpu_gate_return_seconds`
+/// summaries, read off the same scrape under `{gate, site}`.
 ///
 /// Fails with the write gate left off the gateway state, off the Remote Write
 /// state or off the metrics router: that site then reads `(0, 0)`, since its
@@ -288,6 +324,20 @@ async fn write_path_runs_on_the_servers_write_gate() {
         ((1, 0), (1, 0), (2, 0)),
         "(otlp_http_gzip, remote_write_snappy, metrics_flush) as (jobs, inline)"
     );
+
+    // The handoff and post-return amendment: every gated job above started and
+    // returned to a waiting caller, so each site's two trip summaries count it.
+    for (site, jobs) in [
+        ("otlp_http_gzip", 1),
+        ("remote_write_snappy", 1),
+        ("metrics_flush", 2),
+    ] {
+        assert_eq!(
+            write_gate_site_trip_counts(&body, site),
+            (jobs, jobs),
+            "{site} as (handoff_seconds_count, return_seconds_count)"
+        );
+    }
 
     running.shutdown().await.expect("server shuts down");
 }

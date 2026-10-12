@@ -27,11 +27,14 @@
 //!   the tenant on the stream's head and takes no permit (see
 //!   [`OTAP_ARROW_METRICS_PATH`]).
 //!
-//! Both leave an [`IngestPermitHeld`] marker and the resolved `TenantId` in
-//! the request's extensions. Every handler behind them takes its permit
-//! through [`admit_grpc_request`] and its tenant through
-//! [`grpc_request_tenant`] (gRPC), or reads the tenant out of an `Extension`
-//! (HTTP), so one request never charges the ceiling twice.
+//! Both leave an [`IngestPermitHeld`] marker carrying a clone of the
+//! permit's release handle, and the resolved `TenantId`, in the request's
+//! extensions. Every handler behind them takes its handle through
+//! [`admit_grpc_request`] and its tenant through [`grpc_request_tenant`]
+//! (gRPC), or reads both out of an `Extension` (HTTP), so one request never
+//! charges the ceiling twice. The handler releases the permit through its
+//! handle once its write is enqueued, before it waits for the strict ack
+//! (ADR-2793 decision 4).
 //!
 //! The ceiling itself, its `0`-means-unlimited spelling, and the shed counter
 //! are unchanged: this is an ordering fix, so a refusal here is the same
@@ -61,7 +64,7 @@ use tonic::Status;
 use tonic::body::Body as TonicBody;
 use tower::{Layer, Service};
 
-use crate::ingest_concurrency::{IngestConcurrencyController, IngestPermit};
+use crate::ingest_concurrency::{IngestConcurrencyController, IngestPermitHandle};
 
 /// The gRPC service path prefix every unary OTLP ingest service shares
 /// (`opentelemetry.proto.collector.{metrics,logs,trace}.v1`).
@@ -86,14 +89,16 @@ const OTAP_ARROW_METRICS_PATH: &str =
 /// a second permit from the same ceiling for the same request: that would
 /// halve the effective bound and double-count every shed.
 ///
-/// Deliberately a marker rather than the permit itself: extensions require
-/// `Clone`, and an `IngestPermit` moved into extensions would be released
-/// wherever those extensions are dropped (tonic's `Request::into_inner`
-/// drops them mid-handler), which is earlier than the work the permit is
-/// meant to bound. The permit instead lives in the layer's own future, whose
-/// lifetime is exactly the request's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IngestPermitHeld;
+/// Carries a clone of the permit's release handle, never the bare permit:
+/// extensions require `Clone`, and an `IngestPermit` moved into extensions
+/// would be released wherever those extensions are dropped (tonic's
+/// `Request::into_inner` drops them mid-handler), which is earlier than the
+/// work the permit is meant to bound. The layer holds a clone of the release
+/// handle for the request's lifetime, so dropping the extensions drops a
+/// clone, and the permit goes back only when the handler releases it or the
+/// request ends.
+#[derive(Debug, Clone)]
+pub struct IngestPermitHeld(pub IngestPermitHandle);
 
 /// How long an admitted ingest request may take to deliver its whole body,
 /// counted from the moment its head was admitted. A request that has not
@@ -232,19 +237,21 @@ pub trait IngestAdmissionState: Send + Sync + 'static {
 /// request that arrives over the ceiling is therefore shed (429) rather than
 /// rejected (401) even when its credentials are also bad.
 ///
-/// The permit is bound for the whole of `next.run(...)`, so it covers the
-/// body read, the decode, and the durable write, and its RAII drop returns
-/// the slot on every exit path including a client disconnect that cancels
-/// this future. The body read is bounded by [`INGEST_BODY_READ_TIMEOUT`]: a
-/// body still incomplete then fails the handler's body extractor, so the
-/// handler never runs, and the request is answered 503 with `Retry-After`.
+/// The permit is bound for the whole of `next.run(...)` unless the handler
+/// releases it first, so it covers the body read and the decode, and the
+/// layer's clone of its handle returns the slot on every exit path including
+/// a client disconnect that cancels this future. A handler releases it once
+/// its write is enqueued, so the strict ack wait holds no slot. The body read
+/// is bounded by [`INGEST_BODY_READ_TIMEOUT`]: a body still incomplete then
+/// fails the handler's body extractor, so the handler never runs, and the
+/// request is answered 503 with `Retry-After`.
 pub async fn admit_ingest_request<S: IngestAdmissionState>(
     State(state): State<Arc<S>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let _permit = match state.ingest_concurrency().try_admit() {
-        Ok(permit) => permit,
+    let permit = match state.ingest_concurrency().try_admit() {
+        Ok(permit) => IngestPermitHandle::new(permit),
         Err(_) => return crate::otlp_http::ingest_concurrency_shed_response(),
     };
 
@@ -260,33 +267,35 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
     let mut request =
         request.map(|body| axum::body::Body::new(DeadlineBody::new(body, expired.clone())));
     let extensions = request.extensions_mut();
-    extensions.insert(IngestPermitHeld);
+    extensions.insert(IngestPermitHeld(permit.clone()));
     extensions.insert(tenant);
     let response = next.run(request).await;
+    drop(permit);
     if expired.load(Ordering::SeqCst) {
         return body_timeout_response();
     }
     response
 }
 
-/// Takes the in-flight permit for a gRPC ingest request, unless
-/// [`GrpcIngestAdmissionLayer`] already took it for this request.
+/// The release handle for a gRPC ingest request's in-flight permit: a clone
+/// of the one [`GrpcIngestAdmissionLayer`] took for this request, or, on the
+/// direct-call path (a unit test that invokes a service method without the
+/// listener's layer stack), a fresh handle over a permit taken here, which
+/// the handler then owns alone. Read it before `request.into_inner()`.
 ///
-/// `Ok(None)` means the layer holds the permit and will release it when the
-/// request completes; the handler must not take another. `Ok(Some(permit))`
-/// is the direct-call path (a unit test that invokes a service method without
-/// the listener's layer stack), where the handler is the only thing that can
-/// take one.
+/// Either way the handler calls [`IngestPermitHandle::release`] once its
+/// write is enqueued; without that the permit goes back when the request
+/// ends.
 pub(crate) fn admit_grpc_request<T>(
     controller: &IngestConcurrencyController,
     request: &tonic::Request<T>,
-) -> Result<Option<IngestPermit>, Status> {
-    if request.extensions().get::<IngestPermitHeld>().is_some() {
-        return Ok(None);
+) -> Result<IngestPermitHandle, Status> {
+    if let Some(IngestPermitHeld(handle)) = request.extensions().get::<IngestPermitHeld>() {
+        return Ok(handle.clone());
     }
     controller
         .try_admit()
-        .map(Some)
+        .map(IngestPermitHandle::new)
         .map_err(|_| crate::otlp_grpc::ingest_concurrency_shed_status())
 }
 
@@ -419,7 +428,7 @@ where
         }
         let permit = if unary {
             match self.controller.try_admit() {
-                Ok(permit) => Some(permit),
+                Ok(permit) => Some(IngestPermitHandle::new(permit)),
                 Err(_) => {
                     let response = grpc_shed_response();
                     return Box::pin(async move { Ok(response) });
@@ -439,19 +448,22 @@ where
             }
         };
         parts.extensions.insert(tenant);
-        if !unary {
+        // Only a unary export took a permit; the OTAP stream passes on here.
+        let Some(permit) = permit else {
             return Box::pin(self.inner.call(http::Request::from_parts(parts, body)));
-        }
-        parts.extensions.insert(IngestPermitHeld);
+        };
+        parts.extensions.insert(IngestPermitHeld(permit.clone()));
         let expired = Arc::new(AtomicBool::new(false));
         let body = TonicBody::new(DeadlineBody::new(body, expired.clone()));
         let future = self.inner.call(http::Request::from_parts(parts, body));
         Box::pin(async move {
-            // Held for the whole inner call: the body read, tonic's decode,
-            // and the handler's durable write. Dropped when this future
-            // finishes or is cancelled.
-            let _permit = permit;
-            let response = future.await?;
+            // This clone keeps the permit through the body read and tonic's
+            // decode, and returns it when this future finishes or is
+            // cancelled if the handler never released it. The handler
+            // releases it through its own clone once its write is enqueued.
+            let response = future.await;
+            drop(permit);
+            let response = response?;
             // An expired body failed tonic's decode, so the handler never
             // ran; answer with the timeout rather than the decode error.
             if expired.load(Ordering::SeqCst) {
@@ -1161,17 +1173,19 @@ mod tests {
         let controller = IngestConcurrencyController::new(IngestConcurrencyLimit::Bounded(1));
 
         let mut marked = tonic::Request::new(());
-        marked.extensions_mut().insert(IngestPermitHeld);
-        let permit = admit_grpc_request(&controller, &marked).expect("marked request is admitted");
+        marked
+            .extensions_mut()
+            .insert(IngestPermitHeld(IngestPermitHandle::default()));
+        let handle = admit_grpc_request(&controller, &marked).expect("marked request is admitted");
         assert!(
-            permit.is_none(),
+            !handle.is_held(),
             "a request the layer admitted must not take a second permit"
         );
 
         let unmarked = tonic::Request::new(());
-        let permit =
+        let handle =
             admit_grpc_request(&controller, &unmarked).expect("the direct call takes a permit");
-        assert!(permit.is_some());
+        assert!(handle.is_held());
 
         let over = tonic::Request::new(());
         let status = admit_grpc_request(&controller, &over)

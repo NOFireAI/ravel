@@ -367,8 +367,8 @@ pub struct SpanIngestMetricsSnapshot {
     /// `held()`.
     pub pending_strict_acks: u64,
     /// Strict writes refused a pending-ack permit because
-    /// [`Self::pending_strict_acks`] was already at
-    /// `IngestConfig::max_pending_strict_acks`. Cumulative. Same populate-only-
+    /// [`Self::pending_strict_acks`] was already at the budget's ceiling (the
+    /// limit given to `PendingAckBudget::new`). Cumulative. Same populate-only-
     /// through-the-router caveat as `pending_strict_acks`.
     pub pending_ack_shed: u64,
 }

@@ -10,6 +10,7 @@
 # independently reviewed facts: regenerating docs/sql-conformance.md
 # cannot silently change what SQL a row runs (#408).
 #
+Aggregate	any_value	SELECT any_value(value) FROM samples
 Aggregate	approx_distinct	SELECT approx_distinct(value) FROM samples
 Aggregate	approx_median	SELECT approx_median(value) FROM samples
 Aggregate	approx_percentile_cont	SELECT approx_percentile_cont(value) FROM samples
@@ -92,7 +93,9 @@ Scalar function	current_date	SELECT current_date FROM samples
 Scalar function	current_time	SELECT current_time FROM samples
 Scalar function	current_timestamp	SELECT current_timestamp FROM samples
 Scalar function	encode	SELECT encode('a', 'hex') FROM samples LIMIT 1
+Scalar function	file_row_index	SELECT file_row_index() FROM samples
 Scalar function	has_word	SELECT count(*) FROM logs WHERE has_word(body, '1')
+Scalar function	input_file_name	SELECT input_file_name() FROM samples
 Scalar function	label	SELECT label(labels, '__name__') FROM samples WHERE value = 3.0
 Scalar function	label_match	SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')
 Scalar function	length	SELECT length('résumé') FROM samples LIMIT 1
