@@ -103,8 +103,9 @@ on the table:
   the mistake so it is not made twice).
 
 `crates/ravel-sql/src/minmax.rs`'s `is_float(data_type: &DataType) -> bool`
-(`minmax.rs:126-131`, checking `Float16`/`Float32`/`Float64`) already
-exists and already drives a real behavioral branch —
+(`minmax.rs:126-131`, checking `Float16`/`Float32`/`Float64`; since the
+dictionary amendment below it also answers for a dictionary's value type)
+already exists and already drives a real behavioral branch —
 `groups_accumulator_supported` (`minmax.rs:170-`) delegates to the fast
 native accumulator only for non-float input, forcing the slower
 total-order accumulator for float. It is a private `fn`; this ADR's
@@ -181,7 +182,8 @@ explained there.
        section). Their presence anywhere in the query, like a float
        `sum`/`min`/`max`, forces the single-partition plan.
      - Any `sum`/`min`/`max` over a `Float16`/`Float32`/`Float64`
-       (resolved) input: not exact.
+       (resolved) input, or a dictionary of one (see the dictionary
+       amendment below): not exact.
    - **Every `Aggregate` node's GROUP BY key expressions are also
      type-checked, independent of its aggregate expressions.** A
      `Float64` (or narrower float) group key is excluded even when
@@ -862,3 +864,30 @@ the other two parts: NaN payloads stay bit-significant as group keys
 (DataFusion keeps their bits), and no proof exists that DataFusion picks a
 merge-order-stable representative for a float group key under an arbitrary
 partition split. A float group key still disqualifies the query.
+
+## Amendment 2026-10-12 (issue #2901): a dictionary of a float is a float
+
+<!-- amendment-applies: sections="Context|Decision" pointer="dictionary amendment below" -->
+
+Decision 1 classifies a GROUP BY key, a DISTINCT key and a `sum`/`min`/`max`
+argument by asking `minmax::is_float` of its resolved type, and `is_float`
+matched `Float16`, `Float32` and `Float64` only. A `Dictionary(_, Float64)`
+would therefore have classified as non-float and been admitted to the
+repartitioned final. Since DataFusion 55.2 some scalar functions over a
+declared `Str` column return a dictionary-encoded result (`length()` returns
+`Dictionary(Int32, Int32)`, issue #2901), which makes the question live.
+
+`is_float` now looks through one `Dictionary(_, V)` and answers for `V`, so
+a dictionary-encoded float fails the classification closed at every caller:
+`aggregate_node_is_exact`, `distinct_node_is_exact`, the `sum`/`min`/`max`
+arm of `aggregate_expr_is_exact`, the spill predicates, and the bounded
+top-k check. A dictionary of strings or integers is still non-float.
+
+No statement is known to produce a dictionary-encoded float. Probed on main
+`099b0e845` over a declared `Str` column: `sqrt`, `ln`, float multiplication
+and division of `length(col)`, and `CAST(length(col) AS DOUBLE)`, each as a
+`sum`, `min` and `max` argument, a GROUP BY key and a `SELECT DISTINCT`, all
+resolve to a plain Float64 and keep the single-partition final. This
+amendment closes the case by construction; the unit test
+`is_float_sees_through_a_dictionary` in `crates/ravel-sql/src/minmax.rs`
+pins the predicate over constructed dictionary types.

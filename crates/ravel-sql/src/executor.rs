@@ -4767,8 +4767,8 @@ fn group_keys_are_non_float(aggregate: &Aggregate) -> bool {
 /// - `avg`/`mean` over a resolved `Int64` input: eligible. That is
 ///   `crate::avg`'s exact integer path, an `i128` numerator with checked
 ///   addition and an integer count (ADR-0825 decision 2); the analyzer coerces
-///   every admitted integer width to `Int64`, so a resolved `Int64` argument is
-///   the whole of that path.
+///   every admitted integer width, plain or dictionary-encoded, to `Int64`, so
+///   a resolved `Int64` argument is the whole of that path.
 ///
 /// Everything else is ineligible, including `sum` over a float (order-dependent
 /// IEEE addition), `avg` over a float (the same fold), `min`/`max` of any type,
@@ -4950,8 +4950,9 @@ fn aggregate_node_is_exact(aggregate: &Aggregate) -> bool {
 ///
 /// - `count(...)`/`count(DISTINCT ...)`: always exact, any input type.
 /// - `sum`/`min`/`max` over a resolved non-float input: exact.
-/// - `avg`/`mean` over any input, `sum`/`min`/`max` over a float input, and
-///   anything unexpected: never exact (fail closed).
+/// - `avg`/`mean` over a resolved `Int64` input: exact (ADR-0825 decision 3).
+/// - `avg`/`mean` over any other input, `sum`/`min`/`max` over a float input,
+///   and anything unexpected: not exact (fail closed).
 fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
     // `aggr_expr` entries are either an `AggregateFunction` or an `Alias`
     // wrapping one; unwrap a single alias layer.
@@ -4980,11 +4981,12 @@ fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
         // `avg`/`mean` over a resolved integer input runs exact i128
         // accumulation with checked addition (crate::avg, ADR-0825 decision
         // 2): the analyzer coerces the admitted integer types (Int8-Int64,
-        // UInt8-UInt32) to Int64, so a resolved Int64 argument's partial sum
-        // is exact regardless of partitioning or merge order. A Float64
-        // argument still runs the plain IEEE f64 fold (ADR-0094's original
-        // amendment for issue #771) and stays never exact: that partial sum
-        // is order-dependent. Any other resolved type (Decimal, Duration) is
+        // UInt8-UInt32, and a Dictionary of one of those; crate::avg's
+        // `is_admitted_integer` is the list) to Int64, so a resolved Int64
+        // argument's partial sum is exact regardless of partitioning or merge
+        // order. A Float64 argument still runs the plain IEEE f64 fold
+        // (ADR-0094's original amendment for issue #771) and is not exact:
+        // that partial sum is order-dependent. Any other resolved type (Decimal, Duration) is
         // unreachable on the v1 `samples` surface and fails closed.
         "avg" | "mean" => match aggregate_function.params.args.first() {
             Some(arg) => matches!(

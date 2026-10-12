@@ -22,9 +22,10 @@
 //!   against a reference running this identical algorithm; the summation is
 //!   naive, not Kahan (ADR-0022 decision 3), because compensation buys no
 //!   exactness against that reference.
-//! * **Admitted integer input** (`Int8`-`Int64`, `UInt8`-`UInt32`, coerced to
-//!   `Int64` by [`SequentialAvg::coerce_types`] rather than delegating up to
-//!   Float64): exact `i128` accumulation with checked addition, so the result
+//! * **Admitted integer input** (`Int8`-`Int64`, `UInt8`-`UInt32`, or a
+//!   `Dictionary` whose value type is one of those, coerced to `Int64` by
+//!   [`SequentialAvg::coerce_types`] rather than delegating up to Float64;
+//!   [`is_admitted_integer`] is the one list): exact `i128` accumulation with checked addition, so the result
 //!   is a function of the input multiset only, never of partitioning or merge
 //!   order (integer addition is associative and exact; no fold-order
 //!   dependence exists to pin). Partial state is `(Decimal128(38, 0) sum,
@@ -34,8 +35,9 @@
 //!   one IEEE division by the count. Return type stays Float64 either way
 //!   (ADR-0825).
 //!
-//! Any other input type (Decimal, Duration; unreachable on the v1 `samples`
-//! surface, whose only numeric column is Float64) delegates entirely to the
+//! Any other input type (Decimal, Duration, or a `Dictionary` whose value type
+//! is not an admitted integer; Decimal and Duration are unreachable on the v1
+//! `samples` surface, whose only numeric column is Float64) delegates to the
 //! wrapped built-in: metadata (name, aliases, return type) always delegates,
 //! and coercion delegates for every argument type this module does not own.
 //!
@@ -139,9 +141,17 @@ impl std::hash::Hash for SequentialAvg {
 /// Float64-widening coercion (ADR-0825 decision 2). `UInt64` is excluded: it
 /// does not fit `Int64` without narrowing, so it keeps the built-in's
 /// Float64-widening behavior.
+///
+/// A `Dictionary(_, V)` is admitted exactly when `V` is: a scalar function
+/// over a dictionary-encoded column (`length` of a declared `Str` column) can
+/// return a dictionary of integers, and its values are what the average folds.
 fn is_admitted_integer(data_type: &DataType) -> bool {
+    let value_type = match data_type {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
     matches!(
-        data_type,
+        value_type,
         DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -1303,5 +1313,134 @@ mod tests {
             150.0,
             "the surviving group's state must shift down, not be re-read at its old index"
         );
+    }
+
+    fn dictionary_of(value_type: DataType) -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type))
+    }
+
+    /// What the wrapped built-in's own coercion makes of `arg_type`.
+    fn builtin_coercion(arg_type: &DataType) -> Vec<DataType> {
+        let field: FieldRef = Arc::new(Field::new("avg_arg", arg_type.clone(), true));
+        fields_with_udf(&[field], avg_udaf().as_ref())
+            .expect("the built-in coerces this argument")
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect()
+    }
+
+    /// Issue #2901: `length` over a declared `Str` column can return
+    /// `Dictionary(Int32, Int32)`. Its values are admitted integers, so it is
+    /// admitted to `Int64` exactly as a plain `Int32` is.
+    #[test]
+    fn coerce_types_admits_a_dictionary_of_an_admitted_integer() {
+        let avg = SequentialAvg::new();
+        for value_type in [DataType::Int32, DataType::Int64, DataType::UInt32] {
+            let dictionary = dictionary_of(value_type.clone());
+            assert_eq!(
+                avg.coerce_types(std::slice::from_ref(&dictionary))
+                    .expect("coerces"),
+                vec![DataType::Int64],
+                "{dictionary} must be admitted to Int64 like a plain {value_type}"
+            );
+        }
+    }
+
+    /// A dictionary whose value type is not an admitted integer keeps the
+    /// built-in's coercion, so it never reaches the exact integer accumulator.
+    #[test]
+    fn coerce_types_delegates_a_dictionary_of_uint64() {
+        assert_dictionary_coerces_as_the_builtin(DataType::UInt64);
+    }
+
+    #[test]
+    fn coerce_types_delegates_a_dictionary_of_float64() {
+        assert_dictionary_coerces_as_the_builtin(DataType::Float64);
+    }
+
+    fn assert_dictionary_coerces_as_the_builtin(value_type: DataType) {
+        let dictionary = dictionary_of(value_type);
+        let builtin = builtin_coercion(&dictionary);
+        assert_ne!(
+            builtin,
+            vec![DataType::Int64],
+            "precondition: the built-in does not itself coerce {dictionary} to Int64"
+        );
+        assert_eq!(
+            SequentialAvg::new()
+                .coerce_types(std::slice::from_ref(&dictionary))
+                .expect("coerces"),
+            builtin,
+            "{dictionary} must coerce exactly as the built-in coerces it"
+        );
+    }
+
+    /// Fold `array` through the exact integer accumulator.
+    fn exact_integer_avg_bits(array: &ArrayRef) -> Option<u64> {
+        let mut acc = ExactIntegerAvgAccumulator::new();
+        acc.update_batch(std::slice::from_ref(array))
+            .expect("update_batch must not fail");
+        float64_bits(acc.output())
+    }
+
+    /// Fold `array` widened to Float64 through the IEEE accumulator, the path
+    /// a dictionary of integers took before it was admitted.
+    fn float_avg_bits(array: &ArrayRef) -> Option<u64> {
+        let floats = cast(array, &DataType::Float64).expect("casts to Float64");
+        let mut acc = SequentialAvgAccumulator::new();
+        acc.fold_values(&floats).expect("fold must not fail");
+        float64_bits(acc.output())
+    }
+
+    /// A `Dictionary(Int32, Int32)` argument, cast to the type `coerce_types`
+    /// picks, averages exactly whatever the row order. The values sum past
+    /// 2^53, where an f64 fold of the same rows depends on their order.
+    #[test]
+    fn dictionary_of_int32_averages_exactly_in_any_row_order() {
+        use datafusion::arrow::array::{DictionaryArray, Int32Array};
+        use datafusion::arrow::datatypes::Int32Type;
+
+        // Enough `i32::MAX` rows that their sum passes 2^53, and enough 1s that
+        // the ones an f64 fold drops past 2^53 still move the average.
+        let big_rows = (1usize << 22) + 8;
+        let ones = 1usize << 12;
+        let values = Arc::new(Int32Array::from(vec![i32::MAX, 1]));
+        let dictionary = |keys: Vec<i32>| -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), values.clone())
+                    .expect("valid dictionary"),
+            )
+        };
+        let mut ones_last = vec![0i32; big_rows];
+        ones_last.extend(vec![1i32; ones]);
+        let mut ones_first = vec![1i32; ones];
+        ones_first.extend(vec![0i32; big_rows]);
+        let ones_last = dictionary(ones_last);
+        let ones_first = dictionary(ones_first);
+
+        let target = SequentialAvg::new()
+            .coerce_types(&[ones_last.data_type().clone()])
+            .expect("coerces");
+        assert_eq!(target, vec![DataType::Int64]);
+        assert_eq!(avg_kind(&target[0]), AvgKind::Integer);
+
+        let rows = (big_rows + ones) as i128;
+        let exact_sum = i128::from(i32::MAX) * big_rows as i128 + ones as i128;
+        let expected = Some((exact_sum as f64 / rows as f64).to_bits());
+
+        assert_ne!(
+            float_avg_bits(&ones_last),
+            float_avg_bits(&ones_first),
+            "precondition: an f64 fold of these rows depends on their order"
+        );
+        for (order, array) in [("ones last", &ones_last), ("ones first", &ones_first)] {
+            let coerced =
+                cast(array, &target[0]).expect("a Dictionary(Int32, Int32) casts to Int64");
+            assert_eq!(
+                exact_integer_avg_bits(&coerced),
+                expected,
+                "{order}: the exact integer avg is the exact sum over the count"
+            );
+        }
     }
 }

@@ -36,7 +36,8 @@
 //! cross-partition merge of the partial sum order-dependent.
 //!
 //! ADR-0825 revisits that rejection for the integer case specifically: `avg`
-//! over a resolved integer argument (`Int8`-`Int64`, `UInt8`-`UInt32`) now
+//! over a resolved integer argument (`Int8`-`Int64`, `UInt8`-`UInt32`, or a
+//! `Dictionary` of one of those, see `exact_typed_classification_q29.rs`) now
 //! stays `Int64` through the analyzed plan (crate::avg's `coerce_types`) and
 //! accumulates in `i128` with checked addition, so its partial state really
 //! is the exact `(Decimal128(38, 0) sum, Int64 count)` pair #771 wanted, and
