@@ -5,7 +5,9 @@
 //! contain `*` wildcards; neither lexes like an expression. The lexer
 //! therefore tracks which command it is inside: the first word after the
 //! start of the statement or after a `|` selects the mode for the rest of
-//! that command, and `METADATA` ends the source list of a `FROM`.
+//! that command, and `METADATA` ends the source list of a `FROM`. A source
+//! name is expected first and after each comma, so a source named `metadata`
+//! in either place lexes as a source, not as that keyword.
 //!
 //! Whitespace, `//` line comments and `/* */` block comments (which nest)
 //! separate tokens and produce none. Keywords are not distinguished here: a
@@ -114,7 +116,7 @@ pub fn tokenize(source: &str, limits: &Limits) -> Result<Vec<Token>, Error> {
             return Ok(tokens);
         }
         let token = match lexer.mode {
-            Mode::Source => lexer.source_token()?,
+            Mode::SourceStart | Mode::Source => lexer.source_token()?,
             Mode::Pattern => lexer.pattern_token()?,
             Mode::CommandStart | Mode::Expression => lexer.expression_token()?,
         };
@@ -134,6 +136,8 @@ pub fn tokenize(source: &str, limits: &Limits) -> Result<Vec<Token>, Error> {
 enum Mode {
     CommandStart,
     Expression,
+    /// A source name is expected: after `FROM` or a comma in its source list.
+    SourceStart,
     Source,
     Pattern,
 }
@@ -168,7 +172,7 @@ impl<'a> Lexer<'a> {
             (Mode::CommandStart, TokenKind::Word) => {
                 let word = self.text(token.span.start, token.span.end);
                 if word.eq_ignore_ascii_case("FROM") {
-                    Mode::Source
+                    Mode::SourceStart
                 } else if word.eq_ignore_ascii_case("KEEP") || word.eq_ignore_ascii_case("DROP") {
                     Mode::Pattern
                 } else {
@@ -176,6 +180,8 @@ impl<'a> Lexer<'a> {
                 }
             }
             (Mode::CommandStart, _) => Mode::Expression,
+            (Mode::SourceStart, _) => Mode::Source,
+            (Mode::Source, TokenKind::Comma) => Mode::SourceStart,
             // Only METADATA lexes as a word in source mode.
             (Mode::Source, TokenKind::Word) => Mode::Expression,
             (mode, _) => mode,
@@ -296,7 +302,9 @@ impl<'a> Lexer<'a> {
                 while self.byte(0).is_some_and(is_source_byte) {
                     self.pos += 1;
                 }
-                let kind = if self.text(start, self.pos).eq_ignore_ascii_case("METADATA") {
+                let kind = if self.mode == Mode::Source
+                    && self.text(start, self.pos).eq_ignore_ascii_case("METADATA")
+                {
                     TokenKind::Word
                 } else {
                     TokenKind::SourcePattern

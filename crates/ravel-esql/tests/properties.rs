@@ -421,9 +421,12 @@ fn field(named: bool) -> impl Strategy<Value = Field> {
 
 fn source_command() -> impl Strategy<Value = Command> {
     let source = prop_oneof![
-        "[a-z*][a-z0-9_.*:-]{0,8}"
-            .prop_filter("METADATA", |s| !s.eq_ignore_ascii_case("metadata"))
-            .prop_map(|text| SourcePattern {
+        prop_oneof![
+            "[a-z*][a-z0-9_.*:-]{0,8}",
+            Just("metadata".to_owned()),
+            Just("METADATA".to_owned()),
+        ]
+        .prop_map(|text| SourcePattern {
                 text,
                 quoted: false,
                 span: NO_SPAN,

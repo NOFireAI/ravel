@@ -10,7 +10,7 @@ use ravel_esql::ast::{
     Parameter, QualifiedName, Query, RenameCommand, RenamePair, RowCommand, SortCommand, SortKey,
     SortOrder, SourcePattern, StatsCommand, Unary, UnaryOp, WhereCommand,
 };
-use ravel_esql::{Limits, Span, parse, print};
+use ravel_esql::{Error, Limits, Span, parse, print};
 
 const NO_SPAN: Span = Span::new(0, 0);
 
@@ -524,6 +524,37 @@ fn from_command_forms() {
         slice(source, f.metadata.as_ref().expect("metadata").span),
         "metadata _index, _id"
     );
+}
+
+#[test]
+fn a_source_named_metadata_is_a_source() {
+    assert_tree("FROM metadata", &query(from(&["metadata"], &[]), vec![]));
+    assert_tree(
+        "FROM metadata METADATA _index",
+        &query(from(&["metadata"], &["_index"]), vec![]),
+    );
+    assert_tree(
+        "FROM a, METADATA metadata _id",
+        &query(from(&["a", "METADATA"], &["_id"]), vec![]),
+    );
+    let quoted = query(
+        Command::From(FromCommand {
+            sources: vec![SourcePattern {
+                text: "metadata".into(),
+                quoted: true,
+                span: NO_SPAN,
+            }],
+            metadata: None,
+            span: NO_SPAN,
+        }),
+        vec![],
+    );
+    assert_tree("FROM \"metadata\"", &quoted);
+    // After a source name, the keyword still starts the metadata list.
+    assert!(matches!(
+        parse("FROM metadata METADATA", &Limits::default()),
+        Err(Error::UnexpectedToken { .. })
+    ));
 }
 
 #[test]
