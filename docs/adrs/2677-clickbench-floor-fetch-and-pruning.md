@@ -685,7 +685,9 @@ This is the loopback re-scope amendment. Decision 7 no longer derives
 `store_get_concurrency` from host memory. On the c6a.2xlarge (16 GB) lever
 run, the memory-derived permit count bought no cold gain and cost QPS and
 concurrent errors, and `latency-first` carried all of the cold gain (#2683
-comment 6114054762). `store_get_concurrency` keeps its core-derived default
+comment 6114054762). The same run measured `latency-first` alone at a pooled
+error ratio of 0.459 against 0.349, 0.110 worse; the smaller cache carve
+below is what offsets it. `store_get_concurrency` keeps its core-derived default
 (ADR-1195), and an explicit `--store-get-concurrency` still wins.
 
 T5 is now two loopback defaults, both scoped to a `--store s3` deployment
@@ -693,7 +695,8 @@ whose `--s3-endpoint` is loopback, and both recorded as amendments to
 ADR-2023:
 
 - with `--logs-fetch-policy` unset the policy resolves `latency-first`,
-  source `default-loopback`, which is what decision 7 already said;
+  source `default-loopback`. Decision 7 named the policy; the
+  `default-loopback` source is new with this amendment;
 - the fetch cache's loopback share, ADR-2023 decision 3, drops from 40% to
   24% of `memory_budget_bytes`.
 
@@ -716,8 +719,15 @@ carve meets it by itself (0.029), so the baseline condition is met by T5's
 own change rather than ahead of it; the combined arm read 0.040. 60% of the
 concurrent refusals on stock main are the process budget filling (#2044
 comment 6114049172), which a smaller carve relieves. These are single runs
-per arm, not decision 8's three paired phases. The 16 GB confirmation is
-pending, #2683 comment 6115323679.
+per arm, not decision 8's three paired phases.
+
+The 16 GB confirmation passed (#2683 comment 6116274802, requested in
+comment 6115323679). Against stock, the 24% share with `latency-first` read
+a pooled error ratio of 0.259 against 0.282, 0.313 QPS against 0.310, and a
+cold sum of 357.0 s against 453.1 s, and it refused no statement that stock
+answers. Its minimum `MemAvailable` was 0.11 GB, and it spent several times
+stock's time below the host memory gate's floor, so the margin at 16 GB is
+thinner than at 32 GB.
 
 `latency-first` on the loopback default runs at the core-derived permit
 count, not at the 256 of #1196's measurement, so its flag-doc precondition

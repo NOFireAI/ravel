@@ -297,6 +297,13 @@ the 40% share on this corpus; 60% of the concurrent refusals on stock main
 are the process budget filling (issue #2044 comment 6114049172), which is
 what a smaller carve relieves. `latency-first` cut the cold sum by 23% and
 raised QPS on both cache sizes. Decision 4's error-ratio bar, 0.058, is met
-by the carve alone (0.029); the combined arm read 0.040, also under it. The
-confirmation on a 16 GB box is pending, #2683 comment 6115323679.
+by the carve alone (0.029); the combined arm read 0.040, also under it.
+
+The confirmation on a 16 GB box passed (#2683 comment 6116274802, requested
+in comment 6115323679). Against stock, the 24% share with `latency-first`
+read a pooled error ratio of 0.259 against 0.282, 0.313 QPS against 0.310,
+and a cold sum of 357.0 s against 453.1 s, and it refused no statement that
+stock answers. Its minimum `MemAvailable` was 0.11 GB, and it spent several
+times stock's time below the host memory gate's floor, so the margin at
+16 GB is thinner than at 32 GB.
 
