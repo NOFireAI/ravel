@@ -570,6 +570,7 @@ pub fn build_sql_state(
         process_memory_budget,
         None,
         None,
+        false,
         ravel_sql::DEFAULT_MIN_GRACE_MS,
         &SqlSpillInputs::default(),
     )
@@ -1057,6 +1058,9 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// `read_gate` is the process's ADR-1702 read CPU gate, attached to the logs
 /// and spans fetchers so the `logs` and `spans` scans decode their blocks on
 /// it (decision 7). [`build_sql_state`] attaches none and decodes inline.
+/// `scan_decode_inline` (`--sql-scan-decode-inline`, issue #2795) keeps the
+/// gate off the logs and spans fetchers only, so those two scans decode
+/// inline while the `samples` scan's catalog decodes stay on the gate.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -1077,6 +1081,7 @@ pub fn build_sql_state_with_parquet(
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
+    scan_decode_inline: bool,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -1113,6 +1118,7 @@ pub fn build_sql_state_with_parquet(
         process_memory_budget,
         Some(sources),
         Some(read_gate),
+        scan_decode_inline,
         ddl_min_grace_ms,
         spill,
     )
@@ -1136,6 +1142,7 @@ fn build_sql_state_inner(
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet: Option<ravel_sql::ParquetSources>,
     read_gate: Option<Arc<ravel_cpu_gate::ReadGate>>,
+    scan_decode_inline: bool,
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
@@ -1238,10 +1245,14 @@ fn build_sql_state_inner(
     // ADR-1702 decision 7: the `logs` and `spans` scans decode each block on
     // the read gate the fetcher carries, and the logs fetcher's opens run on
     // it too. The `samples` scan's RSEG catalog decodes run on it as well.
+    // `--sql-scan-decode-inline` leaves it off the logs and spans fetchers
+    // only, so those scans decode inline (issue #2795).
     if let Some(gate) = read_gate {
         metrics_fetcher = metrics_fetcher.with_read_gate(gate.clone());
-        logs_fetcher = logs_fetcher.with_read_gate(gate.clone());
-        span_fetcher = span_fetcher.with_read_gate(gate);
+        if !scan_decode_inline {
+            logs_fetcher = logs_fetcher.with_read_gate(gate.clone());
+            span_fetcher = span_fetcher.with_read_gate(gate);
+        }
     }
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
@@ -2430,6 +2441,7 @@ mod tests {
             7_000,
             &SqlSpillInputs::default(),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -2484,6 +2496,7 @@ mod tests {
             expected_ms,
             &SqlSpillInputs::default(),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
@@ -2613,6 +2626,7 @@ mod tests {
                 ravel_sql::DEFAULT_MIN_GRACE_MS,
                 &SqlSpillInputs::default(),
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
+                false,
             )
             .expect("sql state builds")
         };
@@ -3331,6 +3345,7 @@ mod tests {
             ravel_sql::DEFAULT_MIN_GRACE_MS,
             inputs,
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
         )
         .expect("sql state builds");
         state.executor.config().spill.clone()
