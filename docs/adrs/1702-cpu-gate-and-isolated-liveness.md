@@ -186,7 +186,9 @@ rule on thread placement.
 7. **The logs and spans scans get a decode state.** Their decode runs
    inside `poll_next`, so a wrap in place is not possible. Each scan's state
    machine gains a state that holds the pending gate future for one block.
-   `poll_next` returns `Pending` while the block decodes.
+   `poll_next` returns `Pending` while the block decodes. (Given an opt-out
+   flag by the scan-decode opt-out amendment below; the default is
+   unchanged.)
 
 8. **Liveness and readiness get their own listener on their own thread.**
    A new flag `--listen-health <addr>` binds a listener served by a
@@ -852,3 +854,23 @@ Both read the gate's injected monotonic clock. What each excludes:
 
 The counters are per-site atomics in the gate, beside the job and inline
 counts: no lock and no extra allocation per job.
+
+## Amendment (2026-10-12): the scan-decode opt-out amendment (issue #2795)
+
+<!-- amendment-applies: sections="Decision" pointer="scan-decode opt-out amendment" -->
+
+Decision 7 puts the SQL `logs` and `spans` scans' block decode on the read
+gate, which follow-up task 8 implemented. Issue #2795 is a +14% hot regression
+on ClickBench logs aggregates that the task 8 change introduced, and it holds
+the v0.24 release. To let one binary serve both arms of a paired-box A/B,
+`ravel-server` gains `--sql-scan-decode-inline` (env
+`RAVEL_SQL_SCAN_DECODE_INLINE`). When set, the server attaches no read gate to
+the SQL logs and spans fetchers, so those two scans decode each block on the
+tokio worker polling them, as before task 8, and the `log_block` and
+`span_block` sites count nothing for SQL scans. The catalog, PromQL,
+maintenance and SQL `samples` gate sites keep the gate.
+
+The default is unchanged: with the flag unset, decision 7 stands as written.
+The flag exists to measure the gate's cost against its liveness benefit.
+Setting it gives up the isolation decision 7 gives scans: a scan over a large
+part holds a worker for the length of each block's decompress.

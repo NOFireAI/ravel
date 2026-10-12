@@ -3304,6 +3304,16 @@ pub async fn start_with_heartbeat(
                 &maintain_worker.process_id().to_string(),
             )?;
             sql_spill_owner = sql_spill.owner;
+            let scan_decode_inline = config.query_budgets.sql_scan_decode_inline;
+            tracing::info!(
+                sql_scan_decode_inline = scan_decode_inline,
+                "SQL logs and spans scans decode blocks {}",
+                if scan_decode_inline {
+                    "inline on the polling worker"
+                } else {
+                    "on the read CPU gate"
+                }
+            );
             let state = query::build_sql_state_with_parquet(
                 catalog.clone(),
                 store.clone(),
@@ -3336,8 +3346,10 @@ pub async fn start_with_heartbeat(
                 ddl_min_grace_ms,
                 &sql_spill.inputs,
                 // ADR-1702 decision 7: the `logs` and `spans` scans decode on
-                // the same read gate the catalog resolve runs on.
+                // the same read gate the catalog resolve runs on, unless
+                // `--sql-scan-decode-inline` keeps it off those two scans.
                 cpu_gates.read.clone(),
+                scan_decode_inline,
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).

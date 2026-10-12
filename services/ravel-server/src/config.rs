@@ -1458,6 +1458,19 @@ pub struct Cli {
     )]
     pub sql_parallel_final_aggregation: bool,
 
+    /// Decode the SQL `logs` and `spans` scans' blocks on the tokio worker
+    /// polling the scan instead of on the read CPU gate, the behaviour before
+    /// ADR-1702 follow-up task 8. The catalog, PromQL and maintenance read gate
+    /// sites are unaffected, and so is the `samples` scan's RSEG catalog
+    /// decode. Off by default. The flag exists to measure the gate's cost
+    /// against its liveness benefit (issue #2795), and setting it gives up the
+    /// isolation ADR-1702 decision 7 gives scans: a scan over a large part
+    /// holds a worker for each block's decompress. The mode is logged at
+    /// startup. Meaningful only in a build with the `sql` feature; inert
+    /// otherwise.
+    #[arg(long, env = "RAVEL_SQL_SCAN_DECODE_INLINE")]
+    pub sql_scan_decode_inline: bool,
+
     /// Bounded ephemeral SQL spill (ADR-0954, amended by issue #2416). `auto`
     /// (default) spills an exactness-eligible query that exceeds its memory
     /// pool to the first configured source: the
@@ -2941,6 +2954,10 @@ pub struct QueryBudgets {
     /// `--sql-parallel-final-aggregation=false` opt-out restores the
     /// single-partition final.
     pub sql_parallel_final_aggregation: bool,
+    /// `--sql-scan-decode-inline`: the SQL `logs` and `spans` scans decode
+    /// their blocks inline rather than on the read CPU gate (issue #2795).
+    /// Reaches [`crate::query::build_sql_state_with_parquet`]. Default `false`.
+    pub sql_scan_decode_inline: bool,
     /// The operator's explicit `--logs-block-range-threshold`, or `None` when
     /// the flag was not set (ADR-0107). Feeds the ADR-0996 resolution as both
     /// the configured value (`None` meaning
@@ -2996,6 +3013,7 @@ impl Default for QueryBudgets {
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
+            sql_scan_decode_inline: false,
             logs_block_range_threshold: None,
             logs_request_cost_bytes: None,
             logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
@@ -6407,6 +6425,7 @@ impl Cli {
             sql_max_query_bytes: resolved.sql_max_query_bytes,
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
+            sql_scan_decode_inline: self.sql_scan_decode_inline,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
             logs_fetch_policy: logs_fetch_policy.policy(),
@@ -13816,6 +13835,41 @@ mod tests {
         assert_eq!(
             write_only.resolve_cpu_gate_permits(host),
             CpuGatePermits { read: 7, write: 9 }
+        );
+    }
+
+    /// Issue #2795: `--sql-scan-decode-inline` is off unless set, reads
+    /// `RAVEL_SQL_SCAN_DECODE_INLINE`, and reaches the resolved budgets.
+    #[test]
+    fn sql_scan_decode_inline_defaults_off_and_reaches_the_budgets() {
+        use clap::CommandFactory;
+
+        let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
+        assert!(!unset.sql_scan_decode_inline);
+        assert!(
+            !unset
+                .query_budgets(&resolved_from(&unset))
+                .expect("budgets resolve")
+                .sql_scan_decode_inline
+        );
+        assert!(!QueryBudgets::default().sql_scan_decode_inline);
+
+        let set =
+            Cli::try_parse_from(["ravel-server", "--sql-scan-decode-inline"]).expect("parses");
+        assert!(
+            set.query_budgets(&resolved_from(&set))
+                .expect("budgets resolve")
+                .sql_scan_decode_inline
+        );
+
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some("sql-scan-decode-inline"))
+            .expect("the flag is registered");
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("RAVEL_SQL_SCAN_DECODE_INLINE")
         );
     }
 
