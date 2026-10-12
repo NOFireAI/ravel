@@ -183,12 +183,12 @@ fn main_chunk_charge() -> usize {
 }
 
 /// Per block, after the block's first batch is handed out, the pool carries
-/// the block's decoded bytes, its two batches, and the group's values. Less
-/// the decoded bytes, that is the group's values once plus two chunks' keys:
-/// 217,560 bytes, under main's 361,008 (each of two chunks charged a fresh
-/// narrowed dictionary) and under the 434,832 a per-batch
-/// `get_array_memory_size` charges (the whole values array and the whole
-/// block's key buffer, twice).
+/// the block's two batches and the group's values, and nothing for the
+/// decoded block, which the block's job freed, with its charge, before
+/// returning. That is the group's values once plus two chunks' keys: 217,560
+/// bytes, under main's 361,008 (each of two chunks charged a fresh narrowed
+/// dictionary) and under the 434,832 a per-batch `get_array_memory_size`
+/// charges (the whole values array and the whole block's key buffer, twice).
 ///
 /// The three figures, from `get_array_memory_size` (buffer capacities plus the
 /// array structs):
@@ -211,7 +211,9 @@ fn main_chunk_charge() -> usize {
 /// charge, so the drop releases only `K`.
 ///
 /// Flipped: charging `get_array_memory_size` per batch in `hold_batches`, and
-/// slicing the block's keys rather than copying a chunk's, reads 434,832.
+/// slicing the block's keys rather than copying a chunk's, reads 434,832;
+/// leaving the decoded block held and charged until the next decode reads
+/// 217,560 plus the block's decoded bytes.
 #[tokio::test]
 async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
     let t = tenant();
@@ -270,8 +272,7 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
     while let Some(batch) = stream.next().await {
         let batch = batch.expect("batch");
         if batches.len().is_multiple_of(2) {
-            let block = batches.len() / 2;
-            charged.push(pool.reserved() - decoded[block]);
+            charged.push(pool.reserved());
         }
         batches.push(batch);
     }
@@ -334,7 +335,11 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
         "K"
     );
     assert!(after <= main, "no more than main's narrowed dictionaries");
-    assert_eq!(charged, vec![after; BLOCKS], "each block's charge");
+    assert_eq!(
+        charged,
+        vec![after; BLOCKS],
+        "each block's charge, with nothing in it for the decoded block"
+    );
     assert_eq!(
         exhausted, keys_bytes,
         "exhausted, before the drop: the last batch's keys and no values"
@@ -433,13 +438,14 @@ fn region_texts(batches: &[RecordBatch], column: usize) -> Vec<Option<String>> {
 /// over the fixture completes on the columnar path and returns the rows the
 /// row path returns (`SELECT region, attrs FROM logs`, which projects the
 /// `attrs` map and so drains the row path), every record's own value. Its
-/// peak is 668,172 bytes.
+/// peak is 602,348 bytes.
 ///
 /// Flipped: with the per-batch charge (`get_array_memory_size` summed in
 /// `hold_batches`, block keys sliced rather than copied) the same statement
-/// peaks at 1,069,948 bytes unbounded and is refused with `ResourcesExhausted`
-/// under the ceiling.
-const CEILING: usize = 850_000;
+/// peaks at 652,248 bytes unbounded and is refused with `ResourcesExhausted`
+/// under the ceiling. So is the statement with each decoded block left held
+/// and charged until the next block's decode.
+const CEILING: usize = 625_000;
 
 #[tokio::test]
 async fn a_statement_the_per_batch_charge_refused_fits_the_ceiling() {
@@ -458,7 +464,7 @@ async fn a_statement_the_per_batch_charge_refused_fits_the_ceiling() {
         Err(e) => panic!("query failed: {e:?}"),
     };
     let peak = columnar.accounting.peak_intermediate_bytes;
-    assert_eq!(peak, 668_172, "the statement's peak under the fixed charge");
+    assert_eq!(peak, 602_348, "the statement's peak under the fixed charge");
 
     let rows = executor(&store, SqlConfig::default().max_query_bytes)
         .execute(t.hash(), &request("SELECT region, attrs FROM logs"))

@@ -1,10 +1,12 @@
-//! ADR-1702 decision 6 on the gated `logs` columnar scan: the decoded block
-//! the reader still holds stays charged to the query's pool while the next
-//! block's job waits for a permit, and until that job's decode frees it.
+//! ADR-1702 decision 6 on the gated `logs` columnar scan, as the
+//! decoded-state release amendment refines it: a block's job frees the block's
+//! decoded columns, and releases their charge, before it returns, so while the
+//! next block's job waits for a permit the scan holds, and the query's pool
+//! carries, only the batch handed out last.
 //!
 //! The park sits at the entry of the fetcher's `decode` span inside the
-//! second block's gate job: after the job holds its permit and before the
-//! reader frees the first block. The binary holds this one test because
+//! second block's gate job: after the job holds its permit and before its
+//! decode runs. The binary holds this one test because
 //! `tracing` caches a callsite's interest process-wide, so a test in the same
 //! process reaching the `decode` callsite with no subscriber could leave the
 //! span disabled and the probe blind.
@@ -200,7 +202,7 @@ fn task_ctx(pool: &Arc<UnboundedMemoryPool>) -> Arc<TaskContext> {
 /// Parks the block decode the `log_block` job numbered `target` runs, at the
 /// entry of its `decode` span: the first such entry off the runtime thread
 /// once the gate has dispatched `target` block jobs is inside that job, with
-/// its permit held and the reader not yet moved off the previous block.
+/// its permit held and its decode not yet run.
 struct DecodeProbe {
     park: ParkOnFirstArmedCall,
     gate: Arc<ReadGate>,
@@ -225,20 +227,19 @@ where
     }
 }
 
-/// With block 1 drained and block 2's job first queued behind a held permit,
-/// then holding the permit and parked before its decode, the pool still
-/// carries block 1's decoded bytes on top of the batch handed out last:
-/// exactly `batch 1 + BLOCK_DECODED_BYTES` both times. Released, the scan's
-/// output equals the ungated run's batch for batch, at the end of the stream
-/// only the last emitted batch is charged, and dropping the stream returns
-/// the pool to 0.
+/// With block 1 drained, then block 2's job queued behind a held permit, then
+/// holding the permit and parked before its decode, the pool carries the
+/// batch handed out last and nothing for block 1's decoded block
+/// ([`BLOCK_DECODED_BYTES`]), which block 1's job freed: exactly `batch 1`
+/// all three times. Released, the scan's output equals the ungated run's batch
+/// for batch, at the end of the stream only the last emitted batch is
+/// charged, and dropping the stream returns the pool to 0.
 ///
-/// Fails against releasing the block's charge when its batches drain, before
-/// the next job is submitted (the queued check reads the batch alone, 104
-/// bytes of 280), and against releasing it once the job holds its permit but
-/// before the decode runs (the queued check passes, the parked one reads 104).
+/// Fails against leaving each decoded block held, and charged, until the next
+/// block's decode frees it: the first check then reads 280 bytes, the
+/// batch's 104 plus the block's 176.
 #[test]
-fn columnar_block_charge_is_held_while_the_next_decode_waits_for_a_permit() {
+fn no_decoded_block_is_charged_while_the_next_decode_waits_for_a_permit() {
     run_with_watchdog(
         WATCHDOG,
         || format!("test hung for {WATCHDOG:?}"),
@@ -280,8 +281,8 @@ fn columnar_block_charge_is_held_while_the_next_decode_waits_for_a_permit() {
                 let batch_bytes = first.get_array_memory_size();
                 assert_eq!(
                     pool.reserved(),
-                    batch_bytes + block_bytes,
-                    "block 1 drained: its batch and its decoded block"
+                    batch_bytes,
+                    "block 1 drained: its batch, and not its freed decoded block"
                 );
 
                 // Something else holds the only permit.
@@ -310,8 +311,8 @@ fn columnar_block_charge_is_held_while_the_next_decode_waits_for_a_permit() {
                 assert_eq!(log_block_jobs(&gate), 1, "block 2's job has no permit yet");
                 assert_eq!(
                     pool.reserved(),
-                    batch_bytes + block_bytes,
-                    "block 2's job queued for a permit: block 1 is still charged"
+                    batch_bytes,
+                    "block 2's job queued for a permit: block 1 is not charged"
                 );
 
                 unblock_tx.send(()).expect("release the blocker");
@@ -324,8 +325,8 @@ fn columnar_block_charge_is_held_while_the_next_decode_waits_for_a_permit() {
                 assert_eq!(gate.running(), 1, "the parked job holds the permit");
                 assert_eq!(
                     pool.reserved(),
-                    batch_bytes + block_bytes,
-                    "block 2's job holds its permit, decode not run: block 1 is still charged"
+                    batch_bytes,
+                    "block 2's job holds its permit, decode not run: block 1 is not charged"
                 );
 
                 release_tx.send(()).expect("release the parked decode");

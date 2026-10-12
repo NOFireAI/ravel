@@ -186,7 +186,9 @@ rule on thread placement.
 7. **The logs and spans scans get a decode state.** Their decode runs
    inside `poll_next`, so a wrap in place is not possible. Each scan's state
    machine gains a state that holds the pending gate future for one block.
-   `poll_next` returns `Pending` while the block decodes.
+   `poll_next` returns `Pending` while the block decodes. (Refined by the
+   decoded-state release amendment below: a block job frees the decoded
+   block it built before it returns.)
 
 8. **Liveness and readiness get their own listener on their own thread.**
    A new flag `--listen-health <addr>` binds a listener served by a
@@ -852,3 +854,48 @@ Both read the gate's injected monotonic clock. What each excludes:
 
 The counters are per-site atomics in the gate, beside the job and inline
 counts: no lock and no extra allocation per job.
+
+## Amendment (2026-10-12): the decoded-state release amendment (issue #2795)
+
+<!-- amendment-applies: sections="Decision" pointer="decoded-state release amendment" -->
+
+A gate job frees the decoded state it built before it returns, on the thread
+that built it, unless that state is the job's output. Decision 7 moved the
+logs scan's columnar block decode and Arrow build into one `log_block` job, but
+the scan cursor kept the block's decoded columns after the job returned. They
+were freed only at the start of the next block's decode, in the next job, which
+can run on another blocking thread, or on the runtime worker when the scan was
+dropped at the end of a segment. A decoded block holds one heap allocation per
+present cell of each plain-encoded string and fixed-width column, up to 8192
+per such column at the default block target, and each of those frees could
+land on a thread other than the one that made them. #2795 traces its
++14% hot regression on the ClickBench logs aggregates to that free. The
+`cpu_gate_round_trip` microbench posted on #2795, run at 9a9dbaee2 on a fresh
+c6a.4xlarge, priced freeing such a result on a thread other than the one that
+built it at 108 to 328 us more per job than freeing it on the building thread,
+growing with the allocation count, against about 19 us for the gate dispatch
+itself. A flat buffer cost nothing either way.
+
+So `ColumnarBlockJob::run` (`crates/ravel-sql/src/logs_scan.rs`) ends by
+calling `release_decoded`, which calls `LogSegmentScan::release_decoded_block`
+to drop the block and its surviving-row list, and then releases the block's
+`resident` charge, in that order: the charge is sized to the block when its decode returns and is never
+released before the block is freed. The job hands the scan back holding no
+decoded block and an empty charge. The inline path runs the same function. The
+batches the job returns are copies; they do not borrow the block.
+
+Two drains still move many-allocation state across the job boundary, because
+that state is the job's output rather than state it left behind:
+
+- The logs row path (`LogSegmentScan::next_block_on_gate`) frees its decoded
+  block inside the job, but returns the block's `Vec<LogRecord>`, which the
+  stream frees on the runtime worker once its batches are emitted. Freeing it in
+  the job would mean building the row path's batches in the job too, as the
+  columnar path does.
+- The spans columnar drain (`SpanColumnarScan::next_block_on_gate`) returns
+  each block's decoded block, and the partition holds every block until its
+  `(trace_id, start_ts)` sort over all of them has been emitted. Freeing in the
+  job would need a decoded form without per-row allocations, or a build that
+  does not wait for the whole partition.
+
+Neither is on the ClickBench logs path.

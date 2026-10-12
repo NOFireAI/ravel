@@ -488,24 +488,9 @@ fn log_record(i: usize) -> LogRecord {
     }
 }
 
-/// Records for the two-path magnitude fixture: exactly one block at RLOG's
-/// default 8192-record block target, so one block's charge *is* the peak and
-/// the two paths' peaks are directly comparable.
+/// Records for the magnitude fixture: exactly one block at RLOG's default
+/// 8192-record block target, which the scan emits as one batch.
 const ONE_BLOCK_RECORDS: usize = 8192;
-
-/// A pending erasure whose key exists in no record of this fixture. Any pending
-/// erasure makes a scan columnar-ineligible (ADR-0099 decision 2), so this
-/// drains the row path over the identical projection while erasing nothing --
-/// same data, same rows, same output, only the path differs.
-fn no_match_erasure() -> Vec<ravel_proto::commit::v1::ErasureRequest> {
-    vec![ravel_proto::commit::v1::ErasureRequest {
-        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
-            key: "__does_not_exist__".to_string(),
-            value: "__nope__".to_string(),
-        }],
-        ..Default::default()
-    }]
-}
 
 /// Write one RLOG object of `records` records into `store` and return a
 /// snapshot over it, carrying `erasure` as the snapshot's pending erasure.
@@ -566,12 +551,14 @@ fn find_logs_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan
 }
 
 /// The outcome of one columnar `logs` drain: how many batches it emitted, the
-/// peak bytes the pool held mid-stream, and the two path metrics from the
-/// `LogsScanExec` leaf that prove which batch-building path ran.
+/// peak bytes the pool held mid-stream, the Arrow footprint of the largest
+/// batch, and the two path metrics from the `LogsScanExec` leaf that prove
+/// which batch-building path ran.
 struct LogsDrain {
     batches: usize,
     rows: usize,
     peak: usize,
+    largest_batch: usize,
     columnar: usize,
     rowpath: usize,
 }
@@ -616,11 +603,13 @@ async fn drain_logs(
     let mut batches = 0usize;
     let mut rows = 0usize;
     let mut peak = 0usize;
+    let mut largest_batch = 0usize;
     while let Some(next) = stream.next().await {
         let batch = next.expect("batch");
         batches += 1;
         rows += batch.num_rows();
         peak = peak.max(pool.reserved());
+        largest_batch = largest_batch.max(batch.get_array_memory_size());
     }
     drop(stream);
 
@@ -630,6 +619,7 @@ async fn drain_logs(
         batches,
         rows,
         peak,
+        largest_batch,
         columnar: count("columnar_batches"),
         rowpath: count("rowpath_batches"),
     }
@@ -643,9 +633,9 @@ async fn drain_logs(
 /// metrics scan).
 ///
 /// This is the return-to-zero property for what the fast path holds: the decoded
-/// block plus its pre-built `RecordBatch`es
-/// (`hold_batches`/`emit_next_columnar_batch`), charged once together and
-/// relabelled from `held` to `emitted` batch by batch, not a `Vec<LogRecord>`.
+/// block while its job builds from it, then its pre-built `RecordBatch`es
+/// (`hold_batches`/`emit_next_columnar_batch`), charged once and relabelled
+/// from `held` to `emitted` batch by batch, not a `Vec<LogRecord>`.
 /// The metrics-scan tests above never touch the logs scan, so before this case
 /// that release path was unexercised here. The magnitude of that charge is the
 /// next test's job.
@@ -718,36 +708,25 @@ async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
     }
 }
 
-/// How far below the row path's peak the columnar path's peak may sit for the
-/// same data before this test calls it an undercharge.
+/// Between polls the columnar path's pool charge is exactly the Arrow
+/// footprint of the batch it holds: one 8192-record block, projected to
+/// `ts, body`, is one batch, and the pool's peak equals that batch's
+/// `get_array_memory_size`.
 ///
-/// The two paths hold different things, so their peaks are not equal and pinning
-/// a ratio exactly would be a change detector: the row path holds a
-/// `Vec<LogRecord>` (a per-record struct, a cloned STREAM_DIR blob and an owned
-/// `String` per record), the columnar path holds the decoded block plus the
-/// Arrow batches built from it. On this fixture the columnar peak is a little
-/// under half the row path's, so a factor of 3 leaves room in both directions
-/// while still failing the defect it exists to catch: charging the batches
-/// alone put the columnar peak at under a quarter of the row path's.
-const MAX_COLUMNAR_UNDERCHARGE: usize = 3;
-
-/// The columnar path's pool charge must be the same order of magnitude as the
-/// row path's for the same data, because it holds the same data.
+/// This is the magnitude half of the fast path's accounting, which
+/// return-to-zero cannot see: a charge of one byte per block balances
+/// perfectly. The decoded block the batch was built from is not part of the
+/// figure because it no longer exists between polls: the block's read-gate job,
+/// or its inline run, frees it, and releases its charge, before returning
+/// (ADR-1702, the decoded-state release amendment). Its charge while the job
+/// holds it is pinned in `logs_scan.rs` by
+/// `the_resident_charge_covers_each_decoded_block_until_it_is_freed`.
 ///
-/// This is the magnitude half of the fast path's accounting, which return-to-zero
-/// cannot see: a charge of one byte per block balances perfectly. The fixture is
-/// one 8192-record block and the identical projection (`ts, body`) on both runs,
-/// with the row path forced by a pending erasure that matches no record, so the
-/// two runs differ in nothing but the batch-building path. `rows` proves that.
-///
-/// The defect this catches: the columnar path holds a view *borrowing*
-/// `BlockScan`'s decoded block, which the reader releases only when the next
-/// block is decoded, so the block is resident for as long as its batches drain.
-/// Charging only the batches admitted a tenant at 24% of the row path's figure
-/// for identical data, which is what a `peak > 0` assertion cannot distinguish
-/// from a correct charge.
+/// Fails with the batch charged anything other than its footprint, and with
+/// the decoded block left held and charged until the next decode (the peak
+/// then also carries the block's decoded bytes).
 #[tokio::test]
-async fn the_columnar_path_charges_the_same_order_of_bytes_as_the_row_path() {
+async fn the_columnar_path_charges_the_batch_it_holds() {
     let tenant = tenant_id("acme");
     let sql = "SELECT ts, body FROM logs";
 
@@ -769,51 +748,17 @@ async fn the_columnar_path_charges_the_same_order_of_bytes_as_the_row_path() {
         0,
         "the columnar run must release its bytes"
     );
-
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let (pool, _breach) =
-        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
-    let row = drain_logs(
-        Arc::clone(&store),
-        &tenant,
-        Arc::clone(&pool),
-        sql,
-        ONE_BLOCK_RECORDS,
-        no_match_erasure(),
-    )
-    .await;
-    assert_eq!(pool.reserved(), 0, "the row run must release its bytes");
-
-    // Both runs must have taken the path this comparison names them for,
-    // otherwise the ratio below compares one path against itself.
     assert!(
         fast.columnar > 0 && fast.rowpath == 0,
-        "the eligible run must be columnar: columnar={}, rowpath={}",
+        "the run must be columnar: columnar={}, rowpath={}",
         fast.columnar,
         fast.rowpath
     );
-    assert!(
-        row.rowpath > 0 && row.columnar == 0,
-        "the erasure-forced run must be the row path: columnar={}, rowpath={}",
-        row.columnar,
-        row.rowpath
-    );
-    // Same data through both, so the peaks are comparable.
-    assert_eq!(
-        fast.rows, row.rows,
-        "the two paths must emit the same rows for the ratio to mean anything"
-    );
     assert_eq!(fast.rows, ONE_BLOCK_RECORDS);
-    assert!(fast.peak > 0 && row.peak > 0);
-
-    assert!(
-        fast.peak * MAX_COLUMNAR_UNDERCHARGE >= row.peak,
-        "the columnar path's peak charge ({} bytes) is more than \
-         {MAX_COLUMNAR_UNDERCHARGE}x below the row path's ({} bytes) for the \
-         identical block and projection, so the pool is not bounding what the \
-         scan actually holds (ADR-0087 decision 2). The decoded block stays \
-         resident behind the view while its batches drain; charge it.",
-        fast.peak,
-        row.peak
+    assert_eq!(fast.batches, 1, "one block, one batch");
+    assert!(fast.largest_batch > 0);
+    assert_eq!(
+        fast.peak, fast.largest_batch,
+        "the pool's peak is the held batch's footprint"
     );
 }
