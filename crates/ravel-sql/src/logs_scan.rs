@@ -212,14 +212,12 @@
 //! the decoded block before it returns, so what remains resident is the
 //! `Vec<LogRecord>` it built ([`records_memory`]) plus the batch handed
 //! downstream. The columnar path's `next_block_columnar` hands out a view
-//! *borrowing* the decoded block, which the reader releases only when the next
-//! block is decoded, so the block stays resident alongside the Arrow batches
-//! built from it. The two are charged separately: the batches when they are
-//! held ([`LogScanStream::hold_batches`]) and released as they are emitted, the
-//! decoded block in `LogScanStream::resident` until the decode that replaces it
-//! has run, including any wait for a read-gate permit before that decode.
-//! Charging the batches alone would admit a query at a fraction of its
-//! resident footprint.
+//! *borrowing* the decoded block, so the block and the Arrow batches being
+//! built from it are resident together. The block is charged in
+//! `LogScanStream::resident` from its decode until the build is done and the
+//! block is freed, both inside the same block job ([`ColumnarBlockJob::run`]);
+//! the batches are charged when they are held
+//! ([`LogScanStream::hold_batches`]) and released as they are emitted.
 //!
 //! # Column projection
 //!
@@ -4761,7 +4759,7 @@ fn log_block_gate_failed(key: &str, err: CpuGateError) -> DataFusionError {
 /// The block currently being drained into output batches, and the form it is
 /// held in. The charge tracked by [`LogScanStream::held`] covers the records or
 /// batches of whichever variant is live; on the columnar path the decoded block
-/// behind them is charged separately, in `LogScanStream::resident`.
+/// they were built from is already freed.
 enum Pending {
     /// Nothing held.
     None,
@@ -4770,10 +4768,9 @@ enum Pending {
     Rows { records: Vec<LogRecord>, pos: usize },
     /// Columnar fast path: the block's already-built output batches, emitted one
     /// per poll. Built whole from the [`ColumnarBlockView`] so the view (which
-    /// borrows the scan) is dropped before the next block is decoded. The
-    /// decoded block itself is still resident behind the reader until then; it
-    /// is charged in `LogScanStream::resident`, not in the charge for these
-    /// batches. Each batch carries its own charge ([`columnar_charges`]).
+    /// borrows the scan) and the decoded block behind it are dropped in the
+    /// block's own job. Each batch carries its own charge
+    /// ([`columnar_charges`]).
     Batches(VecDeque<(RecordBatch, usize)>),
 }
 
@@ -4876,8 +4873,9 @@ fn row_ref_array(range: RowRefRange, rows: usize) -> DFResult<ArrayRef> {
 /// charges the query's memory pool for exactly that: `held` is the charge
 /// covering `pending`'s records or batches, `emitted` the charge covering the
 /// batch handed downstream on the previous poll, and `resident` the columnar
-/// path's decoded block, which travels into a read-gate job with the scan and
-/// back. Each is released as its data goes away, so the reservation tracks
+/// path's decoded block while a block job holds it, travelling into a
+/// read-gate job with the scan and back. Each is released as its data goes
+/// away, so the reservation tracks
 /// live resident memory rather than cumulative output and a pool overrun
 /// surfaces as `ResourcesExhausted` at the moment the scan genuinely holds too
 /// much.
@@ -4976,14 +4974,12 @@ struct LogScanStream {
     held: usize,
     /// Reservation bytes currently covering the batch emitted last poll.
     emitted: usize,
-    /// The charge for the decoded block the columnar cursor's reader still
-    /// holds. The reader frees that block only when it decodes the next one,
-    /// so this moves into the next block's job with the scan and is resized to
-    /// the new block right after its decode ([`ColumnarBlockJob::run`]), not
-    /// released when the old block's batches drain: on the read gate the next
-    /// decode can wait for a permit while the old block stays resident.
-    /// Charging the batches alone would break ADR-0087 decision 2's contract
-    /// that the pool bounds concurrently-held scan memory.
+    /// The charge for the decoded block a columnar block job holds: sized to
+    /// the block as its decode returns and released right after the job frees
+    /// it ([`ColumnarBlockJob::run`]), so it is empty between jobs. It moves
+    /// into a read-gate job with the scan and back. Charging the batches alone
+    /// would break ADR-0087 decision 2's contract that the pool bounds
+    /// concurrently-held scan memory.
     resident: MemoryReservation,
     /// The block being drained into batches, in row or columnar form.
     pending: Pending,
@@ -5395,8 +5391,7 @@ impl LogScanStream {
     /// Emit the next columnar-path batch: pop the front pre-built batch, relabel
     /// its already-reserved bytes from `held` to `emitted`, and release the
     /// batch handed out on the previous poll. No new reservation is taken -- the
-    /// block's batches were charged once in [`Self::hold_batches`], and the
-    /// decoded block itself stays charged in [`Self::resident`].
+    /// block's batches were charged once in [`Self::hold_batches`].
     fn emit_next_columnar_batch(&mut self) -> DFResult<RecordBatch> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         let Pending::Batches(queue) = &mut self.pending else {
@@ -5429,11 +5424,9 @@ impl LogScanStream {
     }
 
     /// Take ownership of one block's pre-built columnar batches, charging the
-    /// pool for their Arrow footprint as [`columnar_charges`] splits it. The
-    /// decoded block they were built from is charged separately, in
-    /// [`Self::resident`], and the shared dictionary values the scan's
-    /// [`StrValuesCache`] holds in [`Self::str_values_charge`], resized here to
-    /// the cache's live entries.
+    /// pool for their Arrow footprint as [`columnar_charges`] splits it, and
+    /// the shared dictionary values the scan's [`StrValuesCache`] holds in
+    /// [`Self::str_values_charge`], resized here to the cache's live entries.
     ///
     /// [`Self::emit_next_columnar_batch`] moves each emitted batch's own
     /// charge from `held` to `emitted`; the block's shared values stay in
@@ -5490,8 +5483,6 @@ impl LogScanStream {
 
     /// Drop the drained block's records or batches and release their charge,
     /// with the charge of every cached values array no batch reads any more.
-    /// The columnar cursor's decoded block stays charged in
-    /// [`Self::resident`] until the next decode replaces it.
     fn release_block(&mut self) {
         self.reservation.shrink(std::mem::take(&mut self.held));
         self.pending = Pending::None;
@@ -5539,10 +5530,9 @@ impl LogScanStream {
                 "row block requested off a row-path state".into(),
             ));
         };
-        // Unlike the columnar exit, the row exit frees its decoded block before
-        // returning the records (`BlockScan::next_block`), so no previous
-        // block is resident behind the reader while this job waits for a
-        // permit, and there is no block charge to carry into it.
+        // The row exit frees its decoded block before returning the records
+        // (`BlockScan::next_block`), so there is no block charge to carry into
+        // this job.
         if scan.remaining_blocks() > 0 && scan.block_gate().is_some() {
             let (LogScanState::Rows(scan) | LogScanState::RowFallbackBlock { scan, .. }) =
                 std::mem::replace(&mut self.state, LogScanState::Done)
@@ -5727,8 +5717,7 @@ impl LogScanStream {
                 };
             }
             // The block is drained: release its records or batches before
-            // decoding another. A columnar block's decoded bytes stay charged
-            // until the next decode replaces them (`resident`).
+            // decoding another.
             if this.held > 0 || !matches!(this.pending, Pending::None) {
                 this.release_block();
             }
@@ -12864,8 +12853,17 @@ mod read_gate_tests {
 
     /// The fixture stored under `key`.
     async fn fixture_at(key: &str) -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
+        stored(key, object(), BLOCKS).await
+    }
+
+    /// `obj`, holding `samples` records with `ts` in `0..BLOCKS`, stored
+    /// under `key`.
+    async fn stored(
+        key: &str,
+        obj: Vec<u8>,
+        samples: u64,
+    ) -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let obj = object();
         store
             .put(key, bytes::Bytes::from(obj.clone()), PutOptions::default())
             .await
@@ -12876,7 +12874,7 @@ mod read_gate_tests {
             min_event_ts_ns: 0,
             max_event_ts_ns: BLOCKS as i64 - 1,
             ingest_hour_bucket: 0,
-            sample_count: BLOCKS,
+            sample_count: samples,
             series_count: 0,
             shard: 0,
             content_hash: [3u8; 32],
@@ -12933,6 +12931,16 @@ mod read_gate_tests {
         gate: Option<Arc<ReadGate>>,
         rows: bool,
     ) -> LogsScanExec {
+        exec_projected(store, segments, gate, &projection(rows))
+    }
+
+    /// [`exec`] emitting `projection`.
+    fn exec_projected(
+        store: &Arc<dyn ObjectStoreBackend>,
+        segments: &[SegmentRef],
+        gate: Option<Arc<ReadGate>>,
+        projection: &[usize],
+    ) -> LogsScanExec {
         let fetcher = LogSegmentFetcher::new(Arc::clone(store));
         let fetcher = match gate {
             Some(gate) => fetcher.with_read_gate(gate),
@@ -12948,7 +12956,7 @@ mod read_gate_tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
-            Some(&projection(rows)),
+            Some(&projection.to_vec()),
             PhaseAccounting::new(),
             crate::logs_schema::logs_schema_with_declared(&[]),
             Arc::new(Vec::new()),
@@ -13108,6 +13116,253 @@ mod read_gate_tests {
                 other => panic!("expected a transient store error, got {other:?}"),
             }
         }
+    }
+
+    /// Blocks in the plain-page fixture, one per `ts` in `0..BLOCKS`.
+    const PLAIN_BLOCKS: usize = BLOCKS as usize;
+    /// Records in each block of the plain-page fixture.
+    const PLAIN_ROWS: usize = 256;
+
+    fn plain_config() -> RlogConfig {
+        RlogConfig {
+            block_target_records: PLAIN_ROWS,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// [`PLAIN_BLOCKS`] blocks of [`PLAIN_ROWS`] records, every `body`
+    /// distinct, so the writer stores `body` as a plain page and a block
+    /// decoded with it holds one heap allocation per row for that column.
+    /// Block `b`'s records all carry `ts` `b`.
+    fn plain_object() -> Vec<u8> {
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [5u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(plain_config(), identity);
+        for i in 0..PLAIN_BLOCKS * PLAIN_ROWS {
+            let ts = (i / PLAIN_ROWS) as i64;
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!(
+                        "request {i:05} id {:016x}",
+                        (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                })
+                .expect("push");
+        }
+        let obj = writer.finish().expect("finish");
+
+        // The premise: every block decodes `body` from a plain page.
+        let reader = ravel_logseg::RlogReader::new(&obj, &plain_config()).expect("open");
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let mut blocks = 0;
+        while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+            assert_eq!(view.surviving_count(), PLAIN_ROWS, "block {blocks}");
+            assert!(
+                view.str_dict(ravel_logseg::record::COL_BODY).is_none(),
+                "block {blocks}: body is a plain page"
+            );
+            blocks += 1;
+        }
+        assert_eq!(blocks, PLAIN_BLOCKS, "the fixture's block count");
+        obj
+    }
+
+    /// One gated columnar scan of the plain-page fixture, `ts` and `body`
+    /// projected.
+    struct ProbedScan {
+        batches: Vec<RecordBatch>,
+        /// What the inline scan of the same fixture returns.
+        inline: Vec<RecordBatch>,
+        probes: Vec<BlockProbe>,
+        gate: Arc<ReadGate>,
+    }
+
+    /// Runs [`ProbedScan`] with the [`BlockProbe`]s for `key` armed. Each test
+    /// passes its own key, so tests running in parallel record apart.
+    async fn probed_plain_scan(key: &str) -> ProbedScan {
+        let (store, segments) =
+            stored(key, plain_object(), (PLAIN_BLOCKS * PLAIN_ROWS) as u64).await;
+        let projection = [crate::logs_schema::LOG_COL_TS, LOG_COL_BODY];
+        BLOCK_PROBES
+            .lock()
+            .expect("probes")
+            .push((key.to_string(), Vec::new()));
+        let gate = floor_zero_gate();
+        let gated = exec_projected(&store, &segments, Some(Arc::clone(&gate)), &projection);
+        let batches = collect(&gated).await;
+        let probes = {
+            let mut armed = BLOCK_PROBES.lock().expect("probes");
+            let at = armed.iter().position(|(k, _)| k == key).expect("armed key");
+            armed.swap_remove(at).1
+        };
+        assert!(
+            metric_total(&gated, "columnar_batches") > 0,
+            "the scan took the columnar path"
+        );
+        assert_eq!(
+            site_counts(&gate, ReadSite::LogBlock),
+            (PLAIN_BLOCKS as u64, 0),
+            "one log_block job per block"
+        );
+        let inline = collect(&exec_projected(&store, &segments, None, &projection)).await;
+        ProbedScan {
+            batches,
+            inline,
+            probes,
+            gate,
+        }
+    }
+
+    /// Every `log_block` job hands its scan back holding no decoded block, the
+    /// last block of the segment's job included, so the scan
+    /// `finish_segment` drops holds none either; and the gated scan returns
+    /// what the inline scan returns.
+    ///
+    /// Fails with the job's release removed, and with the release moved to
+    /// `finish_segment`: each job's scan then comes back holding its block.
+    #[tokio::test]
+    async fn every_log_block_job_returns_its_scan_holding_no_decoded_block() {
+        let run = probed_plain_scan("t/probe-held.rlog").await;
+        let returned: Vec<bool> = run
+            .probes
+            .iter()
+            .filter_map(|p| match p {
+                BlockProbe::JobReturned { held, .. } => Some(*held),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            returned,
+            vec![false; PLAIN_BLOCKS],
+            "no job's scan came back holding a decoded block"
+        );
+        let finished: Vec<bool> = run
+            .probes
+            .iter()
+            .filter_map(|p| match p {
+                BlockProbe::SegmentFinished { held } => Some(*held),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished,
+            vec![false],
+            "the finished segment's scan holds none"
+        );
+        let rows: usize = run.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, PLAIN_BLOCKS * PLAIN_ROWS);
+        assert_eq!(run.batches, run.inline, "gated and inline output agree");
+        assert_eq!(total_inline(&run.gate), 0, "nothing ran inline");
+    }
+
+    /// Each block's decoded columns are freed on the thread that decoded
+    /// them, a read-gate thread rather than the runtime's: the scan holds the
+    /// block just before the release and not just after it, both observed on
+    /// that thread.
+    ///
+    /// Fails with the release removed (a block is decoded while the previous
+    /// one is still held), and with the release done by the stream once the
+    /// job has returned (it runs on the runtime thread).
+    #[tokio::test]
+    async fn each_decoded_block_is_freed_on_the_thread_that_decoded_it() {
+        let runtime = std::thread::current().id();
+        let run = probed_plain_scan("t/probe-thread.rlog").await;
+        let mut decoded = None;
+        let mut pairs = Vec::new();
+        for probe in &run.probes {
+            match *probe {
+                BlockProbe::Decoded { thread, .. } => {
+                    assert!(
+                        decoded.is_none(),
+                        "a block was decoded while the previous one was still held"
+                    );
+                    decoded = Some(thread);
+                }
+                BlockProbe::Released {
+                    thread,
+                    held_before: true,
+                    held_after,
+                    ..
+                } => {
+                    assert!(!held_after, "the release dropped the block");
+                    let on = decoded.take().expect("a release follows a decode");
+                    pairs.push((on, thread));
+                }
+                _ => {}
+            }
+        }
+        assert!(decoded.is_none(), "the last decoded block was released");
+        assert_eq!(pairs.len(), PLAIN_BLOCKS, "one release per block");
+        for (block, (decoded_on, freed_on)) in pairs.into_iter().enumerate() {
+            assert_ne!(
+                decoded_on, runtime,
+                "block {block} decoded on a gate thread"
+            );
+            assert_eq!(
+                decoded_on, freed_on,
+                "block {block} freed on the thread that decoded it"
+            );
+        }
+    }
+
+    /// `resident` charges each block at its decoded size while the block is
+    /// held, still charges it the moment the block is freed, and is released
+    /// right after, so a job hands back an empty charge and the charge never
+    /// falls below what is held.
+    ///
+    /// Fails with the charge released before the block (`charge_between` reads
+    /// 0), with it left standing after the job (`JobReturned` reads the
+    /// block's size), and with the resize after the decode removed
+    /// (`charge_before` reads 0).
+    #[tokio::test]
+    async fn the_resident_charge_covers_each_decoded_block_until_it_is_freed() {
+        let run = probed_plain_scan("t/probe-charge.rlog").await;
+        let mut bytes = None;
+        let mut releases = 0;
+        for probe in &run.probes {
+            match *probe {
+                BlockProbe::Decoded { bytes: b, .. } => {
+                    assert!(b > 0, "a decoded block has a size");
+                    bytes = Some(b);
+                }
+                BlockProbe::Released {
+                    held_before: true,
+                    charge_before,
+                    charge_between,
+                    charge_after,
+                    ..
+                } => {
+                    let b = bytes.take().expect("a release follows a decode");
+                    assert_eq!(charge_before, b, "charged at the decoded size while held");
+                    assert_eq!(charge_between, b, "still charged as the block is freed");
+                    assert_eq!(charge_after, 0, "released once the block is gone");
+                    releases += 1;
+                }
+                BlockProbe::JobReturned { charge, .. } => {
+                    assert_eq!(charge, 0, "a job hands back an empty charge");
+                }
+                BlockProbe::Released { .. } | BlockProbe::SegmentFinished { .. } => {}
+            }
+        }
+        assert_eq!(releases, PLAIN_BLOCKS);
     }
 }
 

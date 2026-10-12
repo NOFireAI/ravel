@@ -7202,4 +7202,40 @@ mod tests {
             assert_eq!(dict_word_memos() - memos, 1, "one memo for the dictionary");
         }
     }
+
+    /// `release_decoded_block` drops the block a columnar decode left held, and
+    /// the cursor goes on to decode the next block as if nothing happened:
+    /// the release changes when the block is freed, not what is read.
+    ///
+    /// Fails with the release a no-op (`holds_decoded_block` stays true after
+    /// it), and with `surviving` left uncleared.
+    #[test]
+    fn release_decoded_block_drops_the_held_block_and_the_scan_goes_on() {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let recs = (0..12).map(|i| rec(1, i, &format!("body {i}"))).collect();
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        assert!(!scan.holds_decoded_block(), "nothing decoded yet");
+        let mut blocks = 0;
+        let mut first_ts = Vec::new();
+        while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
+            assert_eq!(view.surviving_count(), 4);
+            first_ts.push(view.ts(0));
+            assert!(scan.holds_decoded_block(), "the decode left the block held");
+            scan.release_decoded_block();
+            assert!(!scan.holds_decoded_block(), "the release dropped it");
+            assert!(scan.surviving.is_empty(), "and its surviving rows");
+            scan.release_decoded_block();
+            blocks += 1;
+        }
+        assert_eq!(blocks, 3);
+        assert_eq!(first_ts, vec![Some(0), Some(4), Some(8)]);
+        assert!(!scan.holds_decoded_block(), "exhaustion holds nothing");
+    }
 }
