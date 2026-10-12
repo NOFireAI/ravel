@@ -2546,8 +2546,9 @@ Every site except one has a production call site. On the read gate those are
 `span_flush`, `otap_decode`, `otlp_http_gzip` and `remote_write_snappy`. The
 read gate's `span_section` site has no call site yet, so its figures stay at
 0. With `--sql-scan-decode-inline` the SQL `logs` and `spans` scans decode
-their blocks inline on the polling worker, so for those scans `log_block` and
-`span_block` stay at 0.
+inline on the polling worker, so for SQL statements every site their
+fetchers use, `log_block`, `log_postings`, `log_section` and `span_block`,
+stays at 0. PromQL and LogQL reads of the same objects still count there.
 
 | Metric | Meaning |
 |---|---|

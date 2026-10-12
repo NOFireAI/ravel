@@ -1460,9 +1460,11 @@ pub struct Cli {
 
     /// Decode the SQL `logs` and `spans` scans' blocks on the tokio worker
     /// polling the scan instead of on the read CPU gate, the behaviour before
-    /// ADR-1702 follow-up task 8. The catalog, PromQL and maintenance read gate
-    /// sites are unaffected, and so is the `samples` scan's RSEG catalog
-    /// decode. Off by default. The flag exists to measure the gate's cost
+    /// ADR-1702 follow-up task 8. Every read gate site the SQL logs and spans
+    /// fetchers use (`log_block`, `log_postings`, `log_section` and
+    /// `span_block`) then counts nothing for SQL statements. The catalog,
+    /// PromQL and maintenance read gate sites are unaffected, and so is the
+    /// `samples` scan's RSEG catalog decode. Off by default. The flag exists to measure the gate's cost
     /// against its liveness benefit (issue #2795), and setting it gives up the
     /// isolation ADR-1702 decision 7 gives scans: a scan over a large part
     /// holds a worker for each block's decompress. The mode is logged at

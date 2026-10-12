@@ -866,8 +866,10 @@ the v0.24 release. To let one binary serve both arms of a paired-box A/B,
 `ravel-server` gains `--sql-scan-decode-inline` (env
 `RAVEL_SQL_SCAN_DECODE_INLINE`). When set, the server attaches no read gate to
 the SQL logs and spans fetchers, so those two scans decode each block on the
-tokio worker polling them, as before task 8, and the `log_block` and
-`span_block` sites count nothing for SQL scans. The catalog, PromQL,
+tokio worker polling them, as before task 8. Every read gate site those two
+fetchers use, `log_block`, `log_postings`, `log_section` and `span_block`,
+then counts nothing for SQL statements: the postings and section reads of
+the logs scan leave the gate with its block decode. The catalog, PromQL,
 maintenance and SQL `samples` gate sites keep the gate.
 
 The default is unchanged: with the flag unset, decision 7 stands as written.
