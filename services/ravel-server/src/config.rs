@@ -3278,11 +3278,11 @@ impl LogsFetchStamp {
                     sql_partition_count = self.sql_partition_count,
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = false,
-                    "latency-first is the default on a loopback store: on the loopback \
-                     reference box at the core-derived concurrency, cost-based has measured \
-                     slower cold (ADR-2677 decision 7); latency_first_measured_concurrency \
-                     is the concurrency of the issue #1196 measurement, a precondition of \
-                     that measured trade and not of this default"
+                    "latency-first is the default on a loopback store (ADR-2677 decision 7): \
+                     on the loopback reference box at the core-derived concurrency, \
+                     cost-based has measured slower cold; latency_first_measured_concurrency \
+                     is the concurrency of the issue #1196 measurement and a precondition of \
+                     that measured trade only"
                 );
             } else if !precondition_met {
                 tracing::info!(
