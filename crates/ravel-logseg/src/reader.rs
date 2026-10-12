@@ -1343,9 +1343,9 @@ impl BlockScan {
     /// plain-encoded string and fixed-width column, so a caller that decodes
     /// on one thread calls this on that same thread rather than leave the
     /// block to the next decode, which may run on another: freeing that many
-    /// allocations on a thread other than the one that made them costs far
-    /// more than freeing them where they were made (ADR-1702, the
-    /// decoded-state release amendment).
+    /// allocations on another thread was measured at more than the read
+    /// gate's own dispatch costs (#2795; ADR-1702, the decoded-state release
+    /// amendment).
     pub fn release_decoded_block(&mut self) {
         self.current = None;
         self.surviving.clear();

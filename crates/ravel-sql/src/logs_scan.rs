@@ -13329,8 +13329,8 @@ mod read_gate_tests {
     /// falls below what is held.
     ///
     /// Fails with the charge released before the block (`charge_between` reads
-    /// 0), with it left standing after the job (`JobReturned` reads the
-    /// block's size), and with the resize after the decode removed
+    /// 0), with it left standing after the block is freed (`charge_after`
+    /// reads the block's size), and with the resize after the decode removed
     /// (`charge_before` reads 0).
     #[tokio::test]
     async fn the_resident_charge_covers_each_decoded_block_until_it_is_freed() {
