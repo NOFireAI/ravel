@@ -33,8 +33,8 @@
 #       missing or malformed
 #   3   --timeout elapsed before both arms wrote a marker
 #   4   S3 unreachable: --unreachable-tries consecutive polls failed (default
-#       3), or a download failed with an error other than a missing object
-#       (a 403 included)
+#       3), or a download failed with an error other than a missing key
+#       (a 403 and a missing bucket included)
 #   64  bad usage
 set -uo pipefail
 
@@ -143,7 +143,9 @@ download() {
     0) return 0 ;;
     1)
       case "$msg" in
-        *"(404)"*|*NoSuchKey*|*"does not exist"*)
+        # Only the missing-key errors: a missing bucket also says "does not
+        # exist", and a bare 404 on HeadObject can be either.
+        *NoSuchKey*|*'Key "'*'" does not exist'*)
           echo "fetch: $RUN_URI/$1 is not there" >&2; return 2 ;;
       esac ;;
   esac

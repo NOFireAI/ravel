@@ -1,7 +1,8 @@
 # One ClickBench kit run: copy this file, fill it in, and pass it to
 # benchmarks/clickbench/kit/launch.sh. Every key without "optional" is
-# required. Arrays sit on one line. No key here is a credential: the instance
-# role carries every permission the boxes need.
+# required, and a key or table not named here is refused, naming it. Arrays
+# sit on one line. No key here is a credential: the instance role carries
+# every permission the boxes need.
 
 # The two commits, as full 40-character SHAs. Arm A is the baseline fetch.sh
 # judges arm B against.

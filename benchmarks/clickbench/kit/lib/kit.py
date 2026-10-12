@@ -10,9 +10,10 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
 
   get FILE KEY                 print one run.toml value; an array prints one
                                item per line; a dotted key reads a table
-  check-run FILE               refuse a run.toml missing a required key or
-                               holding a malformed SHA, lane, phase, band
-                               section or digest
+  check-run FILE               refuse a run.toml missing a required key,
+                               holding a key or table it does not know
+                               (named), or holding a malformed SHA, lane,
+                               phase, band section or digest
   check-bands LANE FILE [SECTION...]
                                refuse a band file that does not match the
                                lane's schema (a missing, unknown or removed
@@ -96,6 +97,15 @@ RUN_REQUIRED = (
     "dataset_url", "dataset_sha256", "rows_expected", "rustfs_url",
     "rustfs_sha256", "memory_budget_bytes", "audit_mode",
 )
+# Read by box/run.sh (band_sections through query_timeout_s) or launch.sh
+# (band_sections, ami through key_name) when present.
+RUN_OPTIONAL = (
+    "band_sections", "window_hours", "audit_text", "expected_statements",
+    "fold_min_entry_ratio", "query_timeout_s", "ami", "subnet",
+    "security_group", "key_name",
+)
+# run.toml's only table.
+RUN_TABLES = ("bands",)
 DEFAULT_WINDOW_HOURS = 200000
 
 ENTRY_FIELDS = (
@@ -257,7 +267,20 @@ def band_sections(data):
 
 def check_run(path):
     data = parse_toml(path)
-    missing = [k for k in RUN_REQUIRED if lookup(data, k) in (None, "")]
+    tables = sorted(k for k, v in data.items() if isinstance(v, dict))
+    unknown = sorted(k for k, v in data.items() if not isinstance(v, dict)
+                     and k not in RUN_REQUIRED and k not in RUN_OPTIONAL)
+    if unknown:
+        raise Refusal("run.toml %s: unknown key(s) %s" % (path, ", ".join(unknown)))
+    unknown = [t for t in tables if t not in RUN_TABLES]
+    if unknown:
+        raise Refusal("run.toml %s: unknown table(s) %s"
+                      % (path, ", ".join("[%s]" % t for t in unknown)))
+    unknown = sorted("bands." + k for k in data.get("bands", {}) if k not in LANE_BANDS)
+    if unknown:
+        raise Refusal("run.toml %s: unknown key(s) %s; [bands] names one band file per lane (%s)"
+                      % (path, ", ".join(unknown), ", ".join(sorted(LANE_BANDS))))
+    missing =[k for k in RUN_REQUIRED if lookup(data, k) in (None, "")]
     if missing:
         raise Refusal("run.toml %s: missing required key(s): %s" % (path, ", ".join(missing)))
     for key in ("sha_a", "sha_b"):

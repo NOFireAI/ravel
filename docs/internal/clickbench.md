@@ -1039,9 +1039,10 @@ file per lane (ADR-2867 change 2); `parquet/prereg.toml` is a pointer to it
 and holds no key. The band file ships with `memory_cap_bytes`, `arm_b_hot_s`
 and `arm_b_cold_s` set to a placeholder string, and the bench refuses the
 file, naming each key, until all three are numbers. Fill them before the
-first suite run and commit the filled file with the reports. Its `#@
-relative.*` comment lines are the ClickBench kit's relative bands
-(`benchmarks/clickbench/kit/fetch.sh`); the bench ignores them as comments.
+first suite run and commit the filled file with the reports. The ClickBench
+kit (`benchmarks/clickbench/kit/`) does not read this file: it runs only the
+RLOG lane, whose relative and absolute bands are in
+`benchmarks/clickbench/bands/rlog.toml`.
 
 - `memory_cap_bytes` is the per-query memory cap the pre-registered failures
   are stated against. Start the server once (step 5) and copy the
