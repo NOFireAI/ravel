@@ -410,7 +410,9 @@ projection moved into the saving: at a projected fraction of 0 the two are the
 same test. Note that `--logs-block-range-threshold` pins BOTH the funnel's
 routing threshold and that crossover, so under `byte-minimal` and
 `latency-first` at its 512 KiB default the effective break-even is 512 KiB of
-saving, not the request-cost-derived 8.9 MiB.
+saving, not the request-cost-derived 8.9 MiB. The server's unset
+`--logs-fetch-policy` is `cost-based`, except against a loopback S3 endpoint,
+where it is `latency-first` (ADR-2677 decision 7).
 
 Under `cost-based`, and only there, a finite rate derived from the store cost
 profile (not one an explicit `--logs-request-cost-bytes` set) also resolves a
@@ -1257,9 +1259,10 @@ query still answers, so the process looks healthy and then fails every
 non-trivial query permanently.
 
 Two things are carved from `memory_budget_bytes`, not from raw effective
-memory: the fetcher (RSEG) read cache takes 25%, or 40% when `--store` is
+memory: the fetcher (RSEG) read cache takes 25%, or 24% when `--store` is
 `s3` and the `--s3-endpoint` is loopback (logged with the source
-`budget-carve-loopback`), and the catalog byte cache takes a separate 5%. Rebasing both onto the budget instead of raw memory
+`budget-carve-loopback`; ADR-2023 decision 3 as amended for ADR-2677
+decision 7), and the catalog byte cache takes a separate 5%. Rebasing both onto the budget instead of raw memory
 keeps the percentages meaningful once the reserve is subtracted; deriving
 25% of raw `MemTotal` on a host that is mostly cgroup-limited would size the
 cache against memory the process can never actually use. Neither percentage

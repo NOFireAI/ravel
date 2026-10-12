@@ -774,7 +774,7 @@ Each flag bounds only its own cache.
 
 | Cache | Flag | Unset, derives from the process memory budget |
 |---|---|---|
-| Fetcher cache | `--cache-max-bytes` | 25%, or a larger 40% against a loopback `--s3-endpoint`. `7516192768` on the 30 GiB reference host at the 25% share. |
+| Fetcher cache | `--cache-max-bytes` | 25%, or 24% against a loopback `--s3-endpoint`. `7516192768` on the 30 GiB reference host at the 25% share, `7215545057` at the 24% share. |
 | Catalog byte cache | `--catalog-cache-max-bytes` | Always a smaller 5%. `1503238553` on the 30 GiB reference host. |
 
 [Per-query budgets](#per-query-budgets) describes the process memory budget.
@@ -1424,15 +1424,15 @@ A ranged read there spends a billed request to save bytes that cost nothing.
 Elsewhere the reverse holds.
 
 `--logs-fetch-policy` takes one of four values, spelled as in the table.
-Unset, it resolves `cost-based` on every deployment, including a `--store s3`
-deployment against a loopback `--s3-endpoint`.
+Unset, it resolves `latency-first` on a `--store s3` deployment against a
+loopback `--s3-endpoint`, and `cost-based` on every other deployment.
 
 | Value | Optimizes for | Pick it when |
 |---|---|---|
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
 | `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, on every store including a loopback one, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 18,900,000 bytes of an object reads ranged and every object of 18,900,000 bytes or less reads whole. |
-| `latency-first` | Fewest transferred bytes, as `byte-minimal`. It states an intent: spend requests to save wall time. The concurrency that you configure decides how. | Cold wall-clock matters more than the request bill, and you will raise the object-store GET concurrency and the SQL scan width explicitly. See [the latency-first trade](#the-latency-first-trade). |
+| `latency-first` | Fewest transferred bytes, as `byte-minimal`. It states an intent: spend requests to save wall time. The concurrency that you configure decides how. | The unset default on a loopback store. Elsewhere: cold wall-clock matters more than the request bill, and you will raise the object-store GET concurrency and the SQL scan width explicitly. See [the latency-first trade](#the-latency-first-trade). |
 
 For any policy value a query returns the same rows. Only request counts and
 timing differ.
@@ -1445,13 +1445,14 @@ policy. If a measurement shows that the default is wrong for a deployment,
 set `--logs-fetch-policy` explicitly.
 
 Startup logs the resolved policy and its source on the
-`logs fetch policy resolved` line. The source is `flag` (explicit) or
-`default` (unset). Unset always means `default`/`cost-based`, on every store
-including a loopback one.
+`logs fetch policy resolved` line. The source is `flag` (explicit),
+`default-loopback` (unset, on a loopback store, resolving `latency-first`) or
+`default` (unset, on every other deployment, resolving `cost-based`). To keep
+`cost-based` on a loopback store, pass `--logs-fetch-policy cost-based`.
 
 ### The latency-first trade
 
-`latency-first` against the default policy, as measured:
+`latency-first` against `cost-based` on real S3, as measured:
 
 | Item | Figure |
 |---|---|
@@ -1476,13 +1477,24 @@ constant.
   where they save more bytes than a request costs, and whole-object reads
   where they do not.
 - On the reference corpus against real S3, that shape at the default
-  concurrency measured slower than the default policy.
-- Treat the concurrency as a precondition. The startup line says which side
-  of it this process is on. It reports the precondition met only when both
-  the GET permits and the scan width are raised.
-- A concurrency raise also raises in-flight fetch memory, and no process-wide
-  budget bounds that memory yet. Watch process memory when you try this
-  policy. An under-provisioned raise can end in an out-of-memory kill.
+  concurrency measured slower than `cost-based`.
+- On a loopback store the default concurrency measured the other way. On
+  ClickBench over a RustFS loopback endpoint on c6a.4xlarge boxes, one run
+  per arm, `latency-first` took 368.6 s cold against `cost-based`'s
+  478.1 s, at about the same hot time (60.03 s against 59.90 s). That is
+  why it is the unset default there.
+- Treat the concurrency as a precondition of the real-S3 trade. The startup
+  line says which side of it this process is on. It reports the precondition
+  met only when both the GET permits and the scan width are raised. Below
+  the precondition it is an info line either way. An explicit flag gets the
+  intent text, which says the measurement found this routing slower than
+  `cost-based` below that concurrency. The loopback default gets a line
+  that names `cost-based` as the slower measured arm on a loopback store.
+- A concurrency raise also raises in-flight fetch memory. Logs fetches
+  reserve their bytes on the process memory budget, which refuses a fetch
+  it cannot hold, so an under-provisioned raise shows up as refused
+  fetches. A fallback budget (no host memory figure found) is unlimited and
+  refuses nothing, so watch process memory there.
 
 ### The store cost profile
 
@@ -1796,7 +1808,8 @@ The two caches carve the memory budget (`MemTotal` less the overhead reserve:
 2 GiB from 8 GiB of memory up, scaled down below it at the default ingest
 ceiling, as described below), not `MemTotal`. So the three ceilings together come to about 78% of
 `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720). They
-come to more on a loopback store, where the fetcher cache derives at 40%.
+come to about 77% (24,824,910,970) on a loopback store, where the fetcher
+cache derives at 24%.
 
 ### Catalog resolve concurrency
 
@@ -1845,7 +1858,7 @@ Three more settings are derived the same way:
 
 | Setting | Derived value |
 |---|---|
-| `--cache-max-bytes` (fetcher cache) | 25% normally, or 40% against a loopback `--s3-endpoint`. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
+| `--cache-max-bytes` (fetcher cache) | 25% normally, or 24% against a loopback `--s3-endpoint`. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
 | `--catalog-cache-max-bytes` (catalog byte cache) | Always a separate 5% ceiling. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
 | `--gc-max-query-duration` | 11 minutes. |
 
@@ -1929,10 +1942,9 @@ What the budget feeds:
 
 The 90% cap binds in these cases:
 
-- Every deployment whose store is on loopback. There the 40% fetch-cache
-  share leaves a remainder whose 90% is below 50% of `MemTotal`.
-- An S3 deployment whose effective memory is below about 9.7 GiB, cgroup pods
-  included.
+- An S3 deployment whose effective memory is below about 9.7 GiB (about
+  9.2 GiB against a loopback endpoint, whose 24% fetch-cache share leaves a
+  slightly larger remainder), cgroup pods included.
 - A host with co-resident processes where available memory is well below
   total.
 
@@ -2012,7 +2024,7 @@ from:
 | `derived-available` | `memory_budget_bytes` only: no cgroup limit, derived from `MemAvailable`. |
 | `derived-cgroup` | `memory_budget_bytes` only: a cgroup memory limit is present, so the budget is that limit minus the reserve, ignoring `MemAvailable`. |
 | `budget-carve` | A fixed share of `memory_budget_bytes` and not of raw `MemTotal`. The two cache ceilings resolve to this on a host whose memory could be read or whose budget was set with `--memory-budget-bytes`. |
-| `budget-carve-loopback` | The larger 40% share of the fetcher cache. It is resolved in place of `budget-carve` when the store is `s3` against a loopback endpoint and `--cache-max-bytes` is unset. |
+| `budget-carve-loopback` | The 24% share of the fetcher cache. It is resolved in place of `budget-carve` when the store is `s3` against a loopback endpoint and `--cache-max-bytes` is unset. |
 | `fallback` | No flag and no readable `MemTotal`, so the compiled-in constant is used. |
 
 To see what a process runs with, without reading the unit file, run
