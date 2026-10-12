@@ -39,23 +39,35 @@ const RESERVED: &[&str] = &[
     "RLIKE", "TRUE", "WHERE",
 ];
 
-/// Source commands recognised by keyword and not parsed yet.
-const UNSUPPORTED_SOURCE: &[&str] = &["EXPLAIN", "METRICS", "SET", "SHOW", "TS"];
+/// Source commands recognised by keyword and not parsed yet, each as the
+/// words that name it.
+const UNSUPPORTED_SOURCE: &[&[&str]] = &[
+    &["EXPLAIN"],
+    &["METRICS"],
+    &["SET"],
+    &["SHOW"],
+    &["TS"],
+];
 
-/// Processing commands recognised by keyword and not parsed yet.
-const UNSUPPORTED_PROCESSING: &[&str] = &[
-    "CHANGE_POINT",
-    "COMPLETION",
-    "DISSECT",
-    "ENRICH",
-    "FORK",
-    "FUSE",
-    "GROK",
-    "INLINESTATS",
-    "LOOKUP",
-    "MV_EXPAND",
-    "RERANK",
-    "SAMPLE",
+/// Processing commands recognised by keyword and not parsed yet, each as the
+/// words that name it. The first entry whose words all match is reported, so
+/// a two-word form precedes a one-word form sharing its first word.
+const UNSUPPORTED_PROCESSING: &[&[&str]] = &[
+    &["CHANGE_POINT"],
+    &["COMPLETION"],
+    &["DISSECT"],
+    &["ENRICH"],
+    &["FORK"],
+    &["FUSE"],
+    &["GROK"],
+    &["INLINE", "STATS"],
+    &["INLINESTATS"],
+    &["JOIN"],
+    &["LOOKUP", "JOIN"],
+    &["LOOKUP"],
+    &["MV_EXPAND"],
+    &["RERANK"],
+    &["SAMPLE"],
 ];
 
 const FOUND_MAX_CHARS: usize = 40;
@@ -285,11 +297,9 @@ impl<'a> Parser<'a> {
         match keyword.as_str() {
             "FROM" => self.parse_from_command(span),
             "ROW" => self.row_command(span),
-            k if UNSUPPORTED_SOURCE.contains(&k) => Err(Error::UnsupportedSyntax {
-                command: keyword,
-                span,
-            }),
-            _ => Err(self.unexpected(EXPECTED)),
+            _ => Err(self
+                .unsupported(UNSUPPORTED_SOURCE)
+                .unwrap_or_else(|| self.unexpected(EXPECTED))),
         }
     }
 
@@ -307,12 +317,29 @@ impl<'a> Parser<'a> {
             "STATS" => self.stats_command(span),
             "SORT" => self.sort_command(span),
             "LIMIT" => self.limit_command(span),
-            k if UNSUPPORTED_PROCESSING.contains(&k) => Err(Error::UnsupportedSyntax {
-                command: keyword,
-                span,
-            }),
-            _ => Err(self.unexpected(EXPECTED)),
+            _ => Err(self
+                .unsupported(UNSUPPORTED_PROCESSING)
+                .unwrap_or_else(|| self.unexpected(EXPECTED))),
         }
+    }
+
+    /// The [`Error::UnsupportedSyntax`] for the first of `commands` whose
+    /// words start at the current token, spanning all of them.
+    fn unsupported(&self, commands: &[&[&str]]) -> Option<Error> {
+        commands.iter().find_map(|words| {
+            let mut span: Option<Span> = None;
+            for (offset, word) in words.iter().enumerate() {
+                let token = self.peek_at(offset)?;
+                if !self.token_is_word(Some(token), word) {
+                    return None;
+                }
+                span = Some(span.map_or(token.span, |s| s.to(token.span)));
+            }
+            Some(Error::UnsupportedSyntax {
+                command: words.join(" "),
+                span: span?,
+            })
+        })
     }
 
     /// Parses `item (, item)*`.

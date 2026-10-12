@@ -300,3 +300,60 @@ fn unsupported_syntax_names_the_command() {
         "the GROK command is not supported yet (byte 37)"
     );
 }
+
+#[test]
+fn every_known_unsupported_command_is_named_with_its_span() {
+    let source_commands = ["EXPLAIN", "METRICS", "SET", "SHOW", "TS"];
+    for command in source_commands {
+        let source = format!("{command} x");
+        assert_error(
+            &source,
+            &Limits::default(),
+            Error::UnsupportedSyntax {
+                command: command.into(),
+                span: Span::new(0, command.len()),
+            },
+            1,
+            1,
+        );
+    }
+    // (as written, as reported)
+    let processing_commands = [
+        ("CHANGE_POINT", "CHANGE_POINT"),
+        ("COMPLETION", "COMPLETION"),
+        ("DISSECT", "DISSECT"),
+        ("ENRICH", "ENRICH"),
+        ("FORK", "FORK"),
+        ("FUSE", "FUSE"),
+        ("GROK", "GROK"),
+        ("INLINE STATS", "INLINE STATS"),
+        ("inline\n  Stats", "INLINE STATS"),
+        ("INLINESTATS", "INLINESTATS"),
+        ("JOIN", "JOIN"),
+        ("LOOKUP JOIN", "LOOKUP JOIN"),
+        ("lookup  join", "LOOKUP JOIN"),
+        ("LOOKUP", "LOOKUP"),
+        ("MV_EXPAND", "MV_EXPAND"),
+        ("RERANK", "RERANK"),
+        ("SAMPLE", "SAMPLE"),
+    ];
+    const PREFIX: &str = "FROM t | ";
+    for (written, reported) in processing_commands {
+        let source = format!("{PREFIX}{written} x");
+        assert_error(
+            &source,
+            &Limits::default(),
+            Error::UnsupportedSyntax {
+                command: reported.into(),
+                span: Span::new(PREFIX.len(), PREFIX.len() + written.len()),
+            },
+            1,
+            PREFIX.len() + 1,
+        );
+    }
+    // The first word of a two-word form alone is not that command.
+    assert!(matches!(
+        refuse("FROM t | INLINE x", &Limits::default()),
+        Error::UnexpectedToken { .. }
+    ));
+}

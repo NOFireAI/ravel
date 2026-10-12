@@ -82,9 +82,10 @@ pub enum Error {
     /// An ES|QL command this parser recognises but does not parse yet.
     #[error("the {command} command is not supported yet (byte {})", .span.start)]
     UnsupportedSyntax {
-        /// The command keyword, upper-cased.
+        /// The command's keywords, upper-cased and separated by one space,
+        /// such as `GROK` or `LOOKUP JOIN`.
         command: String,
-        /// The command keyword.
+        /// From the command's first keyword to its last.
         span: Span,
     },
 }
