@@ -209,7 +209,7 @@
   kind: positive
   binds:
     - crates/ravel-sql/src/attrs_per_key.rs::AttrsPerKeyProjection
-    - crates/ravel-sql/src/logs_scan.rs::reproject_attr_keys
+    - crates/ravel-sql/src/logs_scan/mod.rs::reproject_attr_keys
   status: verified
   note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: a query that reads attrs only through literal subscripts, in a single-scan plan with no pending erasure, decodes only those keys' FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys. Corrected by #2082."
 
