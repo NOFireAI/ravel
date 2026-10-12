@@ -4615,4 +4615,40 @@ mod flight_wire {
             "the dictionary column's values equal the plain string form"
         );
     }
+
+    /// `length` over the declared `Str` column is typed `Int32`, not the
+    /// column's dictionary, so unary minus plans over it (issue #2918).
+    #[tokio::test]
+    async fn negated_length_of_a_declared_str_column_answers_over_http() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme".to_string());
+        let records = vec![
+            log_record_named("api", 100, "alpha"),
+            log_record_named("worker", 150, "beta"),
+            log_record_named("api", 200, "alpha"),
+        ];
+        publish_log_segment(store.as_ref(), &tenant, 0, &records).await;
+
+        let app = router(sql_state_with_declared(
+            store,
+            tokens(&[("acme-token", "acme")]),
+        ));
+        let (status, value) = post_json(
+            &app,
+            "acme-token",
+            "SELECT -length(\"name\") FROM logs ORDER BY ts",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let json_rows = value["data"]["rows"].as_array().expect("rows");
+        let got: Vec<Value> = json_rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                serde_json::json!(-5),
+                serde_json::json!(-4),
+                serde_json::json!(-5),
+            ]
+        );
+    }
 }

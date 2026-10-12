@@ -946,6 +946,10 @@ pub fn build_session(
             }
         }
     }
+    // Issue #2918: after the last scalar registration, so every function this
+    // session can call reports a dictionary-of-non-string result as its value
+    // type. See `crate::value_typed_results`.
+    crate::value_typed_results::unpack_dictionary_results(&ctx);
     Ok(ctx)
 }
 

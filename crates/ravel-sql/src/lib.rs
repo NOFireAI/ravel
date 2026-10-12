@@ -107,6 +107,7 @@ pub mod stats_json;
 mod trace_id_planner;
 mod udf;
 mod validate;
+mod value_typed_results;
 
 pub use alerts_provider::AlertsTableProvider;
 pub use alerts_pushdown::{AlertsPushdown, extract_alerts};
