@@ -40,7 +40,8 @@
 # running `shutdown -h now` in every case (a run that failed before it knew its
 # region uploads nothing and only shuts down), which the launch's terminate
 # behaviour turns into a termination. An absolute band miss is a verdict, not a
-# failure: DONE records `bands=miss` and fetch.sh exits 1 on it.
+# failure: DONE records `bands=miss`, and fetch.sh exits 1 from its own
+# evaluation of the bands in results.json.
 #
 # Every statement goes through run_query, which records one JSON line per call
 # in out/<phase>/calls.jsonl: statement, arm, phase, start, duration, HTTP

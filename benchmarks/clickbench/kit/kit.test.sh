@@ -442,6 +442,43 @@ x = 1' 'unknown table(s) [extra]'
 run_case "an unknown [bands] key" '$a\
 parquet = "benchmarks/clickbench/bands/parquet.toml"' 'unknown key(s) bands.parquet'
 
+run_case "a truncated rustfs_sha256" 's/^rustfs_sha256 = .*/rustfs_sha256 = "abc123"/' \
+  'rustfs_sha256 must be 64 lowercase hex digits'
+
+# Catches: a stamped server setting that a start logged zero times or twice
+# being stamped as a list, which two arms then compare equal on.
+settings_case() {
+  local name="$1" drop="$2" dup="$3" want="$4" code=0 log="$TMP/settings-$1.log"
+  : >"$log"
+  for kv in fetch_concurrency=32 cache_max_bytes=7689077760 catalog_cache_max_bytes=1537815552 \
+    sql_max_query_bytes=16451897344 sql_tenant_max_bytes=32903794688; do
+    [ "${kv%%=*}" = "$drop" ] && continue
+    printf 'INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' \
+      "${kv%%=*}" "${kv#*=}" >>"$log"
+    [ "${kv%%=*}" = "$dup" ] && printf 'INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' \
+      "${kv%%=*}" "${kv#*=}" >>"$log"
+  done
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import kit
+try:
+    print(kit.server_settings([sys.argv[2]]))
+except kit.Refusal as e:
+    print(e, file=sys.stderr); sys.exit(2)' "$KIT_SRC/lib" "$log" >"$TMP/settings-$name.out" 2>"$TMP/settings-$name.err" || code=$?
+  if [ -z "$want" ]; then
+    if [ "$code" = 0 ] && grep -qF "'fetch_concurrency': 32" "$TMP/settings-$name.out"; then
+      pass "server settings: $name stamps one number per setting"
+    else
+      fail "server settings $name" "exit $code: $(head -c 300 "$TMP/settings-$name.err")"
+    fi
+  elif [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/settings-$name.err"; then
+    pass "server settings: $name is refused, naming the setting"
+  else
+    fail "server settings $name" "exit $code: $(head -c 300 "$TMP/settings-$name.err") $(head -c 200 "$TMP/settings-$name.out")"
+  fi
+}
+settings_case "all five once" "" "" ""
+settings_case "a setting absent" fetch_concurrency "" 'carries fetch_concurrency 0 times, not once'
+settings_case "a setting logged twice" "" cache_max_bytes 'carries cache_max_bytes 2 times, not once'
+
 # Catches: launching (or uploading) when the instance role could not write
 # results, or a refusal that does not name the role.
 reset_log

@@ -287,9 +287,10 @@ def check_run(path):
         if not SHA_RE.match(str(data[key])):
             raise Refusal("run.toml %s: %s must be a full 40-character commit, got %r"
                           % (path, key, data[key]))
-    if not SHA256_RE.match(str(data["dataset_sha256"])):
-        raise Refusal("run.toml %s: dataset_sha256 must be 64 lowercase hex digits, got %r"
-                      % (path, data["dataset_sha256"]))
+    for key in ("dataset_sha256", "rustfs_sha256"):
+        if not SHA256_RE.match(str(data[key])):
+            raise Refusal("run.toml %s: %s must be 64 lowercase hex digits, got %r"
+                          % (path, key, data[key]))
     for key in ("lanes", "phases"):
         if not isinstance(data[key], list) or not data[key]:
             raise Refusal("run.toml %s: %s must be a non-empty array" % (path, key))
@@ -606,15 +607,15 @@ def parse_settings(log_text):
 
 
 def server_settings(logs):
-    """The settings every benchmark server start resolved. Each restart must
-    resolve the same values, and the two memory caps exactly once, or the
-    statements did not all run under one configuration."""
+    """The settings every benchmark server start resolved. Each start must
+    resolve every stamped setting exactly once, and each restart the same
+    values, or the statements did not all run under one known configuration."""
     first, first_log = None, None
     for log in logs:
         settings, unreadable = parse_settings(open(log, errors="replace").read())
         if unreadable:
             raise Refusal("server log %s: unreadable setting line %r" % (log, unreadable[0]))
-        for name in ("sql_max_query_bytes", "sql_tenant_max_bytes"):
+        for name in STAMPED_SETTINGS:
             if len(settings[name]) != 1:
                 raise Refusal("server log %s carries %s %d times, not once"
                               % (log, name, len(settings[name])))
@@ -627,7 +628,7 @@ def server_settings(logs):
                               % (log, name, settings[name], first_log, first[name]))
     if first is None:
         raise Refusal("assemble: no server log")
-    return dict((k, v[0] if len(v) == 1 else v) for k, v in first.items())
+    return dict((k, v[0]) for k, v in first.items())
 
 
 def _median(xs):
