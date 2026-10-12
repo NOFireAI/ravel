@@ -186,7 +186,6 @@ async fn healthz_answers_while_in_place_read_jobs_spin_on_every_worker() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    let spin_started = Instant::now();
 
     let probes: Vec<Duration> = (0..3)
         .map(|_| {
@@ -195,22 +194,19 @@ async fn healthz_answers_while_in_place_read_jobs_spin_on_every_worker() {
                 .unwrap()
         })
         .collect();
-    let probed_within = spin_started.elapsed();
     let still_running = gate.running();
     stop.store(true, Ordering::Release);
 
     for (index, took) in probes.iter().enumerate() {
+        // hygiene-allow: wall-clock -- the probe's response time is the
+        // property under test: a server on real sockets with no injected
+        // clock, against a bound eight times under the 2 s spin it must beat.
         assert!(
             *took < PROBE_BOUND,
             "/healthz probe {index} took {took:?} while {WORKERS} in-place read jobs spun, \
              over the {PROBE_BOUND:?} bound: every probe {probes:?}"
         );
     }
-    assert!(
-        probed_within < SPIN,
-        "the probes finished {probed_within:?} after the jobs began, so they did not \
-         all run while the jobs held their permits"
-    );
     assert_eq!(
         still_running, WORKERS as u64,
         "both jobs held a permit through every probe"
