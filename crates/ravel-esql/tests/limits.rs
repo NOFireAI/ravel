@@ -176,6 +176,43 @@ fn printer_refuses_a_tree_deeper_than_its_limits() {
     assert_eq!(printed, format!("ROW x = {}1", "-".repeat(20)));
 }
 
+#[test]
+fn printed_text_past_the_byte_limit_is_refused_under_that_limit() {
+    let limits = Limits {
+        max_statement_bytes: 9,
+        ..Limits::default()
+    };
+    let source = "ROW a=1+2";
+    assert_eq!(source.len(), 9);
+    let query = parse(source, &limits).expect("parses at the byte limit");
+    let printed = print(&query, &limits).expect("prints");
+    assert_eq!(printed, "ROW a = 1 + 2");
+    assert_eq!(
+        parse(&printed, &limits),
+        Err(Error::LimitExceeded {
+            limit: LimitKind::StatementBytes,
+            max: 9,
+            span: Span::new(9, 13),
+        })
+    );
+
+    // Each raw tab in a string prints as the two-byte escape `\t`.
+    let limits = Limits::default();
+    let source = format!("ROW x = \"{}\"", "\t".repeat(140_000));
+    assert_eq!(source.len(), 140_010);
+    let query = parse(&source, &limits).expect("parses under the default limits");
+    let printed = print(&query, &limits).expect("prints");
+    assert_eq!(printed.len(), 280_010);
+    assert_eq!(
+        parse(&printed, &limits),
+        Err(Error::LimitExceeded {
+            limit: LimitKind::StatementBytes,
+            max: limits.max_statement_bytes,
+            span: Span::new(limits.max_statement_bytes, 280_010),
+        })
+    );
+}
+
 /// The deepest expression shapes the default limits admit, one per recursion
 /// path through the parser and printer.
 fn worst_admitted_inputs(limits: &Limits) -> Vec<String> {

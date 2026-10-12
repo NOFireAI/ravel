@@ -15,8 +15,10 @@
 //! as `GROK` or `SHOW`, are refused with [`Error::UnsupportedSyntax`]; a word
 //! it does not know there is an [`Error::UnexpectedToken`].
 //!
-//! [`print`] renders a tree back to ES|QL text that parses to the same tree
-//! ignoring spans ([`ast::Query::eq_ignoring_spans`]).
+//! [`print`] renders a tree back to ES|QL text. When that text is itself
+//! within the limits it parses to the same tree ignoring spans
+//! ([`ast::Query::eq_ignoring_spans`]); the printer adds spaces and escapes,
+//! so text printed from a statement at a limit can exceed it.
 //!
 //! No production caller reaches this crate yet: binding and lowering the tree
 //! into SQL plans, and serving it over HTTP, land in later changes.

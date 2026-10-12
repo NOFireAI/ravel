@@ -6,6 +6,15 @@
 //! `+ -`; `* / %`; prefix `-` and `+`; the postfix `::` cast. The binary
 //! operators that chain associate to the left.
 //!
+//! An infix operator takes the expression before it as its left operand only
+//! when that expression binds more tightly, or as tightly and the operator
+//! chains. Because `IN`, `LIKE`, `RLIKE`, `IS NULL` and `:` end at a list,
+//! a pattern, `NULL` or a constant rather than at a parsed operand, an
+//! arithmetic operator, a cast or a comparison can follow one directly; it is
+//! refused there with [`Error::UnexpectedToken`] at the operator, so a
+//! comparison-level node is an operand of those operators only when the
+//! source parenthesised it.
+//!
 //! Every descent into a nested expression level increments a depth counter
 //! that is checked against [`Limits::max_depth`] before the level is parsed,
 //! and every node is checked against the same limit as it is built, so
@@ -93,6 +102,7 @@ enum Infix {
     In { negated: bool },
     Like { kind: LikeKind, negated: bool },
     IsNull,
+    Cast,
 }
 
 impl Infix {
@@ -100,9 +110,24 @@ impl Infix {
         match self {
             Infix::Binary(op) => op.precedence(),
             Infix::In { .. } | Infix::Like { .. } | Infix::IsNull => prec::COMPARISON,
+            Infix::Cast => prec::CAST,
         }
     }
 }
+
+/// Whether an operator binding at `lbp` may take an unparenthesised left
+/// operand whose outermost operator binds at `bound`: one that binds more
+/// tightly, or as tightly when the operator chains. Comparisons do not chain.
+fn takes_left_operand(lbp: u8, bound: u8) -> bool {
+    bound > lbp || (bound == lbp && lbp != prec::COMPARISON)
+}
+
+/// What [`takes_left_operand`] refusing an operator leaves admissible. Only a
+/// comparison-level left operand is refused: every other operand was parsed
+/// at a binding power that already consumed the tighter operators.
+const AFTER_COMPARISON: &str = "`AND`, `OR`, `|` or end of input (a comparison, `:`, `IN`, \
+     `LIKE`, `RLIKE` or `IS NULL` does not chain and is not an operand of arithmetic or `::` \
+     unless parenthesised)";
 
 /// What kind of constant an array holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -649,6 +674,7 @@ impl<'a> Parser<'a> {
             TokenKind::Gt => BinaryOp::Gt,
             TokenKind::GtEq => BinaryOp::GtEq,
             TokenKind::Colon => BinaryOp::Match,
+            TokenKind::Cast => return Some(Infix::Cast),
             TokenKind::Plus => BinaryOp::Add,
             TokenKind::Minus => BinaryOp::Sub,
             TokenKind::Star => BinaryOp::Mul,
@@ -703,29 +729,6 @@ impl<'a> Parser<'a> {
     fn expr_loop(&mut self, min_bp: u8) -> Result<Parsed, Error> {
         let mut lhs = self.prefix(min_bp)?;
         loop {
-            if self.peek_kind() == Some(&TokenKind::Cast) {
-                // `::` applies to a primary or another cast only.
-                if lhs.bound < prec::CAST || prec::CAST < min_bp {
-                    break;
-                }
-                self.bump();
-                let type_span = match self.peek() {
-                    Some(Token {
-                        kind: TokenKind::Word,
-                        span,
-                    }) => *span,
-                    _ => return Err(self.unexpected("a type name")),
-                };
-                self.bump();
-                let span = lhs.expr.span().to(type_span);
-                let cast = Expr::Cast(Cast {
-                    expr: Box::new(lhs.expr),
-                    type_name: self.text(type_span).to_owned(),
-                    span,
-                });
-                lhs = self.node(cast, lhs.height, prec::CAST)?;
-                continue;
-            }
             let Some(infix) = self.infix() else {
                 break;
             };
@@ -733,10 +736,8 @@ impl<'a> Parser<'a> {
             if lbp < min_bp {
                 break;
             }
-            if lbp == prec::COMPARISON && lhs.bound == prec::COMPARISON {
-                return Err(
-                    self.unexpected("`AND`, `OR`, `|` or end of input (comparisons do not chain)")
-                );
+            if !takes_left_operand(lbp, lhs.bound) {
+                return Err(self.unexpected(AFTER_COMPARISON));
             }
             lhs = match infix {
                 Infix::Binary(BinaryOp::Match) => self.match_rhs(lhs)?,
@@ -756,9 +757,29 @@ impl<'a> Parser<'a> {
                 Infix::In { negated } => self.in_rhs(lhs, negated)?,
                 Infix::Like { kind, negated } => self.like_rhs(lhs, kind, negated)?,
                 Infix::IsNull => self.is_null_rhs(lhs)?,
+                Infix::Cast => self.cast_rhs(lhs)?,
             };
         }
         Ok(lhs)
+    }
+
+    fn cast_rhs(&mut self, lhs: Parsed) -> Result<Parsed, Error> {
+        self.bump();
+        let type_span = match self.peek() {
+            Some(Token {
+                kind: TokenKind::Word,
+                span,
+            }) => *span,
+            _ => return Err(self.unexpected("a type name")),
+        };
+        self.bump();
+        let span = lhs.expr.span().to(type_span);
+        let cast = Expr::Cast(Cast {
+            expr: Box::new(lhs.expr),
+            type_name: self.text(type_span).to_owned(),
+            span,
+        });
+        self.node(cast, lhs.height, prec::CAST)
     }
 
     fn match_rhs(&mut self, lhs: Parsed) -> Result<Parsed, Error> {

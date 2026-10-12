@@ -188,7 +188,9 @@ fn unexpected_token() {
         &Limits::default(),
         Error::UnexpectedToken {
             found: "`==`".into(),
-            expected: "`AND`, `OR`, `|` or end of input (comparisons do not chain)",
+            expected: "`AND`, `OR`, `|` or end of input (a comparison, `:`, `IN`, `LIKE`, \
+                       `RLIKE` or `IS NULL` does not chain and is not an operand of arithmetic \
+                       or `::` unless parenthesised)",
             span: Span::new(25, 27),
         },
         1,

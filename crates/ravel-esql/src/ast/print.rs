@@ -10,8 +10,12 @@ use crate::error::Error;
 use crate::limits::{LimitKind, Limits};
 
 /// Renders `query` as ES|QL text, adding parentheses only where precedence
-/// requires them. Parsing the result with the same limits yields a tree equal
-/// to `query` under [`Query::eq_ignoring_spans`].
+/// requires them. When the printed text is itself within `limits`, parsing it
+/// with the same limits yields a tree equal to `query` under
+/// [`Query::eq_ignoring_spans`]. The printer adds spaces around operators and
+/// writes a tab, newline, quote or backslash in a string as a two-byte escape,
+/// so a statement at the byte limit can print to text past it; parsing that
+/// text returns the [`LimitKind::StatementBytes`] limit error.
 ///
 /// Refuses an expression nested deeper than [`Limits::max_depth`], because
 /// the printer recurses once per level.

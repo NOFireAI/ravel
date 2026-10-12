@@ -1,6 +1,8 @@
 //! Property tests: any input yields a tree or a typed error with a span
-//! inside the input, and any tree the parser can produce prints to text that
-//! parses back to the same tree.
+//! inside the input; any tree the parser can produce prints to text that
+//! parses back to the same tree when that text is within the limits; and no
+//! comparison-level node is an operand of arithmetic, a cast or another
+//! comparison unless the source parenthesised it.
 
 #![allow(clippy::expect_used)]
 
@@ -12,7 +14,8 @@ use ravel_esql::ast::{
     QualifiedName, Query, RenameCommand, RenamePair, RowCommand, SortCommand, SortKey, SortOrder,
     SourcePattern, StatsCommand, Unary, UnaryOp, WhereCommand,
 };
-use ravel_esql::{Limits, Span, parse, print};
+use ravel_esql::lexer::tokenize;
+use ravel_esql::{Error, LimitKind, Limits, Span, parse, print};
 
 const NO_SPAN: Span = Span::new(0, 0);
 
@@ -536,6 +539,63 @@ fn query() -> impl Strategy<Value = Query> {
         })
 }
 
+/// An expression with no grouping parentheses: prefix operators, operands,
+/// predicate and cast suffixes, and infix operators, in grammar order. The
+/// only parentheses are those of `IN` lists and calls, which the printer
+/// reproduces, so a tree parsed from it prints with no more `(` than it has
+/// unless the parser made a comparison-level node an operand.
+fn paren_free_statement() -> impl Strategy<Value = String> {
+    const COMMANDS: &[&str] = &[
+        "ROW x = ",
+        "FROM t | WHERE ",
+        "FROM t | EVAL y = ",
+        "FROM t | SORT ",
+        "FROM t | STATS c = count(*) WHERE ",
+    ];
+    const OPERANDS: &[&str] = &[
+        "a", "b.c", "1", "2.5", "\"s\"", "true", "null", "?p", "count(*)", "f(a)", "1 day",
+    ];
+    const PREFIXES: &[&str] = &["NOT", "-", "+"];
+    const SUFFIXES: &[&str] = &[
+        "IN (1, 2)",
+        "NOT IN (a)",
+        "LIKE \"p*\"",
+        "NOT LIKE \"p\"",
+        "RLIKE \"r\"",
+        "NOT RLIKE \"r\"",
+        "IS NULL",
+        "IS NOT NULL",
+        ": \"m\"",
+        "::long",
+    ];
+    const INFIXES: &[&str] = &[
+        "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "AND", "OR",
+    ];
+    let term = (
+        prop::collection::vec(prop::sample::select(PREFIXES), 0..2),
+        prop::sample::select(OPERANDS),
+        prop::collection::vec(prop::sample::select(SUFFIXES), 0..3),
+    )
+        .prop_map(|(prefixes, operand, suffixes)| {
+            let mut words = prefixes;
+            words.push(operand);
+            words.extend(suffixes);
+            words.join(" ")
+        });
+    (
+        prop::sample::select(COMMANDS),
+        term.clone(),
+        prop::collection::vec((prop::sample::select(INFIXES), term), 0..5),
+    )
+        .prop_map(|(command, first, rest)| {
+            let mut text = format!("{command}{first}");
+            for (infix, term) in rest {
+                text.push_str(&format!(" {infix} {term}"));
+            }
+            text
+        })
+}
+
 fn soup() -> impl Strategy<Value = String> {
     let prefix = prop::sample::select(vec![
         "",
@@ -559,11 +619,35 @@ fn tree_or_typed_error(source: &str) -> Result<(), TestCaseError> {
     match parse(source, &limits) {
         Ok(query) => {
             let printed = print(&query, &limits).expect("a parsed tree prints");
-            let reparsed = parse(&printed, &limits).expect("printed text parses");
-            prop_assert!(
-                reparsed.eq_ignoring_spans(&query),
-                "{source:?} printed as {printed:?}"
-            );
+            match parse(&printed, &limits) {
+                Ok(reparsed) => prop_assert!(
+                    reparsed.eq_ignoring_spans(&query),
+                    "{source:?} printed as {printed:?}"
+                ),
+                // The printer adds spaces and escapes, so text printed from a
+                // statement at a limit may exceed it; then, and only then,
+                // the reparse is refused under that limit.
+                Err(Error::LimitExceeded {
+                    limit: LimitKind::StatementBytes,
+                    ..
+                }) => prop_assert!(printed.len() > limits.max_statement_bytes),
+                Err(Error::LimitExceeded {
+                    limit: LimitKind::Tokens,
+                    ..
+                }) => {
+                    let unlimited = Limits {
+                        max_tokens: usize::MAX,
+                        ..limits
+                    };
+                    let tokens = tokenize(&printed, &unlimited).expect("printed text lexes");
+                    prop_assert!(tokens.len() > limits.max_tokens);
+                }
+                Err(error) => {
+                    return Err(TestCaseError::fail(format!(
+                        "{source:?} printed as {printed:?}, which is refused: {error}"
+                    )));
+                }
+            }
         }
         Err(error) => {
             let span = error.span();
@@ -588,6 +672,19 @@ proptest! {
         source in prop_oneof![any::<String>(), "\\PC{0,64}", soup()]
     ) {
         tree_or_typed_error(&source)?;
+    }
+
+    #[test]
+    fn no_comparison_is_an_operand_unless_parenthesised(source in paren_free_statement()) {
+        let limits = Limits::default();
+        if let Ok(query) = parse(&source, &limits) {
+            let printed = print(&query, &limits).expect("a parsed tree prints");
+            let opened = |text: &str| text.matches('(').count();
+            prop_assert!(
+                opened(&printed) <= opened(&source),
+                "{source:?} printed as {printed:?}"
+            );
+        }
     }
 
     #[test]
