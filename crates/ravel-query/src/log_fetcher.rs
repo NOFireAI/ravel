@@ -417,6 +417,26 @@ impl LogSegmentScan {
             .map(|gate| (Arc::clone(gate), JobSize::Bytes(self.block_job_bytes)))
     }
 
+    /// Drop the decoded block a [`next_block_columnar`](Self::next_block_columnar)
+    /// call left held, once its view is no longer read; see
+    /// [`BlockScan::release_decoded_block`]. A caller that decodes inside a
+    /// read-gate job calls this before the job returns, so the block is freed
+    /// on the thread that decoded it. A no-op when nothing is held or the
+    /// cursor is lost.
+    pub fn release_decoded_block(&mut self) {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.release_decoded_block();
+        }
+    }
+
+    /// Whether the cursor holds a decoded block; see
+    /// [`BlockScan::holds_decoded_block`]. `false` once the cursor is lost.
+    pub fn holds_decoded_block(&self) -> bool {
+        self.scan
+            .as_ref()
+            .is_some_and(BlockScan::holds_decoded_block)
+    }
+
     /// Arms the test hook: the next gated block decode panics inside its job.
     #[cfg(test)]
     pub(crate) fn panic_next_gate_job_for_test(&mut self) {
@@ -528,7 +548,9 @@ impl LogSegmentScan {
     /// block counters recorded on exhaustion.
     ///
     /// The returned view borrows this scan, so it must be dropped before the
-    /// next call to either exit.
+    /// next call to either exit. The decoded block behind it stays held until
+    /// [`release_decoded_block`](Self::release_decoded_block) or the next
+    /// decode drops it.
     ///
     /// # This exit refuses when erasure is pending
     ///

@@ -4506,9 +4506,8 @@ enum ColumnarStep {
     /// the row path.
     Fallback,
     /// A clean block's built batches (possibly empty for a block with no
-    /// surviving row). The decoded block itself, which stays resident behind
-    /// the reader while those batches drain, is charged by
-    /// [`ColumnarBlockJob::run`].
+    /// surviving row). The decoded block they were built from is already
+    /// freed: [`ColumnarBlockJob::run`] drops it before it returns.
     Held {
         batches: Vec<RecordBatch>,
     },
@@ -4534,70 +4533,167 @@ struct ColumnarBlockJob {
     /// Panic inside the gate job instead of running it.
     #[cfg(test)]
     panic_for_test: bool,
+    /// The object key the job's [`BlockProbe`]s are recorded under.
+    #[cfg(test)]
+    probe_key: String,
 }
 
 impl ColumnarBlockJob {
-    /// Decodes `scan`'s next block and builds its batches.
+    /// Decodes `scan`'s next block, builds its batches, and frees the decoded
+    /// block before returning ([`release_decoded`]). On the read gate this
+    /// runs as one job, so the block's allocations are freed on the blocking
+    /// thread that made them rather than on whichever thread runs the next
+    /// decode or drops the scan (ADR-1702, the decoded-state release
+    /// amendment).
     ///
-    /// `resident` is the charge for the block the reader held before this
-    /// call. The decode frees that block, so the charge is resized to the
-    /// block it decoded as soon as the decode returns, and freed when it
-    /// decoded none.
+    /// `resident` charges the decoded block from the moment its decode returns
+    /// until it is freed, and is released right after it, so it is empty
+    /// whenever this returns.
     fn run(self, scan: &mut LogSegmentScan, resident: &MemoryReservation) -> ColumnarStep {
-        match scan.next_block_columnar() {
-            Ok(ColumnarBlockOutcome::Exhausted) => {
-                resident.free();
-                ColumnarStep::Exhausted(scan.stats())
-            }
+        #[cfg(test)]
+        let probe_key = self.probe_key.clone();
+        let step = match scan.next_block_columnar() {
+            Ok(ColumnarBlockOutcome::Exhausted) => ColumnarStep::Exhausted(scan.stats()),
             // The fast path is only entered with no erasure, so this is
             // unreachable in practice; fall back rather than risk serving an
             // erased record columnar.
-            Ok(ColumnarBlockOutcome::ErasurePending) => {
-                resident.free();
-                ColumnarStep::Fallback
-            }
+            Ok(ColumnarBlockOutcome::ErasurePending) => ColumnarStep::Fallback,
             Ok(ColumnarBlockOutcome::Block(view)) => {
-                if let Err(e) = resident.try_resize(view.decoded_bytes()) {
-                    return ColumnarStep::Failed(e);
-                }
-                if view.has_attrs_raw_page() {
-                    return ColumnarStep::Fallback;
-                }
-                let built = self.block.and_then(|block| {
-                    build_columnar_batches(
-                        &view,
-                        &self.schema,
-                        &self.projection,
-                        &self.declared,
-                        &self.attr_keys,
-                        self.full_len,
-                        block.map(|block| RowRefRange {
-                            segment: self.segment,
-                            block,
-                            first_row: 0,
-                        }),
-                        &self.str_values,
-                    )
-                });
-                match built {
-                    Ok(batches) => ColumnarStep::Held { batches },
-                    Err(e) => ColumnarStep::Failed(e),
-                }
+                #[cfg(test)]
+                record_block_probe(
+                    &probe_key,
+                    BlockProbe::Decoded {
+                        thread: std::thread::current().id(),
+                        bytes: view.decoded_bytes(),
+                    },
+                );
+                self.build(&view, resident)
             }
-            Err(e) => {
-                resident.free();
-                ColumnarStep::Failed(SqlError::from(e).into())
-            }
+            Err(e) => ColumnarStep::Failed(SqlError::from(e).into()),
+        };
+        release_decoded(
+            scan,
+            resident,
+            #[cfg(test)]
+            &probe_key,
+        );
+        step
+    }
+
+    /// The batches of the block `view` reads, with `resident` resized to the
+    /// block first.
+    fn build(self, view: &ColumnarBlockView<'_>, resident: &MemoryReservation) -> ColumnarStep {
+        if let Err(e) = resident.try_resize(view.decoded_bytes()) {
+            return ColumnarStep::Failed(e);
+        }
+        if view.has_attrs_raw_page() {
+            return ColumnarStep::Fallback;
+        }
+        let built = self.block.and_then(|block| {
+            build_columnar_batches(
+                view,
+                &self.schema,
+                &self.projection,
+                &self.declared,
+                &self.attr_keys,
+                self.full_len,
+                block.map(|block| RowRefRange {
+                    segment: self.segment,
+                    block,
+                    first_row: 0,
+                }),
+                &self.str_values,
+            )
+        });
+        match built {
+            Ok(batches) => ColumnarStep::Held { batches },
+            Err(e) => ColumnarStep::Failed(e),
         }
     }
 }
 
-/// `job` on `gate` as one [`ReadSite::LogBlock`] job: the block's decode and
-/// its Arrow build both leave the runtime worker, and the scan comes back
-/// with the outcome. `resident`, the charge for the block the scan's reader
-/// holds, goes with it, so a job waiting for a permit keeps that block
-/// charged until its decode frees it, and a job that never hands the scan
-/// back drops the charge with the scan.
+/// Frees the decoded block `scan` holds, then its charge in `resident`, in
+/// that order, so the charge never drops below what is held.
+///
+/// The built batches cannot borrow the block: a `RecordBatch` owns its
+/// buffers and the block's columns are plain `Vec`s, so every batch buffer is
+/// a copy. What can outlive the block is a string dictionary's
+/// `Arc<DictValues>`, which the scan's [`StrValuesCache`] shares with it until
+/// its next sweep; that is a few flat buffers, not one allocation per row.
+fn release_decoded(
+    scan: &mut LogSegmentScan,
+    resident: &MemoryReservation,
+    #[cfg(test)] probe_key: &str,
+) {
+    #[cfg(test)]
+    let (held_before, charge_before) = (scan.holds_decoded_block(), resident.size());
+    scan.release_decoded_block();
+    #[cfg(test)]
+    let (held_after, charge_between) = (scan.holds_decoded_block(), resident.size());
+    resident.free();
+    #[cfg(test)]
+    record_block_probe(
+        probe_key,
+        BlockProbe::Released {
+            thread: std::thread::current().id(),
+            held_before,
+            held_after,
+            charge_before,
+            charge_between,
+            charge_after: resident.size(),
+        },
+    );
+}
+
+/// What the columnar drain did to one object's decoded blocks, recorded for
+/// the keys a test arms in [`BLOCK_PROBES`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockProbe {
+    /// A columnar decode returned a block of `bytes` decoded bytes on `thread`.
+    Decoded {
+        thread: std::thread::ThreadId,
+        bytes: usize,
+    },
+    /// [`release_decoded`] ran on `thread`: whether the scan held a decoded
+    /// block before and after the release, and the `resident` charge before
+    /// the release, between the release and the charge's own release, and
+    /// after both.
+    Released {
+        thread: std::thread::ThreadId,
+        held_before: bool,
+        held_after: bool,
+        charge_before: usize,
+        charge_between: usize,
+        charge_after: usize,
+    },
+    /// A `log_block` job's result reached the stream: whether the scan it
+    /// handed back held a decoded block, and the charge it handed back.
+    JobReturned { held: bool, charge: usize },
+    /// [`LogScanStream::finish_segment`] was about to drop a columnar scan
+    /// that did or did not hold a decoded block.
+    SegmentFinished { held: bool },
+}
+
+/// Object keys whose [`BlockProbe`]s are recorded, each with its log.
+#[cfg(test)]
+static BLOCK_PROBES: std::sync::Mutex<Vec<(String, Vec<BlockProbe>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_block_probe(key: &str, probe: BlockProbe) {
+    if let Ok(mut armed) = BLOCK_PROBES.lock()
+        && let Some((_, log)) = armed.iter_mut().find(|(k, _)| k == key)
+    {
+        log.push(probe);
+    }
+}
+
+/// `job` on `gate` as one [`ReadSite::LogBlock`] job: the block's decode, its
+/// Arrow build and the free of its decoded columns all run on the blocking
+/// thread, and the scan comes back with the outcome, holding no decoded block.
+/// `resident` goes with the scan to charge the block while the job holds it,
+/// and comes back empty.
 fn columnar_block_on_gate(
     gate: Arc<ReadGate>,
     size: JobSize,
@@ -5472,6 +5568,17 @@ impl LogScanStream {
     /// This partition is done with the current segment: drop its handle on the
     /// segment's directories and move to the next owned segment.
     fn finish_segment(&mut self) {
+        #[cfg(test)]
+        if let LogScanState::Columnar(scan) = &self.state {
+            record_block_probe(
+                self.current_seg
+                    .as_ref()
+                    .map_or("", |s| s.data_object_key.as_str()),
+                BlockProbe::SegmentFinished {
+                    held: scan.holds_decoded_block(),
+                },
+            );
+        }
         self.current_dirs = None;
         self.state = LogScanState::NextSegment;
         let live = lock_str_values(&self.str_values).live_bytes();
@@ -5948,6 +6055,11 @@ impl LogScanStream {
                                         .as_ref()
                                         .map_or("", |s| s.data_object_key.as_str()),
                                 ),
+                                #[cfg(test)]
+                                probe_key: this
+                                    .current_seg
+                                    .as_ref()
+                                    .map_or_else(String::new, |s| s.data_object_key.clone()),
                             };
                             match scan.block_gate() {
                                 // Exhaustion decodes nothing, so it submits no
@@ -5961,9 +6073,9 @@ impl LogScanStream {
                                                 .into(),
                                         ));
                                     };
-                                    // The previous block's charge goes with the
-                                    // scan: the reader frees that block only
-                                    // when the job's decode runs.
+                                    // The reservation goes with the scan to
+                                    // charge the block the job decodes until
+                                    // the job frees it.
                                     let resident = this.resident.take();
                                     this.state = LogScanState::DecodingColumnar {
                                         job: columnar_block_on_gate(
@@ -6045,9 +6157,6 @@ impl LogScanStream {
                                 fut,
                                 skip: this.block_cursor,
                             };
-                            // The abandoned cursor, and the block its reader
-                            // held, went with the state it was in.
-                            this.resident.free();
                         }
                         ColumnarStep::Held { batches } => {
                             // A clean columnar block: the streak of consecutive
@@ -6060,15 +6169,10 @@ impl LogScanStream {
                             // row-ref cursor moves with it, so a fallback
                             // re-opens at the same surviving-block position.
                             this.block_cursor += 1;
-                            // The decoded block, whether or not a row survived,
-                            // is already charged in `resident`: the job that
-                            // decoded it resized that charge from the previous
-                            // block's as its decode returned, and the next job
-                            // resizes it again only once its own decode has
-                            // freed this block. Outside the decode calls
-                            // themselves there is no interval during which it
-                            // is resident and uncharged, a wait for a gate
-                            // permit included.
+                            // The decoded block these were built from is
+                            // already freed, and its charge with it
+                            // (`ColumnarBlockJob::run`): only the batches are
+                            // left to charge.
                             if !batches.is_empty()
                                 && let Err(e) = this.hold_batches(batches)
                             {
@@ -6200,6 +6304,16 @@ impl LogScanStream {
                     this.blocks.decode_build_elapsed.add_elapsed(started);
                     match ran {
                         Ok((scan, resident, step)) => {
+                            #[cfg(test)]
+                            record_block_probe(
+                                this.current_seg
+                                    .as_ref()
+                                    .map_or("", |s| s.data_object_key.as_str()),
+                                BlockProbe::JobReturned {
+                                    held: scan.holds_decoded_block(),
+                                    charge: resident.size(),
+                                },
+                            );
                             this.resident = resident;
                             this.decoded = Some(Decoded::Columnar(step));
                             this.state = LogScanState::Columnar(scan);
