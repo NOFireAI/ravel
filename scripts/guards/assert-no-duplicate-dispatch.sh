@@ -16,25 +16,87 @@
 # about: a false clean, which is the only wrong answer that costs anything
 # here.
 #
+# A --paths entry takes one of three forms:
+#   path          the whole file: any change the pull request makes to it
+#                 collides.
+#   path:L10-L80  a base line range: collides only when one of the pull
+#                 request's patch hunks for that file changes a base line
+#                 inside it.
+#   path#symbol   a definition on the base: collides only when a hunk changes
+#                 a base line inside it.
+# A changed base line is a removed or replaced line; a pure insertion counts
+# against the base lines on both sides of it; context lines do not count.
+#
+# The symbol anchor is plain text, not a parser. It matches a line that
+# defines the name with fn, struct, enum, trait, mod, const, static, type or
+# union (after pub and the async, const, unsafe, default or extern
+# qualifiers), an impl line that names it anywhere in its header, or a shell
+# function definition (`name()` or `function name`). In .rs files only the
+# Rust forms count, in .sh and .bash files only the shell forms, elsewhere
+# both. The definition runs from the anchor line to its matching close
+# brace; to the first semicolon outside brackets when no brace opens first;
+# or, when braces never balance, to the line before the next definition at
+# column 0. Braces in strings and comments are counted like any other, and
+# doc comments and attributes above the anchor are not part of the
+# definition. Every anchor that matches counts. A name not found on the base
+# is compared as the whole file, with a NOTE.
+#
+# A .md file under docs/ is compared by heading section instead of by line:
+# a line's section is its nearest preceding ATX heading outside fenced code,
+# and an entry collides only when a hunk changes a line in one of the
+# entry's sections. path#symbol names a heading by its GitHub anchor
+# (docs/x.md#usage for "## Usage") and covers its nested subsections;
+# path:L10-L80 covers every section with a line in the range. A bare docs/
+# path names no section and keeps the whole-file rule.
+#
+# Hunks come from the patch field of the same paginated files endpoint, in
+# the same call; a file returned with no patch (a diff too large to inline)
+# is compared as the whole file. Symbols, headings and sections are read
+# from --base-ref (default origin/main), while a pull request's hunks number
+# lines on its own merge base, so the two drift apart by whatever landed in
+# that file since the pull request forked.
+#
 # Usage:
 #   assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b,c] [--paths d]
 #                                   [--closed-days N] [--repo owner/name]
+#                                   [--base-ref REF]
 #
 # Exit codes:
 #   0   nothing overlapping; dispatch
-#   64  usage
+#   64  usage, including a --paths entry that does not parse (path:L10 with
+#       no end, a start of 0 or after the end, path# with no symbol, #symbol
+#       with no path, or a path containing ':' or '#' in any other way)
 #   65  an existing pull request already addresses the issue; skip and log
 #   66  an OPEN, non-draft pull request is already touching the predicted
-#       files (drafts, merged and closed ones are listed as context only)
-#   69  the question could not be asked (gh failed after its retries, or a
-#       pull request list came back as long as its limit and may be
-#       truncated); not the same as a clean answer, and never report it as one
+#       files, line ranges or definitions (drafts, merged and closed ones are
+#       listed as context only)
+#   69  the question could not be asked (gh failed after its retries, a pull
+#       request list came back as long as its limit and may be truncated, a
+#       pull request's files and patches could not be fetched, or --base-ref
+#       does not resolve); not the same as a clean answer, and never report
+#       it as one
 set -euo pipefail
 
 issue=""
 paths=()
 closed_days=14
 repo=""
+base_ref="origin/main"
+
+# Prints bare, range or symbol for an entry that parses; fails otherwise.
+entry_form() {
+  local e="$1"
+  if [[ "${e}" == *"#"* ]]; then
+    [[ "${e}" =~ ^[^#:]+#[A-Za-z0-9_-]+$ ]] || return 1
+    echo symbol
+  elif [[ "${e}" == *:* ]]; then
+    [[ "${e}" =~ ^[^#:]+:L([1-9][0-9]*)-L([1-9][0-9]*)$ ]] || return 1
+    ((BASH_REMATCH[1] <= BASH_REMATCH[2])) || return 1
+    echo range
+  else
+    echo bare
+  fi
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,11 +104,22 @@ while [[ $# -gt 0 ]]; do
     --paths)
       [[ -n "${2:-}" ]] || { echo "assert-no-duplicate-dispatch.sh: --paths needs a value" >&2; exit 64; }
       IFS=',' read -r -a chunk <<<"$2"
-      paths+=("${chunk[@]}")
+      for entry in "${chunk[@]}"; do
+        [[ -z "${entry}" ]] && continue
+        entry_form "${entry}" >/dev/null || {
+          echo "assert-no-duplicate-dispatch.sh: --paths entry '${entry}' is not path, path:L<start>-L<end> or path#symbol" >&2
+          exit 64
+        }
+        paths+=("${entry}")
+      done
       shift 2
       ;;
     --closed-days) closed_days="${2:-}"; shift 2 ;;
     --repo) repo="${2:-}"; shift 2 ;;
+    --base-ref)
+      [[ -n "${2:-}" ]] || { echo "assert-no-duplicate-dispatch.sh: --base-ref needs a value" >&2; exit 64; }
+      base_ref="$2"; shift 2
+      ;;
     *) echo "assert-no-duplicate-dispatch.sh: unexpected argument '$1'" >&2; exit 64 ;;
   esac
 done
@@ -235,22 +308,198 @@ if ((${#paths[@]} == 0)); then
   exit 0
 fi
 
+# The base lines a patch changes: each removed line, and both neighbours of
+# a pure insertion. Exits 3 on a non-empty patch with no hunk header.
+changed_lines_awk='
+  /^@@ -[0-9]/ {
+    h = $2; sub(/^-/, "", h); n = split(h, p, ",")
+    a = p[1] + 0; b = (n > 1) ? p[2] + 0 : 1
+    base = (b == 0) ? a + 1 : a; rep = 0; seen = 1; next
+  }
+  !seen { next }
+  /^-/ { print base; base++; rep = 1; next }
+  /^\+/ { if (!rep) { print base - 1; print base }; next }
+  /^\\/ { next }
+  { base++; rep = 0 }
+  END { if (!seen) exit 3 }'
+
+# lo:hi for every definition of `sym` in the file; see the header.
+symbol_awk='
+  function anchor(s) {
+    if (rust && s ~ ("^[ \t]*(pub(\\([^)]*\\))?[ \t]+)?(async[ \t]+|const[ \t]+|unsafe[ \t]+|default[ \t]+|extern[ \t]+(\"[^\"]*\"[ \t]+)?)*(fn|struct|enum|trait|mod|const|static|type|union)[ \t]+(mut[ \t]+)?" sym "([^A-Za-z0-9_]|$)")) return 1
+    if (rust && s ~ /^[ \t]*(unsafe[ \t]+)?impl([ \t<]|$)/ && s ~ ("(^|[^A-Za-z0-9_])" sym "([^A-Za-z0-9_]|$)")) return 1
+    if (shell && s ~ ("^[ \t]*(function[ \t]+)?" sym "[ \t]*\\(\\)")) return 1
+    if (shell && s ~ ("^[ \t]*function[ \t]+" sym "([ \t{(]|$)")) return 1
+    return 0
+  }
+  function top(s) {
+    if (rust && s ~ /^(pub(\([^)]*\))?[ \t]+)?(async[ \t]+|const[ \t]+|unsafe[ \t]+|default[ \t]+|extern[ \t]+("[^"]*"[ \t]+)?)*(fn|struct|enum|trait|mod|const|static|type|union|impl)[ \t<]/) return 1
+    if (shell && s ~ /^(function[ \t]+[A-Za-z0-9_-]+|[A-Za-z0-9_-]+[ \t]*\(\))/) return 1
+    return 0
+  }
+  { line[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      if (!anchor(line[i])) continue
+      depth = 0; brackets = 0; opened = 0; end = 0
+      for (j = i; j <= NR && !end; j++) {
+        if (j > i && top(line[j])) { end = j - 1; break }
+        n = length(line[j])
+        for (k = 1; k <= n; k++) {
+          c = substr(line[j], k, 1)
+          if (c == "{") { depth++; opened = 1 }
+          else if (c == "}") { depth--; if (opened && depth <= 0) { end = j; break } }
+          else if (c == "(" || c == "[") brackets++
+          else if (c == ")" || c == "]") brackets--
+          else if (c == ";" && !opened && depth <= 0 && brackets <= 0) { end = j; break }
+        }
+      }
+      if (!end) end = NR
+      print i ":" end
+    }
+  }'
+
+# lo:hi for every ATX heading whose GitHub anchor is `sym`, through its
+# nested subsections.
+heading_awk='
+  function slug(s) { s = tolower(s); gsub(/[^a-z0-9 _-]/, "", s); gsub(/ /, "-", s); return s }
+  /^[ ]*(```|~~~)/ { fence = !fence; next }
+  !fence && /^(#|##|###|####|#####|######)([ \t]|$)/ {
+    h++; at[h] = NR; t = $0; match(t, /^#+/); level[h] = RLENGTH
+    sub(/^#+[ \t]*/, "", t); sub(/[ \t]*#*[ \t]*$/, "", t); name[h] = slug(t)
+  }
+  END {
+    for (i = 1; i <= h; i++) {
+      if (name[i] != slug(sym)) continue
+      end = NR
+      for (j = i + 1; j <= h; j++) if (level[j] <= level[i]) { end = at[j] - 1; break }
+      print at[i] ":" end
+    }
+  }'
+
+# The first changed line in `lines` whose section is one of the sections
+# `ranges` covers. A line before the first heading is in section 0.
+section_hit_awk='
+  /^[ ]*(```|~~~)/ { fence = !fence }
+  !fence && /^(#|##|###|####|#####|######)([ \t]|$)/ { cur = NR }
+  { sec[NR] = cur }
+  END {
+    sec[0] = 0; sec[NR + 1] = sec[NR]
+    n = split(ranges, rr, " ")
+    for (i = 1; i <= n; i++) {
+      split(rr[i], b, ":"); hi = (b[2] + 0 > NR + 1) ? NR + 1 : b[2] + 0
+      for (l = b[1] + 0; l <= hi; l++) want[sec[l]] = 1
+    }
+    m = split(lines, ll, " ")
+    for (i = 1; i <= m; i++) {
+      l = ll[i] + 0; if (l < 0) l = 0; if (l > NR + 1) l = NR + 1
+      if (sec[l] in want) { print ll[i]; exit }
+    }
+  }'
+
+# Resolve every entry once against the base. e_mode is whole (any change to
+# the file), lines (a changed line inside e_ranges) or sections (a changed
+# line in a section e_ranges covers, read from e_base).
+e_path=(); e_label=(); e_mode=(); e_ranges=(); e_base=()
+needs_base=0
+for entry in "${paths[@]}"; do
+  form="$(entry_form "${entry}")"
+  p="${entry%%[:#]*}"
+  if [[ "${form}" == symbol || ("${form}" == range && "${p}" == docs/*.md) ]]; then
+    needs_base=1
+  fi
+done
+scratch=""
+if ((needs_base == 1)); then
+  git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null || {
+    echo "assert-no-duplicate-dispatch.sh: base ref '${base_ref}' does not resolve; refusing to report a clean answer" >&2
+    exit 69
+  }
+  scratch="$(mktemp -d)"
+  trap 'rm -rf "${scratch}"' EXIT
+fi
+for entry in "${paths[@]}"; do
+  form="$(entry_form "${entry}")"
+  p="${entry%%[:#]*}"
+  mode=whole; ranges=""; bfile=""
+  docs=0
+  [[ "${p}" == docs/*.md ]] && docs=1
+  if [[ "${form}" != bare && (${docs} == 1 || "${form}" == symbol) ]]; then
+    bfile="${scratch}/base-${#e_path[@]}"
+    git show "${base_ref}:${p}" >"${bfile}" 2>/dev/null || bfile=""
+  fi
+  case "${form}" in
+    range)
+      [[ "${entry}" =~ :L([0-9]+)-L([0-9]+)$ ]]
+      ranges="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+      mode=lines
+      [[ ${docs} == 1 && -n "${bfile}" ]] && mode=sections
+      ;;
+    symbol)
+      sym="${entry#*#}"
+      if [[ -n "${bfile}" && ${docs} == 1 ]]; then
+        ranges="$(awk -v sym="${sym}" "${heading_awk}" "${bfile}")"
+        mode=sections
+      elif [[ -n "${bfile}" ]]; then
+        rust=1; shell=1
+        [[ "${p}" == *.rs ]] && shell=0
+        [[ "${p}" == *.sh || "${p}" == *.bash ]] && rust=0
+        ranges="$(awk -v sym="${sym}" -v rust="${rust}" -v shell="${shell}" "${symbol_awk}" "${bfile}")"
+        mode=lines
+      fi
+      ranges="${ranges//$'\n'/ }"
+      if [[ -z "${ranges}" ]]; then
+        echo "NOTE  ${entry}: '${sym}' not found in ${p} on ${base_ref}; compared as the whole file"
+        mode=whole
+      fi
+      ;;
+  esac
+  e_path+=("${p}"); e_label+=("${entry}"); e_mode+=("${mode}")
+  e_ranges+=("${ranges}"); e_base+=("${bfile}")
+done
+
 collision=0
 overlap_report=""
 context_report=""
 while IFS=$'\t' read -r num state title; do
   [[ -z "${num}" ]] && continue
-  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[].filename')"
+  # One line per file, a JSON array of its name and its patch (null when the
+  # endpoint left the patch out).
+  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[] | [.filename, .patch] | @json')"
+  names="$(jq -r '.[0]' <<<"${files}")" || exit 69
   shared=""
-  for want in "${paths[@]}"; do
-    [[ -z "${want}" ]] && continue
-    while IFS= read -r have; do
-      [[ -z "${have}" ]] && continue
-      if [[ "${have}" == "${want}" ]]; then
-        shared+="${have} "
-      fi
-    done <<<"${files}"
+  for i in "${!e_path[@]}"; do
+    grep -qxF -- "${e_path[i]}" <<<"${names}" || continue
+    if [[ "${e_mode[i]}" == whole ]]; then
+      shared+="${e_label[i]}, "
+      continue
+    fi
+    patch="$(jq -r --arg p "${e_path[i]}" \
+      'select(.[0] == $p) | if .[1] == null then "-" else "+" + .[1] end' <<<"${files}")" || exit 69
+    if [[ "${patch}" == "-" ]]; then
+      shared+="${e_label[i]} (no patch in the API response; compared as the whole file), "
+      continue
+    fi
+    patch="${patch#+}"
+    [[ -z "${patch}" ]] && continue
+    if ! changed="$(printf '%s\n' "${patch}" | awk "${changed_lines_awk}")"; then
+      shared+="${e_label[i]} (patch did not parse; compared as the whole file), "
+      continue
+    fi
+    changed="${changed//$'\n'/ }"
+    hit=""
+    if [[ "${e_mode[i]}" == sections ]]; then
+      hit="$(awk -v ranges="${e_ranges[i]}" -v lines="${changed}" "${section_hit_awk}" "${e_base[i]}")"
+    else
+      for l in ${changed}; do
+        for r in ${e_ranges[i]}; do
+          if ((l >= ${r%%:*} && l <= ${r##*:})); then hit="${l}"; break 2; fi
+        done
+      done
+    fi
+    [[ -n "${hit}" ]] && shared+="${e_label[i]} (base line ${hit}), "
   done
+  shared="${shared%, }"
   if [[ -n "${shared}" ]]; then
     # Only an OPEN, non-draft pull request is a collision: a draft is held
     # work nobody is landing (a held draft once blocked two epics' tickets for
