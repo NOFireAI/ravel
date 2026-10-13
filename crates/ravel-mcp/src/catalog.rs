@@ -143,8 +143,7 @@ pub struct GetTraceInput {
     /// Optional. Omitted, the lookup reads every span the tenant retains.
     pub time_range: Option<TimeRange>,
     pub include_logs: Option<bool>,
-    /// Spans (plus log rows when `include_logs` is set) returned; default
-    /// 200, ceiling 5,000.
+    /// Spans returned; default 200, ceiling 5,000.
     pub max_rows: Option<u32>,
     pub max_bytes_scanned: Option<u64>,
     pub max_store_requests: Option<u32>,
@@ -327,7 +326,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_585;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_541;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.

@@ -41,7 +41,9 @@ mints no reference.
 (see [Fetching one trace by id](../guides/traces.md#fetching-one-trace-by-id)).
 `time_range` is optional. Without it, the lookup resolves from time zero and
 reads every folded part and the unsealed tail the tenant still retains, so its
-cost grows with retention. With it, the bounds are kept exactly. The tool
+cost grows with retention. With it, the bounds are kept exactly. Unlike the
+HTTP route, where `start` and `end` only choose which objects are read, the
+tool also drops every span that starts outside `time_range`. The tool
 returns the spans in view and does not build the span tree or report missing
 parents or orphans. `include_logs: true` and an `evidence_ref` are refused
 with `unsupported`.

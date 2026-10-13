@@ -321,8 +321,8 @@ query endpoint is under `/api/v1` except one. `GET /api/traces/<trace_id>`
 (`sql` feature) returns every span of one trace as `spans` rows. Without
 `start` and `end` it reads every span the tenant retains; see
 [fetching one trace by id](docs/guides/traces.md#fetching-one-trace-by-id).
-The [HTTP API reference](docs/reference/http-api.md) lists the `/api/v1`
-routes. One of them, `POST /api/v1/admin/fold`, triggers a
+The [HTTP API reference](docs/reference/http-api.md) lists every route. One
+of them, `POST /api/v1/admin/fold`, triggers a
 [catalog fold on demand](docs/architecture.md#on-demand-catalog-fold).
 
 ## Agents (MCP)

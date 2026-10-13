@@ -92,7 +92,13 @@ Explicit bounds are kept exactly. `start` and `end` bound which objects are
 listed, as they do on `POST /api/v1/sql`. An omitted `end` is the current
 time.
 
-The rule covers this route and the MCP tool `ravel_get_trace`. A
+On this route, `start` and `end` choose which objects are read and do not
+filter rows. A span that starts outside the window can still be returned
+when its object is read. The MCP tool `ravel_get_trace` resolves its
+`time_range` the same way and also filters rows: it returns only the spans
+that start inside the range.
+
+The no-window rule covers this route and the MCP tool `ravel_get_trace`. A
 `POST /api/v1/sql` request that gives no window still reads one hour before
 `end`, even when its statement pins a `trace_id`. To read a whole trace over
 SQL, pass `"start": 0`.

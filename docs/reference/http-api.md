@@ -99,6 +99,7 @@ JSON body.
 | GET, POST | `/api/v1/query_exemplars` | `query`, `start`, `end` | Prometheus exemplars JSON envelope | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/analytics` | JSON: `query`, `start`, `end`, `step`, `op`, optional `timeout`, `min_commit_token`, `allow_partial` | JSON analytics envelope, one entry per series | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/sql` | JSON: `query`, `start`, `end`, optional `timeout`, `min_commit_token` | Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
+| GET | `/api/traces/{trace_id}` | path `trace_id`, plus optional `start`, `end`, `timeout`, `min_commit_token` | The `/api/v1/sql` response for every span of the trace: Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
 | POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
@@ -200,6 +201,25 @@ the Arrow IPC format to read it exactly`.
 To get an Arrow IPC stream instead, send
 `Accept: application/vnd.apache.arrow.stream`. The stream is bit-exact for
 every type and reads every such column.
+
+### `/api/traces/{trace_id}`
+
+`/api/traces/{trace_id}` is behind the `sql` cargo feature. It runs
+`SELECT * FROM spans WHERE trace_id = X'<trace_id>' ORDER BY start_ts,
+span_id` through the `/api/v1/sql` path, with the same envelope,
+authentication, limits, deadline and query audit record.
+
+- `trace_id` is 32 hexadecimal characters in either case, after the path
+  segment is percent-decoded once. Anything else is 400 `bad_data`, before
+  any object-store read.
+- A trace the tenant does not hold is 200 with zero rows.
+- Without `start`, the lookup reads every span the tenant retains, not the
+  one hour before `end` that `/api/v1/sql` defaults to. An omitted `end` is
+  the current time.
+- `start` and `end` choose which objects are read and do not filter rows, so
+  a span that starts outside them can still be returned.
+
+See [fetching one trace by id](../guides/traces.md#fetching-one-trace-by-id).
 
 ### `/mcp`
 
