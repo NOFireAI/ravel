@@ -4835,9 +4835,10 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
   resolves to `Dictionary(Int32, Int32)` on DataFusion 55.2).
 - **Never eligible:** `avg`/`mean` over a resolved **Float64** input (its UDAF
   runs plain IEEE f64 addition for that kind, which is not associative once a
-  running sum exceeds 2^53, so it depends on the single-partition fold order);
-  any `sum`, `min`, `max` over a `Float16`/`Float32`/`Float64` input, plain
-  or dictionary-encoded; and any
+  running sum exceeds 2^53, so it depends on the single-partition fold order),
+  which includes a `UInt64` argument, plain or dictionary-encoded, because the
+  built-in coercion widens it to Float64; any `sum`, `min`, `max` over a
+  `Float16`/`Float32`/`Float64` input, plain or dictionary-encoded; and any
   **float GROUP BY key** (including a bare `SELECT DISTINCT float_col`),
   because no merge-order-stable representative bit pattern for a float group
   key is proven: DataFusion 55 folds `-0.0` into `0.0` when it groups, but NaN

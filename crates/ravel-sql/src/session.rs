@@ -81,15 +81,17 @@
 //! classification (`executor::SqlExecutor`) has proven every aggregate and
 //! GROUP BY key in the query is order/partition-independent -- `count`, and
 //! `sum`/`min`/`max` over a resolved non-float input, with no float group key;
-//! `avg`/`mean` over a resolved integer input is eligible too (ADR-0825
-//! decision 3): its partial sum is exact `i128` accumulation, never plain f64
-//! addition. `avg`/`mean` over a resolved Float64 input (still plain IEEE f64
-//! addition) and any float input or key are never eligible. It is `false`
-//! for every other query and behind a default-off
-//! `SqlConfig` flag, so this is byte-identical to the old single-partition plan
-//! unless an operator opts in. The join/sort/window/file-scan knobs stay
-//! unconditionally `false`: their determinism requirements are out of ADR-0094's
-//! scope.
+//! `avg`/`mean` over a resolved integer input other than `UInt64`,
+//! dictionary-encoded or not, is eligible too (ADR-0825 decision 3): its
+//! partial sum is exact `i128` accumulation, never plain f64 addition.
+//! `avg`/`mean` over a Float64 or `UInt64` input (both resolve to Float64 and
+//! run plain IEEE f64 addition), `sum`/`min`/`max` over a float input, and any
+//! float group key are never eligible. It is `false` for every other query,
+//! and for every query when the operator turns
+//! `SqlConfig::parallel_final_aggregation` off (it defaults on); either way
+//! the plan is byte-identical to the old single-partition plan. The
+//! join/sort/window/file-scan knobs stay unconditionally `false`: their
+//! determinism requirements are out of ADR-0094's scope.
 //!
 //! Aggregation state size (issue #680, ADR-0102 decision 2's amendment):
 //! [`session_config`] also tightens DataFusion's two skip-partial-aggregation

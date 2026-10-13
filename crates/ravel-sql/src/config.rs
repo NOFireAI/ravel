@@ -372,9 +372,11 @@ pub struct SqlConfig {
     /// per-query classification (ADR-0094 decision 1) only ever flips
     /// DataFusion's `repartition_aggregations` on when this is `true` *and*
     /// every aggregate expression and GROUP BY key in the query is provably
-    /// order/partition-independent (`count`, `count distinct`, and
-    /// `sum`/`min`/`max` over non-float input; never `avg` or any float
-    /// accumulator or key). A non-exact-typed plan keeps the single-partition
+    /// order/partition-independent (`count` and `count distinct` over any
+    /// input, `sum`/`min`/`max` over non-float input, and `avg`/`mean` over an
+    /// integer input other than `UInt64`, dictionary-encoded or not, per
+    /// ADR-0825; never `sum`/`min`/`max` over float input, `avg`/`mean` over
+    /// float or `UInt64` input, or any float key). A non-exact-typed plan keeps the single-partition
     /// final byte for byte whatever this is set to. `false` is the operator
     /// opt-out, restoring the pre-amendment single-partition final for every
     /// query. Set once at server startup (`services/ravel-server`); no

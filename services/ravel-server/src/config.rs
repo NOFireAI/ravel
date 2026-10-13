@@ -1443,10 +1443,11 @@ pub struct Cli {
     /// order/partition-independent (`count` and `count distinct` over any
     /// input, `sum`/`min`/`max` over non-float input, and `avg`/`mean` over an
     /// integer input other than UInt64, dictionary-encoded or not, per
-    /// ADR-0825; no float group key); `sum`/`min`/`max`/`avg`/`mean` over float
-    /// input and any float key are never eligible and stay single-partitioned.
-    /// Pass `--sql-parallel-final-aggregation=false` (or the
-    /// bare `--sql-parallel-final-aggregation`, which stays accepted and still
+    /// ADR-0825; no float group key); `sum`/`min`/`max` over float input,
+    /// `avg`/`mean` over float or UInt64 input, and any float key are never
+    /// eligible and stay single-partitioned. Pass
+    /// `--sql-parallel-final-aggregation=false` (or the bare
+    /// `--sql-parallel-final-aggregation`, which stays accepted and still
     /// means on) to control it; `false` is the operator opt-out that restores
     /// the pre-amendment single-partition final for every query. Process-wide,
     /// not per-tenant; flipping it needs a restart, like every other SQL budget.
