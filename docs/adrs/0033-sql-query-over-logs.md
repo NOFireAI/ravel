@@ -265,6 +265,10 @@ avoiding an unconditional second catalog resolve on every metrics-only
 query, as the original paragraph intended — just enforced before
 DataFusion is invoked, not by DataFusion itself.
 
+ADR-2904 replaces the one-table rule in this paragraph: a statement may
+name several signal tables. See the ADR-2904 amendment at the end of this
+file.
+
 A base-table-name parse has one known sharp edge: a `WITH <name> AS
 (...)` common table expression named `logs` or `samples` shadows the
 real table of that name for the query's own scope, but the visitor
@@ -324,7 +328,9 @@ any layer.
 metrics rows (numeric samples, fixed label set) and log rows (text
 bodies, dynamic attributes, severity) have no common schema worth
 forcing, and no query needs to scan or join both signals in v1. Two
-tables, one session.
+tables, one session. The single `telemetry` table stays rejected; the
+premise that no query joins two signals is withdrawn by ADR-2904 (see the
+ADR-2904 amendment at the end of this file).
 
 **D. A separate `POST /api/v1/logs-sql` endpoint.** Rejected: DataFusion
 already resolves table names from query text inside one
@@ -361,4 +367,24 @@ gain.
 - The `samples`/`logs` table dispatch decided here, and the cross-signal
   rejection, are enumerated and scored in the SQL conformance table
   ([docs/sql-conformance.md](../sql-conformance.md), ADR-0035) alongside the
-  aggregate allowlist and the read-only write rejections.
+  aggregate allowlist and the read-only write rejections. ADR-2904 removes
+  the cross-signal rejection; the conformance row changes when epic #2904
+  lands it.
+
+## Amendment (2026-10-11, ADR-2904): a statement may name several signal tables
+
+<!-- amendment-applies: sections="Decision|Rejected alternatives|Consequences" pointer="ADR-2904" -->
+
+ADR-2904 replaces the rule "exactly one registered per session". A statement
+may name several of the signal tables, and Parquet tables beside them. It
+resolves one snapshot per named signal, and the session registers the tables
+the statement names, with their scalar functions, for the one tenant.
+
+What stays from this ADR: one SQL endpoint, the table set decided from parsed
+table references before any catalog listing, CTE names excluded, and a
+session that registers nothing the statement does not name. Rejected
+alternative C's single `telemetry` table stays rejected.
+
+Until epic #2904's code lands, the executor still returns
+`SqlError::CrossSignalQuery` for such a statement. The decision has moved;
+the behaviour follows it.

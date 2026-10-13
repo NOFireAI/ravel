@@ -132,7 +132,9 @@ before planning, and a query naming two real tables is rejected before
 any catalog listing. Extend `SpansPushdown` with the duration, status,
 and service predicates the v2 structures make prunable, under the
 existing widen-only rule (ADR-0013): pruning may only widen the read set,
-and DataFusion re-applies the original predicate above the scan.
+and DataFusion re-applies the original predicate above the scan. ADR-2904
+replaces the one-signal-per-query rule cited here; see the ADR-2904
+amendment at the end of this file.
 
 `duration_ns` is not a stored column. It is exposed as a computed SQL
 column so `WHERE duration_ns > 5e8` is expressible, and the pushdown maps
@@ -213,3 +215,14 @@ runs out of memory, not whether.
   tenant resolution, budgets, and one-signal-per-query rule the samples
   and logs tables already have.
 - Span links remain unstored. That is a named gap, not an oversight.
+
+## Amendment (2026-10-11, ADR-2904): `spans` may be named beside other tables
+
+<!-- amendment-applies: sections="5. Register the spans table" pointer="ADR-2904" -->
+
+Decision 5 registered `spans` under the one-signal-per-query rule of
+ADR-0033. ADR-2904 replaces that rule: a statement may name `spans` together
+with other signal tables and Parquet tables, with one snapshot resolved per
+named signal. The `spans` table, its pushdown, and its widen-only rule are
+unchanged. Until epic #2904's code lands, the executor still rejects such a
+statement.

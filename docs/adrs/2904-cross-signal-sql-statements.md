@@ -4,8 +4,9 @@ Status: Accepted
 Date: 2026-10-11
 Epic: #2904
 Amends: ADR-0033 ("One SQL endpoint, two tables, exactly one registered per
-session", and Rejected alternatives C and D), ADR-0045 decision 5, ADR-1101
-decision 1, ADR-2040 (a Parquet table beside a signal table)
+session", and the premise of Rejected alternative C), ADR-0045 decision 5,
+ADR-1101 decision 1, ADR-2040 D6 (a Parquet table beside a signal table).
+Each carries an amendment section pointing here.
 
 ## Context
 
@@ -18,7 +19,8 @@ before any catalog listing. `SqlExecutor::statement_tables`
 (`crates/ravel-sql/src/executor.rs`) counts the names and
 `resolve_parquet_target` refuses the Parquet case.
 
-ADR-0033 gave four reasons. Each is checked here against the tree at
+ADR-0033 gave three reasons (1, 2 and 4 below). The code imposes a fourth
+(3), which ADR-0033 never states. Each is checked here against the tree at
 099b0e845.
 
 1. **No use case in v1.** This was a statement about demand, and demand
@@ -32,7 +34,8 @@ ADR-0033 gave four reasons. Each is checked here against the tree at
    Parquet tables join each other (`tests/parquet_tables.rs`). The join
    operators, their memory accounting through the per-query pool, and
    `CompactSlices`'s treatment of join build sides already ship.
-3. **One snapshot per statement.** This is real. `Catalog::resolve` takes
+3. **One snapshot per statement** (from the code, not from ADR-0033). This
+   is real. `Catalog::resolve` takes
    one signal, `Snapshot` carries no signal, and no ordering exists between
    two signals of one tenant (`docs/concepts.md`: "No transaction, snapshot,
    or ordering guarantee spans two tenants or two signals of one tenant").
@@ -129,7 +132,10 @@ the form is unambiguous.
 - A token qualified with a table the statement does not read, or with a
   Parquet table, is a 400.
 
-An unsatisfiable token stays `503 unavailable` and now names the table.
+An unsatisfiable token stays `503 unavailable` with its existing stable
+message. The message does not name the table: it is a fixed constant in both
+`ravel-sql` and `ravel-query`, and the caller already knows which token it
+qualified with which table.
 
 ### 4. The session registers the tables the statement names, for one tenant
 
@@ -145,18 +151,21 @@ Scalar functions are the union over the named tables: `label` and
 aggregate, scalar, window and table-function allowlists are unchanged and
 still run for every session.
 
-The `LIKE` rewrite becomes column-scoped. `LikeToUdf` rewrites a `LIKE`
-only when every column its operands reference is a column of `logs`. Any
-other `LIKE` is evaluated by the engine's built-in operator, as it is in a
-session without `logs` today.
+The `LIKE` rewrite becomes relation-scoped. `LikeToUdf` rewrites a `LIKE`
+only when every column its operands reference resolves to the registered
+`logs` relation. The test is on the relation a column resolves to, not on
+its name: `attrs`, `ts`, `trace_id` and `span_id` are column names `logs`
+shares with other tables. Any other `LIKE` is evaluated by the engine's
+built-in operator, as it is in a session without `logs` today.
 
 ### 5. Plan-derived work is attributed per table
 
 Nothing derived from the plan may assume the plan has one table.
 
-- **Row window.** Each `TableScan` gets the request window on its own
-  table's event-time column. The reported window predicate becomes one entry
-  per table.
+- **Row window.** Each `TableScan` of a signal table gets the request window
+  on its own table's event-time column. A Parquet scan takes no row window,
+  as today: a Parquet table has no event-time column the executor knows. The
+  reported window predicate becomes one entry per signal table.
 - **Snapshot pruning from predicates.** A predicate may prune table T's
   snapshot only when every row that any scan of T contributes to the result
   must satisfy it. The executor derives the candidate predicates per scan,
@@ -201,16 +210,19 @@ present exactly once, with:
 - `phases`, the same per-phase shape as `stats.phases` (`resolve`, `plan`,
   `probe`, `scan`), counting only that signal's requests and bytes
 
-For every counter, the per-signal entries plus the Parquet share sum to the
-statement total. A single-signal statement has one entry. `EXPLAIN` carries
-the same list. `stats.pruning.segments` is documented as the sum, and its
+For every counter, the per-signal entries sum to the statement total when
+the statement names no Parquet table. When it does, the Parquet tables have
+no entry and their share is the total minus the per-signal entries. A
+single-signal statement has one entry. `EXPLAIN` carries the same list, and
+nothing else new. `stats.pruning.segments` is documented as the sum, and its
 "the one snapshot" wording goes.
 
 ### 8. Joins run on the coordinator
 
 A statement that names more than one table never fans out. The distributed
-samples scan stays a single-table, metrics-only path, and `EXPLAIN` reports
-that the statement ran locally. Join operators run under the statement's one
+samples scan stays a single-table, metrics-only path. `EXPLAIN` gains no
+field for this: it plans locally for every statement today and keeps doing
+so. Join operators run under the statement's one
 memory pool. `repartition_joins` stays off. A plan containing a join stays
 ineligible for spill, as it is today, so a join that exceeds the tenant's
 memory budget fails with the existing typed memory error.
@@ -221,9 +233,10 @@ memory budget fails with the existing typed memory error.
   `PagePlanError::CrossSignal`. A page identity over a join is a separate
   decision.
 - **MCP.** `ravel_query_sql` stays one `SELECT` over one table (ADR-1374).
-  Its cursor and envelope carry one `signal`, and its snapshot identity
-  hashes one signal. The MCP tool refuses a multi-table statement with
-  `CrossSignalQuery` before any listing.
+  The tool is not shipped yet. As designed, its cursor and envelope carry
+  one `signal` and its snapshot identity hashes one signal, so when it
+  ships it refuses a multi-table statement with `CrossSignalQuery` before
+  any listing.
 
 ### 10. Flight SQL carries one segment group per signal
 
@@ -233,7 +246,9 @@ segments and pending erasure predicates are grouped under a signal tag, one
 group per named signal. `GetFlightInfo` pins every snapshot and `DoGet`
 executes against exactly those. A version 8 ticket is refused after the
 upgrade; tickets live no longer than their deadline. Slice tickets keep
-their meaning (a subset of one metrics snapshot).
+their meaning (a subset of one metrics snapshot). The ticket's commit tokens
+stay an untagged list: `DoGet` executes against the pinned segments and does
+not resolve again, so the tokens are not used to choose a snapshot there.
 
 The ticket is a short-lived, authenticated message between Ravel processes,
 not one of the persistent formats, so this is a version bump inside
@@ -332,9 +347,11 @@ single response that says what each side read.
   fail after it.
 - Paging and MCP keep the one-table rule and now hold it themselves instead
   of inheriting it from the executor.
-- Documents that restate the old rule are amended when the behaviour lands,
-  in the same commits: ADR-0033, ADR-0045, ADR-1101, ADR-2040 (amendment
-  sections with pointers), `docs/query-engine.md`,
+- ADR-0033, ADR-0045, ADR-1101 and ADR-2040 carry amendment sections that
+  point here, added with this ADR. Each says the executor still enforces the
+  old rule until the code lands.
+- The other documents that restate the old rule are updated when the
+  behaviour lands, in the same commits: `docs/query-engine.md`,
   `docs/consistency-model.md`, `docs/concepts.md`, `docs/guides/query.md`,
   `traces.md`, `alerting.md`, `audit.md`, `cost-model.md`,
   `docs/reference/http-api.md`, `README.md`, and the generated
