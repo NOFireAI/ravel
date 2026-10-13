@@ -32,6 +32,8 @@ mod ceiling_breach;
 mod compact_slices;
 #[path = "deadline.rs"]
 mod deadline;
+#[path = "declared_str_function_results.rs"]
+mod declared_str_function_results;
 #[path = "distinct_on.rs"]
 mod distinct_on;
 #[path = "erasure_dedup_positions.rs"]

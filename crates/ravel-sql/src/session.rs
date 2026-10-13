@@ -946,6 +946,11 @@ pub fn build_session(
             }
         }
     }
+    // After the last scalar registration, so every registered function that
+    // returns a dictionary of non-strings for a dictionary-typed string
+    // argument is typed by the dictionary's value type. Only those functions
+    // are replaced; see `crate::value_typed_results` for how they are found.
+    crate::value_typed_results::unpack_dictionary_results(&ctx);
     Ok(ctx)
 }
 

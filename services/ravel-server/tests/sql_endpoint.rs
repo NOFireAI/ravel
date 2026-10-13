@@ -43,7 +43,10 @@ use ravel_segment::{
 };
 use ravel_server::alerting::ALERT_SHARD;
 use ravel_server::sql::{ARROW_STREAM_MEDIA_TYPE, SqlState, router};
-use ravel_sql::{SqlConfig, SqlExecutor};
+use ravel_sql::{
+    DeclaredColumn, DeclaredColumnSource, DeclaredType, SqlConfig, SqlExecutor,
+    StaticDeclaredColumns,
+};
 use ravel_tenant_resolve::Principal;
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
@@ -4371,6 +4374,91 @@ async fn a_dropped_request_future_records_the_cost_it_incurred() {
     );
 }
 
+/// The tenant's one declared column: a `Str`-typed `name`.
+fn declared_source() -> Arc<dyn DeclaredColumnSource> {
+    Arc::new(StaticDeclaredColumns::new(vec![DeclaredColumn::new(
+        "name",
+        DeclaredType::Str,
+    )]))
+}
+
+/// A `LogRecord` on `service` carrying a record-level `name` attribute, so
+/// the declared `name` column resolves from the record.
+fn log_record_named(service: &str, ts: i64, name: &str) -> LogRecord {
+    let mut record = log_record(service, ts, "b");
+    record.attrs = vec![("name".to_string(), AttrValue::Str(name.to_string()))];
+    record
+}
+
+/// A [`SqlState`] whose executor resolves the declared `name` column for
+/// every tenant.
+fn sql_state_with_declared(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+) -> SqlState {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
+        SqlConfig::default(),
+        1 << 30,
+    )
+    .with_declared_column_source(declared_source());
+    SqlState {
+        executor: Arc::new(executor),
+        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+        store,
+        clock: Arc::new(FixedClock),
+        max_deadline: Duration::from_secs(30),
+        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
+        query_admission: ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+    }
+}
+
+/// `length` over the declared `Str` column is typed `Int32`, not the
+/// column's dictionary, so unary minus plans over it.
+#[tokio::test]
+async fn negated_length_of_a_declared_str_column_answers_over_http() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let records = vec![
+        log_record_named("api", 100, "alpha"),
+        log_record_named("worker", 150, "beta"),
+        log_record_named("api", 200, "alpha"),
+    ];
+    publish_log_segment(store.as_ref(), &tenant, 0, &records).await;
+
+    let app = router(sql_state_with_declared(
+        store,
+        tokens(&[("acme-token", "acme")]),
+    ));
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT -length(\"name\") FROM logs ORDER BY ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let json_rows = value["data"]["rows"].as_array().expect("rows");
+    let got: Vec<Value> = json_rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        got,
+        vec![
+            serde_json::json!(-5),
+            serde_json::json!(-4),
+            serde_json::json!(-5),
+        ]
+    );
+}
+
 /// Reachability for the last task of epic #360: a tenant's declared `Str`
 /// column must arrive as Arrow `Dictionary(Int32, Utf8)` when queried through
 /// the shipping server's real Flight SQL surface, not merely inside ravel-sql.
@@ -4395,60 +4483,10 @@ mod flight_wire {
     use arrow_flight::{FlightData, FlightDescriptor};
     use futures::TryStreamExt;
     use prost::Message;
-    use ravel_sql::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
     use tokio::sync::oneshot;
     use tonic::Request;
 
     use super::*;
-
-    /// The tenant's one declared column: a `Str`-typed `name`.
-    fn declared_source() -> Arc<dyn DeclaredColumnSource> {
-        Arc::new(StaticDeclaredColumns::new(vec![DeclaredColumn::new(
-            "name",
-            DeclaredType::Str,
-        )]))
-    }
-
-    /// A `LogRecord` on `service` carrying a record-level `name` attribute, so
-    /// the declared `name` column resolves from the record.
-    fn log_record_named(service: &str, ts: i64, name: &str) -> LogRecord {
-        let mut record = log_record(service, ts, "b");
-        record.attrs = vec![("name".to_string(), AttrValue::Str(name.to_string()))];
-        record
-    }
-
-    /// A [`SqlState`] whose executor resolves the declared `name` column for
-    /// every tenant.
-    fn sql_state_with_declared(
-        store: Arc<dyn ObjectStoreBackend>,
-        tokens: HashMap<String, TenantId>,
-    ) -> SqlState {
-        let catalog =
-            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
-        let executor = SqlExecutor::new(
-            catalog,
-            SegmentFetcher::new(store.clone()),
-            LogSegmentFetcher::new(store.clone()),
-            ravel_sql::SpanSegmentFetcher::new(store.clone()),
-            SqlConfig::default(),
-            1 << 30,
-        )
-        .with_declared_column_source(declared_source());
-        SqlState {
-            executor: Arc::new(executor),
-            tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
-            store,
-            clock: Arc::new(FixedClock),
-            max_deadline: Duration::from_secs(30),
-            query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
-                std::collections::HashSet::new(),
-            )),
-            query_admission: ravel_query::QueryAdmissionController::shared(
-                ravel_query::QueryConcurrencyLimit::Unlimited,
-            ),
-            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
-        }
-    }
 
     /// A running tonic server carrying only the Flight SQL service, mirroring the
     /// in-process harness in `flight_sql.rs`.
