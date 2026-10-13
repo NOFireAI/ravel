@@ -2841,10 +2841,10 @@ impl SqlExecutor {
     /// `OR`, a regex, a negation, or a `__name__` matcher that is not a lone
     /// `=`, so the returned name is always a predicate the query genuinely
     /// requires at the top level: pruning to it drops only segments whose
-    /// rows the residual filter would drop anyway. A statement that scans
-    /// more than once derives a key per scan from the filters that bind that
-    /// scan alone ([`per_scan_name_keys`]) and returns one only when every
-    /// scan yields the same key. Any planning error yields
+    /// rows the residual filter would drop anyway. The key is derived per
+    /// scan from the filters that bind that scan alone
+    /// ([`per_scan_name_keys`]), and one is returned only when every scan
+    /// yields the same key. Any planning error yields
     /// `None` (no prune); the real plan surfaces such errors later through
     /// [`Self::plan_pinned`].
     async fn pushed_down_name_filter(&self, tenant_hash: TenantHash, sql: &str) -> Option<String> {
@@ -2873,17 +2873,18 @@ impl SqlExecutor {
         )
         .ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
-        if count_table_scans(&plan) > 1 {
-            // Every scan reads the one pruned snapshot, so a key is usable
-            // only when every scan requires it (issue #2907).
-            let mut keys = Vec::new();
-            per_scan_name_keys(&plan, &[], &mut keys);
-            let (first, rest) = keys.split_first()?;
-            return rest.iter().all(|k| k == first).then(|| first.clone())?;
+        // Every `samples` scan reads the one pruned snapshot, so a key is
+        // usable only when every scan requires it (issue #2907). Scans of
+        // other relations are counted too, which only makes the rule
+        // stricter. A key count that differs from the scan count means the
+        // walk missed a scan, so decline rather than let the rest prune.
+        let mut keys = Vec::new();
+        per_scan_name_keys(&plan, &[], &mut keys);
+        if keys.len() != count_table_scans(&plan) {
+            return None;
         }
-        let mut predicates = Vec::new();
-        collect_filter_predicates(&plan, &mut predicates);
-        equality_name_filter(&extract(&predicates).matchers)
+        let (first, rest) = keys.split_first()?;
+        rest.iter().all(|k| k == first).then(|| first.clone())?
     }
 
     /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key

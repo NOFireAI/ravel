@@ -1,10 +1,11 @@
-//! Postings pruning by a pushed-down `__name__` predicate when a statement
-//! scans `samples` more than once (issue #2907).
+//! Postings pruning by a pushed-down `__name__` predicate when the predicate
+//! does not bind every row a `samples` scan produces (issue #2907).
 //!
 //! Every `samples` scan in a statement reads the same resolved snapshot, so a
 //! name filter may prune it only when every scan is required to satisfy that
 //! filter. A predicate on one branch of a `UNION ALL`, or on one side of a
-//! self-join, must leave the other scan's rows intact.
+//! self-join, must leave the other scan's rows intact, and a predicate above a
+//! window or an `ORDER BY ... LIMIT` must leave the rows that node ranks.
 //!
 //! Fixture: segment 1 holds only metric `a` (three samples, value 1.0),
 //! segment 2 holds only metric `b` (two samples, value 2.0), at shared
@@ -220,5 +221,46 @@ async fn single_scan_filter_above_order_by_limit_keeps_rows_the_limit_drops() {
     assert_eq!(
         outcome.stats.segments, 2,
         "the limit ranks rows of both metrics"
+    );
+}
+
+#[tokio::test]
+async fn union_all_branch_filtered_above_window_keeps_rows_the_window_numbers() {
+    let (fixture, tenant) = folded_fixture("multi-scan-window-branch").await;
+    // The derived table carries the scan's own name, so a filter that reached
+    // the scan through the window would bind it and agree with the second
+    // branch's key.
+    let outcome = run(
+        &fixture,
+        &tenant,
+        "SELECT value FROM (SELECT value, labels, \
+         row_number() OVER (ORDER BY value DESC) AS rn FROM samples) AS samples \
+         WHERE label(samples.labels, '__name__') = 'a' AND rn > 2 \
+         UNION ALL SELECT value FROM samples WHERE label(labels, '__name__') = 'a'",
+    )
+    .await;
+    assert_eq!(value_counts(&outcome), (2 * A_ROWS, 0, 2 * A_ROWS));
+    assert_eq!(
+        outcome.stats.segments, 2,
+        "the window branch numbers rows of both metrics"
+    );
+}
+
+#[tokio::test]
+async fn self_join_filtered_on_both_sides_still_prunes() {
+    let (fixture, tenant) = folded_fixture("multi-scan-join-both").await;
+    // Each `a` row pairs with the one `a` row at its timestamp.
+    let outcome = run(
+        &fixture,
+        &tenant,
+        "SELECT a.value FROM samples a JOIN samples b ON a.ts = b.ts \
+         WHERE label(a.labels, '__name__') = 'a' \
+         AND label(b.labels, '__name__') = 'a'",
+    )
+    .await;
+    assert_eq!(value_counts(&outcome), (A_ROWS, 0, A_ROWS));
+    assert_eq!(
+        outcome.stats.segments, 1,
+        "both join sides require a, so the snapshot prunes to its one segment"
     );
 }
