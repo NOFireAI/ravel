@@ -4830,11 +4830,14 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
 
 - **Eligible:** `count(...)` and `count(DISTINCT ...)` over any type; `sum`,
   `min`, `max` over a resolved **non-float** input; `avg`/`mean` over a
-  resolved **integer** input (ADR-0825).
+  resolved **integer** input other than `UInt64`, plain or
+  dictionary-encoded (ADR-0825; `length()` over a declared string column
+  resolves to `Dictionary(Int32, Int32)` on DataFusion 55.2).
 - **Never eligible:** `avg`/`mean` over a resolved **Float64** input (its UDAF
   runs plain IEEE f64 addition for that kind, which is not associative once a
   running sum exceeds 2^53, so it depends on the single-partition fold order);
-  any `sum`, `min`, `max` over a `Float16`/`Float32`/`Float64` input; and any
+  any `sum`, `min`, `max` over a `Float16`/`Float32`/`Float64` input, plain
+  or dictionary-encoded; and any
   **float GROUP BY key** (including a bare `SELECT DISTINCT float_col`),
   because no merge-order-stable representative bit pattern for a float group
   key is proven: DataFusion 55 folds `-0.0` into `0.0` when it groups, but NaN
@@ -4853,7 +4856,8 @@ to `Float64` before planning finishes, so an integer argument would never
 reach an accumulator as an integer, and the classifier would have no resolved
 type by which to tell `avg(int_col)` from `avg(float_col)` apart. The
 `avg`/`mean` UDAF (`crate::avg`) therefore coerces an admitted integer
-argument (`Int8`-`Int64`, `UInt8`-`UInt32`) to `Int64` and keeps it there
+argument (`Int8`-`Int64`, `UInt8`-`UInt32`, or a `Dictionary` of one of
+those) to `Int64` and keeps it there
 instead of widening to `Float64` (ADR-0825), and sums it exactly in `i128`
 with checked addition. That partial state is an exact `(sum, count)` pair,
 carried as `(Decimal128(38, 0), Int64)`, and integer addition is
