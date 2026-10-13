@@ -458,8 +458,11 @@ over a declared `Str` column return `Dictionary(Int32, Int32)`. `coalesce`
 coerces its arguments to one type, which for the column and an integer
 literal is `Dictionary(Int32, Int64)`, and returns that. The test
 `no_scalar_function_returns_a_dictionary_of_non_strings` reads these types
-from a stock DataFusion session and asserts that these seven names are
-exactly the ones it finds. A dictionary of integers is not a
+from a stock DataFusion session and asserts that the functions it finds are
+exactly these, by canonical name (`length` and `char_length` are aliases of
+`character_length`); the unit test
+`the_wrapped_functions_are_exactly_the_numeric_dictionary_results` asserts
+the seven registry names the rule wraps. A dictionary of integers is not a
 type the SQL planner's unary minus accepts (it rejects
 `-length("Referer")`), and `avg`'s exact integer path does not admit it
 (`SequentialAvg::coerce_types`, `crates/ravel-sql/src/avg.rs:195`), so the
