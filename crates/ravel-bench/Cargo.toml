@@ -166,6 +166,12 @@ pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
 ravel-server = { path = "../../services/ravel-server", version = "0.23.0", optional = true, features = ["sql"] }
 ravel-cpu-gate = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+# The pending-ack shed cost lane (`pending_ack_shed`) reads the process CPU
+# clock through `rustix::time::clock_gettime(ClockId::ProcessCPUTime)`, a safe
+# wrapper with nanosecond reporting on Linux and macOS, where `/proc/self/stat`
+# gives 10 ms ticks on Linux and nothing elsewhere. Workspace pin with its
+# `time` feature added; no new external crate.
+rustix = { workspace = true, optional = true, features = ["time"] }
 
 # The saturation bins install jemalloc as their global allocator the way
 # ravel-server's binary does, so the server they measure allocates as the
@@ -226,7 +232,7 @@ flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
 # The ADR-1702 task 11 saturation bins (`liveness_under_decode`,
 # `heartbeat_under_query_load`, issue #2670). Off by default: they link
 # ravel-server and its SQL surface. Advisory lanes, run by hand.
-saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator"]
+saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator", "dep:rustix"]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -245,6 +251,11 @@ axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 flate2 = { workspace = true }
 opentelemetry-proto = { workspace = true }
+# The pending-ack shed lane's count test runs in the default test build, where
+# the `saturation` feature that otherwise supplies these is off. Workspace pins.
+anyhow = { workspace = true }
+ravel-memory = { workspace = true }
+rustix = { workspace = true, features = ["time"] }
 
 # The same bench runs under jemalloc, the allocator the shipped server binary
 # installs, since where a gated job allocates and frees is part of its cost.
@@ -434,6 +445,14 @@ bench = false
 [[bin]]
 name = "heartbeat_under_query_load"
 path = "src/bin/heartbeat_under_query_load.rs"
+required-features = ["saturation"]
+bench = false
+
+# ADR-2793 decision 4: the server CPU one post-decode pending-ack refusal costs
+# over one head refusal (issue #2902).
+[[bin]]
+name = "pending_ack_shed_cost"
+path = "src/bin/pending_ack_shed_cost.rs"
 required-features = ["saturation"]
 bench = false
 
