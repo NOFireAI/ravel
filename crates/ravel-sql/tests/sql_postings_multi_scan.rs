@@ -134,6 +134,22 @@ async fn self_join_filtered_on_one_side_keeps_other_side_rows() {
 }
 
 #[tokio::test]
+async fn subquery_scan_keeps_rows_the_outer_filter_excludes() {
+    let (fixture, tenant) = folded_fixture("multi-scan-subquery").await;
+    // The subquery reads only `b` rows (T1, T2); the outer `a` rows at those
+    // two timestamps survive.
+    let outcome = run(
+        &fixture,
+        &tenant,
+        "SELECT value FROM samples WHERE label(labels, '__name__') = 'a' \
+         AND ts IN (SELECT ts FROM samples WHERE label(labels, '__name__') = 'b')",
+    )
+    .await;
+    assert_eq!(value_counts(&outcome), (B_ROWS, 0, B_ROWS));
+    assert_eq!(outcome.stats.segments, 2);
+}
+
+#[tokio::test]
 async fn single_scan_name_filter_still_prunes() {
     let (fixture, tenant) = folded_fixture("multi-scan-single").await;
     let outcome = run(

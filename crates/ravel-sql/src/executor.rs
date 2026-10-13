@@ -2870,6 +2870,14 @@ impl SqlExecutor {
         )
         .ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
+        if count_table_scans(&plan) > 1 {
+            // Every scan reads the one pruned snapshot, so a key is usable
+            // only when every scan requires it (issue #2907).
+            let mut keys = Vec::new();
+            per_scan_name_keys(&plan, &[], &mut keys);
+            let (first, rest) = keys.split_first()?;
+            return rest.iter().all(|k| k == first).then(|| first.clone())?;
+        }
         let mut predicates = Vec::new();
         collect_filter_predicates(&plan, &mut predicates);
         equality_name_filter(&extract(&predicates).matchers)
@@ -4097,6 +4105,86 @@ fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
     for input in plan.inputs() {
         collect_filter_predicates(input, out);
     }
+}
+
+/// The number of `TableScan` nodes in `plan`, subquery plans included.
+fn count_table_scans(plan: &LogicalPlan) -> usize {
+    let mut scans = 0;
+    // Never errors: the closure only counts and returns a recursion verb.
+    let _ = plan.apply_with_subqueries(|node| {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            scans += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    scans
+}
+
+/// Push one entry per `TableScan` in `plan` (subquery plans included) onto
+/// `keys`: the `__name__` pruning key that scan's rows are required to
+/// satisfy, or `None`.
+///
+/// `inherited` holds the predicates of the `Filter` nodes above `plan` that
+/// still constrain the rows it produces. They pass down only through a
+/// `Filter`, an inner `Join`, and a `SubqueryAlias` directly over a scan; any
+/// other node can rename, aggregate, or null-extend its input, so its inputs
+/// start with none. At a scan, only the conjuncts whose columns all carry
+/// that scan's qualifier, and that reference no outer column, count.
+fn per_scan_name_keys(plan: &LogicalPlan, inherited: &[Expr], keys: &mut Vec<Option<String>>) {
+    let scan_key = |qualifier: &TableReference, inherited: &[Expr]| {
+        let own: Vec<Expr> = inherited
+            .iter()
+            .flat_map(|p| datafusion::logical_expr::utils::split_conjunction(p))
+            .filter(|c| conjunct_is_scoped_to(c, qualifier))
+            .cloned()
+            .collect();
+        equality_name_filter(&extract(&own).matchers)
+    };
+    // Subquery plans nested in this node's expressions see none of the
+    // filters above it.
+    let _ = plan.apply_subqueries(|sub| {
+        per_scan_name_keys(sub, &[], keys);
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match plan {
+        LogicalPlan::TableScan(scan) => keys.push(scan_key(&scan.table_name, inherited)),
+        LogicalPlan::SubqueryAlias(alias) if matches!(*alias.input, LogicalPlan::TableScan(_)) => {
+            keys.push(scan_key(&alias.alias, inherited));
+        }
+        LogicalPlan::Filter(filter) => {
+            let mut next = inherited.to_vec();
+            next.push(filter.predicate.clone());
+            per_scan_name_keys(&filter.input, &next, keys);
+        }
+        LogicalPlan::Join(join) if join.join_type == datafusion::common::JoinType::Inner => {
+            per_scan_name_keys(&join.left, inherited, keys);
+            per_scan_name_keys(&join.right, inherited, keys);
+        }
+        other => {
+            for input in other.inputs() {
+                per_scan_name_keys(input, &[], keys);
+            }
+        }
+    }
+}
+
+/// Whether every column `conjunct` references is qualified by `qualifier`,
+/// and it references no column of an enclosing query.
+fn conjunct_is_scoped_to(conjunct: &Expr, qualifier: &TableReference) -> bool {
+    let mut scoped = true;
+    // Never errors: the closure only inspects and returns a recursion verb.
+    let _ = conjunct.apply(|e| {
+        match e {
+            Expr::Column(c) if c.relation.as_ref() == Some(qualifier) => {}
+            Expr::Column(_) | Expr::OuterReferenceColumn(..) => {
+                scoped = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    scoped
 }
 
 /// Collect every grouping node reachable in `plan` for ADR-0094 decision 1's
