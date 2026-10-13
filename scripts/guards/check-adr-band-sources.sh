@@ -14,7 +14,8 @@
 # delimiter row: cells of one or more hyphens, with or without leading and
 # trailing pipes, and itself containing a `|` (so a horizontal rule is not
 # one). Its data rows are the lines after the delimiter up to the first
-# blank line or the first line with no `|` in it, so a prose sentence that
+# blank line, the first line with no `|` in it, or the header of a table
+# written directly underneath, so a prose sentence that
 # contains a pipe directly under a band table is read as a row: leave a
 # blank line after the table.
 #
@@ -164,6 +165,16 @@ for path in paths:
         j = i + 2
         data: list[int] = []
         while j < len(lines) and prose[j] and lines[j].strip() and "|" in lines[j]:
+            # A row followed by a delimiter row is the header of the next
+            # table, written with no blank line between the two: stop here
+            # so the scan reaches it instead of reading it as data.
+            if (
+                j + 1 < len(lines)
+                and prose[j + 1]
+                and "|" in lines[j + 1]
+                and SEPARATOR_RE.match(lines[j + 1])
+            ):
+                break
             data.append(j)
             j += 1
         if not BAND_RE.search(line):

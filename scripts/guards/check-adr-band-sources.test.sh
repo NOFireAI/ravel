@@ -178,6 +178,11 @@ check "a band table without leading pipes is scanned" "${t}" 1 "carries no sourc
 t="$(new_tree rule_not_table "$(printf 'a | band\n---\n| q1 | from the last run |\n')")"
 check "a horizontal rule is not a delimiter row" "${t}" 70 "no band table"
 
+# Two tables with no blank line between them: the second is a table of its
+# own, scanned with its own header and basis column, not rows of the first.
+t="$(new_tree adjacent_tables "$(printf '| figure | note | source |\n|---|---|---|\n| q1 wall | none | predicted |\n| source | band |\n|---|---|\n| from the last run | 1 s |\n')")"
+check "a band table directly under another table is scanned on its own" "${t}" 1 "carries no source token: 'from the last run'"
+
 # Each header word on its own, in any case, selects the table.
 t="$(new_tree word_bar "$(printf '| figure | bar | source |\n|---|---|---|\n| q1 wall | under 1 s | from the last run |\n')")"
 check "the header word bar selects the table" "${t}" 1 "carries no source token"
