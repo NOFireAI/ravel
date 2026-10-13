@@ -661,6 +661,7 @@ required today) becomes optional; the HTTP endpoint returns the SQL row
 shape as JSON. A SQL statement that pins `trace_id = X` and whose
 request gave no explicit window resolves the same way instead of the
 one-hour request default; a statement with time bounds keeps them.
+(That SQL-endpoint half is deferred: see the T5 delivery amendment below.)
 
 ### 13. Metrics are out of scope, with a named follow-up
 
@@ -863,7 +864,7 @@ cache state) and stamped into the report.
 | T2 loader defaults for every signal, trigger mix and warning on every report, ADR-2614 amendment | 9 | ravel-cli, ravel-ingest (visibility) | no |
 | T3 ranged trace reads (`block_run_span` on the range reader) and the spans read cache | 7, 10 | ravel-rspan, ravel-query, ravel-server | no |
 | T4 fragments carry the pushdown: the ticket plumbing for the trace id, time bounds and declared comparisons (the `KeyEquals` arm does not exist yet; its ticket field and the worker's probe path ride T11) | 11 | ravel-sql | no |
-| T5 `GET /api/traces/<id>`, `ravel_get_trace` without a range, the SQL window rule | 12 | ravel-server, ravel-sql | no |
+| T5 `GET /api/traces/<id>`, `ravel_get_trace` without a range, the SQL window rule (deferred, see the T5 delivery amendment below) | 12 | ravel-server, ravel-sql | no |
 | T6 KEY_IDX grammar in ravel-codec, fuzz and property tests; `Section.prefix_len = 7` on logseg.proto and rspan.proto (additive) | 1 | ravel-codec, proto | yes (grammar, additive footer field) |
 | T7 RSPAN v5: mandatory kind 4, reader, writer, compactor constant, inspector, doc marker flip | 2 | ravel-rspan, ravel-maintain, ravel-cli | yes |
 | T8 RLOG kind 9, tenant declaration (sys.proto, R1 readers first), compactor and erasure rewrite carry the recovered field set, inspector | 3, 6 | ravel-logseg, ravel-catalog (config), ravel-maintain, ravel-cli | yes |
@@ -879,5 +880,26 @@ T7 and T8 concurrently (both consume T6). Wave 2 is T9. Wave 3 is T10 and
 T11 (both consume T9; T11 also consumes T8). T12 closes the epic. The
 first v5 write (T7) is the irreversible step for spans data and is
 sequenced after T6's fuzz targets are green on the grammar.
+
+## Amendment (issue #2756): T5 delivered the endpoint and the tool, not the SQL window rule
+
+<!-- amendment-applies: sections="12. `GET /api/traces/<trace_id>` and MCP `ravel_get_trace` without a time range" pointer="T5 delivery amendment" -->
+
+T5 shipped `GET /api/traces/<trace_id>` and the MCP tool `ravel_get_trace`
+with the no-window semantic of decision 12: without a window the lookup
+resolves from time zero, so every folded part and the unsealed tail are in
+view; explicit bounds are kept. Both build one fixed `spans` statement and
+run it through the SQL endpoint's own execution path. The other half of
+decision 12, a statement sent to `POST /api/v1/sql` that pins
+`trace_id = X` with no explicit window, is not delivered: that endpoint
+still applies its one-hour request default to every statement. Delivering
+it needs the SQL request to carry whether its window was given explicitly
+and the trace-id equality to be read from the extracted spans pushdown
+before the resolve picks its window, both in `crates/ravel-sql`, which T5's
+scope excluded. Issue #2934 carries it; until it lands, a caller of the SQL
+endpoint passes `start: 0`, as the traces guide says. Two behaviours
+decision 12 left open are now fixed by the shipped code: on the HTTP route
+`start` and `end` choose which objects are read and filter no rows, as on
+the SQL endpoint, while the MCP tool's time range also filters rows.
 
 Refs: #2707, #849, #2680, #1848, #1869, #1987, #1382

@@ -317,7 +317,8 @@ it once the catalog resolves that commit into a snapshot. The
 
 The query endpoints live on the HTTP listener, which binds `127.0.0.1:4318` by
 default. They need `Authorization: Bearer <token>`, the same as ingest. Every
-query endpoint is under `/api/v1` except one. `GET /api/traces/<trace_id>`
+query endpoint is under `/api/v1` except two, `POST /mcp` and
+`GET /api/traces/<trace_id>`. The latter
 (`sql` feature) returns every span of one trace as `spans` rows. Without
 `start` and `end` it reads every span the tenant retains; see
 [fetching one trace by id](docs/guides/traces.md#fetching-one-trace-by-id).
