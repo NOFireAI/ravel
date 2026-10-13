@@ -293,7 +293,8 @@ In ravel:
 1. The fleet-task-spec template's CLAIMS AUDIT gains: every number in a
    spec or an ADR band table names its source as a comment id, a report
    path, or `file:line`, and a profile-derived band cites exclusive leaf
-   shares. The paragraph stays advisory for specs (nothing parses a spec);
+   shares (corrected by the share-kind amendment below). The paragraph
+   stays advisory for specs (nothing parses a spec);
    the check that makes the rule bite is item 2's guard on the ADR tables
    that specs copy their numbers from.
 2. `scripts/guards/check-adr-band-sources.sh`: in every ADR, a table whose
@@ -399,3 +400,23 @@ ravel-perf (items 2 and 4), store-00 (item 3).
 - Two repositories change. The claude-fleet half ships only when the
   owner rolls out fleet-cp, the executors and the review bot by the
   runbook's manual steps; until then the ravel half stands on its own.
+
+## Amendment: a profile-derived band names its share kind (issue #2879)
+
+<!-- amendment-applies: sections="6. Specs cite their numbers" pointer="share-kind amendment" -->
+
+Change 6 item 1 required a profile-derived band to cite exclusive leaf
+shares. The only profile-derived band in the tree when the rule was
+written, ADR-2773's, was computed from inclusive shares ("Inclusive shares
+of statement CPU (a frame counts once per stack)",
+`docs/adrs/2773-hot-path-materialization.md:99`). Requiring exclusive
+shares would have made that band non-compliant without making it wrong:
+an inclusive share is the right basis for a band on a frame and its
+callees, and an exclusive one for a band on the frame's own work.
+
+What item 1 requires instead: a profile-derived band cites the shares it
+was computed from and says whether they are inclusive or exclusive. The
+fleet-task-spec CLAIMS AUDIT paragraph states that rule (T11, #2879).
+Item 2's guard does not parse share kinds: it checks that each band row
+carries a source token, and whether the cited shares are the kind the
+band states is a reviewer's check.
