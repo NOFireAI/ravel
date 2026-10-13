@@ -41,6 +41,69 @@ arrive. A trace whose spans straddle a reshard activation can split across
 two shards. A trace-by-id query still returns every stored span from
 wherever it landed.
 
+## Fetching one trace by id
+
+```text
+GET /api/traces/<trace_id>
+```
+
+`trace_id` is 32 hexadecimal characters, in either case. Any other value is
+a 400 with a typed body, before any data is read:
+
+```json
+{"status": "error", "errorType": "bad_data", "error": "invalid trace id \"7a7a\": expected 32 hexadecimal characters"}
+```
+
+The query string takes the same optional parameters as `POST /api/v1/sql`:
+
+- `start` and `end` are Unix seconds as floats, parsed the same way.
+- `timeout` is in seconds, and can only lower the server's deadline.
+- `min_commit_token` can repeat.
+
+The route runs `SELECT * FROM spans WHERE trace_id = X'<trace_id>' ORDER BY
+start_ts, span_id` through the SQL endpoint's own handler path. It uses the
+same authentication, tenant, limits, deadline, and query audit record.
+
+The response is the SQL endpoint's envelope:
+
+- `status`
+- `data`, with `columns` and `rows` in the row shape of
+  [the `spans` table](#the-spans-table)
+- `stats`
+
+`Accept: application/vnd.apache.arrow.stream` returns Arrow IPC, the same as
+on the SQL endpoint.
+
+A trace the tenant does not hold is a 200 with zero rows, not a 404. The
+route needs the `sql` cargo feature, which the published image carries.
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:4318/api/traces/00112233445566778899aabbccddeeff
+```
+
+### Lookups without a window
+
+A lookup pinned to one trace id with no explicit start resolves from time
+zero. It covers every folded part and the unsealed tail that the tenant still
+retains, instead of the SQL endpoint's one hour before `end`.
+
+Explicit bounds are kept exactly. `start` and `end` bound which objects are
+listed, as they do on `POST /api/v1/sql`. An omitted `end` is the current
+time.
+
+The rule covers this route and the MCP tool `ravel_get_trace`. A
+`POST /api/v1/sql` request that gives no window still reads one hour before
+`end`, even when its statement pins a `trace_id`. To read a whole trace over
+SQL, pass `"start": 0`.
+
+A lookup without a window resolves every part of the tenant, so its cost
+grows with retention. Each covering part costs catalog reads, and each
+segment still costs a skip-index probe, even though only the blocks that can
+hold the trace are decoded. That stays true until Ravel gains an exact-key
+index for trace ids. When you know roughly when the trace ran, pass `start`
+and `end`.
+
 ## The `spans` table
 
 `POST /api/v1/sql` serves five tables from one endpoint: `samples`
@@ -273,6 +336,8 @@ happens in two ways:
   child span can start and end inside a window whose parent started before
   it. A window query returns the spans in the window, not the whole trace.
 
-To read a whole trace regardless of the window, query by `trace_id` and widen
-or drop the time bounds. Ravel does not flag a result as incomplete. It
-returns the spans in view and never waits for a missing root or sibling.
+To read a whole trace regardless of the window, use
+[`GET /api/traces/<trace_id>`](#fetching-one-trace-by-id) without `start`
+and `end`, or query by `trace_id` over SQL with `"start": 0`. Ravel does
+not flag a result as incomplete, on that route or anywhere else. It returns
+the spans in view and never waits for a missing root or sibling.

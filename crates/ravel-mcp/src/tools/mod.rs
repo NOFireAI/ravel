@@ -13,6 +13,7 @@
 //! reserves protocol errors for malformed JSON-RPC and unknown tools.
 
 pub mod capabilities;
+pub mod get_trace;
 
 use crate::budget::McpEffectiveBudgets;
 use crate::cursor::CursorKey;
@@ -62,19 +63,18 @@ pub enum ToolError {
 /// call. `dispatch_routes_every_catalog_name_and_refuses_unknown_names` pins
 /// this list against what `dispatch` does, so adding a body without adding it
 /// here fails the test rather than under-reporting the surface.
-pub const SERVED_TOOLS: &[&str] = &["ravel_capabilities"];
+pub const SERVED_TOOLS: &[&str] = &["ravel_capabilities", "ravel_get_trace"];
 
 /// Route one tool call to its body.
 ///
-/// `backend` is the port the query-serving bodies execute through; the two
-/// tools that read nothing (today only `ravel_capabilities`) never touch it.
+/// `backend` is the port the query-serving bodies execute through; a tool
+/// that reads nothing (today only `ravel_capabilities`) never touches it.
 pub async fn dispatch<B: QueryBackend>(
     name: &str,
     args: serde_json::Value,
     ctx: &ToolContext<'_>,
     backend: &B,
 ) -> Result<Envelope, ToolError> {
-    let _ = backend;
     match name {
         "ravel_capabilities" => Ok(capabilities::run(args, ctx)),
         "ravel_describe_data" => Err(ToolError::NotShipped("ravel_describe_data")),
@@ -83,7 +83,7 @@ pub async fn dispatch<B: QueryBackend>(
         "ravel_query_sql" => Err(ToolError::NotShipped("ravel_query_sql")),
         "ravel_query_promql" => Err(ToolError::NotShipped("ravel_query_promql")),
         "ravel_search_logs" => Err(ToolError::NotShipped("ravel_search_logs")),
-        "ravel_get_trace" => Err(ToolError::NotShipped("ravel_get_trace")),
+        "ravel_get_trace" => Ok(get_trace::run(args, ctx, backend).await),
         "ravel_analyze_timeseries" => Err(ToolError::NotShipped("ravel_analyze_timeseries")),
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
@@ -187,6 +187,14 @@ mod tests {
             Err(unreached("sql_execute"))
         }
 
+        async fn trace_lookup(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &crate::service::TraceLookupRequest,
+        ) -> Result<Envelope, Failure> {
+            Err(unreached("trace_lookup"))
+        }
+
         async fn sql_explain(
             &self,
             _tenant_hash: TenantHash,
@@ -208,14 +216,15 @@ mod tests {
     }
 
     /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
-    /// anything else. The counts are exact on purpose: the eight bodies that
+    /// anything else. The counts are exact on purpose: the seven bodies that
     /// land in #1380 and #1382 must each answer `NotShipped` today rather than
-    /// a placeholder envelope, and the one body this build carries must
+    /// a placeholder envelope, and the two bodies this build carries must
     /// answer an envelope.
     /// Drive a future that is ready on its first poll, so this crate needs no
     /// async runtime to test dispatch. Every path `dispatch` takes in this
-    /// build is immediate: `ravel_capabilities` reads no store, and the eight
-    /// refusals return before awaiting anything.
+    /// build is immediate: `ravel_capabilities` reads no store,
+    /// `ravel_get_trace` refuses an empty argument object before reaching its
+    /// backend, and the seven refusals return before awaiting anything.
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
         match future
@@ -240,6 +249,15 @@ mod tests {
         for tool in &catalog {
             let name = tool.name.to_string();
             match block_on(dispatch(&name, serde_json::json!({}), &ctx, &NoBackend)) {
+                Ok(envelope) if name == "ravel_get_trace" => {
+                    // Served, and an empty argument object names no trace.
+                    assert_eq!(envelope.status, crate::envelope::Status::Error);
+                    assert_eq!(
+                        envelope.failure.map(|failure| failure.class),
+                        Some(crate::envelope::FailureClass::InvalidArgument)
+                    );
+                    served.push(name);
+                }
                 Ok(envelope) => {
                     assert_eq!(envelope.status, crate::envelope::Status::Ok);
                     served.push(name);
@@ -254,8 +272,14 @@ mod tests {
             }
         }
 
-        assert_eq!(served, vec!["ravel_capabilities".to_string()]);
-        assert_eq!(not_shipped.len(), 8);
+        assert_eq!(
+            served,
+            vec![
+                "ravel_capabilities".to_string(),
+                "ravel_get_trace".to_string()
+            ]
+        );
+        assert_eq!(not_shipped.len(), 7);
 
         // What `ravel_capabilities` reports is the same split, name for name:
         // `enabled` is what dispatch runs, `catalogued` is what it refuses. A

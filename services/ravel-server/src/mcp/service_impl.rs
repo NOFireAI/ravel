@@ -29,10 +29,10 @@ use std::time::Duration;
 
 use ravel_mcp::budget::McpEffectiveBudgets;
 use ravel_mcp::envelope::{AnyJson, Cell, Envelope, Failure};
-use ravel_mcp::service::QueryBackend;
+use ravel_mcp::service::{QueryBackend, TraceLookupRequest};
 use ravel_promql::{RangeValue, Value as PromValue};
 use ravel_query::http::{InstantRequest, MetadataRequest, RangeRequest};
-use ravel_query::{PhaseAccountingSnapshot, QueryPhase, QueryStats};
+use ravel_query::{PhaseAccountingSnapshot, QueryPhase, QueryStats, RequestBudgets};
 use ravel_types::{CommitToken, TenantHash};
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RoleServer};
@@ -40,6 +40,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::service::{AnalyticsRequest, ExemplarsRequest, QueryService, ServiceError};
+use crate::traces::TraceLookup;
 
 use super::envelope::{self as d4, Spend};
 
@@ -436,36 +437,44 @@ impl QueryBackend for ServiceBackend {
             .sql_execute(tenant_hash, request)
             .await
             .map_err(failure)?;
+        self.sql_envelope(request, outcome)
+    }
 
-        let mut envelope = self.sql_base(request);
-        // A result the JSON encoding cannot hold is the caller's choice of
-        // column, not an internal fault; anything else is one.
-        let output = outcome.output.to_json().map_err(|error| match error {
-            ravel_sql::SqlError::UnencodableResult {
-                column,
-                data_type,
-                reason,
-            } => d4::unencodable_sql_result(&column, &data_type, reason),
-            error => d4::internal(format!("sql result encoding: {error}")),
-        })?;
-        envelope.data = d4::sql_data(&output);
-        if let Some(predicate) = &outcome.stats.window_predicate {
-            envelope.scope.predicates_applied.push(predicate.clone());
-        }
-        // The executor's own row cap stopped the stream, which is a cap this
-        // envelope must report even when the D6 row cap did not fire.
-        envelope.presentation.row_cap_hit = outcome.stats.row_cap_hit;
-        d4::spend(
-            &mut envelope,
-            &self.budgets,
-            &Spend {
-                accounting: &outcome.accounting,
-                estimate: &outcome.estimate,
-                phases: None,
-                estimate_is_upper_envelope: true,
-            },
-        );
-        Ok(d4::finish(envelope, &self.budgets))
+    async fn trace_lookup(
+        &self,
+        tenant_hash: TenantHash,
+        request: &TraceLookupRequest,
+    ) -> Result<Envelope, Failure> {
+        let query = &self.budgets.query;
+        let lookup = TraceLookup {
+            trace_id: request.trace_id,
+            start_ns: request.window.map(|window| window.start_ns),
+            end_ns: request.window.map(|window| window.end_ns),
+            min_tokens: Vec::new(),
+            deadline: self.budgets.deadline,
+            // A window the caller named bounds the rows as well as the
+            // listing, so a bounded call returns only spans that start in it.
+            row_window: true,
+            max_rows: Some(self.budgets.max_rows as usize),
+            budgets: Some(RequestBudgets {
+                max_bytes_scanned: Some(query.max_bytes_scanned),
+                max_store_requests: Some(query.max_store_requests),
+                max_segments: Some(query.max_segments),
+            }),
+        };
+        let native = self
+            .service
+            .trace_request(&lookup)
+            .map_err(|error| failure(error.into()))?;
+        let outcome = self
+            .service
+            .sql_execute(tenant_hash, &native)
+            .await
+            .map_err(failure)?;
+        let mut envelope = self.sql_envelope(&native, outcome)?;
+        envelope.scope.signal = "traces".to_string();
+        envelope.scope.table = "spans".to_string();
+        Ok(envelope)
     }
 
     async fn sql_explain(
@@ -539,6 +548,43 @@ impl ServiceBackend {
         d4::min_tokens(&mut envelope, &request.min_tokens);
         envelope.scope.predicates_applied = request.selectors.clone();
         envelope
+    }
+
+    /// The D4 envelope of an executed SQL statement.
+    fn sql_envelope(
+        &self,
+        request: &ravel_sql::SqlRequest,
+        outcome: ravel_sql::SqlOutcome,
+    ) -> Result<Envelope, Failure> {
+        let mut envelope = self.sql_base(request);
+        // A result the JSON encoding cannot hold is the caller's choice of
+        // column, not an internal fault; anything else is one.
+        let output = outcome.output.to_json().map_err(|error| match error {
+            ravel_sql::SqlError::UnencodableResult {
+                column,
+                data_type,
+                reason,
+            } => d4::unencodable_sql_result(&column, &data_type, reason),
+            error => d4::internal(format!("sql result encoding: {error}")),
+        })?;
+        envelope.data = d4::sql_data(&output);
+        if let Some(predicate) = &outcome.stats.window_predicate {
+            envelope.scope.predicates_applied.push(predicate.clone());
+        }
+        // The executor's own row cap stopped the stream, which is a cap this
+        // envelope must report even when the D6 row cap did not fire.
+        envelope.presentation.row_cap_hit = outcome.stats.row_cap_hit;
+        d4::spend(
+            &mut envelope,
+            &self.budgets,
+            &Spend {
+                accounting: &outcome.accounting,
+                estimate: &outcome.estimate,
+                phases: None,
+                estimate_is_upper_envelope: true,
+            },
+        );
+        Ok(d4::finish(envelope, &self.budgets))
     }
 
     /// The envelope shell of a SQL operation. The signal is not resolved
