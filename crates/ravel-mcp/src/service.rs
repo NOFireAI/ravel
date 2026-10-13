@@ -41,7 +41,7 @@ pub struct TraceLookupRequest {
     pub window: Option<ravel_types::TimeRange>,
 }
 
-/// The nine `QueryService` operations, as the tool layer needs them.
+/// The ten `QueryService` operations, as the tool layer needs them.
 ///
 /// The lint allow is intentional: this trait is a crate-internal seam with
 /// exactly one production implementer (#1381's adapter over the real

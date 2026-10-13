@@ -329,8 +329,10 @@ whole group from the page, and the cursor resumes after the group. To
 request the second page, pass the cursor from `presentation.cursor` back
 as `cursor`, with the same arguments.
 
-`ravel_get_trace` orders by `(start_ts, span_id)`, which is unique, so
-the equal-group rule never applies to it.
+`ravel_get_trace` mints no cursor as served today: it returns the trace's
+spans in one page ordered by `(start_ts, span_id)`, and a trace larger than
+the row cap comes back with status `ok_bounded` and `row_cap_hit` rather
+than paged.
 
 When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.

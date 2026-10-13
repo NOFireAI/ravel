@@ -142,6 +142,7 @@ pub struct GetTraceInput {
     pub trace_id: String,
     /// Optional. Omitted, the lookup reads every span the tenant retains.
     pub time_range: Option<TimeRange>,
+    /// Not served by this build: `true` is refused as `unsupported`.
     pub include_logs: Option<bool>,
     /// Spans returned; default 200, ceiling 5,000.
     pub max_rows: Option<u32>,
@@ -152,6 +153,7 @@ pub struct GetTraceInput {
     /// 256 KiB.
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
+    /// Not served by this build: any value is refused as `unsupported`.
     pub evidence_ref: Option<String>,
 }
 
