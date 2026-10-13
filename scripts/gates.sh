@@ -421,6 +421,15 @@ bash "$(dirname "$0")/guards/check-amendment-integrity.test.sh"
 echo "==> scripts/guards/check-amendment-integrity.sh"
 "$(dirname "$0")/guards/check-amendment-integrity.sh"
 
+# An ADR band table is copied into fleet specs as the bar a task must clear,
+# so every row names where its figure came from: a comment id, a report
+# path, a file:line, a measured date, or the word predicted (issue #2879).
+# Cases first, same reason as the guards above: a source scan, no build.
+echo "==> scripts/guards/check-adr-band-sources.test.sh"
+bash "$(dirname "$0")/guards/check-adr-band-sources.test.sh"
+echo "==> scripts/guards/check-adr-band-sources.sh"
+"$(dirname "$0")/guards/check-adr-band-sources.sh"
+
 # The post-fork shape guard (issue #2811) needs a pull request to check, so
 # pr-review-status.sh runs it and this runs only its cases: fixture git
 # repositories, no network, no build.

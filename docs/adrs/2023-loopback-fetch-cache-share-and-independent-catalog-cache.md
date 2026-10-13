@@ -42,6 +42,7 @@ fetch-cache share sized to hold the corpus (40% of `memory_budget_bytes`,
 from source, run end to end on a fresh bot-style machine (#2023 comment
 5848140511).
 
+<!-- band-sources-allow: source is an issue comment not quoted in the repository: the bars were set on #2023 before the run and no comment id for them is recorded here; the run's figures are #2023 comment 5848140511 -->
 | figure | v0.18.0 stock | `byte-minimal` + 40% share | bar set before the run |
 |---|---|---|---|
 | concurrent QPS | 0.123 | 0.170 | at or above 0.40 |
@@ -161,12 +162,12 @@ change from source with the stock entry. Stamps, bands and the reading rule
 were registered before the runs (#2023 comments 5854876916 and
 5855941650); the figures are on #2023 (comments 5855474385 and 5856580042).
 
-| figure | candidate, 40% | control, 25% | candidate with audit retry, 40% | bar |
-|---|---|---|---|---|
-| cold sum | 1,711.8 s | 1,717.6 s | 1,712.2 s | at or below 1,916.1 s |
-| hot sum | 89.9 s | 268.3 s | 89.2 s | at or below 274.5 s |
-| concurrent QPS | 0.403 | 0.372 | 0.493 | at or above 0.40 |
-| concurrent error ratio | 0.955 | 0.043 | 0.060 | at or below 0.058 |
+| figure | candidate, 40% | control, 25% | candidate with audit retry, 40% | bar | source |
+|---|---|---|---|---|---|
+| cold sum | 1,711.8 s | 1,717.6 s | 1,712.2 s | at or below 1,916.1 s | bar registered in #2023 comments 5854876916 and 5855941650; figures in comments 5855474385 and 5856580042 |
+| hot sum | 89.9 s | 268.3 s | 89.2 s | at or below 274.5 s | bar registered in #2023 comments 5854876916 and 5855941650; figures in comments 5855474385 and 5856580042 |
+| concurrent QPS | 0.403 | 0.372 | 0.493 | at or above 0.40 | bar registered in #2023 comments 5854876916 and 5855941650; figures in comments 5855474385 and 5856580042 |
+| concurrent error ratio | 0.955 | 0.043 | 0.060 | at or below 0.058 | bar registered in #2023 comments 5854876916 and 5855941650; figures in comments 5855474385 and 5856580042 |
 
 Cold sums were within 0.4% of each other on every arm, as decision 4
 expects. The first candidate's QPS of 0.403 was measured in the restart

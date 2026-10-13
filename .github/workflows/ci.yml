@@ -324,6 +324,14 @@ jobs:
         run: bash scripts/guards/check-amendment-integrity.test.sh
       - name: Amendment-integrity guard (issue #1985)
         run: scripts/guards/check-amendment-integrity.sh
+
+      # Every ADR band table row names its source: a comment id, a report
+      # path, a file:line, a measured date, or the word predicted (issue
+      # #2879). Cases first, same reason as the guards above.
+      - name: ADR band-sources guard cases (issue #2879)
+        run: bash scripts/guards/check-adr-band-sources.test.sh
+      - name: ADR band-sources guard (issue #2879)
+        run: scripts/guards/check-adr-band-sources.sh docs/adrs
       # A pull request whose feat/fix commits touch crates/ or services/ must
       # also add or edit a fragment under changelog.d/ (preferred), touch
       # CHANGELOG.md, or carry a `Changelog: none` trailer (issue #1719). The rule is defined over a pull request's base..head commit

@@ -218,13 +218,13 @@ shard-object on every signal).
 The release binaries run with the bot's cloud-init, the ClickBench corpus,
 and loader RSS sampled every 5 s.
 
-| criterion | how measured | target |
-|---|---|---|
-| 1,000,000-row objects (≥ 25 MB) load under a fixed RSS | r6a.4xlarge, `--target-bytes` at the object size | peak loader RSS < 8 GB |
-| load time no worse | same box; the first acceptance step measures main at 524bff9d (v0.22.0 plus #2621) at 1,000,000 rows, since 1,489 s was measured on v0.22.0 and #2621's wall-clock rate was never measured | ≤ 1.05 × that baseline |
-| objects byte-identical | differential tests, row vs columnar and old vs new batch type, on fixed inputs | pass |
-| the corpus loads on a 4 GB machine with ≥ 25 MB objects | c6a.large, full ClickBench run | load completes, no swap-induced shard-ack timeout |
-| the corpus loads on 8 GB and 16 GB with ≥ 25 MB objects | c6a.xlarge, c6a.2xlarge | load completes in ≤ 1.5 × today's stock load time on that machine |
+| criterion | how measured | target | source |
+|---|---|---|---|
+| 1,000,000-row objects (≥ 25 MB) load under a fixed RSS | r6a.4xlarge, `--target-bytes` at the object size | peak loader RSS < 8 GB | 8 GB predicted; 25 MB read off the B0 run, docs/adrs/2614-loader-memory-typed-columnar-batch-and-byte-budget.md:476 |
+| load time no worse | same box; the first acceptance step measures main at 524bff9d (v0.22.0 plus #2621) at 1,000,000 rows, since 1,489 s was measured on v0.22.0 and #2621's wall-clock rate was never measured | ≤ 1.05 × that baseline | 1.05 predicted; the baseline is B0, docs/adrs/2614-loader-memory-typed-columnar-batch-and-byte-budget.md:476 |
+| objects byte-identical | differential tests, row vs columnar and old vs new batch type, on fixed inputs | pass | crates/ravel-logseg/tests/rlog_v5_clustering.rs:277 |
+| the corpus loads on a 4 GB machine with ≥ 25 MB objects | c6a.large, full ClickBench run | load completes, no swap-induced shard-ack timeout | predicted |
+| the corpus loads on 8 GB and 16 GB with ≥ 25 MB objects | c6a.xlarge, c6a.2xlarge | load completes in ≤ 1.5 × today's stock load time on that machine | 1.5 predicted; stock load times at docs/adrs/2614-loader-memory-typed-columnar-batch-and-byte-budget.md:486 and :487 |
 
 Query completion on 4 GB and 8 GB machines is reported, not gated. It also
 depends on #2615 (the read cache serves nothing on these runs, q20 reads the

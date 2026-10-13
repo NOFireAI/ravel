@@ -276,17 +276,17 @@ The implementing tasks' acceptance stamps are measured the same way as Stage 0:
   statements;
 - an end-to-end q1/q7/q37 run on the RustFS entry as the after-stamp.
 
-| figure | now | expected after | counts as a miss |
-|---|---|---|---|
-| q1 hot, real S3, unfolded | 0.413 s | 0.22-0.30 s | above 0.33 s |
-| LISTs per q1 / their summed latency | 5 / about 257 ms | 5 / unchanged | anything other than 5. The sum is unchanged because the same requests now overlap. |
-| wall time spent in the commit listing | about 205 ms | about 55-110 ms | above 150 ms |
-| GET per q1 | 2 | 1 | 2 |
-| audit wait beyond the two PUTs | about 25 ms | under 3 ms | above 10 ms |
-| PUT per q1, sequential traffic | 2 | 2 | anything other than 2 |
-| PUT pairs for steady traffic, one event every 5 ms for 2 s, store PUT about 1 ms | today's loop on the same schedule, about 77 | today's count, plus at most 1 | more than today's count + 1, which means steady traffic reached the idle path |
-| PUT pairs for events submitted while one flush is held | one batch per `max_batch` or `max_age` | unchanged | any change |
-| q1 hot, RustFS entry, end to end | 0.44 s (upstream) | 0.12-0.25 s (from the model) | above 0.30 s |
+| figure | now | expected after | counts as a miss | source |
+|---|---|---|---|---|
+| q1 hot, real S3, unfolded | 0.413 s | 0.22-0.30 s | above 0.33 s | expected and miss predicted; now is Stage 0 on #2509, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:40 |
+| LISTs per q1 / their summed latency | 5 / about 257 ms | 5 / unchanged | anything other than 5. The sum is unchanged because the same requests now overlap. | expected and miss predicted; the 5 LISTs are Stage 0 on #2509, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:43; the 257 ms is not quoted elsewhere in the repository |
+| wall time spent in the commit listing | about 205 ms | about 55-110 ms | above 150 ms | expected and miss predicted; now is Stage 0 on #2509, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:36 |
+| GET per q1 | 2 | 1 | 2 | expected and miss predicted; now is Stage 0 on #2509, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:43 |
+| audit wait beyond the two PUTs | about 25 ms | under 3 ms | above 10 ms | expected and miss predicted; now is Stage 0 on #2509, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:37 |
+| PUT per q1, sequential traffic | 2 | 2 | anything other than 2 | expected and miss predicted; now is Stage 0 on #2509, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:37 |
+| PUT pairs for steady traffic, one event every 5 ms for 2 s, store PUT about 1 ms | today's loop on the same schedule, about 77 | today's count, plus at most 1 | more than today's count + 1, which means steady traffic reached the idle path | predicted by the batching model, corrected to 73 at docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:455 |
+| PUT pairs for events submitted while one flush is held | one batch per `max_batch` or `max_age` | unchanged | any change | predicted |
+| q1 hot, RustFS entry, end to end | 0.44 s (upstream) | 0.12-0.25 s (from the model) | above 0.30 s | expected and miss predicted; now is the upstream entry ClickHouse/ClickBench#2371, docs/adrs/2509-per-statement-floor-parallel-prefix-listing-and-idle-audit-flush.md:13 |
 
 The steady-traffic row's "about 77" is 73 by the batching model, so its miss
 band is above 74: see the steady-traffic and reachability correction below.

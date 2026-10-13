@@ -401,18 +401,18 @@ compared with the same procedure on the dispatch-time main run on the same
 box in the same session (interleaved, not a stored figure). Every band is
 on the ratio new / main.
 
-| Figure | Band | Miss |
-|---|---|---|
-| Set I (q2, q3, q4, q8, q30), warm CPU sum | at most 0.70 | above 0.78 |
-| Set S (q11, q12, q13, q25, q26, q27), warm CPU sum | at most 0.85 | above 0.92 |
-| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 (missed at 0.99; see the Set L amendment below) | above 0.92 |
-| Set N (11), warm wall sum | at most 0.80 | above 0.88 |
-| Suite (43), warm CPU sum | at most 0.90 | above 0.95 |
-| Suite (43), warm wall sum | at most 0.92 | above 0.97 |
-| Every statement's result digest | equal to main | any difference |
-| q33 RSS high-water mark | at most 1.05 | above 1.10 |
-| No statement's warm wall above 1.15 (the per-statement noise floor) | | any |
-| Cold suite wall | at most 1.05 (no regression claimed) | above 1.10 |
+| Figure | Band | Miss | Source |
+|---|---|---|---|
+| Set I (q2, q3, q4, q8, q30), warm CPU sum | at most 0.70 | above 0.78 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :417 |
+| Set S (q11, q12, q13, q25, q26, q27), warm CPU sum | at most 0.85 | above 0.92 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :417 |
+| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 (missed at 0.99; see the Set L amendment below) | above 0.92 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :417; the 0.99 miss was measured on #2790, quoted at :589 |
+| Set N (11), warm wall sum | at most 0.80 | above 0.88 | predicted |
+| Suite (43), warm CPU sum | at most 0.90 | above 0.95 | predicted |
+| Suite (43), warm wall sum | at most 0.92 | above 0.97 | predicted |
+| Every statement's result digest | equal to main | any difference | predicted |
+| q33 RSS high-water mark | at most 1.05 | above 1.10 | predicted |
+| No statement's warm wall above 1.15 (the per-statement noise floor) | | any | predicted |
+| Cold suite wall | at most 1.05 (no regression claimed) | above 1.10 | predicted |
 
 Derivation, from the profile table. Set I: the scatter, Arrow build and
 row-by-row predicate columns sum to 41.7, 43.8, 31.2, 40.6 and 37.9% for
