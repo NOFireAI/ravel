@@ -4,8 +4,8 @@
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. One tool is
-> served today, `ravel_capabilities`. The other eight are catalogued, so
+> once that listener is reachable from anywhere but localhost. Two tools are
+> served today, `ravel_capabilities` and `ravel_get_trace`. The other seven are catalogued, so
 > `tools/list` returns them, and a call to one refuses with a
 > `method_not_found` protocol error until its body lands; the sections below
 > describe the surface as designed. The [MCP reference](../reference/mcp.md)
@@ -99,10 +99,12 @@ cannot write data, delete data, or trigger maintenance.
 
 ### Trace and time series
 
-- `ravel_get_trace`: every span of one trace id inside a required window,
-  the span tree, which parents are missing, and which spans are orphaned. An
-  optional logs pass runs alongside it, reported as an unindexed scan with
-  its own cost.
+- `ravel_get_trace`: every span of one trace id. The time range is
+  optional: omitted, the lookup reads every span the tenant retains; given,
+  it bounds the read and filters the rows. As served today it returns the
+  span rows only: the span tree, missing-parent and orphan reporting and the
+  optional logs pass are not built, and a call asking for the logs pass is
+  refused as unsupported.
 - `ravel_analyze_timeseries`: change-point detection or a summary statistic
   over a PromQL range result. The result names the method as a heuristic,
   states the minimum point count that the method needs, and states whether
@@ -219,10 +221,12 @@ ask for the bounded form of a listing, retry after a wait.
 
 ## Time inputs
 
-Six tools take a required time input: `ravel_query_sql`,
-`ravel_search_logs`, `ravel_get_trace`, `ravel_find_labels`,
-`ravel_analyze_timeseries`, and `ravel_query_promql`. There is no default
-window. If you omit the time input, the call fails with `missing_argument`.
+Five tools take a required time input: `ravel_query_sql`,
+`ravel_search_logs`, `ravel_find_labels`, `ravel_analyze_timeseries`, and
+`ravel_query_promql`. There is no default window. If you omit the time
+input, the call fails with `missing_argument`. `ravel_get_trace` is the
+exception: its time range is optional, and a lookup without one reads
+every span the tenant retains.
 
 `ravel_capabilities` and `ravel_describe_data` take no time input.
 `ravel_describe_data` reports the coverage window and the freshness

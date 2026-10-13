@@ -27,13 +27,13 @@
 
 - id: readme-mcp-one-tool-served
   doc: README.md
-  quote: "One tool is served today, `ravel_capabilities`; the other eight are catalogued and refuse calls until their bodies land."
+  quote: "the other seven are catalogued and refuse calls until their bodies land."
   kind: positive
   binds:
     - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
     - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
   status: verified
-  note: "SERVED_TOOLS holds ravel_capabilities alone; dispatch answers the other eight catalog names with ToolError::NotShipped, and the bound test pins the list against dispatch."
+  note: "SERVED_TOOLS holds ravel_capabilities and ravel_get_trace; dispatch answers the other seven catalog names with ToolError::NotShipped, and the bound test pins the list against dispatch."
 
 - id: agents-mcp-ships
   doc: docs/guides/agents.md
@@ -47,14 +47,14 @@
 
 - id: agents-mcp-one-tool-served
   doc: docs/guides/agents.md
-  quote: "One tool is served today, `ravel_capabilities`."
+  quote: "Two tools are served today, `ravel_capabilities` and `ravel_get_trace`."
   kind: positive
   binds:
     - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
     - crates/ravel-mcp/src/tools/mod.rs::ToolError
     - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
   status: verified
-  note: "The other eight catalog names answer ToolError::NotShipped, which the adapter renders as the method_not_found protocol error the banner names."
+  note: "The other seven catalog names answer ToolError::NotShipped, which the adapter renders as the method_not_found protocol error the banner names."
 
 - id: guide-query-audit-pipeline-installed
   doc: docs/guides/query.md
