@@ -12,7 +12,12 @@
 //! A body is `SERIESxSAMPLES` (`--body`, repeatable; default 1x1, 1000x1,
 //! 1000x10 and 10000x1): that many distinct series with that many samples
 //! each. The bin encodes each body once and decodes it once, refusing one
-//! that does not decode to the requested series, then runs arm P and arm H
+//! that does not decode to the requested series. Before any run it puts each
+//! decoded body through `normalize_resolved` as the Remote Write handler
+//! does, once per tenant the body's runs will use, with the limits the lane's
+//! server is started with and the bin's start time as the ingest clock, and
+//! exits 1 with the rejection list unless every check keeps all series x
+//! samples per series points. It then runs arm P and arm H
 //! (see `ravel_bench::pending_ack_shed`) `--repeats` times each, P first on
 //! even repeats and H first on odd ones, every run on a fresh in-process
 //! server, under the same jemalloc global allocator and background thread
@@ -30,20 +35,25 @@
 //! `ravel_ingest_pending_ack_shed_total` by K and
 //! `ravel_ingest_concurrency_shed_total` by 0, arm H the reverse; no
 //! `ravel_store_calls_total{op="put"}` completes inside the region; in arm P
-//! `ravel_ingest_pending_strict_acks` is still 1 and the gate holds exactly
-//! one call after the region; the parked request is still unanswered after
-//! the K requests, answers 204 once released, and the PUT counter has then
-//! risen above its value before the region. CPU, the median extra per
-//! refusal: 1x1 3 to 20 us (miss below -50 us or above 200 us), 1000x1 0.5 to
-//! 2.5 ms (miss above 10 ms), 1000x10 0.7 to 3.5 ms (miss above 15 ms),
-//! 10000x1 5 to 25 ms (miss below 2 ms or above 100 ms).
+//! `ravel_ingest_pending_strict_acks` is still 1; in both arms the gate holds
+//! exactly one call after the region, the parked one; the parked request is
+//! still unanswered after the K requests, answers 204 once released, and the
+//! PUT counter has then risen above its value before the region. The parked
+//! request's wait from its submit to the region's end stays under 8 s, the
+//! server's 10 s strict-ack deadline less a 2 s margin; a miss says K is too
+//! large for the body on this host. CPU, the median extra per refusal: 1x1 3
+//! to 20 us (miss below -50 us or above 200 us), 1000x1 0.5 to 2.5 ms (miss
+//! above 10 ms), 1000x10 0.7 to 3.5 ms (miss above 15 ms), 10000x1 5 to 25 ms
+//! (miss below 2 ms or above 100 ms).
 //!
-//! It prints a readable table, then one JSON report with its stamp. Exit 0
-//! when every band holds; 1 on a count band miss, ahead of any other
-//! verdict; 2 when a body's figure was withheld for clock resolution; 3,
-//! after the full report, when every count band held and a CPU figure fell
-//! outside its prediction; 4 when the run could not finish, after printing
-//! the rows it measured.
+//! It prints a readable table, then one JSON report with its stamp. Each body
+//! gets its own code: 1 on any count band miss; else 5 when its CPU median is
+//! past a miss bound; else 3 when it is outside the prediction but inside the
+//! miss bounds; else 2 when its figure was withheld for clock resolution;
+//! else 0. The bin exits with the most severe body's code, in the order 1, 5,
+//! 3, 2, 0, so a withheld figure on one body never masks a miss on another.
+//! A failed pre-run normalize check exits 1 before any run. Exit 4 when the
+//! run could not finish, after printing the rows it measured.
 
 use std::process::ExitCode;
 
@@ -51,7 +61,7 @@ use anyhow::Context;
 use clap::Parser;
 use ravel_bench::pending_ack_shed::{
     self as lane, ArmRun, Body, BodyReport, BodySpec, CLIENT_CONCURRENCY, CONNECTION_MODE,
-    CpuVerdict, DEFAULT_BODIES,
+    DEFAULT_BODIES,
 };
 use ravel_bench::saturation_run as run;
 use serde::Serialize;
@@ -97,6 +107,8 @@ struct BodyStamp {
     body_bytes: usize,
     decoded_series: usize,
     decoded_samples: usize,
+    /// Points the pre-run normalize check kept, for the body's first tenant.
+    normalized_points: usize,
 }
 
 #[derive(Serialize)]
@@ -173,13 +185,28 @@ fn measure(measured: &mut Vec<ArmRun>) -> anyhow::Result<u8> {
     run::configure_allocator();
     let resolution_ns = lane::cpu_clock_resolution_ns(RESOLUTION_READS)?;
 
-    let now_ms = run::wall_now_ns() / 1_000_000;
+    let now_ns = run::wall_now_ns();
+    let limits = lane::server_ingest_limits()?;
     let mut bodies = Vec::with_capacity(specs.len());
-    for &spec in &specs {
-        let body = Body::build(spec, now_ms)?;
+    let mut normalized_points = Vec::with_capacity(specs.len());
+    let mut normalize_misses = Vec::new();
+    for (body_index, &spec) in specs.iter().enumerate() {
+        let body = Body::build(spec, now_ns / 1_000_000)?;
+        let mut kept = None;
+        for tenant_index in lane::body_tenants(body_index, args.repeats) {
+            let normalized = body.normalize(&run::tenant(tenant_index), &limits, now_ns);
+            normalize_misses.extend(
+                normalized
+                    .misses(spec)
+                    .into_iter()
+                    .map(|miss| format!("{spec} body, tenant {tenant_index}: {miss}")),
+            );
+            kept.get_or_insert(normalized.points);
+        }
+        let kept = kept.context("a body with no tenant to check")?;
         println!(
             "body: {spec} series={} samples_per_series={} bytes={} decoded_series={} \
-             decoded_samples={}",
+             decoded_samples={} normalized_points={kept}",
             spec.series,
             spec.samples_per_series,
             body.bytes.len(),
@@ -187,19 +214,28 @@ fn measure(measured: &mut Vec<ArmRun>) -> anyhow::Result<u8> {
             body.decoded_samples
         );
         bodies.push(body);
+        normalized_points.push(kept);
+    }
+    if !normalize_misses.is_empty() {
+        for miss in &normalize_misses {
+            println!("  COUNT BAND MISS: {miss}");
+        }
+        println!("RESULT: exit 1: normalize does not keep every sample; nothing was measured");
+        return Ok(1);
     }
 
     let server_rt = run::server_runtime()?;
     let client_rt = run::client_runtime()?;
     let client = lane::lane_client()?;
-    let mut tenant_index = 0;
     let mut reports = Vec::with_capacity(bodies.len());
-    for body in &bodies {
+    for (body_index, body) in bodies.iter().enumerate() {
+        let mut tenants = lane::body_tenants(body_index, args.repeats);
         let mut pairs = Vec::with_capacity(args.repeats);
         for repeat in 0..args.repeats {
             let mut p = None;
             let mut h = None;
             for arm in lane::arms_in_order(repeat) {
+                let tenant_index = tenants.next().context("a run with no tenant left")?;
                 let run = client_rt.block_on(lane::measure_arm(
                     server_rt.handle(),
                     &client,
@@ -209,7 +245,6 @@ fn measure(measured: &mut Vec<ArmRun>) -> anyhow::Result<u8> {
                     repeat,
                     tenant_index,
                 ))?;
-                tenant_index += 1;
                 print_run(&run);
                 measured.push(run.clone());
                 match arm {
@@ -222,18 +257,7 @@ fn measure(measured: &mut Vec<ArmRun>) -> anyhow::Result<u8> {
         reports.push(BodyReport::build(body, pairs, resolution_ns));
     }
 
-    let exit_code = if reports.iter().any(|r| !r.count_misses.is_empty()) {
-        1
-    } else if reports.iter().any(|r| r.resolution_refusal.is_some()) {
-        2
-    } else if reports
-        .iter()
-        .any(|r| r.verdict.is_some_and(CpuVerdict::fails))
-    {
-        3
-    } else {
-        0
-    };
+    let exit_code = lane::exit_code(&reports);
     let report = Report {
         stamp: Stamp {
             git_commit,
@@ -247,12 +271,14 @@ fn measure(measured: &mut Vec<ArmRun>) -> anyhow::Result<u8> {
             cpu_clock_resolution_ns: resolution_ns,
             bodies: bodies
                 .iter()
-                .map(|b| BodyStamp {
+                .zip(normalized_points)
+                .map(|(b, normalized_points)| BodyStamp {
                     series: b.spec.series,
                     samples_per_series: b.spec.samples_per_series,
                     body_bytes: b.bytes.len(),
                     decoded_series: b.decoded_series,
                     decoded_samples: b.decoded_samples,
+                    normalized_points,
                 })
                 .collect(),
         },
@@ -268,7 +294,7 @@ fn measure(measured: &mut Vec<ArmRun>) -> anyhow::Result<u8> {
 fn print_run(run: &ArmRun) {
     println!(
         "run: body={}x{} order={} arm={} repeat={} K={} 429={} other_status={} \
-         transport_errors={} cpu_s={:.6} wall_s={:.3}",
+         transport_errors={} cpu_s={:.6} wall_s={:.3} parked_wait_s={:.3}",
         run.series,
         run.samples_per_series,
         run.order,
@@ -279,14 +305,15 @@ fn print_run(run: &ArmRun) {
         run.client_other_status,
         run.transport_errors,
         run.cpu_secs(),
-        run.wall_secs
+        run.wall_secs,
+        run.parked_wait_secs()
     );
 }
 
 fn print_header() {
     println!(
         "{:>6} {:>4} {:>8} {:>3} {:>3} {:>3} {:>5} {:>5} {:>5} {:>5} {:>6} {:>6} {:>5} {:>4} \
-         {:>9} {:>9} {:>6} {:>9} {:>7}",
+         {:>9} {:>9} {:>6} {:>6} {:>9} {:>7}",
         "series",
         "sps",
         "body_B",
@@ -304,6 +331,7 @@ fn print_header() {
         "put_live",
         "cpu_s",
         "wall_s",
+        "wait_s",
         "cores",
         "req_s"
     );
@@ -312,7 +340,7 @@ fn print_header() {
 fn print_row(run: &ArmRun) {
     println!(
         "{:>6} {:>4} {:>8} {:>3} {:>3} {:>3} {:>5} {:>5} {:>5} {:>5} {:>6} {:>6} {:>5} {:>4} \
-         {:>9} {:>9.6} {:>6.3} {:>9.3} {:>7.1}",
+         {:>9} {:>9.6} {:>6.3} {:>6.3} {:>9} {:>7}",
         run.series,
         run.samples_per_series,
         run.body_bytes,
@@ -333,14 +361,17 @@ fn print_row(run: &ArmRun) {
         ),
         run.cpu_secs(),
         run.wall_secs,
-        run.cores_busy(),
+        run.parked_wait_secs(),
+        run.cores_busy()
+            .map_or("-".to_owned(), |c| format!("{c:.3}")),
         run.requests_per_sec()
+            .map_or("-".to_owned(), |r| format!("{r:.1}"))
     );
     if let Some(status) = run.first_other_status {
-        println!("        first non-429 status: {status}");
+        println!("        earliest non-429 status: {status}");
     }
     if let Some(chain) = &run.first_transport_error {
-        println!("        first transport error: {chain}");
+        println!("        earliest transport error: {chain}");
     }
 }
 
@@ -363,12 +394,13 @@ fn print_table(report: &Report) {
     for body in &stamp.bodies {
         println!(
             "stamp body: series={} samples_per_series={} body_bytes={} decoded_series={} \
-             decoded_samples={}",
+             decoded_samples={} normalized_points={}",
             body.series,
             body.samples_per_series,
             body.body_bytes,
             body.decoded_series,
-            body.decoded_samples
+            body.decoded_samples,
+            body.normalized_points
         );
     }
     print_header();

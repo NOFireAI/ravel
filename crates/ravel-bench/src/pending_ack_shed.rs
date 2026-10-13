@@ -22,7 +22,10 @@
 //! A body is (series, samples per series): synthetic samples with one
 //! distinct label set per series, timestamps one second apart ending at the
 //! run's start, encoded once and decoded once to prove the server will see
-//! the requested series count.
+//! the requested series count. Before any run the decoded body is also put
+//! through `normalize_resolved` with the tenant, limits and clock reading the
+//! handler would use, and must keep every sample: a refusal of a body whose
+//! points normalization drops is not the refusal of the body the stamp names.
 //!
 //! Every arm run starts a fresh server over a fresh
 //! `FaultStore<MemoryStore>` and serves a tenant no earlier run used. The
@@ -36,9 +39,9 @@
 //! `ravel-server`'s own store chain does.
 //!
 //! The parked request waits under the server's strict-ack deadline, so the
-//! region must end inside it: a longer region shows as the parked request
-//! answered (503) and its slot freed before the region ends, a count band
-//! miss.
+//! region must end inside it: the time from the parked request's submit to
+//! the region's end is banded below [`PARKED_WAIT_BAND`], a count band miss
+//! that names K as too large for the body on the host.
 //!
 //! The client opens a fresh connection for every request in both arms: a head
 //! refusal of an unread body closes the connection, so a pooled client's next
@@ -51,6 +54,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,6 +66,8 @@ use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
 use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetrics};
+use ravel_otlp::IngestLimits;
+use ravel_remote_write::ResolvedRequest;
 use ravel_server::ingest_concurrency::IngestConcurrencyLimit;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::{Signal, TenantId};
@@ -95,8 +101,16 @@ pub const RESOLUTION_FACTOR: u64 = 100;
 /// never parks or never finishes fails the run instead of hanging it.
 const WAIT: Duration = Duration::from_secs(15);
 
-/// Per-request client timeout. Above the server's 10 s strict ack deadline,
-/// so a request the server answers late is still answered.
+/// The server's fixed strict-ack deadline: `DEFAULT_ACK_DEADLINE` in
+/// `ravel-server`'s `lib.rs`, which is not public.
+pub const STRICT_ACK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The parked request's wait from its submit to the region's end must stay
+/// under this: [`STRICT_ACK_DEADLINE`] less a 2 s margin.
+pub const PARKED_WAIT_BAND: Duration = STRICT_ACK_DEADLINE.saturating_sub(Duration::from_secs(2));
+
+/// Per-request client timeout. Above [`STRICT_ACK_DEADLINE`], so a request
+/// the server answers late is still answered.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -107,6 +121,9 @@ const BACKGROUND_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// The server's post-Snappy Remote Write cap, used for the body check.
 const DECODE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The `--max-ingest-lag` the lane's server is started with.
+const MAX_INGEST_LAG: Duration = ravel_server::DEFAULT_MAX_INGEST_LAG;
 
 const BODY_METRIC: &str = "ravel_bench_shed_load";
 const SAMPLE_STEP_MS: i64 = 1_000;
@@ -199,7 +216,8 @@ impl FromStr for BodySpec {
 }
 
 /// The samples of a `spec` body: series `s` carries the labels
-/// `instance="shed-bench"` and `series="s<s>"`, and its samples are
+/// `instance="shed-bench"` and `series` set to `s` zero-padded to six digits
+/// (`series="s000042"` for series 42), and its samples are
 /// [`SAMPLE_STEP_MS`] apart, the newest at `now_ms`.
 pub fn body_samples(spec: BodySpec, now_ms: i64) -> anyhow::Result<Vec<LogicalSample>> {
     let per_series = spec.samples_per_series;
@@ -228,6 +246,8 @@ pub struct Body {
     pub bytes: Bytes,
     pub decoded_series: usize,
     pub decoded_samples: usize,
+    /// The decoded request, kept for [`Body::normalize`].
+    pub resolved: ResolvedRequest,
 }
 
 impl Body {
@@ -236,7 +256,7 @@ impl Body {
     /// exactly `spec`'s series and samples.
     pub fn build(spec: BodySpec, now_ms: i64) -> anyhow::Result<Self> {
         let bytes = Bytes::from(encode_rw1_body(&body_samples(spec, now_ms)?)?);
-        let decoded = ravel_remote_write::rw1::decode_write_request(&bytes, DECODE_LIMIT_BYTES)
+        let decoded = ravel_remote_write::decode_write_request(&bytes, DECODE_LIMIT_BYTES)
             .with_context(|| format!("decoding the {spec} body"))?;
         let decoded_series = decoded.series.len();
         let decoded_samples: usize = decoded.series.iter().map(|s| s.samples.len()).sum();
@@ -258,8 +278,76 @@ impl Body {
             bytes,
             decoded_series,
             decoded_samples,
+            resolved: decoded,
         })
     }
+
+    /// What the Remote Write handler's `normalize_resolved` call makes of
+    /// this body for `tenant` under `limits` at the ingest clock reading
+    /// `now_ns`.
+    pub fn normalize(&self, tenant: &TenantId, limits: &IngestLimits, now_ns: i64) -> Normalized {
+        let out =
+            ravel_remote_write::normalize_resolved(tenant, self.resolved.clone(), limits, now_ns);
+        Normalized {
+            points: out.points.len() + out.histogram_points.len(),
+            rejections: out.rejected.iter().map(|r| r.to_string()).collect(),
+            exemplars_dropped: out.exemplars_dropped,
+        }
+    }
+}
+
+/// The limits the lane's server normalizes Remote Write with: the defaults,
+/// with the admission lag `ravel_server::start` derives from the
+/// `max_ingest_lag` [`start_ingest_server`] passes.
+pub fn server_ingest_limits() -> anyhow::Result<IngestLimits> {
+    Ok(IngestLimits {
+        max_ingest_lag_ns: ravel_server::resolve_ingest_lag(MAX_INGEST_LAG)?.admission_lag_ns,
+        ..IngestLimits::default()
+    })
+}
+
+/// One body normalized as the handler normalizes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Normalized {
+    /// Scalar and histogram points normalization kept.
+    pub points: usize,
+    /// Every rejection, as its message.
+    pub rejections: Vec<String>,
+    pub exemplars_dropped: usize,
+}
+
+impl Normalized {
+    /// Every way normalization did not keep exactly `spec`'s
+    /// series x samples per series: one entry per rejection, then the point
+    /// count, then dropped exemplars.
+    pub fn misses(&self, spec: BodySpec) -> Vec<String> {
+        let want = spec.series.saturating_mul(spec.samples_per_series);
+        let mut misses: Vec<String> = self
+            .rejections
+            .iter()
+            .map(|r| format!("normalize rejected: {r}"))
+            .collect();
+        if self.points != want {
+            misses.push(format!(
+                "normalized points = {}, band == {want}",
+                self.points
+            ));
+        }
+        if self.exemplars_dropped != 0 {
+            misses.push(format!(
+                "normalize dropped {} exemplars, band == 0",
+                self.exemplars_dropped
+            ));
+        }
+        misses
+    }
+}
+
+/// The tenant indices the runs of body `body_index` use, two per repeat, in
+/// the order the runs take them.
+pub fn body_tenants(body_index: usize, repeats: usize) -> Range<usize> {
+    let per_body = repeats.saturating_mul(2);
+    body_index.saturating_mul(per_body)..(body_index + 1).saturating_mul(per_body)
 }
 
 /// One arm run: K requests against a fresh server, and what `/metrics` and
@@ -277,10 +365,13 @@ pub struct ArmRun {
     pub client_429: u64,
     /// Answers with a status other than 429.
     pub client_other_status: u64,
+    /// The status of the earliest of those answers, in the order the client
+    /// got them across every worker.
     pub first_other_status: Option<u16>,
     /// Requests that got no answer: the send or the response read failed.
     pub transport_errors: u64,
-    /// The first transport error with its whole cause chain.
+    /// The earliest transport error, in the order the client saw them across
+    /// every worker, with its whole cause chain.
     pub first_transport_error: Option<String>,
     pub pending_ack_shed_delta: u64,
     pub concurrency_shed_delta: u64,
@@ -294,6 +385,8 @@ pub struct ArmRun {
     pub store_puts_after_release: u64,
     pub cpu_ns: u64,
     pub wall_secs: f64,
+    /// Wall seconds from the parked request's submit to the region's start.
+    pub parked_submit_to_region_secs: f64,
     /// `ravel_ingest_pending_strict_acks` in the scrape after the region.
     pub pending_strict_acks_after: u64,
     /// The parked request was still unanswered when the region ended.
@@ -307,13 +400,21 @@ impl ArmRun {
         self.cpu_ns as f64 / 1e9
     }
 
-    /// CPU seconds over wall seconds: cores busy on average across the region.
-    pub fn cores_busy(&self) -> f64 {
-        self.cpu_secs() / self.wall_secs
+    /// CPU seconds over wall seconds: cores busy on average across the
+    /// region. `None` for a region that measured no wall time.
+    pub fn cores_busy(&self) -> Option<f64> {
+        (self.wall_secs > 0.0).then(|| self.cpu_secs() / self.wall_secs)
     }
 
-    pub fn requests_per_sec(&self) -> f64 {
-        self.requests as f64 / self.wall_secs
+    /// `None` for a region that measured no wall time.
+    pub fn requests_per_sec(&self) -> Option<f64> {
+        (self.wall_secs > 0.0).then(|| self.requests as f64 / self.wall_secs)
+    }
+
+    /// Wall seconds from the parked request's submit to the region's end:
+    /// how long it had waited under the strict-ack deadline by then.
+    pub fn parked_wait_secs(&self) -> f64 {
+        self.parked_submit_to_region_secs + self.wall_secs
     }
 }
 
@@ -421,7 +522,7 @@ pub async fn start_ingest_server(
             defaults: unlimited_admission(),
             ..ravel_server::LimitsConfig::default()
         },
-        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        max_ingest_lag: MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: Duration::from_secs(120),
@@ -491,26 +592,40 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     out
 }
 
+/// What K requests got back. Each "first" is held with its answer's sequence
+/// number, the order answers arrived across every worker, so a merge keeps
+/// the earliest rather than whichever worker finished first.
 #[derive(Default)]
 struct Outcomes {
     too_many: u64,
     other_status: u64,
-    first_other_status: Option<u16>,
+    first_other_status: Option<(usize, u16)>,
     transport_errors: u64,
-    first_transport_error: Option<String>,
+    first_transport_error: Option<(usize, String)>,
+}
+
+/// The one of `a` and `b` with the lower sequence number.
+fn earlier<T>(a: Option<(usize, T)>, b: Option<(usize, T)>) -> Option<(usize, T)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 impl Outcomes {
-    fn record(&mut self, answer: Result<reqwest::StatusCode, String>) {
+    /// Records the answer that arrived `seq`th.
+    fn record(&mut self, seq: usize, answer: Result<reqwest::StatusCode, String>) {
         match answer {
             Ok(reqwest::StatusCode::TOO_MANY_REQUESTS) => self.too_many += 1,
             Ok(status) => {
                 self.other_status += 1;
-                self.first_other_status.get_or_insert(status.as_u16());
+                self.first_other_status =
+                    earlier(self.first_other_status.take(), Some((seq, status.as_u16())));
             }
             Err(chain) => {
                 self.transport_errors += 1;
-                self.first_transport_error.get_or_insert(chain);
+                self.first_transport_error =
+                    earlier(self.first_transport_error.take(), Some((seq, chain)));
             }
         }
     }
@@ -519,12 +634,11 @@ impl Outcomes {
         self.too_many += other.too_many;
         self.other_status += other.other_status;
         self.transport_errors += other.transport_errors;
-        if self.first_other_status.is_none() {
-            self.first_other_status = other.first_other_status;
-        }
-        if self.first_transport_error.is_none() {
-            self.first_transport_error = other.first_transport_error;
-        }
+        self.first_other_status = earlier(self.first_other_status.take(), other.first_other_status);
+        self.first_transport_error = earlier(
+            self.first_transport_error.take(),
+            other.first_transport_error,
+        );
     }
 }
 
@@ -537,19 +651,22 @@ async fn send_requests(
     requests: usize,
 ) -> anyhow::Result<Outcomes> {
     let next = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::new(AtomicUsize::new(0));
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..CLIENT_CONCURRENCY {
-        let (client, url, token, body, next) = (
+        let (client, url, token, body, next, answered) = (
             client.clone(),
             url.to_string(),
             token.to_string(),
             body.clone(),
             next.clone(),
+            answered.clone(),
         );
         workers.spawn(async move {
             let mut outcomes = Outcomes::default();
             while next.fetch_add(1, Ordering::Relaxed) < requests {
-                outcomes.record(post_write(&client, &url, &token, body.clone()).await);
+                let answer = post_write(&client, &url, &token, body.clone()).await;
+                outcomes.record(answered.fetch_add(1, Ordering::Relaxed), answer);
             }
             outcomes
         });
@@ -767,6 +884,7 @@ pub async fn measure_arm(
             Occurrence::Always,
         ),
     };
+    let parked_submit = Instant::now();
     let mut parked = {
         let (client, url, token, bytes) = (
             client.clone(),
@@ -806,6 +924,7 @@ pub async fn measure_arm(
         let before = Counters::read(&scrape(client, http_addr, SCRAPE_TIMEOUT).await?)?;
         let cpu_before = process_cpu_ns()?;
         let wall_start = Instant::now();
+        let parked_submit_to_region_secs = wall_start.duration_since(parked_submit).as_secs_f64();
         let outcomes = send_requests(client, &url, &token, &body.bytes, requests).await?;
         let wall_secs = wall_start.elapsed().as_secs_f64();
         let cpu_after = process_cpu_ns()?;
@@ -829,9 +948,9 @@ pub async fn measure_arm(
             requests,
             client_429: outcomes.too_many,
             client_other_status: outcomes.other_status,
-            first_other_status: outcomes.first_other_status,
+            first_other_status: outcomes.first_other_status.map(|(_, status)| status),
             transport_errors: outcomes.transport_errors,
-            first_transport_error: outcomes.first_transport_error,
+            first_transport_error: outcomes.first_transport_error.map(|(_, chain)| chain),
             pending_ack_shed_delta: delta(
                 PENDING_ACK_SHED,
                 before.pending_ack_shed,
@@ -848,6 +967,7 @@ pub async fn measure_arm(
             store_puts_after_release: released.store_puts,
             cpu_ns: delta("process CPU clock", cpu_before, cpu_after)?,
             wall_secs,
+            parked_submit_to_region_secs,
             pending_strict_acks_after: after.pending_strict_acks,
             parked_unanswered_after,
             parked_status,
@@ -868,9 +988,10 @@ pub async fn measure_arm(
 
 /// Every count band `run` misses, in a fixed order: the 429 count, transport
 /// errors, the two shed deltas, completed PUTs inside the region, arm P's
-/// pending slot and held calls after the region, the PUT counter's
-/// liveness, then whether the parked request held its slot through the
-/// region and was acknowledged once released.
+/// pending slot, the calls the gate held after the region (exactly the
+/// parked one in either arm), the PUT counter's liveness, whether the parked
+/// request held its slot through the region and was acknowledged once
+/// released, then the parked request's wait against [`PARKED_WAIT_BAND`].
 pub fn count_band_misses(run: &ArmRun) -> Vec<String> {
     let k = run.requests as u64;
     let (pending_want, concurrency_want) = match run.arm {
@@ -902,12 +1023,12 @@ pub fn count_band_misses(run: &ArmRun) -> Vec<String> {
             run.pending_strict_acks_after,
             1,
         );
-        check(
-            "gate held calls after the region",
-            run.held_after_region as u64,
-            1,
-        );
     }
+    check(
+        "gate held calls after the region",
+        run.held_after_region as u64,
+        1,
+    );
     check(
         "store PUT counter rose once the parked request answered",
         u64::from(run.store_puts_after_release > run.store_puts_before_region),
@@ -923,6 +1044,18 @@ pub fn count_band_misses(run: &ArmRun) -> Vec<String> {
         u64::from(run.parked_status),
         u64::from(REMOTE_WRITE_ACK),
     );
+    let waited = run.parked_wait_secs();
+    let band = PARKED_WAIT_BAND.as_secs_f64();
+    if waited.is_nan() || waited >= band {
+        misses.push(format!(
+            "parked request waited {waited:.3} s from its submit to the region end \
+             ({:.3} s to the region start, then the {:.3} s region), band < {band} s under \
+             the server's {} s strict-ack deadline: K is too large for this body on this host",
+            run.parked_submit_to_region_secs,
+            run.wall_secs,
+            STRICT_ACK_DEADLINE.as_secs_f64()
+        ));
+    }
     misses
 }
 
@@ -980,10 +1113,37 @@ impl CpuVerdict {
         }
     }
 
-    /// Whether the figure fails the bin: anything outside the prediction.
-    pub fn fails(self) -> bool {
-        matches!(self, CpuVerdict::OutsidePrediction | CpuVerdict::Miss)
+    /// The bin's exit code for this verdict alone: 5 past a miss bound, 3
+    /// outside the prediction, 0 otherwise.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            CpuVerdict::Miss => 5,
+            CpuVerdict::OutsidePrediction => 3,
+            CpuVerdict::InBand | CpuVerdict::NoBand => 0,
+        }
     }
+}
+
+/// An exit code's precedence: 1, then 5, 3, 2, and 0 last.
+fn exit_severity(code: u8) -> u8 {
+    match code {
+        1 => 4,
+        5 => 3,
+        3 => 2,
+        2 => 1,
+        _ => 0,
+    }
+}
+
+/// The bin's exit code over every body: the most severe of
+/// [`BodyReport::exit_code`], so one body's outcome never masks a worse one
+/// on another.
+pub fn exit_code(reports: &[BodyReport]) -> u8 {
+    reports
+        .iter()
+        .map(BodyReport::exit_code)
+        .max_by_key(|&code| exit_severity(code))
+        .unwrap_or(0)
 }
 
 /// The median of `values`; the mean of the middle two for an even count.
@@ -1089,6 +1249,19 @@ impl BodyReport {
     pub fn spec(&self) -> BodySpec {
         BodySpec::new(self.series, self.samples_per_series)
     }
+
+    /// This body's exit code: 1 on any count miss; otherwise its CPU
+    /// verdict's ([`CpuVerdict::exit_code`]); 2 when it has no verdict: the
+    /// figure was withheld, or no repeat ran.
+    pub fn exit_code(&self) -> u8 {
+        if !self.count_misses.is_empty() {
+            return 1;
+        }
+        match self.verdict {
+            Some(verdict) => verdict.exit_code(),
+            None => 2,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1123,12 +1296,14 @@ mod tests {
             run.store_put_delta, 0,
             "arm {label}: store PUTs completed in the region: {run:?}"
         );
-        if run.arm == Arm::PostDecode {
-            assert_eq!(
-                run.held_after_region, 1,
-                "arm P: the gate holds exactly the parked write after the region: {run:?}"
-            );
-        }
+        assert_eq!(
+            run.held_after_region, 1,
+            "arm {label}: the gate holds exactly the parked call after the region: {run:?}"
+        );
+        assert!(
+            run.parked_wait_secs() < PARKED_WAIT_BAND.as_secs_f64(),
+            "arm {label}: the parked request's wait stays inside the strict-ack deadline: {run:?}"
+        );
         assert!(
             run.store_puts_after_release > run.store_puts_before_region,
             "arm {label}: the PUT counter rose once the parked request answered: {run:?}"
@@ -1151,18 +1326,26 @@ mod tests {
     /// Both arms reach their refusal through the shipping Remote Write
     /// handler over HTTP on fresh connections: every request answers 429 with
     /// no transport error, the real `/metrics` counts each refusal under its
-    /// own family and no other, no store PUT completes inside the region, arm
-    /// P's gate holds exactly the parked write, and the PUT counter rises once
-    /// the parked request is released. Every `/metrics` read goes through
-    /// `sample_value`, so each family the lane reads appears exactly once
-    /// with its exact label set on the real endpoint.
+    /// own family and no other, no store PUT completes inside the region,
+    /// each arm's gate holds exactly the parked call, the parked request's
+    /// wait stays inside the strict-ack deadline, and the PUT counter rises
+    /// once the parked request is released. Every `/metrics` read goes
+    /// through `sample_value`, so each family the lane reads appears exactly
+    /// once with its exact label set on the real endpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lane_counts_close_at_small_k() {
-        let now_ms = crate::saturation_run::wall_now_ns() / 1_000_000;
-        let body = Body::build(SPEC, now_ms).expect("body encodes");
+        let now_ns = crate::saturation_run::wall_now_ns();
+        let body = Body::build(SPEC, now_ns / 1_000_000).expect("body encodes");
+        let limits = server_ingest_limits().expect("limits resolve");
         let client = lane_client().expect("client builds");
         let server = tokio::runtime::Handle::current();
         for (tenant_index, arm) in arms_in_order(0).into_iter().enumerate() {
+            assert_eq!(
+                body.normalize(&tenant(tenant_index), &limits, now_ns)
+                    .misses(SPEC),
+                Vec::<String>::new(),
+                "normalize keeps every sample of the body"
+            );
             let run = measure_arm(&server, &client, arm, &body, K, 0, tenant_index)
                 .await
                 .expect("arm runs");
@@ -1182,6 +1365,14 @@ mod tests {
                 "{spec}"
             );
         }
+        let wide = body_samples(BodySpec::new(43, 1), 10_000).unwrap();
+        assert_eq!(
+            wide[42].labels,
+            [
+                ("instance".to_string(), "shed-bench".to_string()),
+                ("series".to_string(), "s000042".to_string())
+            ]
+        );
         let samples = body_samples(BodySpec::new(2, 3), 10_000).unwrap();
         let ts: Vec<i64> = samples.iter().map(|s| s.ts_ms).collect();
         assert_eq!(ts, [8_000, 9_000, 10_000, 8_000, 9_000, 10_000]);
@@ -1266,7 +1457,12 @@ mod tests {
         assert!(timespec_ns(0, -1).is_err());
     }
 
+    /// A run that holds every count band.
     fn synthetic_run(arm: Arm, repeat: usize, cpu_ns: u64) -> ArmRun {
+        let (pending_ack_shed_delta, concurrency_shed_delta) = match arm {
+            Arm::PostDecode => (1_000, 0),
+            Arm::Head => (0, 1_000),
+        };
         ArmRun {
             arm,
             order: order_label(repeat),
@@ -1280,18 +1476,202 @@ mod tests {
             first_other_status: None,
             transport_errors: 0,
             first_transport_error: None,
-            pending_ack_shed_delta: 0,
-            concurrency_shed_delta: 0,
+            pending_ack_shed_delta,
+            concurrency_shed_delta,
             store_put_delta: 0,
             held_after_region: 1,
             store_puts_before_region: 0,
             store_puts_after_release: 1,
             cpu_ns,
             wall_secs: 1.0,
+            parked_submit_to_region_secs: 0.1,
             pending_strict_acks_after: 1,
             parked_unanswered_after: true,
             parked_status: REMOTE_WRITE_ACK,
         }
+    }
+
+    fn synthetic_body() -> Body {
+        Body {
+            spec: SPEC,
+            bytes: Bytes::new(),
+            decoded_series: SPEC.series,
+            decoded_samples: SPEC.series,
+            resolved: ResolvedRequest::default(),
+        }
+    }
+
+    fn synthetic_pair(repeat: usize, p_ns: u64, h_ns: u64) -> (ArmRun, ArmRun) {
+        (
+            synthetic_run(Arm::PostDecode, repeat, p_ns),
+            synthetic_run(Arm::Head, repeat, h_ns),
+        )
+    }
+
+    /// The lane's client opens a new TCP connection for every request,
+    /// against a server whose answers would let a pooling client reuse one:
+    /// HTTP/1.1, an empty body with its length, and no `Connection: close`.
+    #[tokio::test]
+    async fn lane_client_opens_a_fresh_connection_per_request() {
+        const REQUESTS: usize = 5;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let acceptor = tokio::spawn({
+            let accepts = accepts.clone();
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(answer_every_request(socket));
+                }
+            }
+        });
+        let client = lane_client().expect("client builds");
+        for _ in 0..REQUESTS {
+            let response = client
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .expect("answered");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            response.bytes().await.expect("body read");
+        }
+        acceptor.abort();
+        assert_eq!(accepts.load(Ordering::SeqCst), REQUESTS);
+    }
+
+    /// Answers every request head on `socket` with an empty 200 that leaves
+    /// the connection open, until the client closes it.
+    async fn answer_every_request(mut socket: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut pending = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                pending.drain(..end + 4);
+                if socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => pending.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// The pre-run check binds: a body whose oldest sample is past the
+    /// server's ingest-lag bound at the check's clock reading loses that
+    /// sample in normalize, and the check reports the rejection and the short
+    /// point count.
+    #[test]
+    fn a_sample_past_the_ingest_lag_bound_fails_the_normalize_check() {
+        let limits = server_ingest_limits().unwrap();
+        assert_eq!(
+            limits.max_ingest_lag_ns,
+            i64::try_from(MAX_INGEST_LAG.as_nanos()).unwrap()
+        );
+        let spec = BodySpec::new(1, 3);
+        let now_ms = 1_760_000_000_000;
+        let body = Body::build(spec, now_ms).unwrap();
+        let tenant = tenant(0);
+
+        let fresh = body.normalize(&tenant, &limits, now_ms * 1_000_000);
+        assert_eq!(fresh.points, 3);
+        assert_eq!(fresh.misses(spec), Vec::<String>::new());
+
+        // The samples are 2 s, 1 s and 0 s old at `now_ms`; this reading puts
+        // the oldest 0.5 s past the bound and the other two inside it.
+        let late_ns = now_ms * 1_000_000 + limits.max_ingest_lag_ns - 1_500_000_000;
+        let late = body.normalize(&tenant, &limits, late_ns);
+        assert_eq!(late.points, 2);
+        assert_eq!(late.rejections.len(), 1, "{late:?}");
+        let misses = late.misses(spec);
+        assert_eq!(misses.len(), 2, "{misses:?}");
+        assert!(misses[0].starts_with("normalize rejected: "), "{misses:?}");
+        assert_eq!(misses[1], "normalized points = 2, band == 3");
+    }
+
+    #[test]
+    fn body_tenants_match_the_run_order() {
+        assert_eq!(body_tenants(0, 3), 0..6);
+        assert_eq!(body_tenants(1, 3), 6..12);
+        assert_eq!(body_tenants(2, 1), 4..6);
+    }
+
+    /// A merge keeps the answer that arrived first, whichever worker's
+    /// tally is merged first.
+    #[test]
+    fn outcomes_keep_the_earliest_answer() {
+        let status = |code| Ok(reqwest::StatusCode::from_u16(code).unwrap());
+        let mut early = Outcomes::default();
+        early.record(2, status(503));
+        early.record(5, Err("late".to_string()));
+        early.record(6, status(500));
+        let mut late = Outcomes::default();
+        late.record(3, Err("early".to_string()));
+        late.record(4, status(502));
+        late.record(7, status(429));
+
+        let mut total = Outcomes::default();
+        total.merge(late);
+        total.merge(early);
+        assert_eq!(total.first_other_status, Some((2, 503)));
+        assert_eq!(total.first_transport_error, Some((3, "early".to_string())));
+        assert_eq!(
+            (total.too_many, total.other_status, total.transport_errors),
+            (1, 3, 2)
+        );
+    }
+
+    /// Arm H's gate holds exactly the parked call too, and a parked wait at
+    /// or past the band is a count miss naming K and the measured seconds.
+    #[test]
+    fn count_bands_hold_the_gate_and_the_parked_wait() {
+        for arm in [Arm::PostDecode, Arm::Head] {
+            assert_eq!(
+                count_band_misses(&synthetic_run(arm, 0, 0)),
+                Vec::<String>::new()
+            );
+            let mut idle_gate = synthetic_run(arm, 0, 0);
+            idle_gate.held_after_region = 0;
+            assert_eq!(
+                count_band_misses(&idle_gate),
+                ["gate held calls after the region = 0, band == 1"]
+            );
+
+            let mut inside = synthetic_run(arm, 0, 0);
+            inside.parked_submit_to_region_secs = 7.0;
+            inside.wall_secs = 0.9;
+            assert_eq!(count_band_misses(&inside), Vec::<String>::new());
+
+            let mut late = synthetic_run(arm, 0, 0);
+            late.parked_submit_to_region_secs = 7.5;
+            late.wall_secs = 0.6;
+            let misses = count_band_misses(&late);
+            assert_eq!(misses.len(), 1, "{misses:?}");
+            assert!(
+                misses[0].starts_with("parked request waited 8.100 s")
+                    && misses[0].ends_with("K is too large for this body on this host"),
+                "{misses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rates_refuse_a_zero_wall_time() {
+        let mut run = synthetic_run(Arm::Head, 0, 2_000_000_000);
+        assert_eq!(run.cores_busy(), Some(2.0));
+        assert_eq!(run.requests_per_sec(), Some(1_000.0));
+        run.wall_secs = 0.0;
+        assert_eq!(run.cores_busy(), None);
+        assert_eq!(run.requests_per_sec(), None);
     }
 
     /// The rule compares the arms' difference, not arm P's total: a large arm
@@ -1299,19 +1679,9 @@ mod tests {
     /// a difference above it reports, in either sign.
     #[test]
     fn resolution_rule_withholds_a_small_difference() {
-        let body = Body {
-            spec: SPEC,
-            bytes: Bytes::new(),
-            decoded_series: SPEC.series,
-            decoded_samples: SPEC.series,
-        };
+        let body = synthetic_body();
         let resolution_ns = 1_000;
-        let pair = |repeat, p_ns, h_ns| {
-            (
-                synthetic_run(Arm::PostDecode, repeat, p_ns),
-                synthetic_run(Arm::Head, repeat, h_ns),
-            )
-        };
+        let pair = synthetic_pair;
 
         let small = BodyReport::build(
             &body,
@@ -1370,7 +1740,54 @@ mod tests {
             CpuVerdict::of(cpu_band(BodySpec::new(7, 1)), 1.0),
             CpuVerdict::NoBand
         );
-        assert!(!CpuVerdict::NoBand.fails());
+        assert_eq!(CpuVerdict::Miss.exit_code(), 5);
+        assert_eq!(CpuVerdict::OutsidePrediction.exit_code(), 3);
+        assert_eq!(CpuVerdict::InBand.exit_code(), 0);
+        assert_eq!(CpuVerdict::NoBand.exit_code(), 0);
+    }
+
+    /// Exit codes are decided per body and the most severe wins, in the
+    /// order 1, 5, 3, 2: a withheld figure on one body never masks a miss on
+    /// another, in either body order.
+    #[test]
+    fn exit_code_takes_the_most_severe_body() {
+        let body = synthetic_body();
+        let resolution_ns = 1_000;
+        // 1000x1 band: 500 to 2,500 us, miss above 10,000 us; K = 1,000.
+        let report = |p_ns: u64| {
+            BodyReport::build(
+                &body,
+                vec![synthetic_pair(0, p_ns, 1_000_000_000)],
+                resolution_ns,
+            )
+        };
+        let withheld = report(1_000_000_001);
+        let in_band = report(2_000_000_000);
+        let outside = report(5_000_000_000);
+        let cpu_miss = report(21_000_000_000);
+        let count_miss = {
+            let (mut p, h) = synthetic_pair(0, 2_000_000_000, 1_000_000_000);
+            p.client_429 -= 1;
+            BodyReport::build(&body, vec![(p, h)], resolution_ns)
+        };
+        assert_eq!(
+            [&withheld, &in_band, &outside, &cpu_miss, &count_miss].map(BodyReport::exit_code),
+            [2, 0, 3, 5, 1]
+        );
+
+        assert_eq!(exit_code(&[]), 0);
+        assert_eq!(exit_code(std::slice::from_ref(&in_band)), 0);
+        for (other, want) in [
+            (&in_band, 2),
+            (&outside, 3),
+            (&cpu_miss, 5),
+            (&count_miss, 1),
+        ] {
+            assert_eq!(exit_code(&[withheld.clone(), other.clone()]), want);
+            assert_eq!(exit_code(&[other.clone(), withheld.clone()]), want);
+        }
+        assert_eq!(exit_code(&[cpu_miss.clone(), count_miss.clone()]), 1);
+        assert_eq!(exit_code(&[outside.clone(), cpu_miss.clone()]), 5);
     }
 
     #[test]
