@@ -85,9 +85,16 @@ case "${sub}" in
     cat "${STUB_DIR}/prs.json"
     ;;
   api)
-    # repos/<o>/<r>/pulls/<n>/files, already --jq'd to filenames by the caller.
+    # repos/<o>/<r>/pulls/<n>/files. The caller's own --jq runs over the
+    # fixture: files-N.json is the endpoint's array (filename and patch),
+    # files-N.txt a bare list of filenames with no patch.
     path="${1:-}"
     num="${path##*/pulls/}"; num="${num%%/*}"
+    jq_expr=""
+    args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      [[ "${args[i]}" == "--jq" ]] && jq_expr="${args[i + 1]:-}"
+    done
     echo x >>"${STUB_DIR}/calls-${num}"
     # fails-N holds how many more calls for pull request N fail first.
     if [[ -f "${STUB_DIR}/gone-${num}" ]]; then
@@ -102,8 +109,25 @@ case "${sub}" in
         exit 1
       fi
     fi
-    [[ -f "${STUB_DIR}/files-${num}.txt" ]] || exit 1
-    cat "${STUB_DIR}/files-${num}.txt"
+    # patch-down-N fails every call for pull request N that asks for patches,
+    # so a guard that fetched them separately and fell back to filenames
+    # would read the failure as no overlap.
+    if [[ -f "${STUB_DIR}/patch-down-${num}" && "${jq_expr}" == *patch* ]]; then
+      echo "HTTP 502: transient" >&2
+      exit 1
+    fi
+    if [[ -f "${STUB_DIR}/files-${num}.json" ]]; then
+      src="$(cat "${STUB_DIR}/files-${num}.json")"
+    elif [[ -f "${STUB_DIR}/files-${num}.txt" ]]; then
+      src="$(jq -R . "${STUB_DIR}/files-${num}.txt" | jq -s 'map({filename: ., patch: null})')"
+    else
+      exit 1
+    fi
+    if [[ -n "${jq_expr}" ]]; then
+      jq -r "${jq_expr}" <<<"${src}"
+    else
+      printf '%s\n' "${src}"
+    fi
     ;;
   *) exit 1 ;;
 esac
@@ -415,6 +439,347 @@ echo 2 >"${d}/fails-repo"
 out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
 check_eq "two failed repo lookups then success: dispatch (0)" "0" "${rc}"
 check_eq "on the third try" "3" "$(wc -l <"${d}/calls-repo" | tr -d ' ')"
+
+# --- hunk, symbol and docs-section entries -------------------------------
+#
+# One base tree for every case below, committed in a scratch repository with
+# refs/remotes/origin/main pointing at it, which is the guard's default base.
+# Line numbers in the comments are the base file's.
+base="${work}/base"
+mkdir -p "${base}/src" "${base}/docs" "${base}/scripts"
+cat >"${base}/src/lib.rs" <<'EOF'
+use std::fmt;
+
+pub fn alpha(x: u32) -> u32 {
+    let y = x + 1;
+    y * 2
+}
+
+pub struct Beta {
+    a: u32,
+}
+
+impl Beta {
+    pub fn gamma(&self) -> u32 {
+        self.a
+    }
+}
+
+const LIMIT: [u8; 2] = [
+    1, 2,
+];
+EOF
+# lib.rs: alpha 3-6, Beta 8-10 and 12-16, gamma 13-15, LIMIT 18-20.
+cat >"${base}/scripts/tool.sh" <<'EOF'
+#!/usr/bin/env bash
+helper() {
+  echo "${1}"
+}
+
+function other {
+  echo two
+}
+EOF
+# tool.sh: helper 2-4, other 6-8.
+cat >"${base}/docs/guide.md" <<'EOF'
+# Guide
+
+Intro text.
+
+## Install
+
+Run the installer.
+
+### Options
+
+Flags here.
+
+## Usage
+
+Use it.
+```
+## not a heading inside a fence
+```
+More usage.
+EOF
+# guide.md: Install 5-12 (Options 9-12 nested in it), Usage 13-19; line 17
+# is inside a fence and is not a heading.
+git -C "${base}" init -q
+git -C "${base}" add -A
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -m base
+git -C "${base}" update-ref refs/remotes/origin/main HEAD
+
+# open_pr <case> <n>: one open, non-draft pull request #n.
+open_pr() {
+  printf '[{"number":%s,"title":"in flight","state":"OPEN","body":"","headRefName":"p","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "$2" >"$1/prs.json"
+}
+# pr_patch <case> <n> <file> <patch line>...: pull request #n changes <file>
+# with the given patch, as the files endpoint returns it.
+pr_patch() {
+  local dir="$1" num="$2" file="$3"
+  shift 3
+  jq -n --arg f "${file}" --arg p "$(printf '%s\n' "$@")" '[{filename: $f, patch: $p}]' \
+    >"${dir}/files-${num}.json"
+}
+run_base() {
+  local dir="$1"; shift
+  (cd "${base}" && run_in "${dir}" "${GUARD}" "$@")
+}
+
+# Patch A changes lib.rs line 4, inside alpha.
+patch_a=('@@ -2,5 +2,5 @@' ' ' ' pub fn alpha(x: u32) -> u32 {' '-    let y = x + 1;' '+    let y = x + 2;' '     y * 2' ' }')
+# Patch B inserts 20 lines after line 1 and changes line 14, inside gamma.
+# Every head line from 2 on is 20 past its base line.
+patch_b=('@@ -1,2 +1,22 @@' ' use std::fmt;')
+for i in $(seq 1 20); do patch_b+=("+// pad ${i}"); done
+patch_b+=(' ' '@@ -12,4 +32,4 @@' ' impl Beta {' '     pub fn gamma(&self) -> u32 {' '-        self.a' '+        self.a + 1' '     }')
+# Patch C changes lib.rs line 19, inside LIMIT.
+patch_c=('@@ -18,3 +18,3 @@' ' const LIMIT: [u8; 2] = [' '-    1, 2,' '+    1, 3,' ' ];')
+
+# A hunk overlapping the range refuses, the range end included.
+# Wrong: a range entry read as a literal file name never matches (0); an
+# exclusive end misses line 14 (0).
+d="$(new_case hunk_overlap)"
+open_pr "${d}" 30
+pr_patch "${d}" 30 src/lib.rs "${patch_b[@]}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L12-L14)"; rc=$?
+check_eq "a hunk inside the range collides (66)" "66" "${rc}"
+check_contains "and names the entry" "src/lib.rs:L12-L14" "${out}"
+
+# The same file, a range no hunk reaches, passes. Patch B's head lines 2-21
+# are new, so reading the head side of the hunk header puts lines 3-6 inside.
+# Wrong: the whole-file rule (66); head-side line numbers (66).
+d="$(new_case hunk_elsewhere)"
+open_pr "${d}" 31
+pr_patch "${d}" 31 src/lib.rs "${patch_b[@]}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L3-L6)"; rc=$?
+check_eq "the same file, a different hunk, passes (0)" "0" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs)"; rc=$?
+check_eq "while the bare path still collides on the whole file (66)" "66" "${rc}"
+
+# A symbol whose body the patch changes refuses.
+# Wrong: the anchor line alone as the symbol (0); the block cut at the first
+# semicolon on the anchor line, whatever the bracket depth (0, for LIMIT).
+d="$(new_case symbol_touched)"
+open_pr "${d}" 32
+pr_patch "${d}" 32 src/lib.rs "${patch_a[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha')"; rc=$?
+check_eq "a symbol whose body the PR changes collides (66)" "66" "${rc}"
+check_contains "and names the entry" "src/lib.rs#alpha" "${out}"
+d="$(new_case symbol_multiline_const)"
+open_pr "${d}" 33
+pr_patch "${d}" 33 src/lib.rs "${patch_c[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#LIMIT')"; rc=$?
+check_eq "a const whose initializer spans lines collides on its body (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#Beta')"; rc=$?
+check_eq "a type's struct and impl blocks do not reach LIMIT (0)" "0" "${rc}"
+
+# A symbol the patch does not reach passes.
+# Wrong: the whole-file rule (66); the block run to the end of the file
+# instead of its closing brace (66, alpha would reach LIMIT).
+d="$(new_case symbol_untouched)"
+open_pr "${d}" 34
+pr_patch "${d}" 34 src/lib.rs "${patch_c[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha')"; rc=$?
+check_eq "a symbol the PR does not touch passes (0)" "0" "${rc}"
+d="$(new_case symbol_impl)"
+open_pr "${d}" 35
+pr_patch "${d}" 35 src/lib.rs "${patch_b[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#Beta')"; rc=$?
+check_eq "an impl block's body counts for the type it names (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha')"; rc=$?
+check_eq "an insertion above a function is not inside it (0)" "0" "${rc}"
+
+# Shell functions in both spellings.
+patch_d=('@@ -6,3 +6,3 @@' ' function other {' '-  echo two' '+  echo three' ' }')
+d="$(new_case shell_symbol)"
+open_pr "${d}" 36
+pr_patch "${d}" 36 scripts/tool.sh "${patch_d[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'scripts/tool.sh#other')"; rc=$?
+check_eq "a shell function the PR changes collides (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'scripts/tool.sh#helper')"; rc=$?
+check_eq "a shell function it does not change passes (0)" "0" "${rc}"
+
+# A symbol that is not on the base is compared as the whole file, and says so.
+d="$(new_case symbol_missing)"
+open_pr "${d}" 37
+pr_patch "${d}" 37 src/lib.rs "${patch_c[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#delta')"; rc=$?
+check_eq "a symbol not on the base falls back to the whole file (66)" "66" "${rc}"
+check_contains "and says it was not found" "not found" "${out}"
+
+# Which base lines a hunk changes. Patch B inserts between lines 1 and 2,
+# and lines 12, 13 and 15 are context in its second hunk; patch A replaces
+# line 4. Wrong: only the line after an insertion (L1 passes), only the line
+# before (L2 passes), the hunk header's whole range (L15 collides), the
+# insertion rule applied to a replacement (L5 collides).
+d="$(new_case changed_lines)"
+open_pr "${d}" 38
+pr_patch "${d}" 38 src/lib.rs "${patch_b[@]}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1)"; rc=$?
+check_eq "an insertion counts against the line before it (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L2-L2)"; rc=$?
+check_eq "and the line after it (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L15-L15)"; rc=$?
+check_eq "a context line does not count (0)" "0" "${rc}"
+pr_patch "${d}" 38 src/lib.rs "${patch_a[@]}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L5-L5)"; rc=$?
+check_eq "a replacement does not reach the line after it (0)" "0" "${rc}"
+
+# Every anchor form in the header, each with a body line below its anchor.
+# Line 48 is inside after(), past every definition including broken(), whose
+# braces never balance (the "{" in a string) and so ends before the next
+# column-0 definition. Wrong: an anchor form missing from the pattern (its
+# name falls back to the whole file, which still collides, so the positive
+# case alone cannot see it; the line-48 case then collides); broken() run to
+# the end of the file (line 48 collides).
+cat >"${work}/kinds.rs" <<'EOF'
+pub(crate) async fn one() {
+    1;
+}
+pub enum Two {
+    A,
+}
+pub trait Three {
+    fn x(&self);
+}
+mod four {
+    fn y() {}
+}
+static FIVE: [u8; 1] = [
+    5,
+];
+type Six = Vec<
+    u8,
+>;
+union Seven {
+    a: u32,
+}
+extern "C" fn eight() {
+    8;
+}
+const fn nine() {
+    9;
+}
+/// Ten.
+#[inline]
+fn ten() {
+    10;
+}
+pub unsafe fn eleven() {
+    11;
+}
+default fn twelve() {
+    12;
+}
+impl Clone for Thirteen {
+    13;
+}
+fn broken() {
+    let s = "{";
+    s.len();
+}
+
+fn after() {
+    48;
+}
+EOF
+cp "${work}/kinds.rs" "${base}/src/kinds.rs"
+git -C "${base}" add src/kinds.rs
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -m kinds
+git -C "${base}" update-ref refs/remotes/origin/main HEAD
+d="$(new_case symbol_kinds)"
+open_pr "${d}" 39
+for pair in one:2 Two:5 Three:8 four:11 FIVE:14 Six:17 Seven:20 eight:23 nine:26 ten:31 eleven:34 twelve:37 Thirteen:40 broken:44; do
+  sym="${pair%%:*}"; line="${pair##*:}"
+  pr_patch "${d}" 39 src/kinds.rs "@@ -${line},1 +${line},1 @@" "-    old" "+    new"
+  out="$(run_base "${d}" --issue 42 --paths "src/kinds.rs#${sym}")"; rc=$?
+  check_eq "#${sym}: a change on its line ${line} collides (66)" "66" "${rc}"
+  pr_patch "${d}" 39 src/kinds.rs "@@ -48,1 +48,1 @@" "-    48;" "+    49;"
+  out="$(run_base "${d}" --issue 42 --paths "src/kinds.rs#${sym}")"; rc=$?
+  check_eq "#${sym}: a change on line 48 does not (0)" "0" "${rc}"
+done
+# Doc comments and attributes above the anchor are not part of it.
+pr_patch "${d}" 39 src/kinds.rs "@@ -28,1 +28,1 @@" "-/// Ten." "+/// Ten, documented."
+out="$(run_base "${d}" --issue 42 --paths 'src/kinds.rs#ten')"; rc=$?
+check_eq "a doc comment above the anchor is not in the definition (0)" "0" "${rc}"
+
+# docs/: the unit is the heading section of the hunk's base lines.
+patch_e=('@@ -14,3 +14,3 @@' ' ' '-Use it.' '+Use it well.' ' ```')
+patch_f=('@@ -18,2 +18,2 @@' ' ```' '-More usage.' '+More usage here.')
+patch_g=('@@ -10,3 +10,3 @@' ' ' '-Flags here.' '+Flags listed here.' ' ')
+
+# Same section refuses. Wrong: the heading line alone as the section (0);
+# a fenced "## " line read as a heading, which ends Usage at line 16 (0).
+d="$(new_case docs_same_section)"
+open_pr "${d}" 40
+pr_patch "${d}" 40 docs/guide.md "${patch_e[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'docs/guide.md#usage')"; rc=$?
+check_eq "a docs edit in the same section collides (66)" "66" "${rc}"
+d="$(new_case docs_fenced_heading)"
+open_pr "${d}" 41
+pr_patch "${d}" 41 docs/guide.md "${patch_f[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'docs/guide.md#usage')"; rc=$?
+check_eq "a heading inside a code fence does not end the section (66)" "66" "${rc}"
+# A docs range is compared by section, not by line. Wrong: line overlap (0).
+out="$(run_base "${d}" --issue 42 --paths docs/guide.md:L14-L15)"; rc=$?
+check_eq "a docs range collides with any edit in its sections (66)" "66" "${rc}"
+
+# A nested subsection belongs to its parent. Wrong: the section ended at the
+# next heading of any level (0).
+d="$(new_case docs_subsection)"
+open_pr "${d}" 42
+pr_patch "${d}" 42 docs/guide.md "${patch_g[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'docs/guide.md#install')"; rc=$?
+check_eq "an edit in a nested subsection collides with its parent (66)" "66" "${rc}"
+
+# A different section passes. Wrong: the whole-file rule (66); the section
+# run to the end of the file (66).
+d="$(new_case docs_other_section)"
+open_pr "${d}" 43
+pr_patch "${d}" 43 docs/guide.md "${patch_e[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'docs/guide.md#install')"; rc=$?
+check_eq "a docs edit in a different section passes (0)" "0" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths docs/guide.md:L5-L8)"; rc=$?
+check_eq "a docs range in a different section passes (0)" "0" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths docs/guide.md)"; rc=$?
+check_eq "a bare docs path keeps the whole-file rule (66)" "66" "${rc}"
+
+# --- a diff that cannot be read is never a pass ---------------------------
+# Wrong: patches fetched in a second call whose failure falls back to the
+# filename list (0).
+d="$(new_case patch_down)"
+open_pr "${d}" 44
+pr_patch "${d}" 44 src/lib.rs "${patch_a[@]}"
+touch "${d}/patch-down-44"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L3-L6)"; rc=$?
+check_eq "a diff fetch failure exits 69" "69" "${rc}"
+check_contains "and refuses to call it clean" "refusing to report a clean answer" "${out}"
+
+# A file the endpoint returns with no patch (a diff too large to inline) is
+# compared as the whole file. Wrong: an empty patch read as no hunks (0).
+d="$(new_case patch_absent)"
+open_pr "${d}" 45
+printf '[{"filename":"src/lib.rs"}]\n' >"${d}/files-45.json"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L3-L6)"; rc=$?
+check_eq "a file with no patch collides as the whole file (66)" "66" "${rc}"
+check_contains "and says why" "no patch" "${out}"
+
+# A base the guard cannot read is could-not-ask.
+d="$(new_case base_missing)"
+open_pr "${d}" 46
+pr_patch "${d}" 46 src/lib.rs "${patch_a[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha' --base-ref refs/heads/no-such-ref)"; rc=$?
+check_eq "an unreadable base ref exits 69" "69" "${rc}"
+
+# --- an entry that does not parse is usage, before any query -------------
+d="$(new_case bad_entries)"
+open_pr "${d}" 47
+pr_patch "${d}" 47 src/lib.rs "${patch_a[@]}"
+for entry in 'src/lib.rs:L10' 'src/lib.rs#' 'src/lib.rs:L80-L10' 'src/lib.rs:L0-L3' '#alpha' 'src/lib.rs:10-80' 'src/lib.rs#al pha'; do
+  out="$(run_base "${d}" --issue 42 --paths "${entry}")"; rc=$?
+  check_eq "'${entry}' is a usage error (64)" "64" "${rc}"
+done
 
 # --- usage -------------------------------------------------------------
 d="$(new_case usage)"
