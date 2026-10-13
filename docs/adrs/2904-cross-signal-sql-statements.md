@@ -131,6 +131,10 @@ the form is unambiguous.
   token with a 400 that names the tables it could have meant.
 - A token qualified with a table the statement does not read, or with a
   Parquet table, is a 400.
+- A token, qualified or not, on a statement that names Parquet tables and no
+  signal table is a 400. Today such a token is accepted and never checked,
+  because the Parquet path returns before the catalog resolve; a lower bound
+  the caller asked for and nobody enforced is not an answer to give.
 
 An unsatisfiable token stays `503 unavailable` with its existing stable
 message. The message does not name the table: it is a fixed constant in both
@@ -233,14 +237,17 @@ memory budget fails with the existing typed memory error.
 
 ### 9. What keeps the one-table rule
 
-- **Paging.** `page_plan` refuses a multi-table statement with
-  `PagePlanError::CrossSignal`. Today `page_target` counts signal names
-  only, and a signal table beside a Parquet table never reaches it because
-  the executor refuses first. With that refusal gone, `page_target` must
-  decide on the statement's full table set, signal and non-signal names
-  together: one `samples` row can join many Parquet rows, so the samples row
-  identity is not a total order over the join. A page identity over a join
-  is a separate decision.
+- **Paging.** `page_plan` refuses, with `PagePlanError::CrossSignal`, a
+  statement that names two or more signal tables (as today) and a statement
+  that names one signal table beside any non-signal table (new). Today
+  `page_target` counts signal names only, and a signal table beside a
+  Parquet table never reaches it because the executor refuses first. With
+  that refusal gone, `page_target` must see the non-signal names too: one
+  `samples` row can join many Parquet rows, so the samples row identity is
+  not a total order over the join. A statement that names only Parquet
+  tables, one or several, is unchanged: it keeps today's `NoTable` outcome,
+  which reports a non-total order and does not refuse. A page identity over
+  a join is a separate decision.
 - **MCP.** `ravel_query_sql` stays one `SELECT` over one table (ADR-1374).
   The tool is not shipped yet. As designed, its cursor and envelope carry
   one `signal` and its snapshot identity hashes one signal, so when it
@@ -250,12 +257,23 @@ memory budget fails with the existing typed memory error.
 ### 10. Flight SQL carries one segment group per signal
 
 The Flight ticket holds one flat segment list and one erasure list with no
-signal tag, so it cannot pin two snapshots. The ticket moves to version 9:
-segments and pending erasure predicates are grouped under a signal tag, one
-group per named signal. `GetFlightInfo` pins every snapshot and `DoGet`
-executes against exactly those. A version 8 ticket is refused after the
-upgrade; tickets live no longer than their deadline. Slice tickets keep
-their meaning (a subset of one metrics snapshot). The ticket's commit tokens
+signal tag, so it cannot pin two snapshots. Versions 8 and 9 are both in
+use: 8 is the base layout and 9 is the same layout with the slice-pushdown
+block. A new version 10 layout groups segments and pending erasure
+predicates under a signal tag, one group per named signal.
+
+- A statement that names two or more signal tables mints a version 10
+  ticket. `GetFlightInfo` pins every snapshot and `DoGet` executes against
+  exactly those.
+- A statement that names at most one signal table keeps minting version 8
+  or 9, byte for byte, so no ticket in flight across an upgrade is refused
+  and no single-signal path changes.
+- Slice tickets stay version 8 or 9 and keep their meaning (a subset of one
+  metrics snapshot). A multi-table statement never produces one.
+- A version 8 or 9 ticket whose statement names two or more signal tables
+  is refused with a typed error; an honest coordinator never mints one.
+
+The ticket's commit tokens
 stay an untagged list: `DoGet` executes against the pinned segments and does
 not resolve again, so the tokens are not used to choose a snapshot there.
 
@@ -352,8 +370,11 @@ single response that says what each side read.
 - Per-table attribution replaces whole-plan collection for pruning. If the
   two-scan shape named in Context is confirmed as a present defect, this
   fixes it, and the changelog says so.
-- The Flight ticket version moves to 9. Tickets minted before an upgrade
-  fail after it.
+- A multi-signal statement over Flight SQL uses a new ticket version 10.
+  Versions 8 and 9 keep their layouts and stay accepted, so an upgrade
+  refuses no ticket in flight.
+- A `min_commit_token` on a Parquet-only statement becomes a 400. It was
+  accepted and ignored.
 - Paging and MCP keep the one-table rule and now hold it themselves instead
   of inheriting it from the executor.
 - ADR-0033, ADR-0045, ADR-1101 and ADR-2040 carry amendment sections that
