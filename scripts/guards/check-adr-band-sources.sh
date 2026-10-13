@@ -71,7 +71,9 @@ root = Path(sys.argv[1])
 docs_dir = root / sys.argv[2]
 
 BAND_RE = re.compile(r"\b(?:band|bar|target|miss)\b", re.IGNORECASE)
-SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+# GFM accepts one hyphen per delimiter cell and a table without leading or
+# trailing pipes; a horizontal rule has no pipe and is not a delimiter row.
+SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
 FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 BASIS_NAMES = {"basis", "source", "measured", "evidence"}
@@ -145,9 +147,10 @@ for path in paths:
         line = lines[i]
         if not (
             prose[i]
-            and line.lstrip().startswith("|")
+            and "|" in line
             and i + 1 < len(lines)
             and prose[i + 1]
+            and "|" in lines[i + 1]
             and SEPARATOR_RE.match(lines[i + 1])
         ):
             i += 1
@@ -156,7 +159,7 @@ for path in paths:
         header = cells(line)
         j = i + 2
         data: list[int] = []
-        while j < len(lines) and prose[j] and lines[j].lstrip().startswith("|"):
+        while j < len(lines) and prose[j] and lines[j].strip() and "|" in lines[j]:
             data.append(j)
             j += 1
         if not BAND_RE.search(line):

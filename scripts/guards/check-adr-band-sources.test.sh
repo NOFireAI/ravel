@@ -166,6 +166,29 @@ else
   fails=$((fails + 1))
 fi
 
+# Table shapes GFM accepts and the scan must not skip: a one-hyphen delimiter
+# row, and a table written without leading pipes.
+t="$(new_tree short_separator "$(printf '| figure | band | source |\n|-|-|-|\n| q1 wall | under 1 s | from the last run |\n')")"
+check "a band table with a one-hyphen delimiter row is scanned" "${t}" 1 "carries no source token"
+t="$(new_tree no_leading_pipe "$(printf 'figure | band | source\n--- | --- | ---\nq1 wall | under 1 s | from the last run\n')")"
+check "a band table without leading pipes is scanned" "${t}" 1 "carries no source token"
+t="$(new_tree rule_not_table "$(printf 'a | band\n\n---\n\nprose after a horizontal rule\n')")"
+check "a horizontal rule is not a delimiter row" "${t}" 70 ""
+
+# Each header word on its own, in any case, selects the table.
+t="$(new_tree word_bar "$(printf '| figure | bar | source |\n|---|---|---|\n| q1 wall | under 1 s | from the last run |\n')")"
+check "the header word bar selects the table" "${t}" 1 "carries no source token"
+t="$(new_tree word_upper "$(printf '| figure | TARGET | source |\n|---|---|---|\n| q1 wall | under 1 s | from the last run |\n')")"
+check "an upper-case header word selects the table" "${t}" 1 "carries no source token"
+t="$(new_tree word_miss "$(printf '| figure | miss | source |\n|---|---|---|\n| q1 wall | over 2 s | predicted |\n')")"
+check "the header word miss selects the table" "${t}" 0 "clean (1 band table(s), 1 row(s) checked"
+
+# A basis column named evidence or measured, not last, is the basis cell.
+t="$(new_tree basis_evidence "$(printf '| figure | evidence | band |\n|---|---|---|\n| q1 wall | predicted | under 1 s |\n')")"
+check "a column named evidence is the basis cell" "${t}" 0 "clean (1 band table(s), 1 row(s) checked"
+t="$(new_tree basis_measured "$(printf '| figure | measured | band |\n|---|---|---|\n| q1 wall | not yet | predicted |\n')")"
+check "a column named measured is the basis cell, not the last cell" "${t}" 1 "carries no source token"
+
 # The real thing: every band table under the shipped docs/adrs/ cites a
 # source in every row, or carries a reasoned exemption.
 out="$(cd "${REPO_ROOT}" && bash "${GUARD}" 2>&1)"; rc=$?
