@@ -499,11 +499,14 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   still read whole; `latency-first`
   resolves the byte-minimizing quantities as an intent rather than from prices,
   and pays off only at the concurrency its trade was measured at, which a pass
-  sets with `--fetch-concurrency`. So a bench run at
-  default flags measures the shape a stock server produces, loopback
-  `--s3-endpoint` or not (ADR-2023 decision 1): roughly one GET per object
-  for a full-scan statement, not one per block, including against the
-  ClickBench entry's local RustFS. Before the flag existed
+  sets with `--fetch-concurrency` (on a loopback store it also measured
+  faster cold at the core-derived concurrency, ADR-2023's issue #2683
+  amendment). So a bench run at default flags measures the shape a stock
+  server produces against a remote `--s3-endpoint`: roughly one GET per
+  object for a full-scan statement, not one per block. Against the
+  ClickBench entry's local RustFS a stock server resolves `latency-first`
+  instead, so pass `--logs-fetch-policy latency-first` to measure that
+  shape (#2920 tracks the bench default). Before the flag existed
   the bench routed at a fixed 512 KiB threshold, which range-read every larger
   object per block and made an in-process table incomparable with the server's;
   pass `byte-minimal` to reach that older shape deliberately. The requested
@@ -779,7 +782,7 @@ startup. With no cgroup limit and a readable `MemAvailable`, the budget is
 raw `MemTotal` as it did before the amendment. The two caches carve this
 budget, not `MemTotal`: a 25% read cache of 6,943,751,168 bytes and a 5%
 catalog byte cache of 1,388,750,233 bytes against an `s3` store. Against a
-loopback store the read cache instead carves a 40% share, 11,110,001,868
+loopback store the read cache instead carves a 24% share, 6,666,001,121
 bytes.
 
 The 50% per-query and per-tenant SQL pools still carve raw `MemTotal` first
@@ -789,10 +792,10 @@ explicit-flag) pool is then held at or below 90% of
 caches are carved out of it. Against the `s3` store, the remainder is
 19,442,503,271 and its 90% cap (17,498,252,943) does not bind, so both SQL
 pools stay at 16,451,897,344 with `remainder_capped=false`. Against the
-loopback store, the larger 40% read-cache carve leaves a remainder of
-15,276,252,571, whose 90% cap (13,748,627,313) does bind: both SQL pools
-resolve to that same 13,748,627,313 (the exact `bytes_as_usize`-truncated
-90% figure) with `remainder_capped=true`. This box's exact numbers depend on
+loopback store, the 24% read-cache carve leaves a remainder of
+19,720,253,318, whose 90% cap (17,748,227,986) does not bind either, so
+both SQL pools also stay at 16,451,897,344 with `remainder_capped=false`.
+This box's exact numbers depend on
 `MemAvailable` at the moment the server starts, not only on its fixed
 `MemTotal`: a co-resident process on the same host at that moment would
 derive a smaller budget and smaller caches, so two stock passes on the same

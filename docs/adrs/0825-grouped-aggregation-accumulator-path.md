@@ -161,8 +161,9 @@ corpus's hot path.
    by construction.** The UDAF stops delegating coercion for integer
    arguments: resolved integer inputs (Int8 through Int64, UInt8 through
    UInt32; Int64 is the only integer the ADR-0101 declared-column
-   vocabulary admits in practice) coerce to Int64 and keep that type in
-   the analyzed plan; the return type stays Float64. The accumulator sums
+   vocabulary admits in practice; a dictionary of one of these is admitted
+   too, see the dictionary-argument amendment below) coerce to Int64 and
+   keep that type in the analyzed plan; the return type stays Float64. The accumulator sums
    into i128 (flat vector per group), with checked addition surfacing a
    typed internal error on the unreachable overflow (exceeding i128 needs
    more than 2^63 rows of i64 extremes in one group; the row cap sits far
@@ -301,3 +302,35 @@ corpus's hot path.
   float `avg` and no float `min`/`max`; decision 1 and decision 4 are
   justified by mechanism identity, not by this profile, and their lanes
   carry their own bit-equality gates rather than borrowing q33's numbers.
+
+## Amendment 2026-10-12 (issue #2901): a dictionary of an admitted integer is an admitted integer
+
+<!-- amendment-applies: sections="Decision" pointer="the dictionary-argument amendment below" -->
+
+Decision 2 lists the resolved integer inputs the UDAF coerces to Int64 as
+the plain types, on the premise that an integer `avg` argument is a
+declared Int64 column or a cast of one. Since the move to DataFusion 55.2
+that premise misses a case: `length()` and `octet_length()` over a declared
+`Str` column (`Dictionary(Int32, Utf8)`, ADR-0099 decision 5) return
+`Dictionary(Int32, Int32)`, where 54.1 cast the argument to `Utf8` first
+and returned `Int32`. `SequentialAvg::coerce_types` did not admit that
+type, delegated to the built-in coercion, and the argument was cast to
+Float64: the Float64 fold ran, the partial state was a Float64 sum, and
+ADR-0094's classifier rightly kept the final aggregation on one partition.
+Measured on main `099b0e845` with ClickBench q29's shape,
+`avg(length("Referer"))`: partial state `[avg_sum]:Float64`, final
+aggregate `mode=Final`; `avg` over a plain Int32 or Int64 argument in the
+same build: `Decimal128(38, 0)` and `mode=FinalPartitioned` (issue #2901).
+
+The admission is by value type. `is_admitted_integer` in
+`crates/ravel-sql/src/avg.rs` looks through one `Dictionary(_, V)` and
+admits it when `V` is an admitted integer, so the analyzer casts the
+argument to Int64 and the exact `i128` accumulator of decision 2 runs,
+with the partial state and the determinism property decision 2 states. A
+dictionary whose value type is UInt64, a float or anything else coerces as
+the built-in does, as the plain type would. Decision 3's classifier arm is
+unchanged: it still admits `avg` only at a resolved Int64 argument, which
+is what it now sees. `crates/ravel-sql/tests/exact_typed_classification_q29.rs`
+pins the plan shape, the partial state type and equal rows with the
+parallel final aggregation on and off; the unit tests beside
+`is_admitted_integer` pin which dictionary value types are admitted.

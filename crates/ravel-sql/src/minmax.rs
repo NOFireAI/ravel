@@ -128,9 +128,19 @@ impl std::hash::Hash for TotalOrderMinMax {
 /// the exact float predicate that drives this UDAF's accumulator choice: the
 /// same resolved-type test decides both "needs the total-order accumulator"
 /// and "must not repartition its final aggregation".
+///
+/// A `Dictionary(_, V)` is a float exactly when `V` is, so a dictionary-encoded
+/// float key or argument fails the classification closed. The built-in
+/// `min`/`max` coercion unpacks one level of dictionary from its argument, so
+/// for a dictionary of a plain type this UDAF's argument and return type are
+/// the value type and its accumulator choice does not depend on this case.
 pub(crate) fn is_float(data_type: &DataType) -> bool {
+    let value_type = match data_type {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
     matches!(
-        data_type,
+        value_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
     )
 }
@@ -452,5 +462,26 @@ mod tests {
             routing_probe::sliding_calls() > 0,
             "a moving frame must construct the sliding accumulator"
         );
+    }
+
+    fn dictionary_of(value_type: DataType) -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type))
+    }
+
+    /// The exactness classification asks `is_float` of GROUP BY keys and
+    /// aggregate arguments, so a dictionary-encoded float must answer as a
+    /// float there.
+    #[test]
+    fn is_float_sees_through_a_dictionary() {
+        for value_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            assert!(is_float(&value_type), "{value_type} is a float");
+            let dictionary = dictionary_of(value_type);
+            assert!(is_float(&dictionary), "{dictionary} is a float");
+        }
+        for value_type in [DataType::Int32, DataType::Int64, DataType::Utf8] {
+            assert!(!is_float(&value_type), "{value_type} is not a float");
+            let dictionary = dictionary_of(value_type);
+            assert!(!is_float(&dictionary), "{dictionary} is not a float");
+        }
     }
 }
