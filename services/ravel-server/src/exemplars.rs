@@ -1073,12 +1073,12 @@ fn too_many_exemplars(max: usize) -> ServiceError {
 // http::params so the semantics match without importing a private module).
 // ---------------------------------------------------------------------------
 
-struct Params {
+pub(crate) struct Params {
     values: HashMap<String, Vec<String>>,
 }
 
 impl Params {
-    fn parse(query_string: Option<&str>, body: Option<&[u8]>) -> Self {
+    pub(crate) fn parse(query_string: Option<&str>, body: Option<&[u8]>) -> Self {
         let mut values = query_string.map(parse_form_encoded).unwrap_or_default();
         if let Some(body) = body {
             let body_str = String::from_utf8_lossy(body);
@@ -1089,14 +1089,14 @@ impl Params {
         Params { values }
     }
 
-    fn first(&self, key: &str) -> Option<&str> {
+    pub(crate) fn first(&self, key: &str) -> Option<&str> {
         self.values
             .get(key)
             .and_then(|v| v.first())
             .map(String::as_str)
     }
 
-    fn all(&self, key: &str) -> &[String] {
+    pub(crate) fn all(&self, key: &str) -> &[String] {
         self.values.get(key).map(Vec::as_slice).unwrap_or(&[])
     }
 

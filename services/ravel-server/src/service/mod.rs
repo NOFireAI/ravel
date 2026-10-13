@@ -324,6 +324,11 @@ impl QueryService {
 
     /// The shared controls, for a surface that runs its own engine call and
     /// needs the same seven steps around it.
+    /// The service clock's current reading.
+    pub fn now_ns(&self) -> i64 {
+        self.clock.now_ns()
+    }
+
     pub fn controls(&self) -> &QueryControls {
         &self.controls
     }

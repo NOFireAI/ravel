@@ -315,10 +315,14 @@ it once the catalog resolves that commit into a snapshot. The
 [query guide](docs/guides/query.md) covers the read path, and
 [architecture](docs/architecture.md) is the one-page overview.
 
-All query endpoints live under `/api/v1` on the HTTP listener, which binds
-`127.0.0.1:4318` by default. They need `Authorization: Bearer <token>`, the same
-as ingest. The [HTTP API reference](docs/reference/http-api.md) lists every
-route. One of them, `POST /api/v1/admin/fold`, triggers a
+The query endpoints live on the HTTP listener, which binds `127.0.0.1:4318` by
+default. They need `Authorization: Bearer <token>`, the same as ingest. Every
+query endpoint is under `/api/v1` except one. `GET /api/traces/<trace_id>`
+(`sql` feature) returns every span of one trace as `spans` rows. Without
+`start` and `end` it reads every span the tenant retains; see
+[fetching one trace by id](docs/guides/traces.md#fetching-one-trace-by-id).
+The [HTTP API reference](docs/reference/http-api.md) lists the `/api/v1`
+routes. One of them, `POST /api/v1/admin/fold`, triggers a
 [catalog fold on demand](docs/architecture.md#on-demand-catalog-fold).
 
 ## Agents (MCP)
@@ -329,8 +333,9 @@ cargo feature (`cargo build -p ravel-server --features mcp`) and the
 runtime `--mcp` flag, both off by default: build with the feature, then pass
 `--mcp` (and `--mcp-allowed-origins`, required whenever the MCP listener is
 reachable from outside localhost) to mount `POST /mcp` on the query router.
-One tool is served today, `ravel_capabilities`; the other eight are
-catalogued and refuse calls until their bodies land.
+Two tools are served today, `ravel_capabilities` and `ravel_get_trace` (whose
+`time_range` is optional: omitted, it reads every span the tenant retains);
+the other seven are catalogued and refuse calls until their bodies land.
 
 ## Container images
 

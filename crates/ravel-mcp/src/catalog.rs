@@ -138,8 +138,10 @@ pub struct SearchLogsInput {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetTraceInput {
+    /// 32 hex characters, either case.
     pub trace_id: String,
-    pub time_range: TimeRange,
+    /// Optional. Omitted, the lookup reads every span the tenant retains.
+    pub time_range: Option<TimeRange>,
     pub include_logs: Option<bool>,
     /// Spans (plus log rows when `include_logs` is set) returned; default
     /// 200, ceiling 5,000.
@@ -298,7 +300,8 @@ pub fn tool_catalog() -> Vec<Tool> {
         tool::<GetTraceInput>(
             "ravel_get_trace",
             "Get trace",
-            "Spans of one trace id, the span tree, missing parents, orphans",
+            "Every span of one trace id, ordered by start time. time_range is \
+             optional; without it every span the tenant retains is read",
         ),
         tool::<AnalyzeTimeseriesInput>(
             "ravel_analyze_timeseries",
@@ -324,7 +327,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_378;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_585;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.

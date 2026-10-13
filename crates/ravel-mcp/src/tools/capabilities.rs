@@ -171,13 +171,22 @@ fn budget_block(ctx: &ToolContext<'_>) -> Budget {
 }
 
 fn invalid_argument(message: String, ctx: &ToolContext<'_>) -> Envelope {
-    let envelope = Envelope {
-        status: Status::Error,
-        failure: Some(Failure {
+    refused(
+        Failure {
             class: FailureClass::InvalidArgument,
             message,
             counter: None,
-        }),
+        },
+        ctx,
+    )
+}
+
+/// The envelope of a call that ran nothing: the failure, and the ceilings the
+/// call resolved to.
+pub(super) fn refused(failure: Failure, ctx: &ToolContext<'_>) -> Envelope {
+    let envelope = Envelope {
+        status: Status::Error,
+        failure: Some(failure),
         budget: Budget {
             effective: AnyJson(budget_ceilings(ctx)),
             actual: AnyJson(Value::Object(Map::new())),
@@ -231,15 +240,18 @@ mod tests {
             .clone();
         assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
         // Served and catalogued are separate lists, and the exact split is
-        // what this build does today: one body, eight declared names that
+        // what this build does today: two bodies, seven declared names that
         // refuse every call.
-        assert_eq!(rows[1][1]["enabled"], json!(["ravel_capabilities"]));
+        assert_eq!(
+            rows[1][1]["enabled"],
+            json!(["ravel_capabilities", "ravel_get_trace"])
+        );
         assert_eq!(
             rows[1][1]["catalogued"]
                 .as_array()
                 .expect("catalogued tool list")
                 .len(),
-            8
+            7
         );
         assert_eq!(rows[3][1]["hash"], json!(ctx.tenant_hash.to_hex()));
         assert_eq!(rows[4][1]["enabled"], json!(["metrics", "logs", "traces"]));

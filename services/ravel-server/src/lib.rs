@@ -72,6 +72,8 @@ pub mod tenant_discovery;
 pub mod tenant_kms;
 #[cfg(all(test, feature = "sql"))]
 mod tests;
+#[cfg(feature = "sql")]
+pub mod traces;
 pub mod traces_ingest;
 pub mod typed_attr_config;
 pub mod typed_attr_metrics;
@@ -3367,6 +3369,7 @@ pub async fn start_with_heartbeat(
             // second instance with its own per-tenant accounting.
             sweep_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
+            http_router = http_router.merge(traces::router(state.clone()));
             // The mTLS listener's SQL route shares the same executor (built
             // once above) rather than calling `build_sql_state` a second
             // time, which would stand up a second `Catalog`/`SqlExecutor`
@@ -3376,7 +3379,8 @@ pub async fn start_with_heartbeat(
                 ..state.clone()
             });
             if let Some(mtls_state) = mtls_sql_query_state.clone() {
-                mtls_router = mtls_router.merge(sql::router(mtls_state));
+                mtls_router = mtls_router.merge(sql::router(mtls_state.clone()));
+                mtls_router = mtls_router.merge(traces::router(mtls_state));
             }
             #[cfg(feature = "flight-sql")]
             {
