@@ -343,7 +343,10 @@ async fn get_trace_by_id_without_a_window_returns_every_span() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "success", "{body}");
     assert_eq!(span_ids(&body["data"]), want(&EVERY_SPAN), "{body}");
-    assert!(body["stats"].is_object(), "the SQL envelope's stats: {body}");
+    assert!(
+        body["stats"].is_object(),
+        "the SQL envelope's stats: {body}"
+    );
 
     // Either case spells the same trace.
     let (status, upper) = get_trace(&base, TOKEN, &TRACE_HEX.to_uppercase(), &[]).await;
@@ -377,7 +380,10 @@ async fn sql_twin_keeps_a_given_window_and_the_default_without_a_trace_id() {
     assert_eq!(wide["data"]["rows"], by_id["data"]["rows"], "{wide}");
     assert_eq!(span_ids(&wide["data"]), want(&EVERY_SPAN), "{wide}");
 
-    let recent = Some((secs(now - 30 * 60 * NS_PER_SEC), secs(now + 60 * NS_PER_SEC)));
+    let recent = Some((
+        secs(now - 30 * 60 * NS_PER_SEC),
+        secs(now + 60 * NS_PER_SEC),
+    ));
     let (status, narrow) = post_sql(&base, &lookup, recent).await;
     assert_eq!(status, 200, "{narrow}");
     assert_eq!(span_ids(&narrow["data"]), want(&[RECENT_SPAN]), "{narrow}");
@@ -400,7 +406,11 @@ async fn a_malformed_id_is_400_and_an_unknown_one_is_200_with_no_rows() {
     let running = start(store, false).await;
     let base = format!("http://{}", running.http_addr);
 
-    for bad in ["7a7a", "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7g", &format!("{TRACE_HEX}00")] {
+    for bad in [
+        "7a7a",
+        "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7g",
+        &format!("{TRACE_HEX}00"),
+    ] {
         let (status, body) = get_trace(&base, TOKEN, bad, &[]).await;
         assert_eq!(status, 400, "{bad}: {body}");
         assert_eq!(body["status"], "error", "{bad}: {body}");
@@ -428,7 +438,10 @@ async fn the_route_is_served_and_authenticated() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start(store, false).await;
     let response = reqwest::Client::new()
-        .get(format!("http://{}/api/traces/{TRACE_HEX}", running.http_addr))
+        .get(format!(
+            "http://{}/api/traces/{TRACE_HEX}",
+            running.http_addr
+        ))
         .send()
         .await
         .expect("trace request sent");
@@ -496,7 +509,10 @@ async fn query_audit_records(store: &dyn ObjectStoreBackend, tenant: &TenantId) 
             .expect("get data");
         let reader = RlogReader::new(object.data.as_ref(), &cfg).expect("rlog reader");
         let (rows, _stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
-        out.extend(rows.into_iter().filter(|r| attr(r, "kind") == Some("query")));
+        out.extend(
+            rows.into_iter()
+                .filter(|r| attr(r, "kind") == Some("query")),
+        );
     }
     out
 }
@@ -543,7 +559,11 @@ mod with_mcp {
             .find(|tool| tool.name == "ravel_get_trace")
             .expect("ravel_get_trace is listed");
         let schema = serde_json::to_value(&listed.input_schema).expect("schema");
-        assert_eq!(schema["required"], serde_json::json!(["trace_id"]), "{schema}");
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["trace_id"]),
+            "{schema}"
+        );
 
         let Value::Object(arguments) = arguments else {
             panic!("arguments are an object");
@@ -588,7 +608,25 @@ mod with_mcp {
         .await;
         assert_eq!(windowed["status"], "ok", "{windowed}");
         assert_eq!(windowed["data"]["row_count"], 1, "{windowed}");
-        assert_eq!(span_ids(&windowed["data"]), want(&[RECENT_SPAN]), "{windowed}");
+        assert_eq!(
+            span_ids(&windowed["data"]),
+            want(&[RECENT_SPAN]),
+            "{windowed}"
+        );
+
+        // The tool's row budget cuts the result and says so.
+        let capped = call_get_trace(
+            &running,
+            serde_json::json!({ "trace_id": TRACE_HEX, "max_rows": 2 }),
+        )
+        .await;
+        assert_eq!(capped["status"], "ok_bounded", "{capped}");
+        assert_eq!(capped["presentation"]["row_cap_hit"], true, "{capped}");
+        assert_eq!(
+            span_ids(&capped["data"]),
+            want(&EVERY_SPAN[..2]),
+            "{capped}"
+        );
 
         running.shutdown().await.expect("graceful shutdown");
     }

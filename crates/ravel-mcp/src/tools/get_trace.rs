@@ -156,6 +156,13 @@ mod tests {
                 }),
                 FailureClass::Unsupported,
             ),
+            (
+                json!({
+                    "trace_id": "00112233445566778899aabbccddeeff",
+                    "evidence_ref": "ev1",
+                }),
+                FailureClass::Unsupported,
+            ),
         ] {
             let failure = request(args.clone()).expect_err("refused");
             assert_eq!(failure.class, class, "{args}");
