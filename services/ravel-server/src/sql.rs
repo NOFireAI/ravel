@@ -254,13 +254,25 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
-    let crate::service::SqlExecution {
-        outcome,
-        audit_elapsed,
-    } = state
+    let execution = state
         .service()
         .sql_execute_timed(tenant_hash, &request)
         .await?;
+    respond(&headers, execution, tenant_hash)
+}
+
+/// Encode an executed query: fold its block counters into the process-global
+/// totals, build `stats`, and encode per the `Accept` header. Shared by every
+/// HTTP route that runs a statement through the SQL surface.
+pub(crate) fn respond(
+    headers: &HeaderMap,
+    execution: crate::service::SqlExecution,
+    tenant_hash: TenantHash,
+) -> Result<Response, ServiceError> {
+    let crate::service::SqlExecution {
+        outcome,
+        audit_elapsed,
+    } = execution;
 
     // Fold this query's LogsScanExec block counters into the process-global
     // prune-selectivity totals. These are the scan's own
@@ -305,14 +317,23 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
             );
         }
     }
-    encode(&headers, &outcome, tenant_hash, stats)
+    encode(headers, &outcome, tenant_hash, stats)
 }
 
 /// The request's wall deadline: a client may shorten its own deadline but
 /// never extend it past the server budget. Shared by the query and DDL paths so
 /// both clamp identically.
 fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, ApiError> {
-    match body.timeout {
+    clamp_timeout(body.timeout, max_deadline)
+}
+
+/// [`request_deadline`] over a bare `timeout` value, for routes that take it
+/// from somewhere other than a [`SqlBody`].
+pub(crate) fn clamp_timeout(
+    timeout: Option<f64>,
+    max_deadline: Duration,
+) -> Result<Duration, ApiError> {
+    match timeout {
         Some(secs) if secs > 0.0 && secs.is_finite() => {
             // `Duration::from_secs_f64` panics when `secs` is finite but too
             // large to represent as a `Duration` (an `f64` as small as 1e300
@@ -589,17 +610,7 @@ fn build_request(
 
     let deadline = request_deadline(body, max_deadline)?;
 
-    let min_tokens = body
-        .min_commit_token
-        .iter()
-        .map(|raw| {
-            CommitToken::decode(raw).map_err(|_| {
-                // The token is the caller's own input, so quoting it back is
-                // safe and is what makes the error actionable.
-                ApiError::bad_request(format!("invalid min_commit_token: {raw:?}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let min_tokens = decode_min_tokens(body.min_commit_token.iter().map(String::as_str))?;
 
     Ok(SqlRequest {
         sql: body.query.clone(),
@@ -616,7 +627,22 @@ fn build_request(
     })
 }
 
-fn seconds_to_ns(name: &str, secs: f64) -> Result<i64, ApiError> {
+/// Decode `min_commit_token` values; a malformed one is 400.
+pub(crate) fn decode_min_tokens<'a>(
+    raw: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<CommitToken>, ApiError> {
+    raw.into_iter()
+        .map(|raw| {
+            CommitToken::decode(raw).map_err(|_| {
+                // The token is the caller's own input, so quoting it back is
+                // safe and is what makes the error actionable.
+                ApiError::bad_request(format!("invalid min_commit_token: {raw:?}"))
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn seconds_to_ns(name: &str, secs: f64) -> Result<i64, ApiError> {
     if !secs.is_finite() {
         return Err(ApiError::bad_request(format!(
             "{name:?} must be a finite number of Unix seconds"
