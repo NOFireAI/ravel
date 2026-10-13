@@ -32,6 +32,15 @@ use ravel_types::TenantHash;
 
 use crate::envelope::{AnyJson, Envelope, Failure};
 
+/// One `ravel_get_trace` lookup, validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceLookupRequest {
+    pub trace_id: [u8; 16],
+    /// The caller's window, kept exactly. `None` is the no-window lookup,
+    /// which reads every span the tenant retains.
+    pub window: Option<ravel_types::TimeRange>,
+}
+
 /// The nine `QueryService` operations, as the tool layer needs them.
 ///
 /// The lint allow is intentional: this trait is a crate-internal seam with
@@ -102,6 +111,15 @@ pub trait QueryBackend {
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
+    ) -> Result<Envelope, Failure>;
+
+    /// Mirrors `QueryService::trace_request` followed by
+    /// `QueryService::sql_execute`: the statement and window rule of
+    /// `GET /api/traces/{trace_id}`, run through the same SQL execution path.
+    async fn trace_lookup(
+        &self,
+        tenant_hash: TenantHash,
+        request: &TraceLookupRequest,
     ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::sql_explain`.
