@@ -2309,13 +2309,15 @@ pub struct Cli {
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
-    /// Jobs the read CPU gate runs at once (ADR-1702 decision 3): the
-    /// catalog's snapshot part, postings and column-statistics decodes above
-    /// the gate's inline floor, each on a blocking-pool thread holding one
-    /// permit. Query segment decode does not run on it. Unset, it is
-    /// `max(1, cores - 1)`. Lower it on a node shared with other CPU-heavy
-    /// work. `0` is rejected at startup, because a zero-permit gate would
-    /// never run a job.
+    /// Jobs the read CPU gate runs at once (ADR-1702 decision 3): decodes
+    /// above the gate's inline floor, each on a blocking-pool thread holding
+    /// one permit. That covers the catalog's snapshot part, postings and
+    /// column-statistics decodes, query segment, log and span block decodes
+    /// (the query engine and the SQL scans), PromQL evaluation, and maintenance
+    /// decodes; the read-gate sites in docs/guides/observability.md list
+    /// them all. Unset, it is `max(1, cores - 1)`. Lower it on a node shared
+    /// with other CPU-heavy work. `0` is rejected at startup, because a
+    /// zero-permit gate would never run a job.
     #[arg(long = "cpu-gate-read-permits", value_name = "COUNT")]
     pub cpu_gate_read_permits: Option<usize>,
 
