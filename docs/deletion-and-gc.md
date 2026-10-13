@@ -1185,7 +1185,7 @@ into them. An operator with erasure obligations must budget them deliberately.
   condition under which the stale `.cstat` is still HEAD-referenced, and a
   metadata-only answer read from typed-column statistics is refused
   outright while any erasure predicate is pending
-  (`crates/ravel-sql/src/logs_scan.rs`).
+  (`crates/ravel-sql/src/logs_scan/mod.rs`).
 
 - **The query-audit keyspace is the one excluded derived store.** It may
   retain matcher values from audited query text, and it is deny-deleted

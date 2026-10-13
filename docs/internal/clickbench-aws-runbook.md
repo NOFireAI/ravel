@@ -218,6 +218,21 @@ curl -s -H "X-aws-ec2-metadata-token: $T" \
   http://169.254.169.254/latest/meta-data/instance-type
 ```
 
+**With the kit.** `benchmarks/clickbench/kit/launch.sh run.toml` (copy
+`benchmarks/clickbench/kit/run.example.toml` and fill it in) replaces this
+section for an A/B pass. It refuses a run.toml with a missing required key
+or a key or table it does not know (a `[bands]` entry for a lane the kit does
+not run included), a band file that still holds a `FILL-IN` value in a
+section `band_sections` selects, and a missing, unknown or removed band key,
+naming each, and refuses with exit 65 when the instance profile
+cannot be read or `simulate-principal-policy` says its role cannot read the
+run's `in/` prefix or write its `out/` prefix, naming the role. It then uploads the kit to
+`s3://<bucket>/<prefix>/runs/<run-id>/in/` and launches one instance per arm
+under that run id, each with the instance profile, a 500 GB gp3 root volume,
+`--instance-initiated-shutdown-behavior terminate` and a user-data that arms
+`shutdown -h +600`. It prints the run id, both instance ids and the `out/`
+prefix; `--dry-run` prints every command and both user-data scripts instead.
+
 ## 6. Bootstrap the box
 
 Run as root. Builds the toolchain, both binaries, and downloads the dataset in
@@ -273,6 +288,33 @@ echo "BOOT DONE"
 
 `hits.parquet` is about 14 GB. Watch with `tail -f /root/bootstrap.log`; the
 run is finished when `/root/BOOT_DONE` or `/root/BOOT_FAILED` appears.
+
+**With the kit.** Nobody logs in. The user-data checks `kit.tgz` and
+`run.toml` against sha256 digests that `launch.sh` wrote into the user-data
+itself (not against a file in S3, so rewriting both objects there does not
+pass), then every file in the kit against its `SHA256SUMS`, writes the arm
+name to `/root/kit/ARM` and starts `box/run.sh` under `nohup`; a failed check
+uploads `FAILED` to the arm's `out/` prefix and shuts the box down before
+`run.sh` starts. `run.sh` runs this section's packages, toolchain, clone of
+the arm's SHA and frame-pointer build itself, then the section 7 load,
+compact, fold and declare against a loopback RustFS store on the gp3 root
+volume whose keys it generates on the box, so no SSM parameter is read. The
+kit uses that store rather than this runbook's S3 bucket for three reasons:
+each arm's data is private to its own box, so the two arms cannot read or
+overwrite each other's tenant; the instance role needs no access beyond the
+run's `in/` and `out/` prefixes; and it is the store the ClickBench Parquet
+lane (ADR-2040 D7) measures against. The cost is that a kit figure includes
+no network round trip to S3, so it is not comparable with a pass against the
+bucket. Each step is stamped in `/root/kit/progress.log`. Every key the box
+generates (the RustFS access and secret keys, the tenant token and the audit
+token key, all in `/root/kit/secrets.env`, which is never uploaded) is
+replaced by `[redacted]` in a copy of the logs before `evidence.tgz` is
+written from it, and in the last 20 lines of `run.log` before `FAILED`
+quotes them. A key still present after that refuses the tarball, and
+`FAILED` then says the tail was withheld instead of quoting it; `FAILED` is
+still uploaded. The audit token key reaches the server only under
+`audit_mode = "required"` with redacted audit text, the one mode that reads
+it.
 
 ## 7. Load, compact, fold, declare
 
@@ -402,8 +444,8 @@ grep -E "watermark_hour|seal_through_hour|buckets_folded|entry_count|part_bytes"
 Check the output before continuing. `--signal` is not optional in practice: a
 fold defaulting to the wrong signal on a logs-only tenant succeeds and seals
 nothing. `seal_through_hour` names the hour the fold sealed through, and
-`entry_count` should be close to the number of objects the load wrote. If the
-fold covered under 80% of them, the shard count or signal is wrong.
+`entry_count` should be at least 0.8 of the number of objects the load wrote.
+If the fold covered under 80% of them, the shard count or signal is wrong.
 
 ### Declare the typed columns
 
@@ -504,6 +546,36 @@ stock result records the `MemAvailable` reading next to the resolved
 against each other (an A/B, a regression check) pins `--memory-budget-bytes`
 to one value on both runs instead, so the budget is not the variable that
 differs between them.
+
+**With the kit.** `run.toml`'s `memory_budget_bytes` is that pinned value,
+the same on both arms. `box/run.sh` writes the binaries and every server flag
+to `/root/kit/arm.env` once and every server start sources it, so a restart
+runs the flags the first start ran. The load must report `rows_written` equal
+to `run.toml`'s `rows_expected` (99,997,497 for `hits.parquet`), or the box
+fails at step `load`. After the declare, a `verify` step sends the corpus's
+`q01` (`SELECT COUNT(*) FROM logs`) once through the same endpoint and window
+the benchmark uses; an answer other than `rows_expected` fails the box at step
+`verify` before any statement is timed, and the three counts are stamped as
+`provenance.row_count`. Its `benchmark` phase runs each statement
+cold (server restarted, page cache dropped) and then twice hot, and every
+call goes through `run_query`, which records it in
+`out/benchmark/calls.jsonl`. Every request body carries an explicit `start`
+and `end` spanning `run.toml`'s `window_hours` (default 200000, the window
+`sql_latency_bench --window-hours 200000` uses), because the SQL endpoint
+otherwise reads only the last hour. Each answer's row count is checked against
+the statement's `expected_rows` in `hits.corpus.json`, or, where that is null,
+against the cold try's count; a mismatch is recorded as a `wrong_answer` error
+and counts in the pooled error rate. `results.json` has the shape of
+`sql_latency_bench`'s report: an `entries` array of `id`, `min_ms` (the hot
+figure: the best of tries 2 and 3), `cold_ms` (try 1), `median_ms` and
+`max_ms` (over all three tries) and `per_run_accounting` (null over HTTP), a
+`failed` array of `id`, `run` and `error`, a `timing_definition` string that
+states those definitions, and the provenance and band verdicts as further
+top-level keys. `sql_latency_bench`'s own `min_ms` is over all three runs, so
+the two are not the same figure. The box
+then writes `results.json`, `evidence.tgz` and `progress.log`, uploads them
+with `DONE` (or `FAILED`, naming the step) to its `out/<arm>/` prefix, and
+terminates itself.
 
 ## 9. Check the report before reading the headline
 
@@ -966,6 +1038,28 @@ Rules that make a pass trustworthy:
   half, because the report counts GET requests, not distinct objects touched;
   the comment above that `SKIP` in the script gives the figures.
 
+**With the kit.** The bands are pre-registered in the lane's band file under
+`benchmarks/clickbench/bands/`, and the box asserts the absolute ones itself:
+a miss writes `DONE` with `bands=miss`. `benchmarks/clickbench/kit/fetch.sh
+--run-toml run.toml <run-id>` polls both arms' `out/` prefixes every 60 s (no
+single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
+each arm's absolute bands and then arm B's relative bands against arm A, and
+exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
+3 on timeout and 4 when S3 is unreachable or a download fails with anything
+but a missing key (a 403 and a missing bucket included). Two arms whose
+dataset, mapping or corpus digest, `hardware.cpu`, RustFS version, audit mode, query window length
+(`window_hours`) or resolved server settings differ, or that were judged by
+different band sections, are not compared and exit 2, naming the field; each
+arm's binary is not compared, since that is what differs by design. Arm B's
+relative bands also miss when fewer statements than the band file's
+`min_both_answered` were answered by both arms, when either arm answered none,
+and when a statement both answered returned a different row count on B than
+on A; each such miss names the statements. The script above reads an arm's
+`results.json` unchanged, and its sums match the kit's. Its cost-class bands
+need `per_run_accounting`, which the HTTP endpoint does not return, so on a
+kit report it lists each statement as `no per_run_accounting; cold cost not
+emitted` and exits 3; the kit's own bands are the verdict for a kit run.
+
 ## 10. Profiling a statement
 
 The `profiling` feature emits a flamegraph. Use `--runs 1` so one execution
@@ -1055,6 +1149,19 @@ aws ssm delete-parameter --name /ravel-clickbench/bucket
 ```
 
 An idle instance bills at its full on-demand rate. Stop it when a run finishes.
+
+**With the kit.** A kit box does not wait to be stopped: after uploading
+`DONE` or `FAILED` it terminates itself through the instance role and then
+runs `shutdown -h now` in every case, which the terminate behaviour turns
+into a termination; a run that failed before reading its region uploads
+nothing and only shuts down. From the moment `run.sh` starts writing `DONE`
+or `FAILED` until that final shutdown, a signal (a hangup, an interrupt or
+a terminate) also runs `shutdown -h now`, once. The `shutdown -h +600`
+timer covers a box whose run hangs.
+Nothing on its volume is kept; the results live under the run's `out/`
+prefix. If `launch.sh` fails on the second arm, it terminates the first. The
+run's `s3://<bucket>/<prefix>/runs/<run-id>/` objects stay until removed
+with `aws s3 rm --recursive`.
 
 ## Troubleshooting
 

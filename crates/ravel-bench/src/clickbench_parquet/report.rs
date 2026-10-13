@@ -1,7 +1,7 @@
 //! The ClickBench Parquet lane's report (ADR-2040 D7, issue #2055): what one
 //! run of `clickbench_parquet_bench` measured, the provenance that makes it
 //! comparable, the pre-registration it is judged against
-//! (`benchmarks/clickbench/parquet/prereg.toml`), and [`check`], which turns
+//! (`benchmarks/clickbench/bands/parquet.toml`), and [`check`], which turns
 //! D7's bar into typed [`Violation`]s.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1028,7 +1028,7 @@ mod tests {
 
     const CHECKED_IN_PREREG: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../benchmarks/clickbench/parquet/prereg.toml"
+        "/../../benchmarks/clickbench/bands/parquet.toml"
     ));
 
     const CAP: u64 = 16_451_897_344;

@@ -13,7 +13,7 @@
 //! clickbench_parquet_bench -- --server http://127.0.0.1:4318 --token-env
 //! RAVEL_TOKEN --arm a --location s3://clickbench/hits/ --reference
 //! benchmarks/clickbench/parquet/ref --prereg
-//! benchmarks/clickbench/parquet/prereg.toml --server-log server.log --out
+//! benchmarks/clickbench/bands/parquet.toml --server-log server.log --out
 //! report.json --sql-max-query-bytes N --sql-tenant-max-bytes N`
 
 use std::path::{Path, PathBuf};

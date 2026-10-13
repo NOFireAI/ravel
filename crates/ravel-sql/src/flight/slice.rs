@@ -58,7 +58,8 @@ pub enum SliceReject {
     Expired,
     /// The ticket is for another surface: a client whole-set ticket presented
     /// as a slice, a slice-key ticket that is not a slice (`slice_count <= 1`),
-    /// or a slice ticket presented on a listener that serves no slices.
+    /// a slice-key ticket in a version this build does not decode, or a slice
+    /// ticket presented on a listener that serves no slices.
     WrongSurface,
 }
 
@@ -133,8 +134,11 @@ impl SliceRejectCounters {
 /// several ways is attributed to the first. A handle the decoder reports as
 /// truncated is counted as missing, not as a bad MAC: before the MAC is
 /// checked that means shorter than the smallest ticket, and after it only a
-/// payload that verified yet ends early. The role is checked by the caller,
-/// which decides whether a `DoGet` is a slice fetch at all.
+/// payload that verified yet ends early. A ticket version this build does not
+/// decode is only reported after its MAC verified under a slice key, so it is
+/// an authentic slice this worker cannot serve (a newer coordinator during a
+/// rolling upgrade): wrong surface, not a bad MAC. The role is checked by the
+/// caller, which decides whether a `DoGet` is a slice fetch at all.
 pub(super) fn verify_slice(
     keys: &SqlTicketKeys,
     handle: &[u8],
@@ -146,6 +150,7 @@ pub(super) fn verify_slice(
     let ticket = match keys.decode(handle, TicketSurface::Slice) {
         Ok(ticket) => ticket,
         Err(FlightTicketError::Truncated) => return Err(SliceReject::Missing),
+        Err(FlightTicketError::UnsupportedVersion(_)) => return Err(SliceReject::WrongSurface),
         Err(_) if keys.decode(handle, TicketSurface::Client).is_ok() => {
             return Err(SliceReject::WrongSurface);
         }
@@ -255,5 +260,33 @@ mod tests {
             Err(SliceReject::BadMac),
             "a 102-byte handle clears the length guard, so its MAC is checked"
         );
+    }
+
+    /// A slice ticket in a version newer than this build decodes, signed
+    /// under a slice key, is the rolling-upgrade case: an authentic slice this
+    /// worker cannot read. It is refused as the wrong surface, so skew is not
+    /// counted as a forgery; the same handle with its MAC flipped still is.
+    #[test]
+    fn a_newer_slice_ticket_version_is_wrong_surface_not_bad_mac() {
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let encoded = keys
+            .encode(&slice_ticket(), TicketSurface::Slice)
+            .expect("encode");
+        let mut body = encoded[..encoded.len() - 32].to_vec();
+        body[4] = crate::flight_ticket::VERSION_PUSHDOWN + 1;
+        let tag = blake3::keyed_hash(keys.mint_key(TicketSurface::Slice), &body);
+        body.extend_from_slice(tag.as_bytes());
+        assert_eq!(
+            keys.decode(&body, TicketSurface::Slice),
+            Err(FlightTicketError::UnsupportedVersion(10))
+        );
+        assert_eq!(
+            verify_slice(&keys, &body, NOW_NS),
+            Err(SliceReject::WrongSurface)
+        );
+
+        let last = body.len() - 1;
+        body[last] ^= 0x01;
+        assert_eq!(verify_slice(&keys, &body, NOW_NS), Err(SliceReject::BadMac));
     }
 }

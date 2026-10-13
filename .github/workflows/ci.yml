@@ -510,6 +510,8 @@ jobs:
         run: bash scripts/tests/fleet-result-merge-squash.test.sh
       - name: Fresh-box launcher cases
         run: bash scripts/bench/fresh-box.test.sh
+      - name: ClickBench kit cases
+        run: bash benchmarks/clickbench/kit/kit.test.sh
       # And the check that keeps this list honest. Python suites are enrolled
       # by `unittest discover -p 'test_*.py'`, so they cannot be orphaned;
       # shell suites are enumerated by hand and a new one runs nowhere until
