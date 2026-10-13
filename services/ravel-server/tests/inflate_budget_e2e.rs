@@ -378,7 +378,7 @@ async fn measured_router_charge(points: usize) -> u64 {
 /// not that it was charged as each chunk inflated: that mid-inflate,
 /// chunk-by-chunk property is pinned separately by
 /// `over_cap_inflate_charge_peaks_at_the_cap_exactly` in
-/// `services/ravel-server/src/otlp_http.rs`.
+/// `services/ravel-server/src/ingest_decode.rs`.
 ///
 /// Non-vacuity: revert the per-chunk `budget.try_charge` in
 /// `decompress_gzip_capped_charged` and the bomb inflates fully and fails
@@ -746,7 +746,7 @@ async fn measured_remote_write_router_charge(points: usize, pad_bytes: usize) ->
 /// the allocation it pays for.
 ///
 /// Non-vacuity: remove the `charge_snappy_inflate` call from
-/// `decode_body_charged` in `src/remote_write.rs` and this returns 400.
+/// `decode_body_charged` in `src/ingest_decode.rs` and this returns 400.
 #[tokio::test]
 async fn remote_write_body_is_charged_against_the_budget_before_it_inflates() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

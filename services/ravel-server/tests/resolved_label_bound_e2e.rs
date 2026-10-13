@@ -46,7 +46,7 @@ const TENANT: &str = "acme";
 
 const HOUR_NS: i64 = 3_600 * 1_000_000_000;
 
-/// The HTTP body cap (`MAX_REQUEST_BODY_BYTES` in `otlp_http.rs`).
+/// The HTTP body cap (`MAX_REQUEST_BODY_BYTES` in `ingest_decode.rs`).
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Classic histogram points in the over-bound metrics fixture. Each projects

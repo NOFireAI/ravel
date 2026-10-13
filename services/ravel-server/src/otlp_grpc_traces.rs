@@ -13,10 +13,10 @@ use ravel_types::Signal;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
-use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
-use crate::otlp_http::{
-    COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns, resolve_write_mode,
-};
+use crate::ingest_admission::admission_rejection_status;
+use crate::ingest_mode::resolve_write_mode;
+use crate::otlp_grpc::metadata_to_headers;
+use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns};
 use crate::traces_ingest::SpanIngestRequestError;
 use crate::wire_byte_count::wire_request_bytes;
 
@@ -97,7 +97,7 @@ impl TraceService for GrpcTraceService {
                 ravel_ingest::SpanWriteError::BufferBudgetExceeded,
             ) => Status::resource_exhausted(err.to_string()),
             SpanIngestRequestError::Write(ravel_ingest::SpanWriteError::PendingAckLimitReached) => {
-                crate::otlp_grpc::pending_ack_shed_status()
+                crate::ingest_admission::pending_ack_shed_status()
             }
             // A shard at the flush deferral cap refused the write before
             // buffering it: the same backpressure class as the budget shed.
