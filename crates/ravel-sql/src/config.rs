@@ -379,8 +379,8 @@ pub struct SqlConfig {
     /// float or `UInt64` input, or any float key). A non-exact-typed plan
     /// keeps the single-partition final byte for byte whatever this is set to.
     /// `false` is the operator opt-out, restoring the pre-amendment
-    /// single-partition final for every query. Set once at server startup (`services/ravel-server`); no
-    /// live-reload, like every other field here.
+    /// single-partition final for every query. Set once at server startup
+    /// (`services/ravel-server`); no live-reload, like every other field here.
     pub parallel_final_aggregation: bool,
     /// Whether the partial aggregation stage may give up early on a
     /// high-cardinality group key (issue #680, ADR-0102 decision 2 amendment).
