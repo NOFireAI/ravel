@@ -8,11 +8,15 @@
 #
 # WHAT COUNTS AS A BAND TABLE
 #
-# A markdown table (a `|` row followed by a `|---|` separator row, outside
-# fenced code) whose header row contains the whole word band, bar, target or
-# miss, in any case. "Bands", "bars", "targets" and "misses" do not count.
-# Its data rows are the `|` lines that follow the separator, up to the first
-# line that does not start with `|`.
+# A markdown table outside fenced code whose header row contains the whole
+# word band, bar, target or miss, in any case. "Bands", "bars", "targets"
+# and "misses" do not count. A table is a row containing a `|` followed by a
+# delimiter row: cells of one or more hyphens, with or without leading and
+# trailing pipes, and itself containing a `|` (so a horizontal rule is not
+# one). Its data rows are the lines after the delimiter up to the first
+# blank line or the first line with no `|` in it, so a prose sentence that
+# contains a pipe directly under a band table is read as a row: leave a
+# blank line after the table.
 #
 # THE BASIS CELL
 #

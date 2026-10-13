@@ -172,8 +172,11 @@ t="$(new_tree short_separator "$(printf '| figure | band | source |\n|-|-|-|\n| 
 check "a band table with a one-hyphen delimiter row is scanned" "${t}" 1 "carries no source token"
 t="$(new_tree no_leading_pipe "$(printf 'figure | band | source\n--- | --- | ---\nq1 wall | under 1 s | from the last run\n')")"
 check "a band table without leading pipes is scanned" "${t}" 1 "carries no source token"
-t="$(new_tree rule_not_table "$(printf 'a | band\n\n---\n\nprose after a horizontal rule\n')")"
-check "a horizontal rule is not a delimiter row" "${t}" 70 ""
+# The rule sits directly under a line with a pipe and a band word, and a
+# pipe row follows: only the delimiter row's own pipe requirement keeps this
+# from being read as a band table with an unsourced row.
+t="$(new_tree rule_not_table "$(printf 'a | band\n---\n| q1 | from the last run |\n')")"
+check "a horizontal rule is not a delimiter row" "${t}" 70 "no band table"
 
 # Each header word on its own, in any case, selects the table.
 t="$(new_tree word_bar "$(printf '| figure | bar | source |\n|---|---|---|\n| q1 wall | under 1 s | from the last run |\n')")"
