@@ -63,7 +63,8 @@ unchanged. The format-change procedure does not apply.
      `TargetSignal::Audit`, mapped to `Signal::Alerts` and `Signal::Audit`.
      `target_signal` counts five names; naming two or more of
      {`samples`, `logs`, `spans`, `alerts`, `audit`} is `CrossSignalQuery`,
-     rejected before any catalog listing. The "no real table" default stays
+     rejected before any catalog listing (ADR-2904 replaces this rejection;
+     see the ADR-2904 amendment at the end of this file). The "no real table" default stays
      `Metrics`. Both plan arms construct their provider over the resolved
      snapshot with the query's `tenant_hash`, the executor's existing
      `log_fetcher` (the same `LogSegmentFetcher`, cache attached, that the
@@ -198,7 +199,7 @@ build while this ADR is Proposed.
 
 - `POST /api/v1/sql` and Flight SQL serve five tables. The one-signal-per-
   query rule extends to five names; naming two is still a 400 before any
-  listing.
+  listing. ADR-2904 replaces this rule (see the ADR-2904 amendment below).
 - A tenant can read its own audit trail, including the `query.text` of
   every retained SQL statement it ran and the `hold.scope` key prefixes of
   its own legal holds. Retention differs by shard: query-audit records are
@@ -230,3 +231,15 @@ build while this ADR is Proposed.
   window exists.
 - ADR-0043 decision 7 and the "not this ADR's work" line in ADR-0040's
   consequences are now delivered.
+
+## Amendment (2026-10-11, ADR-2904): `alerts` and `audit` may be named beside other tables
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-2904" -->
+
+The Decision extended ADR-0033's one-signal-per-query rule to five names.
+ADR-2904 replaces that rule: a statement may name `alerts` or `audit`
+together with other signal tables and Parquet tables, with one snapshot
+resolved per named signal. Access is unchanged: a tenant reads its own
+records, and a join reaches nothing its two sides could not already read
+separately. Until epic #2904's code lands, the executor still rejects such a
+statement.

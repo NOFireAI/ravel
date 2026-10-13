@@ -569,7 +569,9 @@ and bloom-filter pruning do not (see the page index amendment and the bloom
 filter amendment below). A query may name several Parquet tables. A Parquet
 table and a signal table in one statement is a `CrossSignalQuery` error, as
 two signal tables are today. `target_signal` gains a Parquet arm, since
-today a name it does not know routes to Metrics.
+today a name it does not know routes to Metrics. ADR-2904 allows a Parquet
+table beside a signal table; see the ADR-2904 amendment at the end of this
+file.
 
 ### D7. Validation and the performance bar
 
@@ -1475,3 +1477,16 @@ Maintain credential through an S3 tool.
 still the root fix. Until it lands, a stolen Query credential can put keys
 no request reaches; they no longer fail a listing, but each is paged through,
 counted and warned about until an operator removes it by hand.
+
+## Amendment (2026-10-11, ADR-2904): a Parquet table may be named beside a signal table
+
+<!-- amendment-applies: sections="D6. Session settings for Parquet tables follow the measurement" pointer="ADR-2904" -->
+
+D6 made a Parquet table beside a signal table a `CrossSignalQuery` error.
+ADR-2904 decision 11 allows it: the session carries the tenant's Parquet
+store registry and read limits, and registers the named signal tables beside
+the Parquet tables. In such a statement the request row window applies to
+the signal scans and not to the Parquet scan, and commit tokens apply to
+signal tables only. A statement over Parquet tables alone that carries a row
+window stays a 400. The session settings D6 chose for Parquet plans are unchanged. Until
+epic #2904's code lands, the executor still rejects such a statement.
