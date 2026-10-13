@@ -847,6 +847,25 @@ than passing for "no pull request open".
   directory argument outside the repository. Wired into
   `gates.sh` and ci.yml's `doc-scripts` job, cases first. Cases in
   `scripts/guards/check-amendment-integrity.test.sh`.
+- `scripts/guards/check-adr-band-sources.sh [dir]`: exits non-zero when a
+  row of an ADR band table carries no source. A band table is a markdown
+  table outside fenced code whose header row names the whole word band,
+  bar, target or miss, in any case; its basis cell is the one under a
+  column named basis, source, measured or evidence, else the row's last
+  cell. That cell must hold an issue comment link or `comment <id>`, an
+  `s3://` or `bench/` path, a `path.ext:N` citation, `measured
+  YYYY-MM-DD`, or the word predicted. Specs copy these bands as the bar a
+  task must clear (ADR-2867 change 6, issue #2879), and a band nobody can
+  trace back is a bar nobody can check. `docs/adrs/README.md` is the index
+  and is skipped. Exit 1 names the file, the table's header line and the
+  row's first cell. Exit 70 is a scan that could not run: no such
+  directory, no ADR files, no band table anywhere, or a band header with
+  no data rows. Exit 64 is bad usage. `<!-- band-sources-allow: <reason>
+  -->` on the nearest non-blank line above a table's header exempts that
+  table only; an empty reason, a marker that does not parse, and a marker
+  with no band table below it are each a finding. Wired into `gates.sh`
+  and ci.yml's `doc-scripts` job, cases first. Cases in
+  `scripts/guards/check-adr-band-sources.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
   a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,

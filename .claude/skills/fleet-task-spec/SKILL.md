@@ -265,9 +265,15 @@ that asserts a property of the system, and name the test or exact code
 line that makes it true. Delete or qualify any you cannot pair with one.
 Do not write "never" or "always" about behaviour you have not checked on
 every path, and recompute every number you state against the tree you are
-committing. Running this after the gated commit means landing a
-documentation fixup on top of it, which is the shape "Format before you
-commit, not after" forbids.
+committing. Every figure in a band table cites its source in its own row:
+a comment id, a report path (s3:// or bench/), a file:line, or `measured
+YYYY-MM-DD`; a band derived from a profile cites the exclusive leaf shares
+it was computed from, and a band with no measurement behind it is marked
+predicted. scripts/guards/check-adr-band-sources.sh fails any docs/adrs
+band row that carries none of these; whether a cited profile share is the
+leaf one is yours to check. Running this after the gated commit means
+landing a documentation fixup on top of it, which is the shape "Format
+before you commit, not after" forbids.
 
 DISTINGUISHING TESTS, when this task delivers an acceptance test for a
 behaviour change: name at least TWO plausible WRONG implementations the

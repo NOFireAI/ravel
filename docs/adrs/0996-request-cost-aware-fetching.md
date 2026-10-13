@@ -593,15 +593,15 @@ cache state) plus the active profile next to each figure, per the
 measurement rules. Order of investigation on a miss: state vs
 pre-registration first, per-phase split second, code hypotheses last.
 
-| figure | band | counter that reports it |
-|---|---|---|
-| cold 43-statement pass, data GETs | ≤ 160,000 (= 149,167 floor + freshness residue ~29 + bounded fallback term; expected ≈ 149.2k) | existing: `StoreMetrics.get.attempts`/`calls`, per-statement `object_store_get_requests`; scan-phase split via `PhaseAccounting` |
-| modeled cold-pass read cost | ≤ $0.064 (160,000 × $0.40/M) at the stamped reference profile | NEW: modeled-cost column (Decision 3) |
-| range_amplification, full-scan statements | ≤ 1.05 | NEW: `data_objects_touched` denominator; existing scan-phase GET numerator |
-| hot pass residual GETs | ≤ 35 (policy must not disturb #888 freshness; today 29) | existing per-statement hot counters |
-| cold-pass wall time | ≤ 1.60× the byte-minimal baseline at reference concurrency (pre-registered from #680's 1.46× measured ratio + margin); a follow-up sweep raises `--fetch-concurrency` to find the buy-back point | existing bench latency table |
-| peak fetch-buffer residency | ≤ permits × 64 MiB; on this corpus ≤ permits × 3.5 MB, band unchanged ±10% vs baseline | existing `peak_intermediate_bytes` (`accounting.rs:142`) + assembly-pool stats (`log_fetcher.rs:2883-2890`) |
-| load / compaction PUTs | unchanged bands (~14.5k / ~3.5k): read-policy change must not move PUT class | existing `StoreMetrics.put` |
+| figure | band | counter that reports it | source |
+|---|---|---|---|
+| cold 43-statement pass, data GETs | ≤ 160,000 (= 149,167 floor + freshness residue ~29 + bounded fallback term; expected ≈ 149.2k) | existing: `StoreMetrics.get.attempts`/`calls`, per-statement `object_store_get_requests`; scan-phase split via `PhaseAccounting` | predicted; the 149,167 floor is derived from the measured baseline at docs/adrs/0996-request-cost-aware-fetching.md:36 |
+| modeled cold-pass read cost | ≤ $0.064 (160,000 × $0.40/M) at the stamped reference profile | NEW: modeled-cost column (Decision 3) | predicted, from the GET band above |
+| range_amplification, full-scan statements | ≤ 1.05 | NEW: `data_objects_touched` denominator; existing scan-phase GET numerator | predicted |
+| hot pass residual GETs | ≤ 35 (policy must not disturb #888 freshness; today 29) | existing per-statement hot counters | predicted; today's 29 is the measured baseline at docs/adrs/0996-request-cost-aware-fetching.md:31 |
+| cold-pass wall time | ≤ 1.60× the byte-minimal baseline at reference concurrency (pre-registered from #680's 1.46× measured ratio + margin); a follow-up sweep raises `--fetch-concurrency` to find the buy-back point | existing bench latency table | predicted; #680's 1.46× is not quoted with a comment id in the repository |
+| peak fetch-buffer residency | ≤ permits × 64 MiB; on this corpus ≤ permits × 3.5 MB, band unchanged ±10% vs baseline | existing `peak_intermediate_bytes` (`accounting.rs:142`) + assembly-pool stats (`log_fetcher.rs:2883-2890`) | predicted |
+| load / compaction PUTs | unchanged bands (~14.5k / ~3.5k): read-policy change must not move PUT class | existing `StoreMetrics.put` | predicted; ~14.5k and ~3.5k are the measured baseline at docs/adrs/0996-request-cost-aware-fetching.md:32 and :33 |
 
 Each figure present exactly once and inside band; absent or duplicated
 fails identically to out-of-band. Latency/memory guardrails ride beside

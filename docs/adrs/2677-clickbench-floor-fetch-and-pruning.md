@@ -357,22 +357,22 @@ load with no server flags. The one exception is the q20 row, which runs
 the loader's default `--target-bytes` (the 2,617-object, 3.8 MB corpus)
 because decision 2 acts only on objects under the bound; its row says so.
 
-| check | target | miss |
-|---|---|---|
-| c6a.4xlarge cold total, 43 statements, this epic's build at derived defaults | at most 425 s (W1 tuned basis on this box 386.0 s; stock 486.6 s) | over 486.6 s |
-| c6a.4xlarge hot total, 43 statements | at most 55 s (stock 56.9 s less about 90 ms of floor on each of 43 statements) | over 58 s |
-| q1 and q7 hot p50 after an end-of-load fold | at most 80 ms (160 ms floor less the 88 ms LIST; the residual is what `stats.timings` attributes) | over 100 ms |
-| resolve LISTs per statement, folded against unfolded large-object arm | at least 80% fewer | fewer than 60% fewer |
-| `unfoldedSegmentsResolved` after the fold | 0 | any |
-| load time with `--fold-after-load` | at most 1.05x the same load without it | over 1.1x |
-| q20 GETs per object / wire bytes over corpus bytes, loader-default corpus (3.8 MB objects, not the entry recipe) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 |
-| q2 hot on 16 GB with the cache at about half the corpus | cache-served bytes at least 40% of wire bytes (deferred with decision 3 and not measured in this epic: see the decision 3 deferral amendment) | under 25% |
-| hot geomean ratio to VictoriaLogs, 42 statements, +0.01 s | reported; the plan's eight-week figure (1.1) is not this epic's target | |
-| statements answered on the reference box | 43 of 43 | fewer |
-| c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal |
-| c6a.2xlarge (16 GB), no server flags | no statement refused that stock answers (42 of 43, #2627 R6); cold reported against the tuned 377.1 s and the stock arm | any such refusal |
-| concurrent phase on c6a.4xlarge, RustFS, no server flags: first the #2044 fix alone, then with the derived defaults; three phases per arm on one box, beside three stock phases on the same box as the paired control (one pass is not a result: stock measured 0.058 and 0.027 on two S3 passes, 0.084 and 0.093 on two RustFS passes) | pooled error ratio at most 0.058 (ADR-2023 decision 4), no single phase over 0.08, pooled QPS not below the paired stock phases' | pooled error ratio over 0.058, a phase over 0.08, or QPS below the paired stock |
-| unaffected statements | no confirmed regression over 5% | |
+| check | target | miss | source |
+|---|---|---|---|
+| c6a.4xlarge cold total, 43 statements, this epic's build at derived defaults | at most 425 s (W1 tuned basis on this box 386.0 s; stock 486.6 s) | over 486.6 s | 425 s predicted; 386.0 s and 486.6 s from #1191 comment 6071729407, #2677 comment 6071772569 and #2592 comment 6072731122, quoted at docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:28 |
+| c6a.4xlarge hot total, 43 statements | at most 55 s (stock 56.9 s less about 90 ms of floor on each of 43 statements) | over 58 s | 55 s predicted; stock 56.9 s from #1191 comment 6071729407, #2677 comment 6071772569 and #2592 comment 6072731122, quoted at docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:28 |
+| q1 and q7 hot p50 after an end-of-load fold | at most 80 ms (160 ms floor less the 88 ms LIST; the residual is what `stats.timings` attributes) | over 100 ms | 80 ms predicted; the 160 ms floor and 88 ms LIST are #2639's, quoted at docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:22 |
+| resolve LISTs per statement, folded against unfolded large-object arm | at least 80% fewer | fewer than 60% fewer | predicted |
+| `unfoldedSegmentsResolved` after the fold | 0 | any | predicted |
+| load time with `--fold-after-load` | at most 1.05x the same load without it | over 1.1x | predicted |
+| q20 GETs per object / wire bytes over corpus bytes, loader-default corpus (3.8 MB objects, not the entry recipe) under `cost-based` | at most 1.0 / at most 1.05 | over 1.2 / over 1.3 | predicted |
+| q2 hot on 16 GB with the cache at about half the corpus | cache-served bytes at least 40% of wire bytes (deferred with decision 3 and not measured in this epic: see the decision 3 deferral amendment) | under 25% | predicted |
+| hot geomean ratio to VictoriaLogs, 42 statements, +0.01 s | reported; the plan's eight-week figure (1.1) is not this epic's target | | predicted (the plan's 1.1) |
+| statements answered on the reference box | 43 of 43 | fewer | stock 43 of 43 from #1191 comment 6071729407, #2677 comment 6071772569 and #2592 comment 6072731122, quoted at docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:28 |
+| c6a.4xlarge, no server flags, derived permits and loopback policy | 43 of 43; cold within 10% of the tuned 386.0 s | over 425 s, or a refusal | 10% predicted; 386.0 s from #1191 comment 6071729407, #2677 comment 6071772569 and #2592 comment 6072731122, quoted at docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:28 |
+| c6a.2xlarge (16 GB), no server flags | no statement refused that stock answers (42 of 43, #2627 R6); cold reported against the tuned 377.1 s and the stock arm | any such refusal | 42 of 43 is #2627 R6 at docs/adrs/2614-loader-memory-typed-columnar-batch-and-byte-budget.md:486; the tuned 377.1 s is not quoted elsewhere in the repository |
+| concurrent phase on c6a.4xlarge, RustFS, no server flags: first the #2044 fix alone, then with the derived defaults; three phases per arm on one box, beside three stock phases on the same box as the paired control (one pass is not a result: stock measured 0.058 and 0.027 on two S3 passes, 0.084 and 0.093 on two RustFS passes) | pooled error ratio at most 0.058 (ADR-2023 decision 4), no single phase over 0.08, pooled QPS not below the paired stock phases' | pooled error ratio over 0.058, a phase over 0.08, or QPS below the paired stock | 0.058 bar at docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:97; 0.08 predicted; stock 0.084 from #1191 comment 6071729407, #2677 comment 6071772569 and #2592 comment 6072731122, quoted at docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:28; 0.027 and 0.093 are not quoted elsewhere in the repository |
+| unaffected statements | no confirmed regression over 5% | | predicted |
 
 The v0.23 nine-machine pass already in flight (pre-registration #2592
 comment 6070942990) is the "large objects, tuned fetch and cache" arm. It
