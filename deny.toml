@@ -89,6 +89,17 @@ ignore = [
   # pprof does that, or when a fixed object_store 0.13.x appears.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
+  # RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is unmaintained. Cargo.lock
+  # reaches it through one parent, serde_yaml_ng 0.10.0, which
+  # services/ravel-operator declares under [dev-dependencies] only: the
+  # render-parity test parses the checked-in
+  # deploy/k8s/operator/operator.yaml with it. It never links into a
+  # shipped binary, and its only input is a manifest in this repository,
+  # so no caller-controlled YAML reaches it. serde_yaml_ng is itself the
+  # maintained fork taken to clear RUSTSEC-2024-0320 (serde_yaml); it
+  # still wraps unsafe-libyaml. Revisit when a serde_yaml_ng release
+  # drops unsafe-libyaml, or replace the test's parser.
+  "RUSTSEC-2024-0449",
 ]
 
 [licenses]
