@@ -2841,7 +2841,10 @@ impl SqlExecutor {
     /// `OR`, a regex, a negation, or a `__name__` matcher that is not a lone
     /// `=`, so the returned name is always a predicate the query genuinely
     /// requires at the top level: pruning to it drops only segments whose
-    /// rows the residual filter would drop anyway. Any planning error yields
+    /// rows the residual filter would drop anyway. A statement that scans
+    /// more than once derives a key per scan from the filters that bind that
+    /// scan alone ([`per_scan_name_keys`]) and returns one only when every
+    /// scan yields the same key. Any planning error yields
     /// `None` (no prune); the real plan surfaces such errors later through
     /// [`Self::plan_pinned`].
     async fn pushed_down_name_filter(&self, tenant_hash: TenantHash, sql: &str) -> Option<String> {
