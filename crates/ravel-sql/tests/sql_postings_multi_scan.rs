@@ -181,3 +181,44 @@ async fn union_all_with_same_filter_on_both_branches_still_prunes() {
         "both scans require a, so the snapshot prunes to its one segment"
     );
 }
+
+#[tokio::test]
+async fn single_scan_filter_above_window_keeps_rows_the_window_numbers() {
+    let (fixture, tenant) = folded_fixture("single-scan-window").await;
+    // Ordered by value descending, `b` takes rn 1-2 and `a` takes rn 3-5, so
+    // every `a` row passes `rn > 2`. Pruning to `a` below the window would
+    // renumber `a` as rn 1-3 and keep one row.
+    let outcome = run(
+        &fixture,
+        &tenant,
+        "SELECT value FROM (SELECT value, labels, \
+         row_number() OVER (ORDER BY value DESC) AS rn FROM samples) t \
+         WHERE label(t.labels, '__name__') = 'a' AND rn > 2",
+    )
+    .await;
+    assert_eq!(value_counts(&outcome), (A_ROWS, 0, A_ROWS));
+    assert_eq!(
+        outcome.stats.segments, 2,
+        "the window numbers rows of both metrics"
+    );
+}
+
+#[tokio::test]
+async fn single_scan_filter_above_order_by_limit_keeps_rows_the_limit_drops() {
+    let (fixture, tenant) = folded_fixture("single-scan-limit").await;
+    // The two largest values are both `b`, so no `a` row survives the limit.
+    // Pruning to `a` below the limit would let two `a` rows through.
+    let outcome = run(
+        &fixture,
+        &tenant,
+        "SELECT value FROM (SELECT value, labels FROM samples \
+         ORDER BY value DESC LIMIT 2) t \
+         WHERE label(t.labels, '__name__') = 'a'",
+    )
+    .await;
+    assert_eq!(value_counts(&outcome), (0, 0, 0));
+    assert_eq!(
+        outcome.stats.segments, 2,
+        "the limit ranks rows of both metrics"
+    );
+}
