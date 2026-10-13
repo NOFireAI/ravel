@@ -79,8 +79,9 @@
 //! `exact_typed_aggregates` argument [`session_config`] receives, rather than a
 //! hardcoded `false`. That argument is `true` only when a per-query
 //! classification (`executor::SqlExecutor`) has proven every aggregate and
-//! GROUP BY key in the query is order/partition-independent -- `count`, and
-//! `sum`/`min`/`max` over a resolved non-float input, with no float group key;
+//! GROUP BY key in the query is order/partition-independent -- `count` and
+//! `count distinct` over any input, and `sum`/`min`/`max` over a resolved
+//! non-float input, with no float group key;
 //! `avg`/`mean` over a resolved integer input other than `UInt64`,
 //! dictionary-encoded or not, is eligible too (ADR-0825 decision 3): its
 //! partial sum is exact `i128` accumulation, never plain f64 addition.
