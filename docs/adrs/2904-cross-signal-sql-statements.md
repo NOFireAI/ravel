@@ -114,8 +114,8 @@ tokens (decision 3). That is the only cross-signal consistency tool, and it
 is a lower bound per signal, not a common point.
 
 `docs/consistency-model.md` ("A query resolves one snapshot") and
-`docs/concepts.md` are amended to say "one snapshot per signal the query
-reads".
+`docs/concepts.md` will say "one snapshot per signal the query reads". That
+edit lands with the behaviour, not with this ADR.
 
 ### 3. `min_commit_token` is qualified by table on a multi-signal statement
 
@@ -163,9 +163,13 @@ built-in operator, as it is in a session without `logs` today.
 Nothing derived from the plan may assume the plan has one table.
 
 - **Row window.** Each `TableScan` of a signal table gets the request window
-  on its own table's event-time column. A Parquet scan takes no row window,
-  as today: a Parquet table has no event-time column the executor knows. The
-  reported window predicate becomes one entry per signal table.
+  on its own table's event-time column. A Parquet table has no event-time
+  column the executor knows, so a Parquet scan gets no window. In a statement
+  that names a signal table beside a Parquet table, the window applies to
+  the signal scans and not to the Parquet scan, and the docs say so. A
+  statement that names only Parquet tables and carries a row window stays a
+  400 (`ParquetQueryError::RowWindowUnsupported`), as today. The reported
+  window predicate becomes one entry per signal table.
 - **Snapshot pruning from predicates.** A predicate may prune table T's
   snapshot only when every row that any scan of T contributes to the result
   must satisfy it. The executor derives the candidate predicates per scan,
@@ -229,9 +233,14 @@ memory budget fails with the existing typed memory error.
 
 ### 9. What keeps the one-table rule
 
-- **Paging.** `page_plan` keeps refusing a multi-table statement with
-  `PagePlanError::CrossSignal`. A page identity over a join is a separate
-  decision.
+- **Paging.** `page_plan` refuses a multi-table statement with
+  `PagePlanError::CrossSignal`. Today `page_target` counts signal names
+  only, and a signal table beside a Parquet table never reaches it because
+  the executor refuses first. With that refusal gone, `page_target` must
+  decide on the statement's full table set, signal and non-signal names
+  together: one `samples` row can join many Parquet rows, so the samples row
+  identity is not a total order over the join. A page identity over a join
+  is a separate decision.
 - **MCP.** `ravel_query_sql` stays one `SELECT` over one table (ADR-1374).
   The tool is not shipped yet. As designed, its cursor and envelope carry
   one `signal` and its snapshot identity hashes one signal, so when it

@@ -1482,6 +1482,8 @@ counted and warned about until an operator removes it by hand.
 D6 made a Parquet table beside a signal table a `CrossSignalQuery` error.
 ADR-2904 decision 11 allows it: the session carries the tenant's Parquet
 store registry and read limits, and registers the named signal tables beside
-the Parquet tables. A Parquet scan takes no request row window and no commit
-token. The session settings D6 chose for Parquet plans are unchanged. Until
+the Parquet tables. In such a statement the request row window applies to
+the signal scans and not to the Parquet scan, and commit tokens apply to
+signal tables only. A statement over Parquet tables alone that carries a row
+window stays a 400. The session settings D6 chose for Parquet plans are unchanged. Until
 epic #2904's code lands, the executor still rejects such a statement.
