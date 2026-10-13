@@ -7,7 +7,9 @@
 //! now cannot reach the old hour (its listing reaches back one hour plus the
 //! two-hour ingest lag, and the folded part's event range ends five hours
 //! back), and a resolve over folded parts alone cannot reach the recent one,
-//! so only a lookup that resolves the whole tenant returns every span.
+//! so only a lookup that resolves the whole tenant returns every span. A
+//! second tenant holds one span under the same trace id, in an object of its
+//! own.
 //!
 //! The server runs on the real clock, so the fixture timestamps are read from
 //! it too.
@@ -52,6 +54,8 @@ const RECENT_SPAN: [u8; 8] = [3; 8];
 /// [`OTHER_TRACE`]'s spans, one per hour.
 const OTHER_OLD_SPAN: [u8; 8] = [9; 8];
 const OTHER_RECENT_SPAN: [u8; 8] = [8; 8];
+/// [`OTHER_TENANT`]'s one span, carrying the same trace id as [`TRACE`].
+const OTHER_TENANT_SPAN: [u8; 8] = [0xb0; 8];
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -141,14 +145,16 @@ fn server_config(mcp_enabled: bool) -> ServerConfig {
     }
 }
 
-/// One RSPAN object holding `spans`, committed in the ingest hour of `ts_ns`.
+/// One RSPAN object of `tenant` holding `spans`, committed in the ingest hour
+/// of `ts_ns`.
 async fn publish_spans(
     store: &dyn ObjectStoreBackend,
+    tenant: &str,
     writer_id: Uuid,
     ts_ns: i64,
     spans: &[([u8; 16], [u8; 8], i64)],
 ) {
-    let tenant = TenantId::new(TENANT);
+    let tenant = TenantId::new(tenant);
     let mut writer = ravel_rspan::RspanWriter::new(
         ravel_rspan::RspanConfig::default(),
         ravel_rspan::ObjectIdentity {
@@ -214,6 +220,7 @@ async fn seeded() -> (Arc<dyn ObjectStoreBackend>, i64) {
     let recent = now - 120 * NS_PER_SEC;
     publish_spans(
         store.as_ref(),
+        TENANT,
         Uuid::from_u128(1),
         old,
         &[
@@ -225,12 +232,21 @@ async fn seeded() -> (Arc<dyn ObjectStoreBackend>, i64) {
     .await;
     publish_spans(
         store.as_ref(),
+        TENANT,
         Uuid::from_u128(2),
         recent,
         &[
             (TRACE, RECENT_SPAN, recent),
             (OTHER_TRACE, OTHER_RECENT_SPAN, recent),
         ],
+    )
+    .await;
+    publish_spans(
+        store.as_ref(),
+        OTHER_TENANT,
+        Uuid::from_u128(3),
+        recent,
+        &[(TRACE, OTHER_TENANT_SPAN, recent)],
     )
     .await;
 
@@ -439,6 +455,31 @@ async fn a_malformed_id_is_400_and_an_unknown_one_is_200_with_no_rows() {
         );
     }
 
+    // The path segment is percent-decoded once before it is parsed.
+    let encoded_seven = format!("%37{}", &TRACE_HEX[1..]);
+    let (status, body) = get_trace(&base, TOKEN, &encoded_seven, &[]).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(span_ids(&body["data"]), want(&EVERY_SPAN), "{body}");
+
+    for bad in [
+        // 32 characters as sent, 30 once decoded.
+        format!("%37{}", &TRACE_HEX[3..]),
+        // A valid id only after a second decode.
+        format!("%2537{}", &TRACE_HEX[1..]),
+        // 32 bytes, as 16 two-byte characters.
+        "\u{e9}".repeat(16),
+    ] {
+        let (status, body) = get_trace(&base, TOKEN, &bad, &[]).await;
+        assert_eq!(status, 400, "{bad}: {body}");
+        assert_eq!(body["errorType"], "bad_data", "{bad}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("32 hexadecimal")),
+            "{bad}: {body}"
+        );
+    }
+
     let (status, body) = get_trace(&base, TOKEN, &hex(&[0x55; 16]), &[]).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "success", "{body}");
@@ -493,15 +534,29 @@ async fn a_lookup_writes_one_query_audit_record() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// Both tenants hold spans under [`TRACE`]; each lookup returns only the
+/// asking tenant's.
 #[tokio::test]
-async fn another_tenant_reads_no_rows_of_the_trace() {
+async fn tenants_sharing_a_trace_id_read_only_their_own_spans() {
     let (store, _) = seeded().await;
     let running = start(store, false).await;
     let base = format!("http://{}", running.http_addr);
 
-    let (status, body) = get_trace(&base, OTHER_TOKEN, TRACE_HEX, &[]).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["data"]["rows"], serde_json::json!([]), "{body}");
+    let (status, own) = get_trace(&base, TOKEN, TRACE_HEX, &[]).await;
+    assert_eq!(status, 200, "{own}");
+    assert_eq!(span_ids(&own["data"]), want(&EVERY_SPAN), "{own}");
+    assert!(
+        !span_ids(&own["data"]).contains(&Value::from(hex(&OTHER_TENANT_SPAN))),
+        "{own}"
+    );
+
+    let (status, other) = get_trace(&base, OTHER_TOKEN, TRACE_HEX, &[]).await;
+    assert_eq!(status, 200, "{other}");
+    assert_eq!(
+        span_ids(&other["data"]),
+        want(&[OTHER_TENANT_SPAN]),
+        "{other}"
+    );
 
     running.shutdown().await.expect("graceful shutdown");
 }
