@@ -181,8 +181,11 @@ fn invalid_argument(message: String, ctx: &ToolContext<'_>) -> Envelope {
     )
 }
 
-/// The envelope of a call that ran nothing: the failure, and the ceilings the
-/// call resolved to.
+/// The envelope of a failed call: the failure, and the ceilings the call
+/// resolved to. It carries no spend, so it is exact only for a call that ran
+/// nothing (an argument refusal); a backend failure raised after the scan
+/// started is also rendered here and under-reports what it read, because
+/// `ServiceError` carries no accounting.
 pub(super) fn refused(failure: Failure, ctx: &ToolContext<'_>) -> Envelope {
     let envelope = Envelope {
         status: Status::Error,

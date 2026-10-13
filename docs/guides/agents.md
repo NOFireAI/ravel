@@ -303,8 +303,9 @@ Paging order differs per tool:
   as for `ravel_search_logs`, and cursor paging continues.
 - `ravel_search_logs` orders by a tuple that is not always unique, because
   `logs` rows carry no row identity. The equal-group rule applies.
-- `ravel_get_trace` orders by `start_ts` and `span_id`, and every span
-  carries a `span_id`. The equal-group rule never applies to it.
+- `ravel_get_trace` mints no cursor as served today: it returns the trace's
+  spans in one page, ordered by `start_ts` and `span_id`, and a trace larger
+  than the row cap comes back bounded (`row_cap_hit`) rather than paged.
 
 The equal-group rule: a page never ends inside a group of equal tuples. If a
 group does not fit on the page whole, the tool drops that whole group from
@@ -335,8 +336,8 @@ whether the same query returns that row today.
 The server does not promise these things:
 
 - **Completeness of a trace.** `ravel_get_trace` reports the spans that it
-  found, the parents that are missing, and the spans with no known parent.
-  It does not promise that every span of a trace has arrived. Distributed
+  found; it does not yet report which parents are missing or which spans have
+  no known parent. It does not promise that every span of a trace has arrived. Distributed
   tracing is best-effort, and a trace can still be receiving spans when you
   ask.
 - **Immunity to prompt injection.** Telemetry text (a log body, a span
