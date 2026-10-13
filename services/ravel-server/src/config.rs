@@ -1440,10 +1440,12 @@ pub struct Cli {
     /// `ravel_sql::SqlConfig::parallel_final_aggregation`. On by default: a
     /// per-query classification flips DataFusion's `repartition_aggregations`
     /// on for a query whose aggregates and GROUP BY keys are all provably
-    /// order/partition-independent (`count`, `count distinct`, and
-    /// `sum`/`min`/`max` over non-float input, no float group key);
-    /// `avg`/`mean` and any float input or key are never eligible and stay
-    /// single-partitioned. Pass `--sql-parallel-final-aggregation=false` (or the
+    /// order/partition-independent (`count` and `count distinct` over any
+    /// input, `sum`/`min`/`max` over non-float input, and `avg`/`mean` over an
+    /// integer input other than UInt64, dictionary-encoded or not, per
+    /// ADR-0825; no float group key); `sum`/`min`/`max`/`avg`/`mean` over float
+    /// input and any float key are never eligible and stay single-partitioned.
+    /// Pass `--sql-parallel-final-aggregation=false` (or the
     /// bare `--sql-parallel-final-aggregation`, which stays accepted and still
     /// means on) to control it; `false` is the operator opt-out that restores
     /// the pre-amendment single-partition final for every query. Process-wide,
