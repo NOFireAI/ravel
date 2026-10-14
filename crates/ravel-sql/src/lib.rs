@@ -215,7 +215,7 @@ pub use session::{
     EXCLUDED_SCALARS, EXCLUDED_TABLE_FUNCTIONS, EXCLUDED_WINDOWS, EmptyObjectStoreRegistry,
     LOGS_TABLE, SAMPLES_TABLE, SKIP_PARTIAL_AGGREGATION_PROBE_RATIO,
     SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SPANS_TABLE, SessionTable, SpillDecision, build_session,
-    session_config,
+    build_session_with_tables, session_config,
 };
 pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
 pub use spans_provider::SpansTableProvider;
