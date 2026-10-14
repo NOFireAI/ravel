@@ -556,7 +556,9 @@ source wins:
    `--cache-dir` says. This is requirement 9's no-spill profile as a flag.
    The flag's other value, `auto`, is the default.
 2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES` both set: that
-   directory and that per-query ceiling, as before this amendment.
+   directory and that per-query ceiling, as before this amendment. (The
+   ceiling is per process, as requirement 2 below says for every source; see
+   the per-process spill ceiling correction.)
 3. `--cache-dir` set and `RAVEL_SQL_SPILL_DIR` unset: the directory is
    `<cache-dir>/sql-spill/<instance-id>`. The ceiling is
    `RAVEL_SQL_SPILL_MAX_BYTES` when it is set alone, and otherwise
@@ -701,3 +703,18 @@ are local to each client (NFS mounted `nolock` or `local_lock`), a sweep
 on one host can take, and delete, another host's live root. The cache
 directory of a process whose spill is not `off` must be on a local volume,
 since its startup sweep runs wherever its spill resolves.
+
+## Correction (2026-10-14): the spill ceiling is per process
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): spill under --cache-dir by default, and a tie-ordered Sort (issue #2416)" pointer="per-process spill ceiling correction" -->
+
+This is the per-process spill ceiling correction (issue #2948). Item 2 of
+the amendment's requirement 3 calls the `RAVEL_SQL_SPILL_MAX_BYTES` value
+of the environment pair a per-query ceiling. It is not: whichever source
+supplies it, the resolved `SpillConfig::max_bytes` is the one ceiling of
+the amendment's requirement 2. `SqlExecutor::new` builds one `SpillBudget`
+from it, every query granted spill reserves its cap from that budget, and
+`ravel-server` builds one executor per process and shares it across its
+HTTP, mTLS and Flight SQL surfaces. The environment pair therefore sets the
+directory and the process-wide ceiling. Nothing else in the amendment
+changes.
