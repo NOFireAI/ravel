@@ -25,6 +25,10 @@
 //! result that is not finite all read null, as in ES|QL. ES|QL also attaches
 //! a warning to the response for each; this lowering has no warning channel,
 //! so those nulls arrive without one.
+//!
+//! A statement ending in its own `LIMIT` returns at most [`MAX_LIMIT`] rows,
+//! and one that does not returns at most [`IMPLICIT_LIMIT`]. A statement that
+//! binds to more than [`MAX_BOUND_NODES`] expression nodes is refused.
 
 mod binder;
 mod error;
@@ -44,7 +48,7 @@ pub use error::EsqlError;
 pub use run::{EsqlOutcome, EsqlRequest, EsqlRun, execute};
 pub use types::{EsqlColumn, EsqlType};
 
-pub use binder::IMPLICIT_LIMIT;
+pub use binder::{IMPLICIT_LIMIT, MAX_BOUND_NODES, MAX_LIMIT};
 
 use crate::declared::DeclaredColumn;
 use crate::executor::{StatementTables, TargetSignal};
@@ -68,6 +72,14 @@ pub struct PrepareContext {
 }
 
 /// A parsed and bound ES|QL statement, ready to run.
+///
+/// Run it through [`execute`]. A `ROW` statement must not be handed to
+/// [`SqlExecutor::execute_statement_accounted`] directly: its
+/// [`target`](LoweredStatement::target) still names the `logs` signal while
+/// [`needs_catalog`](Self::needs_catalog) says it reads no catalog, and only
+/// [`execute`] routes it to a session that registers no table.
+///
+/// [`SqlExecutor::execute_statement_accounted`]: crate::executor::SqlExecutor::execute_statement_accounted
 #[derive(Debug, Clone)]
 pub struct PreparedEsql {
     text: String,
@@ -76,6 +88,7 @@ pub struct PreparedEsql {
     window: Option<TimeRange>,
     columns: Vec<EsqlColumn>,
     now_ns: i64,
+    clamped_limit: Option<u64>,
 }
 
 /// The scalar functions an ES|QL lowering may call, by registered name.
@@ -136,6 +149,7 @@ pub fn prepare(
         window,
         columns: bound.columns,
         now_ns: ctx.now_ns,
+        clamped_limit: bound.clamped_limit,
     })
 }
 
@@ -155,6 +169,12 @@ impl PreparedEsql {
     /// The result columns, in order, with their ES|QL types.
     pub fn columns(&self) -> &[EsqlColumn] {
         &self.columns
+    }
+
+    /// The statement's own final `LIMIT`, when it was above [`MAX_LIMIT`]
+    /// and the statement returns at most [`MAX_LIMIT`] rows instead.
+    pub fn clamped_limit(&self) -> Option<u64> {
+        self.clamped_limit
     }
 
     /// The statement's logical plan in `session`, lowered and admitted as the
@@ -191,6 +211,11 @@ impl PreparedEsql {
 
 #[async_trait]
 impl LoweredStatement for PreparedEsql {
+    /// The `logs` signal, for a `ROW` statement as well, which reads no
+    /// catalog: run a `ROW` statement through [`execute`], never through
+    /// [`SqlExecutor::execute_statement_accounted`] directly.
+    ///
+    /// [`SqlExecutor::execute_statement_accounted`]: crate::executor::SqlExecutor::execute_statement_accounted
     fn target(&self) -> StatementTarget {
         StatementTarget::Signal(TargetSignal::Logs)
     }

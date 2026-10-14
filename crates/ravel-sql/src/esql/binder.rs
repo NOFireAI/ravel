@@ -16,7 +16,7 @@
 //! before declared, applied at `FROM` rather than per reference, so no
 //! reference is ambiguous.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use datafusion::arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
 use datafusion::arrow::datatypes::{DataType, IntervalMonthDayNano, TimeUnit};
@@ -38,12 +38,38 @@ use crate::session::LOGS_TABLE;
 /// The rows a query returns when it does not end with its own `LIMIT`.
 pub const IMPLICIT_LIMIT: u64 = 1000;
 
+/// The most rows a query returns: a final `LIMIT` above it is lowered to it.
+/// This mirrors the default result cap of Elasticsearch 9.5.5, the target
+/// release (`esql.query.result_truncation_max_size`, 10,000 rows).
+pub const MAX_LIMIT: u64 = 10_000;
+
+/// The most expression nodes a statement may bind to, counting every
+/// stage's expressions and the column references each projection carries; a
+/// statement past it is refused with a verification error.
+///
+/// The densest shape measured is a long division per two tokens, whose
+/// guards bind to 17 nodes: a statement of such divisions binds to under 9
+/// nodes per token, so one at the default 65,536-token limit binds to under
+/// 589,824 nodes. The budget is the next power of two. A statement of many
+/// fields over many columns can still pass it, since each field's projection
+/// carries every visible column, and is refused.
+pub const MAX_BOUND_NODES: usize = 1 << 20;
+
+/// An expression the bound output repeats is copied only up to this many
+/// nodes. A larger one is computed once under a fresh internal name ahead of
+/// the stage that reads it, and the copies read that column, so an operand
+/// larger than this appears once in the bound statement however often it is
+/// read.
+const INLINE_NODES: usize = 4;
+
 /// What binding produced.
 pub(crate) struct Bound {
     pub(crate) pipeline: Pipeline,
     pub(crate) columns: Vec<EsqlColumn>,
     /// `None` for `ROW`.
     pub(crate) window: Option<WindowBounds>,
+    /// The statement's own final `LIMIT`, when [`MAX_LIMIT`] lowered it.
+    pub(crate) clamped_limit: Option<u64>,
 }
 
 /// The request inputs binding reads.
@@ -64,6 +90,10 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
         scope: Scope::default(),
         window: None,
         ts: None,
+        nodes: 0,
+        at: query.source.span(),
+        pre: Vec::new(),
+        post: Vec::new(),
     };
     match &query.source {
         Command::From(from) => binder.from(from, input)?,
@@ -71,12 +101,13 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
             for field in &row.fields {
                 let (value, ty) = binder.value(&field.expr, &mut Cx::Row)?;
                 let name = binder.field_name(field);
-                binder.define(name, value, ty);
+                binder.define(name, value, ty)?;
             }
         }
         other => return Err(binder.unsupported(other.span(), "this source command")),
     }
     for command in &query.processing {
+        binder.at = command.span();
         let before = binder.timestamp_internal();
         binder.command(command)?;
         if binder.timestamp_internal() != before
@@ -85,8 +116,15 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
             window.close();
         }
     }
-    if !matches!(query.processing.last(), Some(Command::Limit(_))) {
-        binder.stages.push(Stage::Limit(IMPLICIT_LIMIT));
+    let mut clamped_limit = None;
+    match (query.processing.last(), binder.stages.last_mut()) {
+        (Some(Command::Limit(_)), Some(Stage::Limit(count))) => {
+            if *count > MAX_LIMIT {
+                clamped_limit = Some(*count);
+                *count = MAX_LIMIT;
+            }
+        }
+        _ => binder.push(Stage::Limit(IMPLICIT_LIMIT))?,
     }
     let output = binder
         .scope
@@ -116,6 +154,7 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
         },
         columns,
         window: binder.window,
+        clamped_limit,
     })
 }
 
@@ -215,6 +254,14 @@ struct Binder<'a> {
     window: Option<WindowBounds>,
     /// The internal name of the source's timestamp column.
     ts: Option<String>,
+    /// The expression nodes bound so far, against [`MAX_BOUND_NODES`].
+    nodes: usize,
+    /// The command being bound, where a budget refusal points.
+    at: Span,
+    /// Shared operands the next stage reads, over the current scope.
+    pre: Vec<(String, BExpr)>,
+    /// Shared operands of a `STATS` field, over the aggregate's output.
+    post: Vec<(String, BExpr)>,
 }
 
 impl Binder<'_> {
@@ -260,25 +307,148 @@ impl Binder<'_> {
         }
     }
 
-    /// Every visible column and the hidden `attrs` column, unchanged.
-    fn carry(&self) -> Vec<(BExpr, String)> {
+    /// The internal names of every visible column and the hidden `attrs`
+    /// column.
+    fn carry_names(&self) -> Vec<String> {
         self.scope
             .cols
             .iter()
             .map(|col| &col.internal)
             .chain(self.scope.attrs.as_ref())
-            .map(|internal| (BExpr::Column(internal.clone()), internal.clone()))
+            .cloned()
             .collect()
     }
 
+    /// Every visible column and the hidden `attrs` column, unchanged.
+    fn carry(&self) -> Vec<(BExpr, String)> {
+        self.carry_names()
+            .into_iter()
+            .map(|internal| (BExpr::Column(internal.clone()), internal))
+            .collect()
+    }
+
+    /// Refuse a statement that has bound more than [`MAX_BOUND_NODES`]
+    /// expression nodes, pointing at `span`.
+    fn within_budget(&self, nodes: usize, span: Span) -> Result<(), EsqlError> {
+        if nodes > MAX_BOUND_NODES {
+            return Err(self.verification(
+                span,
+                format!("the statement binds to more than {MAX_BOUND_NODES} expression nodes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, stage: Stage) -> Result<(), EsqlError> {
+        self.nodes = self.nodes.saturating_add(stage.nodes());
+        self.within_budget(self.nodes, self.at)?;
+        self.stages.push(stage);
+        Ok(())
+    }
+
+    /// `value` if it is small enough to copy, else a column reading it,
+    /// computed ahead of the stage that reads the result: over the
+    /// aggregate's output for a `STATS` field (`post`), else over the current
+    /// scope.
+    fn share(&mut self, value: BExpr, post: bool) -> BExpr {
+        if value.nodes() <= INLINE_NODES {
+            return value;
+        }
+        let name = self.fresh();
+        let lets = if post { &mut self.post } else { &mut self.pre };
+        lets.push((name.clone(), value));
+        BExpr::Column(name)
+    }
+
+    /// Compute the shared operands `reads` reaches ahead of the stage that
+    /// reads them, from the current scope.
+    fn flush_pre(&mut self, reads: &[&BExpr]) -> Result<(), EsqlError> {
+        let lets = std::mem::take(&mut self.pre);
+        let carry = self.carry_names();
+        self.flush(lets, &carry, reads)
+    }
+
+    /// Compute the shared operands `lets` that `reads` reaches, one projection
+    /// per level of nesting, deepest first. Each projection carries `carry`,
+    /// computes the operands at its level and passes on the ones a shallower
+    /// level still reads, so the stage after the last projection reads
+    /// `carry` and every operand `reads` names. A shared operand reads only
+    /// operands shared before it, so `lets` is in dependency order.
+    fn flush(
+        &mut self,
+        lets: Vec<(String, BExpr)>,
+        carry: &[String],
+        reads: &[&BExpr],
+    ) -> Result<(), EsqlError> {
+        if lets.is_empty() {
+            return Ok(());
+        }
+        let (names, mut values): (Vec<String>, Vec<Option<BExpr>>) = lets
+            .into_iter()
+            .map(|(name, value)| (name, Some(value)))
+            .unzip();
+        let index: HashMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        // depth: 1 for an operand the stage reads, one more than its deepest
+        // reader otherwise, 0 when nothing reads it. reader: the depth of its
+        // shallowest reader, the stage being depth 0.
+        let mut depth = vec![0usize; names.len()];
+        let mut reader = vec![usize::MAX; names.len()];
+        let mut read = Vec::new();
+        reads.iter().for_each(|e| e.columns(&mut read));
+        for name in read {
+            if let Some(&i) = index.get(name) {
+                depth[i] = 1;
+                reader[i] = 0;
+            }
+        }
+        for i in (0..names.len()).rev() {
+            if depth[i] == 0 {
+                continue;
+            }
+            let mut read = Vec::new();
+            if let Some(value) = &values[i] {
+                value.columns(&mut read);
+            }
+            for name in read {
+                if let Some(&child) = index.get(name) {
+                    depth[child] = depth[child].max(depth[i] + 1);
+                    reader[child] = reader[child].min(depth[i]);
+                }
+            }
+        }
+        let deepest = depth.iter().copied().max().unwrap_or(0);
+        for level in (1..=deepest).rev() {
+            let mut columns: Vec<(BExpr, String)> = carry
+                .iter()
+                .map(|name| (BExpr::Column(name.clone()), name.clone()))
+                .collect();
+            for (i, name) in names.iter().enumerate() {
+                if depth[i] == level {
+                    if let Some(value) = values[i].take() {
+                        columns.push((value, name.clone()));
+                    }
+                } else if depth[i] > level && reader[i] < level {
+                    columns.push((BExpr::Column(name.clone()), name.clone()));
+                }
+            }
+            self.push(Stage::Project(columns))?;
+        }
+        Ok(())
+    }
+
     /// Add `name` as the last column, replacing any column of that name.
-    fn define(&mut self, name: String, value: BExpr, ty: EsqlType) {
+    fn define(&mut self, name: String, value: BExpr, ty: EsqlType) -> Result<(), EsqlError> {
+        self.flush_pre(&[&value])?;
         let internal = self.fresh();
         self.scope.cols.retain(|col| col.name != name);
         let mut columns = self.carry();
         columns.push((value, internal.clone()));
         self.scope.cols.push(Col { name, internal, ty });
-        self.stages.push(Stage::Project(columns));
+        self.push(Stage::Project(columns))
     }
 
     fn from(&mut self, from: &ast::FromCommand, input: &BindInput<'_>) -> Result<(), EsqlError> {
@@ -384,7 +554,7 @@ impl Binder<'_> {
         let ts = self.scope.cols[0].internal.clone();
         let body = self.scope.cols[4].internal.clone();
         self.scope.aliases = vec![("ts", ts.clone()), ("body", body)];
-        self.stages.push(Stage::Project(columns));
+        self.push(Stage::Project(columns))?;
 
         let mut range = Vec::new();
         if let Some(start) = input.start {
@@ -405,7 +575,7 @@ impl Binder<'_> {
             .into_iter()
             .reduce(|left, right| BExpr::binary(left, Operator::And, right))
         {
-            self.stages.push(Stage::Filter(condition));
+            self.push(Stage::Filter(condition))?;
         }
         self.ts = Some(ts);
         self.window = Some(WindowBounds::default());
@@ -420,13 +590,14 @@ impl Binder<'_> {
                 if let (Some(window), Some(ts)) = (&mut self.window, &self.ts) {
                     window.observe(&condition, ts);
                 }
-                self.stages.push(Stage::Filter(condition));
+                self.flush_pre(&[&condition])?;
+                self.push(Stage::Filter(condition))?;
             }
             Command::Eval(eval) => {
                 for field in &eval.fields {
                     let (value, ty) = self.value(&field.expr, &mut Cx::Row)?;
                     let name = self.field_name(field);
-                    self.define(name, value, ty);
+                    self.define(name, value, ty)?;
                 }
             }
             Command::Keep(keep) => self.keep(&keep.patterns)?,
@@ -458,13 +629,15 @@ impl Binder<'_> {
                         nulls_first,
                     });
                 }
-                self.stages.push(Stage::Sort(keys));
+                let reads: Vec<&BExpr> = keys.iter().map(|key| &key.expr).collect();
+                self.flush_pre(&reads)?;
+                self.push(Stage::Sort(keys))?;
             }
             Command::Limit(limit) => {
                 if let Some(window) = &mut self.window {
                     window.close();
                 }
-                self.stages.push(Stage::Limit(limit.count));
+                self.push(Stage::Limit(limit.count))?;
             }
             other => {
                 let keyword = self.text(other.span());
@@ -572,8 +745,7 @@ impl Binder<'_> {
         self.scope.cols = cols;
         self.scope.attrs = None;
         self.scope.blocked.clear();
-        self.stages.push(Stage::Project(columns));
-        Ok(())
+        self.push(Stage::Project(columns))
     }
 
     fn drop(&mut self, patterns: &[QualifiedName], span: Span) -> Result<(), EsqlError> {
@@ -608,8 +780,7 @@ impl Binder<'_> {
                 format!("Removing all fields is not allowed [{}]", self.text(span)),
             ));
         }
-        self.stages.push(Stage::Project(self.carry()));
-        Ok(())
+        self.push(Stage::Project(self.carry()))
     }
 
     fn rename(&mut self, pair: &ast::RenamePair) -> Result<(), EsqlError> {
@@ -631,7 +802,7 @@ impl Binder<'_> {
                 let value = self
                     .attribute(&old)
                     .ok_or_else(|| self.unknown(&old, pair.old.span))?;
-                self.define(new, value, EsqlType::Keyword);
+                self.define(new, value, EsqlType::Keyword)?;
                 self.scope.block(Pattern::of(&pair.old));
                 Ok(())
             }
@@ -646,7 +817,9 @@ impl Binder<'_> {
             let filter = match &aggregate.filter {
                 Some(filter) => {
                     let (condition, ty) = self.value(filter, &mut Cx::Row)?;
-                    Some(self.condition(condition, ty, filter.span())?)
+                    let condition = self.condition(condition, ty, filter.span())?;
+                    // Every aggregate call in the field repeats the filter.
+                    Some(self.share(condition, false))
                 }
                 None => None,
             };
@@ -666,7 +839,22 @@ impl Binder<'_> {
             groups.push((value, internal.clone()));
             outputs.push((self.field_name(grouping), BExpr::Column(internal), ty));
         }
-        self.stages.push(Stage::Aggregate { groups, aggregates });
+        let mut reads: Vec<&BExpr> = groups.iter().map(|(e, _)| e).collect();
+        for (call, _) in &aggregates {
+            reads.extend(&call.args);
+            reads.extend(&call.filter);
+        }
+        self.flush_pre(&reads)?;
+        let carry: Vec<String> = groups
+            .iter()
+            .map(|(_, name)| name)
+            .chain(aggregates.iter().map(|(_, name)| name))
+            .cloned()
+            .collect();
+        self.push(Stage::Aggregate { groups, aggregates })?;
+        let post = std::mem::take(&mut self.post);
+        let reads: Vec<&BExpr> = outputs.iter().map(|(_, e, _)| e).collect();
+        self.flush(post, &carry, &reads)?;
 
         let mut cols: Vec<Col> = Vec::new();
         let mut columns = Vec::new();
@@ -679,7 +867,7 @@ impl Binder<'_> {
             columns.push((value, internal.clone()));
             cols.push(Col { name, internal, ty });
         }
-        self.stages.push(Stage::Project(columns));
+        self.push(Stage::Project(columns))?;
         self.scope.cols = cols;
         self.scope.attrs = None;
         self.scope.aliases.clear();
@@ -700,7 +888,17 @@ impl Binder<'_> {
         }
     }
 
+    /// Bind `e`, refusing it when the statement would pass
+    /// [`MAX_BOUND_NODES`] with it.
     fn bind(&mut self, e: &Expr, cx: &mut Cx<'_>) -> Result<Value, EsqlError> {
+        let value = self.bind_node(e, cx)?;
+        if let Value::Expr(expr, _) = &value {
+            self.within_budget(self.nodes.saturating_add(expr.nodes()), e.span())?;
+        }
+        Ok(value)
+    }
+
+    fn bind_node(&mut self, e: &Expr, cx: &mut Cx<'_>) -> Result<Value, EsqlError> {
         match e {
             Expr::Literal(literal) => self.literal(&literal.value, literal.span),
             Expr::Interval(interval) => {
@@ -954,7 +1152,7 @@ impl Binder<'_> {
                 column.try_cast(DataType::Int64),
                 EsqlType::Long,
             ),
-            ("sum", EsqlType::Double) => ("sum", arg, finite(column), EsqlType::Double),
+            ("sum", EsqlType::Double) => ("sum", arg, self.finite(column, true), EsqlType::Double),
             ("avg", EsqlType::Long | EsqlType::Double) => ("avg", arg, column, EsqlType::Double),
             ("min", ty) if ty != EsqlType::Null => ("min", arg, column, ty),
             ("max", ty) if ty != EsqlType::Null => ("max", arg, column, ty),
@@ -1064,7 +1262,7 @@ impl Binder<'_> {
             | Operator::LtEq
             | Operator::Gt
             | Operator::GtEq => self.compare(op, left, right, binary),
-            _ => self.arithmetic(op, left, right, binary),
+            _ => self.arithmetic(op, left, right, binary, matches!(cx, Cx::Stats { .. })),
         }
     }
 
@@ -1165,29 +1363,24 @@ impl Binder<'_> {
             .map_err(|_| self.verification(span, format!("cannot parse [{text}] as a date")))
     }
 
+    /// `post` places shared operands over the aggregate's output, for a
+    /// `STATS` field.
     fn arithmetic(
-        &self,
+        &mut self,
         op: Operator,
         left: Value,
         right: Value,
         b: &ast::Binary,
+        post: bool,
     ) -> Result<Value, EsqlError> {
         let additive = matches!(op, Operator::Plus | Operator::Minus);
-        let incompatible = |left: &Value, right: &Value| {
-            self.verification(
-                b.span,
-                format!(
-                    "[{}] has arguments with incompatible types [{}] and [{}]",
-                    self.text(b.span),
-                    Self::operand_type(left),
-                    Self::operand_type(right)
-                ),
-            )
-        };
         match (&left, &right) {
-            (Value::Expr(_, EsqlType::Null), _) | (_, Value::Expr(_, EsqlType::Null)) => Ok(
-                Value::Expr(BExpr::Literal(ScalarValue::Null), EsqlType::Null),
-            ),
+            (Value::Expr(_, EsqlType::Null), _) | (_, Value::Expr(_, EsqlType::Null)) => {
+                return Ok(Value::Expr(
+                    BExpr::Literal(ScalarValue::Null),
+                    EsqlType::Null,
+                ));
+            }
             (Value::Duration(a, pa), Value::Duration(b_, pb)) if additive => {
                 let sum = if op == Operator::Plus {
                     a.checked_add(*b_)
@@ -1195,33 +1388,89 @@ impl Binder<'_> {
                     a.checked_sub(*b_)
                 };
                 let period = pa.clone().or_else(|| pb.clone());
-                sum.map(|sum| Value::Duration(sum, period))
-                    .ok_or_else(|| self.verification(b.span, "interval does not fit in 64 bits"))
+                return sum
+                    .map(|sum| Value::Duration(sum, period))
+                    .ok_or_else(|| self.verification(b.span, "interval does not fit in 64 bits"));
             }
             (Value::Expr(date, EsqlType::DateNanos), Value::Duration(d, _)) if additive => {
-                Ok(date_shift(date.clone(), op, *d))
+                return Ok(date_shift(date.clone(), op, *d));
             }
             (Value::Duration(d, _), Value::Expr(date, EsqlType::DateNanos))
                 if op == Operator::Plus =>
             {
-                Ok(date_shift(date.clone(), op, *d))
+                return Ok(date_shift(date.clone(), op, *d));
             }
+            _ => {}
+        }
+        match (left, right) {
             (Value::Expr(l, EsqlType::Long), Value::Expr(r, EsqlType::Long)) => Ok(Value::Expr(
-                long_arithmetic(l.clone(), op, r.clone()),
+                self.long_arithmetic(l, op, r, post),
                 EsqlType::Long,
             )),
             (Value::Expr(l, lt), Value::Expr(r, rt)) if lt.is_numeric() && rt.is_numeric() => {
-                Ok(Value::Expr(
-                    finite(BExpr::binary(
-                        as_double(l.clone(), *lt),
-                        op,
-                        as_double(r.clone(), *rt),
-                    )),
-                    EsqlType::Double,
-                ))
+                let raw = BExpr::binary(as_double(l, lt), op, as_double(r, rt));
+                Ok(Value::Expr(self.finite(raw, post), EsqlType::Double))
             }
-            _ => Err(incompatible(&left, &right)),
+            (left, right) => Err(self.verification(
+                b.span,
+                format!(
+                    "[{}] has arguments with incompatible types [{}] and [{}]",
+                    self.text(b.span),
+                    Self::operand_type(&left),
+                    Self::operand_type(&right)
+                ),
+            )),
         }
+    }
+
+    /// Long arithmetic with ES|QL's null results: overflow, a zero divisor,
+    /// and `i64::MIN / -1` give null; `x % -1` is `0`. No operand reaches an
+    /// Arrow kernel that can fail, whichever branches the engine evaluates.
+    /// Each operand of `/` and `%` is read twice, so it is shared.
+    fn long_arithmetic(&mut self, left: BExpr, op: Operator, right: BExpr, post: bool) -> BExpr {
+        if !matches!(op, Operator::Divide | Operator::Modulo) {
+            return checked_long(left, op, right);
+        }
+        let left = self.share(left, post);
+        let right = self.share(right, post);
+        let divisor = BExpr::Scalar(
+            "nullif",
+            vec![
+                BExpr::Scalar("nullif", vec![right.clone(), long_literal(0)]),
+                long_literal(-1),
+            ],
+        );
+        let minus_one = BExpr::binary(right, Operator::Eq, long_literal(-1));
+        let on_minus_one = if op == Operator::Divide {
+            checked_long(long_literal(0), Operator::Minus, left.clone())
+        } else {
+            BExpr::binary(left.clone(), Operator::Multiply, long_literal(0))
+        };
+        BExpr::Case(
+            vec![(minus_one, on_minus_one)],
+            Some(Box::new(BExpr::binary(left, op, divisor))),
+        )
+    }
+
+    /// `value` when it is a finite double, else null: ES|QL reports an
+    /// infinite or NaN result as null. `value` is read three times, so it is
+    /// shared.
+    fn finite(&mut self, value: BExpr, post: bool) -> BExpr {
+        let value = self.share(value, post);
+        let within = BExpr::binary(
+            BExpr::binary(
+                value.clone(),
+                Operator::GtEq,
+                BExpr::Literal(ScalarValue::Float64(Some(f64::MIN))),
+            ),
+            Operator::And,
+            BExpr::binary(
+                value.clone(),
+                Operator::LtEq,
+                BExpr::Literal(ScalarValue::Float64(Some(f64::MAX))),
+            ),
+        );
+        BExpr::Case(vec![(within, value)], None)
     }
 
     fn in_list(&mut self, list: &ast::InList, cx: &mut Cx<'_>) -> Result<Value, EsqlError> {
@@ -1313,51 +1562,6 @@ fn checked_long(left: BExpr, op: Operator, right: BExpr) -> BExpr {
     BExpr::binary(left.cast(DECIMAL), op, right.cast(DECIMAL)).try_cast(DataType::Int64)
 }
 
-/// Long arithmetic with ES|QL's null results: overflow, a zero divisor, and
-/// `i64::MIN / -1` give null; `x % -1` is `0`. No operand reaches an Arrow
-/// kernel that can fail, whichever branches the engine evaluates.
-fn long_arithmetic(left: BExpr, op: Operator, right: BExpr) -> BExpr {
-    if !matches!(op, Operator::Divide | Operator::Modulo) {
-        return checked_long(left, op, right);
-    }
-    let divisor = BExpr::Scalar(
-        "nullif",
-        vec![
-            BExpr::Scalar("nullif", vec![right.clone(), long_literal(0)]),
-            long_literal(-1),
-        ],
-    );
-    let minus_one = BExpr::binary(right, Operator::Eq, long_literal(-1));
-    let on_minus_one = if op == Operator::Divide {
-        checked_long(long_literal(0), Operator::Minus, left.clone())
-    } else {
-        BExpr::binary(left.clone(), Operator::Multiply, long_literal(0))
-    };
-    BExpr::Case(
-        vec![(minus_one, on_minus_one)],
-        Some(Box::new(BExpr::binary(left, op, divisor))),
-    )
-}
-
-/// `value` when it is a finite double, else null: ES|QL reports an infinite
-/// or NaN result as null.
-fn finite(value: BExpr) -> BExpr {
-    let within = BExpr::binary(
-        BExpr::binary(
-            value.clone(),
-            Operator::GtEq,
-            BExpr::Literal(ScalarValue::Float64(Some(f64::MIN))),
-        ),
-        Operator::And,
-        BExpr::binary(
-            value.clone(),
-            Operator::LtEq,
-            BExpr::Literal(ScalarValue::Float64(Some(f64::MAX))),
-        ),
-    );
-    BExpr::Case(vec![(within, value)], None)
-}
-
 /// `date op duration`, null when the result leaves the representable range. A
 /// constant date folds to a literal, so a bound such as `NOW() - 1 hour`
 /// reaches the window as one.
@@ -1442,5 +1646,81 @@ impl Pattern {
             pi += 1;
         }
         pi == p.len()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn bound(source: &str) -> Result<Bound, EsqlError> {
+        let query = ravel_esql::parse(source, &ravel_esql::Limits::default()).expect("parses");
+        bind(
+            &query,
+            &BindInput {
+                source,
+                declared: &[],
+                now_ns: 0,
+                start: None,
+                end: None,
+            },
+        )
+    }
+
+    /// The bound nodes of `ROW x = first op 1 op 1 ...` with `n` operators.
+    fn chain(first: &str, op: &str, n: usize) -> usize {
+        let source = format!("ROW x = {first}{}", format!(" {op} 1").repeat(n));
+        bound(&source).expect("binds").pipeline.nodes()
+    }
+
+    /// The node counts at 10, 20 and 40 operators, asserting the first is
+    /// `at_ten` before binding the longer chains.
+    fn growth(first: &str, op: &str, at_ten: usize) -> [usize; 3] {
+        let ten = chain(first, op, 10);
+        assert_eq!(ten, at_ten, "{first} {op} x10");
+        [ten, chain(first, op, 20), chain(first, op, 40)]
+    }
+
+    /// The densest shapes measured: a long division per two tokens, in a
+    /// row, over the scope's columns, and over aggregate results, each
+    /// within the default token limit and its nesting limit.
+    #[test]
+    fn the_largest_dense_statements_bind_within_the_budget() {
+        let row = vec![format!("(9{})", " / 1".repeat(60)); 50].join(" + ");
+        let row = vec![format!("x = {row}"); 10].join(", ");
+        let stats = vec![format!("(SUM(severity_num){})", " / 1".repeat(60)); 50].join(" + ");
+        let stats: Vec<String> = (0..10).map(|i| format!("x{i} = {stats}")).collect();
+        for source in [
+            format!("ROW {row}"),
+            format!("FROM logs | EVAL {row}"),
+            format!("FROM logs | STATS {}", stats.join(", ")),
+        ] {
+            let tokens = ravel_esql::lexer::tokenize(&source, &ravel_esql::Limits::default())
+                .expect("lexes")
+                .len();
+            assert!(tokens > 60_000, "{tokens}");
+            let nodes = bound(&source).expect("binds").pipeline.nodes();
+            assert!(nodes < 9 * tokens, "{nodes} nodes for {tokens} tokens");
+        }
+        assert!(9 * ravel_esql::Limits::default().max_tokens < MAX_BOUND_NODES);
+    }
+
+    #[test]
+    fn a_chain_of_double_additions_binds_to_linearly_many_nodes() {
+        let [ten, twenty, forty] = growth("1.0", "+", 126);
+        let step = (twenty - ten) / 10;
+        assert_eq!(step, 12);
+        assert_eq!(twenty - ten, 10 * step);
+        assert_eq!(forty - twenty, 20 * step);
+    }
+
+    #[test]
+    fn a_chain_of_long_divisions_binds_to_linearly_many_nodes() {
+        let [ten, twenty, forty] = growth("9", "/", 170);
+        let step = (twenty - ten) / 10;
+        assert_eq!(step, 17);
+        assert_eq!(twenty - ten, 10 * step);
+        assert_eq!(forty - twenty, 20 * step);
     }
 }

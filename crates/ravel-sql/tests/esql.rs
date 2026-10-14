@@ -10,6 +10,8 @@ mod support;
 mod binder;
 #[path = "esql/bucket.rs"]
 mod bucket;
+#[path = "esql/limits.rs"]
+mod limits;
 #[path = "esql/lowering.rs"]
 mod lowering;
 #[path = "esql/types.rs"]
