@@ -35,6 +35,7 @@ fn column(key: &str, ty: sysproto::TypedAttrColumnType) -> sysproto::TypedAttrCo
     sysproto::TypedAttrColumn {
         key: key.to_string(),
         r#type: ty as i32,
+        key_index: false,
     }
 }
 

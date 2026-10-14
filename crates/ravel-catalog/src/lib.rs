@@ -107,8 +107,9 @@ pub use snapshot_format::{
 pub use tenant_config::{
     BloomScope, ClusteringBucketWidth, ClusteringKey, ClusteringKeyState, DeclaredColumnType,
     DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS, MAX_CLUSTERING_KEY_COLUMNS,
-    SetOutcome as TenantConfigSetOutcome, StorageLayoutConfigError, StorageLayoutWrite,
-    StoredBloomScope, StoredClusteringKey, TENANT_CONFIG_FORMAT_VERSION,
+    MAX_KEY_INDEX_COLUMN_KEY_LEN, MAX_KEY_INDEX_COLUMNS, SetOutcome as TenantConfigSetOutcome,
+    StorageLayoutConfigError, StorageLayoutWrite, StoredBloomScope, StoredClusteringKey,
+    StoredKeyIndex, TENANT_CONFIG_FORMAT_VERSION, TENANT_CONFIG_KEY_INDEX_WRITER_VERSION,
     TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION,
     TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, TenantConfig, TenantConfigError,
     TenantLifecycleState, TypedAttrColumnError, config_key, read_config, read_config_values,

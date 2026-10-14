@@ -2036,6 +2036,7 @@ mod tests {
         let typed = |key: &str, ty: proto::TypedAttrColumnType| proto::TypedAttrColumn {
             key: key.to_string(),
             r#type: ty as i32,
+            key_index: false,
         };
         let record = proto::TenantConfigRecord {
             format_version: 3,

@@ -3244,6 +3244,7 @@ mod tests {
             crc32c: crc32c::crc32c(&payload),
             comp: crate::footer::COMP_NONE,
             uncomp_len: payload.len() as u64,
+            prefix_len: 0,
         };
         let acct = QueryAccounting::new();
         let raw = decode_section_accounted(&payload, &desc, &cfg, &acct).expect("decode raw");
@@ -3606,6 +3607,7 @@ mod tests {
             crc32c: crc32c::crc32c(&payload),
             comp: COMP_NONE,
             uncomp_len: payload.len() as u64,
+            prefix_len: 0,
         };
         // Usable without an RlogReader: it takes bytes + a descriptor directly.
         let got = read_section(&payload, &good, &cfg).expect("valid section reads");

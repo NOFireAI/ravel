@@ -2896,6 +2896,7 @@ mod tests {
                 crc32c: crc32c::crc32c(&bytes),
                 comp,
                 uncomp_len,
+                prefix_len: d.prefix_len,
             });
             out.extend_from_slice(&bytes);
         }

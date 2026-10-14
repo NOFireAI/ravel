@@ -61,7 +61,8 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // writer stamps 3 since Release B. TenantConfigRecord accepts {1, 2, 3}
         // after ADR-2135's reader-first step (clustering_key and bloom_scope;
         // the writer stamps 2 by default and 3 behind the storage-layout
-        // opt-in). MetricMetadataRecord accepts {1, 2} after ADR-0066 R1;
+        // opt-in), and {1, 2, 3, 4} after ADR-2707's (key_index and
+        // index_trace_id, stamped 4 behind the same opt-in). MetricMetadataRecord accepts {1, 2} after ADR-0066 R1;
         // AuthTokenMap accepts {1, 2} (managed_by, ADR-0072 #897) and
         // KeyEpochRecord {1}, both as a floor-and-ceiling set since ADR-0066 R2.
         // GcConfig and CompactionClaim still carry ceiling-only gates in their
@@ -70,7 +71,7 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // checked against that reader's own constants by
         // `catalog_read_sets_match_their_readers_constants`.
         ("ProvisioningRecord", CasMutable(&[1, 2, 3])),
-        ("TenantConfigRecord", CasMutable(&[1, 2, 3])),
+        ("TenantConfigRecord", CasMutable(&[1, 2, 3, 4])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),
         ("AuthTokenMap", CasMutable(&[1, 2])),
         ("GcConfig", CasMutable(&[1])),

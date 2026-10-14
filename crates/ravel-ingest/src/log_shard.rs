@@ -866,7 +866,7 @@ impl LogFlushCtx {
         // durable read the indexed-field resolution above just performed (fast
         // path hit, or the `refresh` that ran on a miss). An empty list leaves
         // every column of this object uncovered, the permanent legal default.
-        let (typed_columns, layout) = self
+        let (typed_columns, layout, key_index_fields) = self
             .indexed_fields
             .declared_layout_cached(&tenant_hash, flush_open_ns);
         // ADR-2135 decisions 1 and 5: the tenant's clustering key and bloom
@@ -905,6 +905,7 @@ impl LogFlushCtx {
                 let encode_start = std::time::Instant::now();
                 let mut writer = RlogWriter::new(rlog_config, identity)
                     .with_indexed_fields(indexed_fields)
+                    .with_key_index_fields(key_index_fields)
                     .with_sort_descriptor(writer_layout.descriptor, writer_layout.generation)
                     .with_bloom_scope(writer_layout.bloom_scope);
                 let push_result = match payload {

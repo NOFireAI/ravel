@@ -118,6 +118,19 @@ pub enum MaintainError {
         a_len: usize,
         b_len: usize,
     },
+    /// Two RLOG inputs of one merge carry a KEY_IDX entry for the same field
+    /// under different key types, so no single output field set carries both.
+    /// Nothing was written.
+    #[error(
+        "inputs {first_object:?} and {second_object:?} index KEY_IDX field {field:?} under key types {first} and {second}; nothing written"
+    )]
+    KeyIndexKeyTypeConflict {
+        field: String,
+        first: String,
+        first_object: String,
+        second: String,
+        second_object: String,
+    },
     /// An input object the codec's writer would refuse to rewrite
     /// ([`crate::codec::SegmentCodec::unwritable_input`]), found before the
     /// merge by a run that must carry every input: format migration and the

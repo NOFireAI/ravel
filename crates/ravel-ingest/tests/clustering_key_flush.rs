@@ -112,6 +112,7 @@ fn layout_record(
                 .map(|(k, ty)| TypedAttrColumn {
                     key: k.to_string(),
                     r#type: *ty as i32,
+                    key_index: false,
                 })
                 .collect(),
         }),

@@ -760,6 +760,7 @@ mod tests {
             typed_attr_columns: None,
             clustering_key: None,
             bloom_scope: ravel_proto::sys::v1::BloomScope::All as i32,
+            index_trace_id: false,
         };
         store
             .put(

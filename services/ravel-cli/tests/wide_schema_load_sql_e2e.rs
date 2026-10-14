@@ -524,6 +524,7 @@ async fn a_wide_load_is_queryable_through_declared_columns_and_the_attrs_overflo
         Arc::clone(&store),
         TENANT,
         &mapping_path,
+        &ravel_cli::typed_attr_column::KeyIndexSpec::default(),
         CLOCK_NS,
     )
     .await
