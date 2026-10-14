@@ -1,7 +1,7 @@
 # ADR-2793: Strict flush-on-arrival ack policy and admission permit release
 
-Status: Accepted. The 2026-10-14 amendments at the end are pending the
-maintainer's approval of their revised text.
+Status: Accepted. The 2026-10-14 amendments at the end were approved by
+the maintainer in their revised text on 2026-10-14.
 Date: 2026-10-10
 Epic: #2793
 Amends: ADR-0076 decision 4 (adds a second axis; the aged flush stays the
