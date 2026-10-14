@@ -28,7 +28,11 @@
 //!
 //! A statement ending in its own `LIMIT` returns at most [`MAX_LIMIT`] rows,
 //! and one that does not returns at most [`IMPLICIT_LIMIT`]. A statement that
-//! binds to more than [`MAX_BOUND_NODES`] expression nodes is refused.
+//! binds to more than [`MAX_BOUND_NODES`] expression nodes, to an expression
+//! deeper than [`MAX_EXPRESSION_DEPTH`], or to more than [`MAX_PLAN_STAGES`]
+//! plan stages is refused with a verification error, so every statement the
+//! parser's default limits admit plans and runs within a worker thread's
+//! stack.
 
 mod binder;
 mod error;
@@ -48,7 +52,9 @@ pub use error::EsqlError;
 pub use run::{EsqlOutcome, EsqlRequest, EsqlRun, execute};
 pub use types::{EsqlColumn, EsqlType};
 
-pub use binder::{IMPLICIT_LIMIT, MAX_BOUND_NODES, MAX_LIMIT};
+pub use binder::{
+    IMPLICIT_LIMIT, MAX_BOUND_NODES, MAX_EXPRESSION_DEPTH, MAX_LIMIT, MAX_PLAN_STAGES,
+};
 
 use crate::declared::DeclaredColumn;
 use crate::executor::{StatementTables, TargetSignal};

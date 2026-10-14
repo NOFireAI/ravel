@@ -4,6 +4,7 @@
 //! [`segmented_fixture`], records on both sides of the query clock laid out
 //! as two segments or as one.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -477,4 +478,34 @@ pub async fn optimized(fixture: &Fixture, source: &str) -> LogicalPlan {
         .optimized_plan(&session(&fixture.store))
         .await
         .expect("plans")
+}
+
+/// The stack a server worker thread runs a query on: tokio's default.
+pub const WORKER_STACK: usize = 2 << 20;
+
+/// Run `f` on a fresh thread with a `stack`-byte stack, inside a
+/// current-thread runtime built and dropped on that thread, so every frame
+/// the future and its drop use lands on that stack whatever the test
+/// runner's own thread stack is.
+pub fn on_stack<F, Fut, T>(stack: usize, f: F) -> T
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T>,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("esql-small-stack".to_string())
+        .stack_size(stack)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let out = runtime.block_on(f());
+            drop(runtime);
+            out
+        })
+        .expect("spawns")
+        .join()
+        .expect("the small-stack thread does not panic")
 }

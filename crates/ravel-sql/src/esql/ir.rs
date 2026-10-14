@@ -49,6 +49,30 @@ impl BExpr {
         count
     }
 
+    /// The nodes on the longest path from this node to a leaf, this one
+    /// included, where a column counts as `column(name)` nodes rather than
+    /// one.
+    pub(crate) fn depth(&self, column: &dyn Fn(&str) -> usize) -> usize {
+        let depth = |e: &BExpr| e.depth(column);
+        let children = match self {
+            BExpr::Column(name) => return column(name),
+            BExpr::Literal(_) => 0,
+            BExpr::Scalar(_, args) => args.iter().map(depth).max().unwrap_or(0),
+            BExpr::Cast(inner, _)
+            | BExpr::TryCast(inner, _)
+            | BExpr::Not(inner)
+            | BExpr::Negative(inner)
+            | BExpr::IsNull(inner, _) => depth(inner),
+            BExpr::Binary(left, _, right) => depth(left).max(depth(right)),
+            BExpr::InList(value, list, _) => list.iter().map(depth).fold(depth(value), usize::max),
+            BExpr::Case(arms, otherwise) => arms
+                .iter()
+                .map(|(when, then)| depth(when).max(depth(then)))
+                .fold(otherwise.as_deref().map_or(0, depth), usize::max),
+        };
+        children + 1
+    }
+
     /// Every column name this tree reads.
     pub(crate) fn columns<'e>(&'e self, out: &mut Vec<&'e str>) {
         self.walk(&mut |e| {
@@ -170,6 +194,27 @@ impl Stage {
                         .sum::<usize>()
             }
             Stage::Sort(keys) => keys.iter().map(|key| key.expr.nodes()).sum(),
+            Stage::Limit(_) => 0,
+        }
+    }
+
+    /// The depth of the deepest expression this stage holds, a column
+    /// counting as `column(name)` nodes.
+    pub(crate) fn depth(&self, column: &dyn Fn(&str) -> usize) -> usize {
+        let deepest = |exprs: &mut dyn Iterator<Item = &BExpr>| {
+            exprs.map(|e| e.depth(column)).max().unwrap_or(0)
+        };
+        match self {
+            Stage::Project(columns) => deepest(&mut columns.iter().map(|(e, _)| e)),
+            Stage::Filter(condition) => condition.depth(column),
+            Stage::Aggregate { groups, aggregates } => deepest(
+                &mut groups.iter().map(|(e, _)| e).chain(
+                    aggregates
+                        .iter()
+                        .flat_map(|(call, _)| call.args.iter().chain(&call.filter)),
+                ),
+            ),
+            Stage::Sort(keys) => deepest(&mut keys.iter().map(|key| &key.expr)),
             Stage::Limit(_) => 0,
         }
     }

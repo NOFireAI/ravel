@@ -14,6 +14,8 @@ mod bucket;
 mod limits;
 #[path = "esql/lowering.rs"]
 mod lowering;
+#[path = "esql/stack.rs"]
+mod stack;
 #[path = "esql/types.rs"]
 mod types;
 #[path = "esql/window.rs"]

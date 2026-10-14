@@ -47,13 +47,42 @@ pub const MAX_LIMIT: u64 = 10_000;
 /// stage's expressions and the column references each projection carries; a
 /// statement past it is refused with a verification error.
 ///
-/// The densest shape measured is a long division per two tokens, whose
-/// guards bind to 17 nodes: a statement of such divisions binds to under 9
-/// nodes per token, so one at the default 65,536-token limit binds to under
-/// 589,824 nodes. The budget is the next power of two. A statement of many
-/// fields over many columns can still pass it, since each field's projection
-/// carries every visible column, and is refused.
+/// The densest shapes measured bind to 3 nodes per token (a field of one
+/// double division), and each of at most [`MAX_PLAN_STAGES`] projections
+/// carries at most one column per four tokens (`x = 1,`), so a statement
+/// within the default 65,536-token limit binds to under 3 * 65,536 + 12 *
+/// 16,384 = 393,216 nodes. A statement parsed under a larger token limit
+/// can pass the budget, and is refused.
 pub const MAX_BOUND_NODES: usize = 1 << 20;
+
+/// The deepest expression a statement may bind to, a column computed by a
+/// projection under it counting as the depth of the expression computing
+/// it; a statement past it is refused with a verification error.
+///
+/// DataFusion's analyzer, optimizer, physical planner, evaluator and drop
+/// each recurse over an expression, and the optimizer inlines a projection
+/// into the projection or filter above it, so the depth that reaches those
+/// recursions is the inlined one. Arithmetic reads each operand once, so the
+/// only values shared ahead of a stage to keep the bound size linear are the
+/// operand of a double result's finite check, made once at the root, and a
+/// per-aggregate `WHERE` its field's calls repeat. Sharing moves depth into
+/// a projection without removing it, and DataFusion inlines it back, so
+/// once operands are read once, bounding depth and [`MAX_PLAN_STAGES`] is
+/// what keeps the plan within the stack.
+pub const MAX_EXPRESSION_DEPTH: usize = 24;
+
+/// The most stages a statement may bind to, each projection the binder
+/// schedules for its fields and shared operands included; a statement past
+/// it is refused with a verification error.
+///
+/// Plan depth and expression depth draw on the same recursions, so both
+/// limits were measured together on the unoptimized test build. Alone,
+/// shallow filters overflowed a 1 MiB stack past 22 stages and an `AND`
+/// chain past 45 levels; at these limits, the deepest admitted expression in
+/// every stage of a `WHERE`, `SORT`, `EVAL`, `STATS` field or per-aggregate
+/// `WHERE` pipeline plans and runs on 1 MiB, half the 2 MiB stack of a
+/// server worker thread.
+pub const MAX_PLAN_STAGES: usize = 12;
 
 /// An expression the bound output repeats is copied only up to this many
 /// nodes. A larger one is computed once under a fresh internal name ahead of
@@ -94,6 +123,7 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
         at: query.source.span(),
         pre: Vec::new(),
         post: Vec::new(),
+        inlined: HashMap::new(),
     };
     match &query.source {
         Command::From(from) => binder.from(from, input)?,
@@ -101,7 +131,7 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
             for field in &row.fields {
                 let (value, ty) = binder.value(&field.expr, &mut Cx::Row)?;
                 let name = binder.field_name(field);
-                binder.define(name, value, ty)?;
+                binder.define(name, value, ty);
             }
         }
         other => return Err(binder.unsupported(other.span(), "this source command")),
@@ -116,6 +146,7 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
             window.close();
         }
     }
+    binder.flush_pre(&[])?;
     let mut clamped_limit = None;
     match (query.processing.last(), binder.stages.last_mut()) {
         (Some(Command::Limit(_)), Some(Stage::Limit(count))) => {
@@ -234,6 +265,9 @@ enum Cx<'c> {
 /// `BUCKET` refuses.
 enum Value {
     Expr(BExpr, EsqlType),
+    /// Double arithmetic whose result is not yet checked to be finite: see
+    /// [`Binder::arithmetic`].
+    Raw(BExpr),
     Duration(i64, Option<Period>),
 }
 
@@ -262,6 +296,9 @@ struct Binder<'a> {
     pre: Vec<(String, BExpr)>,
     /// Shared operands of a `STATS` field, over the aggregate's output.
     post: Vec<(String, BExpr)>,
+    /// The depth of each projected column with the projections under it
+    /// inlined, for [`MAX_EXPRESSION_DEPTH`].
+    inlined: HashMap<String, usize>,
 }
 
 impl Binder<'_> {
@@ -340,8 +377,29 @@ impl Binder<'_> {
     }
 
     fn push(&mut self, stage: Stage) -> Result<(), EsqlError> {
+        if self.stages.len() >= MAX_PLAN_STAGES {
+            return Err(self.verification(
+                self.at,
+                format!("the statement binds to more than {MAX_PLAN_STAGES} plan stages"),
+            ));
+        }
+        let depth = stage.depth(&|name| self.inlined.get(name).copied().unwrap_or(1));
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(self.verification(
+                self.at,
+                format!(
+                    "the statement binds to an expression {depth} levels deep, more than the limit of {MAX_EXPRESSION_DEPTH}"
+                ),
+            ));
+        }
         self.nodes = self.nodes.saturating_add(stage.nodes());
         self.within_budget(self.nodes, self.at)?;
+        if let Stage::Project(columns) = &stage {
+            let depths: Vec<usize> = columns.iter().map(|(e, _)| self.inlined_depth(e)).collect();
+            for ((_, name), depth) in columns.iter().zip(depths) {
+                self.inlined.insert(name.clone(), depth);
+            }
+        }
         self.stages.push(stage);
         Ok(())
     }
@@ -355,17 +413,45 @@ impl Binder<'_> {
             return value;
         }
         let name = self.fresh();
+        self.inlined
+            .insert(name.clone(), self.inlined_depth(&value));
         let lets = if post { &mut self.post } else { &mut self.pre };
         lets.push((name.clone(), value));
         BExpr::Column(name)
     }
 
-    /// Compute the shared operands `reads` reaches ahead of the stage that
-    /// reads them, from the current scope.
+    /// The depth of `value` with every projection under it inlined: a column
+    /// a projection or a pending let computes counts as the depth of what
+    /// computes it, any other column as one node.
+    fn inlined_depth(&self, value: &BExpr) -> usize {
+        value.depth(&|name| self.inlined.get(name).copied().unwrap_or(1))
+    }
+
+    /// Compute the defined columns still visible and the shared operands
+    /// they or `reads` reach, ahead of the stage that reads them. Each
+    /// projection carries the visible columns already computed, the hidden
+    /// `attrs` column, and the columns a pending value reads, which a
+    /// definition since the last stage may have replaced in scope.
     fn flush_pre(&mut self, reads: &[&BExpr]) -> Result<(), EsqlError> {
         let lets = std::mem::take(&mut self.pre);
-        let carry = self.carry_names();
-        self.flush(lets, &carry, reads)
+        if lets.is_empty() {
+            return Ok(());
+        }
+        let pending: BTreeSet<&str> = lets.iter().map(|(name, _)| name.as_str()).collect();
+        let mut carry: Vec<String> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let visible = self.carry_names();
+        let mut read = Vec::new();
+        lets.iter().for_each(|(_, value)| value.columns(&mut read));
+        for name in visible.iter().map(String::as_str).chain(read) {
+            if !pending.contains(name) && seen.insert(name) {
+                carry.push(name.to_string());
+            }
+        }
+        let visible: Vec<BExpr> = visible.into_iter().map(BExpr::Column).collect();
+        let mut reads = reads.to_vec();
+        reads.extend(&visible);
+        self.flush(lets, &carry, &reads)
     }
 
     /// Compute the shared operands `lets` that `reads` reaches, one projection
@@ -440,15 +526,17 @@ impl Binder<'_> {
         Ok(())
     }
 
-    /// Add `name` as the last column, replacing any column of that name.
-    fn define(&mut self, name: String, value: BExpr, ty: EsqlType) -> Result<(), EsqlError> {
-        self.flush_pre(&[&value])?;
+    /// Add `name` as the last column, replacing any column of that name. The
+    /// column is computed with the shared operands ahead of the next stage,
+    /// so the fields of one `EVAL` or `ROW` that do not read each other share
+    /// a projection.
+    fn define(&mut self, name: String, value: BExpr, ty: EsqlType) {
         let internal = self.fresh();
         self.scope.cols.retain(|col| col.name != name);
-        let mut columns = self.carry();
-        columns.push((value, internal.clone()));
+        self.inlined
+            .insert(internal.clone(), self.inlined_depth(&value));
+        self.pre.push((internal.clone(), value));
         self.scope.cols.push(Col { name, internal, ty });
-        self.push(Stage::Project(columns))
     }
 
     fn from(&mut self, from: &ast::FromCommand, input: &BindInput<'_>) -> Result<(), EsqlError> {
@@ -597,11 +685,17 @@ impl Binder<'_> {
                 for field in &eval.fields {
                     let (value, ty) = self.value(&field.expr, &mut Cx::Row)?;
                     let name = self.field_name(field);
-                    self.define(name, value, ty)?;
+                    self.define(name, value, ty);
                 }
             }
-            Command::Keep(keep) => self.keep(&keep.patterns)?,
-            Command::Drop(drop) => self.drop(&drop.patterns, drop.span)?,
+            Command::Keep(keep) => {
+                self.flush_pre(&[])?;
+                self.keep(&keep.patterns)?;
+            }
+            Command::Drop(drop) => {
+                self.flush_pre(&[])?;
+                self.drop(&drop.patterns, drop.span)?;
+            }
             Command::Rename(rename) => {
                 for pair in &rename.renames {
                     self.rename(pair)?;
@@ -637,6 +731,7 @@ impl Binder<'_> {
                 if let Some(window) = &mut self.window {
                     window.close();
                 }
+                self.flush_pre(&[])?;
                 self.push(Stage::Limit(limit.count))?;
             }
             other => {
@@ -802,7 +897,7 @@ impl Binder<'_> {
                 let value = self
                     .attribute(&old)
                     .ok_or_else(|| self.unknown(&old, pair.old.span))?;
-                self.define(new, value, EsqlType::Keyword)?;
+                self.define(new, value, EsqlType::Keyword);
                 self.scope.block(Pattern::of(&pair.old));
                 Ok(())
             }
@@ -875,14 +970,46 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// Bind `e` as a value, refusing it past [`MAX_EXPRESSION_DEPTH`].
     fn value(&mut self, e: &Expr, cx: &mut Cx<'_>) -> Result<(BExpr, EsqlType), EsqlError> {
-        match self.bind(e, cx)? {
-            Value::Expr(value, ty) => Ok((value, ty)),
-            Value::Duration(..) => Err(self.verification(
+        let value = self.bind(e, cx)?;
+        let unsettled = match &value {
+            Value::Expr(value, _) | Value::Raw(value) => self.inlined_depth(value),
+            Value::Duration(..) => 0,
+        };
+        let (value, ty) = self.settle(value, cx, e.span())?;
+        let depth = unsettled.max(self.inlined_depth(&value));
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(self.verification(
                 e.span(),
                 format!(
-                    "[{}] is a time duration, which is not a value outside date arithmetic and BUCKET",
+                    "[{}] binds to an expression {depth} levels deep, more than the limit of {MAX_EXPRESSION_DEPTH}",
                     self.text(e.span())
+                ),
+            ));
+        }
+        Ok((value, ty))
+    }
+
+    /// `value` as an expression: unchecked double arithmetic gets its finite
+    /// check here.
+    fn settle(
+        &mut self,
+        value: Value,
+        cx: &Cx<'_>,
+        span: Span,
+    ) -> Result<(BExpr, EsqlType), EsqlError> {
+        match value {
+            Value::Expr(value, ty) => Ok((value, ty)),
+            Value::Raw(raw) => Ok((
+                self.finite(raw, matches!(cx, Cx::Stats { .. })),
+                EsqlType::Double,
+            )),
+            Value::Duration(..) => Err(self.verification(
+                span,
+                format!(
+                    "[{}] is a time duration, which is not a value outside date arithmetic and BUCKET",
+                    self.text(span)
                 ),
             )),
         }
@@ -892,7 +1019,7 @@ impl Binder<'_> {
     /// [`MAX_BOUND_NODES`] with it.
     fn bind(&mut self, e: &Expr, cx: &mut Cx<'_>) -> Result<Value, EsqlError> {
         let value = self.bind_node(e, cx)?;
-        if let Value::Expr(expr, _) = &value {
+        if let Value::Expr(expr, _) | Value::Raw(expr) = &value {
             self.within_budget(self.nodes.saturating_add(expr.nodes()), e.span())?;
         }
         Ok(value)
@@ -1199,6 +1326,13 @@ impl Binder<'_> {
             Value::Duration(..) => {
                 return Err(self.mismatch(unary.span, "boolean", "time_duration"));
             }
+            Value::Raw(raw) => {
+                return match unary.op {
+                    UnaryOp::Minus => Ok(Value::Raw(BExpr::Negative(Box::new(raw)))),
+                    UnaryOp::Plus => Ok(Value::Raw(raw)),
+                    UnaryOp::Not => Err(self.mismatch(unary.span, "boolean", "double")),
+                };
+            }
             Value::Expr(value, ty) => (value, ty),
         };
         Ok(match (unary.op, ty) {
@@ -1254,21 +1388,37 @@ impl Binder<'_> {
         };
         let left = self.bind(&binary.left, cx)?;
         let right = self.bind(&binary.right, cx)?;
+        let post = matches!(cx, Cx::Stats { .. });
         match op {
-            Operator::Or | Operator::And => self.logical(op, left, right, binary),
+            Operator::Or | Operator::And => {
+                let (left, right) = (self.checked(left, post), self.checked(right, post));
+                self.logical(op, left, right, binary)
+            }
             Operator::Eq
             | Operator::NotEq
             | Operator::Lt
             | Operator::LtEq
             | Operator::Gt
-            | Operator::GtEq => self.compare(op, left, right, binary),
-            _ => self.arithmetic(op, left, right, binary, matches!(cx, Cx::Stats { .. })),
+            | Operator::GtEq => {
+                let (left, right) = (self.checked(left, post), self.checked(right, post));
+                self.compare(op, left, right, binary)
+            }
+            _ => self.arithmetic(op, left, right, binary),
+        }
+    }
+
+    /// `value` with any unchecked double arithmetic checked to be finite.
+    fn checked(&mut self, value: Value, post: bool) -> Value {
+        match value {
+            Value::Raw(raw) => Value::Expr(self.finite(raw, post), EsqlType::Double),
+            other => other,
         }
     }
 
     fn operand_type(value: &Value) -> &'static str {
         match value {
             Value::Expr(_, ty) => ty.name(),
+            Value::Raw(_) => "double",
             Value::Duration(..) => "time_duration",
         }
     }
@@ -1363,15 +1513,23 @@ impl Binder<'_> {
             .map_err(|_| self.verification(span, format!("cannot parse [{text}] as a date")))
     }
 
-    /// `post` places shared operands over the aggregate's output, for a
-    /// `STATS` field.
+    /// Double arithmetic gives a [`Value::Raw`]: ES|QL's finite check runs
+    /// once, where the result is read as a value ([`Binder::settle`],
+    /// [`Binder::checked`]), not after each operation. That is the same
+    /// result. A non-finite left operand of `+ - * / %`, an operand of `+ - *`
+    /// on either side, and a negated one all give a non-finite result, so a
+    /// non-finite intermediate still reads null at the root. The one way an
+    /// operation turns a non-finite operand finite is dividing by an infinite
+    /// one (`x / inf` is `0`, `x % inf` is `x`), so an unchecked divisor that
+    /// is infinite becomes null, which the result then reads as; a NaN
+    /// divisor gives NaN. Every operand is read once, so the bound size and
+    /// depth stay linear in the operations and nothing is shared per step.
     fn arithmetic(
         &mut self,
         op: Operator,
         left: Value,
         right: Value,
         b: &ast::Binary,
-        post: bool,
     ) -> Result<Value, EsqlError> {
         let additive = matches!(op, Operator::Plus | Operator::Minus);
         match (&left, &right) {
@@ -1403,53 +1561,24 @@ impl Binder<'_> {
             _ => {}
         }
         match (left, right) {
-            (Value::Expr(l, EsqlType::Long), Value::Expr(r, EsqlType::Long)) => Ok(Value::Expr(
-                self.long_arithmetic(l, op, r, post),
-                EsqlType::Long,
-            )),
-            (Value::Expr(l, lt), Value::Expr(r, rt)) if lt.is_numeric() && rt.is_numeric() => {
-                let raw = BExpr::binary(as_double(l, lt), op, as_double(r, rt));
-                Ok(Value::Expr(self.finite(raw, post), EsqlType::Double))
+            (Value::Expr(l, EsqlType::Long), Value::Expr(r, EsqlType::Long)) => {
+                Ok(Value::Expr(long_arithmetic(l, op, r), EsqlType::Long))
             }
-            (left, right) => Err(self.verification(
-                b.span,
-                format!(
-                    "[{}] has arguments with incompatible types [{}] and [{}]",
-                    self.text(b.span),
-                    Self::operand_type(&left),
-                    Self::operand_type(&right)
-                ),
-            )),
+            (left, right) => {
+                let (lt, rt) = (Self::operand_type(&left), Self::operand_type(&right));
+                let divides = matches!(op, Operator::Divide | Operator::Modulo);
+                match (double_operand(left, false), double_operand(right, divides)) {
+                    (Some(l), Some(r)) => Ok(Value::Raw(BExpr::binary(l, op, r))),
+                    _ => Err(self.verification(
+                        b.span,
+                        format!(
+                            "[{}] has arguments with incompatible types [{lt}] and [{rt}]",
+                            self.text(b.span),
+                        ),
+                    )),
+                }
+            }
         }
-    }
-
-    /// Long arithmetic with ES|QL's null results: overflow, a zero divisor,
-    /// and `i64::MIN / -1` give null; `x % -1` is `0`. No operand reaches an
-    /// Arrow kernel that can fail, whichever branches the engine evaluates.
-    /// Each operand of `/` and `%` is read twice, so it is shared.
-    fn long_arithmetic(&mut self, left: BExpr, op: Operator, right: BExpr, post: bool) -> BExpr {
-        if !matches!(op, Operator::Divide | Operator::Modulo) {
-            return checked_long(left, op, right);
-        }
-        let left = self.share(left, post);
-        let right = self.share(right, post);
-        let divisor = BExpr::Scalar(
-            "nullif",
-            vec![
-                BExpr::Scalar("nullif", vec![right.clone(), long_literal(0)]),
-                long_literal(-1),
-            ],
-        );
-        let minus_one = BExpr::binary(right, Operator::Eq, long_literal(-1));
-        let on_minus_one = if op == Operator::Divide {
-            checked_long(long_literal(0), Operator::Minus, left.clone())
-        } else {
-            BExpr::binary(left.clone(), Operator::Multiply, long_literal(0))
-        };
-        BExpr::Case(
-            vec![(minus_one, on_minus_one)],
-            Some(Box::new(BExpr::binary(left, op, divisor))),
-        )
     }
 
     /// `value` when it is a finite double, else null: ES|QL reports an
@@ -1549,15 +1678,47 @@ fn long_literal(value: i64) -> BExpr {
     BExpr::Literal(ScalarValue::Int64(Some(value)))
 }
 
-fn as_double(value: BExpr, ty: EsqlType) -> BExpr {
-    match ty {
-        EsqlType::Long => value.cast(DataType::Float64),
-        _ => value,
+/// A numeric operand of double arithmetic as a double, `None` for any other
+/// operand. An unchecked `divisor` that is infinite reads null.
+fn double_operand(value: Value, divisor: bool) -> Option<BExpr> {
+    match value {
+        Value::Expr(value, EsqlType::Long) => Some(value.cast(DataType::Float64)),
+        Value::Expr(value, EsqlType::Double) => Some(value),
+        Value::Raw(value) if divisor => Some(nullif_infinite(value)),
+        Value::Raw(value) => Some(value),
+        Value::Expr(..) | Value::Duration(..) => None,
     }
 }
 
-/// `left op right` over longs for `+ - *`, null when the result leaves the
-/// long range.
+/// `value`, or null when it is infinite, reading it once.
+fn nullif_infinite(value: BExpr) -> BExpr {
+    let nullif = |value, limit: f64| {
+        BExpr::Scalar(
+            "nullif",
+            vec![value, BExpr::Literal(ScalarValue::Float64(Some(limit)))],
+        )
+    };
+    nullif(nullif(value, f64::INFINITY), f64::NEG_INFINITY)
+}
+
+/// Long arithmetic with ES|QL's null results: overflow, a zero divisor, and
+/// `i64::MIN / -1` give null; `x % -1` is `0`. The exact quotient is a
+/// decimal that truncates toward zero, as long division does, and its cast
+/// back reads null outside the long range, which is the one overflowing
+/// quotient. No operand reaches an Arrow kernel that can fail, and each is
+/// read once.
+fn long_arithmetic(left: BExpr, op: Operator, right: BExpr) -> BExpr {
+    match op {
+        Operator::Divide | Operator::Modulo => checked_long(
+            left,
+            op,
+            BExpr::Scalar("nullif", vec![right, long_literal(0)]),
+        ),
+        _ => checked_long(left, op, right),
+    }
+}
+
+/// `left op right` over longs, null when the result leaves the long range.
 fn checked_long(left: BExpr, op: Operator, right: BExpr) -> BExpr {
     BExpr::binary(left.cast(DECIMAL), op, right.cast(DECIMAL)).try_cast(DataType::Int64)
 }
@@ -1674,53 +1835,59 @@ mod tests {
         bound(&source).expect("binds").pipeline.nodes()
     }
 
-    /// The node counts at 10, 20 and 40 operators, asserting the first is
-    /// `at_ten` before binding the longer chains.
-    fn growth(first: &str, op: &str, at_ten: usize) -> [usize; 3] {
-        let ten = chain(first, op, 10);
-        assert_eq!(ten, at_ten, "{first} {op} x10");
-        [ten, chain(first, op, 20), chain(first, op, 40)]
+    /// Asserts `chain(first, op, n)` for each `(n, nodes)` in `counts`, and
+    /// that each operator past the first count adds `step` nodes.
+    fn linear(first: &str, op: &str, counts: [(usize, usize); 3], step: usize) {
+        let (n0, nodes0) = counts[0];
+        for (n, nodes) in counts {
+            assert_eq!(chain(first, op, n), nodes, "{first} {op} x{n}");
+            assert_eq!(nodes - nodes0, step * (n - n0), "{first} {op} x{n}");
+        }
     }
 
-    /// The densest shapes measured: a long division per two tokens, in a
-    /// row, over the scope's columns, and over aggregate results, each
-    /// within the default token limit and its nesting limit.
+    /// The densest shapes measured within the default token limit: a double
+    /// division per field in a row, the deepest admitted long division chain
+    /// per field over the scope's columns, and over aggregate results. Each
+    /// binds to at most 3 nodes per token, which is the figure the
+    /// [`MAX_BOUND_NODES`] doc computes its margin from.
     #[test]
     fn the_largest_dense_statements_bind_within_the_budget() {
-        let row = vec![format!("(9{})", " / 1".repeat(60)); 50].join(" + ");
-        let row = vec![format!("x = {row}"); 10].join(", ");
-        let stats = vec![format!("(SUM(severity_num){})", " / 1".repeat(60)); 50].join(" + ");
-        let stats: Vec<String> = (0..10).map(|i| format!("x{i} = {stats}")).collect();
+        let limits = ravel_esql::Limits::default();
+        let fields = |count: usize, value: &dyn Fn(usize) -> String| {
+            (0..count)
+                .map(|i| format!("x{i} = {}", value(i)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let divisions = " / 1".repeat(7);
         for source in [
-            format!("ROW {row}"),
-            format!("FROM logs | EVAL {row}"),
-            format!("FROM logs | STATS {}", stats.join(", ")),
+            format!("ROW {}", fields(10_900, &|_| "9.0 / 1".to_string())),
+            format!(
+                "FROM logs | EVAL {}",
+                fields(3_600, &|_| format!("severity_num{divisions}"))
+            ),
+            format!(
+                "FROM logs | STATS {}",
+                fields(3_000, &|_| format!("SUM(severity_num){divisions}"))
+            ),
         ] {
-            let tokens = ravel_esql::lexer::tokenize(&source, &ravel_esql::Limits::default())
+            let tokens = ravel_esql::lexer::tokenize(&source, &limits)
                 .expect("lexes")
                 .len();
             assert!(tokens > 60_000, "{tokens}");
             let nodes = bound(&source).expect("binds").pipeline.nodes();
-            assert!(nodes < 9 * tokens, "{nodes} nodes for {tokens} tokens");
+            assert!(nodes <= 3 * tokens, "{nodes} nodes for {tokens} tokens");
         }
-        assert!(9 * ravel_esql::Limits::default().max_tokens < MAX_BOUND_NODES);
+        assert!(3 * limits.max_tokens + MAX_PLAN_STAGES * limits.max_tokens / 4 < MAX_BOUND_NODES);
     }
 
     #[test]
     fn a_chain_of_double_additions_binds_to_linearly_many_nodes() {
-        let [ten, twenty, forty] = growth("1.0", "+", 126);
-        let step = (twenty - ten) / 10;
-        assert_eq!(step, 12);
-        assert_eq!(twenty - ten, 10 * step);
-        assert_eq!(forty - twenty, 20 * step);
+        linear("1.0", "+", [(4, 22), (8, 34), (16, 58)], 3);
     }
 
     #[test]
     fn a_chain_of_long_divisions_binds_to_linearly_many_nodes() {
-        let [ten, twenty, forty] = growth("9", "/", 170);
-        let step = (twenty - ten) / 10;
-        assert_eq!(step, 17);
-        assert_eq!(twenty - ten, 10 * step);
-        assert_eq!(forty - twenty, 20 * step);
+        linear("9", "/", [(1, 8), (3, 22), (7, 50)], 7);
     }
 }

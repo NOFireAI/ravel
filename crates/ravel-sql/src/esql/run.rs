@@ -24,7 +24,10 @@ pub struct EsqlRequest {
     pub min_tokens: Vec<CommitToken>,
     /// The whole request's deadline.
     pub deadline: Duration,
-    /// The request's resource budgets.
+    /// The request's resource budgets, passed to the executor as
+    /// [`StatementRequest::budgets`]. A `ROW` statement scans no segment and
+    /// issues no store request, so it does not read them; it runs under the
+    /// tenant's memory budget alone.
     pub budgets: Option<RequestBudgets>,
     /// The caller's row cap, passed to the executor as
     /// [`StatementRequest::max_rows`]: a `FROM logs` statement returning more
