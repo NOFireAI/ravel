@@ -94,19 +94,42 @@ fn probed_field() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just("a"), Just("b"), Just("s"), Just("zz")]
 }
 
+fn key_type() -> impl Strategy<Value = KeyType> {
+    prop_oneof![
+        Just(KeyType::Id16),
+        Just(KeyType::I64),
+        Just(KeyType::Str),
+        Just(KeyType::Bytes),
+    ]
+}
+
+/// The type the seed fields were written under, so a probe is answered.
+fn written_type(field: &str) -> KeyType {
+    if field == "s" {
+        KeyType::Str
+    } else {
+        KeyType::I64
+    }
+}
+
 proptest! {
     #[test]
     fn arbitrary_bytes_never_panic(
         bytes in prop::collection::vec(any::<u8>(), 0..512),
         prefix_len in 0u32..520,
         field in probed_field(),
+        probed_type in key_type(),
         key in any::<[u8; 8]>(),
     ) {
         let verified = verify_key_idx(&bytes, prefix_len);
-        let probed = probe(&bytes, prefix_len, field, &key);
+        let probed = probe(&bytes, prefix_len, field, probed_type, &key);
         if let (Ok(summary), Ok(found)) = (&verified, &probed) {
-            // A section that verifies must answer consistently with itself.
-            let named = summary.fields.iter().find(|f| f.name == field);
+            // A section that verifies must answer consistently with itself:
+            // a probe answers only for a field named under the probed type.
+            let named = summary
+                .fields
+                .iter()
+                .find(|f| f.name == field && f.key_type == probed_type);
             prop_assert_eq!(named.is_some(), found.is_some());
             if let (Some(f), Some(blocks)) = (named, found) {
                 prop_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
@@ -125,11 +148,15 @@ proptest! {
     ) {
         let section = encode_key_idx_with_bucket_bits(&fields, bucket_bits).expect("encode");
         let key: Key8 = if field == "s" { key8_str("ab") } else { key8_i64(probe_key) };
-        let want = probe(&section.bytes, section.prefix_len, field, &key).expect("probe clean");
+        let kt = written_type(field);
+        let want = probe(&section.bytes, section.prefix_len, field, kt, &key).expect("probe clean");
         verify_key_idx(&section.bytes, section.prefix_len).expect("verify clean");
+        let other = if kt == KeyType::I64 { KeyType::Str } else { KeyType::I64 };
+        let declined = probe(&section.bytes, section.prefix_len, field, other, &key);
+        prop_assert_eq!(declined.expect("probe clean"), None);
 
         let bytes = mutate(&section.bytes, &m);
-        let got = probe(&bytes, section.prefix_len, field, &key);
+        let got = probe(&bytes, section.prefix_len, field, kt, &key);
         let verified = verify_key_idx(&bytes, section.prefix_len);
         if bytes == section.bytes {
             prop_assert_eq!(got.expect("unchanged section probes"), want);
@@ -153,7 +180,7 @@ proptest! {
         let wrong = u32::try_from((i64::from(section.prefix_len) + delta).rem_euclid(1 << 32))
             .expect("u32");
         let key = key8_i64(probe_key);
-        prop_assert!(probe(&section.bytes, wrong, field, &key).is_err());
+        prop_assert!(probe(&section.bytes, wrong, field, written_type(field), &key).is_err());
         prop_assert!(verify_key_idx(&section.bytes, wrong).is_err());
     }
 }
