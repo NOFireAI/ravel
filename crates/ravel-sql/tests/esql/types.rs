@@ -8,7 +8,7 @@ use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion::logical_expr::{AggregateUDF, Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 
-use crate::esql_lowering::fetches_around_aggregate;
+use crate::lowering::fetches_around_aggregate;
 use crate::support::{columns, fixture, optimized, prepare, rows, run, session};
 
 async fn cells(source: &str) -> Vec<Vec<String>> {

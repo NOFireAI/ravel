@@ -355,8 +355,8 @@ path = "tests/logs_scan_block_charge.rs"
 name = "group_by_string_keys"
 path = "tests/group_by_string_keys.rs"
 
-# The ES|QL lowering's test files, not yet members of tests/it.rs; they share
-# no process-wide state and can move there.
+# The ES|QL lowering's tests, with their modules under tests/esql/. Not yet a
+# member of tests/it.rs; they share no process-wide state and can move there.
 [[test]]
 name = "esql"
 path = "tests/esql.rs"

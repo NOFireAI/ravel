@@ -3,14 +3,14 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-#[path = "esql_support.rs"]
+#[path = "esql/support.rs"]
 mod support;
 
-#[path = "esql_binder.rs"]
-mod esql_binder;
-#[path = "esql_lowering.rs"]
-mod esql_lowering;
-#[path = "esql_types.rs"]
-mod esql_types;
-#[path = "esql_window.rs"]
-mod esql_window;
+#[path = "esql/binder.rs"]
+mod binder;
+#[path = "esql/lowering.rs"]
+mod lowering;
+#[path = "esql/types.rs"]
+mod types;
+#[path = "esql/window.rs"]
+mod window;
