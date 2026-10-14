@@ -389,64 +389,109 @@ Remote Write over loopback:
 | 64,351 B | 2,000 x 3 runs | 262, 254, 260 (about 13%) | issue #2926 body |
 | 6,000 series, x86_64 | 2,000 | 169 | comment 6156727395 |
 
-**Decision.** Every refusal that the admission layer answers at the head of
-an HTTP/1 ingest request reads and discards the request body before it
-sends the response. That covers the in-flight ceiling's 429, the credential
-check's 401, and the pending-ack 429 once issue #2805 moves it to the
-head. Three bounds apply:
+**Decision.** When the in-flight ceiling sheds an HTTP/1 ingest request at
+its head and the request's tenant credential resolves, the admission layer
+reads and discards the request body before it sends the 429. The pending-ack
+429 joins this once issue #2805 moves it to the head. Three bounds apply,
+each a constant in `ingest_admission.rs`, not a flag:
 
 - `HEAD_REFUSAL_DRAIN_MAX_BYTES`: 1 MiB of body as sent, before any
   inflate.
 - `HEAD_REFUSAL_DRAIN_TIMEOUT`: 1 s.
 - `HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`: 64 drains at once, process-wide.
 
+Changing any of the three takes a later amendment with its own evidence.
+
 A drained body is never inflated, decoded or charged to any budget. The
-drain holds no admission permit: the in-flight permit is released before
-it starts. The concurrency bound is what limits a drain, because the
-admission permits do not: under the overload that produces refusals, and
-for unauthenticated callers on the 401 path, the drains would otherwise
-have no bound on count.
+code that calls the drain holds no admission permit while it runs: a shed
+request was never given one, and a later head refusal that holds the
+in-flight permit releases it first. The concurrency bound is taken with
+`try_acquire` and never awaited. It is what limits drains under the
+overload that produces them, since no admission permit does.
 
-A refusal that cannot be drained is answered as it is today, with
-`Connection: close` added. That happens when the body is past the byte
-cap, when it is not complete within the deadline, or when all 64 drain
-slots are taken. The status, `Retry-After` and body text are unchanged.
-These refusals are counted in `ravel_ingest_head_refusal_undrained_total`
-with a `reason` label of `over_cap`, `timeout` or `busy`. A deployment
-whose refused bodies outgrow the cap can see it there.
+**Only an authenticated caller is drained.** The admission layer checks the
+credential right after the permit, and that ordering exists so that an
+unauthenticated caller cannot make this process buffer a body (ADR-0051).
+Draining for an unauthenticated caller would undo that guarantee. It would
+also let such a caller hold all 64 drain slots, which pushes every
+authenticated refusal onto the fallback below. So:
 
-**The cap is 1 MiB, not the routes' 16 MiB body limit.** The reset starts
-at about one socket buffer, near 64 KB on loopback. 1 MiB covers bodies 16
-times that. Draining 16 MiB per refusal, under the overload that makes the
-refusals, holds a connection task for the transfer time of the largest
-legal body. The time bound is what limits a slow sender, and the
-concurrency bound is what limits the total. A deployment that needs a larger cap can
-raise it with its own evidence. This amendment does not add a flag for it.
+- A shed request whose credential does not resolve gets the 429 with no
+  drain. The check costs nothing extra: it reads only the request head.
+- The credential check's own 401 is not drained either.
+
+The cost is diagnosability. A client sending a large body with a bad
+credential can see a connection reset where it would have seen a 401.
+That client fails either way, and neither response tells it to retry.
+
+**The fallback.** A refusal that is not drained is answered as it is today:
+the same status, `Retry-After` and body text, with `Connection: close`
+added. That happens when:
+
+- the body is past the byte cap (a `Content-Length` above it is refused
+  without reading a byte);
+- the body is not complete within the deadline;
+- all 64 drain slots are taken;
+- the credential does not resolve.
+
+`Connection: close` tells a client that does read the response not to reuse
+the connection. It does not prevent the reset, so an undrained refusal can
+still reach the client as a transport error. A deployment sees how often
+this happens through `ravel_ingest_head_refusal_undrained_total`, with a
+`reason` label of `over_cap`, `timeout`, `busy` or `unauthenticated`.
+
+**The bounds.**
+- The byte cap is 1 MiB, not the routes' 16 MiB body limit. The reset
+  starts at about one socket buffer, near 64 KB on loopback, and 1 MiB
+  covers bodies 16 times that.
+- The time bound is what limits a slow sender.
+- 64 concurrent drains is chosen, not measured. It caps the body bytes
+  being read for refusals at 64 MiB at any instant. It is one sixteenth of
+  the default in-flight ceiling of 1,024, so drains cannot rival the
+  admitted work they protect.
+- Draining 16 MiB per refusal would hold a task for the transfer time of
+  the largest legal body.
 
 **Excluded.**
 
-- The body-read timeout's 503: that body did not arrive within 30 s, so
-  there is nothing to drain.
+- The body-read timeout's 503. That sender is already past a 30 s
+  deadline, and 503 is a status both exporters retry. A sender still
+  trickling bytes can be reset there, as before.
+- The route body limit's 413. It is layered outside the admission layer,
+  and a body over 16 MiB is past the drain cap by construction.
 - The gRPC surfaces. HTTP/2 refuses a stream, not the connection, and
-  delivers the response headers. This is inferred from the protocol, not
-  measured. The acceptance tests below include a gRPC case to pin it.
-- OTAP: its refusals answer inside an open stream.
+  still delivers the response headers. That is inferred from the protocol,
+  not measured, and the acceptance tests pin it.
+- OTAP, whose refusals answer inside an open stream.
 
-**Acceptance.** A pooled-client test sends a body larger than the loopback
-socket buffer and below the cap to each of the three OTLP HTTP routes and
-to Remote Write while the ceiling is held. Every refusal must arrive as a
-readable 429 with `Retry-After`, with zero client transport errors. The
-test must rule out three wrong implementations:
+**Acceptance.**
+- A pooled-client test, run while the ceiling is held, sends to each of
+  the three OTLP HTTP routes and to Remote Write. Its bodies are larger
+  than the loopback socket buffer and below the cap. Every refusal must
+  arrive as a readable 429 with `Retry-After`, with zero client transport
+  errors. The test must rule out three wrong implementations:
+  - `Connection: close` alone: transport errors stay.
+  - A drain that decodes: the inner handler must never run.
+  - A drain with no cap: a request whose `Content-Length` is above the cap
+    must get `Connection: close` and move the `over_cap` series by exactly
+    one.
+- A unit test fills the drain slots and asserts that the next refusal
+  takes the `busy` path.
+- A refusal without a resolvable credential must reach its response
+  without reading the body:
+  - a shed request takes the `unauthenticated` path;
+  - a 401 is sent while the client has sent only the request head.
+- A gRPC case with a large message asserts `RESOURCE_EXHAUSTED`.
 
-- `Connection: close` alone: transport errors stay.
-- A drain that decodes: the decode counters must stay at zero.
-- A drain with no cap: a second case above the cap must get
-  `Connection: close` and move the undrained counter's `over_cap` series
-  by exactly one.
+**Follow-through in the code change.** Some text in the tree states the old
+property and must change in the same commit as the code:
 
-A unit test fills the drain slots and asserts that the next refusal takes
-the `busy` path.
+- the `--max-inflight-ingest-requests` help in `config.rs`, and the
+  generated flag reference rebuilt from it;
+- the admission section of `docs/ingest.md`, whose sentence "a shed request
+  costs this process the bytes of one request head" holds afterwards only
+  for an unauthenticated caller;
+- any test on the HTTP routes that pins that a shed body is never read;
+  it is changed to pin never decoded and never charged.
 
-A gRPC case with a large message asserts `RESOURCE_EXHAUSTED`. Tests that
-pin the old never-read property on the HTTP routes change to pin
-never-decoded and never-charged.
+The gRPC `PoisonBody` tests stay as they are.
