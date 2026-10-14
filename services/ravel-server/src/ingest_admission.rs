@@ -362,17 +362,17 @@ async fn discard_body(mut body: axum::body::Body) -> Result<(), DrainStopped> {
 ///
 /// 1. HTTP/2 and later: answered as is, uncounted, since a stream reset
 ///    leaves the connection usable and a `Connection` header is invalid.
-/// 2. `Expect: 100-continue`: answered with `Connection: close`, uncounted.
+/// 2. Not authenticated: `unauthenticated`.
+/// 3. `Expect: 100-continue`: answered with `Connection: close`, uncounted.
 ///    The client sends nothing until it sees `100 Continue`, which reading the
 ///    body would solicit, so there are no unread bytes to drain.
-/// 3. Not authenticated: `unauthenticated`.
 /// 4. `Content-Length` above [`HEAD_REFUSAL_DRAIN_MAX_BYTES`], with nothing
 ///    read: `over_cap`.
 /// 5. No free drain slot ([`HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`]): `busy`.
 /// 6. While draining, the body passes the cap (`over_cap`) or does not end
 ///    within [`HEAD_REFUSAL_DRAIN_TIMEOUT`] (`timeout`).
 ///
-/// Cases 3 to 6 add `Connection: close` and count one under
+/// Cases 2 and 4 to 6 add `Connection: close` and count one under
 /// `ravel_ingest_head_refusal_undrained_total`. A body that fails mid-drain
 /// (the client went away) also gets `Connection: close` and is not counted.
 pub(crate) async fn refuse_from_head(
@@ -390,11 +390,11 @@ pub(crate) async fn refuse_from_head(
     ) {
         return refusal;
     }
-    if expects_continue(request.headers()) {
-        return with_connection_close(refusal);
-    }
     if !authenticated(request.headers()) {
         return drain.undrained(UndrainedReason::Unauthenticated, refusal);
+    }
+    if expects_continue(request.headers()) {
+        return with_connection_close(refusal);
     }
     let body = request.into_body();
     if body.size_hint().lower() > HEAD_REFUSAL_DRAIN_MAX_BYTES {
@@ -1599,6 +1599,33 @@ mod tests {
         // virtual clock, which moves only when a timer fires.
         assert!(started.elapsed() < HEAD_REFUSAL_DRAIN_TIMEOUT);
         assert_eq!(undrained_counts(&controller), [0, 0, 0, 0]);
+    }
+
+    /// The credential is checked before `Expect: 100-continue`, so an
+    /// unauthenticated request waiting on it is counted as `unauthenticated`
+    /// like any other unauthenticated shed.
+    #[tokio::test(start_paused = true)]
+    async fn an_unauthenticated_expect_continue_shed_counts_as_unauthenticated() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/v1/metrics")
+            .header(header::EXPECT, "100-continue")
+            .body(axum::body::Body::new(StalledBody::new()))
+            .expect("request builds");
+
+        let response =
+            tokio::time::timeout(TEST_DEADLINE, http_router(&controller).oneshot(request))
+                .await
+                .expect("answered")
+                .expect("infallible router");
+
+        assert_shed(response, true).await;
+        let drain = controller.head_refusal_drain();
+        assert_eq!(drain.undrained_total(UndrainedReason::Unauthenticated), 1);
+        assert_eq!(undrained_counts(&controller).iter().sum::<u64>(), 1);
     }
 
     /// A caller that refuses a request still holding its permit has the

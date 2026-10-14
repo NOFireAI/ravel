@@ -119,7 +119,8 @@ impl IngestConcurrencyController {
     /// resolution and before any per-signal admission check, so a shed
     /// request is never decoded or charged and reaches neither a shard channel
     /// nor a commit token. The HTTP layer then checks the shed request's
-    /// credential, with no side effect, only to decide whether to read and
+    /// credential, without the unauthorized hook or a rejected-request
+    /// count, only to decide whether to read and
     /// discard its body before answering (`crate::ingest_admission`). The
     /// transport layers there call this for every ingest route; a handler
     /// takes a permit itself only when no layer did.

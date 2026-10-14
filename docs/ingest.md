@@ -89,12 +89,15 @@ unread can reach the client as a reset or a broken pipe instead of the
 response, and a pooled HTTP/1.1 client that is still uploading sees exactly
 that. So when the HTTP layer sheds a request, it reads the request body and
 discards it before sending the 429, if the caller is authenticated: the
-credential is checked on the head with no side effect (no rejected-request
-count moves), and an unauthenticated caller's body is never read. A drained
+credential is checked on the head without calling the surface's unauthorized
+hook or moving its rejected-request count (a durable bearer token that misses
+still triggers its usual rate-limited `sys/auth` re-read), and an
+unauthenticated caller's body is never read. A drained
 body is never inflated, decoded or charged to the byte budget, and the drain
 holds no admission permit. Three fixed bounds apply, constants in
-`ingest_admission.rs` rather than flags: at most 1 MiB of body as sent (before
-any inflate), at most 1 second, and at most 64 drains at once in the process,
+`ingest_admission.rs` rather than flags: the drain stops once it has read
+1 MiB of body as sent (before any inflate; the frame that crosses the cap is
+the last one read), at most 1 second, and at most 64 drains at once in the process,
 a slot taken without waiting. A drained 429 is answered as before; a shed it
 does not drain keeps its status, `Retry-After` and body and adds
 `Connection: close`. The first reason that applies is counted in
@@ -106,8 +109,11 @@ then, during the drain, `over_cap` (a chunked body passed 1 MiB) or `timeout`
 prevent the reset: a client still uploading when the connection closes can
 see a transport error regardless. An HTTP/2 shed refuses one stream and keeps
 the connection, so it is answered with no drain, no `Connection` header, and
-no count; so is a request waiting on `Expect: 100-continue`, which has sent no
-body yet (it gets `Connection: close` and is not counted). The 401, the 413
+no count. An authenticated request waiting on `Expect: 100-continue` has sent
+no body yet, so it is answered without a drain, with `Connection: close`, and
+is not counted; an unauthenticated one is counted as `unauthenticated` like any
+other. A drain the client abandons midway also ends with `Connection: close`
+and is not counted. The 401, the 413
 for a body above the request size limit, the 503 for a body that does not
 arrive in time, gRPC, OTAP, and the 429s a handler returns after decode are
 unchanged.
