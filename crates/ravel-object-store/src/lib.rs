@@ -8,6 +8,7 @@
 pub mod conformance;
 pub mod external;
 pub mod fault;
+pub mod get_latency;
 pub mod instrument;
 pub mod kms_routing;
 pub mod memory;
