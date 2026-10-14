@@ -64,18 +64,35 @@ pub const MAX_BOUND_NODES: usize = 1 << 20;
 /// command.
 ///
 /// DataFusion's analyzer, optimizer, physical planner, evaluator and drop
-/// each recurse over an expression. The optimizer inlines a projection into
-/// the projection or filter above it, pushes a filter on a group below the
-/// aggregate with the group's expression in place of the column, and merges
-/// the filters it pushes together into one left-deep `AND`, which a `LIMIT`
-/// stops. So the depth that reaches those recursions is the inlined and
-/// merged one. Arithmetic reads each operand once, so the only values shared
-/// ahead of a stage to keep the bound size linear are the operand of a double
-/// result's finite check, made once at the root, and a per-aggregate `WHERE`
-/// its field's calls repeat. Sharing moves depth into a projection without
-/// removing it, and DataFusion inlines it back, so once operands are read
-/// once, bounding depth and [`MAX_PLAN_STAGES`] is what keeps the plan within
-/// the stack. The measurements are on [`MAX_PLAN_STAGES`].
+/// each recurse over an expression. The optimizer inlines a computed column
+/// into the filter above it, pushes a filter on a group below the aggregate
+/// with the group's expression in place of the column, and merges the
+/// filters it pushes together into one left-deep `AND`, which a `LIMIT`
+/// stops; a column the statement also returns stays in its own projection.
+/// The count is the inlined and merged depth, and the stack tests
+/// (`tests/esql/stack.rs`) measure the deepest expression of the optimized
+/// plan for every shape at its limit: it is never deeper than the count, and
+/// where it is shallower each difference is named there (a folded constant
+/// divisor, an unwrapped checked cast, a cast or finite-check operand the
+/// optimizer shares). Three small differences are not in the count:
+///
+/// - the request time range runs as its own scan filters and is not merged
+///   into the counted conditions, so the merged `AND` stays as deep as
+///   counted (`the_request_range_is_a_condition_apart_from_the_counted_ones`);
+/// - the analyzer adds a cast where a long is compared with a double, one
+///   level past the count (`a_long_compared_with_a_double_gains_a_cast`);
+/// - a short `IN` list may be rewritten as a chain of `OR`, which runs an
+///   `IN` of three values two levels past the count
+///   (`a_short_in_list_runs_as_a_chain_of_or`).
+///
+/// Arithmetic reads each operand once, so the only values shared ahead of a
+/// stage to keep the bound size linear are the operand of a double result's
+/// finite check, made once at the root, and a per-aggregate `WHERE` its
+/// field's calls repeat. Sharing moves depth into a projection without
+/// removing it, and DataFusion inlines it back into a filter, so once
+/// operands are read once, bounding depth and [`MAX_PLAN_STAGES`] is what
+/// keeps the plan within the stack. The measurements are on
+/// [`MAX_PLAN_STAGES`].
 pub const MAX_EXPRESSION_DEPTH: usize = 24;
 
 /// The most stages the statement's own commands may bind to, each projection

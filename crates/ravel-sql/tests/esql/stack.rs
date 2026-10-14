@@ -179,7 +179,10 @@ impl Shape {
                     } else {
                         ("s", "s")
                     };
-                    format!(" | STATS s = SUM({sum}) WHERE {} >= 0 BY service", e(over, i))
+                    format!(
+                        " | STATS s = SUM({sum}) WHERE {} >= 0 BY service",
+                        e(over, i)
+                    )
                 })
             ),
             Shape::StatsGroup => format!(
@@ -562,7 +565,9 @@ fn worst_in(kind: Kind, shape: Shape, depth: Option<usize>, ranged: bool) -> Lim
         (k, n, refusal(&longer), counted)
     });
     let optimized = optimized_depth(shape.statement(kind, k, n), ranged);
-    eprintln!("{kind:?} {shape:?} ranged={ranged}: k = {k}, n = {n}, {longer:?}, counted {counted:?}, optimized {optimized}");
+    eprintln!(
+        "{kind:?} {shape:?} ranged={ranged}: k = {k}, n = {n}, {longer:?}, counted {counted:?}, optimized {optimized}"
+    );
     Limit {
         k,
         n,
@@ -608,10 +613,7 @@ fn a_long_compared_with_a_literal_drops_its_checked_cast() {
     let Expr::BinaryExpr(comparison) = &predicate else {
         panic!("{predicate}");
     };
-    assert!(
-        !matches!(*comparison.left, Expr::TryCast(_)),
-        "{predicate}"
-    );
+    assert!(!matches!(*comparison.left, Expr::TryCast(_)), "{predicate}");
     assert_eq!(
         merged_filter(source, false),
         (1, 6 - FOLDED_DIVISOR - UNWRAPPED_CAST)
@@ -896,7 +898,10 @@ fn a_chain_of_groups_filtered_after_the_last_is_refused() {
         chain(4),
         chain(5)
     );
-    let column = source.find("STATS c = COUNT(*) BY g2").expect("a second STATS") + 1;
+    let column = source
+        .find("STATS c = COUNT(*) BY g2")
+        .expect("a second STATS")
+        + 1;
     let found = on_stack(WORKER_STACK, move || async move {
         match prepare(&source) {
             Ok(prepared) => {
@@ -1068,8 +1073,15 @@ fn a_short_in_list_runs_as_a_chain_of_or() {
         merged_filter(format!("FROM logs | WHERE {}", three(0)), false),
         (1, 2 + 2)
     );
-    let four =
-        |j: usize| format!("dur IN ({}, {}, {}, {})", 4 * j + 1, 4 * j + 2, 4 * j + 3, 4 * j + 4);
+    let four = |j: usize| {
+        format!(
+            "dur IN ({}, {}, {}, {})",
+            4 * j + 1,
+            4 * j + 2,
+            4 * j + 3,
+            4 * j + 4
+        )
+    };
     assert_eq!(counted_condition(four), 2);
     assert_eq!(
         merged_filter(format!("FROM logs | WHERE {}", four(0)), false),
