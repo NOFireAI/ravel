@@ -59,7 +59,7 @@ use ravel_logseg::{
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_REQUEST_COST_BYTES,
-    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher,
+    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, DEFAULT_MAX_SEGMENTS, EngineConfig, EngineConfigError, LogSegmentFetcher,
     LogsFetchPolicy, PhaseWireByteCounter, PhaseWireByteCounts, ProbeMissCounter, QueryPhase,
     ResolvedLogsFetch, SegmentFetcher, resolve_logs_fetch,
 };
@@ -1674,26 +1674,68 @@ struct ColdExecutor {
     get_limiter_permits: usize,
 }
 
+/// An executor setting [`EngineConfig::validate`] refuses, named by the bench
+/// flag that carried it. Boxed into [`Error`]; tests downcast to it.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid {flag}: {source}")]
+pub struct ExecutorConfigError {
+    /// The flag whose value the engine refused, or the config field when no
+    /// bench flag sets it.
+    pub flag: &'static str,
+    #[source]
+    pub source: EngineConfigError,
+}
+
+/// The [`EngineConfig`] an in-process executor runs with, refused through
+/// [`EngineConfig::validate`] exactly as `ravel-server` refuses it. A zero
+/// `--sql-partition-count` or `--store-get-concurrency` is an error here, not a
+/// value DataFusion or the GET limiter would reinterpret. `fetch_concurrency`
+/// is clamped to 1 before validation, so `--fetch-concurrency 0` keeps running
+/// at 1 (see [`knob_effective`]).
+fn executor_engine_config(settings: &ExecutorSettings) -> Result<EngineConfig, Error> {
+    let engine = EngineConfig {
+        fetch_concurrency: settings.fetch_concurrency.max(1),
+        sql_partition_count: settings.sql_partition_count,
+        store_get_concurrency: settings.store_get_concurrency,
+        max_segments: settings.max_segments,
+        logs_request_cost_bytes: settings.logs_request_cost_bytes,
+        logs_block_range_threshold: settings.logs_block_range_threshold,
+        logs_projection_break_even_bytes: settings.logs_projection_break_even_bytes,
+        logs_fetch_policy: settings.logs_fetch_policy,
+        ..EngineConfig::default()
+    };
+    engine.validate().map_err(|source| {
+        let flag = match source {
+            EngineConfigError::ZeroSqlPartitionCount => "--sql-partition-count",
+            EngineConfigError::ZeroGetLimiterPermits => "--store-get-concurrency",
+            EngineConfigError::ZeroFetchConcurrency => "--fetch-concurrency",
+            EngineConfigError::ZeroFetchBound => "logs_max_fetch_run_bytes",
+            EngineConfigError::ZeroPromqlFetchFanout => "promql_fetch_fanout",
+        };
+        Error::from(ExecutorConfigError { flag, source })
+    })?;
+    Ok(engine)
+}
+
 fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
     cache: Option<Arc<Cache<CacheFetchError>>>,
     settings: ExecutorSettings,
 ) -> Result<ColdExecutor, Error> {
+    let engine = executor_engine_config(&settings)?;
     let ExecutorSettings {
         max_query_bytes,
         shard_count,
         fetch_concurrency,
-        sql_partition_count,
         store_get_concurrency,
         tenant_max_bytes,
         parallel_final_aggregation,
-        max_segments,
         logs_block_range_threshold,
         logs_suffix_len,
         logs_request_cost_bytes,
         logs_projection_break_even_bytes,
-        logs_fetch_policy,
+        ..
     } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -1742,17 +1784,7 @@ fn cold_executor(
         SpanSegmentFetcher::new(Arc::clone(store)),
         SqlConfig {
             max_query_bytes,
-            engine: EngineConfig {
-                fetch_concurrency: fetch_concurrency.max(1),
-                sql_partition_count,
-                store_get_concurrency,
-                max_segments,
-                logs_request_cost_bytes,
-                logs_block_range_threshold,
-                logs_projection_break_even_bytes,
-                logs_fetch_policy,
-                ..EngineConfig::default()
-            },
+            engine,
             parallel_final_aggregation,
             // The bench reporter is the one reader of the per-segment scan
             // timeline (issue #913): production leaves `SqlConfig::
@@ -2329,18 +2361,20 @@ async fn dataset_info(
     })
 }
 
-/// Run the generated lane: build a wide-schema logs dataset in process, install
-/// the corpus's declared-column union, and measure every statement.
 /// The `*_effective` provenance for one ADR-1195 knob.
 ///
 /// `in_process` is false on the Flight lane, where the override never left this
 /// process and the server's own config governed the quantity: unknown here, so
 /// `None` rather than a guess.
 ///
-/// The fallback clamps, because `cold_executor` stores `fetch_concurrency` as
-/// `.max(1)` and `EngineConfig` resolves against that clamped value. Reporting
-/// the raw figure makes `--fetch-concurrency 0` print `effective = 0` beside a
-/// `fetch_concurrency` field of 1, describing a run that did not happen.
+/// The fallback clamps, because [`executor_engine_config`] stores
+/// `fetch_concurrency` as `.max(1)` and `EngineConfig` resolves against that
+/// clamped value. Reporting the raw figure makes `--fetch-concurrency 0` print
+/// `effective = 0` beside a `fetch_concurrency` field of 1, describing a run
+/// that did not happen. An explicit zero `requested` never gets here on an
+/// in-process lane: `--sql-partition-count 0` and `--store-get-concurrency 0`
+/// are refused by [`executor_engine_config`] before the lane does any work, so
+/// no report is written for them.
 fn knob_effective(
     in_process: bool,
     requested: Option<usize>,
@@ -2349,33 +2383,16 @@ fn knob_effective(
     in_process.then(|| requested.unwrap_or(fetch_concurrency).max(1))
 }
 
+/// Run the generated lane: build a wide-schema logs dataset in process, install
+/// the corpus's declared-column union, and measure every statement.
+///
+/// Always in process, so the executor settings are validated
+/// ([`executor_engine_config`]) before the dataset is generated: a refused
+/// setting costs no store request.
 pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Error> {
-    // Unique tenant per run so repeated runs against one shared bucket never
-    // read each other's objects (mirrors the other bench cores).
-    let tenant = TenantId::new(format!("sql-latency-gen-{}", Uuid::new_v4()));
-    let tenant_hash = tenant.hash();
-
-    let load_start = Instant::now();
-    generate_dataset(&cfg.store, &tenant, cfg).await?;
-    let load_wall_ms = load_start.elapsed().as_secs_f64() * 1e3;
-
-    let window = TimeRange {
-        start_ns: 0,
-        end_ns: NOW_NS,
-    };
-    let declared = declaration_union(&cfg.entries);
     // The generated lane writes shard 0 only by construction (see
     // `generate_dataset`), so a single shard resolves the whole dataset.
     let shard_count = 1;
-    let dataset = dataset_info(
-        &cfg.store,
-        tenant_hash,
-        window,
-        NOW_NS,
-        Some(load_wall_ms),
-        shard_count,
-    )
-    .await?;
     let resolved_logs_fetch = logs_fetch_resolution(
         cfg.logs_fetch_policy,
         &cfg.store_cost_profile,
@@ -2397,6 +2414,31 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
     };
+    executor_engine_config(&settings)?;
+
+    // Unique tenant per run so repeated runs against one shared bucket never
+    // read each other's objects (mirrors the other bench cores).
+    let tenant = TenantId::new(format!("sql-latency-gen-{}", Uuid::new_v4()));
+    let tenant_hash = tenant.hash();
+
+    let load_start = Instant::now();
+    generate_dataset(&cfg.store, &tenant, cfg).await?;
+    let load_wall_ms = load_start.elapsed().as_secs_f64() * 1e3;
+
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: NOW_NS,
+    };
+    let declared = declaration_union(&cfg.entries);
+    let dataset = dataset_info(
+        &cfg.store,
+        tenant_hash,
+        window,
+        NOW_NS,
+        Some(load_wall_ms),
+        shard_count,
+    )
+    .await?;
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
         tenant_hash,
@@ -2533,6 +2575,21 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
     let tenant = TenantId::new(cfg.tenant.clone());
     let tenant_hash = tenant.hash();
 
+    let resolved_logs_fetch = logs_fetch_resolution(
+        cfg.logs_fetch_policy,
+        &cfg.store_cost_profile,
+        cfg.logs_request_cost_bytes,
+        cfg.logs_block_range_threshold,
+    );
+    // The in-process lane validates its executor settings before the first
+    // store read. The shard count is not resolved yet and does not reach
+    // `EngineConfig`, so any value validates the same. The Flight lane is
+    // skipped: its settings never leave this process, and the server's own
+    // config, which the server validates, governs the run.
+    if cfg.flight.is_none() {
+        executor_engine_config(&tenant_executor_settings(cfg, 1, &resolved_logs_fetch))?;
+    }
+
     // How many shards to resolve over. Before #677 this was implicitly 1
     // (`CatalogConfig::default()`), so a multi-shard tenant was measured over
     // shard 0 alone and any tenant whose data all sat on a higher shard read as
@@ -2585,16 +2642,12 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             .into());
         }
     }
-    let resolved_logs_fetch = logs_fetch_resolution(
-        cfg.logs_fetch_policy,
-        &cfg.store_cost_profile,
-        cfg.logs_request_cost_bytes,
-        cfg.logs_block_range_threshold,
-    );
     let settings = tenant_executor_settings(cfg, shard_count, &resolved_logs_fetch);
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
-    // SQL, in process or across a gRPC channel to a server.
+    // SQL, in process or across a gRPC channel to a server. Only the in-process
+    // arm builds an `EngineConfig` from `settings`, which is why only it was
+    // validated above; the Flight arm runs on the server's own validated config.
     let (entries, skipped, failed) = match &cfg.flight {
         Some(target) => measure_over_flight(target, cfg, &declared).await?,
         None => {
