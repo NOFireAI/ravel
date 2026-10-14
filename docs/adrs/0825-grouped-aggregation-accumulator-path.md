@@ -157,6 +157,8 @@ corpus's hot path.
    produces identical bits to the shipped path on the same input stream.
    No semantics change, no gate deviation, ADR-0022 decisions 3 and 4
    untouched except for the sentence that forbade a groups accumulator.
+   This is the plain call; a `DISTINCT` call has its own accumulator and
+   no groups accumulator, see the distinct-aggregate amendment below.
 2. **Integer-input `avg`/`mean`: exact integer accumulation, deterministic
    by construction.** The UDAF stops delegating coercion for integer
    arguments: resolved integer inputs (Int8 through Int64, UInt8 through
@@ -254,8 +256,10 @@ corpus's hot path.
   the same pprof harness, `GroupsAccumulatorAdapter` machinery falls from
   42.67% of on-CPU samples to under 5% (after decisions 1, 2, and 4 the
   only remaining adapter users are non-owned delegate types that this
-  corpus never exercises; the figure is asserted by the profiling lane,
-  present exactly once and inside the band, per the measurement rules).
+  corpus never exercises, and `DISTINCT` calls of the owned kinds, see the
+  distinct-aggregate amendment below; the figure is asserted by the
+  profiling lane, present exactly once and inside the band, per the
+  measurement rules).
 - **Acceptance, q33:** completes under the 8 GiB pool with decision 2
   plus decision 3 (exact integer `avg` admits the statement to the
   repartitioned final; flat state cuts resident aggregate state to ~25
@@ -334,3 +338,58 @@ is what it now sees. `crates/ravel-sql/tests/exact_typed_classification_q29.rs`
 pins the plan shape, the partial state type and equal rows with the
 parallel final aggregation on and off; the unit tests beside
 `is_admitted_integer` pin which dictionary value types are admitted.
+
+## Amendment 2026-10-14 (issue #2930): a DISTINCT call of either owned kind has its own accumulator
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="the distinct-aggregate amendment below" -->
+
+Decisions 1 and 2 describe the accumulators of a plain call. The UDAF
+chose its accumulator, state fields and groups-accumulator support from the
+argument type alone and never read `is_distinct`, so a `DISTINCT` call
+reached the plain accumulator and averaged every row. DataFusion's
+`SingleDistinctToGroupBy` rule (datafusion-optimizer 55.2.0) hid this for
+the statements it rewrites into a group by: those whose distinct aggregates
+are all over one expression, whose other aggregates are `sum`, `min` or
+`max`, and none of which carries a FILTER or ORDER BY. A statement the rule
+does not rewrite reached the accumulator. `crates/ravel-sql/tests/avg_distinct.rs`
+shows the plain average coming back before this change for the integer
+kind with two `DISTINCT` aggregates over different arguments, a `DISTINCT`
+average beside a plain `avg`, a FILTER clause on the `DISTINCT` average
+(each with and without `GROUP BY`), and a FILTER clause on a different,
+non-distinct aggregate in the same statement; and for the float kind with
+two `DISTINCT` aggregates, with and without `GROUP BY`, and a `DISTINCT`
+average beside a plain `avg` with `GROUP BY`. It also shows the rewritten
+shapes answering correctly before and after.
+
+Both owned kinds now select a distinct accumulator when `is_distinct` is
+true, in `crates/ravel-sql/src/avg.rs`:
+
+- **Integer kind:** a set of distinct `i64` values. Evaluation sums the set
+  with the checked `i128` addition of decision 2, converts the exact sum to
+  `f64` once and divides by the set size once; an empty set is NULL.
+- **Float kind:** a set keyed by `f64::to_bits`, so `0.0` and `-0.0` are two
+  values and NaNs with different payloads are two values. That is the
+  equality DataFusion's `count(DISTINCT)` uses over Float64, so the two
+  aggregates count the same set. Evaluation sorts the set with
+  `f64::total_cmp`, folds it with the naive seeded sequential fold of
+  decision 1 and divides once, so the result is a function of the distinct
+  set and not of arrival or merge order, for a statement that reaches this
+  accumulator. A statement the `SingleDistinctToGroupBy` rule rewrites into a
+  group by never reaches it: that shape runs the ordinary float `avg` over
+  the group keys in emission order instead.
+- **State:** one list field named `{name}[avg_distinct]` whose items are the
+  values; merging two partial states is the union of their sets.
+- **No distinct groups accumulator:** `groups_accumulator_supported` is
+  false for a distinct call of an owned kind, so DataFusion runs the
+  per-group accumulator behind `GroupsAccumulatorAdapter`, and
+  `create_groups_accumulator` returns a typed internal error if it is called
+  for one. A distinct call of a delegated input type stays delegated.
+
+Decision 3's classifier arm is unchanged: `avg` over a resolved Int64
+argument is exact whether or not it is distinct, because a union of sets is
+the same set however rows are partitioned, so the integer distinct average
+keeps ADR-0094's partitioned final aggregation. `avg` over a Float64
+argument is still not admitted to it, distinct or not. The new tests pin
+the plan shape, the partial state and the answers of the integer case with
+the parallel final aggregation on and off.
+
