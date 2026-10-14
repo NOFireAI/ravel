@@ -40,6 +40,10 @@ pub mod logs_scan_scaling;
 pub mod metrics_gen;
 pub mod metrics_ingest;
 pub mod metrics_workload;
+// Compiled in the default test build too, where ravel-server is a
+// dev-dependency, so its count test runs without the `saturation` feature.
+#[cfg(any(feature = "saturation", test))]
+pub mod pending_ack_shed;
 pub mod profiling;
 pub mod promql_corpus;
 pub mod pushdown_crossover;
@@ -49,7 +53,7 @@ pub mod read_accounting;
 pub mod report;
 pub mod report_schema;
 pub mod saturation;
-#[cfg(feature = "saturation")]
+#[cfg(any(feature = "saturation", test))]
 pub mod saturation_run;
 pub mod section_accounting;
 pub mod segment_support;
