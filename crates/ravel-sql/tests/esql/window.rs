@@ -24,7 +24,10 @@ fn range(start_ns: i64, end_ns: i64) -> TimeRange {
 
 /// The first column of every row, sorted.
 fn sorted_cells(outcome: &EsqlOutcome) -> Vec<String> {
-    let mut cells: Vec<String> = rows(outcome).into_iter().map(|row| row[0].clone()).collect();
+    let mut cells: Vec<String> = rows(outcome)
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
     cells.sort();
     cells
 }
@@ -61,7 +64,10 @@ fn both_bounds_set_both_ends() {
 #[test]
 fn no_lower_bound_starts_at_the_epoch() {
     assert_eq!(window("FROM logs"), range(0, NOW + 1));
-    assert_eq!(window("FROM logs | WHERE message == \"a\""), range(0, NOW + 1));
+    assert_eq!(
+        window("FROM logs | WHERE message == \"a\""),
+        range(0, NOW + 1)
+    );
     assert_eq!(
         window(r#"FROM logs | WHERE @timestamp < "2023-11-14T22:14:00Z""#),
         range(0, BASE + 60 * SECOND)
@@ -129,10 +135,7 @@ async fn a_lower_bound_alone_returns_rows_up_to_the_clock_on_every_layout() {
 #[tokio::test]
 async fn a_lower_bound_after_the_clock_returns_no_rows_on_every_layout() {
     let source = "FROM logs | WHERE @timestamp >= NOW() + 1 minute";
-    assert_eq!(
-        window(source),
-        range(NOW + 60 * SECOND, NOW + 60 * SECOND)
-    );
+    assert_eq!(window(source), range(NOW + 60 * SECOND, NOW + 60 * SECOND));
     for layout in LAYOUTS {
         let fixture = segmented_fixture(layout).await;
         let outcome = run(&fixture, source)
@@ -182,12 +185,11 @@ async fn sort_orders_rows_across_segments() {
         .await
         .unwrap_or_else(|e| panic!("{layout:?}: {e}"));
         assert_eq!(segments(&outcome), segment_count(layout), "{layout:?}");
-        let order: Vec<String> = rows(&outcome).into_iter().map(|row| row[0].clone()).collect();
-        assert_eq!(
-            order,
-            ["1", "3", "5", "7", "9", "11", "13"],
-            "{layout:?}"
-        );
+        let order: Vec<String> = rows(&outcome)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect();
+        assert_eq!(order, ["1", "3", "5", "7", "9", "11", "13"], "{layout:?}");
     }
 }
 

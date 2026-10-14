@@ -149,7 +149,8 @@ fn a_declared_column_colliding_with_a_reserved_name_yields_to_it() {
         .collect();
     assert_eq!(
         columns,
-        [("severity_text", "keyword"), ("dur", "long")].map(|(n, t)| (n.to_string(), t.to_string()))
+        [("severity_text", "keyword"), ("dur", "long")]
+            .map(|(n, t)| (n.to_string(), t.to_string()))
     );
     let all = esql::prepare("FROM logs", &ravel_esql::Limits::default(), &ctx).expect("prepares");
     let names: Vec<&str> = all.columns().iter().map(|c| c.name.as_str()).collect();
@@ -167,7 +168,11 @@ fn a_declared_column_colliding_with_a_reserved_name_yields_to_it() {
             "dur",
         ]
     );
-    match esql::prepare("FROM logs | KEEP attrs", &ravel_esql::Limits::default(), &ctx) {
+    match esql::prepare(
+        "FROM logs | KEEP attrs",
+        &ravel_esql::Limits::default(),
+        &ctx,
+    ) {
         Err(EsqlError::Verification { message, .. }) => {
             assert_eq!(message, "Unknown column [attrs]")
         }

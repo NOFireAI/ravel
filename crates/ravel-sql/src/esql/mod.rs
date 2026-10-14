@@ -8,8 +8,9 @@
 //! statement's output columns and their ES|QL types and the time window read
 //! from its `@timestamp` bounds. Every statement carries the same
 //! [`DialectPolicy`], the fixed function list below (ADR-2887 D7); `prepare`
-//! refuses a bound pipeline calling anything off it with an internal error. [`PreparedEsql`] then lowers the same bound
-//! pipeline against every session the executor builds for it.
+//! refuses a bound pipeline calling anything off it with an internal error.
+//! [`PreparedEsql`] then lowers the same bound pipeline against every session
+//! the executor builds for it.
 //!
 //! A `FROM logs` statement reads its window from the conjunctive `@timestamp`
 //! bounds of the `WHERE` stages ahead of the first `LIMIT`, `STATS` or stage

@@ -168,6 +168,9 @@ mod tests {
         let LogicalPlan::Projection(projection) = &plan else {
             panic!("expected the final projection, got {plan:?}");
         };
-        assert_eq!(projection.expr, vec![Expr::Column(Column::from_name("_e1"))]);
+        assert_eq!(
+            projection.expr,
+            vec![Expr::Column(Column::from_name("_e1"))]
+        );
     }
 }

@@ -24,8 +24,8 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use ravel_esql::Span;
 use ravel_esql::ast::{
-    self, BinaryOp, CallArgs, Command, Expr, IntervalKind, LiteralValue, NullsOrder,
-    QualifiedName, SortOrder, UnaryOp,
+    self, BinaryOp, CallArgs, Command, Expr, IntervalKind, LiteralValue, NullsOrder, QualifiedName,
+    SortOrder, UnaryOp,
 };
 
 use super::error::EsqlError;
@@ -704,12 +704,11 @@ impl Binder<'_> {
         match e {
             Expr::Literal(literal) => self.literal(&literal.value, literal.span),
             Expr::Interval(interval) => {
-                let period = matches!(interval.kind(), Some(IntervalKind::DatePeriod)).then(|| {
-                    Period {
+                let period =
+                    matches!(interval.kind(), Some(IntervalKind::DatePeriod)).then(|| Period {
                         span: interval.span,
                         unit: interval.unit.clone(),
-                    }
-                });
+                    });
                 self.interval(interval)
                     .map(|nanos| Value::Duration(nanos, period))
             }

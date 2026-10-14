@@ -236,7 +236,10 @@ async fn row_runs_without_the_catalog() {
 async fn a_result_column_named_like_an_internal_name_runs() {
     let fixture = fixture().await;
     let outcome = run(&fixture, "ROW _e1 = 1").await.expect("runs");
-    assert_eq!(columns(&outcome), vec![("_e1".to_string(), "long".to_string())]);
+    assert_eq!(
+        columns(&outcome),
+        vec![("_e1".to_string(), "long".to_string())]
+    );
     assert_eq!(rows(&outcome), vec![vec!["1"]]);
 
     let outcome = run(
