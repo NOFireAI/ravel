@@ -175,8 +175,8 @@ L0 object over each configured typed attribute column, stored in an RCST1
 object bound to the covered part set) and loaded once per query by
 `Catalog::load_column_stats`; the query-side rewrite is `MetadataOnlyAggregate`
 (crates/ravel-sql/src/metadata_agg.rs), which replaces the aggregate subtree
-with a `MetadataOnlyExec` leaf whose `EXPLAIN` line reads
-`MetadataOnlyExec: metadata_only=true, rows=<n>`. The two shapes are:
+with a `MetadataOnlyExec` leaf whose line in a `ravel-cli sql explain` plan
+reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The two shapes are:
 
 - **q02**: `SELECT COUNT(*) FROM logs WHERE <typed attribute column> <>
   <literal>`, one residual filter over the scan and no `GROUP BY`. Answered as
@@ -1444,9 +1444,8 @@ ListView, LargeListView, RunEndEncoded or Union column, so a batch carrying
 one tends to pass through uncopied; its values stay correct.
 The cost is one copy of each aggregate output that feeds an exchange or a
 sort; `ravel-cli sql explain` shows the operator and its `--analyze` mode the
-operator's `copied_bytes`
-(the referenced bytes of the batches it copied), `compacted_batches` and
-`passed_through_batches` metrics. The regression test
+operator's `copied_bytes` (the referenced bytes of the batches it copied),
+`compacted_batches` and `passed_through_batches` metrics. The regression test
 (`crates/ravel-sql/tests/compact_slices.rs`) pins the repartition edge on
 the q29 shape (`HAVING ... ORDER BY count DESC LIMIT` over a
 single-partition final aggregate fanned back out to 4 partitions, 20,000
@@ -3940,8 +3939,8 @@ NULL count equal to the row count. The comparison runs in signed `i64` order
 `str`/`bytes` equality never skips a segment, and neither does a shape
 `extract_logs` declines. A skipped segment costs no GET and is counted as
 `segments_pruned_by_stats` in the scan's metrics (`ravel-cli sql explain
---analyze` prints them) and in
-`SqlStats`. `max_segments` admission still counts the whole resolved snapshot,
+--analyze` prints them) and in `SqlStats`. `max_segments` admission still
+counts the whole resolved snapshot,
 and the distributed coordinator fan-out does not skip. A Flight SQL `DoGet`
 rebuilds its segments from the ticket, whose pin carries no stamps, so it
 skips nothing by statistics.
@@ -4115,7 +4114,7 @@ Two consequences an operator and a plan reader both see:
   clustering key, then `ts`), never globally by `ts`, and a partition spans several segments, so a
   block-at-a-time scan cannot truthfully claim that order. `ORDER BY ts`
   returns correctly sorted results; the ordering comes from a `SortExec`
-  DataFusion inserts above the scan, visible in `EXPLAIN`.
+  DataFusion inserts above the scan, visible in a `ravel-cli sql explain` plan.
 - **Projection reaches the reader.** The scan's output schema *is* DataFusion's
   requested projection; there is no `ProjectionExec` above it discarding
   columns the scan already decoded. The decoded column set is the projected
@@ -4135,8 +4134,7 @@ Two consequences an operator and a plan reader both see:
 
 `LogsScanExec` publishes `pages_decoded` and `pages_skipped` per partition
 alongside its block counters, so `ravel-cli sql explain --analyze` shows how
-much of each block
-the projection avoided touching.
+much of each block the projection avoided touching.
 
 Two decode-time byte counters sit next to those page counts on the query's
 `QueryAccounting` handle (ADR-0107 decision 4): `page_bytes_fetched`, the stored
@@ -4180,8 +4178,8 @@ pages per block (`ts`, `stream_ref`, `body`) against 8 for
 `ColumnSelection::all()` on the same object, and the difference matches
 `pages_skipped` exactly. A user observes the effect in `pages_decoded` on
 `ScanStats` (the per-partition page counters `ravel-cli sql explain
---analyze` prints), in
-`page_bytes_decoded` on the query's accounting, and in reduced peak decode
+--analyze` prints), in `page_bytes_decoded` on the query's accounting, and in
+reduced peak decode
 memory, never in request count or wire bytes -- those stay exactly where the
 fast path already put them. The
 "one GET per segment" figure counts one logical `GetRange::Full` read; a warm
@@ -4248,8 +4246,9 @@ LogsRowFetchExec: row_ref=__ravel_row_ref, restored_columns=41
         LogsScanExec: partitions=1, content=0, prune=0, projection=[ts, body, __ravel_row_ref]
 ```
 
-Both phases are visible in one `EXPLAIN`. The first phase is the scan line: the same
-TopK over the same filter, but over a scan projecting only `ts` and `body` plus
+Both phases are visible in one `ravel-cli sql explain` plan. The first phase
+is the scan line: the same TopK over the same filter, but over a scan
+projecting only `ts` and `body` plus
 `__ravel_row_ref`, a synthetic non-nullable `UInt64` column packing each row's
 `(segment ordinal, surviving-block position, surviving-row position)` -- all
 three cursor state the scan already holds, so nothing is decoded to produce
@@ -4274,8 +4273,8 @@ share a fetch); the object-store requests behind them depend on the fetch
 path, as the next paragraph says. Those are accounted like any other scan read,
 and `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
 `segments_fetched` as metrics (`ravel-cli sql explain --analyze` prints them)
-so a report can state phase 2's cost
-instead of inferring it. With a read cache wired and an object below the
+so a report can state phase 2's cost instead of inferring it. With a read
+cache wired and an object below the
 block-range threshold they land on the cache key phase 1 already admitted and
 cost no request at all; with `--disable-cache` they are one GET each.
 
@@ -4318,8 +4317,8 @@ this skip can serve. Such a scan keeps snapshot visit order and the fast
 path's open pipelining exactly as without the filter. The scan keeps only
 the first such filter, so when another operator's filter reaches it ahead
 of the TopK's, nothing is confirmed and nothing is skipped. A confirmed scan
-shows `topk_threshold=ts` in `EXPLAIN`. The scan only reads `t` off the
-confirmed filter's current expression and uses it twice:
+shows `topk_threshold=ts` in a `ravel-cli sql explain` plan. The scan only
+reads `t` off the confirmed filter's current expression and uses it twice:
 
 - Segments are dealt to partitions in ascending `min_event_ts_ns` (ties by
   snapshot index) instead of snapshot order, and a partition does not open
@@ -4527,8 +4526,8 @@ oversights.
    What an operator sees change is cost, not answers. `LogsScanExec` publishes
    `blocks_total`, `blocks_scanned`, and `blocks_pruned_by_postings` per
    partition, so `ravel-cli sql explain --analyze` shows whether a query
-   pruned; a selective
-   equality on an indexed key reads a fraction of the blocks it read before, and
+   pruned; a selective equality on an indexed key reads a fraction of the
+   blocks it read before, and
    returns the same rows. A key the object does not index reports
    `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
    fallback, not a failure.
@@ -4970,8 +4969,9 @@ fewer bytes than asked.
 Cache keys are `(tenant_hash, content_hash, offset,
 len)`, so entries survive object-key churn and two writers producing
 identical bytes share one entry. Each funnel credits its own hit/miss and
-byte counters to `QueryAccounting` (ADR-0044), so a query's `EXPLAIN
-ANALYZE` output distinguishes cache hits from store round trips.
+byte counters to `QueryAccounting` (ADR-0044), so a query's accounting
+distinguishes cache hits from store round trips; the server publishes those
+counts as `ravel_query_cache_hits_total` and `ravel_query_cache_misses_total`.
 
 Alongside the byte cache, `ravel-catalog` keeps its five decoded-structure
 caches (commit records, compaction records, HEAD with a TTL, snapshot
