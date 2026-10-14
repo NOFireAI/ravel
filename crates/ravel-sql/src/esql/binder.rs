@@ -57,33 +57,43 @@ pub const MAX_LIMIT: u64 = 10_000;
 pub const MAX_BOUND_NODES: usize = 1 << 20;
 
 /// The deepest expression a statement may bind to, a column computed by a
-/// projection under it counting as the depth of the expression computing
-/// it; a statement past it is refused with a verification error.
+/// projection or a `STATS ... BY` group under it counting as the depth of the
+/// expression computing it, and the conditions of every `WHERE` since the
+/// source command or the last `LIMIT` counting as one condition joined by
+/// `AND`; a statement past it is refused with a verification error naming the
+/// command.
 ///
 /// DataFusion's analyzer, optimizer, physical planner, evaluator and drop
-/// each recurse over an expression, and the optimizer inlines a projection
-/// into the projection or filter above it, so the depth that reaches those
-/// recursions is the inlined one. Arithmetic reads each operand once, so the
-/// only values shared ahead of a stage to keep the bound size linear are the
-/// operand of a double result's finite check, made once at the root, and a
-/// per-aggregate `WHERE` its field's calls repeat. Sharing moves depth into
-/// a projection without removing it, and DataFusion inlines it back, so
-/// once operands are read once, bounding depth and [`MAX_PLAN_STAGES`] is
-/// what keeps the plan within the stack.
+/// each recurse over an expression. The optimizer inlines a projection into
+/// the projection or filter above it, pushes a filter on a group below the
+/// aggregate with the group's expression in place of the column, and merges
+/// the filters it pushes together into one left-deep `AND`, which a `LIMIT`
+/// stops. So the depth that reaches those recursions is the inlined and
+/// merged one. Arithmetic reads each operand once, so the only values shared
+/// ahead of a stage to keep the bound size linear are the operand of a double
+/// result's finite check, made once at the root, and a per-aggregate `WHERE`
+/// its field's calls repeat. Sharing moves depth into a projection without
+/// removing it, and DataFusion inlines it back, so once operands are read
+/// once, bounding depth and [`MAX_PLAN_STAGES`] is what keeps the plan within
+/// the stack. The measurements are on [`MAX_PLAN_STAGES`].
 pub const MAX_EXPRESSION_DEPTH: usize = 24;
 
-/// The most stages a statement may bind to, each projection the binder
-/// schedules for its fields and shared operands included; a statement past
-/// it is refused with a verification error.
+/// The most stages the statement's own commands may bind to, each projection
+/// the binder schedules for their fields and shared operands included; a
+/// statement past it is refused with a verification error naming the command
+/// that passes it. The source projection, the request time range's filter and
+/// the implicit `LIMIT` are stages the statement does not write and do not
+/// count, so whether a statement is admitted does not depend on the request.
 ///
 /// Plan depth and expression depth draw on the same recursions, so both
-/// limits were measured together on the unoptimized test build. With neither
-/// limit applied, 21 `WHERE dur > 0` filters (23 stages) ran on a 1 MiB
-/// stack and 22 overflowed it, as did one `WHERE` of 45 `AND`ed comparisons
-/// where 44 ran. At these limits, the deepest admitted expression in every
-/// stage of a `WHERE`, `SORT`, `EVAL`, `STATS` field or per-aggregate `WHERE`
-/// pipeline plans and runs on 1 MiB, half the 2 MiB stack of a server worker
-/// thread.
+/// limits were measured together, every internal stage included, by running
+/// the deepest and longest statement each shape admits (`WHERE`, `AND`,
+/// `SORT`, `ROW`, `EVAL`, chained `EVAL`, `STATS` field, per-aggregate
+/// `WHERE` and `STATS ... BY` group, with and without a request time range)
+/// on threads of a fixed stack. In the unoptimized test build each runs on
+/// 1 MiB and some overflow 768 KiB; in the `ci-opt` build, which optimizes
+/// DataFusion and Arrow, each runs on 768 KiB and some overflow 512 KiB. A
+/// server worker thread has 2 MiB.
 pub const MAX_PLAN_STAGES: usize = 10;
 
 /// What counts toward [`MAX_EXPRESSION_DEPTH`], as a refusal states it.
@@ -457,7 +467,8 @@ impl Binder<'_> {
             // A filter on a group is pushed below the aggregate with the
             // group's expression in place of the column.
             Stage::Aggregate { groups, .. } => {
-                let depths: Vec<usize> = groups.iter().map(|(e, _)| self.inlined_depth(e)).collect();
+                let depths: Vec<usize> =
+                    groups.iter().map(|(e, _)| self.inlined_depth(e)).collect();
                 for ((_, name), depth) in groups.iter().zip(depths) {
                     self.inlined.insert(name.clone(), depth);
                 }

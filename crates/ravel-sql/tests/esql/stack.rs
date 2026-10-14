@@ -12,8 +12,8 @@ use ravel_sql::esql::{
 };
 
 use crate::support::{
-    BASE, NOW, SECOND, WORKER_STACK, columns, context, fixture, on_stack, optimized, prepare,
-    rows, run_prepared,
+    BASE, NOW, SECOND, WORKER_STACK, columns, context, fixture, on_stack, optimized, prepare, rows,
+    run_prepared,
 };
 
 /// A request time range holding every fixture row.
@@ -468,16 +468,28 @@ fn the_deepest_and_chain_runs_on_a_worker_stack() {
         merged_filter(Shape::And.statement(Kind::Long, 2, 7)),
         (21, 22)
     );
+    // A LIMIT keeps the conditions above it apart from those below.
+    let and = |from: usize| {
+        (from..from + 12)
+            .map(|j| format!("dur != -{j}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    assert_eq!(
+        merged_filter(format!(
+            "FROM logs | WHERE {} | LIMIT 100 | WHERE {}",
+            and(1),
+            and(13)
+        )),
+        (12, 13)
+    );
 }
 
 /// A group counts as the depth of the expression computing it, which a
 /// `WHERE` over it inlines below the aggregate.
 #[test]
 fn the_deepest_long_stats_group_runs_on_a_worker_stack() {
-    assert_eq!(
-        worst(Kind::Long, Shape::StatsGroup),
-        (3, 1, Refusal::Depth)
-    );
+    assert_eq!(worst(Kind::Long, Shape::StatsGroup), (3, 1, Refusal::Depth));
     assert_eq!(
         worst_at(Kind::Long, Shape::StatsGroup, Some(1)),
         (1, 4, Refusal::Stages)

@@ -91,10 +91,16 @@ mod tests {
         let detail = "Schema error: No field named \"_e9 + Int64(1)\"".to_string();
         let error = EsqlError::from_executor(SqlError::Plan(detail.clone()));
         assert!(matches!(&error, EsqlError::Plan(kept) if *kept == detail));
-        assert_eq!(error.to_string(), "the ES|QL statement could not be planned");
+        assert_eq!(
+            error.to_string(),
+            "the ES|QL statement could not be planned"
+        );
         assert_eq!(error.class(), SqlError::Plan(detail).class());
 
         let execution = EsqlError::from_executor(SqlError::Execution("x".to_string()));
-        assert!(matches!(execution, EsqlError::Execution(SqlError::Execution(_))));
+        assert!(matches!(
+            execution,
+            EsqlError::Execution(SqlError::Execution(_))
+        ));
     }
 }

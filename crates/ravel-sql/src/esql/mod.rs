@@ -29,10 +29,12 @@
 //! A statement ending in its own `LIMIT` returns at most [`MAX_LIMIT`] rows,
 //! and one that does not returns at most [`IMPLICIT_LIMIT`]. A statement that
 //! binds to more than [`MAX_BOUND_NODES`] expression nodes, to an expression
-//! deeper than [`MAX_EXPRESSION_DEPTH`], or to more than [`MAX_PLAN_STAGES`]
-//! plan stages is refused with a verification error, so every statement the
-//! parser's default limits admit plans and runs within a worker thread's
-//! stack.
+//! deeper than [`MAX_EXPRESSION_DEPTH`] (the conditions of every `WHERE` up to
+//! a `LIMIT` counted as one), or to more than [`MAX_PLAN_STAGES`] stages of its
+//! own commands is refused with a verification error naming the command and
+//! the limit, so every statement the parser's default limits admit plans and
+//! runs within a worker thread's stack. A lowered statement DataFusion still
+//! cannot plan is refused with [`EsqlError::Plan`].
 
 mod binder;
 mod error;
@@ -198,8 +200,8 @@ impl PreparedEsql {
         };
         let tables = self.tables();
         let context = LoweringContext::snapshot(session, providers, &tables);
-        let plan = lower::lower(&self.pipeline, &context)
-            .map_err(|e| EsqlError::Plan(e.to_string()))?;
+        let plan =
+            lower::lower(&self.pipeline, &context).map_err(|e| EsqlError::Plan(e.to_string()))?;
         admit_lowered_plan(&plan, &context, &tables, &self.policy)
             .map_err(EsqlError::from_executor)?;
         session

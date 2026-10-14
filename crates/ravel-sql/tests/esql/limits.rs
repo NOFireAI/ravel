@@ -10,7 +10,8 @@ use ravel_sql::esql::{
 
 use crate::lowering::fetch;
 use crate::support::{
-    BASE, NOW, SECOND, WORKER_STACK, context, fixture, on_stack, optimized, prepare, request, rows, run, run_with,
+    BASE, NOW, SECOND, WORKER_STACK, context, fixture, on_stack, optimized, prepare, request, rows,
+    run, run_with,
 };
 
 /// Every fetch in `plan`, outermost first.
@@ -275,7 +276,9 @@ fn an_expression_past_the_depth_limit_is_refused() {
     assert_eq!(
         refusal(&format!("ROW x = 9{}\n| EVAL y = x / 1", " / 1".repeat(7))),
         (
-            format!("EVAL expression [x / 1] is 26 levels deep, past the limit of 24: {DEPTH_RULE}"),
+            format!(
+                "EVAL expression [x / 1] is 26 levels deep, past the limit of 24: {DEPTH_RULE}"
+            ),
             2,
             3
         )
@@ -363,10 +366,7 @@ fn a_statement_past_the_stage_limit_is_refused() {
         ..context()
     };
     esql::prepare(&filters(10), &ravel_esql::Limits::default(), &ranged).expect("prepares");
-    assert_eq!(
-        refusal_in(&filters(11), &ranged),
-        refusal(&filters(11))
-    );
+    assert_eq!(refusal_in(&filters(11), &ranged), refusal(&filters(11)));
 }
 
 /// The most times `stage` follows `head` in a statement that prepares.
