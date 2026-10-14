@@ -20,9 +20,11 @@ use ravel_cli::sql_explain::{self, ExplainOptions, UNAUDITED_REQUIRED};
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{EngineConfigError, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlRequest, ValidationError,
 };
@@ -61,6 +63,13 @@ fn write_parquet(path: &Path, batch: &RecordBatch) {
 }
 
 async fn loaded_store() -> Arc<dyn ObjectStoreBackend> {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    load_into(Arc::clone(&store)).await;
+    store
+}
+
+/// Load the fixture's ten records into `store`.
+async fn load_into(store: Arc<dyn ObjectStoreBackend>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let pq = dir.path().join("logs.parquet");
     let ts: ArrayRef = Arc::new(Int64Array::from(
@@ -79,9 +88,8 @@ body_column = "body"
 "#,
     )
     .expect("mapping");
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let report = load::load(
-        Arc::clone(&store),
+        store,
         &pq,
         TENANT,
         &mapping,
@@ -95,7 +103,6 @@ body_column = "body"
     .await
     .expect("load succeeds");
     assert_eq!(report.rows_processed, BODIES.len() as u64);
-    store
 }
 
 fn options(sql: &str, analyze: bool) -> ExplainOptions {
@@ -308,6 +315,108 @@ async fn refuses_without_unaudited_before_any_store_request() {
         .await
         .expect_err("every request is throttled");
     assert!(requests(&store) > 0);
+}
+
+/// `--sql-partitions 0` is refused by the engine config's own validation,
+/// before the first store request, rather than handed to DataFusion, which
+/// reads zero as "use the host's core count". The same store with one
+/// partition does reach it.
+#[tokio::test]
+async fn zero_sql_partitions_is_refused_before_any_store_request() {
+    let store = throttling_store();
+    let mut opts = options(GROUPED, true);
+    opts.sql_partitions = Some(0);
+    let err = explain(store.clone(), &opts)
+        .await
+        .expect_err("--sql-partitions 0 is refused");
+    assert!(format!("{err:#}").contains("--sql-partitions"), "{err:#}");
+    assert!(
+        matches!(
+            err.downcast_ref::<EngineConfigError>(),
+            Some(EngineConfigError::ZeroSqlPartitionCount)
+        ),
+        "{err:?}"
+    );
+    assert_eq!(requests(&store), 0);
+
+    opts.sql_partitions = Some(1);
+    explain(store.clone(), &opts)
+        .await
+        .expect_err("every request is throttled");
+    assert!(requests(&store) > 0);
+}
+
+/// A capped `--analyze` run reports the cap it stopped at, not the probe row
+/// past it; an uncapped run over the same data reports the exact count.
+#[tokio::test]
+async fn capped_analyze_prints_the_cap_not_the_probe_row() {
+    let store = loaded_store().await;
+    let mut opts = options(GROUPED, true);
+    opts.max_rows = Some(1);
+    let output = explain(Arc::clone(&store), &opts)
+        .await
+        .expect("sql explain --analyze --max-rows 1");
+    assert_eq!(
+        output.lines().last(),
+        Some("rows: 1+ (stopped at --max-rows)"),
+        "{output}"
+    );
+
+    let output = explain(store, &options(GROUPED, true))
+        .await
+        .expect("sql explain --analyze");
+    assert_eq!(
+        output.lines().last(),
+        Some(format!("rows: {GROUPED_ROWS}").as_str()),
+        "{output}"
+    );
+}
+
+/// The window check matches `POST /api/v1/sql`: `--start` equal to `--end` is
+/// accepted and only `--start` after `--end` is refused.
+#[tokio::test]
+async fn start_equal_to_end_is_accepted_and_start_after_end_is_refused() {
+    let store = loaded_store().await;
+    let mut opts = options(GROUPED, true);
+    opts.start_ns = Some(CLOCK_NS);
+    opts.end_ns = Some(CLOCK_NS);
+    explain(Arc::clone(&store), &opts)
+        .await
+        .expect("an empty window is accepted");
+
+    opts.start_ns = Some(CLOCK_NS + 1);
+    let err = explain(store, &opts)
+        .await
+        .expect_err("--start after --end is refused");
+    assert_eq!(err.to_string(), "--start must not be after --end");
+}
+
+/// A run whose scan never gets an answer from the store ends at `--deadline`
+/// with the deadline error. The hold is on GETs of the logs data objects (`l/l0/` keys),
+/// which only the resolve, plan and run read, so the unbounded steps before
+/// them complete and the hold lands inside the deadline-bounded run.
+#[tokio::test]
+async fn analyze_stuck_on_the_store_returns_the_deadline_error() {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    load_into(Arc::clone(&store)).await;
+    let gate = fault.hold(Op::Get, Some("/l/l0/".to_string()), Occurrence::Always);
+
+    let mut opts = options(GROUPED, true);
+    opts.deadline = Duration::from_secs(2);
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(explain(store, &opts), gate.wait_until_held(1))
+    })
+    .await
+    .expect("the run reaches the held GET and then its deadline");
+    let err = result.expect_err("the held GET outlasts the deadline");
+    assert!(
+        matches!(
+            err.downcast_ref::<SqlError>(),
+            Some(SqlError::DeadlineExceeded { millis: 2000 })
+        ),
+        "{err:?}"
+    );
 }
 
 /// The compiled binary refuses before building its store: with `--store s3`

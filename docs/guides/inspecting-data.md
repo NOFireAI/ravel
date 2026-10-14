@@ -638,20 +638,24 @@ differ from the HTTP endpoint's plan for data at the edges of the window.
   refuses every `EXPLAIN` statement. This command is the only way to see a
   plan with metrics.
 - `--start` and `--end` (RFC 3339) bound the event-time window. They default
-  to the hour ending now, the HTTP endpoint's default.
+  to the hour ending now, the HTTP endpoint's default. As on that endpoint,
+  `--start` equal to `--end` is accepted and `--start` after `--end` is
+  refused.
 - `--shards` and `--max-ingest-lag` resolve the catalog as they do for
   `export`. `--deadline` (default `30s`) bounds the resolve, the plan and,
   with `--analyze`, the run. The steps before them, the read of the bucket's
   tenancy scheme, the tenant-presence check and the read of the tenant's
   config record, are not bounded by it.
-  `--max-rows` stops an `--analyze` run after that many rows plus one, marked
-  `(stopped at --max-rows)` on the row line. The plan's metrics then cover
-  only the work done before the cut, so they understate what the whole
-  statement costs.
+  `--max-rows` stops an `--analyze` run after that many rows plus one. The
+  row line then reads `rows: <max-rows>+ (stopped at --max-rows)`, the cap
+  rather than the extra row read to detect the cut. The plan's metrics then
+  cover only the work done before the cut, so they understate what the
+  whole statement costs.
 - The engine runs with its default configuration, including its default
   per-query memory ceiling, so the plan can differ from the server's. Pass
   `--sql-partitions` with the server's `--sql-partition-count` to get the same
-  partitioning. A tenant's durable typed attribute columns
+  partitioning. `--sql-partitions 0` is refused before any store request, as
+  the server refuses a zero `--sql-partition-count`. A tenant's durable typed attribute columns
   (`typed-attr-column set`) are read from its config record; columns declared
   only by a server's `--typed-attr-column` or `--typed-attr-column-tenant`
   flags are not visible to this command.

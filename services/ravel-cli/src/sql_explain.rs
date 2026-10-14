@@ -85,9 +85,10 @@ pub async fn run(
     let start_ns = opts
         .start_ns
         .unwrap_or_else(|| end_ns.saturating_sub(DEFAULT_WINDOW_NS));
-    if start_ns >= end_ns {
-        anyhow::bail!("--start must be before --end");
+    if start_ns > end_ns {
+        anyhow::bail!("--start must not be after --end");
     }
+    let config = sql_config(opts)?;
 
     let tenant_hash = TenantId::new(&opts.tenant).hash();
     require_tenant_data_present(
@@ -99,7 +100,7 @@ pub async fn run(
     )
     .await?;
     let declared = durable_declared_columns(store.as_ref(), &tenant_hash).await?;
-    let executor = executor(&store, opts, declared)?;
+    let executor = executor(&store, opts, config, declared)?;
     let req = SqlRequest {
         sql: opts.sql.clone(),
         window: TimeRange { start_ns, end_ns },
@@ -122,10 +123,9 @@ pub async fn run(
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))?;
     writeln!(out, "{}", run.plan_with_metrics.trim_end())?;
-    if run.row_cap_hit {
-        writeln!(out, "rows: {} (stopped at --max-rows)", run.rows)?;
-    } else {
-        writeln!(out, "rows: {}", run.rows)?;
+    match (run.row_cap_hit, req.max_rows) {
+        (true, Some(cap)) => writeln!(out, "rows: {cap}+ (stopped at --max-rows)")?,
+        _ => writeln!(out, "rows: {}", run.rows)?,
     }
     Ok(())
 }
@@ -164,9 +164,24 @@ async fn analyze(
         .await
 }
 
+/// The engine configuration with `--sql-partitions` applied, refused by the
+/// same `EngineConfig::validate` the server applies to its own.
+fn sql_config(opts: &ExplainOptions) -> anyhow::Result<SqlConfig> {
+    let mut config = SqlConfig::default();
+    if let Some(partitions) = opts.sql_partitions {
+        config.engine.sql_partition_count = Some(partitions);
+    }
+    config
+        .engine
+        .validate()
+        .context("--sql-partitions is not a valid engine setting")?;
+    Ok(config)
+}
+
 fn executor(
     store: &Arc<dyn ObjectStoreBackend>,
     opts: &ExplainOptions,
+    config: SqlConfig,
     declared: Vec<DeclaredColumn>,
 ) -> anyhow::Result<SqlExecutor> {
     let mut catalog_config = CatalogConfig {
@@ -179,10 +194,6 @@ fn executor(
     let catalog = Catalog::new(Arc::clone(store), catalog_config)
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();
-    let mut config = SqlConfig::default();
-    if let Some(partitions) = opts.sql_partitions {
-        config.engine.sql_partition_count = Some(partitions);
-    }
     let max_tenant_bytes = config.max_query_bytes;
     Ok(SqlExecutor::new(
         Arc::new(catalog),

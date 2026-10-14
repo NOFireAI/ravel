@@ -969,7 +969,8 @@ enum SqlCommand {
         max_rows: Option<usize>,
         /// The SQL engine's partition count. Defaults to the engine's own
         /// default; the server's `--sql-partition-count` may differ, and the
-        /// plan shape depends on it.
+        /// plan shape depends on it. Zero is refused, as the server refuses
+        /// it.
         #[arg(long)]
         sql_partitions: Option<usize>,
     },
@@ -5709,9 +5710,6 @@ mod tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-// `cli_reference_is_current` and its helpers are compiled out of a
-// `sql-explain` build; see that test.
-#[cfg_attr(feature = "sql-explain", allow(dead_code, unused_imports))]
 mod cli_reference_tests {
     //! Drift check for `docs/reference/ravel-cli-flags.md` (ADR-1040 decision
     //! 4). The tables are rendered from `Cli`'s clap definition by the shared
@@ -5722,22 +5720,29 @@ mod cli_reference_tests {
     //! crate) so the two binaries share one table format rather than
     //! duplicating it.
 
+    // `cli_reference_is_current` and the items only it uses are compiled out
+    // of a `sql-explain` build; see that test.
+    #[cfg(all(test, not(feature = "sql-explain")))]
     use std::env;
+    #[cfg(all(test, not(feature = "sql-explain")))]
     use std::path::{Path, PathBuf};
 
     use clap::CommandFactory;
-    use ravel_server::cli_reference::{
-        BEGIN_MARKER, END_MARKER, count_data_rows, render_command_tree_block, splice, user_args,
-    };
+    #[cfg(all(test, not(feature = "sql-explain")))]
+    use ravel_server::cli_reference::{BEGIN_MARKER, END_MARKER, splice};
+    use ravel_server::cli_reference::{count_data_rows, render_command_tree_block, user_args};
 
     use super::Cli;
 
+    #[cfg(all(test, not(feature = "sql-explain")))]
     const UPDATE_ENV: &str = "RAVEL_UPDATE_CLI_REFERENCE";
+    #[cfg(all(test, not(feature = "sql-explain")))]
     const REGEN: &str = "RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-cli";
 
     /// `docs/reference/ravel-cli-flags.md`, resolved from this crate's manifest
     /// directory so the path is stable regardless of the test's working
     /// directory.
+    #[cfg(all(test, not(feature = "sql-explain")))]
     fn reference_doc() -> PathBuf {
         let manifest = env!("CARGO_MANIFEST_DIR");
         Path::new(manifest)
