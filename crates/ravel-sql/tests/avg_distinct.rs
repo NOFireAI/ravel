@@ -732,6 +732,30 @@ fn line_of(plan: &str, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("expected a plan line containing {needle:?}; got:\n{plan}"))
 }
 
+/// A Float64 average is not admitted to the partitioned final aggregation,
+/// distinct or not, so the float distinct average keeps a single-partition
+/// `Final` and no hash repartition.
+#[tokio::test]
+async fn float_distinct_average_keeps_a_single_partition_final() {
+    let on = Fixture::build(true).await;
+    let plan = on
+        .plan(
+            "SELECT g, avg(DISTINCT CAST(a AS DOUBLE)), avg(DISTINCT CAST(b AS DOUBLE)) \
+             FROM logs GROUP BY g",
+        )
+        .await;
+    assert!(
+        !plan.contains("AggregateExec: mode=FinalPartitioned")
+            && !plan.contains("RepartitionExec: partitioning=Hash")
+            && plan.contains("AggregateExec: mode=Final,"),
+        "a float distinct average must keep a single-partition Final; got:\n{plan}"
+    );
+    assert!(
+        plan.contains("[avg_distinct]"),
+        "the plan must carry the distinct state; got:\n{plan}"
+    );
+}
+
 /// The classifier calls an integer distinct average exact: a set-union merge
 /// of the partial sets is the same set however the rows are partitioned, so
 /// the final aggregation fans out over a hash repartition and still answers
