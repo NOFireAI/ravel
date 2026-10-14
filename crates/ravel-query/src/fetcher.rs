@@ -271,10 +271,15 @@ pub const DEFAULT_COALESCE_GAP: u64 = 64 * 1024;
 /// the small end of the L1 part distribution while never whole-object-reading
 /// a large compacted part just to reach its footer.
 pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
-/// Default bound on the number of byte-range GETs a single segment fetch
-/// keeps in flight at once. The fetcher clones share one
-/// semaphore, so this also bounds the total in-flight GETs across every
-/// concurrent segment fetch in a query, not just within one segment.
+/// Permit count of the private [`crate::GetLimiter`] that [`SegmentFetcher::new`]
+/// (and `SpanSegmentFetcher::new`) builds. A fetcher's clones share its
+/// limiter, so the count bounds in-flight GETs across all of them, until
+/// [`SegmentFetcher::with_get_limiter`] or
+/// [`SegmentFetcher::with_max_concurrent_gets`] replaces it. A
+/// [`crate::QueryEngine`] wires every fetcher it owns to one limiter sized by
+/// `store_get_concurrency()`, and `ravel-server` wires one process-wide limiter
+/// (`--store-get-concurrency`, default `max(8, 2 * cores)`) into every fetcher
+/// it builds, so inside the server this constant bounds nothing.
 pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 /// Most page-range GETs one fetch of an L0 segment issues, and since ADR-2066
 /// the most chunk-run GETs one ranged read of an L0 RLOG object issues
