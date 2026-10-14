@@ -9,8 +9,9 @@
 # No toolchain: a stub `cargo` first on PATH answers `cargo metadata` with a
 # synthetic workspace whose edges mirror the real ones these cases are about
 # (ravel-sql and ravel-server depend on ravel-query, ravel-cli on ravel-sql,
-# ravel-ingest on ravel-logseg, ravel-ingest-router on ravel-affinity), logs
-# every other call
+# ravel-query, ravel-logseg, ravel-ingest and, as a dev-dependency,
+# ravel-server, ravel-ingest on ravel-logseg, ravel-ingest-router on
+# ravel-affinity), logs every other call
 # and builds nothing. gates.sh runs with --dry-run, which prints each cargo
 # command a real run would execute without running it.
 set -uo pipefail
@@ -69,7 +70,7 @@ pkg() {
   printf ','
   pkg ravel-bench ravel-server ravel-ingest
   printf ','
-  pkg ravel-cli ravel-sql ravel-query
+  pkg ravel-cli ravel-sql ravel-query ravel-logseg ravel-ingest ravel-server
   printf ','
   pkg ravel-affinity
   printf ','
@@ -171,9 +172,12 @@ check_eq "gates -p ravel-sql: exit 0" "0" "${rc}"
 check_eq "gates -p ravel-sql: sql-explain lane clippy" "1" \
   "$(count "${tmp}/sql.out" "${cli_explain_clippy}")"
 
-# -p ravel-logseg: ravel-cli is outside its closure, so no sql-explain lane.
-check_eq "gates -p ravel-logseg: no sql-explain lane" "0" \
-  "$(count_matching "${tmp}/logseg.out" 'sql-explain')"
+# -p ravel-logseg: ravel-cli depends on it directly, so the sql-explain lane
+# runs here too.
+check_eq "gates -p ravel-logseg: sql-explain lane clippy" "1" \
+  "$(count "${tmp}/logseg.out" "${cli_explain_clippy}")"
+check_eq "gates -p ravel-logseg: sql-explain lane tests" "1" \
+  "$(count "${tmp}/logseg.out" "${cli_explain_test}")"
 
 # -p ravel-affinity: nothing that carries a feature lane is in its closure.
 run_stubbed affinity bash "${SCRIPTS}/gates.sh" -p ravel-affinity --dry-run
