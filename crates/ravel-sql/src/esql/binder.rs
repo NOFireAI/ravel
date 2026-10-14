@@ -13,8 +13,8 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use ravel_esql::Span;
 use ravel_esql::ast::{
-    self, BinaryOp, CallArgs, Command, Expr, LiteralValue, NullsOrder, QualifiedName, SortOrder,
-    UnaryOp,
+    self, BinaryOp, CallArgs, Command, Expr, IntervalKind, LiteralValue, NullsOrder,
+    QualifiedName, SortOrder, UnaryOp,
 };
 
 use super::error::EsqlError;
@@ -170,10 +170,19 @@ enum Cx<'c> {
 }
 
 /// A bound expression, or a time duration in nanoseconds, which is only an
-/// operand of date arithmetic or `BUCKET`.
+/// operand of date arithmetic or `BUCKET`. A duration with a date period
+/// (`day` or `week`) among its terms carries the first such term, which
+/// `BUCKET` refuses.
 enum Value {
     Expr(BExpr, EsqlType),
-    Duration(i64),
+    Duration(i64, Option<Period>),
+}
+
+/// A date-period term of a duration: its span and its unit as written.
+#[derive(Clone)]
+struct Period {
+    span: Span,
+    unit: String,
 }
 
 struct Binder<'a> {
@@ -204,6 +213,17 @@ impl Binder<'_> {
 
     fn unsupported(&self, span: Span, name: impl Into<String>) -> EsqlError {
         EsqlError::unsupported(self.source, span, name)
+    }
+
+    fn bucket_period(&self, period: &Period) -> EsqlError {
+        self.unsupported(
+            period.span,
+            format!(
+                "BUCKET over the date period [{}] (unit [{}]); BUCKET takes a fixed time duration in milliseconds, seconds, minutes or hours",
+                self.text(period.span),
+                period.unit
+            ),
+        )
     }
 
     fn field_name(&self, field: &ast::Field) -> String {
@@ -647,7 +667,7 @@ impl Binder<'_> {
     fn value(&mut self, e: &Expr, cx: &mut Cx<'_>) -> Result<(BExpr, EsqlType), EsqlError> {
         match self.bind(e, cx)? {
             Value::Expr(value, ty) => Ok((value, ty)),
-            Value::Duration(_) => Err(self.verification(
+            Value::Duration(..) => Err(self.verification(
                 e.span(),
                 format!(
                     "[{}] is a time duration, which is not a value outside date arithmetic and BUCKET",
@@ -660,7 +680,16 @@ impl Binder<'_> {
     fn bind(&mut self, e: &Expr, cx: &mut Cx<'_>) -> Result<Value, EsqlError> {
         match e {
             Expr::Literal(literal) => self.literal(&literal.value, literal.span),
-            Expr::Interval(interval) => self.interval(interval).map(Value::Duration),
+            Expr::Interval(interval) => {
+                let period = matches!(interval.kind(), Some(IntervalKind::DatePeriod)).then(|| {
+                    Period {
+                        span: interval.span,
+                        unit: interval.unit.clone(),
+                    }
+                });
+                self.interval(interval)
+                    .map(|nanos| Value::Duration(nanos, period))
+            }
             Expr::Field(name) => {
                 let text = name_text(name);
                 if matches!(cx, Cx::Stats { .. }) {
@@ -808,8 +837,21 @@ impl Binder<'_> {
                         ));
                     }
                 }
+                // date_bin bins from the epoch in fixed nanoseconds, so it
+                // matches ES|QL's calendar-aligned buckets only for a fixed
+                // duration (ADR-2887 D9). A month, quarter or year is refused
+                // here, before `interval` refuses it as a calendar interval.
+                if let Expr::Interval(interval) = &args[1]
+                    && matches!(interval.kind(), Some(IntervalKind::DatePeriod))
+                {
+                    return Err(self.bucket_period(&Period {
+                        span: interval.span,
+                        unit: interval.unit.clone(),
+                    }));
+                }
                 let width = match self.bind(&args[1], cx)? {
-                    Value::Duration(width) if width > 0 => width,
+                    Value::Duration(_, Some(period)) => return Err(self.bucket_period(&period)),
+                    Value::Duration(width, None) if width > 0 => width,
                     _ => {
                         return Err(self.verification(
                             args[1].span(),
@@ -923,13 +965,18 @@ impl Binder<'_> {
         }
         let operand = self.bind(&unary.operand, cx)?;
         let (value, ty) = match operand {
-            Value::Duration(d) if unary.op == UnaryOp::Minus => {
-                return d.checked_neg().map(Value::Duration).ok_or_else(|| {
-                    self.verification(unary.span, "interval does not fit in 64 bits")
-                });
+            Value::Duration(d, period) if unary.op == UnaryOp::Minus => {
+                return d
+                    .checked_neg()
+                    .map(|d| Value::Duration(d, period))
+                    .ok_or_else(|| {
+                        self.verification(unary.span, "interval does not fit in 64 bits")
+                    });
             }
-            Value::Duration(d) if unary.op == UnaryOp::Plus => return Ok(Value::Duration(d)),
-            Value::Duration(_) => {
+            Value::Duration(d, period) if unary.op == UnaryOp::Plus => {
+                return Ok(Value::Duration(d, period));
+            }
+            Value::Duration(..) => {
                 return Err(self.mismatch(unary.span, "boolean", "time_duration"));
             }
             Value::Expr(value, ty) => (value, ty),
@@ -1002,7 +1049,7 @@ impl Binder<'_> {
     fn operand_type(value: &Value) -> &'static str {
         match value {
             Value::Expr(_, ty) => ty.name(),
-            Value::Duration(_) => "time_duration",
+            Value::Duration(..) => "time_duration",
         }
     }
 
@@ -1119,19 +1166,20 @@ impl Binder<'_> {
             (Value::Expr(_, EsqlType::Null), _) | (_, Value::Expr(_, EsqlType::Null)) => Ok(
                 Value::Expr(BExpr::Literal(ScalarValue::Null), EsqlType::Null),
             ),
-            (Value::Duration(a), Value::Duration(b_)) if additive => {
+            (Value::Duration(a, pa), Value::Duration(b_, pb)) if additive => {
                 let sum = if op == Operator::Plus {
                     a.checked_add(*b_)
                 } else {
                     a.checked_sub(*b_)
                 };
-                sum.map(Value::Duration)
+                let period = pa.clone().or_else(|| pb.clone());
+                sum.map(|sum| Value::Duration(sum, period))
                     .ok_or_else(|| self.verification(b.span, "interval does not fit in 64 bits"))
             }
-            (Value::Expr(date, EsqlType::DateNanos), Value::Duration(d)) if additive => {
+            (Value::Expr(date, EsqlType::DateNanos), Value::Duration(d, _)) if additive => {
                 Ok(date_shift(date.clone(), op, *d))
             }
-            (Value::Duration(d), Value::Expr(date, EsqlType::DateNanos))
+            (Value::Duration(d, _), Value::Expr(date, EsqlType::DateNanos))
                 if op == Operator::Plus =>
             {
                 Ok(date_shift(date.clone(), op, *d))

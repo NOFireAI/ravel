@@ -8,6 +8,8 @@ mod support;
 
 #[path = "esql/binder.rs"]
 mod binder;
+#[path = "esql/bucket.rs"]
+mod bucket;
 #[path = "esql/lowering.rs"]
 mod lowering;
 #[path = "esql/types.rs"]
