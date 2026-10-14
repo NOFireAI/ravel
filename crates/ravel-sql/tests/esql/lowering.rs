@@ -139,6 +139,38 @@ async fn esql_plans_pass_admission_through_the_executor() {
     }
 }
 
+/// A sort on a key a sort below it also sorts on plans and runs, ordered by
+/// the last sort.
+#[tokio::test]
+async fn a_sort_repeating_an_earlier_key_runs() {
+    let fixture = fixture().await;
+    for (source, expected) in [
+        (
+            "FROM logs | SORT dur + 1 | SORT dur + 1 | KEEP message",
+            ["f", "d", "e", "a", "b", "c"].as_slice(),
+        ),
+        (
+            "FROM logs | SORT dur + 1 DESC | SORT dur + 1 | KEEP message",
+            ["f", "d", "e", "a", "b", "c"].as_slice(),
+        ),
+        (
+            "FROM logs | SORT dur > 5, dur | SORT dur > 5, dur DESC | KEEP message",
+            ["d", "f", "b", "a", "e", "c"].as_slice(),
+        ),
+        (
+            "FROM logs | WHERE dur > 5 | SORT dur > 5, dur DESC | KEEP message",
+            ["b", "a", "e"].as_slice(),
+        ),
+    ] {
+        let outcome = run(&fixture, source)
+            .await
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        let found: Vec<Vec<String>> = rows(&outcome);
+        let expected: Vec<Vec<String>> = expected.iter().map(|m| vec![m.to_string()]).collect();
+        assert_eq!(found, expected, "{source}");
+    }
+}
+
 /// A [`PreparedEsql`] whose lowering wraps the plan in a projection calling
 /// `upper`, which the statement's policy does not name.
 #[derive(Debug)]

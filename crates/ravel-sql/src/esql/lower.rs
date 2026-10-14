@@ -3,9 +3,13 @@
 //! Every function call carries the context's own `Arc` for the name the
 //! pipeline recorded, which is what plan admission checks.
 
+use std::sync::Arc;
+
 use datafusion::common::{Column, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::{AggregateFunction, Case, InList, ScalarFunction};
+use datafusion::logical_expr::expr_rewriter::normalize_sorts;
+use datafusion::logical_expr::logical_plan::Sort;
 use datafusion::logical_expr::{
     Cast, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, TryCast, binary_expr, lit,
 };
@@ -41,8 +45,13 @@ pub(crate) fn lower(
                     .map(|(call, name)| Ok(aggregate(call, ctx)?.alias(name)))
                     .collect::<Result<Vec<_>, DataFusionError>>()?,
             )?,
-            Stage::Sort(keys) => builder.sort(
-                keys.iter()
+            // Not `builder.sort`: it rewrites a key a sort below it also
+            // sorts on into a column named after the key, which the input
+            // does not have.
+            Stage::Sort(keys) => {
+                let input = builder.build()?;
+                let keys = keys
+                    .iter()
                     .map(|key| {
                         Ok(SortExpr::new(
                             expr(&key.expr, ctx)?,
@@ -50,8 +59,13 @@ pub(crate) fn lower(
                             key.nulls_first,
                         ))
                     })
-                    .collect::<Result<Vec<_>, DataFusionError>>()?,
-            )?,
+                    .collect::<Result<Vec<_>, DataFusionError>>()?;
+                LogicalPlanBuilder::from(LogicalPlan::Sort(Sort {
+                    expr: normalize_sorts(keys, &input)?,
+                    input: Arc::new(input),
+                    fetch: None,
+                }))
+            }
             Stage::Limit(count) => {
                 builder.limit(0, Some(usize::try_from(*count).unwrap_or(usize::MAX)))?
             }

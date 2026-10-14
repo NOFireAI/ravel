@@ -28,7 +28,13 @@
 //!
 //! A statement ending in its own `LIMIT` returns at most [`MAX_LIMIT`] rows,
 //! and one that does not returns at most [`IMPLICIT_LIMIT`]. A statement that
-//! binds to more than [`MAX_BOUND_NODES`] expression nodes is refused.
+//! binds to more than [`MAX_BOUND_NODES`] expression nodes, to an expression
+//! deeper than [`MAX_EXPRESSION_DEPTH`] (the conditions of every `WHERE` up to
+//! a `LIMIT` counted as one), or to more than [`MAX_PLAN_STAGES`] stages of its
+//! own commands is refused with a verification error naming the command and
+//! the limit, so every statement the parser's default limits admit plans and
+//! runs within a worker thread's stack. A lowered statement DataFusion still
+//! cannot plan is refused with [`EsqlError::Plan`].
 
 mod binder;
 mod error;
@@ -48,7 +54,9 @@ pub use error::EsqlError;
 pub use run::{EsqlOutcome, EsqlRequest, EsqlRun, execute};
 pub use types::{EsqlColumn, EsqlType};
 
-pub use binder::{IMPLICIT_LIMIT, MAX_BOUND_NODES, MAX_LIMIT};
+pub use binder::{
+    IMPLICIT_LIMIT, MAX_BOUND_NODES, MAX_EXPRESSION_DEPTH, MAX_LIMIT, MAX_PLAN_STAGES,
+};
 
 use crate::declared::DeclaredColumn;
 use crate::executor::{StatementTables, TargetSignal};
@@ -185,20 +193,21 @@ impl PreparedEsql {
             let provider = session
                 .table_provider(LOGS_TABLE)
                 .await
-                .map_err(|e| EsqlError::Execution(crate::SqlError::Plan(e.to_string())))?;
+                .map_err(|e| EsqlError::Plan(e.to_string()))?;
             vec![(LOGS_TABLE.to_string(), provider)]
         } else {
             Vec::new()
         };
         let tables = self.tables();
         let context = LoweringContext::snapshot(session, providers, &tables);
-        let plan = lower::lower(&self.pipeline, &context)
-            .map_err(|e| EsqlError::Execution(crate::SqlError::Plan(e.to_string())))?;
-        admit_lowered_plan(&plan, &context, &tables, &self.policy).map_err(EsqlError::Execution)?;
+        let plan =
+            lower::lower(&self.pipeline, &context).map_err(|e| EsqlError::Plan(e.to_string()))?;
+        admit_lowered_plan(&plan, &context, &tables, &self.policy)
+            .map_err(EsqlError::from_executor)?;
         session
             .state()
             .optimize(&plan)
-            .map_err(|e| EsqlError::Execution(crate::SqlError::Plan(e.to_string())))
+            .map_err(|e| EsqlError::Plan(e.to_string()))
     }
 
     fn tables(&self) -> StatementTables {

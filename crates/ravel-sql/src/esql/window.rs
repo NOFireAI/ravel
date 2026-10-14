@@ -108,7 +108,7 @@ impl WindowBounds {
     }
 }
 
-fn split_and<'a>(e: &'a BExpr, out: &mut Vec<&'a BExpr>) {
+pub(crate) fn split_and<'a>(e: &'a BExpr, out: &mut Vec<&'a BExpr>) {
     match e {
         BExpr::Binary(left, Operator::And, right) => {
             split_and(left, out);
