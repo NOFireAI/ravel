@@ -24,6 +24,8 @@ mod alerts_provider;
 mod attrs_map_vs_declared;
 #[path = "audit_provider.rs"]
 mod audit_provider;
+#[path = "avg_distinct.rs"]
+mod avg_distinct;
 #[path = "bounded_topk_aggregate.rs"]
 mod bounded_topk_aggregate;
 #[path = "ceiling_breach.rs"]

@@ -55,11 +55,30 @@
 //! single-phase one -- bit-identical for Float64, exact for the integer kind
 //! regardless of how partitioning or merge order differ. See ADR-0022 and
 //! ADR-0825.
+//!
+//! # Distinct
+//!
+//! A call with `DISTINCT` on an owned kind ([`DistinctFloatAvgAccumulator`],
+//! [`DistinctIntegerAvgAccumulator`]) averages the distinct values of its
+//! argument. DataFusion's `SingleDistinctToGroupBy` rule rewrites some of
+//! these into a group by before an accumulator is built, but not a statement
+//! with a second distinct argument, a non-distinct aggregate other than `sum`,
+//! `min` or `max`, or a FILTER clause (#2930), so the accumulators cannot rely
+//! on it. The partial state is one list of the distinct values, which merges
+//! by union; the integer kind sums the set exactly and divides once, and the
+//! float kind keys the set by `f64::to_bits`, sorts it with `f64::total_cmp`
+//! and folds it with the same seeded sequential fold as the plain float kind.
+//! [`SequentialAvg::groups_accumulator_supported`] returns false for a
+//! distinct call of an owned kind, so DataFusion runs the per-group
+//! [`Accumulator`] behind `GroupsAccumulatorAdapter`. A distinct call of the
+//! delegated kind stays delegated.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Decimal128Builder, Float64Array, Int64Array,
+    ListArray,
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
@@ -90,7 +109,7 @@ pub fn sequential_avg_udaf() -> AggregateUDF {
 /// [`fields_with_udf`]. [`Self::state_fields`], [`Self::accumulator`],
 /// [`Self::groups_accumulator_supported`], and
 /// [`Self::create_groups_accumulator`] all dispatch on [`avg_kind`] of the
-/// (coerced) argument type.
+/// (coerced) argument type and, for the owned kinds, on `is_distinct`.
 #[derive(Debug)]
 struct SequentialAvg {
     /// The wrapped built-in `avg` (`avg_udaf()`), used for metadata
@@ -224,6 +243,15 @@ impl AggregateUDFImpl for SequentialAvg {
             .map(|field| avg_kind(field.data_type()))
             .unwrap_or(AvgKind::Delegate);
         match kind {
+            // Matches [`DistinctFloatAvgAccumulator`]'s `state`/`merge_batch`:
+            // the set of distinct values seen so far, as one list.
+            AvgKind::Float if args.is_distinct => {
+                Ok(vec![distinct_state_field(args.name, DataType::Float64)])
+            }
+            // Matches [`DistinctIntegerAvgAccumulator`]'s `state`/`merge_batch`.
+            AvgKind::Integer if args.is_distinct => {
+                Ok(vec![distinct_state_field(args.name, DataType::Int64)])
+            }
             // Matches [`SequentialAvgAccumulator`]/[`SequentialAvgGroupsAccumulator`]'s
             // `state`/`merge_batch`: a nullable Float64 running sum (null
             // until the first row) and an Int64 non-null count. Names are
@@ -268,6 +296,12 @@ impl AggregateUDFImpl for SequentialAvg {
             .map(|field| avg_kind(field.data_type()))
             .unwrap_or(AvgKind::Delegate);
         match kind {
+            AvgKind::Float if acc_args.is_distinct => {
+                Ok(Box::new(DistinctFloatAvgAccumulator::new()))
+            }
+            AvgKind::Integer if acc_args.is_distinct => {
+                Ok(Box::new(DistinctIntegerAvgAccumulator::new()))
+            }
             AvgKind::Float => Ok(Box::new(SequentialAvgAccumulator::new())),
             AvgKind::Integer => Ok(Box::new(ExactIntegerAvgAccumulator::new())),
             AvgKind::Delegate => self.inner.accumulator(acc_args),
@@ -281,6 +315,10 @@ impl AggregateUDFImpl for SequentialAvg {
             .map(|field| avg_kind(field.data_type()))
             .unwrap_or(AvgKind::Delegate);
         match kind {
+            // A distinct call of an owned kind has no `GroupsAccumulator`:
+            // DataFusion wraps its per-group `Accumulator` in
+            // `GroupsAccumulatorAdapter`.
+            AvgKind::Float | AvgKind::Integer if args.is_distinct => false,
             // Both owned kinds have a real `GroupsAccumulator` (see below):
             // no need to fall back to `GroupsAccumulatorAdapter`.
             AvgKind::Float | AvgKind::Integer => true,
@@ -298,6 +336,13 @@ impl AggregateUDFImpl for SequentialAvg {
             .map(|field| avg_kind(field.data_type()))
             .unwrap_or(AvgKind::Delegate);
         match kind {
+            AvgKind::Float | AvgKind::Integer if args.is_distinct => {
+                Err(DataFusionError::Internal(
+                    "avg: no GroupsAccumulator exists for a DISTINCT call of an owned kind; \
+                     groups_accumulator_supported returns false for it"
+                        .to_string(),
+                ))
+            }
             AvgKind::Float => Ok(Box::new(SequentialAvgGroupsAccumulator::new())),
             AvgKind::Integer => Ok(Box::new(ExactIntegerAvgGroupsAccumulator::new())),
             AvgKind::Delegate => self.inner.create_groups_accumulator(args),
@@ -886,6 +931,182 @@ impl GroupsAccumulator for ExactIntegerAvgGroupsAccumulator {
     }
 }
 
+/// The single state field of a distinct call: the set of distinct values seen
+/// so far, as a list of `item_type`. Named by the aggregate expression name
+/// so a two-phase plan's partial and final state schemas line up.
+fn distinct_state_field(name: &str, item_type: DataType) -> FieldRef {
+    Arc::new(Field::new_list(
+        format!("{name}[avg_distinct]"),
+        Field::new_list_field(item_type, true),
+        false,
+    ))
+}
+
+/// Call `visit` with the values of every non-null list in a distinct state
+/// column.
+fn visit_state_lists(
+    state: &ArrayRef,
+    mut visit: impl FnMut(&ArrayRef) -> DFResult<()>,
+) -> DFResult<()> {
+    let lists = state.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        DataFusionError::Internal("distinct avg: merge state is not a ListArray".to_string())
+    })?;
+    for row in 0..lists.len() {
+        if lists.is_valid(row) {
+            visit(&lists.value(row))?;
+        }
+    }
+    Ok(())
+}
+
+/// Sum `values` onto `seed` with checked `i128` addition.
+fn checked_sum_i64(seed: i128, values: impl IntoIterator<Item = i64>) -> DFResult<i128> {
+    values
+        .into_iter()
+        .try_fold(seed, |acc, value| checked_add_i128(acc, i128::from(value)))
+}
+
+/// `AVG(DISTINCT x)` over admitted-integer input. The state is the set of
+/// distinct `i64` values; two partial sets merge by union, so the result is a
+/// function of the set of values alone, however rows are partitioned or
+/// partial states merged. Evaluation sums the set exactly in `i128`, converts
+/// the sum to `f64` once and divides by the set size once, as
+/// [`ExactIntegerAvgAccumulator::output`] does for the plain average.
+#[derive(Debug)]
+struct DistinctIntegerAvgAccumulator {
+    values: HashSet<i64>,
+}
+
+impl DistinctIntegerAvgAccumulator {
+    fn new() -> Self {
+        Self {
+            values: HashSet::new(),
+        }
+    }
+
+    fn insert_values(&mut self, array: &ArrayRef) -> DFResult<()> {
+        let ints = as_int64(array)?;
+        self.values.extend(ints.iter().flatten());
+        Ok(())
+    }
+
+    /// NULL when the set is empty; a typed error when the exact sum
+    /// overflows `i128`.
+    fn output(&self) -> DFResult<ScalarValue> {
+        if self.values.is_empty() {
+            return Ok(ScalarValue::Float64(None));
+        }
+        let sum = checked_sum_i64(0, self.values.iter().copied())?;
+        Ok(ScalarValue::Float64(Some(
+            sum as f64 / self.values.len() as f64,
+        )))
+    }
+}
+
+impl Accumulator for DistinctIntegerAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        self.insert_values(&values[0])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        visit_state_lists(&states[0], |list| self.insert_values(list))
+    }
+
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        let scalars: Vec<ScalarValue> = self
+            .values
+            .iter()
+            .map(|&value| ScalarValue::Int64(Some(value)))
+            .collect();
+        Ok(vec![ScalarValue::List(ScalarValue::new_list_nullable(
+            &scalars,
+            &DataType::Int64,
+        ))])
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        self.output()
+    }
+
+    fn size(&self) -> usize {
+        // One control byte per hash table slot on top of the value.
+        std::mem::size_of_val(self) + self.values.capacity() * (std::mem::size_of::<i64>() + 1)
+    }
+}
+
+/// `AVG(DISTINCT x)` over Float64 input. The state is the set of distinct
+/// values keyed by `f64::to_bits`, so `0.0` and `-0.0` are two values and two
+/// NaNs with different payloads are two values. Evaluation sorts the set with
+/// `f64::total_cmp` and folds it with the naive seeded sequential fold of
+/// [`SequentialAvgAccumulator`], then divides once, so the result is a
+/// function of the set alone, not of arrival or merge order, for a statement
+/// that reaches this accumulator. A statement DataFusion's
+/// `SingleDistinctToGroupBy` rule rewrites into a group by (`AVG(DISTINCT
+/// CAST(a AS DOUBLE))` alone, for example) never reaches it: that shape runs
+/// the ordinary float `avg` over the group keys in whatever order the plan
+/// emits them.
+#[derive(Debug)]
+struct DistinctFloatAvgAccumulator {
+    bits: HashSet<u64>,
+}
+
+impl DistinctFloatAvgAccumulator {
+    fn new() -> Self {
+        Self {
+            bits: HashSet::new(),
+        }
+    }
+
+    fn insert_values(&mut self, array: &ArrayRef) -> DFResult<()> {
+        let floats = as_float64(array)?;
+        self.bits.extend(floats.iter().flatten().map(f64::to_bits));
+        Ok(())
+    }
+
+    /// NULL when the set is empty.
+    fn output(&self) -> ScalarValue {
+        let mut values: Vec<f64> = self.bits.iter().copied().map(f64::from_bits).collect();
+        values.sort_by(f64::total_cmp);
+        let mut fold = SequentialAvgAccumulator::new();
+        for value in values {
+            fold.fold(value);
+            fold.count += 1;
+        }
+        fold.output()
+    }
+}
+
+impl Accumulator for DistinctFloatAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        self.insert_values(&values[0])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        visit_state_lists(&states[0], |list| self.insert_values(list))
+    }
+
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        let scalars: Vec<ScalarValue> = self
+            .bits
+            .iter()
+            .map(|&bits| ScalarValue::Float64(Some(f64::from_bits(bits))))
+            .collect();
+        Ok(vec![ScalarValue::List(ScalarValue::new_list_nullable(
+            &scalars,
+            &DataType::Float64,
+        ))])
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        Ok(self.output())
+    }
+
+    fn size(&self) -> usize {
+        // One control byte per hash table slot on top of the value.
+        std::mem::size_of_val(self) + self.bits.capacity() * (std::mem::size_of::<u64>() + 1)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -1442,5 +1663,383 @@ mod tests {
                 "{order}: the exact integer avg is the exact sum over the count"
             );
         }
+    }
+
+    fn array_of(values: &[i64]) -> ArrayRef {
+        Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    fn floats_of(values: &[f64]) -> ArrayRef {
+        Arc::new(Float64Array::from(values.to_vec()))
+    }
+
+    /// The single list column a distinct accumulator's `state()` returns.
+    fn distinct_state_column(state: Vec<ScalarValue>) -> ArrayRef {
+        assert_eq!(state.len(), 1, "a distinct state is one list column");
+        state[0]
+            .to_array()
+            .expect("the state scalar converts to an array")
+    }
+
+    /// Merge the partial `states` into a fresh accumulator in `order` and
+    /// return the result's bits.
+    fn merged_distinct_bits<A: Accumulator>(
+        fresh: impl Fn() -> A,
+        states: &[ArrayRef],
+        order: &[usize],
+    ) -> Option<u64> {
+        let mut merged = fresh();
+        for &index in order {
+            merged
+                .merge_batch(&[Arc::clone(&states[index])])
+                .expect("merge_batch must not fail");
+        }
+        float64_bits(merged.evaluate().expect("evaluate must not fail"))
+    }
+
+    fn integer_distinct_partial(values: &[i64]) -> ArrayRef {
+        let mut acc = DistinctIntegerAvgAccumulator::new();
+        acc.update_batch(&[array_of(values)])
+            .expect("update_batch must not fail");
+        distinct_state_column(acc.state().expect("state must not fail"))
+    }
+
+    fn float_distinct_partial(values: &[f64]) -> ArrayRef {
+        let mut acc = DistinctFloatAvgAccumulator::new();
+        acc.update_batch(&[floats_of(values)])
+            .expect("update_batch must not fail");
+        distinct_state_column(acc.state().expect("state must not fail"))
+    }
+
+    /// Two partial sets that overlap (3, 5, 7 and -2 appear in both), merged
+    /// in both orders, give the average of the union, bit for bit.
+    #[test]
+    fn integer_distinct_avg_merges_overlapping_sets_in_any_order() {
+        let first = [3, 3, 5, 7, -2, 5];
+        let second = [5, 7, 7, 11, -2, 3];
+        let states = [
+            integer_distinct_partial(&first),
+            integer_distinct_partial(&second),
+        ];
+
+        // The distinct set is {-2, 3, 5, 7, 11}: sum 24 over 5 values.
+        let expected = Some((24.0_f64 / 5.0).to_bits());
+        let plain_sum: i64 = first.iter().chain(second.iter()).sum();
+        assert_ne!(
+            Some((plain_sum as f64 / 12.0).to_bits()),
+            expected,
+            "precondition: the plain average of the same rows is a different number"
+        );
+
+        assert_eq!(
+            merged_distinct_bits(DistinctIntegerAvgAccumulator::new, &states, &[0, 1]),
+            expected,
+            "first then second"
+        );
+        assert_eq!(
+            merged_distinct_bits(DistinctIntegerAvgAccumulator::new, &states, &[1, 0]),
+            expected,
+            "second then first"
+        );
+
+        let mut single = DistinctIntegerAvgAccumulator::new();
+        single
+            .update_batch(&[array_of(&[first.as_slice(), second.as_slice()].concat())])
+            .expect("update_batch must not fail");
+        assert_eq!(
+            float64_bits(single.evaluate().expect("evaluate must not fail")),
+            expected,
+            "one accumulator over all the rows"
+        );
+    }
+
+    /// 0.1, 0.2 and 0.3 sum to a different double in descending order than in
+    /// ascending order, so the result tells a sorted fold from an arrival-order
+    /// one.
+    #[test]
+    fn float_distinct_avg_folds_the_set_in_sorted_order() {
+        let arrival = [0.3, 0.2, 0.1];
+        let sorted = [0.1, 0.2, 0.3];
+
+        let fold = |values: &[f64]| {
+            let mut acc = SequentialAvgAccumulator::new();
+            acc.fold_values(&floats_of(values))
+                .expect("fold must not fail");
+            acc
+        };
+        let arrival_fold = fold(&arrival);
+        let sorted_fold = fold(&sorted);
+        assert_ne!(
+            arrival_fold.sum.map(f64::to_bits),
+            sorted_fold.sum.map(f64::to_bits),
+            "precondition: the sum depends on the order it is folded in"
+        );
+        let arrival_bits = float64_bits(arrival_fold.output());
+        let sorted_bits = float64_bits(sorted_fold.output());
+        assert_ne!(
+            arrival_bits, sorted_bits,
+            "precondition: the average depends on the order it is folded in"
+        );
+
+        let mut acc = DistinctFloatAvgAccumulator::new();
+        acc.update_batch(&[floats_of(&arrival)])
+            .expect("update_batch must not fail");
+        assert_eq!(
+            float64_bits(acc.evaluate().expect("evaluate must not fail")),
+            sorted_bits,
+            "the average follows the sorted order, not the arrival order"
+        );
+
+        // Overlapping partials (0.2 is in both), merged in both orders.
+        let states = [
+            float_distinct_partial(&[0.3, 0.2]),
+            float_distinct_partial(&[0.2, 0.1]),
+        ];
+        assert_eq!(
+            merged_distinct_bits(DistinctFloatAvgAccumulator::new, &states, &[0, 1]),
+            sorted_bits,
+            "first then second"
+        );
+        assert_eq!(
+            merged_distinct_bits(DistinctFloatAvgAccumulator::new, &states, &[1, 0]),
+            sorted_bits,
+            "second then first"
+        );
+    }
+
+    /// `0.0` and `-0.0` are two values, two NaN payloads are two values, and
+    /// a repeated NaN payload is one.
+    #[test]
+    fn float_distinct_avg_keys_the_set_by_bit_pattern() {
+        let distinct_len = |values: &[f64]| {
+            let mut acc = DistinctFloatAvgAccumulator::new();
+            acc.update_batch(&[floats_of(values)])
+                .expect("update_batch must not fail");
+            acc.bits.len()
+        };
+        assert_eq!(distinct_len(&[0.0, -0.0]), 2, "signed zeros");
+        assert_eq!(
+            distinct_len(&[nan_with_payload(1), nan_with_payload(2)]),
+            2,
+            "two NaN payloads"
+        );
+        assert_eq!(
+            distinct_len(&[nan_with_payload(7), nan_with_payload(7)]),
+            1,
+            "one NaN payload repeated"
+        );
+
+        // The count reaches the divisor: -0.0, 0.0 and 1.0 sum to 1.0 over 3.
+        let mut acc = DistinctFloatAvgAccumulator::new();
+        acc.update_batch(&[floats_of(&[0.0, 1.0, -0.0, 1.0])])
+            .expect("update_batch must not fail");
+        assert_eq!(
+            float64_bits(acc.evaluate().expect("evaluate must not fail")),
+            Some((1.0_f64 / 3.0).to_bits())
+        );
+
+        // The state round trip keeps both zeros and both payloads.
+        let state = float_distinct_partial(&[0.0, -0.0, nan_with_payload(1), nan_with_payload(2)]);
+        let mut merged = DistinctFloatAvgAccumulator::new();
+        merged
+            .merge_batch(&[state])
+            .expect("merge_batch must not fail");
+        assert_eq!(merged.bits.len(), 4);
+    }
+
+    #[test]
+    fn distinct_avg_of_nothing_is_null() {
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None, None]));
+        let mut integer = DistinctIntegerAvgAccumulator::new();
+        assert_eq!(
+            float64_bits(integer.evaluate().expect("evaluate must not fail")),
+            None
+        );
+        integer
+            .update_batch(&[nulls])
+            .expect("update_batch must not fail");
+        assert_eq!(
+            float64_bits(integer.evaluate().expect("evaluate must not fail")),
+            None,
+            "all-NULL integer input"
+        );
+
+        let nulls: ArrayRef = Arc::new(Float64Array::from(vec![None, None]));
+        let mut float = DistinctFloatAvgAccumulator::new();
+        assert_eq!(
+            float64_bits(float.evaluate().expect("evaluate must not fail")),
+            None
+        );
+        float
+            .update_batch(&[nulls])
+            .expect("update_batch must not fail");
+        assert_eq!(
+            float64_bits(float.evaluate().expect("evaluate must not fail")),
+            None,
+            "all-NULL float input"
+        );
+    }
+
+    /// The set of `i64` values cannot hold enough values to overflow an
+    /// `i128` sum, so the overflow is exercised through the seeded sum the
+    /// accumulator evaluates with a zero seed.
+    #[test]
+    fn integer_distinct_avg_overflow_is_a_typed_error() {
+        let err = checked_sum_i64(i128::MAX, [1]).expect_err("i128::MAX + 1 must overflow");
+        assert!(
+            matches!(err, DataFusionError::Internal(_)),
+            "expected a typed internal error, got {err:?}"
+        );
+        assert_eq!(
+            checked_sum_i64(0, [i64::MAX, i64::MAX, i64::MIN]).expect("no overflow"),
+            i128::from(i64::MAX) - 1,
+            "the i128 sum does not wrap at i64"
+        );
+    }
+
+    fn state_fields_of(data_type: DataType, is_distinct: bool) -> Vec<FieldRef> {
+        let input: FieldRef = Arc::new(Field::new("x", data_type, true));
+        SequentialAvg::new()
+            .state_fields(StateFieldsArgs {
+                name: "avg(x)",
+                input_fields: &[input],
+                return_field: Arc::new(Field::new("avg(x)", DataType::Float64, true)),
+                ordering_fields: &[],
+                is_distinct,
+            })
+            .expect("state_fields must not fail")
+    }
+
+    fn with_accumulator_args<T>(
+        data_type: DataType,
+        is_distinct: bool,
+        run: impl FnOnce(AccumulatorArgs) -> T,
+    ) -> T {
+        let schema = datafusion::arrow::datatypes::Schema::empty();
+        let input: FieldRef = Arc::new(Field::new("x", data_type, true));
+        run(AccumulatorArgs {
+            return_field: Arc::new(Field::new("avg(x)", DataType::Float64, true)),
+            schema: &schema,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: "avg(x)",
+            is_distinct,
+            exprs: &[],
+            expr_fields: &[input],
+        })
+    }
+
+    #[test]
+    fn distinct_state_is_one_list_field_for_both_owned_kinds() {
+        for item in [DataType::Float64, DataType::Int64] {
+            let fields = state_fields_of(item.clone(), true);
+            assert_eq!(fields.len(), 1, "{item}: one state field");
+            assert_eq!(fields[0].name(), "avg(x)[avg_distinct]");
+            match fields[0].data_type() {
+                DataType::List(element) => assert_eq!(element.data_type(), &item),
+                other => panic!("{item}: expected a List state field, got {other}"),
+            }
+
+            let plain = state_fields_of(item.clone(), false);
+            assert_eq!(plain.len(), 2, "{item}: a plain call keeps (sum, count)");
+        }
+    }
+
+    #[test]
+    fn distinct_state_field_matches_the_accumulator_state() {
+        for (data_type, state) in [
+            (
+                DataType::Float64,
+                DistinctFloatAvgAccumulator::new().state(),
+            ),
+            (
+                DataType::Int64,
+                DistinctIntegerAvgAccumulator::new().state(),
+            ),
+        ] {
+            let fields = state_fields_of(data_type.clone(), true);
+            let state = state.expect("state must not fail");
+            assert_eq!(
+                state[0].data_type(),
+                fields[0].data_type().clone(),
+                "{data_type}: the state scalar has the declared field type"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_calls_have_no_groups_accumulator() {
+        for data_type in [DataType::Float64, DataType::Int64] {
+            assert!(
+                !with_accumulator_args(data_type.clone(), true, |args| {
+                    SequentialAvg::new().groups_accumulator_supported(args)
+                }),
+                "{data_type}: a distinct call must not claim a GroupsAccumulator"
+            );
+            assert!(
+                with_accumulator_args(data_type.clone(), false, |args| {
+                    SequentialAvg::new().groups_accumulator_supported(args)
+                }),
+                "{data_type}: a plain call keeps its GroupsAccumulator"
+            );
+
+            let created = with_accumulator_args(data_type.clone(), true, |args| {
+                SequentialAvg::new().create_groups_accumulator(args)
+            });
+            assert!(
+                matches!(created, Err(DataFusionError::Internal(_))),
+                "{data_type}: create_groups_accumulator on a distinct call is a typed error"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_calls_build_the_distinct_accumulators() {
+        for (data_type, values) in [
+            (DataType::Float64, floats_of(&[1.5, 1.5, 2.5])),
+            (DataType::Int64, array_of(&[1, 1, 2])),
+        ] {
+            let mut acc = with_accumulator_args(data_type.clone(), true, |args| {
+                SequentialAvg::new().accumulator(args)
+            })
+            .expect("accumulator must build");
+            acc.update_batch(&[values])
+                .expect("update_batch must not fail");
+            let state = acc.state().expect("state must not fail");
+            assert_eq!(state.len(), 1, "{data_type}: a set, not (sum, count)");
+            assert!(
+                matches!(state[0], ScalarValue::List(_)),
+                "{data_type}: the state is a list"
+            );
+            assert_eq!(
+                float64_bits(acc.evaluate().expect("evaluate must not fail")),
+                Some(if data_type == DataType::Float64 {
+                    2.0_f64.to_bits()
+                } else {
+                    1.5_f64.to_bits()
+                }),
+                "{data_type}: the average of the two distinct values"
+            );
+        }
+    }
+
+    /// The delegated kind stays delegated, distinct or not.
+    #[test]
+    fn distinct_call_of_the_delegated_kind_stays_delegated() {
+        let data_type = DataType::Decimal128(10, 2);
+        assert_eq!(avg_kind(&data_type), AvgKind::Delegate);
+        let ours = state_fields_of(data_type.clone(), true);
+        let input: FieldRef = Arc::new(Field::new("x", data_type, true));
+        let builtin = avg_udaf()
+            .state_fields(StateFieldsArgs {
+                name: "avg(x)",
+                input_fields: &[input],
+                return_field: Arc::new(Field::new("avg(x)", DataType::Float64, true)),
+                ordering_fields: &[],
+                is_distinct: true,
+            })
+            .expect("the built-in state_fields must not fail");
+        assert_eq!(ours, builtin);
     }
 }
