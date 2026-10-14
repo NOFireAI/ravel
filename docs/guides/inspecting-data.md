@@ -585,8 +585,8 @@ reverse.
 ## `sql explain`
 
 The command prints the physical plan of a SQL statement. With `--analyze`, it
-runs the statement and prints the plan that ran, with every operator's own
-metrics, followed by the row count.
+runs the statement and prints the plan that ran, with the metrics each
+operator recorded, followed by the row count.
 
 The subcommand exists only in a binary built with the `sql-explain` feature:
 
@@ -610,11 +610,23 @@ ProjectionExec: expr=[body@0 as body, count(Int64(1))@1 as n], metrics=[output_r
 rows: 4
 ```
 
-Each `metrics=[...]` belongs to the operator on that line: `output_rows` is
-the rows that operator emitted and `elapsed_compute` is the CPU time it spent.
-The scan reports its own counters, such as `pages_decoded`, `pages_skipped`,
-`fast_path_whole_object_segments` and `fast_path_ranged_segments`. Without
-`--analyze` the command runs nothing and prints the plan with no metrics.
+Each `metrics=[...]` belongs to the operator on that line. An operator that
+registers DataFusion's baseline metrics shows `output_rows`, the rows it
+emitted, and `elapsed_compute`, the CPU time it spent. The logs scan and the
+slice-compaction node register neither and show their own counters, such as
+`pages_decoded`, `pages_skipped`, `fast_path_whole_object_segments` and
+`fast_path_ranged_segments` on the scan.
+
+Without `--analyze` the command runs no query and prints the plan with no
+metrics. It still reads the store to plan: catalog LIST and GET requests,
+column-statistics GETs and Parquet footer reads.
+
+The two modes do not plan the same way. `--analyze` plans as the Flight SQL
+path does (`plan_pinned_with_inputs`), whose column-statistics window is the
+one covering the resolved snapshot's segments (`snapshot_covering_window`).
+The plain mode plans as `SqlExecutor::explain` does, with the request's own
+`--start`/`--end` window. The two plans can therefore differ for data at the
+edges of the window.
 
 - `--unaudited` is required. This command writes no query-audit record, so it
   refuses to run without the flag, before it builds the store or sends a
