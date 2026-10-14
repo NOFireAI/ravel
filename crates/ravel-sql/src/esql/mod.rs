@@ -25,6 +25,10 @@
 //! result that is not finite all read null, as in ES|QL. ES|QL also attaches
 //! a warning to the response for each; this lowering has no warning channel,
 //! so those nulls arrive without one.
+//!
+//! A statement ending in its own `LIMIT` returns at most [`MAX_LIMIT`] rows,
+//! and one that does not returns at most [`IMPLICIT_LIMIT`]. A statement that
+//! binds to more than [`MAX_BOUND_NODES`] expression nodes is refused.
 
 mod binder;
 mod error;
