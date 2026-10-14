@@ -26,6 +26,11 @@ pub struct EsqlRequest {
     pub deadline: Duration,
     /// The request's resource budgets.
     pub budgets: Option<RequestBudgets>,
+    /// The caller's row cap, passed to the executor as
+    /// [`StatementRequest::max_rows`]: a `FROM logs` statement returning more
+    /// rows reports [`SqlStats::row_cap_hit`](crate::executor::SqlStats::row_cap_hit).
+    /// A `ROW` statement returns one row and does not read it.
+    pub max_rows: Option<usize>,
 }
 
 /// A statement's result: the rows, and each column's ES|QL type.
@@ -35,6 +40,9 @@ pub struct EsqlOutcome {
     pub columns: Vec<EsqlColumn>,
     /// How the statement ran.
     pub run: EsqlRun,
+    /// The statement's own final `LIMIT`, when it was above
+    /// [`MAX_LIMIT`](super::MAX_LIMIT) and lowered to it.
+    pub clamped_limit: Option<u64>,
 }
 
 /// How a statement ran.
@@ -85,7 +93,7 @@ pub async fn execute(
                 now_ns: prepared.now_ns,
                 deadline: request.deadline,
                 row_window: true,
-                max_rows: None,
+                max_rows: request.max_rows,
                 budgets: request.budgets,
             };
             let outcome = executor
@@ -100,7 +108,11 @@ pub async fn execute(
                 .map_err(EsqlError::Execution)?,
         ),
     };
-    Ok(EsqlOutcome { columns, run })
+    Ok(EsqlOutcome {
+        columns,
+        run,
+        clamped_limit: prepared.clamped_limit(),
+    })
 }
 
 async fn run_row(

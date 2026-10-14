@@ -374,6 +374,7 @@ pub fn request() -> EsqlRequest {
         min_tokens: Vec::new(),
         deadline: Duration::from_secs(30),
         budgets: None,
+        max_rows: None,
     }
 }
 
@@ -386,11 +387,19 @@ pub async fn run_prepared(
     fixture: &Fixture,
     prepared: &PreparedEsql,
 ) -> Result<EsqlOutcome, EsqlError> {
+    run_with(fixture, prepared, &request()).await
+}
+
+pub async fn run_with(
+    fixture: &Fixture,
+    prepared: &PreparedEsql,
+    request: &EsqlRequest,
+) -> Result<EsqlOutcome, EsqlError> {
     esql::execute(
         &fixture.executor,
         tenant().hash(),
         prepared,
-        &request(),
+        request,
         &LiveAccounting::new(),
     )
     .await

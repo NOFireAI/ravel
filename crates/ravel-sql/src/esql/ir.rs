@@ -42,6 +42,52 @@ impl BExpr {
         BExpr::TryCast(Box::new(self), to)
     }
 
+    /// The expression nodes in this tree, this one included.
+    pub(crate) fn nodes(&self) -> usize {
+        let mut count = 0;
+        self.walk(&mut |_| count += 1);
+        count
+    }
+
+    /// Every column name this tree reads.
+    pub(crate) fn columns<'e>(&'e self, out: &mut Vec<&'e str>) {
+        self.walk(&mut |e| {
+            if let BExpr::Column(name) = e {
+                out.push(name);
+            }
+        });
+    }
+
+    fn walk<'e>(&'e self, visit: &mut impl FnMut(&'e BExpr)) {
+        visit(self);
+        match self {
+            BExpr::Column(_) | BExpr::Literal(_) => {}
+            BExpr::Scalar(_, args) => args.iter().for_each(|arg| arg.walk(visit)),
+            BExpr::Cast(inner, _)
+            | BExpr::TryCast(inner, _)
+            | BExpr::Not(inner)
+            | BExpr::Negative(inner)
+            | BExpr::IsNull(inner, _) => inner.walk(visit),
+            BExpr::Binary(left, _, right) => {
+                left.walk(visit);
+                right.walk(visit);
+            }
+            BExpr::InList(value, list, _) => {
+                value.walk(visit);
+                list.iter().for_each(|item| item.walk(visit));
+            }
+            BExpr::Case(arms, otherwise) => {
+                for (when, then) in arms {
+                    when.walk(visit);
+                    then.walk(visit);
+                }
+                if let Some(otherwise) = otherwise {
+                    otherwise.walk(visit);
+                }
+            }
+        }
+    }
+
     fn scalars(&self, out: &mut BTreeSet<&'static str>) {
         match self {
             BExpr::Column(_) | BExpr::Literal(_) => {}
@@ -107,6 +153,28 @@ pub(crate) enum Stage {
     Limit(u64),
 }
 
+impl Stage {
+    /// The expression nodes this stage holds.
+    pub(crate) fn nodes(&self) -> usize {
+        match self {
+            Stage::Project(columns) => columns.iter().map(|(e, _)| e.nodes()).sum(),
+            Stage::Filter(condition) => condition.nodes(),
+            Stage::Aggregate { groups, aggregates } => {
+                groups.iter().map(|(e, _)| e.nodes()).sum::<usize>()
+                    + aggregates
+                        .iter()
+                        .map(|(call, _)| {
+                            call.args.iter().map(BExpr::nodes).sum::<usize>()
+                                + call.filter.as_ref().map_or(0, BExpr::nodes)
+                        })
+                        .sum::<usize>()
+            }
+            Stage::Sort(keys) => keys.iter().map(|key| key.expr.nodes()).sum(),
+            Stage::Limit(_) => 0,
+        }
+    }
+}
+
 /// Where the rows come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
@@ -126,6 +194,12 @@ pub(crate) struct Pipeline {
 }
 
 impl Pipeline {
+    /// Every expression node in the pipeline's stages.
+    #[cfg(test)]
+    pub(crate) fn nodes(&self) -> usize {
+        self.stages.iter().map(Stage::nodes).sum()
+    }
+
     /// Every scalar and every aggregate function the pipeline calls, by
     /// registered name.
     pub(crate) fn functions(&self) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
