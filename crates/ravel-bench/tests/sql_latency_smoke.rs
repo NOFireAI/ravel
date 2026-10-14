@@ -436,7 +436,11 @@ async fn generated_lane_stamps_the_cost_profile_and_models_absent_request_cost()
 /// The serialized report carries `get_latency` exactly once, with every read
 /// phase by name and every size bucket under each (issue #2976), and the GETs
 /// the measured statements issued through the fetchers land under named
-/// phases: the RLOG fetcher's plan and scan reads are timed, not dropped.
+/// phases, one timed GET per GET the fetcher counted.
+///
+/// FLIP: handing `measure_corpus` the unwrapped `&cfg.store` in
+/// `run_generated` leaves every phase at zero against the fetcher's 36 scan
+/// GETs.
 #[tokio::test]
 async fn generated_lane_reports_get_latency_per_phase_per_bucket() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -477,8 +481,30 @@ async fn generated_lane_reports_get_latency_per_phase_per_bucket() {
     for phase in phases {
         assert_eq!(phase["buckets"].as_array().expect("buckets").len(), 16);
     }
-    assert!(count_of(&phases[1]) > 0, "plan GETs are timed");
-    assert!(count_of(&phases[3]) > 0, "scan GETs are timed");
+    // The logs fetcher's own per-run, per-phase GET counts, summed over every
+    // run of every measured statement: each of those GETs is timed under the
+    // same phase. The catalog's commit-record reads carry no phase and are the
+    // `unattributed` row.
+    let mut wire_requests = [0u64; 4];
+    for entry in json["entries"].as_array().expect("entries") {
+        for run in entry["per_run_accounting"].as_array().expect("runs") {
+            for phase in run["wire_bytes_by_phase"].as_array().into_iter().flatten() {
+                let at = names
+                    .iter()
+                    .position(|name| phase["phase"] == *name)
+                    .expect("a known phase");
+                wire_requests[at] += phase["get_requests"].as_u64().expect("get_requests");
+            }
+        }
+    }
+    let timed: Vec<u64> = phases.iter().map(count_of).collect();
+    assert!(wire_requests[3] > 0, "the statements read data: {wire_requests:?}");
+    assert_eq!(
+        timed[..4],
+        wire_requests,
+        "resolve, plan, probe, scan: timed GETs against the fetcher's counts"
+    );
+    assert!(timed[4] > 0, "the catalog resolve reads are unattributed: {timed:?}");
 }
 
 /// Count how many times `key` appears as an object key anywhere in `v`.
