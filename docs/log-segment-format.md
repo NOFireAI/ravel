@@ -1325,7 +1325,7 @@ per-field distinct-value cap drops such a field outright, ADR-0049 decision
 every distinct `(key8, block ordinal)` pair in the object per indexed field,
 sorted, in buckets a probe reads one at a time by range. One definition
 serves RLOG and RSPAN: the grammar below is implemented once in
-`ravel-codec`'s `key_index` module, as BLOOM is in `bloom_section`, and
+`ravel-codec`'s `key_idx` module, as BLOOM is in `bloom_section`, and
 RSPAN uses it with its own fixed parameters (docs/span-segment-format.md,
 "KEY_IDX").
 
@@ -1433,8 +1433,10 @@ lays the section out as the header, then every field's directory in field
 order, each directly after the previous one's `dir_crc32c`, then every
 field's bucket area: `prefix_len` names the end of the last directory, and
 a reader whose first GET covers `[0, prefix_len)` holds every directory. A
-`dir_offset` outside `[0, prefix_len)`, or a `buckets_offset` below
-`prefix_len`, is `Corrupted`. Readers still address every directory and
+`dir_offset` below the end of the header's own `header_crc32c` (a directory
+overlapping the header) or at or past `prefix_len`, a directory running
+past `prefix_len`, or a `buckets_offset` below `prefix_len`, is
+`Corrupted`. Readers still address every directory and
 bucket by the header's offsets, never by assumed adjacency; the placement
 rule fixes the probe cost, not the parser.
 
@@ -1454,9 +1456,10 @@ footer entry's (a disagreement is `Corrupted`), finds the field, verifies
 its `dir_crc32c`, finds the bucket, then reads that one bucket (verifying
 `frame_crc32c`, then the decompressed length). The section sits between
 BLOCKS and SKIP_IDX, so the 256 KiB tail probe (ADR-0699 decision 5) does
-not carry it: a key probe on an opened object costs exactly two ranged
-GETs for every conformant writer, the first of `prefix_len` bytes and the
-second one bucket. A `Section` entry for kind 9 whose `prefix_len` is zero
+not carry it: a key probe on an opened object costs at most two ranged
+GETs, the first of `prefix_len` bytes and a second of one bucket only when
+the header names the field under the probed `key_type` and that bucket is
+non-empty. A `Section` entry for kind 9 whose `prefix_len` is zero
 or past `len` is `Corrupted`, and so is one over `KEY_IDX_PREFIX_MAX` =
 4 MiB, a reader-side ceiling on the first GET: the accepted ranges alone
 (64 fields at 16 bits) would allow a 16 MiB prefix on an object the
@@ -1479,7 +1482,9 @@ by ranged GET to build the per-part `.kidx` leaf
 (docs/catalog-and-mvcc.md, "Per-part key-index leaves"), never rows.
 
 A probe declines (no prune, as for an unindexed field) when the section is
-absent or its header does not name the field. A section whose `version`
+absent, its header does not name the field, or the header names it under a
+`key_type` other than the one the caller derived `key8` under: the stored
+`key_type` decides, not the tenant's current column type. A section whose `version`
 byte is above the one the reader knows, or any violation of the grammar
 above, is a typed `Corrupted` error that disables the probe for the object;
 the object is then read as if it had no KEY_IDX. The result never changes,

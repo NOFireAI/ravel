@@ -2,8 +2,10 @@
 //! (docs/adrs/0045-rspan-v2-trace-investigation.md decision 1): the encoding
 //! tag registry, the blocked token bloom filter and its section framing, and
 //! the normative word tokenizer. `ravel-logseg` re-exports all four so its
-//! own callers see no change. `ravel-rspan` will depend on this crate
-//! directly rather than growing a second copy of the tokenizer, which is
+//! own callers see no change. It also holds the KEY_IDX exact-key section
+//! grammar (`key_idx`, ADR-2707 decision 1), shared by RLOG and RSPAN.
+//! `ravel-rspan` will depend on this crate directly rather than growing a
+//! second copy of the tokenizer, which is
 //! normative because it defines word semantics identically on the write and
 //! read paths (docs/log-segment-format.md "Tokenizer"). That dependency
 //! arrives with RSPAN v2; this crate does not have it yet.
@@ -18,4 +20,5 @@ pub mod bloom;
 pub mod bloom_section;
 pub mod encoding;
 pub mod error;
+pub mod key_idx;
 pub mod tokenizer;
