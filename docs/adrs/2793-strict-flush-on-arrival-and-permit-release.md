@@ -1,6 +1,7 @@
 # ADR-2793: Strict flush-on-arrival ack policy and admission permit release
 
-Status: Accepted, amended 2026-10-14 (amendments at the end)
+Status: Accepted. The 2026-10-14 amendments at the end are pending the
+maintainer's approval of their revised text.
 Date: 2026-10-10
 Epic: #2793
 Amends: ADR-0076 decision 4 (adds a second axis; the aged flush stays the
@@ -346,7 +347,8 @@ flowchart LR
   body read, tonic's decode, and the handler's durable write", which the
   early release contradicts; and the `--max-inflight-ingest-requests`
   help at `services/ravel-server/src/config.rs:1550-1565`, which keeps
-  its head-shed sentence and gains one saying the permit is released at
+  its head-shed sentence (changed later by the head-refusal drain
+  amendment below) and gains one saying the permit is released at
   enqueue, so the count bounds decodes in flight and no longer covers the
   ack wait. `docs/reference/ravel-server-flags.md`,
   `docs/reference/http-api.md`, `docs/guides/ingest.md` and `docs/concepts.md`
@@ -426,9 +428,9 @@ The cost is diagnosability. A client sending a large body with a bad
 credential can see a connection reset where it would have seen a 401.
 That client fails either way, and neither response tells it to retry.
 
-**The fallback.** A refusal that is not drained is answered as it is today:
-the same status, `Retry-After` and body text, with `Connection: close`
-added. That happens when:
+**The fallback.** On HTTP/1, a shed refusal that is not drained is answered
+as it is today: the same status, `Retry-After` and body text, with
+`Connection: close` added. That happens when:
 
 - the credential does not resolve;
 - the body is past the byte cap (a `Content-Length` above it is refused
@@ -447,8 +449,9 @@ the connection. It does not prevent the reset, so an undrained refusal can
 still reach the client as a transport error. A deployment sees how often
 this happens through `ravel_ingest_head_refusal_undrained_total`, with a
 `reason` label of `over_cap`, `timeout`, `busy` or `unauthenticated`. It
-counts shed refusals only. A 401 at a ceiling with room is not a shed and
-is not counted.
+counts shed refusals only. A 401 at a ceiling with room is not a shed: it
+is not counted and gets no `Connection: close`, so it is answered exactly
+as today.
 
 **The bounds.**
 - The byte cap is 1 MiB, not the routes' 16 MiB body limit. The reset
@@ -456,9 +459,10 @@ is not counted.
   covers bodies 16 times that.
 - The time bound is what limits a slow sender.
 - 64 concurrent drains is chosen, not measured. It caps the body bytes
-  being read for refusals at 64 MiB at any instant. It is one sixteenth of
-  the default in-flight ceiling of 1,024, so drains cannot rival the
-  admitted work they protect.
+  being read for refusals at 64 MiB at any instant. At the default
+  in-flight ceiling of 1,024 it is one sixteenth of the admitted requests,
+  so drains do not rival the admitted work they protect. A deployment
+  that sets a much lower ceiling gets a drain pool close to its size.
 - Draining 16 MiB per refusal would hold a task for the transfer time of
   the largest legal body.
 
@@ -475,8 +479,9 @@ is not counted.
 - OTAP, whose refusals answer inside an open stream.
 - An HTTP/2 request on the same routes. The listeners serve HTTP/2 when
   the build enables it, and there a refusal ends a stream, not the
-  connection. It is answered without a drain and is not counted, so it
-  cannot take the drain slots the HTTP/1 path depends on.
+  connection. It is answered without a drain, is not counted, and carries
+  no `Connection` header, which HTTP/2 forbids. So it cannot take the
+  drain slots the HTTP/1 path depends on.
 
 **Acceptance.**
 - A pooled-client test, run while the ceiling is held, sends to each of
@@ -485,12 +490,19 @@ is not counted.
   arrive as a readable 429 with `Retry-After`, with zero client transport
   errors. The test must rule out three wrong implementations:
   - `Connection: close` alone: transport errors stay.
-  - A drain that decodes: the inner handler must never run.
+  - A drain that decodes or charges: across the drained refusals the
+    counters that move only on a decode or a charge stay at zero:
+    `ravel_ingest_buffered_items_total` and the ingest byte-budget
+    charge. The existing over-ceiling test uses this same form.
   - A drain with no cap: a request whose `Content-Length` is above the cap
     must get `Connection: close` and move the `over_cap` series by exactly
     one.
 - A unit test fills the drain slots and asserts that the next refusal
   takes the `busy` path.
+- A shed request whose chunked body stalls below the cap gets a response
+  with `Connection: close` within about the deadline, and moves the
+  `timeout` series by exactly one. This rules out a deadline that is never
+  armed, which would let a stalled sender hold a drain slot.
 - A refusal without a resolvable credential must reach its response
   without reading the body:
   - a shed request takes the `unauthenticated` path;
