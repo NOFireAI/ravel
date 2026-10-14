@@ -1687,7 +1687,7 @@ pub struct ExecutorConfigError {
 }
 
 /// The [`EngineConfig`] an in-process executor runs with, refused through
-/// [`EngineConfig::validate`] exactly as `ravel-server` refuses it. A zero
+/// [`EngineConfig::validate`], the check `ravel-server` runs on its own. A zero
 /// `--sql-partition-count` or `--store-get-concurrency` is an error here, not a
 /// value DataFusion or the GET limiter would reinterpret. `fetch_concurrency`
 /// is clamped to 1 before validation, so `--fetch-concurrency 0` keeps running

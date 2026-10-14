@@ -195,7 +195,8 @@ struct Args {
     /// leaving today's behaviour byte-for-byte unchanged; set, it lets a
     /// measurement vary the scan's partition count at a fixed GET
     /// concurrency. Recorded in the report's provenance alongside the
-    /// requested value.
+    /// requested value. Zero is refused before any data is generated or read
+    /// on the in-process lanes.
     #[arg(long = "sql-partition-count", value_name = "N")]
     sql_partition_count: Option<usize>,
     /// Explicit override for the process-wide in-flight object-store GET cap
@@ -204,7 +205,8 @@ struct Args {
     /// `--fetch-concurrency`, leaving today's behaviour byte-for-byte
     /// unchanged; set, it lets a measurement vary the GET concurrency at a
     /// fixed partition count. Recorded in the report's provenance alongside
-    /// the requested value.
+    /// the requested value. Zero is refused before any data is generated or
+    /// read on the in-process lanes.
     #[arg(long = "store-get-concurrency", value_name = "N")]
     store_get_concurrency: Option<usize>,
     /// The logs fetch policy (ADR-0996 decision 2), the same knob and the same
