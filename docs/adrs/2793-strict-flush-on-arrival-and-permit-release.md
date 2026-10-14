@@ -234,7 +234,8 @@ that order on OTAP.
 What the permit covered by accident, the count of held response contexts,
 gets an explicit bound: `--max-pending-strict-acks` (default 8,192, 0 =
 unlimited). `submit` takes a pending-ack permit for a strict write before
-sending, and `Submitted` holds it until the acks resolve or the deadline
+sending (see the head pending-ack amendment below: a write admitted at the
+head arrives holding one), and `Submitted` holds it until the acks resolve or the deadline
 passes. A strict request refused here gets the same 429 with `Retry-After`
 and gRPC `RESOURCE_EXHAUSTED` as the in-flight ceiling, with its own body
 text and counter `ravel_ingest_pending_ack_shed_total`, and the gauge
@@ -562,9 +563,11 @@ services (not OTAP; see below), the admission layer takes the pending-ack
 permit at the request head. It does so right after the in-flight permit and
 the credential check, and only for a strict write.
 
-Whether a write is strict is a property of the surface, supplied by the
-admission state each surface instantiates the shared layer with, not a
-property of the header:
+Whether a write is strict is a property of the surface, not of the header.
+Each surface's admission layer is given what it needs to decide it: the
+HTTP middleware through the admission state each surface instantiates it
+with, and the gRPC admission layer through the strict flush policy, which
+it does not carry today and gains in this change:
 
 - On OTLP HTTP and gRPC the state answers with `resolve_write_mode` over
   the header or the gRPC metadata, the same function the handler uses, so
@@ -608,8 +611,10 @@ Taking the pending-ack permit there would turn today's per-batch pending-ack
 refusal, which keeps the stream open, into a stream teardown and a fresh
 decoder state for every refused batch. A stream's batches share one
 connection and one decoder, so wasting the decode is the cheaper of the two
-costs. The OTAP stream head takes no pending-ack permit: its mode is read
-once per stream and says nothing about each batch's write.
+costs. The OTAP stream head takes no pending-ack permit either. Its mode
+does cover every batch on the stream, but one stream serves an unbounded
+number of writes, so a single permit taken at the head would be held for
+the stream's whole lifetime while bounding none of them.
 
 **What the bound now counts.** A pre-admitted permit is held from the head,
 through the body read (up to the 30 s body-read timeout) and the decode, and
@@ -634,8 +639,8 @@ beside it.
 | Budget 2, PUT held. Two concurrent strict writes. | Both admitted, gauge 2, and a third refused. | Acquiring at the head and again in `submit`: the second is refused. Releasing at `submit`: the third is admitted. |
 | Budget 1, one ack held. A `buffered` request on HTTP and on gRPC. | 200 and OK. | Taking a permit for every mode. Reading the mode from the wrong source on one transport. |
 | Budget 1, one ack held. A Remote Write request carrying `x-ravel-ingest-mode: buffered`. | The pending-ack 429. | Reading the header on Remote Write, which would let any client opt out of the bound. |
-| Budget 1, PUT held. A direct-call gRPC request with no layer and an undecodable body. | `RESOURCE_EXHAUSTED`, with the decode never reached. | A no-layer path that takes no permit at the head: it refuses only after decode. A bare permit dropped with tonic's extensions: the second request is admitted. |
-| Budget 1, one ack held. A refusal on HTTP/1 with a body below the drain cap. | A readable 429, and the in-flight gauge back to its prior value before the drain completes. | A drain that runs while the in-flight permit is still held. |
+| Budget 1, PUT held. A direct-call gRPC request, with no layer, invoking the service method in-process. | `RESOURCE_EXHAUSTED`, with normalization and `submit` never reached: the router and ingest counters do not move. | A no-layer path that takes no permit at the head: it refuses only after decode. A bare permit dropped with tonic's extensions: the second request is admitted. |
+| In-flight ceiling 1, budget 1, one ack held. A strict request is refused by the pending-ack bound, and its body below the drain cap is still draining. A second request, buffered, arrives during that drain. | The second is admitted: the refused request's in-flight slot was returned before its drain. | A drain that runs while the in-flight permit is still held: the second is shed. |
 
 **Follow-through in the code change.** Some text in the tree stops being true
 for admission-layer writes and must change in the same commit as the code:
@@ -646,7 +651,12 @@ for admission-layer writes and must change in the same commit as the code:
   shed counter, which describe `submit`;
 - the gauge's HELP text;
 - the `--max-pending-strict-acks` help, and the flag reference generated
-  from it.
+  from it;
+- the module doc of `crates/ravel-ingest/src/pending_ack.rs` and the doc
+  comment on the strict submit in `log_router.rs` (and its metrics and span
+  equivalents), which say a strict `submit` takes the permit. They stay
+  true for callers outside the admission layer and gain that a
+  pre-admitted write carries one in.
 
 ```mermaid
 flowchart LR
@@ -654,7 +664,7 @@ flowchart LR
     M -- yes --> P[take pending-ack permit<br/>or release in-flight, drain, 429]
     M -- no --> B
     P --> B[decode body]
-    B --> C[router submit with held permit<br/>charge byte budget, send to shards]
+    B --> C[router submit, with the held permit if strict<br/>charge byte budget, send to shards]
     C --> D[drop in-flight permit]
     D --> E[Submitted.acks holds the<br/>pending-ack permit to the ack]
 ```
