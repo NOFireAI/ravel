@@ -28,7 +28,16 @@ required` (or `RAVEL_AUDIT_MODE=required`) to enable it, or `best-effort`
 
 The record comes from the execution path of the server. It does not come from
 the request body or from the ticket that a client sent. A tenant cannot forge
-a record, and cannot suppress the record of a query that it ran.
+a record.
+
+When a Flight SQL stream ends, cleanly or with an error, the server waits for
+the record to be written before it sends that end to the client. Under
+`required` a write failure turns the end into `Unavailable` (see
+[Write failures](#write-failures)). A client that cancels a Flight SQL stream
+part way through gets no such guarantee. The server submits that stream's
+record, with status `Error`, on a background task, and the stream does not
+wait for the write or act on its result. Under either mode, the record of a
+cancelled Flight SQL stream is best-effort.
 
 One group-commit pipeline writes the records of every surface. Ravel installs
 the pipeline only in the query-serving modes (`all` and `query`), and only
