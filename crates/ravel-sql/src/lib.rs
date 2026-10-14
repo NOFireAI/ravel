@@ -229,7 +229,7 @@ pub use spans_schema::{
     span_links_item_field, span_links_type, spans_schema,
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
-pub use statement::{DialectPolicy, LoweredStatement, StatementTarget};
+pub use statement::{DialectPolicy, LoweredStatement, LoweringContext, StatementTarget};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{
     DdlIntent, DdlKind, DdlValidationError, StatementKind, ValidationError, ddl_kind,

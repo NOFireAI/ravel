@@ -1,17 +1,15 @@
 //! A statement that is not SQL text, run through `SqlExecutor`.
 //!
 //! The statements here are built with DataFusion's `LogicalPlanBuilder` and
-//! expression API against whatever session the executor hands the lowering,
+//! expression API over the `LoweringContext` the executor hands the lowering,
 //! which is what a non-SQL front end does. Each one counts its lowerings and
-//! records the session it was lowered against, so a test can tell the
-//! classification session, the executed session and a retry's rebuilt session
-//! apart.
+//! records the provider it scanned, so a test can tell the classification
+//! session, the executed session and a retry's rebuilt session apart.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::util;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,14 +18,12 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::display::array_value_to_string;
-use datafusion::datasource::{MemTable, TableProvider, provider_as_source};
+use datafusion::datasource::{MemTable, TableProvider, provider_as_source, source_as_provider};
 use datafusion::error::DataFusionError;
-use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
 use datafusion::logical_expr::{
-    AggregateUDF, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, col, exists, lit,
+    AggregateUDF, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, cast, col, exists, lit,
 };
-use datafusion::prelude::SessionContext;
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
@@ -40,9 +36,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{RequestBudgets, RequestLimit};
 use ravel_sql::{
-    DialectPolicy, ErrorClass, LiveAccounting, LoweredStatement, MSG_INTERNAL, SpillConfig,
-    SqlConfig, SqlError, SqlOutcome, SqlRequest, StatementRequest, StatementTarget, TargetSignal,
-    ValidationError,
+    DialectPolicy, ErrorClass, LiveAccounting, LoweredStatement, LoweringContext, MSG_INTERNAL,
+    SpillConfig, SqlConfig, SqlError, SqlOutcome, SqlRequest, StatementRequest, StatementTarget,
+    TargetSignal, ValidationError,
 };
 use ravel_types::{Signal, TenantId, logstream};
 use util::{Fixture, request, tenant_id};
@@ -62,18 +58,21 @@ const RECORDS: [(i64, u8, &str, &str); 6] = [
 const GROUPED_SQL: &str = "SELECT severity_text, count(*) AS n FROM logs \
      WHERE severity_num >= 9 GROUP BY severity_text ORDER BY severity_text";
 
-type Lowering = dyn Fn(&SessionContext, &Arc<dyn TableProvider>) -> Result<LogicalPlan, DataFusionError>
-    + Send
-    + Sync;
+/// Lowers against the context it is handed; the second argument is the
+/// 1-based number of this call.
+type Lowering =
+    dyn Fn(&LoweringContext, usize) -> Result<LogicalPlan, DataFusionError> + Send + Sync;
 
 /// A programmatic statement over a fixed target: `build` lowers it against the
-/// session it is handed, given the `logs` provider that session registered.
+/// context it is handed.
 struct Programmatic {
     target: StatementTarget,
     policy: DialectPolicy,
     build: Box<Lowering>,
     lowerings: AtomicUsize,
-    sessions: Mutex<Vec<String>>,
+    /// The `logs` provider each lowering's context held, kept alive so two
+    /// sessions' providers cannot share an address.
+    providers: Mutex<Vec<Arc<dyn TableProvider>>>,
 }
 
 impl std::fmt::Debug for Programmatic {
@@ -88,7 +87,7 @@ impl std::fmt::Debug for Programmatic {
 impl Programmatic {
     fn over_logs<F>(policy: DialectPolicy, build: F) -> Self
     where
-        F: Fn(&SessionContext, &Arc<dyn TableProvider>) -> Result<LogicalPlan, DataFusionError>
+        F: Fn(&LoweringContext, usize) -> Result<LogicalPlan, DataFusionError>
             + Send
             + Sync
             + 'static,
@@ -98,7 +97,7 @@ impl Programmatic {
             policy,
             build: Box::new(build),
             lowerings: AtomicUsize::new(0),
-            sessions: Mutex::new(Vec::new()),
+            providers: Mutex::new(Vec::new()),
         }
     }
 
@@ -106,9 +105,17 @@ impl Programmatic {
         self.lowerings.load(Ordering::SeqCst)
     }
 
+    /// How many different `logs` providers the lowerings were handed: one
+    /// per session, since every session is built over its own provider.
     fn distinct_sessions(&self) -> usize {
-        let sessions = self.sessions.lock().unwrap();
-        sessions.iter().collect::<BTreeSet<_>>().len()
+        let providers = self.providers.lock().unwrap();
+        let mut distinct: Vec<&Arc<dyn TableProvider>> = Vec::new();
+        for provider in providers.iter() {
+            if !distinct.iter().any(|seen| Arc::ptr_eq(seen, provider)) {
+                distinct.push(provider);
+            }
+        }
+        distinct.len()
     }
 }
 
@@ -126,17 +133,27 @@ impl LoweredStatement for Programmatic {
         &self.policy
     }
 
-    async fn lower(&self, ctx: &SessionContext) -> Result<LogicalPlan, DataFusionError> {
-        self.lowerings.fetch_add(1, Ordering::SeqCst);
-        self.sessions.lock().unwrap().push(ctx.session_id());
-        let logs = ctx.table_provider("logs").await?;
-        (self.build)(ctx, &logs)
+    async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
+        let call = self.lowerings.fetch_add(1, Ordering::SeqCst) + 1;
+        let scan = logs_scan_node(ctx)?;
+        self.providers
+            .lock()
+            .unwrap()
+            .push(source_as_provider(&scan.source)?);
+        (self.build)(ctx, call)
     }
 }
 
-/// A `TableScan` of `logs` through `provider`.
-fn logs_scan(provider: &Arc<dyn TableProvider>) -> Result<LogicalPlanBuilder, DataFusionError> {
-    LogicalPlanBuilder::scan("logs", provider_as_source(Arc::clone(provider)), None)
+/// The bare `TableScan` of `logs` the context builds.
+fn logs_scan_node(
+    ctx: &LoweringContext,
+) -> Result<datafusion::logical_expr::TableScan, DataFusionError> {
+    match ctx.scan("logs")?.build()? {
+        LogicalPlan::TableScan(scan) => Ok(scan),
+        other => Err(DataFusionError::Internal(format!(
+            "the context built {other:?} for a scan"
+        ))),
+    }
 }
 
 /// A call carrying `func` itself. `AggregateUDF::call` would wrap a copy,
@@ -163,9 +180,9 @@ fn count_policy() -> DialectPolicy {
 /// The programmatic equivalent of [`GROUPED_SQL`], calling the session's own
 /// `count`.
 fn grouped_statement() -> Programmatic {
-    Programmatic::over_logs(count_policy(), |ctx, logs| {
-        let count = ctx.udaf("count")?;
-        logs_scan(logs)?
+    Programmatic::over_logs(count_policy(), |ctx, _call| {
+        let count = ctx.aggregate("count")?;
+        ctx.scan("logs")?
             .filter(col("severity_num").gt_eq(lit(9u8)))?
             .aggregate(
                 vec![col("severity_text")],
@@ -182,9 +199,9 @@ const UNORDERED_GROUPED_SQL: &str =
     "SELECT severity_text, count(*) AS n FROM logs GROUP BY severity_text";
 
 fn unordered_grouped_statement() -> Programmatic {
-    Programmatic::over_logs(count_policy(), |ctx, logs| {
-        let count = ctx.udaf("count")?;
-        logs_scan(logs)?
+    Programmatic::over_logs(count_policy(), |ctx, _call| {
+        let count = ctx.aggregate("count")?;
+        ctx.scan("logs")?
             .aggregate(
                 vec![col("severity_text")],
                 vec![aggregate_call(count, vec![lit(1i64)]).alias("n")],
@@ -506,9 +523,9 @@ async fn lowered_length_by_its_registered_name_is_admitted() {
     let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
     let statement = Programmatic::over_logs(
         DialectPolicy::new(["length"], Vec::<String>::new(), Vec::<String>::new()),
-        |ctx, logs| {
-            let length = ctx.udf("length")?;
-            logs_scan(logs)?
+        |ctx, _call| {
+            let length = ctx.scalar("length")?;
+            ctx.scan("logs")?
                 .project(vec![scalar_call(length, vec![col("body")]).alias("len")])?
                 .build()
         },
@@ -529,9 +546,9 @@ async fn lowered_length_by_its_registered_name_is_admitted() {
 async fn lowered_plan_with_an_unlisted_function_is_refused() {
     let tenant = tenant_id("acme-logs");
     let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
-    let statement = Programmatic::over_logs(count_policy(), |ctx, logs| {
-        let upper = ctx.udf("upper")?;
-        logs_scan(logs)?
+    let statement = Programmatic::over_logs(count_policy(), |ctx, _call| {
+        let upper = ctx.scalar("upper")?;
+        ctx.scan("logs")?
             .project(vec![scalar_call(upper, vec![col("body")])])?
             .build()
     });
@@ -551,14 +568,14 @@ async fn lowered_plan_with_a_foreign_function_instance_is_refused() {
     let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
     let statement = Programmatic::over_logs(
         DialectPolicy::new(Vec::<String>::new(), ["min"], Vec::<String>::new()),
-        |ctx, logs| {
+        |ctx, _call| {
             let foreign = datafusion::functions_aggregate::min_max::min_udaf();
             assert!(
-                !Arc::ptr_eq(&foreign, &ctx.udaf("min")?),
+                !Arc::ptr_eq(&foreign, &ctx.aggregate("min")?),
                 "the session must register its own min for this case to mean anything"
             );
             assert_eq!(foreign.name(), "min");
-            logs_scan(logs)?
+            ctx.scan("logs")?
                 .aggregate(
                     Vec::<Expr>::new(),
                     vec![aggregate_call(foreign, vec![col("ts")])],
@@ -586,7 +603,7 @@ async fn lowered_plan_scanning_another_table_is_refused() {
         Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("empty table"))
     }
 
-    let elsewhere = Programmatic::over_logs(DialectPolicy::default(), |_ctx, _logs| {
+    let elsewhere = Programmatic::over_logs(DialectPolicy::default(), |_ctx, _call| {
         LogicalPlanBuilder::scan("samples", provider_as_source(foreign_table()), None)?.build()
     });
     let err = run_statement(&fixture, &tenant, &elsewhere, &statement_request())
@@ -594,7 +611,7 @@ async fn lowered_plan_scanning_another_table_is_refused() {
         .expect_err("a scan outside the target is refused");
     assert_not_admitted(&err, "not in its target");
 
-    let impostor = Programmatic::over_logs(DialectPolicy::default(), |_ctx, _logs| {
+    let impostor = Programmatic::over_logs(DialectPolicy::default(), |_ctx, _call| {
         LogicalPlanBuilder::scan("logs", provider_as_source(foreign_table()), None)?.build()
     });
     let err = run_statement(&fixture, &tenant, &impostor, &statement_request())
@@ -607,9 +624,9 @@ async fn lowered_plan_scanning_another_table_is_refused() {
 async fn lowered_plan_with_an_unadmitted_node_is_refused() {
     let tenant = tenant_id("acme-logs");
     let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
-    let statement = Programmatic::over_logs(DialectPolicy::default(), |_ctx, logs| {
-        let right = logs_scan(logs)?.alias("b")?.build()?;
-        logs_scan(logs)?.alias("a")?.cross_join(right)?.build()
+    let statement = Programmatic::over_logs(DialectPolicy::default(), |ctx, _call| {
+        let right = ctx.scan("logs")?.alias("b")?.build()?;
+        ctx.scan("logs")?.alias("a")?.cross_join(right)?.build()
     });
 
     let err = run_statement(&fixture, &tenant, &statement, &statement_request())
@@ -624,9 +641,9 @@ async fn lowered_plan_with_an_unadmitted_node_is_refused() {
 async fn lowered_plan_with_a_subquery_is_refused() {
     let tenant = tenant_id("acme-logs");
     let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
-    let statement = Programmatic::over_logs(DialectPolicy::default(), |_ctx, logs| {
-        let inner = logs_scan(logs)?.project(vec![col("ts")])?.build()?;
-        logs_scan(logs)?
+    let statement = Programmatic::over_logs(DialectPolicy::default(), |ctx, _call| {
+        let inner = ctx.scan("logs")?.project(vec![col("ts")])?.build()?;
+        ctx.scan("logs")?
             .filter(exists(Arc::new(inner)))?
             .project(vec![col("body")])?
             .build()
@@ -644,8 +661,8 @@ async fn lowered_plan_with_a_subquery_is_refused() {
 async fn lowered_plan_with_a_copy_of_the_session_instance_is_refused() {
     let tenant = tenant_id("acme-logs");
     let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
-    let statement = Programmatic::over_logs(count_policy(), |ctx, logs| {
-        let registered = ctx.udaf("count")?;
+    let statement = Programmatic::over_logs(count_policy(), |ctx, _call| {
+        let registered = ctx.aggregate("count")?;
         let copied = registered.call(vec![lit(1)]);
         match &copied {
             Expr::AggregateFunction(call) => assert!(
@@ -654,7 +671,7 @@ async fn lowered_plan_with_a_copy_of_the_session_instance_is_refused() {
             ),
             other => panic!("count built {other:?}"),
         }
-        logs_scan(logs)?
+        ctx.scan("logs")?
             .aggregate(Vec::<Expr>::new(), vec![copied])?
             .build()
     });
@@ -809,4 +826,301 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish logs commit record");
+}
+
+/// A lowering that scans `logs` and takes DataFusion's own `min` under the
+/// listed name `min`, where the session registered its total-order `min`.
+fn stock_min_statement() -> Programmatic {
+    Programmatic::over_logs(min_policy(), |ctx, _call| stock_min_plan(ctx))
+}
+
+fn min_policy() -> DialectPolicy {
+    DialectPolicy::new(Vec::<String>::new(), ["min"], Vec::<String>::new())
+}
+
+fn stock_min_plan(ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
+    let stock = datafusion::functions_aggregate::min_max::min_udaf();
+    assert!(
+        !Arc::ptr_eq(&stock, &ctx.aggregate("min")?),
+        "the session must register its own min for this case to mean anything"
+    );
+    ctx.scan("logs")?
+        .aggregate(
+            Vec::<Expr>::new(),
+            vec![aggregate_call(stock, vec![col("body")])],
+        )?
+        .build()
+}
+
+/// [`grouped_statement`]'s plan for a context.
+fn grouped_plan(ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
+    let count = ctx.aggregate("count")?;
+    ctx.scan("logs")?
+        .filter(col("severity_num").gt_eq(lit(9u8)))?
+        .aggregate(
+            vec![col("severity_text")],
+            vec![aggregate_call(count, vec![lit(1i64)]).alias("n")],
+        )?
+        .sort(vec![col("severity_text").sort(true, false)])?
+        .build()
+}
+
+/// No spill and no parallel final aggregation: a logs statement without
+/// declared columns then builds no classification session, so the executed
+/// session is the only one that lowers and admits.
+fn executed_only_config() -> SqlConfig {
+    SqlConfig {
+        parallel_final_aggregation: false,
+        ..SqlConfig::default()
+    }
+}
+
+/// DataFusion's stock `character_length` under the listed name `length`. The
+/// session replaced the function registered under that name, so the stock
+/// handle is a different instance and is refused.
+#[tokio::test]
+async fn stock_scalar_under_a_name_the_session_replaced_is_refused() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(["length"], Vec::<String>::new(), Vec::<String>::new()),
+        |ctx, _call| {
+            let stock = datafusion::functions::unicode::character_length();
+            assert!(
+                stock.aliases().iter().any(|alias| alias == "length"),
+                "the stock function must answer to length for this case to mean anything"
+            );
+            assert!(
+                !Arc::ptr_eq(&stock, &ctx.scalar("length")?),
+                "the session must replace length for this case to mean anything"
+            );
+            ctx.scan("logs")?
+                .project(vec![scalar_call(stock, vec![col("body")]).alias("len")])?
+                .build()
+        },
+    );
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("the stock character_length under length is refused");
+    assert_not_admitted(&err, "not the session's instance");
+}
+
+/// The session did not replace `count`, so DataFusion's own handle is the
+/// instance the session registered, and admission lets it through.
+#[tokio::test]
+async fn stock_count_is_the_session_instance_and_is_admitted() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(count_policy(), |ctx, _call| {
+        let stock = datafusion::functions_aggregate::count::count_udaf();
+        assert!(
+            Arc::ptr_eq(&stock, &ctx.aggregate("count")?),
+            "the session registers DataFusion's own count"
+        );
+        ctx.scan("logs")?
+            .aggregate(
+                Vec::<Expr>::new(),
+                vec![aggregate_call(stock, vec![lit(1i64)]).alias("n")],
+            )?
+            .build()
+    });
+
+    let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect("the stock count is the session's count");
+    assert_eq!(rows(outcome.output.batches()), owned(&[&["6"]]));
+}
+
+/// A policy that lists only the alias `length` admits the instance fetched by
+/// its canonical name `character_length`: both names hold one allocation.
+#[tokio::test]
+async fn policy_listing_an_alias_admits_the_instance_fetched_by_its_canonical_name() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(["length"], Vec::<String>::new(), Vec::<String>::new()),
+        |ctx, _call| {
+            let canonical = ctx.scalar("character_length")?;
+            assert_eq!(canonical.name(), "character_length");
+            assert!(Arc::ptr_eq(&canonical, &ctx.scalar("length")?));
+            ctx.scan("logs")?
+                .project(vec![scalar_call(canonical, vec![col("body")]).alias("len")])?
+                .build()
+        },
+    );
+
+    let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect("the alias admits the canonical name's instance");
+    let mut lengths = rows(outcome.output.batches());
+    lengths.sort();
+    assert_eq!(
+        lengths,
+        owned(&[&["4"], &["5"], &["5"], &["5"], &["7"], &["7"]])
+    );
+}
+
+/// The executed session refuses a foreign instance on its own: no
+/// classification session is built, so the one lowering is the executed one.
+#[tokio::test]
+async fn foreign_function_is_refused_at_the_executed_site() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, executed_only_config()).await;
+    let statement = stock_min_statement();
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("the executed site refuses a foreign min");
+    assert_not_admitted(&err, "not the session's instance");
+    assert_eq!(statement.lowerings(), 1, "only the executed site lowered");
+}
+
+/// Clean for the classification session, foreign for the executed one: the
+/// executed site's own admission is what refuses it.
+#[tokio::test]
+async fn lowering_refused_only_on_its_second_call_is_refused() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(Vec::<String>::new(), ["count", "min"], Vec::<String>::new()),
+        |ctx, call| match call {
+            1 => grouped_plan(ctx),
+            _ => stock_min_plan(ctx),
+        },
+    );
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("the second lowering is refused");
+    assert_not_admitted(&err, "not the session's instance");
+    assert_eq!(statement.lowerings(), 2, "one classification, one executed");
+}
+
+/// The snapshot retry's executed lowering is admitted on its own: the first
+/// attempt's lowering is clean, the retry's is foreign.
+#[tokio::test]
+async fn retry_lowering_is_admitted_again() {
+    let tenant = tenant_id("acme-logs");
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let (store, fixture) = logs_fixture(plan, &tenant, executed_only_config()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(Vec::<String>::new(), ["count", "min"], Vec::<String>::new()),
+        |ctx, call| match call {
+            1 => grouped_plan(ctx),
+            _ => stock_min_plan(ctx),
+        },
+    );
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("the retry's lowering is refused");
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+        1,
+        "the injected NotFound must have fired, else there was no retry"
+    );
+    assert_not_admitted(&err, "not the session's instance");
+    assert_eq!(statement.lowerings(), 2, "one per attempt");
+    assert_eq!(statement.distinct_sessions(), 2);
+}
+
+/// A scan whose `filters` are set, the shape only the optimizer's pushdown
+/// produces, is refused.
+#[tokio::test]
+async fn lowered_scan_with_filters_is_refused() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(DialectPolicy::default(), |ctx, _call| {
+        let mut scan = logs_scan_node(ctx)?;
+        scan.filters = vec![col("severity_num").gt_eq(lit(9u8))];
+        Ok(LogicalPlan::TableScan(scan))
+    });
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("a scan carrying filters is refused");
+    assert_not_admitted(&err, "with filters");
+}
+
+/// A scan whose `fetch` is set is refused.
+#[tokio::test]
+async fn lowered_scan_with_a_fetch_is_refused() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(DialectPolicy::default(), |ctx, _call| {
+        let mut scan = logs_scan_node(ctx)?;
+        scan.fetch = Some(1);
+        Ok(LogicalPlan::TableScan(scan))
+    });
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("a scan carrying a fetch is refused");
+    assert_not_admitted(&err, "with a fetch");
+}
+
+/// The classification lowering sums an integer column, which is exact-typed;
+/// the executed lowering sums it cast to `Float64`, which is not. The
+/// exact-typed decision the classification took does not hold for the plan
+/// that would run, so the statement is refused.
+#[tokio::test]
+async fn lowering_that_changes_an_aggregate_input_type_is_refused() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(Vec::<String>::new(), ["sum"], Vec::<String>::new()),
+        |ctx, call| {
+            let sum = ctx.aggregate("sum")?;
+            let input = match call {
+                1 => col("severity_num"),
+                _ => cast(col("severity_num"), DataType::Float64),
+            };
+            ctx.scan("logs")?
+                .aggregate(
+                    vec![col("severity_text")],
+                    vec![aggregate_call(sum, vec![input]).alias("s")],
+                )?
+                .build()
+        },
+    );
+
+    let err = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect_err("a lowering whose aggregate changes type is refused");
+    assert_not_admitted(&err, "not repeatable");
+    assert_eq!(statement.lowerings(), 2, "one classification, one executed");
+}
+
+/// The control for the case above: the integer sum on both calls runs.
+#[tokio::test]
+async fn lowering_with_the_same_aggregate_on_both_calls_runs() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(Vec::<String>::new(), ["sum"], Vec::<String>::new()),
+        |ctx, _call| {
+            let sum = ctx.aggregate("sum")?;
+            ctx.scan("logs")?
+                .aggregate(
+                    vec![col("severity_text")],
+                    vec![aggregate_call(sum, vec![col("severity_num")]).alias("s")],
+                )?
+                .sort(vec![col("severity_text").sort(true, false)])?
+                .build()
+        },
+    );
+
+    let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect("a repeatable lowering runs");
+    assert_eq!(
+        rows(outcome.output.batches()),
+        owned(&[&["DEBUG", "5"], &["INFO", "27"], &["WARN", "26"]])
+    );
+    assert_eq!(statement.lowerings(), 2);
 }
