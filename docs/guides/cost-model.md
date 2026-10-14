@@ -506,8 +506,10 @@ threshold keeps its 512 KiB default. Above it, against a remote store, the
 projection break-even decides whether the read is ranged or whole.
 
 To see which way your queries route, read the `fast_path_whole_object_segments`
-and `fast_path_ranged_segments` plan metrics of the logs scan from an
-`EXPLAIN ANALYZE`, beside the per-operation request and byte counts. A large
+and `fast_path_ranged_segments` plan metrics of the logs scan from
+`ravel-cli sql explain --analyze`
+([inspecting data](inspecting-data.md#sql-explain)). That command prints no
+request or byte counts. A large
 ranged-open share on statements that move few bytes, on a backend that bills
 requests, is the signal that this value is set for the wrong objective.
 

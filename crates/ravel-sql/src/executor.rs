@@ -98,6 +98,7 @@ use datafusion::logical_expr::{
     Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort,
     SortExpr, WindowFunctionDefinition, lit,
 };
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
@@ -3437,6 +3438,60 @@ impl PinnedQuery {
                 .with_row_cap(row_cap),
         )
     }
+
+    /// Run this query to completion and render the plan it executed with
+    /// DataFusion's per-operator metrics, the `EXPLAIN ANALYZE` view (ADR-2867
+    /// change 7 item 3).
+    ///
+    /// The batches go through the same [`PinnedStream`] [`Self::execute`]
+    /// returns, so the memory ceiling, the row cap and the panic boundary
+    /// apply exactly as they do there; a failure mid-stream returns the
+    /// error and no plan. The plan is rendered after the drain from the same
+    /// handle the stream executed, which is where the operators recorded
+    /// their metrics. The rows themselves are counted and dropped.
+    pub async fn execute_analyzed(self) -> Result<AnalyzedRun, SqlError> {
+        let PinnedQuery {
+            ctx,
+            frame,
+            schema,
+            breach,
+            scratch,
+            row_cap,
+            window_predicate: _,
+        } = self;
+        let plan = frame.create_physical_plan().await.map_err(plan_error)?;
+        let mut stream =
+            PinnedStream::start_with_scratch(ctx, Arc::clone(&plan), schema, breach, scratch)?
+                .with_row_cap(row_cap);
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch?.num_rows();
+        }
+        let row_cap_hit = stream.row_cap_hit();
+        drop(stream);
+        let plan_with_metrics = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+            .indent(true)
+            .to_string();
+        Ok(AnalyzedRun {
+            plan_with_metrics,
+            rows,
+            row_cap_hit,
+        })
+    }
+}
+
+/// What [`PinnedQuery::execute_analyzed`] returns: the executed plan with
+/// its metrics, and how many rows the run produced.
+#[derive(Debug, Clone)]
+pub struct AnalyzedRun {
+    /// The executed physical plan, rendered as DataFusion's indented display
+    /// with each operator's `metrics=[...]`.
+    pub plan_with_metrics: String,
+    /// Rows the stream emitted. With a row cap set this is at most the cap
+    /// plus one, and [`Self::row_cap_hit`] says whether the cap cut it.
+    pub rows: usize,
+    /// Whether the row cap set by [`PinnedQuery::with_row_cap`] cut the run.
+    pub row_cap_hit: bool,
 }
 
 /// A running plan's `RecordBatch` stream, with its session attached.

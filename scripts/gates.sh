@@ -278,11 +278,13 @@ want_sql=0
 want_flight_sql=0
 want_bench=0
 want_stage_timing=0
+want_cli_sql_explain=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
   want_flight_sql=1
   want_bench=1
   want_stage_timing=1
+  want_cli_sql_explain=1
 else
   for c in "${gate_crates[@]}"; do
     case "${c}" in
@@ -300,6 +302,9 @@ else
     # ravel-bench lane below cannot reach.
     case "${c}" in
       ravel-bench | ravel-ingest | ravel-logseg) want_stage_timing=1 ;;
+    esac
+    case "${c}" in
+      ravel-cli) want_cli_sql_explain=1 ;;
     esac
   done
 fi
@@ -338,6 +343,13 @@ run_feature_lanes() {
   # it would be red for an unrelated reason.
   if [[ ${want_stage_timing} -eq 1 ]]; then
     run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
+  fi
+
+  # ravel-cli's `sql explain` subcommand (issue #2881) and its tests compile
+  # only under `sql-explain`, which no other lane selects. Mirrors CI's
+  # `cli-sql-explain` features leg.
+  if [[ ${want_cli_sql_explain} -eq 1 ]]; then
+    run_feature_lane sql-explain -p ravel-cli
   fi
 }
 

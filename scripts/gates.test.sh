@@ -8,8 +8,10 @@
 #
 # No toolchain: a stub `cargo` first on PATH answers `cargo metadata` with a
 # synthetic workspace whose edges mirror the real ones these cases are about
-# (ravel-sql and ravel-server depend on ravel-query, ravel-ingest on
-# ravel-logseg, ravel-ingest-router on ravel-affinity), logs every other call
+# (ravel-sql and ravel-server depend on ravel-query, ravel-cli on ravel-sql,
+# ravel-query, ravel-logseg, ravel-ingest and, as a dev-dependency,
+# ravel-server, ravel-ingest on ravel-logseg, ravel-ingest-router on
+# ravel-affinity), logs every other call
 # and builds nothing. gates.sh runs with --dry-run, which prints each cargo
 # command a real run would execute without running it.
 set -uo pipefail
@@ -68,6 +70,8 @@ pkg() {
   printf ','
   pkg ravel-bench ravel-server ravel-ingest
   printf ','
+  pkg ravel-cli ravel-sql ravel-query ravel-logseg ravel-ingest ravel-server
+  printf ','
   pkg ravel-affinity
   printf ','
   pkg ravel-ingest-router ravel-affinity
@@ -105,6 +109,8 @@ sql_test='==> cargo nextest run --locked -p ravel-server --features sql'
 flight_clippy='==> cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings'
 flight_test='==> cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql'
 stage_clippy='==> cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings'
+cli_explain_clippy='==> cargo clippy --locked -p ravel-cli --features sql-explain --all-targets -- -D warnings'
+cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-explain'
 
 # --- gates.sh --dry-run -------------------------------------------------
 
@@ -151,6 +157,28 @@ check_eq "gates -p ravel-logseg: scoped clippy names ravel-ingest" "1" \
   "$(count_matching "${out}" '^==> cargo clippy --locked (-p [a-z-]+ )*-p ravel-ingest (-p [a-z-]+ )*--all-targets')"
 check_eq "gates -p ravel-logseg: stage-timing lane" "1" "$(count "${out}" "${stage_clippy}")"
 
+# -p ravel-cli: the sql-explain lane, and no lane of a crate outside it.
+run_stubbed cli bash "${SCRIPTS}/gates.sh" -p ravel-cli --dry-run
+out="${tmp}/cli.out"
+check_eq "gates -p ravel-cli: exit 0" "0" "${rc}"
+check_eq "gates -p ravel-cli: sql-explain lane clippy" "1" "$(count "${out}" "${cli_explain_clippy}")"
+check_eq "gates -p ravel-cli: sql-explain lane tests" "1" "$(count "${out}" "${cli_explain_test}")"
+check_eq "gates -p ravel-cli: only that feature lane" "1" \
+  "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
+
+# -p ravel-sql: ravel-cli depends on it, so the sql-explain lane runs too.
+run_stubbed sql bash "${SCRIPTS}/gates.sh" -p ravel-sql --dry-run
+check_eq "gates -p ravel-sql: exit 0" "0" "${rc}"
+check_eq "gates -p ravel-sql: sql-explain lane clippy" "1" \
+  "$(count "${tmp}/sql.out" "${cli_explain_clippy}")"
+
+# -p ravel-logseg: ravel-cli depends on it directly, so the sql-explain lane
+# runs here too.
+check_eq "gates -p ravel-logseg: sql-explain lane clippy" "1" \
+  "$(count "${tmp}/logseg.out" "${cli_explain_clippy}")"
+check_eq "gates -p ravel-logseg: sql-explain lane tests" "1" \
+  "$(count "${tmp}/logseg.out" "${cli_explain_test}")"
+
 # -p ravel-affinity: nothing that carries a feature lane is in its closure.
 run_stubbed affinity bash "${SCRIPTS}/gates.sh" -p ravel-affinity --dry-run
 out="${tmp}/affinity.out"
@@ -171,7 +199,8 @@ check_eq "gates --dry-run: workspace clippy" "1" \
   "$(count "${out}" '==> cargo clippy --locked --workspace --all-targets -- -D warnings')"
 check_eq "gates --dry-run: sql lane" "1" "$(count "${out}" "${sql_clippy}")"
 check_eq "gates --dry-run: flight-sql lane" "1" "$(count "${out}" "${flight_clippy}")"
-check_eq "gates --dry-run: feature lane clippy runs" "5" \
+check_eq "gates --dry-run: sql-explain lane" "1" "$(count "${out}" "${cli_explain_clippy}")"
+check_eq "gates --dry-run: feature lane clippy runs" "6" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
 check_eq "gates --dry-run: no cargo call" "0" "$(wc -l <"${tmp}/workspace.calls" | tr -d ' ')"
 

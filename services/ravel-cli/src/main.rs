@@ -122,6 +122,9 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // (ADR-2040 decision D1), so every `parquet` subcommand hashes a
         // tenant.
         | Command::Parquet { .. } => true,
+        // `sql explain` resolves the tenant's catalog from its `--tenant`.
+        #[cfg(feature = "sql-explain")]
+        Command::Sql { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
         // `--tenant`, so it needs the bucket's scheme resolved first; the
         // other `commit` variants take an explicit key/path and do not.
@@ -184,6 +187,10 @@ fn command_is_write(command: &Command) -> bool {
         // `export` reads a resolved snapshot's objects and writes only to the
         // local `--parquet` path; it publishes nothing to object storage.
         Command::Export { .. } => false,
+        // `sql explain` admits read-only statements only and prints to
+        // stdout.
+        #[cfg(feature = "sql-explain")]
+        Command::Sql { .. } => false,
         // Both `provision` shapes write a durable record (or, for `adopt`, a
         // control record and audit entry via `reshard`); neither has a
         // read-only variant.
@@ -904,6 +911,67 @@ enum Command {
         /// same range. Zero is refused, as the server refuses it.
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
         max_ingest_lag: Option<i64>,
+    },
+    /// Run SQL diagnostics outside the HTTP endpoint (built only with
+    /// `--features sql-explain`).
+    #[cfg(feature = "sql-explain")]
+    Sql {
+        #[command(subcommand)]
+        command: SqlCommand,
+    },
+}
+
+#[cfg(feature = "sql-explain")]
+#[derive(Debug, Subcommand)]
+enum SqlCommand {
+    /// Print a statement's physical plan; with `--analyze`, run it and print
+    /// the executed plan with every operator's metrics and the row count.
+    ///
+    /// The statement is a plain read-only query, checked by the same gate the
+    /// HTTP endpoint applies; do not prefix it with EXPLAIN, which that gate
+    /// refuses. No query-audit record is written for this command, so it
+    /// refuses to run unless `--unaudited` is passed.
+    Explain {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// The statement to explain, e.g. `SELECT count(*) FROM logs`.
+        sql: String,
+        /// Run the statement and print the executed plan with per-operator
+        /// metrics (`output_rows`, `elapsed_compute`, ...) and the row count.
+        #[arg(long)]
+        analyze: bool,
+        /// Required. Acknowledges that this command writes no query-audit
+        /// record: the statement reads tenant data with no audit trail of
+        /// who ran it.
+        #[arg(long)]
+        unaudited: bool,
+        /// Inclusive start of the event-time window, RFC 3339. Defaults to
+        /// one hour before `--end`, as the HTTP endpoint does.
+        #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
+        start: Option<i64>,
+        /// End of the event-time window, RFC 3339. Defaults to now.
+        #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
+        end: Option<i64>,
+        /// Configured shard count, used to resolve the catalog, as for
+        /// `export`. Defaults to the server's default of 4.
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
+        /// The deployment's `ravel-server --max-ingest-lag`, as for `export`.
+        #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
+        max_ingest_lag: Option<i64>,
+        /// Wall deadline for the resolve, plan and (with `--analyze`) the run
+        /// (humantime, e.g. `30s`).
+        #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = humantime::parse_duration)]
+        deadline: std::time::Duration,
+        /// With `--analyze`, stop the run after this many rows plus one.
+        #[arg(long)]
+        max_rows: Option<usize>,
+        /// The SQL engine's partition count. Defaults to the engine's own
+        /// default; the server's `--sql-partition-count` may differ, and the
+        /// plan shape depends on it.
+        #[arg(long)]
+        sql_partitions: Option<usize>,
     },
 }
 
@@ -2069,6 +2137,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 /// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
 /// than stderr.
 async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
+    // Refused before the store is built: an unaudited query must not cost a
+    // single request unless the operator acknowledged it.
+    #[cfg(feature = "sql-explain")]
+    if let Command::Sql {
+        command: SqlCommand::Explain { unaudited, .. },
+    } = &cli.command
+    {
+        ravel_cli::sql_explain::require_unaudited(*unaudited)?;
+    }
     // Before running any subcommand that computes a tenant hash, resolve the
     // bucket's real tenant-hash scheme from `sys/tenancy` and install it
     // process-wide. Without this a hashing command would silently use the
@@ -2957,6 +3034,45 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 shards,
                 max_ingest_lag,
                 now_ns()?,
+            )
+            .await
+        }
+        #[cfg(feature = "sql-explain")]
+        Command::Sql {
+            command:
+                SqlCommand::Explain {
+                    tenant,
+                    sql,
+                    analyze,
+                    unaudited,
+                    start,
+                    end,
+                    shards,
+                    max_ingest_lag,
+                    deadline,
+                    max_rows,
+                    sql_partitions,
+                },
+        } => {
+            let opts = ravel_cli::sql_explain::ExplainOptions {
+                tenant,
+                sql,
+                analyze,
+                unaudited,
+                start_ns: start,
+                end_ns: end,
+                shards,
+                max_ingest_lag_ns: max_ingest_lag,
+                deadline,
+                max_rows,
+                sql_partitions,
+            };
+            ravel_cli::sql_explain::run(
+                store::build_store(&cli.store)?,
+                cli.store.selection(),
+                &opts,
+                now_ns()?,
+                &mut std::io::stdout(),
             )
             .await
         }
@@ -5593,6 +5709,9 @@ mod tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+// `cli_reference_is_current` and its helpers are compiled out of a
+// `sql-explain` build; see that test.
+#[cfg_attr(feature = "sql-explain", allow(dead_code, unused_imports))]
 mod cli_reference_tests {
     //! Drift check for `docs/reference/ravel-cli-flags.md` (ADR-1040 decision
     //! 4). The tables are rendered from `Cli`'s clap definition by the shared
@@ -5684,6 +5803,9 @@ mod cli_reference_tests {
     }
 
     /// The committed reference matches what the current command tree renders.
+    /// The page documents the default build, which has no `sql` subcommand, so
+    /// a `sql-explain` build skips this; the default-feature run checks it.
+    #[cfg(not(feature = "sql-explain"))]
     #[test]
     fn cli_reference_is_current() {
         let cmd = Cli::command();
